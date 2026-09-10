@@ -506,9 +506,10 @@ pub(crate) fn resolve_source_sandbox(
             // real blast-radius change and belongs in its own issue.
             None => Err(anyhow!(
                 "workload `{}` requires a fixture satisfying `{}` but no registered \
-                 fixture matches in the registry at {} (this registry is looked up \
-                 project-locally when the current directory has its own `.darkmux/`, \
-                 which can differ from the home-tier registry that `darkmux lab \
+                 fixture matches in the registry at {} (this registry follows the \
+                 standard project/home resolution — project-local when the current \
+                 directory has its own `.darkmux/` and `DARKMUX_HOME` is not set, \
+                 the home tier otherwise — which can differ from what `darkmux lab \
                  fixture list` shows from elsewhere).\n\
                  \n\
                  Fix:\n\
@@ -1068,6 +1069,88 @@ mod tests {
             msg.contains(&paths.root.join("lab-registry.json").display().to_string()),
             "error must name the registry path actually consulted, so the \
              project/home split is visible instead of silent: got: {msg}"
+        );
+    }
+
+    /// (#2590 follow-up, review round 2 finding 2) The explanatory clause
+    /// added by the fix above claims the registry "is looked up
+    /// project-locally when the current directory has its own `.darkmux/`"
+    /// — true as a description of `ResolveScope::Auto` in isolation, but
+    /// `DARKMUX_HOME` short-circuits `paths::resolve` BEFORE that branch is
+    /// ever evaluated (see `darkmux_types::paths::resolve`). With an
+    /// explicit `DARKMUX_HOME` set AND a project-local `.darkmux/` also
+    /// sitting in cwd, the OLD wording named the right path (`DARKMUX_HOME`
+    /// wins either way) but gave the wrong REASON — cwd's own `.darkmux/`
+    /// had nothing to do with why that path was chosen. Red-proved:
+    /// reverting the hedge back to the unconditional "when the current
+    /// directory has its own `.darkmux/`" phrasing keeps this test's path
+    /// assertions green while making its "DARKMUX_HOME" assertion fail —
+    /// the wording no longer names the actual override that decided it.
+    #[test]
+    #[serial_test::serial]
+    fn resolver_fixture_error_names_dark_home_not_the_bypassed_project_root() {
+        use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
+        use std::collections::BTreeMap;
+
+        let dark_home = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::set(dark_home.path());
+
+        // A project-local `.darkmux/` ALSO exists in cwd — exactly the
+        // state the finding names ("an explicit state root set and a
+        // project-local registry also present"). `DARKMUX_HOME` must win
+        // regardless.
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux")).unwrap();
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let paths = paths::resolve(ResolveScope::Auto);
+        assert_eq!(
+            paths.root, dark_home.path(),
+            "sanity: DARKMUX_HOME must win over the project-local .darkmux/ \
+             in cwd, or this test isn't exercising the state under test"
+        );
+
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "coding-task".into(),
+                    description: None,
+                    role: Some("coder".into()),
+                    prompt: Some("do the thing".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: true,
+                    requires_fixture: Some("never-registered@1.0".into()),
+                    verify: None,
+                    expected: None,
+                    image: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: project.path().join("workloads/demo.json"),
+            base_dir: project.path().to_path_buf(),
+            source: WorkloadSource::OnDisk,
+        };
+        let err = resolve_source_sandbox(&loaded, &paths).unwrap_err();
+        let msg = format!("{err:#}");
+
+        let dark_home_registry = dark_home.path().join("lab-registry.json");
+        let bypassed_project_registry = project.path().join(".darkmux").join("lab-registry.json");
+
+        assert!(
+            msg.contains(&dark_home_registry.display().to_string()),
+            "must name the DARKMUX_HOME-rooted registry actually consulted: {msg}"
+        );
+        assert!(
+            !msg.contains(&bypassed_project_registry.display().to_string()),
+            "must not name the project-local registry that was never consulted: {msg}"
+        );
+        assert!(
+            msg.contains("DARKMUX_HOME"),
+            "the explanation must name the override that actually decided \
+             this path, not just cwd's own `.darkmux/`: {msg}"
         );
     }
 

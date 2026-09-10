@@ -166,7 +166,72 @@ pub(crate) fn load(id: &str, user_dir: Option<&Path>) -> Result<LoadedWorkload> 
     } else {
         avail.join(", ")
     };
+    // (#2590 follow-up, review round 2 finding 1) The USER tier is forced
+    // home-only above, on purpose — but that leaves the exact silence the
+    // sibling `resolve_source_sandbox` fixture-error fix (`lab::run`)
+    // removed, one lookup over: standing in a project directory holding a
+    // `.darkmux/workloads/<id>.json` for an id that resolves nowhere
+    // darkmux actually searches, the operator got a bare "not found" that
+    // never mentioned the document sitting right there in cwd. Name it,
+    // same remedy shape as that sibling fix.
+    if let Some(note) = ignored_project_local_note(id, user_dir) {
+        bail!("workload \"{id}\" not found. Available: {listed}\n\n{note}");
+    }
     bail!("workload \"{id}\" not found. Available: {listed}")
+}
+
+/// Only reachable when there IS a project-local `.darkmux` actually being
+/// bypassed: the `ResolveScope::Auto`-resolved root differs from the
+/// `ResolveScope::ForceUser` root the caller already searched (as
+/// `user_dir`). An operator with no project-local `.darkmux/` at all, or
+/// one who set `DARKMUX_HOME` (which makes `Auto` and `ForceUser` resolve
+/// identically regardless of cwd — see `darkmux_types::paths::resolve`),
+/// gets no note: nothing is actually being ignored in that case, so
+/// claiming otherwise would be the same kind of wrong steer this note
+/// exists to avoid.
+fn ignored_project_local_note(id: &str, user_dir: Option<&Path>) -> Option<String> {
+    let auto_root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root;
+    if let Some(udir) = user_dir {
+        if udir == auto_root {
+            return None;
+        }
+    }
+    let project_workloads = auto_root.join("workloads");
+    let found = find_in_dir(&project_workloads, id)?;
+    Some(format!(
+        "Note: `{id}` exists at {} but is ignored — the workload user tier \
+         resolves to the home directory unconditionally (#2590), never the \
+         current directory's own `.darkmux/`. Move it to \
+         ~/.darkmux/workloads/{id}.json (or export DARKMUX_HOME to point at \
+         a different root) if you want darkmux to use it.",
+        display_under_cwd(&found),
+    ))
+}
+
+/// (review round 2 finding 3) `darkmux_types::paths::resolve` derives the
+/// project root from `std::env::current_dir()`, which resolves symlinks
+/// (e.g. macOS's `/tmp` → `/private/tmp`, or any temp dir under
+/// `/var/folders/...` → `/private/var/folders/...`) — a spelling the
+/// operator's own shell won't have shown them, since `pwd`/`ls` read the
+/// shell's own unresolved `$PWD`. Left alone, the operator sees one
+/// spelling of their own directory in the terminal and a DIFFERENT one in
+/// this note, for what is the same path. Re-spell `p` (which must be
+/// somewhere under the real cwd) using `$PWD`'s logical form when it
+/// actually names the same real directory — falling back to `p` verbatim
+/// whenever `$PWD` is unset, stale, or unreadable, so this is cosmetic-only
+/// and never changes what gets searched or found.
+fn display_under_cwd(p: &Path) -> String {
+    (|| {
+        let pwd = PathBuf::from(env::var_os("PWD")?);
+        let real_pwd = pwd.canonicalize().ok()?;
+        let real_cwd = env::current_dir().ok()?.canonicalize().ok()?;
+        if real_pwd != real_cwd {
+            return None;
+        }
+        let rest = p.strip_prefix(&real_cwd).ok()?;
+        Some(pwd.join(rest).display().to_string())
+    })()
+    .unwrap_or_else(|| p.display().to_string())
 }
 
 pub fn list_available(user_dir: Option<&Path>) -> Vec<String> {
@@ -711,6 +776,138 @@ mod tests {
 
         let err = load("cwd-only-2553", None).unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    // ─── #2590 review round 2 — name the ignored project-local document ──
+    //
+    // A trap worth naming for whoever red-proves the test below (or any
+    // test in this module): filtering by the bare function name with an
+    // `--exact`-style flag has silently matched ZERO tests and still
+    // exited 0 in this repo before — the module-qualified path
+    // (`workloads::load::tests::<name>`, as `cargo test <name>` without
+    // `--exact` or `cargo nextest run -E 'test(<name>)'` would resolve it)
+    // is what's required for the filter to actually select something. A
+    // green "0 passed; 0 failed" reads identically to a real pass at a
+    // glance — it isn't one.
+
+    /// The sibling of `resolve_source_sandbox`'s fixture-error fix, one
+    /// lookup over: a project directory holding its OWN
+    /// `.darkmux/workloads/<id>.json` for an id that resolves nowhere
+    /// darkmux actually searches (no user/on-disk/embedded tier has it
+    /// either) must have that ignored document NAMED in the "not found"
+    /// error, not silently omitted. Red-proved: deleting the
+    /// `ignored_project_local_note` call in [`load`] makes this fail —
+    /// the error still says "not found" but drops the ignored path.
+    #[test]
+    #[serial_test::serial]
+    fn not_found_names_an_ignored_project_local_document() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+
+        let cwd_tmp = TempDir::new().unwrap();
+        write(
+            &cwd_tmp.path().join(".darkmux/workloads/cwd-only-ignored.json"),
+            &manifest_json("cwd-only-ignored"),
+        );
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        // Mirrors what `lab_run`/`lab_workloads`/`lab_inspect` actually pass:
+        // the `ResolveScope::ForceUser`-resolved root — home-tier,
+        // unconditionally — which here differs from what `Auto` would
+        // resolve from cwd (the project-local `.darkmux` just planted).
+        let forced_user_root = home_tmp.path().join(".darkmux");
+        let err = load("cwd-only-ignored", Some(&forced_user_root)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(
+            msg.contains("cwd-only-ignored.json"),
+            "expected the ignored project-local document's path named in the error: {msg}"
+        );
+    }
+
+    /// The counterpart: when `user_dir` (the `ForceUser` root) already IS
+    /// what `Auto` resolves to — no project-local `.darkmux` is being
+    /// bypassed at all — nothing should be claimed as "ignored". Covers
+    /// both the "no project `.darkmux` exists" case (Auto falls through to
+    /// the same home root) and guards against a note that fires whenever
+    /// ANY document exists at that id, whether or not it's actually the
+    /// document that's being bypassed.
+    #[test]
+    #[serial_test::serial]
+    fn not_found_stays_bare_when_nothing_is_actually_ignored() {
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_tmp.path());
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", home_tmp.path().join("nope"));
+
+        // No project-local `.darkmux` anywhere in cwd — Auto falls back to
+        // the same home root ForceUser already resolved and searched.
+        let cwd_tmp = TempDir::new().unwrap();
+        let _cwd_guard = CwdGuard::new(cwd_tmp.path());
+
+        let forced_user_root = home_tmp.path().join(".darkmux");
+        let err = load("nothing-anywhere", Some(&forced_user_root)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(
+            !msg.contains("is ignored"),
+            "nothing was actually bypassed here — the note should not fire: {msg}"
+        );
+    }
+
+    /// (review round 2 finding 3) `display_under_cwd` must re-spell a path
+    /// using `$PWD`'s logical form when it names the same real directory —
+    /// the note's path must match what the operator's own `pwd`/`ls`
+    /// already showed them, not `std::env::current_dir()`'s
+    /// symlink-resolved form (macOS: `/tmp` → `/private/tmp`, or any path
+    /// under `/var/folders/...` → `/private/var/folders/...`). Builds an
+    /// explicit symlink so the divergence is guaranteed regardless of
+    /// where the test tempdir itself happens to live. Red-proved: deleting
+    /// the `$PWD`-based branch in `display_under_cwd` (falling straight to
+    /// `p.display()`) makes this fail — `shown` would come back resolved,
+    /// same as `target`, and the `assert_ne!` sanity check below would
+    /// have nothing to distinguish.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn display_under_cwd_prefers_the_logical_pwd_spelling_over_the_resolved_one() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let symlinked = tmp.path().join("symlinked");
+        std::os::unix::fs::symlink(&real_dir, &symlinked).unwrap();
+
+        let prev_cwd = env::current_dir().unwrap();
+        let prev_pwd = env::var_os("PWD");
+        env::set_current_dir(&symlinked).unwrap();
+        unsafe { env::set_var("PWD", &symlinked) };
+
+        let target = env::current_dir().unwrap().join("some-file.json");
+        let shown = display_under_cwd(&target);
+
+        env::set_current_dir(&prev_cwd).unwrap();
+        unsafe {
+            match &prev_pwd {
+                Some(v) => env::set_var("PWD", v),
+                None => env::remove_var("PWD"),
+            }
+        }
+
+        // Sanity: prove the symlink actually causes divergence here, or
+        // this test isn't exercising the case under test at all.
+        assert_ne!(
+            target.display().to_string(),
+            symlinked.join("some-file.json").display().to_string(),
+            "the symlink must make the resolved and logical spellings differ"
+        );
+        assert_eq!(
+            shown,
+            symlinked.join("some-file.json").display().to_string(),
+            "must re-spell using $PWD's logical form, matching what the \
+             operator's shell already showed them"
+        );
     }
 
     /// The escape-hatch verification, by EXECUTION not by reading. This is
