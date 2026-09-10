@@ -1414,6 +1414,15 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
 /// resident is user state and is never inspected here — same filter
 /// `is_darkmux_owned` applies everywhere else (`machine status`/`eject`,
 /// dispatch preflight, `plan_acquire`'s own Exclusive pass).
+///
+/// Deliberately OUT OF SCOPE (#1944 CONSIDER 5): matching is identity-only —
+/// a resident whose identifier matches a declared model but whose LOADED
+/// context is smaller than that model's `n_ctx` (so gestalt refuses to
+/// reuse it and would reload rather than dispatch to it — the #1135 shape)
+/// still reads as `Pass` here. That's a real accumulation path, just not
+/// the one #1944 reported; widen this check to compare
+/// `LoadedModel.context` against the declared `n_ctx` if that shape shows
+/// up in practice.
 fn check_unreachable_darkmux_residents() -> Check {
     let registry = match darkmux_profiles::profiles::load_registry(None) {
         Ok(r) => r.registry,
@@ -1482,17 +1491,42 @@ fn unreachable_residents_status(
         };
     }
 
+    // (#1944 CONSIDER 4) A profile whose entry failed to parse is
+    // quarantined out of `registry.profiles` entirely (#1282) — invisible
+    // to the `addressable` set above. A resident loaded from a profile
+    // that's currently quarantined by a hand-edit typo would otherwise
+    // read identically to a genuine orphan; name the quarantine explicitly
+    // rather than let the operator draw the wrong conclusion from the
+    // warning alone.
+    let quarantine_note = if registry.quarantined.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Note: {} profile entr{} in this registry {} currently quarantined (failed to parse — see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, it may simply be waiting on that profile to be fixed, not genuinely orphaned.",
+            registry.quarantined.len(),
+            if registry.quarantined.len() == 1 { "y" } else { "ies" },
+            if registry.quarantined.len() == 1 { "is" } else { "are" },
+            registry
+                .quarantined
+                .iter()
+                .map(|q| q.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
     Check {
         name,
         status: Status::Warn,
         message: format!(
-            "{} darkmux-owned resident(s) unreachable — no profile in the registry declares them, so nothing will ever dispatch to (or reconcile) them until reclaimed by hand: {}",
+            "{} darkmux-owned resident(s) unreachable — no profile in this registry declares them right now: {}",
             unreachable.len(),
             unreachable.join(", ")
         ),
         hint: Some(format!(
-            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44) — reclaim the RAM yourself: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.",
-            unreachable[0]
+            "darkmux never auto-unloads a resident outside a reconcile it's already planning (operator sovereignty, #44). A reconcile pass DOES evict a darkmux-owned orphan like this — but only on the next dispatch that reaches it, and only through THIS same registry (a doctor run in a project directory can be reading a different profiles.json than a dispatch run elsewhere — local `.darkmux.json`/`.darkmux/profiles.json` take precedence over `~/.darkmux/profiles.json`). To reclaim the RAM now rather than wait: `lms unload <identifier>` for each one listed (e.g. `lms unload {}`), or `darkmux machine eject` to sweep every darkmux-owned resident if nothing is running. This is usually a leftover from a superseded profile version or review-staffing seat — no data loss either way.{}",
+            unreachable[0],
+            quarantine_note
         )),
     }
 }
@@ -9210,7 +9244,8 @@ mod tests {
         // mission-config-registry [#1284] + daemon-freshness +
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
-        // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
+        // [#1819] + unreachable-residents [#1944] +
+        // review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + reasoning-checkpoint-interval [#2165] +
         // host-sampler-interval [#2107, #1833] +
         // telemetry-record-every-samples [#2111] +
@@ -10016,22 +10051,41 @@ mod tests {
     /// test (only proving orphans get flagged) would risk shipping a
     /// doctor check that also — wrongly — nudges the operator to `lms
     /// unload` their own state.
+    ///
+    /// The fixtures are deliberate NEAR-MISSES of the `darkmux:` namespace
+    /// prefix, not just any foreign string — `is_darkmux_owned` is a pure
+    /// `starts_with(DARKMUX_NAMESPACE)` check
+    /// (`darkmux_gestalt::ownership::is_darkmux_owned`), and a plain
+    /// `some-user-loaded-model` fixture can't tell that implementation
+    /// apart from a weaker `.contains("darkmux:")` one — both would
+    /// correctly ignore it. `my-darkmux:orphan` / `predarkmux:orphan`
+    /// contain the namespace as a substring without starting with it (a
+    /// `.contains` implementation would wrongly flag either — e.g. a user
+    /// model the operator happened to alias `my-darkmux:foo` would get an
+    /// unload suggestion for their own state); `DARKMUX:orphan` pins the
+    /// case-sensitivity half of the same prefix check.
     #[test]
     fn unreachable_residents_never_flags_a_foreign_resident() {
         let registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
-        let loaded = vec![lm("some-user-loaded-model", "some-user-loaded-model")];
+        let loaded = vec![
+            lm("my-darkmux:orphan", "orphan"),
+            lm("predarkmux:orphan", "orphan"),
+            lm("DARKMUX:orphan", "orphan"),
+        ];
         let c = super::unreachable_residents_status(&loaded, &registry);
         assert_eq!(
             c.status,
             Status::Pass,
-            "a foreign (non-namespaced) resident is never this check's business: {}",
+            "a foreign resident whose identifier merely CONTAINS the darkmux: namespace (or differs only by case) is never this check's business: {}",
             c.message
         );
-        assert!(
-            !c.message.contains("some-user-loaded-model"),
-            "a foreign identifier must never appear in this check's output, suggested or otherwise: {}",
-            c.message
-        );
+        for id in ["my-darkmux:orphan", "predarkmux:orphan", "DARKMUX:orphan"] {
+            assert!(
+                !c.message.contains(id),
+                "a foreign identifier must never appear in this check's output, suggested or otherwise: {}",
+                c.message
+            );
+        }
     }
 
     /// The machine utility (compactor) binding (#590) is the one darkmux-
@@ -10064,6 +10118,30 @@ mod tests {
             Status::Pass,
             "an explicit alias is addressable under its own spelling: {}",
             c.message
+        );
+    }
+
+    /// (#1944 CONSIDER 4) A resident that's actually unreachable for an
+    /// unrelated reason (its declaring profile is quarantined, not that it
+    /// was never declared at all) still WARNs — the check can't tell those
+    /// two cases apart from `LoadedModel` alone — but the hint names the
+    /// quarantine so the operator doesn't draw "genuinely orphaned" from a
+    /// warning that's actually "waiting on a typo fix".
+    #[test]
+    fn unreachable_residents_hint_names_a_quarantined_profile() {
+        let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        registry.quarantined.push(darkmux_types::QuarantinedEntry {
+            kind: darkmux_types::QuarantinedEntryKind::Profile,
+            name: "broken-profile".to_string(),
+            error: "missing field `models`".to_string(),
+        });
+        let loaded = vec![lm("darkmux:orphan", "orphan")];
+        let c = super::unreachable_residents_status(&loaded, &registry);
+        assert_eq!(c.status, Status::Warn);
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(
+            hint.contains("broken-profile") && hint.contains("quarantined"),
+            "hint names the quarantined profile so the operator doesn't assume a genuine orphan: {hint}"
         );
     }
 
