@@ -161,6 +161,39 @@ pub fn is_set() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
+/// (#2476) Set [`INTERRUPTED`] directly, WITHOUT installing (or touching)
+/// any `libc::signal(2)` disposition — the production twin of
+/// [`simulate_sigint_for_test`] etc., callable from a normal (non-test)
+/// build.
+///
+/// **Why this exists instead of every long-lived host calling
+/// [`install`]/[`install_term`]/[`install_hup`].** Those functions call
+/// raw `libc::signal(2)`, which unconditionally REPLACES whatever handler
+/// currently owns that signal's disposition. `darkmux acp` and `darkmux
+/// serve` are long-lived hosts that already run their OWN async signal
+/// detection via `tokio::signal` (`signal-hook-registry` under the hood,
+/// which chains multiple listeners for the same signal cooperatively). A
+/// raw `libc::signal()` call installed on top would silently clobber that
+/// chain — not add to it — breaking the host's own already-working
+/// graceful-shutdown detection instead of complementing it. A host that
+/// has ALREADY detected an operator-requested shutdown through its own
+/// `tokio::signal` listener calls `mark_interrupted` so every OTHER
+/// `is_set()` consumer in the process (the docker-container trajectory
+/// tailer, the hosted `curl` post-wait reclassification in
+/// `dispatch_internal.rs`) reacts exactly as if a raw signal had landed
+/// here — without a second, conflicting signal handler ever being
+/// installed.
+///
+/// Deliberately gets the SAME never-resets contract as a real signal (see
+/// the module doc) — a long-lived host that calls this is, by convention,
+/// also the one about to reap its own children and exit; nothing in this
+/// codebase calls it and then keeps dispatching normally afterward. See
+/// `darkmux acp`'s and `darkmux serve`'s own shutdown-signal handling for
+/// the two production call sites.
+pub fn mark_interrupted() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
 /// Test-only: deliver a simulated SIGINT without installing a real signal
 /// handler or sending a real OS signal — calls the internal handler
 /// directly, exercising the exact same code path a real Ctrl-C would.
@@ -246,6 +279,36 @@ mod tests {
         assert!(!is_set());
         on_sigint(libc::SIGINT);
         assert!(is_set());
+        INTERRUPTED.store(false, Ordering::SeqCst);
+    }
+
+    /// (#2476) `mark_interrupted` sets the SAME flag a real signal sets,
+    /// without going anywhere near `libc::signal(2)` — proven here by
+    /// checking the SIGINT disposition is untouched (`libc::signal`
+    /// returns the PREVIOUS handler; re-installing `SIG_DFL` and reading
+    /// back what it replaced tells us whether `mark_interrupted` changed
+    /// it). Real-signal-delivery coverage for the two production callers
+    /// (`darkmux acp`, `darkmux serve`) lives in each host's own test
+    /// module, not here — this module owns only the flag's own contract.
+    #[test]
+    #[serial_test::serial]
+    fn mark_interrupted_sets_the_flag_without_touching_sigint_disposition() {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let before = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+        assert_eq!(before, libc::SIG_DFL, "SIGINT must already be at its default disposition before this test runs");
+
+        assert!(!is_set());
+        mark_interrupted();
+        assert!(is_set(), "mark_interrupted must flip is_set() to true");
+
+        let after = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+        assert_eq!(
+            after,
+            libc::SIG_DFL,
+            "mark_interrupted must not install (or otherwise touch) a SIGINT handler — the \
+             disposition must still read back as SIG_DFL"
+        );
+
         INTERRUPTED.store(false, Ordering::SeqCst);
     }
 

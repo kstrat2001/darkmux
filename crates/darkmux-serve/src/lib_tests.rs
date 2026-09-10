@@ -6570,3 +6570,46 @@ fn join_host_samples_scans_both_days_when_the_run_spans_midnight() {
     assert_eq!(telemetry.len(), 2, "a run spanning midnight joins samples from both days: {records:#?}");
     assert_eq!(stats.days_scanned, 2, "the run's window spans exactly the two overlapping day files");
 }
+
+/// (#2476) `reap_dispatch_children_on_shutdown` must kill a REAL,
+/// currently-registered child — the exact new capability this fix adds
+/// to `darkmux serve`'s shutdown path. Proven directly against a real
+/// spawned `sleep` process registered the same way `dispatch_internal.
+/// rs`'s own docker/curl spawn sites do — no OS signal needed HERE:
+/// `shutdown_signal()`'s own `tokio::signal`-based detection is
+/// pre-existing, unmodified code, not what this fix changes. What's new
+/// is only what runs once that already-working detection fires, and
+/// that's what this test exercises.
+#[test]
+#[serial_test::serial]
+fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
+    darkmux_types::child_registry::reset_for_test();
+    darkmux_types::interrupt::reset_for_test();
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawning a real sleep child to register");
+    let pid = child.id();
+    darkmux_types::child_registry::register(pid);
+
+    assert!(
+        !darkmux_types::interrupt::is_set(),
+        "must start unset for this test's own post-call assertion to mean anything"
+    );
+
+    reap_dispatch_children_on_shutdown();
+
+    assert!(
+        darkmux_types::interrupt::is_set(),
+        "reap_dispatch_children_on_shutdown must mark_interrupted() so dispatch_internal.rs's \
+         own post-wait docker_kill_by_name check can fire — kill_all alone only kills the \
+         `docker run` CLIENT pid, never the container itself"
+    );
+
+    let status = child.wait().expect("reaping the (now-signaled) sleep child");
+    assert!(!status.success(), "a SIGKILLed child must not report success: {status:?}");
+
+    darkmux_types::child_registry::reset_for_test();
+    darkmux_types::interrupt::reset_for_test();
+}

@@ -1151,6 +1151,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             shutdown_signal().await;
             let _ = shutdown_tx.send(true);
             host_sampler_stop.store(true, Ordering::SeqCst);
+            // (#2476) Reap the fleet runner's in-flight dispatch child
+            // BEFORE the grace-window force-exit below — see
+            // `reap_dispatch_children_on_shutdown`'s own doc for why this
+            // is more than `kill_all` alone.
+            reap_dispatch_children_on_shutdown();
             eprintln!(
                 "\ndarkmux serve: shutdown signal received, {SHUTDOWN_GRACE_SECS}s grace for in-flight connections"
             );
@@ -4812,6 +4817,48 @@ fn redis_value_as_str(v: &redis::Value) -> Option<&str> {
         redis::Value::SimpleString(s) => Some(s.as_str()),
         _ => None,
     }
+}
+
+/// (#2476) Reap whatever the fleet runner thread's in-flight
+/// `darkmux_crew::dispatch::dispatch` call has currently registered in
+/// `darkmux_types::child_registry` — the docker CLI pid or the hosted
+/// `curl` pid, per `dispatch_internal.rs`'s own registration sites — and
+/// mark `darkmux_types::interrupt` observed so the SAME machinery an
+/// armed CLI launcher's signal handling already relies on reacts here
+/// too.
+///
+/// **Why both calls, not just `kill_all`.** `kill_all` alone unblocks the
+/// runner thread's blocking wait (the registered pid dies, the pipes
+/// close) but for the DOCKER path that only kills the `docker run` CLIENT
+/// process — attached/foreground `docker run` does not forward a SIGKILL
+/// to the container itself (SIGKILL can't be proxied at all, unlike
+/// SIGTERM). The actual `docker kill <container>` only fires from
+/// `dispatch_internal.rs`'s own post-wait check (`if darkmux_types::
+/// interrupt::is_set() && !status.success()`), which is why
+/// `mark_interrupted` has to run too — without it, `kill_all` alone
+/// unblocks the wait but leaves the container itself `Up` under dockerd,
+/// the exact failure mode `dispatch_internal.rs`'s own NEW-1 finding
+/// measured and documented for the armed-CLI-launcher case, unmeasured
+/// here until this fix. For the hosted `curl` path, `mark_interrupted`
+/// additionally reclassifies the killed call's error as "interrupted by
+/// an operator signal" rather than a bare, confusing curl failure.
+///
+/// **Why NOT `darkmux_types::interrupt::install_term()`/`launch_guard::
+/// arm()`.** Those call raw `libc::signal(2)`, which would silently
+/// replace this daemon's OWN already-working `tokio::signal`-based
+/// detection (`shutdown_signal`, below) rather than complement it — see
+/// `mark_interrupted`'s own doc. And `launch_guard::spawn_reap_watchdog`'s
+/// 100ms-forever loop is the wrong shape for a host that (before this
+/// call) has no guarantee it is about to exit — it would SIGKILL every
+/// LATER dispatch's children for the rest of this process's life once
+/// tripped once. This function is a single, explicit, called-exactly-once
+/// reap, run from the shutdown path that is ALREADY about to force-exit
+/// this process within `SHUTDOWN_GRACE_SECS` regardless — so "never
+/// resets" costs nothing here: there is no later dispatch in this process
+/// that needs the flag to go back to false.
+pub(crate) fn reap_dispatch_children_on_shutdown() {
+    darkmux_types::interrupt::mark_interrupted();
+    darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
 }
 
 /// Wait for SIGINT or SIGTERM to trigger graceful shutdown. SIGTERM

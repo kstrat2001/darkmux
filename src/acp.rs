@@ -154,6 +154,20 @@
 //!   cleanup path; named here so a stop-button user isn't surprised by
 //!   drift accumulating in `mission status` or stray files under the
 //!   workspace.
+//! - (#2476 — RESOLVED) This file had NO OS signal handling at all — a
+//!   SIGINT/SIGTERM to `darkmux acp` itself (as opposed to an
+//!   ACP-protocol `session/cancel`, covered above) killed the process by
+//!   default disposition and orphaned whatever curl/subprocess child was
+//!   in flight. `run()` now spawns [`host_shutdown_reap_loop`], which
+//!   waits on `tokio::signal` (NOT `launch_guard::arm()`/raw
+//!   `libc::signal()` — see [`wait_for_host_shutdown_signal`]'s own doc
+//!   for why that would be the wrong tool for a long-lived host) and, on
+//!   a real signal, reaps every registered dispatch child
+//!   (`darkmux_types::child_registry::kill_all`) before exiting. The
+//!   `mission launch` subprocess [`run_launch_command`] spawns is
+//!   registered the same way via [`spawn_registered`], closing the one
+//!   child this file spawns directly that `child_registry` didn't already
+//!   cover through `darkmux-crew`'s own dispatch machinery.
 //! - The `case_id` passed to the review mission is derived from the diff's
 //!   content hash + the cwd's directory name (see [`derive_case_id`]) —
 //!   deterministic (no `Date`/random per the task brief) but not
@@ -709,7 +723,20 @@ pub fn run() -> Result<i32> {
         crate::radio_answer::dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel)
     });
     let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
-    rt.block_on(serve(router, AnsweringSeat { call: answerer, scope }, Arc::new(IdleState::new()), AcpStdio::new()))?;
+    rt.block_on(async {
+        // (#2476) Reap-on-signal for the whole long-lived host — see
+        // `host_shutdown_reap_loop`'s own doc for why this exits the
+        // process rather than continuing to serve.
+        tokio::spawn(host_shutdown_reap_loop(|| {
+            eprintln!(
+                "[darkmux-acp] shutdown signal received — reaping in-flight dispatch children"
+            );
+            darkmux_types::interrupt::mark_interrupted();
+            darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+            std::process::exit(130);
+        }));
+        serve(router, AnsweringSeat { call: answerer, scope }, Arc::new(IdleState::new()), AcpStdio::new()).await
+    })?;
     Ok(0)
 }
 
@@ -1977,6 +2004,103 @@ fn loaded_config(config_id: &str) -> Result<crate::crew::mission_config::Mission
         .with_context(|| format!("loading mission config \"{config_id}\""))
 }
 
+/// (#2476) Spawn `cmd`, registering its pid in `darkmux_types::
+/// child_registry` for the span between spawn and the wait resolving —
+/// the SAME "register before the blocking wait" convention
+/// `dispatch_internal.rs`'s `PidRegistration` established for the
+/// synchronous docker/curl children `crew::dispatch` spawns (see that
+/// struct's own doc). [`run_launch_command`]'s `mission launch`
+/// subprocess already had `.kill_on_drop(true)` for ACP-level
+/// `session/cancel` aborts (dropping the awaiting task drops the
+/// `Child`), but an OS SIGINT/SIGTERM to `darkmux acp` ITSELF never
+/// reached that `Drop` at all before this fix — an unhandled signal tore
+/// the whole process down before any Rust destructor could run, orphaning
+/// this subprocess. Registering here is what lets this file's own host
+/// shutdown handling ([`host_shutdown_reap_loop`], below) reach it
+/// through the exact same `child_registry::kill_all` every other
+/// signal-aware dispatch path in this codebase already uses — the router
+/// and answerer curl dispatches need no equivalent change: they already
+/// register through `darkmux-crew`'s own `remote_chat_attempt`/
+/// `dispatch_local_single_shot`, shared, unmodified code this file
+/// already calls.
+async fn spawn_registered(mut cmd: Command) -> std::io::Result<std::process::Output> {
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    if let Some(pid) = pid {
+        darkmux_types::child_registry::register(pid);
+    }
+    let result = child.wait_with_output().await;
+    if let Some(pid) = pid {
+        darkmux_types::child_registry::deregister(pid);
+    }
+    result
+}
+
+/// (#2476) Wait for SIGINT or SIGTERM — mirrors `darkmux-serve`'s own
+/// `shutdown_signal()`. Matches that daemon's existing two-signal scope
+/// rather than the three-signal (+ SIGHUP) set `mission launch` launchers
+/// install via `launch_guard::arm()`; widening to SIGHUP here is a
+/// reasonable future addition, not something this fix's own scope (a
+/// missing guard, not missing signal breadth) requires.
+///
+/// **Why not `launch_guard::arm()`/`darkmux_types::interrupt::
+/// install_term()`.** Those call raw `libc::signal(2)`, which
+/// unconditionally REPLACES whatever handler currently owns a signal's
+/// disposition — installing one here would silently break `tokio::
+/// signal`'s own registration for any OTHER listener started later in
+/// this same process (`tokio::signal` uses `signal-hook-registry`, which
+/// chains cooperating listeners; a raw `libc::signal()` call does not
+/// cooperate, it overwrites). Reusing `tokio::signal` end-to-end, the
+/// same primitive `darkmux serve` already uses successfully, avoids that
+/// interaction entirely. See `darkmux_types::interrupt::mark_interrupted`'s
+/// own doc for the fuller version of this reasoning.
+async fn wait_for_host_shutdown_signal() {
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sig) = signal(SignalKind::terminate()) {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = term => {},
+    }
+}
+
+/// (#2476) Wait for a host shutdown signal, then invoke `on_signal` —
+/// split out so a test can inject a callback that does NOT call
+/// `std::process::exit` and still prove the wiring against a REAL
+/// delivered signal without killing the test binary. Production
+/// ([`run`]) passes a closure that reaps every currently-registered
+/// dispatch child (this file's `mission launch` subprocess via
+/// [`spawn_registered`]; `darkmux-crew`'s own curl/docker children,
+/// registered independently of this file) and force-exits — see this
+/// module's own doc for why `darkmux acp` needed this at all: before
+/// this fix, a SIGTERM mid-dispatch killed the process outright (default
+/// disposition, no handler installed anywhere in this file) and orphaned
+/// whatever child was in flight.
+///
+/// **Why this host EXITS on a caught signal rather than continuing to
+/// serve** (the design question #2476 itself raised — "worth deciding
+/// whether `interrupt`'s never-reset behavior should stay global"):
+/// `darkmux_types::interrupt::is_set()` never resets, so
+/// `launch_guard::spawn_reap_watchdog`'s forever-loop would be actively
+/// hostile if this process kept accepting new work after tripping once —
+/// every LATER dispatch's children would get SIGKILLed too. That risk
+/// only exists for a host that survives the signal. This one doesn't: an
+/// operator-delivered SIGINT/SIGTERM to a long-lived host process is
+/// conventionally "stop", exactly like `darkmux serve`'s own shutdown
+/// path already treats it — so `is_set()`'s never-reset contract costs
+/// nothing here, and no scoped/resettable variant needed to be built.
+async fn host_shutdown_reap_loop(on_signal: impl FnOnce() + Send + 'static) {
+    wait_for_host_shutdown_signal().await;
+    on_signal();
+}
+
 /// (#1684 rule D) Launch a panel command whose graph has at least one
 /// model-dispatching step as a normal `darkmux mission launch <id>`
 /// subprocess — a full instance (this process's own executable,
@@ -2071,16 +2195,19 @@ async fn run_launch_command(
     );
     let _ = cx.send_notification(agent_chunk(session_id, format!("darkmux: launching `{config_id}`…")));
 
-    let output = cmd
-        .current_dir(cwd)
+    cmd.current_dir(cwd)
         .stdin(ProcStdio::null())
         .stdout(ProcStdio::piped())
         .stderr(ProcStdio::piped())
         // (#1684 remainder — cancellation) A `session/cancel`-driven abort
         // drops this `Child` mid-`.output()`; `kill_on_drop(true)` sends the
         // OS process a real kill rather than orphaning it.
-        .kill_on_drop(true)
-        .output()
+        .kill_on_drop(true);
+    // (#2476) `spawn_registered` (not a plain `.output()`) so this pid is
+    // also reachable from `child_registry::kill_all` — see its own doc
+    // for why `kill_on_drop` alone isn't enough for an OS-signal-driven
+    // shutdown of this process.
+    let output = spawn_registered(cmd)
         .await
         .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
 
@@ -2138,7 +2265,7 @@ fn agent_chunk(session_id: &SessionId, text: impl Into<String>) -> SessionNotifi
 mod tests {
     use super::*;
     use agent_client_protocol::ByteStreams;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -3675,5 +3802,114 @@ mod tests {
             matches!(in_flight.lock().unwrap().get(&session_id), Some(InFlightSlot::Running(_))),
             "the session's slot must now be Running"
         );
+    }
+
+    /// (#2476) `spawn_registered` must register its child's pid BEFORE
+    /// the wait can observe it — proven by starting a real, long-lived
+    /// `sleep 30` through it, then reaching that SAME pid through
+    /// `darkmux_types::child_registry::kill_all` (the exact call
+    /// `host_shutdown_reap_loop`'s production closure makes) and
+    /// confirming the process actually died from it, not from its own
+    /// `.kill_on_drop(true)` (also set, matching `run_launch_command`'s
+    /// real `Command`, but this test wants to see `kill_all` do the
+    /// killing — see the timing note below for why that's the thing
+    /// under test).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_registered_pid_is_reachable_via_child_registry_kill_all() {
+        darkmux_types::child_registry::reset_for_test();
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+
+        let handle = tokio::spawn(spawn_registered(cmd));
+        // Give the spawned task a chance to actually reach `cmd.spawn()`
+        // (and register) before `kill_all` runs — otherwise this could
+        // kill nothing and prove nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("spawn_registered's task did not resolve within 5s of kill_all")
+            .expect("joining spawn_registered's task")
+            .expect("sleep 30 should spawn cleanly");
+        assert!(
+            !output.status.success(),
+            "a child reached through child_registry::kill_all must not report success: {:?}",
+            output.status
+        );
+
+        darkmux_types::child_registry::reset_for_test();
+    }
+
+    /// (#2476) `wait_for_host_shutdown_signal` must react to a REAL
+    /// SIGTERM, not a structural assertion — sends this test's OWN
+    /// process a real `kill -TERM`, the same technique `launch_guard.rs`'s
+    /// own `arm_installs_real_sigterm_and_sighup_handlers` test uses to
+    /// prove ITS handler actually fires, and asserts the future resolves
+    /// within a bound rather than hanging.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn wait_for_host_shutdown_signal_resolves_on_a_real_sigterm() {
+        let pid = std::process::id().to_string();
+        let wait = tokio::spawn(wait_for_host_shutdown_signal());
+        // Give the spawned task a chance to actually install its listener
+        // before the signal is sent — an unregistered listener observes
+        // nothing, real signal or not.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            std::process::Command::new("kill").args(["-TERM", &pid]).status().expect("running kill -TERM").success(),
+            "kill -TERM itself must succeed sending a real signal to this process"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("wait_for_host_shutdown_signal did not resolve within 5s of a real SIGTERM")
+            .expect("joining the wait task");
+    }
+
+    /// (#2476) `host_shutdown_reap_loop` must call `on_signal` — and ONLY
+    /// after a real signal arrives, never eagerly. Proven with an
+    /// injected callback (an `AtomicBool`, never `std::process::exit`)
+    /// against the same real self-SIGTERM technique as the test above —
+    /// this is the piece that proves the WIRING between signal detection
+    /// and the reap action. The reap action's own production closure
+    /// (`mark_interrupted` + `kill_all` + `std::process::exit`) is NOT
+    /// exercised end-to-end here: `std::process::exit` cannot be run
+    /// in-process without killing the test binary, the same reason
+    /// `launch_guard.rs`'s `reap_and_exit_on_signal` is never unit-tested
+    /// directly either — only `mark_interrupted` (unit-tested in
+    /// `darkmux_types::interrupt`) and `kill_all` (real-child-death proved
+    /// by `spawn_registered_pid_is_reachable_via_child_registry_kill_all`,
+    /// above) are individually proven; this test proves the glue that
+    /// calls them actually runs when the real signal lands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn host_shutdown_reap_loop_calls_on_signal_only_after_a_real_signal() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_closure = called.clone();
+        let handle = tokio::spawn(host_shutdown_reap_loop(move || {
+            called_for_closure.store(true, AtomicOrdering::SeqCst);
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!called.load(AtomicOrdering::SeqCst), "on_signal must not fire before any signal arrives");
+
+        let pid = std::process::id().to_string();
+        assert!(
+            std::process::Command::new("kill").args(["-TERM", &pid]).status().expect("running kill -TERM").success(),
+            "kill -TERM itself must succeed sending a real signal to this process"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("host_shutdown_reap_loop did not resolve within 5s of a real SIGTERM")
+            .expect("joining the loop task");
+
+        assert!(called.load(AtomicOrdering::SeqCst), "on_signal must fire once the real signal is observed");
     }
 }
