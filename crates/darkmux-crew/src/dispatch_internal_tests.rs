@@ -3352,7 +3352,7 @@
                 // a `\`-newline-indent continuation, same as every other
                 // message in this file.
                 let helper_carries_anchor = named_fn_body(src, RESUME_FROM_GUARD_ALLOWED_HELPER)
-                    .map(|helper_body| collapse_str_continuations(helper_body))
+                    .map(collapse_str_continuations)
                     .is_some_and(|helper_body| helper_body.contains(RESUME_FROM_GUARD_ANCHOR));
                 if helper_carries_anchor {
                     return true;
