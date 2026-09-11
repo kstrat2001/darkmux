@@ -87,14 +87,19 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     let paths = paths::resolve(ResolveScope::Auto);
     paths::ensure(&paths)?;
 
-    // (#2590) The workload USER tier is forced to the home root — a
+    // (#2590, #2613) The workload USER tier is forced to the home root — a
     // SEPARATE resolution from `paths` above. `paths` stays `Auto`
     // (cwd-sensitive) on purpose: it governs run-artifact placement
     // (`darkmux_types::config_access::lab_dir()`, resolved independently
-    // below) and sandbox/fixture-registry lookup (`paths.sandboxes`, used
-    // by `resolve_source_sandbox` further down) — both deliberately
-    // project-local when the cwd has a `.darkmux/`. Folding the workload
-    // *document* lookup into that same `Auto` root is what let a stale
+    // below) and the sandbox FALLBACK (`paths.sandboxes`, used by
+    // `resolve_source_sandbox` further down when a workload has no
+    // `requires_fixture`) — deliberately project-local when the cwd has a
+    // `.darkmux/`. The fixture REGISTRY lookup `resolve_source_sandbox`
+    // also performs is NOT part of that project-local behavior: since
+    // #2613 it resolves independently via `ResolveScope::ForceUser`,
+    // ignoring `paths` (and therefore cwd) entirely — see that function's
+    // own doc comment. Folding the workload *document* lookup into that
+    // same `Auto` root is what let a stale
     // `./.darkmux/workloads/<id>.json` silently outrank the embedded
     // workload of the same id, and let a cwd-only id resolve at all — the
     // exact bug class #1012 closed for crew/mission state and #2432 closed
@@ -459,11 +464,19 @@ fn enrich_manifest_with_fixture_info(
 ///   1. If `workload.requires_fixture` is set, look up a registered
 ///      fixture satisfying it via the lab registry. The registry is
 ///      ALWAYS consulted at the home (user) tier — `ResolveScope::ForceUser`,
-///      independent of `paths` below — so a fixture registered once is
-///      visible from every directory, matching the workload-document fix
-///      (#2611) and the crew/mission-state precedent (#1012, #2432). If
-///      found, use that fixture's path as the source. If no fixture
-///      satisfies, return an operator-actionable error pointing at
+///      independent of `paths` below — matching the workload-document fix
+///      (#2611) and the crew/mission-state precedent (#1012, #2432). With
+///      `DARKMUX_HOME` unset, or set to an absolute path, this is enough to
+///      make a fixture registered once visible from every directory — the
+///      regression this fix closes. A `DARKMUX_HOME` set to a RELATIVE path
+///      is a separate, pre-existing gap `paths::resolve` still has: the
+///      value is used verbatim after tilde expansion with no
+///      canonicalization, so it resolves against cwd and reproduces the
+///      exact #2613 symptom (register from one directory, "vanish" from
+///      another) even with the override set. Not fixed here — tracked
+///      separately for `paths::resolve` itself as #2664. If found, use
+///      that fixture's path as the source. If no fixture satisfies,
+///      return an operator-actionable error pointing at
 ///      `dm lab fixture register`.
 ///   2. Otherwise fall back to `{paths.sandboxes}/<workload-id>/` (the
 ///      default location for workloads with `setupContent` or no external
@@ -1166,6 +1179,88 @@ mod tests {
             !msg.contains(&bypassed_project_registry.display().to_string()),
             "must not name the project-local registry — it was never consulted: {msg}"
         );
+    }
+
+    /// (#2613) The positive twin of the not-found test above: a fixture
+    /// genuinely registered at the home root must actually RESOLVE — not
+    /// merely fail-to-be-not-found — when the caller's cwd has its own
+    /// project-local `.darkmux/`. The not-found test alone can't catch a
+    /// bug where the registry lookup starts consulting the right PATH in
+    /// its error text but still reads an empty/different registry at that
+    /// path (e.g. a stray canonicalization mismatch between where
+    /// `cmd_register` writes and where `resolve_source_sandbox` reads);
+    /// only an assertion on the successful resolved path closes that gap.
+    #[test]
+    #[serial_test::serial]
+    fn resolver_fixture_registry_resolves_from_project_local_cwd_when_registered_at_home() {
+        use crate::lab::registry::{default_registry_path, LabRegistry};
+        use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
+        use std::collections::BTreeMap;
+
+        let real_home = TempDir::new().unwrap();
+        let _real_home_guard = RealHomeGuard::set(real_home.path());
+
+        // Register the fixture at the home root BEFORE the project cwd is
+        // set up — mimics `dm lab fixture register` run earlier from
+        // anywhere, then a later dispatch from a project directory.
+        let fixture_dir = real_home.path().join("my-fx");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        std::fs::write(
+            fixture_dir.join(".fixture.json"),
+            r#"{"name": "my-fx", "satisfies": "demo-shape@1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(fixture_dir.join("source.txt"), "baseline").unwrap();
+
+        let home_paths = paths::resolve(ResolveScope::ForceUser);
+        let mut registry = LabRegistry::default();
+        registry.register(&fixture_dir, None, false).unwrap();
+        registry.save(&default_registry_path(&home_paths)).unwrap();
+
+        // NOW a project-local `.darkmux/` genuinely exists in cwd — the
+        // thing that makes `Auto` resolution diverge from the home tier.
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".darkmux")).unwrap();
+        let _cwd_guard = CwdGuard::new(project.path());
+
+        let auto_paths = paths::resolve(ResolveScope::Auto);
+        assert_eq!(
+            auto_paths.scope,
+            paths::Scope::Project,
+            "sanity: cwd's own .darkmux/ must make Auto resolve project-local, \
+             or this test isn't exercising the state under test"
+        );
+
+        let loaded = LoadedWorkload {
+            manifest: WorkloadManifest {
+                workload: WorkloadSpec {
+                    id: "demo".into(),
+                    provider: "coding-task".into(),
+                    description: None,
+                    role: Some("coder".into()),
+                    prompt: Some("do the thing".into()),
+                    prompt_file: None,
+                    sandbox_seed: None,
+                    setup_content: BTreeMap::new(),
+                    requires_external_sandbox: true,
+                    requires_fixture: Some("demo-shape@1.0".into()),
+                    verify: None,
+                    expected: None,
+                    image: None,
+                    extras: BTreeMap::new(),
+                },
+            },
+            manifest_path: project.path().join("workloads/demo.json"),
+            base_dir: project.path().to_path_buf(),
+            source: WorkloadSource::OnDisk,
+        };
+
+        // Pass the `Auto`-resolved (project-local) `paths` — exactly what
+        // `lab_run` passes in production. The registry lookup must still
+        // find the home-registered fixture and resolve successfully.
+        let resolved = resolve_source_sandbox(&loaded, &auto_paths).unwrap();
+        let expected = fixture_dir.canonicalize().unwrap();
+        assert_eq!(resolved, expected);
     }
 
     /// (#2613) `DARKMUX_HOME` still wins for the registry when set —

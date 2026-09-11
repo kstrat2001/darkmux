@@ -129,18 +129,28 @@ pub fn cmd_list() -> Result<String> {
     let reg_path = default_registry_path(&paths);
 
     if !reg_path.exists() {
-        return Ok(format!(
+        let mut msg = format!(
             "No registry at {}.\n  To get started:\n    `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
-        ));
+        );
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            msg.push_str("\n\n  ");
+            msg.push_str(&crate::lab::registry::orphan_signpost_line(&orphan));
+        }
+        return Ok(msg);
     }
 
     let registry = LabRegistry::load(&reg_path)?;
     if registry.fixtures.is_empty() {
-        return Ok(format!(
+        let mut msg = format!(
             "Registry at {} has no fixtures registered.\n  Add one: `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
-        ));
+        );
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            msg.push_str("\n\n  ");
+            msg.push_str(&crate::lab::registry::orphan_signpost_line(&orphan));
+        }
+        return Ok(msg);
     }
 
     let mut out = format!(

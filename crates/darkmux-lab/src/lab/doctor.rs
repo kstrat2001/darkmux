@@ -47,6 +47,11 @@ pub fn lab_doctor() -> Result<DoctorReport> {
             "no registry found at {}\n  Options:\n    (a) Bootstrap built-in synthetic fixtures:  `scripts/lab-init.sh`\n    (b) Register your own fixture:              `dm lab fixture register /path/to/your/fixture/`\n    (c) Hand-write the registry:                see docs/lab-registry.md (when published)\n  Until then, `dm lab run` can't resolve any fixture by name.",
             reg_path.display()
         ));
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            report
+                .warnings
+                .push(crate::lab::registry::orphan_signpost_line(&orphan));
+        }
         return Ok(report);
     }
     report.registry_present = true;
@@ -59,6 +64,11 @@ pub fn lab_doctor() -> Result<DoctorReport> {
             "registry at {} is empty — no fixtures registered.\n  Add one: `dm lab fixture register /path/to/your/fixture/`",
             reg_path.display()
         ));
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            report
+                .warnings
+                .push(crate::lab::registry::orphan_signpost_line(&orphan));
+        }
         return Ok(report);
     }
 
