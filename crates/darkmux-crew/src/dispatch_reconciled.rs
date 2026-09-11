@@ -72,12 +72,26 @@
 //! dispatch is active in the process at a time. `src/radio.rs` and
 //! `src/radio_answer.rs` route through `darkmux acp`, an async (tokio)
 //! daemon that tracks dispatches `in_flight` per session and can plausibly
-//! run more than one concurrently in the same process; wiring them through
-//! here without first solving that aggregation problem risks a NEW
-//! lease-clobber hazard (two concurrent same-process reconciles racing to
-//! overwrite each other's lease content) that is worse than today's silent
-//! gap. Deferred, named explicitly rather than silently dropped — see the
-//! PR body for the follow-up issue.
+//! run more than one concurrently in the same process.
+//!
+//! **Correction (#2628 CONSIDER 7):** wiring them through here would NOT
+//! be introducing a new hazard from scratch — that same `darkmux acp`
+//! process already has a concurrent lease writer today.
+//! `src/acp_panel.rs`'s ephemeral-panel dispatch path calls
+//! `crate::scheduler::run_step_graph` in-process, which reaches
+//! `run_local_waves` → the SAME `LeaseGuard::acquire()` + `write_lease`
+//! this module uses. Two concurrent ACP sessions each running an
+//! ephemeral panel dispatch already race to overwrite and delete each
+//! other's lease content, independent of anything in this module. Wiring
+//! `radio.rs`/`radio_answer.rs` through `dispatch_reconciled` without
+//! first solving the same-process-aggregation problem would add a
+//! SECOND INSTANCE of that EXISTING hazard, not a new class of one — but
+//! a second instance is still worth deferring rather than compounding
+//! silently. Filed as its own issue rather than left as an inference:
+//! see [#2651](https://github.com/kstrat2001/darkmux/issues/2651)
+//! (read-not-executed — a code-reading finding, not yet reproduced with
+//! a live race). Deferred here, named explicitly rather than silently
+//! dropped — see the PR body for this follow-up issue too.
 //!
 //! # What this does not change
 //!
@@ -299,6 +313,18 @@ mod tests {
     /// `ensure_wave_loaded` call (i.e. reverting to the pre-#2628 raw
     /// `local_dispatch(opts)` short-circuit) makes this fail: the orphan
     /// is never evicted and the assertion on `host.ops` mismatches.
+    ///
+    /// **Ordering is asserted, not just presence (#2628 MUST FIX 3).**
+    /// `dispatched == 1` and the final `ops` vector are both
+    /// order-insensitive: a regression that ran `local_dispatch(opts)`
+    /// BEFORE `ensure_wave_loaded(...)` would produce the identical final
+    /// state (same dispatch count, same eventual ops) while actually
+    /// dispatching against un-reconciled residency. The
+    /// `ops_at_dispatch_time` snapshot, taken from INSIDE the injected
+    /// `local_dispatch` closure, catches exactly that reordering — proven
+    /// by swapping the two statements in `dispatch_reconciled_with` and
+    /// observing this test fail (`left: []`, no reconcile ops yet present
+    /// when the dispatch closure ran).
     #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_evicts_a_darkmux_owned_orphan_before_dispatching() {
@@ -309,11 +335,26 @@ mod tests {
         let factory = host_factory_over(host.clone());
         let dispatched = Arc::new(AtomicUsize::new(0));
         let dispatched_clone = dispatched.clone();
+        // (#2628 MUST FIX 3) Snapshot the host's ops AT THE MOMENT
+        // `local_dispatch` is called, not after the whole function
+        // returns. `dispatched == 1` and the final `ops` vector are both
+        // ORDER-INSENSITIVE — swapping `ensure_wave_loaded(...)` and
+        // `local_dispatch(opts)` in `dispatch_reconciled_with` produces
+        // the identical final state (one dispatch call, one reconcile,
+        // same ops vector) even though the dispatch would then run
+        // against UN-reconciled residency. This closure captures the
+        // host's op log as of its own invocation, so a reordering is
+        // caught here even though the end-state assertions below cannot
+        // see it.
+        let host_for_snapshot = host.clone();
+        let ops_at_dispatch_time = Arc::new(Mutex::new(Vec::new()));
+        let ops_at_dispatch_time_clone = ops_at_dispatch_time.clone();
 
         let result = dispatch_reconciled_with(
             test_opts("coder"),
             SeatClaim::LocalModel(placement("m", 8_000)),
             move |opts| {
+                *ops_at_dispatch_time_clone.lock().unwrap() = host_for_snapshot.lock().unwrap().ops.clone();
                 dispatched_clone.fetch_add(1, Ordering::SeqCst);
                 Ok(DispatchResult {
                     exit_code: 0,
@@ -329,6 +370,18 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(dispatched.load(Ordering::SeqCst), 1, "local_dispatch ran exactly once");
+
+        // The reconcile ops must already be present WHEN `local_dispatch`
+        // fires — proving the ORDER, not just that both eventually ran.
+        assert_eq!(
+            *ops_at_dispatch_time.lock().unwrap(),
+            vec![
+                HostOp::ListResident,
+                HostOp::Unload { identifier: "darkmux:orphan".to_string() },
+                HostOp::Load { model_key: "m".to_string(), identifier: "darkmux:m".to_string(), min_ctx: 8_000 },
+            ],
+            "reconcile must complete BEFORE local_dispatch runs, not merely before this function returns"
+        );
 
         let ops = host.lock().unwrap().ops.clone();
         assert_eq!(
@@ -352,6 +405,17 @@ mod tests {
     /// bare identifier would make this fail — the foreign model would be
     /// evicted as an "orphan," which is exactly the namespace-bypass shape
     /// #1609 already closed and #1274 declared ABSOLUTE.
+    ///
+    /// **Near-miss fixture (#2628 CONSIDER 5).** `"not-darkmux:m"` sits
+    /// right at the boundary: it CONTAINS the `darkmux:` namespace string
+    /// but does not START WITH it. A crude widening of `is_darkmux_owned`
+    /// from `starts_with(DARKMUX_NAMESPACE)` to
+    /// `.contains(DARKMUX_NAMESPACE)` would misclassify this resident as
+    /// darkmux-owned and evict it — `foreign-model` alone doesn't contain
+    /// the namespace string at all, so that mutation would slip past it.
+    /// This makes the test self-sufficient rather than relying on
+    /// `darkmux-gestalt`'s own `is_darkmux_owned_detects_namespace` to
+    /// catch that class upstream.
     #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_never_unloads_a_non_namespaced_user_owned_resident() {
@@ -362,6 +426,9 @@ mod tests {
                 // this is what a hand-loaded, operator-owned resident looks
                 // like in `lms ps`.
                 .resident("foreign-model", "foreign-model", 32_000, Some(1_000))
+                // Near-miss: contains the namespace string but doesn't
+                // START WITH it — see the doc above.
+                .resident("not-darkmux:m", "not-darkmux:m", 32_000, Some(1_000))
                 .cataloged("m", 1_000),
         ));
         let factory = host_factory_over(host.clone());
@@ -386,7 +453,7 @@ mod tests {
         let locked = host.lock().unwrap();
         assert!(
             !locked.ops.iter().any(|op| matches!(op, HostOp::Unload { .. })),
-            "the foreign, non-namespaced resident must never be unloaded: {:?}",
+            "neither non-namespaced resident (foreign-model, not-darkmux:m) may ever be unloaded: {:?}",
             locked.ops
         );
         assert!(
@@ -395,11 +462,16 @@ mod tests {
             locked.residents
         );
         assert!(
+            locked.residents.iter().any(|r| r.identifier == "not-darkmux:m"),
+            "the near-miss resident must still be present afterward: {:?}",
+            locked.residents
+        );
+        assert!(
             locked.ops.iter().any(|op| matches!(
                 op,
                 HostOp::Load { identifier, .. } if identifier == "darkmux:m"
             )),
-            "darkmux still loads its OWN namespaced copy alongside the untouched foreign one: {:?}",
+            "darkmux still loads its OWN namespaced copy alongside the untouched foreign ones: {:?}",
             locked.ops
         );
     }
@@ -470,8 +542,17 @@ mod tests {
     /// substitute — proving `dispatch_reconciled` reached all the way
     /// through resolution into `dispatch_reconciled_with` rather than
     /// erroring out earlier.
+    #[serial_test::serial]
     #[test]
     fn dispatch_reconciled_production_entry_point_resolves_and_falls_through_for_an_unknown_role() {
+        // (#2638 audit) `dispatch_reconciled` -> `resolve_local_seat` reads
+        // `DARKMUX_HOME` (+ the `DARKMUX_CREW_DIR`/`DARKMUX_PROFILES`
+        // overrides it derives from) through the same chokepoints its
+        // sibling tests below guard with `LeaseTestEnv` + `#[serial]` — this
+        // test called the real production entry point unguarded, so it
+        // could observe a sibling test's tempdir mid-flight, or the
+        // operator's real `~/.darkmux` on a machine with none of those set.
+        let _env = LeaseTestEnv::new();
         let opts = test_opts("this-role-does-not-exist-2628");
         let result = dispatch_reconciled(opts);
         // `crate::dispatch::dispatch` (the real primitive) is what actually
@@ -483,5 +564,90 @@ mod tests {
         let err = result.expect_err("an unknown role fails at the raw dispatch primitive, not before it");
         let msg = format!("{err:#}");
         assert!(msg.contains("this-role-does-not-exist-2628"), "{msg}");
+    }
+
+    /// Mirrors `residency_lease::residency_dir()`'s private path
+    /// construction (`<DARKMUX_HOME>/residency/<pid>.lease`) so a test in
+    /// THIS crate can assert on the lease file's existence without a new
+    /// public accessor in `darkmux-types`. `DARKMUX_HOME` under
+    /// `LeaseTestEnv` is always an absolute tempdir path, so no tilde
+    /// expansion is needed here.
+    fn lease_file_path(env: &LeaseTestEnv, pid: u32) -> std::path::PathBuf {
+        env._tmp.path().join("residency").join(format!("{pid}.lease"))
+    }
+
+    /// **CONSIDER 4 (#2628): the lease guard's existence is asserted, not
+    /// just its absence of a compile warning.** Deleting `let _lease_guard
+    /// = residency_lease::LeaseGuard::acquire();` from
+    /// `dispatch_reconciled_with`'s `LocalModel` arm leaves every other
+    /// test in this module green — clippy's unused-import lint is the
+    /// ONLY thing that would catch it today, and only if the import isn't
+    /// used elsewhere. This test asserts the lease file for THIS process
+    /// actually exists while the guard is conceptually held (via a
+    /// `local_dispatch` that checks mid-call) and is gone once
+    /// `dispatch_reconciled_with` returns normally.
+    #[serial_test::serial]
+    #[test]
+    fn dispatch_reconciled_holds_and_releases_the_lease_on_normal_return() {
+        let env = LeaseTestEnv::new();
+        let pid = std::process::id();
+        let path = lease_file_path(&env, pid);
+        assert!(!path.exists(), "no lease file before the call: {path:?}");
+
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("m", 1_000)));
+        let factory = host_factory_over(host.clone());
+        let path_for_closure = path.clone();
+
+        let result = dispatch_reconciled_with(
+            test_opts("coder"),
+            SeatClaim::LocalModel(placement("m", 8_000)),
+            move |opts| {
+                // Mid-call: the lease guard is held and `write_lease` has
+                // already run as part of `ensure_wave_loaded` — the file
+                // must exist right now, not just "eventually."
+                assert!(path_for_closure.exists(), "lease file must exist while the guard is held: {path_for_closure:?}");
+                Ok(DispatchResult {
+                    exit_code: 0,
+                    stdout: format!("dispatched {}", opts.role_id),
+                    stderr: String::new(),
+                    session_id: String::new(),
+                    out_dir: None,
+                })
+            },
+            factory.as_ref(),
+        )
+        .expect("reconcile + dispatch succeeds");
+        assert_eq!(result.exit_code, 0);
+
+        assert!(!path.exists(), "lease file must be gone after a normal return: {path:?}");
+    }
+
+    /// **CONSIDER 4, panic-unwind half.** A `local_dispatch` that panics
+    /// mid-call must still release the lease — `LeaseGuard::drop` runs on
+    /// unwind, same as a normal return. Given three panic-path lease/lock
+    /// leaks found in this repo this same week, this is asserted directly
+    /// rather than assumed from `Drop`'s general contract.
+    #[serial_test::serial]
+    #[test]
+    fn dispatch_reconciled_releases_the_lease_on_a_panicking_dispatch() {
+        let env = LeaseTestEnv::new();
+        let pid = std::process::id();
+        let path = lease_file_path(&env, pid);
+        assert!(!path.exists(), "no lease file before the call: {path:?}");
+
+        let host = Arc::new(Mutex::new(MockHost::new().cataloged("m", 1_000)));
+        let factory = host_factory_over(host.clone());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_reconciled_with(
+                test_opts("coder"),
+                SeatClaim::LocalModel(placement("m", 8_000)),
+                |_opts| panic!("W18A-CONSIDER-4: simulated dispatch panic"),
+                factory.as_ref(),
+            )
+        }));
+        assert!(outcome.is_err(), "the injected local_dispatch panic must propagate, not be swallowed");
+
+        assert!(!path.exists(), "lease file must be released even when local_dispatch panics: {path:?}");
     }
 }

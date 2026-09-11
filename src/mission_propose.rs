@@ -100,8 +100,9 @@ pub fn propose(
 
     // (#2463) `mission propose` dispatches `mission-compiler` (in the loop
     // below, possibly more than once across `Decision::Regenerate` passes)
-    // through `dispatch_compiler` -> `crate::fleet::dispatch_routed` — the
-    // plain `dispatch()` primitive, no signal handling at all. Note this
+    // through `dispatch_compiler` -> `crate::fleet::dispatch_routed_via`
+    // (#2628 — `dispatch_reconciled`, not the raw `dispatch()` primitive) —
+    // no signal handling at all either way. Note this
     // one specifically per the issue: `--start` only calls
     // `mission_launch::launch` (which arms for ITSELF) from
     // `persist_and_maybe_start`, well AFTER this compiler dispatch has
@@ -325,7 +326,17 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
     };
-    let dispatch_result = crate::fleet::dispatch_routed(opts);
+    // (#2628) Standalone (non-wave, non-`StepKind`) dispatch — routed
+    // through `dispatch_routed_via` directly with `dispatch_reconciled`
+    // as the injected `local_dispatch`, rather than through the
+    // `dispatch_routed` thin wrapper (which stays the raw primitive for
+    // `phase_cli`'s already-wave-protected caller — see that wrapper's
+    // doc). Gives this dispatch the same Exclusive-reconcile + #1487
+    // lease protection the CLI verb and mission engine already have.
+    let dispatch_result = crate::fleet::dispatch_routed_via(
+        opts,
+        crate::crew::dispatch_reconciled::dispatch_reconciled,
+    );
 
     let wall_ms = compile_start_instant.elapsed().as_millis() as u64;
     let (success, output_chars) = match &dispatch_result {
