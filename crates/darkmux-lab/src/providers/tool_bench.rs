@@ -67,8 +67,16 @@ pub(crate) struct ToolBenchProvider {
 
 impl ToolBenchProvider {
     /// The registered provider — dispatches for real.
+    ///
+    /// (#2628) `dispatch_reconciled`, not the raw `crew::dispatch::dispatch`
+    /// primitive: this provider's `run()` loop dispatches one task × trial
+    /// at a time, strictly sequentially (no concurrency in this module) —
+    /// the single-writer shape `dispatch_reconciled`'s lease-write contract
+    /// requires. `darkmux lab run` is a standalone harness invocation, not
+    /// a `StepKind`, so it was never wave-protected; this closes the gap
+    /// #1509's own doc named as a follow-up.
     pub(crate) fn production() -> Self {
-        Self { dispatch: Arc::new(darkmux_crew::dispatch::dispatch) }
+        Self { dispatch: Arc::new(darkmux_crew::dispatch_reconciled::dispatch_reconciled) }
     }
     /// A provider whose dispatch is `f`. Test-only in practice; lets a test
     /// drive `run()` end-to-end and inspect the `DispatchOpts` it actually

@@ -529,7 +529,21 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 /// with no capacity, or — once #1243 is wired — a single profile that
 /// exceeds the WHOLE budget) is never retried: no wait changes what
 /// `plan_acquire` already refused to plan.
-fn ensure_wave_loaded(
+///
+/// `pub(crate)` (#2628): [`crate::dispatch_reconciled`] calls this directly
+/// for a single-placement "wave" of one, giving a standalone (non-graph,
+/// non-wave) dispatch the SAME Exclusive-reconcile + lease-write regime a
+/// mission/coder-phase/review step gets via [`run_local_waves`] — without
+/// pulling in the wave-batch executor's own multi-placement machinery it
+/// doesn't need. Safe ONLY for callers that are never one placement among
+/// several CONCURRENT wave siblings: a caller whose seat is already
+/// resolved via `resolve_local_seat` (i.e. is itself a `StepKind`) must
+/// NEVER also call this — its residency is already reconciled by the wave
+/// that placed it, and a second independent single-placement reconcile
+/// here would see its concurrent siblings' models as "not desired" and
+/// evict them. See `dispatch_reconciled`'s own module doc for the full
+/// list of which callers this is and is not safe for.
+pub(crate) fn ensure_wave_loaded(
     placements: &[Placement],
     est: &(dyn FootprintEstimator + Sync),
     host: &mut dyn ModelHost,

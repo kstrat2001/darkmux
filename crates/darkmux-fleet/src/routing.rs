@@ -411,16 +411,21 @@ pub fn build_work_job(
 
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
-/// Route a dispatch local-vs-remote, then run it locally via the raw
-/// `crew::dispatch::dispatch` primitive — the pre-#1509 behavior, and still
-/// what every caller other than the `darkmux dispatch` CLI verb wants
-/// (`phase_cli`'s QA-gate dispatch, `mission_propose`, `notebook` — #1509's
-/// scope is the CLI verb only; those three are a named follow-up, see
-/// `dispatch_as_crew_of_one`'s module doc). Thin wrapper over
-/// [`dispatch_routed_via`]; see that function's doc for the full routing
-/// contract.
+/// Route a dispatch local-vs-remote, then run it locally via
+/// `darkmux_crew::dispatch_reconciled::dispatch_reconciled` — every caller
+/// other than the `darkmux dispatch` CLI verb (`mission_propose`,
+/// `notebook`). #1509's own doc named this gap a follow-up; #2628 filed
+/// and closed it: `dispatch_reconciled` resolves this dispatch's own seat
+/// and, when it's a local model, reconciles residency (Exclusive
+/// `plan_acquire` + a #1487 lease) to that one placement before running
+/// the raw primitive — see that module's own doc for the full contract and
+/// for which named call sites were deliberately left out of this wrapper
+/// (`phase_cli`'s QA-gate dispatch is reached only from an already-wave-
+/// protected `StepKind` and never calls `dispatch_routed` standalone).
+/// Thin wrapper over [`dispatch_routed_via`]; see that function's doc for
+/// the full routing contract.
 pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
-    dispatch_routed_via(opts, dispatch::dispatch)
+    dispatch_routed_via(opts, darkmux_crew::dispatch_reconciled::dispatch_reconciled)
 }
 
 /// Route a dispatch local-vs-remote, then run it. When `--machine` is set
