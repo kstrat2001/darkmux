@@ -36,7 +36,8 @@
       "max_pause_ms": 900000,
       "min_cpu_speed_limit_pct": 50,
       "speed_limit_hold_samples": 3
-    }
+    },
+    "liveness_retention_hours": 168
   },
   "fleet": {
     "mode": "standalone"

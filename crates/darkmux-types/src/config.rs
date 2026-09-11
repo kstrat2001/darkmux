@@ -493,6 +493,17 @@ pub struct RuntimeBehaviorConfig {
     /// (#2110/#2109) The thermal governor + breaker's tuning block. See
     /// [`ThermalConfig`]'s own doc for the pause/resume/breaker semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub thermal: Option<ThermalConfig>,
+    /// (#2653) Retention window, in hours, for
+    /// `<darkmux-home>/liveness/<pid>.log` per-dispatch heartbeat files
+    /// (`darkmux_types::dispatch_liveness`) — a file older than this is
+    /// pruned the next time any dispatch writes a marker. Absent = the
+    /// module's own built-in default (168h / 7 days). This field exists for
+    /// OPERATOR VISIBILITY and for `darkmux doctor`'s resolved-value row
+    /// (`config_access::liveness_retention_hours`); `dispatch_liveness`
+    /// itself deliberately does NOT resolve through `config_access` (see
+    /// that module's doc — it must work before config/Redis/audit/flow are
+    /// touched), so it does its own minimal raw peek at this same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub liveness_retention_hours: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1107,6 +1118,9 @@ impl DarkmuxConfig {
                     speed_limit_hold_samples: Some(3),
                     extras: Default::default(),
                 }),
+                // (#2653) Visible `168` (7 days) — the built-in default,
+                // discoverable and one edit from a tighter/looser window.
+                liveness_retention_hours: Some(168),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {

@@ -170,6 +170,7 @@ pub fn run() -> DoctorReport {
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
         check_host_sampler(),
+        check_liveness_retention(),
         check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
@@ -2782,6 +2783,59 @@ fn check_host_sampler_interval() -> Check {
 /// a healthy install as faulty. The file-based lock could only ever show
 /// ONE current holder either way, so the marker never actually proved a
 /// second emitter was active; deleting the channel loses no real signal.
+/// (#2653) Surface `<darkmux-home>/liveness/`'s current heartbeat-file count
+/// and the retention window pruning it. The growth this reports on (10,249
+/// files, 40 MB on one laptop, oldest two months old) was invisible until an
+/// operator went and looked by hand; this makes it visible from `darkmux
+/// doctor` without leaving the machine. Counts only `<pid>.log` files (the
+/// `host-sampler.lock` file living in the same directory is a different
+/// mechanism, see `check_host_sampler` below, and is never counted here).
+fn check_liveness_retention() -> Check {
+    let name = "liveness retention";
+    let env_raw = std::env::var("DARKMUX_LIVENESS_RETENTION_HOURS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let env_parses = env_raw.as_deref().is_some_and(|s| s.trim().parse::<u64>().is_ok());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.liveness_retention_hours)
+        .is_some();
+    let provenance = if env_parses {
+        "from DARKMUX_LIVENESS_RETENTION_HOURS env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let hours = darkmux_types::config_access::liveness_retention_hours();
+    let dir = darkmux_types::config_access::liveness_dir();
+    let count = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let p = e.path();
+                    p.extension().and_then(|x| x.to_str()) == Some("log")
+                        && p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|s| s.parse::<u32>().is_ok())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{count} heartbeat file(s) in {} — retention {hours}h / {:.1}d ({provenance}); \
+             pruned automatically as new dispatches write markers",
+            dir.display(),
+            hours as f64 / 24.0
+        ),
+        hint: None,
+    }
+}
+
 fn check_host_sampler() -> Check {
     let name = "host sampler";
     let now_ms = darkmux_crew::host_sampler_lock::epoch_ms_now();
@@ -7843,6 +7897,55 @@ mod tests {
             "names the schema version it was retired in: {}",
             check.message
         );
+    }
+
+    // ─── (#2653) check_liveness_retention ───
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_reports_default_window_and_zero_files() {
+        with_isolated_liveness_dir(|| {
+            let check = check_liveness_retention();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains("0 heartbeat file"), "{}", check.message);
+            assert!(check.message.contains("168h"), "{}", check.message);
+            assert!(check.message.contains("(default)"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_counts_only_pid_named_log_files() {
+        with_isolated_liveness_dir(|| {
+            let dir = darkmux_types::config_access::liveness_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("123.log"), "hi").unwrap();
+            std::fs::write(dir.join("456.log"), "hi").unwrap();
+            // Neither counted: not a pid name, and not a `.log` file.
+            std::fs::write(dir.join("not-a-pid.log"), "hi").unwrap();
+            std::fs::write(dir.join("host-sampler.lock"), "{}").unwrap();
+            let check = check_liveness_retention();
+            assert!(check.message.contains("2 heartbeat file"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_env_override_shows_in_provenance() {
+        with_isolated_liveness_dir(|| {
+            let k = "DARKMUX_LIVENESS_RETENTION_HOURS";
+            let prev = std::env::var(k).ok();
+            unsafe { std::env::set_var(k, "24") };
+            let check = check_liveness_retention();
+            assert!(check.message.contains("24h"), "{}", check.message);
+            assert!(check.message.contains("DARKMUX_LIVENESS_RETENTION_HOURS env"), "{}", check.message);
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        });
     }
 
     // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───

@@ -803,6 +803,21 @@ pub fn acp_idle_exit_minutes() -> u64 {
     pick_parsed("DARKMUX_ACP_IDLE_EXIT_MINUTES", cfg, Some(30)).unwrap()
 }
 
+// ── Liveness heartbeat retention (#2653) ──
+/// Retention window, in hours, for `<darkmux-home>/liveness/<pid>.log`
+/// per-dispatch heartbeat files (`darkmux_types::dispatch_liveness`) — a
+/// file older than this is pruned the next time any dispatch writes a
+/// marker. Resolves `env(DARKMUX_LIVENESS_RETENTION_HOURS) >
+/// config.runtime.liveness_retention_hours > 168` (7 days). This is the
+/// doctor-facing / operator-visible reader; `dispatch_liveness`'s own prune
+/// pass resolves the SAME precedence through its own minimal raw peek
+/// rather than calling this function — see that module's doc for why (it
+/// must work before config/Redis/audit/flow are touched).
+pub fn liveness_retention_hours() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.liveness_retention_hours);
+    pick_parsed("DARKMUX_LIVENESS_RETENTION_HOURS", cfg, Some(168)).unwrap()
+}
+
 // ── Role -> profile map (#1475 packet 1) ──
 /// (#1475 packet 1) Normalize a raw role->profile map: trim BOTH the role key
 /// AND the profile value, and drop any binding whose profile is blank (a
@@ -2201,6 +2216,29 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(turn_delay_ms(), 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── liveness_retention_hours (#2653): env > config > 168 default,
+    //    mirroring turn_delay_ms's resolution exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn liveness_retention_hours_env_overrides_then_default() {
+        let k = "DARKMUX_LIVENESS_RETENTION_HOURS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + the empty test config (#811) → the built-in 168h default.
+        assert_eq!(liveness_retention_hours(), 168);
+        unsafe { std::env::set_var(k, "24") };
+        assert_eq!(liveness_retention_hours(), 24, "env wins live");
+        // An unparseable env value falls through (here, to the default).
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(liveness_retention_hours(), 168);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
