@@ -202,12 +202,17 @@ fn should_emit_edges(first_tick: bool, recovered_this_tick: bool) -> bool {
 /// from the beat (the session's machine, not the local observer) to suppress
 /// the write-time auto-stamp. `handle` carries the role for the viewer.
 ///
-/// A `session.end` is the close-edge for the **abandoned** case (host process
-/// killed mid-run — no clean `dispatch.complete`). A cleanly-completed session
-/// pre-claims `session-end:<sid>` in `SessionEmitter::stop` to SUPPRESS this
-/// edge, keeping its `dispatch.complete` as the sole close. So in practice
-/// `session.end` marks the crash/kill/timeout interval-close that playback
-/// would otherwise have no bracket for.
+/// A `session.end` is the close-edge for the **abandoned** case: the host
+/// process died before `SessionEmitter` could run its teardown at all
+/// (killed, OOM, `panic = "abort"`) — no clean terminal record and no
+/// pre-claim. A session whose emitter DID run its teardown — a clean
+/// `stop()`, or (#2344) `Drop` catching an early `?`-return or a caught
+/// panic the process survived — pre-claims `session-end:<sid>` (both paths
+/// share `SessionEmitter::remove_presence_key`) to SUPPRESS this edge,
+/// keeping its own `dispatch.complete`/`dispatch.error` as the sole close.
+/// So in practice `session.end` marks only the process-level-abandonment
+/// interval-close that playback would otherwise have no bracket for at all
+/// — not merely "this dispatch errored".
 fn build_session_end_record(beat: &SessionBeat) -> FlowRecord {
     FlowRecord {
         ts: crate::ts_utc_now(),
@@ -255,10 +260,12 @@ pub fn emit_machine_online_edge() {
 /// started are not "appearances" — machine `online` is self-emitted by the
 /// machine's own daemon, and a session's open-edge is its `dispatch.start`, so
 /// we never emit appearances here). From the next tick on, any id that vanished
-/// is a close-edge, recorded once across the fleet via [`claim_edge`]. A
-/// cleanly-completed session pre-claims its `session-end` in
-/// `SessionEmitter::stop`, so only abandoned (crash/kill/timeout) sessions —
-/// the ones playback has no close bracket for otherwise — get a `session.end`.
+/// is a close-edge, recorded once across the fleet via [`claim_edge`]. Any
+/// session whose emitter reached its teardown (a clean `stop()`, or (#2344)
+/// `Drop` catching an early return / a caught panic) pre-claims its
+/// `session-end`, so only sessions where the whole host process died before
+/// teardown could run — the ones playback has no close bracket for
+/// otherwise — get a `session.end`.
 pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5). `RawRedisUrl`
     // moves into the thread; `expose_for_probe()` at the client open below.
@@ -386,11 +393,14 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                     if gone.machine_uid.is_none() {
                                         continue;
                                     }
-                                    // A cleanly-completed session pre-claimed this
-                                    // in SessionEmitter::stop, so the claim loses
-                                    // here and no redundant edge is recorded; an
-                                    // abandoned (crash/kill) session has no
-                                    // pre-claim, so this wins and records the close.
+                                    // A session that reached its own teardown —
+                                    // clean `stop()`, or (#2344) `SessionEmitter::
+                                    // drop` catching an early return or a caught
+                                    // panic — pre-claimed this, so the claim loses
+                                    // here and no redundant edge is recorded; only
+                                    // a session whose whole host process died
+                                    // before Drop could run has no pre-claim, so
+                                    // this wins and records the close.
                                     if claim_edge(&client, "session-end", &gone.session_id) {
                                         // (#902) Release the claim on a failed
                                         // record write so it doesn't suppress a

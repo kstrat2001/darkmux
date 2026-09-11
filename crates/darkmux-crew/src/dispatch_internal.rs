@@ -3257,8 +3257,10 @@ fn dispatch_remote(
     // whole hosted arm of `darkmux dispatch` and of every fleet-queue job
     // read as "not running" on the live fleet view the entire time it WAS.
     // Self-disables when Redis is unset. Stopped explicitly before each
-    // terminal record below; `SessionEmitter::drop` halts the beat thread
-    // for a `?`/panic in between and the presence TTL ages the key out.
+    // terminal record below; for a `?`/panic in between, `SessionEmitter::drop`
+    // (#2344) now removes the presence key itself (pre-claim + DEL), the same
+    // teardown `stop()` runs, instead of only halting the beat thread and
+    // leaving the TTL to age the key out.
     let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
         session_id.clone(),
         Some(opts.role_id.clone()),
@@ -5237,9 +5239,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // killed / watchdog-timed-out dispatch (which never emits a clean
     // dispatch.complete) ages out of the live set instead of showing
     // "running" forever. Self-disables when DARKMUX_REDIS_URL is unset. The
-    // TTL is the crash backstop; `stop()` after the container exits DELetes
-    // the key for an instant drop on the clean path. Held to end-of-fn; an
-    // early `?`-return drops it, halting the thread (key then TTLs out).
+    // TTL is the backstop only for the one exit this can't observe (the
+    // whole host process dying before Drop can run); `stop()` after the
+    // container exits DELetes the key for an instant drop on the clean path.
+    // Held to end-of-fn; an early `?`-return drops it, and `SessionEmitter::
+    // drop` (#2344) now removes the key itself the same way `stop()` does,
+    // rather than only halting the thread and leaving the TTL to age it out.
     let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
         session_id.clone(),
         Some(opts.role_id.clone()),

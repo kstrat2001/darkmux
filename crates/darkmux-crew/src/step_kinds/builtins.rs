@@ -1061,8 +1061,10 @@ impl DispatchSingleShotStepKind {
         // wall-clock; without a beat none of it was visible on the live
         // fleet view, because bookends are terminal-only records. Stopped
         // explicitly once the call returns and before the terminal record
-        // below; `SessionEmitter::drop` halts the beat thread for a
-        // `?`/panic in between and the presence TTL ages the key out.
+        // below; for a `?`/panic in between, `SessionEmitter::drop` (#2344)
+        // now removes the presence key itself, the same DEL `stop()` issues,
+        // instead of only halting the beat thread and leaving the TTL to
+        // age the key out.
         //
         // See `DispatchMapStepKind::run_map`'s own spawn site for why the
         // key is TASK-scoped here rather than step-scoped.
@@ -1900,11 +1902,11 @@ impl DispatchMapStepKind {
         // every record on this path uses (`session_id::task`), so a beat and
         // its bookends key on the identical session. Stopped explicitly right
         // after the loop (below) on the clean path; `SessionEmitter::drop`
-        // is the backstop for a `?`/panic in between — same discipline
-        // `dispatch_internal`'s `session_emitter` uses, and it never DELetes
-        // the key itself (only halts the refresh thread), so a beat that
-        // wasn't explicitly stopped ages out via the presence TTL instead of
-        // lingering as "running" forever.
+        // (#2344) is the backstop for a `?`/panic in between — same
+        // discipline `dispatch_internal`'s `session_emitter` uses, and it now
+        // removes the key itself (pre-claim + DEL), the same teardown
+        // `stop()` runs, rather than only halting the refresh thread and
+        // leaving the TTL to age the beat out.
         //
         // WHY TASK-SCOPED, not step-scoped (fresh-review finding). The key
         // has to be the one the RECORDS use, because the live view joins the
@@ -1915,8 +1917,10 @@ impl DispatchMapStepKind {
         // only `dispatch.internal`, a solo dispatch, is step-scoped). A beat
         // keyed on the step would be presence for a session no record names.
         //
-        // The known cost, named rather than left to be rediscovered: a clean
-        // `stop()` pre-claims `edge-claim:session-end:<task-sid>` for
+        // The known cost, named rather than left to be rediscovered: ANY
+        // teardown that reaches `remove_presence_key` — a clean `stop()`, or
+        // (#2344) `SessionEmitter::drop` catching an early return or a caught
+        // panic — pre-claims `edge-claim:session-end:<task-sid>` for
         // `EDGE_CLAIM_TTL_SECS` (60s), so a LATER model-bearing step in the
         // SAME task that is abandoned inside that window loses the claim and
         // the presence reconciler skips its `session.end` edge — playback
@@ -2026,7 +2030,8 @@ impl DispatchMapStepKind {
         // at its own stop site. `stop()` joins the beat thread and DELetes
         // the key for an instant drop on the live view instead of waiting
         // out the TTL; a `?`/panic earlier in this function never reaches
-        // here and relies on `SessionEmitter::drop`'s TTL backstop instead.
+        // here, but `SessionEmitter::drop` (#2344) removes the key itself
+        // the same way on the way out, rather than only relying on the TTL.
         if let Some(em) = session_emitter {
             em.stop();
         }

@@ -3923,6 +3923,53 @@ mod tests {
         assert_eq!(idx["sess-2"].terminal_status, Some(RunStatus::Abandoned));
     }
 
+    /// (#2344 review, CONSIDER 4) A REDUNDANT `session.end` arriving after a
+    /// dispatch's own `dispatch.error` must not flip `terminal_status` to
+    /// `Abandoned`. This is the exact record shape `SessionEmitter`'s
+    /// pre-claim exists to make rare (a Redis outage spanning the claim's
+    /// 60s TTL can still let one through — the "benign edge" noted on
+    /// `remove_presence_key`'s own doc) — so the schema decision not to
+    /// bump `FLOW_SCHEMA_VERSION` over #2344 rests on this: even when both
+    /// records exist for the same session, `terminal_status_for_action`'s
+    /// "keep the FIRST terminal seen" (file/write order, not a timestamp
+    /// sort) already resolves to the dispatch's own terminal, because
+    /// `session.end` can only ever be written AFTER the reconciler notices
+    /// the presence key gone — strictly later than the terminal that caused
+    /// its removal.
+    #[test]
+    fn build_flow_session_index_dispatch_error_wins_over_a_later_redundant_session_end() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T10:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "sess-3",
+                    "handle": "coder",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T10:00:05Z",
+                    "action": "dispatch error",
+                    "session_id": "sess-3",
+                    "handle": "coder",
+                }),
+                // Arrives strictly later (the reconciler's ~7s tick after
+                // the presence key's TTL lapses) and would, before #2344,
+                // have been the ONLY close-edge for a panicked/early-
+                // returning dispatch. Still must not win.
+                serde_json::json!({
+                    "ts": "2026-07-24T10:00:20Z",
+                    "action": "session.end",
+                    "session_id": "sess-3",
+                }),
+            ],
+        );
+        let idx = build_flow_session_index(tmp.path(), &[]);
+        assert_eq!(idx["sess-3"].terminal_status, Some(RunStatus::Error));
+    }
+
     #[test]
     fn build_flow_session_index_never_indexes_a_session_from_beyond_the_scan_window() {
         // (#1523 gate scale-cap) 2000-01-01 is always more than
