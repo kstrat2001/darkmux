@@ -19298,5 +19298,223 @@
     "_type": "schema",
     "version": "1.18.0",
     "darkmux_version": "2.5.0"
+  },
+  {
+    "ts": "2026-08-08T02:09:59Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.start",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "crew_dispatch",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "runtime": "internal",
+      "image": "darkmux-runtime:latest"
+    }
+  },
+  {
+    "ts": "2026-08-08T02:10:00Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "turn_seq": 1,
+      "prompt_tokens": 1000,
+      "completion_tokens": 0,
+      "total_tokens": 1000
+    }
+  },
+  {
+    "ts": "2026-08-08T02:10:01Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "turn_seq": 2,
+      "prompt_tokens": 50,
+      "completion_tokens": 0,
+      "total_tokens": 50
+    }
+  },
+  {
+    "ts": "2026-08-08T02:10:02Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "turn_seq": 3,
+      "prompt_tokens": 60,
+      "completion_tokens": 0,
+      "total_tokens": 60
+    }
+  },
+  {
+    "ts": "2026-08-08T02:10:03Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.complete",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "crew_dispatch",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "runtime": "internal",
+      "wall_ms": 4000,
+      "exit_code": 0,
+      "result_class": "ok",
+      "total_turns": 3,
+      "total_tools": 0,
+      "total_compactions": 0,
+      "prompt_tokens": 1110,
+      "completion_tokens": 0,
+      "total_tokens": 1110
+    }
+  },
+  {
+    "ts": "2026-08-08T02:14:59Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.start",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "crew_dispatch",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "runtime": "internal",
+      "image": "darkmux-runtime:latest"
+    }
+  },
+  {
+    "ts": "2026-08-08T02:15:00Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "turn_seq": 1,
+      "prompt_tokens": 2000,
+      "completion_tokens": 0,
+      "total_tokens": 2000
+    }
+  },
+  {
+    "ts": "2026-08-08T02:15:01Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "turn_seq": 2,
+      "prompt_tokens": 80,
+      "completion_tokens": 0,
+      "total_tokens": 80
+    }
+  },
+  {
+    "ts": "2026-08-08T02:15:02Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "turn_seq": 3,
+      "prompt_tokens": 90,
+      "completion_tokens": 0,
+      "total_tokens": 90
+    }
+  },
+  {
+    "ts": "2026-08-08T02:15:03Z",
+    "level": "info",
+    "category": "work",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "dispatch.complete",
+    "handle": "coder",
+    "session_id": "mission-run-w20c-repro-p1",
+    "source": "crew_dispatch",
+    "model": "qwen3.6-35b-a3b-turboquant-mlx",
+    "mission_id": "w20c-repro",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "payload": {
+      "runtime": "internal",
+      "wall_ms": 4000,
+      "exit_code": 0,
+      "result_class": "ok",
+      "total_turns": 3,
+      "total_tools": 0,
+      "total_compactions": 0,
+      "prompt_tokens": 2170,
+      "completion_tokens": 0,
+      "total_tokens": 2170
+    }
   }
 ]

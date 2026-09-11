@@ -75,8 +75,10 @@ interface TokenPayload {
 
 /** A `sess`-grouped turn, carrying the record's own `ts` alongside its
  * payload — needed to sort turns chronologically (#1856) rather than by
- * `turn_seq` alone, which a session id spanning multiple pipeline stages
- * (worktree → coder → verify) restarts at 1 per stage. */
+ * `turn_seq` alone, which restarts at 1 on every dispatch — including a
+ * RE-LAUNCH of the same mission phase under the same deterministic
+ * `mission_run` session id (see the sort comment below for the corrected
+ * mechanism). */
 interface SessTurn extends TokenPayload {
   ts: string;
 }
@@ -222,26 +224,67 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
     if (recs.every((p) => p.turn_seq != null)) {
       // (#1856) Sort by TIME, turn_seq only as a tiebreak — not the reverse.
-      // A session id can legitimately span multiple pipeline stages
-      // (worktree → coder → verify all dispatch under the SAME mission-run
-      // session id) and each stage's own turn counter restarts at 1, so
-      // sorting by `turn_seq` alone interleaves chronologically unrelated
-      // turns from different stages: turn_seq=1 from stage 2 sorts next to
-      // turn_seq=1 from stage 1 even though they may be minutes apart, and
-      // the overlap estimator below then compares prompt sizes across a
-      // stage boundary where no re-read relationship exists. Sorting by
-      // `ts` groups each stage's turns together (only the ONE true
-      // stage-boundary pair is ever compared, not every same-turn_seq
-      // pair), matching what actually happened. `ts` is second-precision
-      // (`ts_utc_now()`), so same-second turns are common — turn_seq is the
-      // correct tiebreak there (and the fallback for an unparseable `ts`,
-      // via the `Number.isNaN` guard), never the primary key.
+      // `mission_run(mission_id, phase_id)` mints a DETERMINISTIC session id
+      // (`crates/darkmux-types/src/session_id.rs`) — the same phase
+      // re-launched or retried inside the viewer's 24h window reuses the
+      // identical session id, and each launch's own coder dispatch restarts
+      // its turn counter at 1. Sorting by `turn_seq` alone interleaves
+      // chronologically unrelated turns from different launches: turn_seq=1
+      // from a later launch sorts next to turn_seq=1 from an earlier one
+      // even though they may be minutes (or longer) apart, and the overlap
+      // estimator below then compares prompt sizes across a launch boundary
+      // where no re-read relationship exists. Sorting by `ts` groups each
+      // launch's turns together (only the ONE true launch-boundary pair is
+      // ever compared, not every same-turn_seq pair), matching what
+      // actually happened.
+      //
+      // (MUST FIX 2, #1856 fix-pass) The comparator below resolves BOTH
+      // sides to a number BEFORE branching — never mixes a ts-comparison on
+      // one pair with a turn_seq-comparison on another, which is what makes
+      // this a genuine total order. An earlier version of this comparator
+      // branched per-pair ("if both sides parse, compare by ts; else fall
+      // to turn_seq") and was provably intransitive: with a well-timed A, a
+      // corrupt-timestamp B, and a well-timed-but-earlier C, that shape
+      // produced A<B, B<C, and A>C simultaneously — three different sorted
+      // outputs depending on incidental input order. Mapping an unparseable
+      // `ts` to `+Infinity` up front (sorting those turns LAST, never used
+      // to decide an ordering relative to a well-timed turn by anything
+      // other than "is it well-timed") restores a real total order: turns
+      // compare on `(resolvedTs, turn_seq)` lexicographically, always.
+      //
+      // `ts` is second-precision (`ts_utc_now()`), so a same-`ts` tie is
+      // POSSIBLE in principle and turn_seq is the correct tiebreak for it —
+      // but measured across both parity corpora (731 adjacent same-session
+      // token-telemetry pairs, `tests/parity/corpus/flow-{today,yesterday}.json`
+      // + `docs/demo/demo-flow.jsonl`), same-second adjacent turns are ZERO,
+      // not common. The tiebreak stays as a defensive floor (and as the
+      // resolution for the corrupt-timestamp case above), not because ties
+      // are expected in practice.
+      //
+      // (Known-narrower alternative, not adopted here — tracked as
+      // #2665) Grouping turns by `session_id` PLUS `payload.step_id`
+      // (stamped on every per-event flow record a graph-bound dispatch
+      // emits, `crates/darkmux-crew/src/dispatch_internal.rs`'s
+      // `TailerState::step_id` doc) would be exact and immune to clock
+      // resolution for the worktree/coder/verify-in-one-launch shape —
+      // but it does NOT disambiguate two SEPARATE launches of the SAME
+      // step (the actual mechanism above): both stamp the identical
+      // `(session_id, step_id)` pair, so grouping alone can't tell them
+      // apart either. Adopting it would also mean changing the OUTER
+      // `sess` grouping key that `runs`/`cloudRuns`/`unknownRuns` are
+      // derived from too — the exact same shape of problem #2659 already
+      // owns. Filed as #2665 rather than folded in here.
       const turns = recs
         .slice()
         .sort((a, b) => {
           const ta = T(a.ts);
           const tb = T(b.ts);
-          if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb) return ta - tb;
+          const na = Number.isNaN(ta) ? Infinity : ta;
+          const nb = Number.isNaN(tb) ? Infinity : tb;
+          if (na !== nb) return na - nb;
+          // A non-numeric `turn_seq` reaching this point is a pre-existing,
+          // unrelated gap (this branch only runs turn_seq!=null records —
+          // see the `recs.every` guard above); not addressed here.
           return (a.turn_seq as number) - (b.turn_seq as number);
         });
       let rr = 0;
