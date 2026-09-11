@@ -441,7 +441,7 @@ The fix is not a special case for shell steps. It is making the question answera
 
 | Claim | What it means | How it is scheduled |
 |---|---|---|
-| `LocalModel(placement)` | needs this model resident locally | gestalt plans a wave for it; it holds a residency lease so a concurrent darkmux command cannot evict its model mid-generation |
+| `LocalModel(placement)` | needs this model resident locally | gestalt plans a wave for it; it holds a residency lease so a concurrent darkmux command in ANOTHER process cannot evict its model mid-generation (a same-process concurrent dispatch is not yet protected — #2663) |
 | `RemoteEndpoint` | a hosted endpoint | bounded by `remote.concurrent_cap` — consumes no local pool |
 | `NoModel` | dispatches nothing at all | bounded by `runtime.dispatch_free_concurrency` (default 8), and per command by `runtime.step_command_timeout_seconds` |
 | `LocalModelUnresolved { reason }` | meant to be local; the placement would not resolve | runs under the remote cap, exactly as before — but loudly, naming the step and the reason on stderr and in the flow stream |

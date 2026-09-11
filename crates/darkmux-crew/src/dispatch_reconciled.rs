@@ -87,11 +87,21 @@
 //! and [`ensure_wave_loaded`](crate::concurrent_dispatch::ensure_wave_loaded)
 //! (and this module's own call into it, above) both thread their own guard
 //! through explicitly rather than resolving one implicitly by pid — so the
-//! same-process-aggregation hazard this section used to defer on is closed
-//! for every caller of that primitive, this module included. Wiring
-//! `radio.rs`/`radio_answer.rs` through `dispatch_reconciled` is now safe
-//! on THIS specific hazard; it remains its own separate scope decision
-//! (not attempted here) rather than a side effect of the lease fix.
+//! on-disk lease FILE is now correct no matter how many guards this
+//! process holds concurrently: no clobber, no premature deletion, for
+//! every caller of that primitive, this module included. **That is not
+//! the same claim as "concurrent same-process dispatches can no longer
+//! evict each other's model."** `live_leased_models` excludes `own_pid`
+//! by construction (see that function's own doc), so a SIBLING
+//! same-process holder's contribution — correctly written into the union
+//! on disk — is never read back by THIS process's own reconcile; the
+//! `pinned` set `ensure_wave_loaded` plans against only ever contains
+//! OTHER processes' leases. A same-process sibling's model can therefore
+//! still be evicted mid-generation by this process's own Exclusive
+//! reconcile. Confirmed live post-fix (#2662 review) and tracked
+//! separately as #2663. Wiring `radio.rs`/`radio_answer.rs` through
+//! `dispatch_reconciled` is NOT yet safe on that hazard — it stays
+//! deferred, now blocked on #2663 rather than merely unattempted.
 //!
 //! # What this does not change
 //!
@@ -155,8 +165,13 @@ pub(crate) fn dispatch_reconciled_with(
             // since a concurrent SAME-PROCESS caller (e.g. an ephemeral ACP
             // panel dispatch's own `run_local_waves` track) may hold its
             // OWN `LeaseGuard` at the same time — see this module's own
-            // doc for why that same-process aggregation is exactly what
-            // makes wiring a genuinely concurrent caller through here safe.
+            // doc for why that same-process aggregation keeps the on-disk
+            // lease FILE consistent across them (never clobbered, never
+            // prematurely deleted). It does NOT make a same-process
+            // sibling's dispatch safe from eviction by THIS reconcile:
+            // `live_leased_models` excludes this process's own pid, so a
+            // sibling guard's models never appear in the `pinned` set
+            // `ensure_wave_loaded` plans against below — tracked as #2663.
             let lease_guard = residency_lease::LeaseGuard::acquire();
             let est = FixedEstimator::default();
             let mut host = host_factory();

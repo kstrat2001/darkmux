@@ -519,6 +519,85 @@ mod tests {
         assert!(!path.exists(), "the lease file is removed once the LAST concurrent holder drops");
     }
 
+    /// #2662 review finding: deleting `union.sort()` in `union_of` left all
+    /// 9 pre-existing tests green — but only SOMETIMES. Eight repeats of
+    /// `two_concurrent_in_process_holders_union_rather_than_clobber` under
+    /// that mutant gave 5 passes and 3 failures, because that test's raw
+    /// (pre-sort) flatten order depends on `HashMap`'s iteration order over
+    /// `ACTIVE_LEASES`, which varies by process (a fresh random hasher seed
+    /// per run) — for some seeds the two single-element contributions
+    /// happen to land already in sorted order by luck, and a `dedup()`
+    /// with no `sort()` first can't tell the difference.
+    ///
+    /// This test is constructed so that can never happen — it fails under
+    /// the mutant on EVERY run, not just some, regardless of which of the
+    /// `HashMap`'s many possible iteration orders occurs:
+    ///
+    /// 1. Guard 1's own contribution (`[b, zzdup, c]`) is internally out of
+    ///    sorted order on its own (`"darkmux:zzdup"` > `"darkmux:c"`, yet
+    ///    `zzdup` is written before `c`). Each guard's own `Vec` is
+    ///    flattened as one contiguous block — `union_of` never reorders
+    ///    WITHIN a single guard's contribution, only decides which
+    ///    guard's block comes first — so that inversion survives into the
+    ///    raw flatten no matter how `HashMap` orders the guards' blocks
+    ///    relative to each other. A raw flatten containing `zzdup`
+    ///    immediately before `c` can never equal the correctly sorted
+    ///    vector (where every `c` precedes every `zzdup`), so the assertion
+    ///    below is guaranteed to catch a missing `.sort()` on every run.
+    /// 2. `"darkmux:zzdup"` is contributed by BOTH guard 1 and guard 2, and
+    ///    in each case sandwiched strictly INTERIOR to that guard's own
+    ///    block (never at a block's edge) — so its two occurrences can
+    ///    never land adjacent to each other in the flatten regardless of
+    ///    block order, meaning a mutant `dedup()` (which only ever
+    ///    collapses ADJACENT duplicates) can never accidentally collapse
+    ///    them by luck either. Real `dedup()` after a real `sort()`
+    ///    collapses them unconditionally, so this also pins the "two
+    ///    guards naming the same model" case named in review.
+    #[serial_test::serial]
+    #[test]
+    fn sort_and_dedup_are_order_independent_across_concurrent_holders() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        let guard1 = LeaseGuard::acquire();
+        guard1
+            .write(&["darkmux:b".to_string(), "darkmux:zzdup".to_string(), "darkmux:c".to_string()])
+            .unwrap();
+
+        let guard2 = LeaseGuard::acquire();
+        guard2
+            .write(&["darkmux:e".to_string(), "darkmux:zzdup".to_string(), "darkmux:f".to_string()])
+            .unwrap();
+
+        let guard3 = LeaseGuard::acquire();
+        guard3.write(&["darkmux:a".to_string()]).unwrap();
+
+        let guard4 = LeaseGuard::acquire();
+        guard4.write(&["darkmux:g".to_string()]).unwrap();
+
+        let other_own_pid = std::process::id().wrapping_add(1);
+        let models = live_leased_models(other_own_pid);
+        assert_eq!(
+            models,
+            vec![
+                "darkmux:a".to_string(),
+                "darkmux:b".to_string(),
+                "darkmux:c".to_string(),
+                "darkmux:e".to_string(),
+                "darkmux:f".to_string(),
+                "darkmux:g".to_string(),
+                "darkmux:zzdup".to_string(),
+            ],
+            "the union across 4 concurrent same-process holders must be fully sorted and \
+             deduplicated, regardless of HashMap iteration order over ACTIVE_LEASES"
+        );
+
+        drop(guard1);
+        drop(guard2);
+        drop(guard3);
+        drop(guard4);
+    }
+
     /// The panic path (mandatory per #2651's review): a holder that panics
     /// mid-dispatch (its wave/job panics while the lease guard is held,
     /// unwinding through `run_local_waves`) must still release ONLY its own
