@@ -1067,9 +1067,12 @@ mod tests {
     // was never wrong about a developer's own machine. Set the env var
     // locally (or in a workflow running on real Apple Silicon) to restore
     // the strict check; documented as a test-only knob in
-    // docs/ENVIRONMENT.md. Unconditional either way: no panic, the cost
-    // budget, and every field in range or `None` — the degradation
-    // contract this module exists to guarantee.
+    // docs/ENVIRONMENT.md. Unconditional either way: no panic, and every
+    // field in range or `None` — the degradation contract this module
+    // exists to guarantee. The cost budget is the one exception, gated on
+    // coverage instrumentation instead (see `under_coverage_instrumentation`
+    // below, #2631) — it measures wall clock, which instrumentation itself
+    // inflates.
     // Only called from the aarch64-gated live-probe test below — cfg-gated
     // the same way so a non-Apple-Silicon TEST build doesn't flag it as
     // dead code under `-D warnings` (the same class of finding as #1's
@@ -1078,6 +1081,30 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn expect_ioreport() -> bool {
         std::env::var("DARKMUX_EXPECT_IOREPORT").as_deref() == Ok("1")
+    }
+
+    // (#2631) The cost-budget assertion below measures the probe's own
+    // wall-clock stamp — the number that makes the observability doctrine's
+    // "the observer must not perturb the observed" claim checkable at all
+    // (see CLAUDE.md's "observer must not join the observed"). Under
+    // `cargo llvm-cov`, every call in this crate is built with
+    // `-Cinstrument-coverage`, so the sampler's own code (and everything it
+    // calls) runs slower than the binary that ships — the assertion would
+    // be measuring the instrumentation's overhead, not the probe's. That is
+    // a second observer perturbing the first: the exact failure mode this
+    // module exists to catch, now happening to the test that catches it.
+    // `cargo-llvm-cov` sets `CARGO_LLVM_COV=1` in the environment of the
+    // test binary it runs (confirmed empirically for this crate — present
+    // under `cargo llvm-cov`, absent under plain `cargo test`), which is
+    // the one signal available at test-run time that names the actual
+    // condition (instrumented code is running) rather than a proxy for it.
+    // Only the timing half is skipped; every range/presence assertion below
+    // still runs unconditionally under coverage — an uncovered branch is a
+    // real defect wall-clock instrumentation cannot cause, so nothing about
+    // *that* half of the doctrine is instrumentation-dependent.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn under_coverage_instrumentation() -> bool {
+        std::env::var("CARGO_LLVM_COV").is_ok()
     }
 
     #[test]
@@ -1106,11 +1133,30 @@ mod tests {
         let s = complete.expect("twenty samples");
         let mean = costs.iter().sum::<u64>() as f64 / costs.len() as f64;
         let max = *costs.iter().max().unwrap();
-        assert!(
-            max < 60,
-            "the observer must stay negligible: max {max} ms, mean {mean:.1} ms over {} samples",
-            costs.len()
-        );
+        // (#2631) `cargo llvm-cov` builds this whole crate with
+        // `-Cinstrument-coverage`, so `max`/`mean` here measure the
+        // instrumented sampler's cost, not the shipped one — the same
+        // number under two different builds means two different things.
+        // Raising the 60ms ceiling to survive instrumentation would weaken
+        // the budget for the build that actually ships, which is the one
+        // this assertion exists to protect; skipping the whole test would
+        // stop checking the range/presence assertions below, which ARE
+        // instrumentation-independent. So only the timing half is
+        // conditional, and the condition is the tool's own signal
+        // (`CARGO_LLVM_COV`), not a threshold fudge.
+        if under_coverage_instrumentation() {
+            eprintln!(
+                "cost budget skipped under coverage instrumentation (not the shipped cost): \
+                 max {max} ms, mean {mean:.1} ms over {} samples",
+                costs.len()
+            );
+        } else {
+            assert!(
+                max < 60,
+                "the observer must stay negligible: max {max} ms, mean {mean:.1} ms over {} samples",
+                costs.len()
+            );
+        }
 
         // Every field that IS present must be in range. Absence is allowed
         // (a future macOS could move any of these); a nonsense value is not.
