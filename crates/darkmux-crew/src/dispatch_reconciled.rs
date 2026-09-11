@@ -89,19 +89,44 @@
 //! through explicitly rather than resolving one implicitly by pid — so the
 //! on-disk lease FILE is now correct no matter how many guards this
 //! process holds concurrently: no clobber, no premature deletion, for
-//! every caller of that primitive, this module included. **That is not
+//! every caller of that primitive, this module included. **That was not
 //! the same claim as "concurrent same-process dispatches can no longer
-//! evict each other's model."** `live_leased_models` excludes `own_pid`
-//! by construction (see that function's own doc), so a SIBLING
-//! same-process holder's contribution — correctly written into the union
-//! on disk — is never read back by THIS process's own reconcile; the
-//! `pinned` set `ensure_wave_loaded` plans against only ever contains
-//! OTHER processes' leases. A same-process sibling's model can therefore
-//! still be evicted mid-generation by this process's own Exclusive
-//! reconcile. Confirmed live post-fix (#2662 review) and tracked
-//! separately as #2663. Wiring `radio.rs`/`radio_answer.rs` through
-//! `dispatch_reconciled` is NOT yet safe on that hazard — it stays
-//! deferred, now blocked on #2663 rather than merely unattempted.
+//! evict each other's model" — #2651 left that half open, tracked as
+//! #2663.** `live_leased_models` excludes `own_pid` by construction (see
+//! that function's own doc, correct for a single-dispatch process), so a
+//! SIBLING same-process holder's contribution — correctly written into
+//! the union on disk — was never read back by THIS process's own
+//! reconcile; the `pinned` set `ensure_wave_loaded` planned against only
+//! ever contained OTHER processes' leases. Confirmed live (#2662 review):
+//! a sibling guard writing `darkmux:sibling`, then `ensure_wave_loaded`
+//! for a different model in the SAME process, produced `[ListResident,
+//! Unload { identifier: "darkmux:sibling" }, Load { .. }]`.
+//!
+//! **#2663 (fixed):** [`ensure_wave_loaded`](crate::concurrent_dispatch::ensure_wave_loaded)
+//! (and this module's own call into it) now compute `pinned` via
+//! [`residency_lease::LeaseGuard::all_live_leased_models`] instead of the
+//! bare `live_leased_models(own_pid)` free function — it unions
+//! `live_leased_models` (other processes) with every OTHER same-process
+//! holder's own live contribution to `ACTIVE_LEASES`, excluding the
+//! CALLING guard's own token (so a guard never pins its own
+//! about-to-be-superseded placement against itself). A live same-process
+//! sibling is now protected from this process's own Exclusive reconcile
+//! choosing to pass-1-evict its model as not-desired, and a sibling that
+//! has actually withdrawn (dropped cleanly, or via panic-unwind — `Drop`
+//! runs on every exit path, #2651) stops being pinned the moment it
+//! withdraws, never "pinned forever." **This does NOT cover every
+//! eviction path: `plan_acquire`'s per-desired `Reconcile` arm (unload +
+//! reload at a higher context for the SAME model key) never consults
+//! `pinned` at all, so a live sibling resident at the same model key but
+//! insufficient context can still be unloaded out from under it — filed
+//! as #2669, not fixed here.** Wiring `radio.rs`/`radio_answer.rs`
+//! through `dispatch_reconciled` is no longer blocked on the pass-1
+//! not-desired hazard this PR closes — but #2669 remains open, and is
+//! most likely to bite exactly when an operator sets
+//! `radio.router_profile` and `radio.answerer_profile` to two profiles
+//! naming the same catalog model at different contexts (both default to
+//! empty today, which is why this has not yet been observed live). That
+//! wiring itself remains a separate, unattempted follow-up.
 //!
 //! # What this does not change
 //!
@@ -167,11 +192,12 @@ pub(crate) fn dispatch_reconciled_with(
             // OWN `LeaseGuard` at the same time — see this module's own
             // doc for why that same-process aggregation keeps the on-disk
             // lease FILE consistent across them (never clobbered, never
-            // prematurely deleted). It does NOT make a same-process
-            // sibling's dispatch safe from eviction by THIS reconcile:
-            // `live_leased_models` excludes this process's own pid, so a
-            // sibling guard's models never appear in the `pinned` set
-            // `ensure_wave_loaded` plans against below — tracked as #2663.
+            // prematurely deleted). A same-process sibling's dispatch is
+            // ALSO now safe from eviction by THIS reconcile (#2663):
+            // `ensure_wave_loaded` computes its `pinned` set via
+            // `LeaseGuard::all_live_leased_models`, which unions a
+            // same-process sibling's own live contribution into `pinned`
+            // (never this guard's own — see that method's doc).
             let lease_guard = residency_lease::LeaseGuard::acquire();
             let est = FixedEstimator::default();
             let mut host = host_factory();
@@ -684,5 +710,60 @@ mod tests {
         assert!(outcome.is_err(), "the injected local_dispatch panic must propagate, not be swallowed");
 
         assert!(!path.exists(), "lease file must be released even when local_dispatch panics: {path:?}");
+    }
+
+    /// **#2663 coverage, named explicitly in this module's own doc**: this
+    /// module's doc named `radio.rs`/`radio_answer.rs` as blocked on the
+    /// same-process eviction hazard — two overlapping `session/prompt`
+    /// tasks in a `darkmux acp` daemon, each reaching this function on its
+    /// own thread. A live SAME-PROCESS sibling holder (its own
+    /// `LeaseGuard`, still held, still resident) must never be evicted by
+    /// a DIFFERENT `dispatch_reconciled_with` call's own Exclusive
+    /// reconcile running in the same process.
+    #[serial_test::serial]
+    #[test]
+    fn dispatch_reconciled_never_evicts_a_live_same_process_sibling_lease() {
+        let _env = LeaseTestEnv::new();
+
+        // The sibling: a second concurrent standalone dispatch in the
+        // SAME process, holding its own guard for a different model,
+        // still live (not dropped) for the whole test.
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:sibling".to_string()]).expect("sibling writes its lease");
+
+        let host = Arc::new(Mutex::new(
+            MockHost::new().resident("darkmux:sibling", "sibling", 32_000, Some(1_000)).cataloged("m", 1_000),
+        ));
+        let factory = host_factory_over(host.clone());
+
+        let result = dispatch_reconciled_with(
+            test_opts("coder"),
+            SeatClaim::LocalModel(placement("m", 8_000)),
+            |opts| {
+                Ok(DispatchResult {
+                    exit_code: 0,
+                    stdout: format!("dispatched {}", opts.role_id),
+                    stderr: String::new(),
+                    session_id: String::new(),
+                    out_dir: None,
+                })
+            },
+            factory.as_ref(),
+        )
+        .expect("reconcile + dispatch succeeds");
+        assert_eq!(result.exit_code, 0);
+
+        let ops = host.lock().unwrap().ops.clone();
+        assert!(
+            !ops.iter().any(|op| matches!(op, HostOp::Unload { identifier } if identifier == "darkmux:sibling")),
+            "a live SAME-PROCESS sibling's model must never be evicted by a DIFFERENT \
+             dispatch_reconciled call's own reconcile: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, HostOp::Load { identifier, .. } if identifier == "darkmux:m")),
+            "this dispatch's own wanted model still loads: {ops:?}"
+        );
+
+        drop(sibling_guard);
     }
 }

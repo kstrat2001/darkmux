@@ -502,11 +502,20 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 /// `Exclusive`: pass 1 unloads darkmux-owned residents this wave does NOT
 /// desire, before any load. Concurrency-safe via the residency-lease
 /// registry (`darkmux_types::residency_lease`, #1487 PR2 part A): every
-/// OTHER live darkmux command's leased `darkmux:*` model ids are read
-/// fresh on every attempt and fed in as `AcquireOpts.pinned` (#1487 PR1) —
-/// `plan_acquire` never pass-1-unloads a pinned resident and always counts
-/// it as occupied, so a concurrent command's in-use model is never yanked
-/// out from under it. This process's OWN lease is written/refreshed to
+/// OTHER live holder's leased `darkmux:*` model ids — an OTHER PROCESS
+/// AND a same-process sibling alike (#2663; `LeaseGuard::
+/// all_live_leased_models`, never the bare `live_leased_models` free
+/// function, which excludes only `own_pid` and so missed a live
+/// same-process sibling entirely) — are read fresh on every attempt and
+/// fed in as `AcquireOpts.pinned` (#1487 PR1) — `plan_acquire` never
+/// pass-1-unloads a pinned resident as not-desired, and always counts it
+/// as occupied, whether that pin comes from a different process or a
+/// sibling dispatch in THIS one. **This guards pass-1 not-desired
+/// eviction, the budget eviction loop, and the pool-headroom eviction
+/// loop only — it does NOT guard the per-desired `Reconcile` arm, which
+/// can still unload a pinned identifier that shares a model key with a
+/// desired placement at insufficient context (#2669, filed, not yet
+/// fixed).** This process's OWN lease is written/refreshed to
 /// this wave's placements BEFORE planning, via the CALLER-SUPPLIED `lease`
 /// guard's own [`residency_lease::LeaseGuard::write`] (#2651 — never the
 /// old bare `write_lease` free function, which clobbered a concurrent
@@ -603,7 +612,6 @@ pub(crate) fn ensure_wave_loaded(
     // write` unions this contribution with every other currently-live
     // guard's own, rather than overwriting the shared per-pid file
     // outright (#2651).
-    let own_pid = std::process::id();
     let own_models: Vec<String> = unique.iter().map(|p| p.identifier.clone()).collect();
     lease.write(&own_models)
         .map_err(|e| anyhow!("darkmux: could not write this wave's residency lease: {e}"))?;
@@ -618,10 +626,15 @@ pub(crate) fn ensure_wave_loaded(
         let pools = MacProbe.pools().unwrap_or_default();
         let facts = Facts { residents, pools, ..Default::default() };
 
-        // Other live commands' leases, read fresh every attempt (the
+        // Every OTHER live holder's lease, read fresh every attempt (the
         // blocker this attempt is retrying past may free between
-        // attempts).
-        let pinned = residency_lease::live_leased_models(own_pid);
+        // attempts) — other PROCESSES via `live_leased_models`, UNIONED
+        // with every other SAME-PROCESS holder's own contribution,
+        // excluding THIS guard's own token (#2663; see
+        // `LeaseGuard::all_live_leased_models`'s doc for why a live
+        // same-process sibling must be protected too, and why this
+        // guard's own just-written contribution must not be).
+        let pinned = lease.all_live_leased_models();
         let opts = AcquireOpts {
             pinned: pinned.clone(),
             ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive)
@@ -705,6 +718,46 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Conformance (#2666 CONSIDER 2): the bare
+    /// `residency_lease::live_leased_models` free function excludes only
+    /// `own_pid` — it is right for `LeaseGuard::all_live_leased_models`'s
+    /// own internal use (which additionally unions in same-process
+    /// siblings) and wrong for anything computing `AcquireOpts.pinned`
+    /// directly, which is exactly the #2663 bug shape (a caller reaching
+    /// past `all_live_leased_models` and missing same-process siblings).
+    /// Scans this file's and `dispatch_reconciled.rs`'s own PRODUCTION
+    /// source (everything before their `mod tests` boundary, with
+    /// comments skipped) for a bare call to the free function — i.e. an
+    /// occurrence of `live_leased_models(` not part of
+    /// `all_live_leased_models(`. A future edit that reintroduces #2663 by
+    /// wiring `pinned` straight to the free function fails this test
+    /// before it ever gets to a real dispatch.
+    #[test]
+    fn no_production_pinned_computation_bypasses_all_live_leased_models() {
+        for (name, src) in [
+            ("concurrent_dispatch.rs", include_str!("concurrent_dispatch.rs")),
+            ("dispatch_reconciled.rs", include_str!("dispatch_reconciled.rs")),
+        ] {
+            let production = src.split("\nmod tests").next().unwrap_or(src);
+            for (line_no, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue; // doc/line comments reference the free function by name
+                }
+                if let Some(idx) = line.find("live_leased_models(") {
+                    let prefix = &line[..idx];
+                    assert!(
+                        prefix.ends_with("all_"),
+                        "{name}:{}: production code calls the bare `live_leased_models` \
+                         free function directly — every `AcquireOpts.pinned` computation \
+                         must go through `LeaseGuard::all_live_leased_models` instead \
+                         (#2663): {line:?}",
+                        line_no + 1,
+                    );
+                }
+            }
+        }
+    }
 
     /// Hermetic `host_factory` for these fixtures — synthetic `Facts`/
     /// placements (fake model keys like "m"/"small-a") were never intended
@@ -845,8 +898,8 @@ mod tests {
     fn ensure_wave_loaded_never_evicts_a_model_pinned_by_a_live_external_lease() {
         let env = LeaseTestEnv::new();
         // A genuinely live OTHER process (this test's own pid would be
-        // excluded as "own" by `ensure_wave_loaded`'s internal
-        // `live_leased_models(std::process::id())` call — the lease must
+        // excluded as "own" by the `live_leased_models(self.pid)` read
+        // inside `LeaseGuard::all_live_leased_models` — the lease must
         // belong to some OTHER live pid to prove the cross-process path).
         let mut holder = std::process::Command::new("sleep")
             .arg("5")
@@ -892,6 +945,178 @@ mod tests {
 
         let _ = holder.kill();
         let _ = holder.wait();
+    }
+
+    // ── #2663: same-process sibling protection ──────────────────────────
+    //
+    // #2651 made the on-disk `<pid>.lease` file the correct union of every
+    // concurrent in-process `LeaseGuard`'s own contribution, but
+    // `ensure_wave_loaded`'s `pinned` set was still computed from
+    // `residency_lease::live_leased_models(own_pid)` alone, which EXCLUDES
+    // `own_pid` by construction — so a live SAME-PROCESS sibling holder's
+    // model (correctly present in the on-disk union) was never actually
+    // read back by this process's own reconcile. The reviewer's exact
+    // repro (#2662): a sibling guard writes `darkmux:sibling`, then
+    // `ensure_wave_loaded` for a different model in the SAME process
+    // produces `[ListResident, Unload { identifier: "darkmux:sibling" },
+    // Load { .. }]` — the sibling's model is evicted mid-generation by a
+    // plan the same process itself generated.
+
+    /// RED-PROVE (reviewer's exact probe, #2662): a live same-process
+    /// sibling `LeaseGuard` (still held, still resident) must never be
+    /// evicted by a DIFFERENT guard's `ensure_wave_loaded` reconcile
+    /// running in the same process. Pre-fix, this fails with exactly the
+    /// reviewer's repro — `host.ops` contains `Unload { identifier:
+    /// "darkmux:sibling" }`.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_never_evicts_a_live_same_process_sibling_lease() {
+        let _env = LeaseTestEnv::new();
+
+        // The sibling: a second concurrent local track in the SAME
+        // process (same pid), holding its own guard for a DIFFERENT
+        // model, still live (not dropped) for the whole test.
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:sibling".to_string()]).expect("sibling writes its lease");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:sibling", "sibling", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        // A SEPARATE guard — this call's own local track, reconciling for
+        // a completely different model, in the SAME process as the
+        // sibling above.
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &own_guard).expect("the wanted model loads");
+
+        let unloads: Vec<_> = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. }))
+            .collect();
+        assert!(
+            unloads.is_empty(),
+            "a live SAME-PROCESS sibling's model must never be evicted by this process's own \
+             reconcile: {:?}",
+            host.ops
+        );
+        assert!(
+            host.residents.iter().any(|r| r.identifier == "darkmux:sibling"),
+            "the sibling's model must still be resident afterward: {:?}",
+            host.residents
+        );
+        assert!(
+            host.ops.iter().any(|op| matches!(
+                op,
+                darkmux_gestalt::mock::HostOp::Load { identifier, .. } if identifier == "darkmux:m"
+            )),
+            "the wave's own desired model still loads: {:?}",
+            host.ops
+        );
+
+        drop(sibling_guard);
+        drop(own_guard);
+    }
+
+    /// INVERTED direction: once the same-process sibling's guard has
+    /// actually DROPPED (its dispatch finished, or it withdrew), its model
+    /// must no longer stay pinned — a later reconcile in the same process
+    /// (a different guard) must be free to evict it as an orphan not in
+    /// its own desired set. Guards against a fix that protects same-process
+    /// siblings but never lets go once they're gone (which would mean a
+    /// wave that should free memory never does, and the next dispatch
+    /// fails to fit).
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_evicts_a_same_process_orphan_once_its_holder_has_dropped() {
+        let _env = LeaseTestEnv::new();
+
+        {
+            let withdrawn_guard = residency_lease::LeaseGuard::acquire();
+            withdrawn_guard
+                .write(&["darkmux:withdrawn".to_string()])
+                .expect("the withdrawing guard writes its lease");
+            // Guard drops here — its dispatch is over, its contribution
+            // must be released (Drop-only release, #2651).
+        }
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:withdrawn", "withdrawn", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &own_guard).expect("the wanted model loads");
+
+        assert!(
+            host.ops.iter().any(|op| matches!(
+                op,
+                darkmux_gestalt::mock::HostOp::Unload { identifier } if identifier == "darkmux:withdrawn"
+            )),
+            "a withdrawn (dropped) same-process holder's model must not stay pinned forever — \
+             it must be evicted as an orphan: {:?}",
+            host.ops
+        );
+    }
+
+    /// Panic path: a same-process sibling that PANICS mid-dispatch (its
+    /// guard's `Drop` still runs during unwind, releasing ONLY its own
+    /// contribution — #2651's guarantee) must (a) still protect a
+    /// DIFFERENT, genuinely live survivor sibling from eviction, and (b)
+    /// not itself stay wrongfully pinned forever once its own `Drop` has
+    /// run. Exercises the same self-token exclusion + panic-release
+    /// contract this fix adds on top of #2651's own panic-path proof in
+    /// `residency_lease`'s test suite.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_after_a_same_process_sibling_panics_protects_the_survivor_and_frees_the_doomed(
+    ) {
+        let _env = LeaseTestEnv::new();
+
+        let survivor_guard = residency_lease::LeaseGuard::acquire();
+        survivor_guard.write(&["darkmux:survivor".to_string()]).expect("survivor writes its lease");
+
+        let unwound = std::panic::catch_unwind(|| {
+            let doomed_guard = residency_lease::LeaseGuard::acquire();
+            doomed_guard.write(&["darkmux:doomed".to_string()]).expect("doomed writes its lease");
+            panic!("simulated mid-dispatch panic (#2663 panic-path proof)");
+        });
+        assert!(unwound.is_err(), "precondition: the simulated panic must actually have unwound");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:survivor", "survivor", 32_000, Some(1_000))
+            .resident("darkmux:doomed", "doomed", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 8_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &own_guard).expect("the wanted model loads");
+
+        let unloaded: Vec<String> = host
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                darkmux_gestalt::mock::HostOp::Unload { identifier } => Some(identifier.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !unloaded.contains(&"darkmux:survivor".to_string()),
+            "the genuinely live survivor must never be evicted by this process's own reconcile: \
+             {unloaded:?}"
+        );
+        assert!(
+            unloaded.contains(&"darkmux:doomed".to_string()),
+            "the panicked holder's model must be evicted once its Drop released it during unwind \
+             — never wrongfully pinned forever: {unloaded:?}"
+        );
+
+        drop(survivor_guard);
+        drop(own_guard);
     }
 
     /// (#1487 PR2) `ensure_wave_loaded` writes its OWN lease before
