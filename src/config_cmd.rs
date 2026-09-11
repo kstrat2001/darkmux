@@ -141,6 +141,12 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2107, #1833) Cadence of `darkmux serve`'s daemon-side continuous
     // host sampler feeding the machine stats drawer. `0` disables it.
     ("runtime.host_sampler_interval_ms", Ty::Uint),
+    // (#2653) Retention window, in hours, for
+    // `<darkmux-home>/liveness/<pid>.log` per-dispatch heartbeat files
+    // (`darkmux_types::dispatch_liveness`). `0` disables pruning entirely
+    // (the same zero-means-off convention as `host_sampler_interval_ms`
+    // above and `redis.maxlen` below — never "retain nothing").
+    ("runtime.liveness_retention_hours", Ty::Uint),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc.
     ("runtime.thermal.enabled", Ty::Bool),
@@ -581,6 +587,24 @@ mod tests {
         assert_eq!(get_at(p, "runtime.max_stall_recoveries").unwrap(), "4");
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(cfg.runtime.unwrap().max_stall_recoveries, Some(4));
+    }
+
+    /// (#2653 MUST FIX 4) `runtime.liveness_retention_hours` was documented
+    /// as the mechanism (`darkmux config set <key> <value>`) but absent from
+    /// the `KEYS` registry, so `set` rejected it as a typo — `set_at`
+    /// returning `Err` on `"168"` (a perfectly valid value) is the CI-red
+    /// this test guards against regressing. `0` (the zero-means-disabled
+    /// value, #2653 MUST FIX 6) round-trips too.
+    #[test]
+    fn liveness_retention_hours_settable_and_get_round_trips() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "runtime.liveness_retention_hours", "168").unwrap();
+        assert_eq!(get_at(p, "runtime.liveness_retention_hours").unwrap(), "168");
+        set_at(p, "runtime.liveness_retention_hours", "0").unwrap();
+        assert_eq!(get_at(p, "runtime.liveness_retention_hours").unwrap(), "0");
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(cfg.runtime.unwrap().liveness_retention_hours, Some(0));
     }
 
     /// (#1475 packet 1) `role_profiles.<role>` is a dynamic settable key — it
