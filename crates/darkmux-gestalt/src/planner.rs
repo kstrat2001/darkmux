@@ -83,6 +83,23 @@ pub struct AcquireOpts {
     /// caller's job before calling in — see the #1487 design doc). Empty by
     /// default via [`AcquireOpts::new`] — every caller that predates #1487
     /// gets an identical plan.
+    ///
+    /// **Known residual gap (#2672 CONSIDER 6, inherited from earlier
+    /// work):** the `is_darkmux_owned` half of that no-op check is a bare
+    /// `darkmux:` PREFIX test — it has no visibility into any specific
+    /// placement's own identifier, so a pin naming a genuinely live
+    /// EXPLICIT ALIAS (a non-namespaced identifier a darkmux profile is
+    /// configured to use instead of the default namespace) never enters
+    /// `claimed` at all, even though `decide_residency` would treat that
+    /// same alias as darkmux-owned once a placement actually names it. The
+    /// #2669/#2672 Reconcile-arm protection above is therefore NOT closed
+    /// for aliased pins — only for `darkmux:*`-namespaced ones. Reproduced:
+    /// pinned `"custom"`, an aliased placement wanting more context for
+    /// the same model key, plans `Unload { "custom" }` — the live sibling
+    /// is unloaded mid-generation. Left un-widened for now (the fix would
+    /// change this field's documented "namespaced identifiers" contract, a
+    /// bigger decision than this qualifier); extend the seeding check in
+    /// `plan_acquire` if aliased pins become a real operational pattern.
     pub pinned: Vec<String>,
 }
 
@@ -156,6 +173,22 @@ pub fn plan_acquire(
             claimed.insert(id.clone());
         }
     }
+    // (#2672 CONSIDER 3) A SEPARATE tracker, disjoint in origin from
+    // `claimed` above: identifiers claimed by THIS call's OWN earlier
+    // decisions (a `Reuse` or a successful `Reconcile`), never by
+    // `opts.pinned` alone. `claimed` conflates two causes the Reconcile
+    // arm's Block below needs to tell apart — an EXTERNAL pin (a
+    // concurrent darkmux command, or a same-process sibling) can genuinely
+    // clear with time (the pinning command finishing its own dispatch), so
+    // `ensure_wave_loaded`'s bounded retry-hold is worth attempting; a
+    // SAME-PLAN collision (two placements in this one `desired` list
+    // resolving to the identical stale resident — `facts` is a single
+    // snapshot, so retrying `plan_acquire` with the same input regenerates
+    // the IDENTICAL collision every time) can never clear no matter how
+    // long anything waits. `Reason::ClaimedResidentInsufficientCtx`'s own
+    // `clearable` field is `!same_plan_claimed.contains(&stale_identifier)`
+    // at the point of the Block — see its construction below.
+    let mut same_plan_claimed: BTreeSet<String> = BTreeSet::new();
     // Reconcile unload-halves, committed after the refusal passes (see
     // ReconcileFree).
     let mut reconcile_frees: Vec<ReconcileFree> = Vec::new();
@@ -200,6 +233,7 @@ pub fn plan_acquire(
             }
             ResidencyDecision::Reuse { identifier, resident_ctx } => {
                 claimed.insert(identifier.clone());
+                same_plan_claimed.insert(identifier.clone());
                 push_reuse(&mut decisions, &mut warnings, identifier, resident_ctx, p.min_ctx);
             }
             ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
@@ -218,6 +252,18 @@ pub fn plan_acquire(
                 // (`pinned_resident_blocks_budget_load_never_evicted_1487`):
                 // a `Block` naming the claimed instance, never an eviction.
                 if claimed.contains(&stale_identifier) {
+                    // (#2672 CONSIDER 3) `clearable` distinguishes WHY this
+                    // is claimed: an external pin (never in
+                    // `same_plan_claimed`) can genuinely resolve once its
+                    // holder finishes, so `ensure_wave_loaded`'s bounded
+                    // retry-hold is worth attempting; a same-plan
+                    // collision (this identifier already claimed by an
+                    // EARLIER decision in THIS SAME `desired` list) can
+                    // never resolve by waiting — `facts` is one fixed
+                    // snapshot, so re-running `plan_acquire` on the exact
+                    // same input regenerates the identical Block every
+                    // time.
+                    let clearable = !same_plan_claimed.contains(&stale_identifier);
                     decisions.push(PlannedAction {
                         action: Action::Block {
                             model_key: p.model_key.clone(),
@@ -227,11 +273,13 @@ pub fn plan_acquire(
                             identifier: stale_identifier,
                             resident_ctx: stale_ctx,
                             min_ctx: p.min_ctx,
+                            clearable,
                         },
                         precondition: Precondition::None,
                     });
                 } else {
                     claimed.insert(stale_identifier.clone());
+                    same_plan_claimed.insert(stale_identifier.clone());
                     let stale_target = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
                         .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
                     reconcile_frees.push(ReconcileFree {
@@ -1530,6 +1578,7 @@ mod tests {
                         identifier: "darkmux:m".into(),
                         resident_ctx: 32_000,
                         min_ctx: 68_000,
+                        clearable: true, // origin: opts.pinned (external) — #2672
                     },
                     precondition: Precondition::None,
                 }],
@@ -1540,6 +1589,51 @@ mod tests {
         assert!(
             plan.actions.iter().all(|a| !matches!(&a.action, Action::Unload { .. })),
             "no Unload of any kind may appear when the stale is pinned: {:?}",
+            plan.actions
+        );
+    }
+
+    /// (#2672 CONSIDER 4) The distinguishing fixture: an EXPLICITLY
+    /// ALIASED placement (identifier "custom-alias", NOT the default
+    /// "darkmux:{model_key}") over the SAME pinned resident "darkmux:m".
+    /// Every OTHER #2669 fixture happens to have the stale identifier
+    /// equal to the placement's own identifier (both default to
+    /// "darkmux:{model_key}"), so a mutant checking `claimed.contains(&p.
+    /// identifier)` instead of `claimed.contains(&stale_identifier)` is
+    /// invisible to them — `p.identifier` and `stale_identifier` are
+    /// simply the same string in every other row. Here they are NOT: the
+    /// placement wants "custom-alias" but `decide_residency` still finds
+    /// "darkmux:m" (darkmux-owned, so it matches regardless of the
+    /// placement's own identifier — see `decide_residency`'s own doc) as
+    /// the stale resident. That mutant would check `claimed.contains(
+    /// "custom-alias")` — never pinned itself — and wrongly proceed to
+    /// unload the ACTUALLY-pinned "darkmux:m", which is exactly the bug
+    /// this whole PR fixes, reached through an aliased identifier instead
+    /// of the default one.
+    #[test]
+    fn reconcile_arm_checks_the_stale_identifier_not_the_placements_own_2672() {
+        let f = facts(vec![resident("darkmux:m", "m", 32_000, None)]);
+        let pinned = opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:m"]);
+        let aliased_placement =
+            Placement { model_key: "m".into(), identifier: "custom-alias".into(), min_ctx: 68_000, seat: "test".into() };
+
+        let plan = plan_acquire(&[aliased_placement], &f, pinned, &no_est());
+
+        assert!(
+            plan.actions.iter().all(|a| !matches!(&a.action, Action::Unload { .. })),
+            "the pinned resident must never be unloaded just because the placement wanting it \
+             uses a DIFFERENT identifier: {:?}",
+            plan.actions
+        );
+        assert!(
+            matches!(
+                &plan.actions.first(),
+                Some(PlannedAction {
+                    reason: Reason::ClaimedResidentInsufficientCtx { identifier, .. },
+                    ..
+                }) if identifier == "darkmux:m"
+            ),
+            "the Block must name the STALE resident's own identifier, not the placement's: {:?}",
             plan.actions
         );
     }
@@ -1611,6 +1705,10 @@ mod tests {
                     identifier: "darkmux:shared".into(),
                     resident_ctx: 4_096,
                     min_ctx: 68_000,
+                    // (#2672 CONSIDER 3) Same-plan origin, never external —
+                    // no amount of waiting resolves this, so it must never
+                    // be retried (unlike the pinned-external case above).
+                    clearable: false,
                 },
                 precondition: Precondition::None,
             },

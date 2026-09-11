@@ -439,6 +439,12 @@ enum PlanExecOutcome {
 /// Stops at the first failure; a partially-executed plan on failure is the
 /// same behavior `ensure_wave_loaded` always had (the caller's fresh-facts
 /// re-plan on the next attempt/wave is the recovery path, not a rollback).
+/// A `Block` mid-plan stops here too, same as a live host error — #2669/
+/// #2672 made `Action::Block` reachable via `Reason::
+/// ClaimedResidentInsufficientCtx` in the ORDINARY concurrent-session case
+/// (not just a capacity/catalog error), widening this pre-existing
+/// partial-execution exposure's practical blast radius; tracked as a
+/// separate follow-up, #2674.
 fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> PlanExecOutcome {
     for planned in &plan.actions {
         match &planned.action {
@@ -650,7 +656,22 @@ pub(crate) fn ensure_wave_loaded(
         // `LeaseGuard::all_live_leased_models`'s doc for why a live
         // same-process sibling must be protected too, and why this
         // guard's own just-written contribution must not be).
-        let pinned = lease.all_live_leased_models();
+        //
+        // (#2672 MUST FIX 1) Excluded from that raw pinned set: any of
+        // THIS wave's own desired identifiers where every OTHER live
+        // holder currently claiming it is itself still only ACQUIRING
+        // (never confirmed `loaded`) and this guard's own priority is the
+        // lowest among them — see `identifiers_i_should_lead`'s doc for
+        // the full mechanism. Without this, two concurrent waves that
+        // both merely INTEND to acquire the same identifier each see the
+        // OTHER as an already-claimed pin and both fail — a regression
+        // from pre-#2669, where both simply succeeded. An identifier any
+        // live holder has confirmed `loaded` (genuinely mid-generation)
+        // is never excluded this way, regardless of priority — #2669's
+        // protection against evicting a live sibling is untouched.
+        let mut pinned = lease.all_live_leased_models();
+        let led = lease.identifiers_i_should_lead(&own_models);
+        pinned.retain(|id| !led.contains(id));
         let opts = AcquireOpts {
             pinned: pinned.clone(),
             ..AcquireOpts::new(CallerIntent::Auto, AcquireScope::Exclusive)
@@ -658,15 +679,46 @@ pub(crate) fn ensure_wave_loaded(
         let plan = plan_acquire(&unique, &facts, opts, est);
 
         match execute_plan(&plan, host, deadline) {
-            PlanExecOutcome::Loaded => return Ok(()),
+            PlanExecOutcome::Loaded => {
+                // (#2672) This wave's own models are now genuinely
+                // resident — flip this guard's lease entry for them from
+                // "acquiring" to "loaded" so a CONCURRENT sibling's own
+                // `identifiers_i_should_lead` never treats this dispatch
+                // as a mere racing acquirer once it starts generating.
+                // Best-effort: a lease write failure here must not fail an
+                // otherwise-successful load — the lease is a busy-overlay,
+                // never the source of truth (see the module doc's "`lms
+                // ps` stays the truth" section), so a stale "acquiring"
+                // entry only costs a future sibling its leader-election
+                // fast path, never correctness (#2669's own Block-on-claim
+                // guard still protects a resident that fresh facts show is
+                // actually loaded).
+                if let Err(e) = lease.mark_loaded(&own_models) {
+                    eprintln!(
+                        "darkmux: could not mark this wave's residency lease as loaded (non-fatal): {e}"
+                    );
+                }
+                return Ok(());
+            }
             PlanExecOutcome::Blocked { model_key, reason } => {
-                // (#2669) The one Block reason that can genuinely resolve
-                // with time: the claimed resident's holder may finish and
-                // release its lease before the next attempt. Same bounded
-                // hold-not-fail budget as the analogous HostFailed+pinned
-                // shortfall below — never an unbounded wait, never an
-                // eviction of the claimed resident either way.
-                if matches!(reason, Reason::ClaimedResidentInsufficientCtx { .. })
+                // (#2669; narrowed #2672 CONSIDER 3) The one Block reason
+                // that can genuinely resolve with time: the claimed
+                // resident's holder may finish and release its lease
+                // before the next attempt — but ONLY when `clearable` is
+                // true (the claim's origin is an external pin). A
+                // `clearable: false` claim (a same-plan collision — this
+                // SAME `desired` list already targeted the identical
+                // stale resident via an earlier decision) can never
+                // resolve by waiting: `plan_acquire` decides from one
+                // fixed `facts` snapshot, so retrying with the identical
+                // input regenerates the identical Block every time —
+                // burning the whole retry budget on a deterministic
+                // failure was the CONSIDER 3 finding this narrows. Same
+                // bounded hold-not-fail budget as the analogous
+                // HostFailed+pinned shortfall below for the clearable
+                // case — never an unbounded wait, never an eviction of
+                // the claimed resident either way.
+                if matches!(reason, Reason::ClaimedResidentInsufficientCtx { clearable: true, .. })
                     && attempt < BLOCKED_BY_HOLDER_RETRY_ATTEMPTS
                 {
                     std::thread::sleep(BLOCKED_BY_HOLDER_RETRY_DELAY);
@@ -747,7 +799,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     /// Conformance (#2666 CONSIDER 2): the bare
@@ -994,6 +1046,14 @@ mod tests {
     /// RED-PROVE (same-process): a live same-process sibling's lease pins
     /// "darkmux:m" — resident at ctx 32_000 — while this wave wants it at
     /// 68_000. Must Block, never Unload.
+    ///
+    /// The sibling calls `mark_loaded` right after `write` (#2672): this
+    /// scenario means "the sibling is genuinely MID-GENERATION on
+    /// darkmux:m" (its own doc: "the pinned sibling's model must still be
+    /// resident... afterward"), never "the sibling is ALSO still racing to
+    /// acquire it" — MUST FIX 1's leader/follower exclusion applies only
+    /// to the latter, so this red-prove must keep blocking regardless of
+    /// which guard's token happens to be lower.
     #[serial_test::serial]
     #[test]
     fn ensure_wave_loaded_never_reconciles_over_a_live_same_process_sibling_at_insufficient_ctx_2669(
@@ -1002,6 +1062,9 @@ mod tests {
 
         let sibling_guard = residency_lease::LeaseGuard::acquire();
         sibling_guard.write(&["darkmux:m".to_string()]).expect("sibling writes its lease");
+        sibling_guard
+            .mark_loaded(&["darkmux:m".to_string()])
+            .expect("sibling confirms it is genuinely resident, not merely acquiring");
 
         let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
         let mut host = MockHost::new()
@@ -1036,6 +1099,15 @@ mod tests {
     /// `live_leased_models` half of `all_live_leased_models`'s union, not
     /// the same-process half the test above exercises). Must Block, never
     /// Unload — the SAME outcome, proving the fix is process-shape-agnostic.
+    ///
+    /// The hand-written lease names `darkmux:m` in BOTH `models` AND
+    /// `loaded` (#2672): this scenario is "the external process is
+    /// genuinely mid-generation," never "the external process is ALSO
+    /// still racing to acquire it" — the latter is what MUST FIX 1's
+    /// leader/follower exclusion is FOR, and a foreign pid is otherwise
+    /// unpredictable relative to this test process's own pid (a real
+    /// spawned child), so this must stay pinned regardless of which side
+    /// happens to have the lower pid.
     #[serial_test::serial]
     #[test]
     fn ensure_wave_loaded_never_reconciles_over_a_live_external_process_lease_at_insufficient_ctx_2669(
@@ -1050,7 +1122,7 @@ mod tests {
         std::fs::create_dir_all(&residency_dir).unwrap();
         std::fs::write(
             residency_dir.join(format!("{holder_pid}.lease")),
-            format!(r#"{{"pid":{holder_pid},"models":["darkmux:m"]}}"#),
+            format!(r#"{{"pid":{holder_pid},"models":["darkmux:m"],"loaded":["darkmux:m"]}}"#),
         )
         .expect("hand-writing a lease for the external holder pid");
 
@@ -1129,8 +1201,16 @@ mod tests {
     fn ensure_wave_loaded_retries_a_permanently_claimed_reconcile_before_failing_loud_2669() {
         let _env = LeaseTestEnv::new();
 
+        // (#2672) `mark_loaded` after `write`: a "permanently claimed"
+        // sibling is genuinely mid-generation, never merely racing to
+        // acquire — MUST FIX 1's leader/follower exclusion must not apply
+        // here regardless of token order, so this retries-then-fails-loud
+        // guarantee must keep holding.
         let sibling_guard = residency_lease::LeaseGuard::acquire();
         sibling_guard.write(&["darkmux:m".to_string()]).expect("sibling writes its lease");
+        sibling_guard
+            .mark_loaded(&["darkmux:m".to_string()])
+            .expect("sibling confirms it is genuinely resident, not merely acquiring");
 
         let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
         let mut host = MockHost::new()
@@ -1162,6 +1242,149 @@ mod tests {
 
         drop(sibling_guard);
         drop(own_guard);
+    }
+
+    // ── #2672 MUST FIX 1: two racing ACQUIRERS must not mutually Block ──
+    //
+    // The regression a reviewer's adversarial probe proved live: #2669
+    // (above) correctly Blocks a Reconcile that would evict an ALREADY-
+    // LOADED sibling — but its guard also fired for two waves that BOTH
+    // merely INTEND to acquire the identical identifier, neither one
+    // loaded yet. Both write their lease before planning (existing #1487/
+    // #2651 discipline), each then sees the OTHER as an already-claimed
+    // pin, and both hit `Reason::ClaimedResidentInsufficientCtx` — where
+    // pre-#2669 both had simply succeeded. `identifiers_i_should_lead`
+    // (#2672) closes this: exactly one racing guard (the lowest-priority
+    // live holder) excludes the identifier from its own `pinned` set and
+    // proceeds with the real reconcile; the other keeps it pinned and
+    // takes the existing bounded retry-hold path, converging to a plain
+    // `Reuse` once the leader's reconcile lands.
+
+    /// A [`ModelHost`] both probe threads share, wrapping one [`MockHost`]
+    /// behind a mutex — the faithful model of production: two concurrent
+    /// `ensure_wave_loaded` callers (two ACP sessions, two `darkmux
+    /// dispatch` processes) each hold their OWN `LmsHost`/`Box<dyn
+    /// ModelHost>`, but both ultimately talk to the SAME real LMStudio
+    /// server. Two independent, unsynchronized `MockHost` instances would
+    /// miss that: the follower's retry-and-reuse convergence only works
+    /// because its `list_resident()` call can actually observe the
+    /// leader's completed reconcile.
+    #[derive(Clone)]
+    struct SharedMockHost(Arc<Mutex<MockHost>>);
+
+    impl ModelHost for SharedMockHost {
+        fn list_resident(&mut self) -> std::result::Result<Vec<ResidentFact>, HostError> {
+            self.0.lock().expect("shared mock host mutex poisoned").list_resident()
+        }
+        fn list_catalog(&mut self) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, HostError> {
+            self.0.lock().expect("shared mock host mutex poisoned").list_catalog()
+        }
+        fn load(
+            &mut self,
+            model_key: &str,
+            identifier: &str,
+            min_ctx: u32,
+            deadline: Deadline,
+        ) -> std::result::Result<darkmux_gestalt::LoadReport, HostError> {
+            self.0
+                .lock()
+                .expect("shared mock host mutex poisoned")
+                .load(model_key, identifier, min_ctx, deadline)
+        }
+        fn unload(
+            &mut self,
+            target: &darkmux_gestalt::OwnedTarget,
+            deadline: Deadline,
+        ) -> std::result::Result<(), HostError> {
+            self.0.lock().expect("shared mock host mutex poisoned").unload(target, deadline)
+        }
+    }
+
+    /// RED-PROVE, the reviewer's exact probe: two threads, a barrier
+    /// AFTER each writes its own lease for `["darkmux:m"]` (forcing both
+    /// to be symmetrically visible to each other at planning time — the
+    /// worst case), a shared host with `darkmux:m` resident at ctx
+    /// 32_000, and both waves wanting it at 68_000. Five runs, both
+    /// siblings must succeed on EVERY run — pre-#2672 (the #2669 guard
+    /// with no leader/follower distinction) this failed at least one side
+    /// on every run (`A ERR B ERR`, `A ERR B OK`, `B ERR A OK` ×2, `B ERR
+    /// A ERR` in the reviewer's own five); disabling the #2669 guard
+    /// entirely (the pre-#2669 baseline) gave `A OK B OK` every time —
+    /// this test proves #2672 restores that same "both OK" outcome
+    /// WITHOUT disabling the #2669 protection (the sibling-mid-generation
+    /// red-proves above still pass unmodified).
+    #[serial_test::serial]
+    #[test]
+    fn two_concurrent_same_process_acquirers_of_the_same_identifier_both_succeed_2672() {
+        for run in 0..5 {
+            let _env = LeaseTestEnv::new();
+            let shared_host =
+                SharedMockHost(Arc::new(Mutex::new(MockHost::new()
+                    .resident("darkmux:m", "m", 32_000, Some(1_000))
+                    .cataloged("m", 1_000))));
+            let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+            let wave = vec![placement("m", 68_000)];
+
+            // Both guards acquired BEFORE spawning, so token order (and
+            // therefore which side leads) is fixed per run but not
+            // predetermined across runs — either side may end up the
+            // leader; the assertion is symmetric on purpose.
+            let guard_a = residency_lease::LeaseGuard::acquire();
+            let guard_b = residency_lease::LeaseGuard::acquire();
+
+            // The reviewer's exact setup: each side writes its OWN lease
+            // for `["darkmux:m"]` FIRST — `ensure_wave_loaded` would do
+            // this same write as its own first action, so doing it here
+            // ahead of time (its own internal write then just repeats the
+            // identical content, a no-op difference) lets a barrier force
+            // the deterministic worst case: BOTH writes are guaranteed
+            // visible to EACH OTHER before either side's first planning
+            // pass, every run — never left to chance on which thread the
+            // OS schedules first.
+            let own_models = vec!["darkmux:m".to_string()];
+            guard_a.write(&own_models).expect("A writes its lease");
+            guard_b.write(&own_models).expect("B writes its lease");
+            let barrier = Barrier::new(2);
+
+            let result = std::thread::scope(|scope| {
+                let host_a = shared_host.clone();
+                let host_b = shared_host.clone();
+                let wave_a = wave.clone();
+                let wave_b = wave.clone();
+                let est_ref = &est;
+                let barrier_ref = &barrier;
+                let guard_a_ref = &guard_a;
+                let guard_b_ref = &guard_b;
+
+                let handle_a = scope.spawn(move || {
+                    let mut host_a = host_a;
+                    barrier_ref.wait();
+                    ensure_wave_loaded(&wave_a, est_ref, &mut host_a, guard_a_ref)
+                });
+                let handle_b = scope.spawn(move || {
+                    let mut host_b = host_b;
+                    barrier_ref.wait();
+                    ensure_wave_loaded(&wave_b, est_ref, &mut host_b, guard_b_ref)
+                });
+
+                (handle_a.join().expect("thread A joins"), handle_b.join().expect("thread B joins"))
+            });
+
+            drop(guard_a);
+            drop(guard_b);
+
+            let (a, b) = result;
+            assert!(a.is_ok(), "run {run}: sibling A must succeed: {:?}", a.err());
+            assert!(b.is_ok(), "run {run}: sibling B must succeed: {:?}", b.err());
+
+            let residents = shared_host.0.lock().expect("shared mock host mutex poisoned").residents.clone();
+            assert!(
+                residents
+                    .iter()
+                    .any(|r| r.identifier == "darkmux:m" && r.ctx >= 68_000),
+                "run {run}: darkmux:m must end up resident at a sufficient ctx: {residents:?}"
+            );
+        }
     }
 
     // ── #2663: same-process sibling protection ──────────────────────────
@@ -1432,6 +1655,72 @@ mod tests {
             .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::Load { .. }))
             .count();
         assert_eq!(load_attempts, 1, "no retry when nothing explains the shortfall as transient: {:?}", host.ops);
+    }
+
+    /// (#2672 CONSIDER 5) Conformance: the retry-hold at
+    /// `ensure_wave_loaded` is gated on the SPECIFIC `Reason::
+    /// ClaimedResidentInsufficientCtx { clearable: true, .. }` match, never
+    /// on "any `ClaimedResidentInsufficientCtx`, regardless of
+    /// `clearable`" (never mind "any `Action::Block`" at all). Two
+    /// placements in ONE wave sharing a model key but under DIFFERENT
+    /// identifiers (so `ensure_wave_loaded`'s own model_key+identifier
+    /// dedup does not collapse them) both resolve against the identical
+    /// stale resident; the second Blocks with `clearable: false` (a
+    /// same-plan collision — see `Reason::ClaimedResidentInsufficientCtx`'s
+    /// own doc) — this must fail on the FIRST attempt, never retried,
+    /// since no amount of waiting ever changes a deterministic re-plan of
+    /// the identical fixed input. Pins the exact boundary the #2672
+    /// narrowing checks: a mutant that widens the match to `Reason::
+    /// ClaimedResidentInsufficientCtx { .. }` (dropping the `clearable:
+    /// true` sub-pattern, retrying BOTH origins alike) would still pass
+    /// every #2669 red-prove above (all `clearable: true` fixtures) but
+    /// fails this one — it would see `ListResident` called
+    /// `BLOCKED_BY_HOLDER_RETRY_ATTEMPTS` times instead of once.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_never_retries_a_same_plan_collision_2672() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("shared".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:shared", "shared", 4_096, Some(1_000))
+            .cataloged("shared", 1_000);
+        // Same model_key, DIFFERENT identifiers — `ensure_wave_loaded`'s
+        // own dedup only collapses an EXACT (model_key, identifier) match,
+        // so both placements reach `plan_acquire` in the same call.
+        let wave = vec![
+            Placement {
+                model_key: "shared".into(),
+                identifier: "darkmux:shared".into(),
+                min_ctx: 8_000,
+                seat: "probe-a".into(),
+            },
+            Placement {
+                model_key: "shared".into(),
+                identifier: "custom-alias".into(),
+                min_ctx: 68_000,
+                seat: "probe-b".into(),
+            },
+        ];
+
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+            .expect_err("a same-plan collision is never satisfiable by waiting");
+        assert!(
+            err.to_string().contains("never resolve by waiting"),
+            "the error must name the real (non-clearable) reason: {err:#}"
+        );
+
+        let list_attempts = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::ListResident))
+            .count();
+        assert_eq!(
+            list_attempts, 1,
+            "a same-plan (clearable: false) collision must fail on the very first attempt, \
+             never retried: {:?}",
+            host.ops
+        );
     }
 
     /// The plan sketch's headline test: `run_bounded` respects
