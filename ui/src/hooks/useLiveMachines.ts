@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
-import type { CoverageMeta, FleetMachinesLiveResponse, PresenceBeat } from "../types/handwritten";
+import type { CoverageMeta, FleetMachinesLiveResponse, FleetRosterResponse, PresenceBeat, RosterMachineEntry } from "../types/handwritten";
 import { getSource } from "../lib/source";
 
 /** (#2067) The committed fleet snapshot a daemon-less build ships
@@ -57,6 +57,40 @@ export function useLiveMachines(enabled = true): Map<string, PresenceBeat> {
     }
     return map;
   }, [query.data]);
+}
+
+/**
+ * (#1855) The operator's DECLARED fleet roster — `GET /fleet/roster` —
+ * independent of presence. This is the other half of "rostered-but-silent
+ * machine vanishes entirely": `useLiveMachines` above can only ever report
+ * a machine that is CURRENTLY beating, so a machine the operator added and
+ * which is down, unreachable, or has never started its daemon was
+ * previously invisible to every consumer of this file. `cards.ts`'s
+ * `rosterOnlyEntries` reconciles this against the live/flow-derived uids so
+ * a machine that IS already accounted for (beating, or with flow history)
+ * is never double-reported.
+ *
+ * `enabled` (#1800 P2, same reasoning as `useLiveMachines`): a REPLAY must
+ * not consult the CURRENT roster over a past day — showing today's fleet
+ * membership against a recorded day is the same confidently-wrong class
+ * this file's other live-only hooks already guard against.
+ */
+export function useFleetRoster(enabled = true): RosterMachineEntry[] {
+  const query = useQuery({
+    enabled,
+    queryKey: queryKeys.fleetRoster(),
+    queryFn: () => fetchJson<FleetRosterResponse>("/fleet/roster"),
+    // Roster membership is local operator config, not a heartbeat — no need
+    // for the tight presence cadence. Polling at all (rather than fetching
+    // once) is what makes a `darkmux machine add` show up on an already-open
+    // page without a reload, same convenience `/runs` gives the lab count.
+    refetchInterval: PRESENCE_POLL_MS,
+  });
+  // `?? []` guards a malformed/shape-mismatched 200 the same way `runs`'s own
+  // query does (`FleetLens.tsx`'s own comment on that guard) — `ok: true`
+  // only proves the body parsed as JSON, not that it matches
+  // `FleetRosterResponse`.
+  return query.data?.ok ? (query.data.data.machines ?? []) : [];
 }
 
 /**

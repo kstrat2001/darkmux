@@ -68,6 +68,10 @@ function mockFleetFetch(opts: {
    * 404 (every pre-#1923 test in this file is unaffected), same pattern as
    * `specs` above. */
   runs?: unknown[];
+  /** (#1855) `GET /fleet/roster` entries — the operator's DECLARED
+   * topology. Omitted defaults to an empty roster (`error: null`), so
+   * every pre-#1855 test in this file is unaffected. */
+  roster?: unknown[];
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -100,6 +104,9 @@ function mockFleetFetch(opts: {
       if (path === "/runs") {
         if (opts.runs === undefined) return Promise.resolve(new Response("not recorded\n", { status: 404 }));
         return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs, generated_at_ms: 1 }), { status: 200 }));
+      }
+      if (path === "/fleet/roster") {
+        return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster ?? [], error: null }), { status: 200 }));
       }
       return Promise.resolve(new Response("not recorded\n", { status: 404 }));
     }),
@@ -781,6 +788,55 @@ describe("FleetLens", () => {
     expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("0%");
     // The hero moved too — the completion is no longer visible at tMin.
     expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("0");
+  });
+});
+
+// ── (#1855) a rostered-but-silent machine must still render a card ──
+//
+// Before this fix, the fleet card list was `machineUids(flowData,
+// liveMachines)` — a union of flow-derived uids and CURRENTLY-beating
+// presence keys, with no read of the operator's declared roster at all. A
+// machine added via `darkmux machine add` and never yet started (or down
+// right now, with zero flow history under its name) produced no uid for
+// either half of that union to find, so it vanished from the dashboard
+// entirely — indistinguishable from never having been added.
+describe("FleetLens — rostered-but-silent machine (#1855)", () => {
+  it("a machine on the roster with zero flow history and no live beat renders an offline card, not nothing", async () => {
+    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(screen.getByText("studio")).toBeInTheDocument();
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("offline");
+    // Reuses the SAME "offline"/`.absent` indicator a machine that WAS seen
+    // and has since gone quiet already renders with — no parallel "silent"
+    // vocabulary invented for this case (the project's "no snowflakes,
+    // shared indicators" rule).
+    expect(card.className).toContain("absent");
+  });
+
+  // The INVERTED case: a roster entry naming a machine that IS actually
+  // live must not draw a SECOND, duplicate "offline" card for the same
+  // machine beside its real one.
+  it("a roster entry matching a currently-live machine does not duplicate its card", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "studio", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelectorAll(".mach").length).toBe(1);
+    expect(document.querySelector(".mach")!.className).not.toContain("absent");
+  });
+
+  // A genuinely gone machine (never rostered, never beating, never in flow
+  // history) must not linger as if present — the roster fix must not make
+  // every machine render forever regardless of evidence.
+  it("a machine that is genuinely gone (not rostered, not beating, no flow history) renders no card at all", async () => {
+    mockFleetFetch();
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
+    expect(document.querySelector(".mach")).toBeNull();
   });
 });
 

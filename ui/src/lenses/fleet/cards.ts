@@ -26,8 +26,8 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
-import { nameOf, machineNames } from "../../lib/flow";
+import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import { nameOf, machineNames, machineUids } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
@@ -188,6 +188,36 @@ export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]):
  * post-#2060), and counting it again here would double-count it. */
 export function runningLabRunCount(machineRuns: Run[]): number {
   return machineRuns.filter((r) => r.kind === "lab" && r.status === "running").length;
+}
+
+/** (#1855) Which of the operator's DECLARED roster entries have NO known
+ * identity in this window at all — no flow record under that name, no live
+ * presence beat under it either. These are the entries the card list would
+ * otherwise drop silently: `machineUids` only ever unions flow-derived uids
+ * with CURRENTLY-beating presence keys, so a machine the operator added via
+ * `darkmux machine add` and which has never once started its daemon (or is
+ * down right now, with zero history) produces no uid for it to fall back
+ * on — the exact "rostered-but-silent machine vanishes entirely" defect.
+ *
+ * A roster entry IS excluded here — deliberately NOT double-reported —
+ * when its `id` matches any alias (`machineNames`) any known uid has ever
+ * used, whether that uid is currently beating or only has past flow
+ * history. Matching is exact-string against `machine_id`/`display_name`,
+ * the same identity contract `roster.rs::MachineEntry.id`'s own doc
+ * states ("what flow records carry as `machine_id`") — an operator who set
+ * `DARKMUX_MACHINE_ID` to match their roster entry's `id` gets no
+ * duplicate; the burden is naming the entry to match, not on this filter
+ * to guess at aliases it has no evidence for. */
+export function rosterOnlyEntries(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  roster: RosterMachineEntry[],
+): RosterMachineEntry[] {
+  const knownNames = new Set<string>();
+  for (const uid of machineUids(data, liveMachines)) {
+    for (const name of machineNames(data, liveMachines, uid)) knownNames.add(name);
+  }
+  return roster.filter((entry) => !knownNames.has(entry.id));
 }
 
 export interface FleetCard {

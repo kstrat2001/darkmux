@@ -423,6 +423,7 @@ pub(crate) fn build_router_full(
         .route("/icon-512-maskable.png", get(icon_512_maskable_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
+        .route("/fleet/roster", get(fleet_roster_handler))
         .route("/lab/runs", get(lab_runs_handler))
         .route("/lab/run/detail", get(lab_run_detail_handler))
         .route("/lab/run/events", get(lab_run_events_handler))
@@ -672,6 +673,49 @@ async fn fleet_machines_live_handler() -> impl IntoResponse {
 /// The literal every presence failure reports on the wire. Never the
 /// underlying error — see [`source_state`] on why `detail` excludes it.
 const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
+
+/// GET /fleet/roster (#1855) — the operator's DECLARED fleet topology
+/// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
+/// is beating right now.
+///
+/// This is what closes the "rostered-but-silent machine vanishes entirely"
+/// half of #1855: `/fleet/machines/live` only ever reports a machine that is
+/// currently publishing a presence beat, so a machine the operator
+/// deliberately added and which is down, unreachable, or has simply never
+/// started its daemon produced no card, no offline row, nothing — it read
+/// as though it had never been added. Roster membership is a SEPARATE
+/// question from liveness, and the viewer needs both to tell "not on my
+/// fleet" from "on my fleet, not answering right now".
+///
+/// Deliberately does NOT probe reachability — that is `darkmux machine list
+/// --deep`'s job, run explicitly by the operator against real network
+/// addresses. This route only reads a local JSON file and reports what is
+/// declared in it, per "darkmux describes, never adjudicates": it says what
+/// the operator's roster claims, not what darkmux verified about a peer's
+/// network reachability.
+///
+/// Never 500s. A missing file is an empty roster (`load_roster`'s own
+/// fresh-install contract, not an error); a PRESENT but corrupt file
+/// reports the parse failure in `error` rather than silently discarding the
+/// roster and answering as if nothing were ever added.
+async fn fleet_roster_handler() -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(darkmux_fleet::load_roster).await;
+    let (machines, error) = match result {
+        Ok(Ok(roster)) => (roster.machines.into_values().collect::<Vec<_>>(), None),
+        Ok(Err(e)) => {
+            eprintln!("darkmux serve: GET /fleet/roster — reading the roster failed ({e:#})");
+            (Vec::new(), Some(format!("{e:#}")))
+        }
+        Err(e) => {
+            eprintln!("darkmux serve: GET /fleet/roster task failed ({e})");
+            (Vec::new(), Some("internal error reading the fleet roster".to_string()))
+        }
+    };
+    axum::Json(serde_json::json!({
+        "machines": machines,
+        "error": error,
+    }))
+}
 
 /// Read one presence key-space, classifying the outcome instead of
 /// flattening it.

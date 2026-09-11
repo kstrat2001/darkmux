@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard } from "./cards";
-import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
+import { machActive, specOf, buildFleetCard, rosterOnlyEntries } from "./cards";
+import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
@@ -13,6 +13,10 @@ function rec(overrides: Partial<FlowRecord>): FlowRecord {
 
 function beat(overrides: Partial<PresenceBeat>): PresenceBeat {
   return { machine_uid: "u1", display_name: "studio", schema_version: "1.18.0", beat_ts_ms: 1, ...overrides };
+}
+
+function rosterEntry(overrides: Partial<RosterMachineEntry> & Pick<RosterMachineEntry, "id">): RosterMachineEntry {
+  return { address: "100.64.1.2:8765", added_unix_ms: 1000, ...overrides };
 }
 
 /** The playhead. `/next` has no scrubber, so it is always `tMax`; a value
@@ -357,5 +361,68 @@ describe("buildFleetCard", () => {
     const machineRuns: Run[] = [run({ id: "s1", kind: "dispatch", status: "running", machine: "u1" })];
     const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, new Map(), machineRuns);
     expect(card.runsCount).toBe(1);
+  });
+
+  // (#1855) A rostered-but-never-seen machine must render the SAME "offline"
+  // stat a machine that WAS seen and has since gone quiet already uses — the
+  // shared indicator vocabulary this project's "no snowflakes" rule asks
+  // for, rather than a new "silent"/"unknown" state. `entry.id` stands in
+  // for `m` directly, matching how `FleetLens.tsx` calls this for a roster
+  // entry with no known uid.
+  it("(#1855) a rostered entry with no known identity reads 'offline', not 'idle'", () => {
+    const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio", true, T_MAX);
+    expect(card.stat).toBe("offline");
+    expect(card.active).toBe(false);
+    expect(card.runsCount).toBe(0);
+    expect(card.name).toBe("studio");
+    // Never having reported hardware is honest, not a bug — darkmux has
+    // genuinely never heard from this machine.
+    expect(card.spec).toBe("");
+  });
+});
+
+describe("rosterOnlyEntries", () => {
+  // (#1855) THE defect this closes: `machineUids` only ever unions
+  // flow-derived uids with CURRENTLY-beating presence keys, so a roster
+  // entry with neither produced no uid for the card list to fall back on —
+  // the machine vanished from the dashboard entirely, indistinguishable
+  // from never having been added.
+  it("a roster entry with no flow record and no presence beat is reported roster-only", () => {
+    const roster = [rosterEntry({ id: "studio" })];
+    expect(rosterOnlyEntries([], new Map(), roster)).toEqual(roster);
+  });
+
+  // The INVERTED case, and the one that proves this doesn't just echo the
+  // roster back unfiltered: a machine that IS live (or has flow history)
+  // under the exact name the roster declares must NOT be reported here too
+  // — reporting it would draw a duplicate "offline" card next to its real,
+  // live one for the same machine.
+  it("a roster entry already covered by a live presence beat under the same name is excluded", () => {
+    const roster = [rosterEntry({ id: "studio" })];
+    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
+  });
+
+  // Same exclusion, but via flow history rather than live presence — a
+  // machine that has previously reported under this name (and might simply
+  // be between beats right now) is already covered by the ordinary
+  // `machineUids` union and must not ALSO get a roster-only phantom card.
+  it("a roster entry already covered by flow history under the same name is excluded", () => {
+    const roster = [rosterEntry({ id: "studio" })];
+    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
+    expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
+  });
+
+  // A mixed roster: one entry covered, one genuinely silent — only the
+  // silent one comes back. Proves the filter is per-entry, not all-or-none.
+  it("filters a mixed roster down to only the genuinely-unaccounted entries", () => {
+    const roster = [rosterEntry({ id: "studio" }), rosterEntry({ id: "mini-1" })];
+    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual([rosterEntry({ id: "mini-1" })]);
+  });
+
+  it("an empty roster reports nothing, on an otherwise busy fleet", () => {
+    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
+    expect(rosterOnlyEntries(data, new Map(), [])).toEqual([]);
   });
 });

@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { useFleetCoverage, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
+import { useFleetCoverage, useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS, T } from "../../lib/flow";
@@ -14,7 +14,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard } from "./cards";
+import { buildFleetCard, rosterOnlyEntries } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -391,6 +391,12 @@ export function FleetLens({
   // isolated test.
   const liveMachines = useLiveMachines(livePolling);
   const liveSessionIds = useLiveSessionIds(livePolling);
+  // (#1855) The operator's DECLARED roster, gated the same way as presence
+  // above — a replay must not assert the CURRENT roster over a past day.
+  // See `rosterOnlyEntries`'s own doc for how this is reconciled with the
+  // presence/flow-derived uids so a machine that's already accounted for
+  // (beating, or with flow history under this name) is never duplicated.
+  const roster = useFleetRoster(livePolling);
   // (#2067) A static build cannot poll presence, so its cards' hardware line
   // comes from the committed fleet snapshot instead — spec lookup ONLY;
   // presence at the playhead still derives from the records.
@@ -504,10 +510,17 @@ export function FleetLens({
     [flowWindow.data, liveSessionIds, nowMs, liveMode],
   );
   const uids = useMemo(() => machineUids(flowWindow.data, liveMachines), [flowWindow.data, liveMachines]);
+  // (#1855) The roster entries with NO known identity anywhere in this
+  // window — not beating, no flow history under this name either. See
+  // `rosterOnlyEntries`'s own doc.
+  const rosterOnly = useMemo(
+    () => rosterOnlyEntries(flowWindow.data, liveMachines, roster),
+    [flowWindow.data, liveMachines, roster],
+  );
 
   const cards = useMemo(
-    () =>
-      uids.map((m) =>
+    () => [
+      ...uids.map((m) =>
         buildFleetCard(
           flowWindow.data,
           liveMachines,
@@ -524,7 +537,33 @@ export function FleetLens({
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
         ),
       ),
-    [uids, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs],
+      // (#1855) A rostered entry with no known identity is, by definition,
+      // not currently beating — `machAbsent` is forced `true` rather than
+      // derived through `machPresent` (which would answer `null`/"unknown"
+      // for a uid it has never heard of, not `false`/"absent"). Forcing it
+      // is what renders these on the SAME "offline" stat/CSS branch a
+      // machine that WAS seen and has since gone quiet already uses — the
+      // shared indicator this project's "no snowflakes" rule asks for,
+      // rather than a new vocabulary for "silent". `entry.id` doubles as
+      // the card's `uid`: a roster entry carries no hardware uid (it is
+      // declared before the machine has ever proven one), and `id` is
+      // already the identity `nameOf`/`specOf` fall back to for an unknown
+      // `m` — see those functions' own docs.
+      ...rosterOnly.map((entry) =>
+        buildFleetCard(
+          flowWindow.data,
+          liveMachines,
+          specs,
+          liveSet,
+          /* machAbsent */ true,
+          entry.id,
+          liveMode,
+          playheadT,
+          specBeats,
+        ),
+      ),
+    ],
+    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs],
   );
 
   const timeline = useMemo(

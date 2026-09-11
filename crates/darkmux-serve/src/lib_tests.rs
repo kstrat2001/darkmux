@@ -630,6 +630,81 @@
         assert!(body["meta"]["sources"]["fleet"]["state"].is_string(), "coverage state must be reported");
     }
 
+    /// GET /fleet/roster (#1855) — the declared topology, independent of
+    /// presence. This is the endpoint the "rostered-but-silent machine
+    /// vanishes entirely" fix reads: a machine the operator added via
+    /// `darkmux machine add` must be nameable even when it has never once
+    /// beaten and has zero flow records, and this is the only place that
+    /// data can come from — `/fleet/machines/live` structurally cannot
+    /// answer it (presence-only by design).
+    #[tokio::test]
+    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+    async fn fleet_roster_reports_a_rostered_machine_that_has_never_beaten() {
+        let tmp = TempDir::new().unwrap();
+        let roster_path = tmp.path().join("fleet.json");
+        fs::write(
+            &roster_path,
+            r#"{"version":"2","machines":{"studio":{"id":"studio","address":"100.64.1.2:8765","description":"hub","added_unix_ms":1000}}}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+        }
+
+        assert!(body["error"].is_null(), "a valid roster file must not report an error: {body}");
+        let machines = body["machines"].as_array().expect("machines must be an array");
+        assert_eq!(machines.len(), 1, "the rostered-but-never-beaten machine must still appear: {body}");
+        assert_eq!(machines[0]["id"], "studio");
+        assert_eq!(machines[0]["address"], "100.64.1.2:8765");
+    }
+
+    /// The inverted case: no roster file at all (the fresh-install/
+    /// standalone-machine default) must answer an EMPTY roster with no
+    /// error, not a 500 or a fabricated entry. `load_roster`'s own contract
+    /// (missing file ⇒ empty roster) is what this pins at the HTTP layer.
+    #[tokio::test]
+    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+    async fn fleet_roster_is_empty_and_errorless_when_no_roster_file_exists() {
+        let tmp = TempDir::new().unwrap(); // deliberately no fleet.json inside
+        let roster_path = tmp.path().join("fleet.json");
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+        }
+
+        assert!(body["error"].is_null(), "a missing roster file is not an error: {body}");
+        assert_eq!(
+            body["machines"].as_array().expect("machines must be an array").len(),
+            0,
+            "no roster file must mean zero machines, not a fabricated one: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn machine_status_returns_200_with_structured_body() {
         // The handler calls into `lms::list_loaded()`, which shells out to

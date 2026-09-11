@@ -62,6 +62,27 @@ export interface FleetSessionsLiveResponse {
   meta: CoverageMeta;
 }
 
+/** One machine in the operator's DECLARED fleet roster — `darkmux machine
+ * add`'s `fleet.json`, keyed by the operator-chosen `id` (what flow records
+ * carry as `machine_id`), not a hardware uid. Source:
+ * `crates/darkmux-fleet/src/roster.rs::MachineEntry`. */
+export interface RosterMachineEntry {
+  id: string;
+  address: string;
+  description?: string | null;
+  added_unix_ms: number;
+}
+
+/** `GET /fleet/roster` (#1855) — the declared topology, independent of
+ * presence. `error` is non-null only when a roster file EXISTS but failed
+ * to parse (an operator hand-edit gone wrong); a missing file is an empty
+ * roster with `error: null` (the fresh-install/standalone default).
+ * Source: `crates/darkmux-serve/src/lib.rs::fleet_roster_handler`. */
+export interface FleetRosterResponse {
+  machines: RosterMachineEntry[];
+  error: string | null;
+}
+
 /** One presence beat. (The endpoint wraps these in `FleetMachinesLiveResponse`
  * since #1729; this is the element type.) A REAL typed
  * struct, but one that lives in `darkmux-flow` rather than `darkmux-serve`.
