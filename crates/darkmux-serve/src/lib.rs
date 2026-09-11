@@ -1787,9 +1787,21 @@ enum GraphSource {
 /// always `200` — a mission with phases but no task/step graph still
 /// returns a (phases-only) graph with `legacy: true` + a `note`, never an
 /// error (item 6).
+///
+/// This route is also the one `peer_graph::fetch_peer_graph_json` calls on
+/// a PEER — a request this same handler, on THAT machine, receives and
+/// answers identically. The belt-and-braces relay guard (#1466 gate MUST
+/// FIX 1) lives at the top of this function precisely because of that
+/// symmetry: an incoming request already carrying
+/// `peer_graph::PEER_RELAY_HEADER` is one that already crossed one peer
+/// hop, and this handler never lets it try `try_peer_graph` again — capping
+/// the worst case at exactly one hop even across a multi-peer attribution
+/// cycle, which the self-machine check inside `peer_graph` alone doesn't
+/// cover.
 async fn mission_graph_json_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if !is_valid_catalog_id(&id) {
         return (
@@ -1799,6 +1811,13 @@ async fn mission_graph_json_handler(
             .into_response();
     }
     let id_owned = id.clone();
+    // (#1466 gate MUST FIX 1, belt-and-braces) An INCOMING request that
+    // already carries `peer_graph::PEER_RELAY_HEADER` is one this daemon
+    // (or a peer's own copy of it) already relayed once — never relay it
+    // a second time. Read off the request BEFORE the blocking task so the
+    // header (peer-controlled input) never rides into the closure as
+    // anything but a plain `bool`.
+    let already_relayed = headers.contains_key(peer_graph::PEER_RELAY_HEADER);
     // (#1432 item 4) The flow-record backfill folds completed steps' finalized
     // token/turn totals into graph.json at page load — read from the daemon's
     // flows_dir once, off the async runtime.
@@ -1813,7 +1832,7 @@ async fn mission_graph_json_handler(
             // that's already being polled.
             None => {
                 let fleet = fleet_flow_records();
-                match peer_graph::try_peer_graph(&id_owned, &flows_dir, &fleet.records) {
+                match peer_graph::try_peer_graph(&id_owned, &flows_dir, &fleet.records, already_relayed) {
                     Some(graph) => Ok(GraphSource::Peer(graph)),
                     None => Ok(GraphSource::NotFound),
                 }

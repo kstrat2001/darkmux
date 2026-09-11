@@ -510,8 +510,25 @@ pub fn peer_mission_runs(
 ///
 /// Deliberately answers for ANY mission id, including a LOCAL one (no
 /// `known_mission_ids` filter) — `peer_graph::try_peer_graph` only calls
-/// this after its own local disk lookup already came back empty, so a
-/// non-`None` result here is by construction never this machine's own.
+/// this after its own local disk lookup already came back empty.
+///
+/// **This does NOT mean a non-`None` result is never this machine's own**
+/// (an earlier revision of this doc claimed exactly that, and it was
+/// false — #1466 gate MUST FIX 1). A flow record can name THIS machine as
+/// `machine_id` for a mission that is no longer on THIS machine's disk —
+/// cleared, pruned, or a `DARKMUX_HOME` mismatch between the process that
+/// ran it and the daemon reading it now, i.e. exactly the state this
+/// attribution-based lookup exists to recover from. darkmux's own docs
+/// (`docs/guide/always-on-hub.html`, `skills/darkmux-add-machine/SKILL.md`)
+/// tell every operator to register this machine in its own roster at
+/// `127.0.0.1:8765`, and a machine always beats its own presence — so
+/// without a separate guard, that self-attributed case would classify as
+/// a live, dialable peer and the daemon would fetch its own route,
+/// recursing. `peer_graph::try_peer_graph` is the caller that owns
+/// guarding against this (comparing the returned machine against
+/// `darkmux_flow::resolve_machine_id()` before ever treating it as a
+/// peer) — this function stays a pure attribution lookup and makes no
+/// promise about who the answer names.
 pub(crate) fn mission_owner_machine(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
