@@ -48,6 +48,20 @@
 //! mutation — including one that unwinds through a panic — leave the
 //! registry and the on-disk file consistent.
 //!
+//! **That made the on-disk FILE correct — it did not, by itself, make a
+//! same-process sibling's LIVE dispatch safe from this process's own
+//! reconcile.** [`live_leased_models`] excludes `own_pid` by construction
+//! (see its own doc below), which is right for a single-dispatch process
+//! but meant a caller using it alone (the bare free function) would never
+//! see a same-process sibling's contribution — correctly written into the
+//! on-disk union — as pinned. That gap (#2662 review, tracked as #2663)
+//! is closed by [`LeaseGuard::all_live_leased_models`]: the
+//! same-process-INCLUSIVE read every `AcquireOpts.pinned` computation
+//! should use instead of the bare free function, unioning
+//! [`live_leased_models`] with every OTHER currently-live guard's own
+//! contribution to [`ACTIVE_LEASES`] (excluding the calling guard's own
+//! token, so a guard never pins its own placement against itself).
+//!
 //! # `lms ps` stays the truth
 //!
 //! This registry is a subordinate BUSY-OVERLAY, never authoritative for
@@ -158,6 +172,52 @@ impl LeaseGuard {
         active.insert(self.token, models.to_vec());
         let union = union_of(&active);
         write_lease_file(self.pid, &union)
+    }
+
+    /// Every `darkmux:*` model id leased by ANY other LIVE holder this
+    /// guard should treat as pinned — other PROCESSES (via
+    /// [`live_leased_models`]) UNIONED with every other SAME-PROCESS
+    /// holder's own contribution to [`ACTIVE_LEASES`], excluding this
+    /// guard's own token (#2663).
+    ///
+    /// [`live_leased_models`] alone is the gap #2663 closes: it excludes
+    /// `own_pid` by construction (see its own doc — a process must never
+    /// see its OWN lease as something to protect itself from), which is
+    /// correct for a single-dispatch process but wrong the moment a
+    /// SECOND concurrent in-process holder exists (`darkmux acp` running
+    /// two overlapping `session/prompt` tasks, say). #2651 already made
+    /// that second holder's contribution visible in the on-disk union —
+    /// correct for an OTHER process's `live_leased_models(own_pid)` read —
+    /// but nothing in THIS process ever consulted it, so a live
+    /// same-process sibling could still be evicted mid-generation by a
+    /// wave reconciling in the SAME process. This method is that missing
+    /// same-process-inclusive read.
+    ///
+    /// Excludes `self.token` so a guard never sees ITS OWN just-written
+    /// contribution as something to pin against itself — a guard's own
+    /// desired placement is already accounted for by the caller's own
+    /// planning input (the wave's own desired-set), never by being
+    /// externally "pinned"; self-inclusion would make a wave unable to
+    /// ever supersede its own prior placement when it legitimately needs
+    /// to change what model it holds.
+    ///
+    /// A same-process holder that has actually DROPPED (its dispatch
+    /// finished, withdrew, or panicked — `Drop` runs on every exit path,
+    /// #2651) is no longer in [`ACTIVE_LEASES`] at all, so its models
+    /// never appear here: withdrawal is real, never "pinned forever".
+    pub fn all_live_leased_models(&self) -> Vec<String> {
+        let mut models = live_leased_models(self.pid);
+        let active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        for (token, sibling_models) in active.iter() {
+            if *token == self.token {
+                continue;
+            }
+            models.extend(sibling_models.iter().cloned());
+        }
+        drop(active);
+        models.sort();
+        models.dedup();
+        models
     }
 }
 
@@ -637,5 +697,123 @@ mod tests {
 
         drop(survivor);
         assert!(!path.exists(), "the lease file is removed once the survivor itself drops");
+    }
+
+    // ── #2663: same-process-inclusive read ──────────────────────────────
+
+    /// `all_live_leased_models` must union THREE sources into one pinned
+    /// set — a genuinely live OTHER process's on-disk lease, a genuinely
+    /// live SAME-PROCESS sibling guard's in-memory contribution — while
+    /// excluding the CALLING guard's own just-written contribution, so it
+    /// never pins its own about-to-be-superseded placement against
+    /// itself.
+    #[serial_test::serial]
+    #[test]
+    fn all_live_leased_models_unions_cross_process_and_same_process_siblings_excluding_self() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let dir = residency_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        // A genuinely live OTHER process's on-disk lease (a real spawned
+        // child, not a hand-picked constant — same discipline the
+        // cross-process tests above use).
+        let mut holder = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawning a short-lived holder process");
+        let holder_pid = holder.id();
+        let cross_process_lease = LeaseFile {
+            pid: holder_pid,
+            models: vec!["darkmux:cross-process".to_string()],
+        };
+        fs::write(lease_path(&dir, holder_pid), serde_json::to_string(&cross_process_lease).unwrap())
+            .expect("hand-writing a lease for the external holder pid");
+
+        // A genuinely live SAME-PROCESS sibling.
+        let sibling = LeaseGuard::acquire();
+        sibling.write(&["darkmux:sibling".to_string()]).unwrap();
+
+        // The CALLING guard's own contribution — must never appear in its
+        // own result.
+        let calling = LeaseGuard::acquire();
+        calling.write(&["darkmux:calling-own".to_string()]).unwrap();
+
+        let mut models = calling.all_live_leased_models();
+        models.sort();
+        assert_eq!(
+            models,
+            vec!["darkmux:cross-process".to_string(), "darkmux:sibling".to_string()],
+            "must include the cross-process lease AND the same-process sibling's lease, while \
+             excluding the calling guard's own just-written contribution: {models:?}"
+        );
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// Withdrawal (INVERTED direction, #2663): once a same-process
+    /// sibling's guard has actually DROPPED, its model must no longer
+    /// appear as pinned — a lease that never releases pins memory
+    /// forever, the exact failure `residency_lease` exists to prevent.
+    #[serial_test::serial]
+    #[test]
+    fn all_live_leased_models_stops_pinning_a_same_process_sibling_once_it_drops() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        let calling = LeaseGuard::acquire();
+        calling.write(&["darkmux:calling-own".to_string()]).unwrap();
+
+        {
+            let withdrawing = LeaseGuard::acquire();
+            withdrawing.write(&["darkmux:withdrawing".to_string()]).unwrap();
+            assert_eq!(
+                calling.all_live_leased_models(),
+                vec!["darkmux:withdrawing".to_string()],
+                "while still held, the sibling's model is pinned"
+            );
+        } // `withdrawing` drops here.
+
+        assert!(
+            calling.all_live_leased_models().is_empty(),
+            "once the sibling's guard drops, its model must no longer be pinned"
+        );
+    }
+
+    /// Panic path (#2663): a same-process sibling that panics mid-dispatch
+    /// still releases ONLY its own contribution via `Drop` during unwind
+    /// (#2651's guarantee, exercised here through the new same-process-
+    /// inclusive read) — a genuinely live survivor stays pinned, and the
+    /// panicked holder's contribution is gone from the calling guard's
+    /// own view once its `Drop` has run.
+    #[serial_test::serial]
+    #[test]
+    fn all_live_leased_models_after_a_same_process_sibling_panics_keeps_the_survivor_drops_the_doomed(
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        let calling = LeaseGuard::acquire();
+        calling.write(&["darkmux:calling-own".to_string()]).unwrap();
+
+        let survivor = LeaseGuard::acquire();
+        survivor.write(&["darkmux:survivor".to_string()]).unwrap();
+
+        let unwound = std::panic::catch_unwind(|| {
+            let doomed = LeaseGuard::acquire();
+            doomed.write(&["darkmux:doomed".to_string()]).unwrap();
+            panic!("simulated mid-dispatch panic (#2663 panic-path proof)");
+        });
+        assert!(unwound.is_err(), "precondition: the simulated panic must actually have unwound");
+
+        assert_eq!(
+            calling.all_live_leased_models(),
+            vec!["darkmux:survivor".to_string()],
+            "the survivor stays pinned; the panicked holder's contribution is gone (its Drop ran \
+             during unwind) and the calling guard's own contribution is excluded"
+        );
+
+        drop(survivor);
     }
 }
