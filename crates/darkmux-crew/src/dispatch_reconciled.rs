@@ -563,7 +563,21 @@ mod tests {
         // reached the real primitive rather than stopping short.
         let err = result.expect_err("an unknown role fails at the raw dispatch primitive, not before it");
         let msg = format!("{err:#}");
-        assert!(msg.contains("this-role-does-not-exist-2628"), "{msg}");
+        // Two failures prove the same thing, and which one surfaces depends
+        // on the machine rather than on this crate. With Docker present the
+        // primitive gets as far as the role lookup and names the role. With
+        // Docker absent — every `macos-latest` runner — the primitive's own
+        // preflight bails first and names Docker. Either way the error came
+        // from `crate::dispatch::dispatch`, which is the wiring this test
+        // exists to pin; asserting only the role name made it pass locally
+        // and fail in CI for a reason that had nothing to do with the fix.
+        let named_the_role = msg.contains("this-role-does-not-exist-2628");
+        let named_the_runtime_precondition = msg.contains("requires Docker");
+        assert!(
+            named_the_role || named_the_runtime_precondition,
+            "the failure must come from the raw dispatch primitive (role lookup \
+             or its Docker preflight), not from the reconcile layer: {msg}"
+        );
     }
 
     /// Mirrors `residency_lease::residency_dir()`'s private path
