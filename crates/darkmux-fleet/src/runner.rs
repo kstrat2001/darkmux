@@ -321,9 +321,19 @@ fn handle_claimed_job(client: &redis::Client, claimed: ClaimedJob) {
     // `RUNNER_DISPATCH_IN_FLIGHT`'s own docs. The flag goes false the
     // instant `dispatch()` returns, not when this whole function (ack
     // included) finishes.
+    //
+    // (#2628) `dispatch_reconciled`, not the raw `crew::dispatch::dispatch`
+    // primitive: `runner_main`'s claim/dispatch/ack loop (above) is
+    // strictly serial — one claimed job dispatched at a time, never
+    // concurrently with another job in this same process — so this is
+    // exactly the single-writer shape `dispatch_reconciled`'s lease-write
+    // contract requires. Gives a queue-claimed job the same Exclusive-
+    // reconcile + #1487 residency-lease protection a `darkmux dispatch`
+    // CLI verb or mission step gets, closing the gap #1509's own doc
+    // named as a follow-up for this runner.
     let dispatch_result = {
         let _in_flight = DispatchInFlightGuard::new();
-        darkmux_crew::dispatch::dispatch(opts)
+        darkmux_crew::dispatch_reconciled::dispatch_reconciled(opts)
     };
 
     match dispatch_result {

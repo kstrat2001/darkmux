@@ -412,13 +412,23 @@ pub fn build_work_job(
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it locally via the raw
-/// `crew::dispatch::dispatch` primitive — the pre-#1509 behavior, and still
-/// what every caller other than the `darkmux dispatch` CLI verb wants
-/// (`phase_cli`'s QA-gate dispatch, `mission_propose`, `notebook` — #1509's
-/// scope is the CLI verb only; those three are a named follow-up, see
-/// `dispatch_as_crew_of_one`'s module doc). Thin wrapper over
-/// [`dispatch_routed_via`]; see that function's doc for the full routing
-/// contract.
+/// `crew::dispatch::dispatch` primitive — the pre-#1509, pre-#2628
+/// behavior. This is the THIN WRAPPER's own default and stays the raw
+/// primitive for every caller that reaches it: `phase_cli`'s QA-gate
+/// dispatch is reached only from `MissionVerifyStepKind::run()`, an
+/// already-wave-protected `StepKind` whose `seat()` has already resolved
+/// residency for the WHOLE wave via `resolve_local_seat` — routing it
+/// through `darkmux_crew::dispatch_reconciled::dispatch_reconciled`
+/// instead would independently Exclusive-reconcile against a single
+/// placement the scheduler already reconciled as part of a larger wave,
+/// evicting concurrent wave siblings this call can't see (see that
+/// module's own doc for the full hazard). `mission_propose` and `notebook
+/// draft` are standalone (non-wave, non-`StepKind`) callers that DO want
+/// #2628's Exclusive-reconcile + #1487 lease protection — they call
+/// [`dispatch_routed_via`] directly with `dispatch_reconciled` as the
+/// injected `local_dispatch`, rather than through this wrapper. Thin
+/// wrapper over [`dispatch_routed_via`]; see that function's doc for the
+/// full routing contract.
 pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
     dispatch_routed_via(opts, dispatch::dispatch)
 }
@@ -427,10 +437,14 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 /// (and isn't the local machine), publish to the single global work queue
 /// and (if `--wait`) block on the runner's `dispatch.complete` flow
 /// record. Otherwise fall through to `local_dispatch` — a caller-injected
-/// LOCAL execution primitive (#1509). Every caller except the `darkmux
-/// dispatch` CLI verb passes the raw `crew::dispatch::dispatch` primitive
-/// (via the [`dispatch_routed`] thin wrapper, unchanged pre-#1509 behavior);
-/// the CLI verb passes `darkmux_crew::dispatch_as_crew_of_one::
+/// LOCAL execution primitive (#1509). `phase_cli`'s QA-gate dispatch passes
+/// the raw `crew::dispatch::dispatch` primitive via the [`dispatch_routed`]
+/// thin wrapper (unchanged pre-#1509 behavior — see that wrapper's doc for
+/// why it stays raw); `mission_propose` and `notebook draft` call this
+/// function directly with `darkmux_crew::dispatch_reconciled::
+/// dispatch_reconciled` (#2628 — Exclusive-reconcile + a #1487 lease for a
+/// standalone, non-wave dispatch); the CLI verb passes
+/// `darkmux_crew::dispatch_as_crew_of_one::
 /// dispatch_as_crew_of_one`, which runs the SAME primitive wrapped in a
 /// crew-of-one Mission/Phase/Task/Step graph through `run_step_graph` — a
 /// first-class run whose residency participates in the #1487 lease/

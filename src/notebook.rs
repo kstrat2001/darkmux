@@ -112,9 +112,10 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
         )
     } else {
         // (#2463) `notebook draft`'s dispatch (`dispatch_draft_via_internal`
-        // below, via `crate::fleet::dispatch_routed` -> the plain
-        // `dispatch()` primitive `darkmux dispatch` itself uses) installs
-        // no signal handling at all — the #2262 gap, unfixed here. The
+        // below, via `crate::fleet::dispatch_routed_via` -> `dispatch_reconciled`,
+        // #2628 — not the raw `dispatch()` primitive `darkmux dispatch`'s
+        // CLI-verb path uses) installs no signal handling at all — the
+        // #2262 gap, unfixed here. The
         // call already gets its own `dispatch.error` bookend from
         // `DispatchBookendGuard`, and the docker path already self-kills
         // on a caught signal via the trajectory tailer's
@@ -210,8 +211,18 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
     };
-    let result = crate::fleet::dispatch_routed(opts)
-        .context("internal-runtime dispatch for notebook draft")?;
+    // (#2628) Standalone (non-wave, non-`StepKind`) dispatch — routed
+    // through `dispatch_routed_via` directly with `dispatch_reconciled`
+    // as the injected `local_dispatch`, rather than through the
+    // `dispatch_routed` thin wrapper (which stays the raw primitive for
+    // `phase_cli`'s already-wave-protected caller — see that wrapper's
+    // doc). Gives this dispatch the same Exclusive-reconcile + #1487
+    // lease protection the CLI verb and mission engine already have.
+    let result = crate::fleet::dispatch_routed_via(
+        opts,
+        crate::crew::dispatch_reconciled::dispatch_reconciled,
+    )
+    .context("internal-runtime dispatch for notebook draft")?;
     if result.exit_code != 0 {
         bail!(
             "internal-runtime notebook draft failed (exit {}): {}",
