@@ -393,12 +393,18 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  *   start/end span, but not process-exclusive to it: since schema 1.42.0
  *   / #2413, `machine.telemetry` is a single MACHINE-scoped sampler with
  *   no `session_id` to join on, so the samples inside that window are the
- *   whole machine's readings during that span, host-wide (#2647 tracks
- *   giving that window real process exclusivity, or being explicit in the
- *   UI that it can't have any). The daemon's own window spans unrelated
- *   time before/after it; only `now` is overridden by the daemon's live
- *   reading when present, since the daemon is always the freshest possible
- *   "right this instant" number.
+ *   whole machine's readings during that span, host-wide. #2647 weighed
+ *   making that window genuinely process-exclusive against being explicit
+ *   in the UI that it can't have any — the former would mean reintroducing
+ *   the per-dispatch sampler #2413 retired specifically for its cost
+ *   (37,455 records/day) and for violating the observer-must-not-perturb-
+ *   the-observed doctrine, so #2647 lands on the latter: every surface
+ *   that names this scope (this doc, the footnote below, and the gauges'
+ *   own `aria-label`s — see `gaugeAriaScope` in `useMachineStatsContent`)
+ *   says "host-wide," not exclusive to this dispatch. The daemon's own
+ *   window spans unrelated time before/after it; only `now` is overridden
+ *   by the daemon's live reading when present, since the daemon is always
+ *   the freshest possible "right this instant" number.
  * - Every other route — mission included, per #2559: a mission route has no
  *   server-side join to bound it to a window at all, so it takes this same
  *   branch as fleet/console/runs/playback — the daemon's `window` IS the
@@ -412,11 +418,11 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  *
  * The boolean param is named for what it actually gates (a dispatch
  * route's own time-windowed join — narrower than the rolling window every
- * other route uses, though not process-exclusive within that window; see
- * #2647), not for which routes call it `true` — kept generic rather than
- * importing `Route` here, since the decision of WHICH routes pass `true`
- * belongs to the caller (`useMachineStatsContent`'s `isDispatch`), not to
- * this merge rule.
+ * other route uses, though not process-exclusive within that window, per
+ * #2647's resolution above), not for which routes call it `true` — kept
+ * generic rather than importing `Route` here, since the decision of WHICH
+ * routes pass `true` belongs to the caller (`useMachineStatsContent`'s
+ * `isDispatch`), not to this merge rule.
  */
 export function effectiveHostAggregate(
   isDispatch: boolean,
@@ -601,6 +607,24 @@ export function useMachineStatsContent({
     !isDispatch && daemonLoad != null
       ? daemonWindowLabel(daemonLoad.window?.span_ms ?? 0)
       : scope.scopeLabel;
+  // (#2647) The gauges' `aria-label`s are a SECOND surface naming this same
+  // scope, reachable without ever passing through the footnote text node —
+  // a screen-reader user tabbing straight to a gauge hears only this
+  // string. `role="img"` on the SVG (`Meter.tsx`) means assistive tech
+  // announces the label alone, not the numerals drawn inside it, so on a
+  // dispatch route the label is the ENTIRE scope claim that reader gets.
+  // Bare `scopeLabel` ("this dispatch") makes exactly the false
+  // process-exclusivity implication the #2559 review fix pass corrected in
+  // the footnote (`meterFootnote` below) and in this file's own doc
+  // comments, but left standing here — since #2413, the samples inside a
+  // dispatch route's join window are the whole machine's, not that one
+  // process's (see `effectiveHostAggregate`'s doc and #2647). Every other
+  // route's `scopeLabel` already carries no ownership claim to correct
+  // (mission dropped "this mission" in #2559; fleet/console/runs/playback
+  // never had one), so this only branches on `isDispatch`.
+  const gaugeAriaScope = isDispatch
+    ? `${scopeLabel}'s window, host-wide`
+    : scopeLabel;
   // (#2270, narrowed to dispatch-only by #2559) `HostExtras` (below) renders
   // thermal/power/energy off `daemonLoad` DIRECTLY, unconditionally on every
   // route — see that component's own doc for why (those readings are never
@@ -655,7 +679,7 @@ export function useMachineStatsContent({
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
-        ariaLabel={`CPU: ${scopeLabel}`}
+        ariaLabel={`CPU: ${gaugeAriaScope}`}
         {...compactMeterProps(
           "CPU",
           "mm-gauge-fill-compact",
@@ -667,7 +691,7 @@ export function useMachineStatsContent({
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
-        ariaLabel={`GPU: ${scopeLabel}`}
+        ariaLabel={`GPU: ${gaugeAriaScope}`}
         {...compactMeterProps(
           "GPU",
           "mm-gauge-fill-compact",
@@ -679,7 +703,7 @@ export function useMachineStatsContent({
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
-        ariaLabel={`MEM: ${scopeLabel}`}
+        ariaLabel={`MEM: ${gaugeAriaScope}`}
         warnAt={MEM_WARN_AT}
         criticalAt={MEM_CRITICAL_AT}
         {...compactMeterProps(

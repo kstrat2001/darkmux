@@ -864,6 +864,21 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
       document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
     expect(footnoteText).not.toContain("this mission");
     expect(footnoteText).toContain("Measured over last 2 min · daemon sampler");
+
+    // (#2647) A mission route's gauges were never given a false ownership
+    // claim to correct (their window IS the daemon's genuinely-host-wide
+    // ring, unlike a dispatch route's join) — `gaugeAriaScope` must be a
+    // no-op here, matching `scopeLabel` byte for byte rather than growing
+    // a universal ", host-wide" suffix that would read as redundant noise
+    // on every non-dispatch route.
+    const gaugeLabels = Array.from(
+      document.querySelectorAll("svg[role='img']"),
+    ).map((svg) => svg.getAttribute("aria-label"));
+    expect(gaugeLabels).toEqual([
+      "CPU: last 2 min · daemon sampler",
+      "GPU: last 2 min · daemon sampler",
+      "MEM: last 2 min · daemon sampler",
+    ]);
   });
 
   it("(#2270) on a dispatch route, the footnote names the dispatch scope for the gauges and the daemon ring for thermal/power/energy separately", async () => {
@@ -889,6 +904,47 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(footnoteText).toContain("host-wide");
     expect(footnoteText).toContain("a different window");
     expect(footnoteText).toContain("last 2 min");
+  });
+
+  /** (#2647) The footnote is one DOM node a reader can skip past — a
+   * screen-reader user tabbing straight to a gauge hears ONLY its own
+   * `aria-label` (`role="img"` on the SVG means assistive tech announces
+   * the label, not the numerals drawn inside it; see `Meter.tsx`). Before
+   * this fix, that label was the bare `scopeLabel` ("this dispatch"),
+   * making exactly the false process-exclusivity implication the #2559
+   * review fix pass had already corrected in the footnote text — reachable
+   * without ever encountering the corrected sentence. Pins that every
+   * gauge's label carries the same "host-wide" qualifier the footnote
+   * does, and that none of them assert bare ownership. */
+  it("(#2647) on a dispatch route, each gauge's aria-label also says host-wide — not just the footnote", async () => {
+    stubDaemonFetch();
+    render(
+      <MachineDrawer
+        route={{ kind: "dispatch", dispatchId: "d1" }}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await waitFor(() => expect(screen.getByText("56%")).toBeInTheDocument());
+    const gaugeLabels = Array.from(
+      document.querySelectorAll("svg[role='img']"),
+    ).map((svg) => svg.getAttribute("aria-label"));
+    expect(gaugeLabels).toEqual([
+      "CPU: this dispatch's window, host-wide",
+      "GPU: this dispatch's window, host-wide",
+      "MEM: this dispatch's window, host-wide",
+    ]);
+    // The exact bare claim this fix removes — pinned as a negative so a
+    // future regression back to `scopeLabel` (not `gaugeAriaScope`) fails
+    // loudly here rather than only in the harder-to-notice string above.
+    expect(gaugeLabels.some((l) => l === "CPU: this dispatch")).toBe(false);
   });
 
   /** (#2270 review, narrowed by #2559) The split sentence's SECOND half
