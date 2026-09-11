@@ -187,6 +187,13 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Bounded {
         });
     }
     drop(eof_tx);
+    // (#2479 audit) `Instant`, deliberately: `started` bounds THIS spawned
+    // child (an operator's `test_command`), not wall-clock time. Same
+    // reasoning as its sibling in `gestalt_host::lms_host` — if the host
+    // sleeps mid-command, the child is suspended right along with it, so
+    // no progress was possible and none should count against the budget.
+    // See the audit at `dispatch_internal.rs`'s inactivity deadline for
+    // the full two-bucket classification this follows.
     let started = Instant::now();
     let outcome = loop {
         match child.try_wait() {

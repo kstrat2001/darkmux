@@ -393,6 +393,18 @@ fn collect_within(rx: &std::sync::mpsc::Receiver<String>, cap: Duration) -> Stri
 /// load-bearing: a chatty child that fills the OS pipe buffer would
 /// otherwise block forever and read as a timeout. Post-exit collection is
 /// total-bounded per stream by [`PIPE_GRACE`] ([`collect_within`]).
+///
+/// (#2479 audit) The `deadline`/`start.elapsed()` wait loop below is
+/// `Instant`-based, deliberately, not a bug: `deadline` bounds ONE
+/// `lms load`/`lms unload` call — `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` —
+/// which guards against a hung *child process*, not against the wall
+/// clock. If the host sleeps mid-call, the spawned `lms` child is
+/// suspended right along with the host (same machine, same sleep) — it
+/// has not hung, it has not made LESS progress than the elapsed budget
+/// implies, so nothing should count against it while asleep. This is the
+/// "process activity" bucket from the #2479 audit, same shape as the
+/// dispatch inactivity watchdog just above it in that audit and the acp
+/// idle-exit fix (#1781).
 /// Whether a spawned program is LM Studio's CLI (`lms`, or any path ending
 /// in it, which is what `lms_bin` overrides look like).
 fn is_lms_program(program: &str) -> bool {

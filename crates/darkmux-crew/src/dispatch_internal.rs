@@ -5636,6 +5636,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // forwarded into the container above (`DockerRunConfig.
     // inactivity_timeout_seconds`) rather than re-resolving, so both sides
     // can't disagree about the budget when `--timeout` overrides it.
+    // (#2479 audit) `Instant`, deliberately, not a bug: this deadline
+    // meters the DISPATCH'S OWN PROOF-OF-WORK, not wall-clock elapsed
+    // time. If the host machine sleeps mid-dispatch, the container's
+    // Docker Desktop VM suspends with it — nothing runs, so nothing SHOULD
+    // count against the budget, exactly the "process activity" bucket
+    // from the #2479 audit (same shape as the acp idle-exit fix, #1781: a
+    // process that was not running is not idle either). Converting this
+    // to wall clock would fire the watchdog on a healthy dispatch the
+    // instant the operator's laptop woke up from an afternoon nap.
     let inactivity_secs = inactivity_timeout_seconds;
     let inactivity_deadline = Arc::new(Mutex::new(
         Instant::now() + Duration::from_secs(inactivity_secs),
