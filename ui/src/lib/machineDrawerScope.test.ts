@@ -56,6 +56,25 @@ describe("resolveDrawerScope (#2107)", () => {
     expect(s.samples.map((p) => p.cpu)).toEqual([3]);
   });
 
+  // (PR #2646 CONSIDER 2) `rollingWindowSamples`'s `uid == null` branch
+  // disables the machine filter entirely — it is documented as "unfiltered
+  // when `uid` is unresolved" (this module's own doc, above), not "show
+  // nothing". Pre-existing on the rolling branch, and the mission route is
+  // strictly better off than before #2559 (which had no window at all), so
+  // this is not a regression — but nothing pinned the DIRECTION of the
+  // fallback for any route before this test: with `localUid` null (a
+  // daemon build before `/machine/specs` resolves, or that endpoint
+  // failing/returning no id), a mission-route drawer averages a peer
+  // machine's GPU into "this machine"'s gauges. #2647 tracks the
+  // dispatch-route host-wide-sample gap; this is the SAME shape of gap on
+  // the localUid side, reachable on any non-dispatch route.
+  it("(#2646 CONSIDER 2) with no known local uid, a mission route's rolling window does NOT filter by machine — a peer's sample leaks in alongside the local one", () => {
+    const now = Date.parse("2026-01-01T00:10:00Z");
+    const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine"), proc("2026-01-01T00:09:30Z", 11, "this-machine")];
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
+    expect(s.samples.map((p) => p.cpu)).toEqual([99, 11]);
+  });
+
   it("on every other route, rolls a last-10-minute window of the live tail", () => {
     const now = Date.parse("2026-01-01T00:20:00Z");
     const rolling = [

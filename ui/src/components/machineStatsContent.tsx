@@ -387,27 +387,36 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  * meters render — a pure function so the merge rule is unit-testable
  * without mounting anything.
  *
- * - Dispatch route: `avg`/`high`/`p95` stay the dispatch's OWN samples (that
- *   scope IS the run's own record set — the daemon's window spans unrelated
- *   time before/after it); only `now` is overridden by the daemon's live
+ * - Dispatch route: `avg`/`high`/`p95` stay the aggregate from this
+ *   dispatch's own JOIN WINDOW (`join_host_samples_into_session_records`,
+ *   `crates/darkmux-serve/src/lib.rs`) — bounded to this dispatch's own
+ *   start/end span, but not process-exclusive to it: since schema 1.42.0
+ *   / #2413, `machine.telemetry` is a single MACHINE-scoped sampler with
+ *   no `session_id` to join on, so the samples inside that window are the
+ *   whole machine's readings during that span, host-wide (#2647 tracks
+ *   giving that window real process exclusivity, or being explicit in the
+ *   UI that it can't have any). The daemon's own window spans unrelated
+ *   time before/after it; only `now` is overridden by the daemon's live
  *   reading when present, since the daemon is always the freshest possible
  *   "right this instant" number.
  * - Every other route — mission included, per #2559: a mission route has no
- *   server-side join to genuinely scope it, so it takes this same branch as
- *   fleet/console/runs/playback — the daemon's `window` IS the aggregate
- *   (mean → avg, max → high, p95 → p95), and `now` comes from the daemon
- *   too — the daemon samples continuously regardless of whether a dispatch
- *   happens to be running, so it is always the more current answer than a
- *   rolling slice of flow records.
+ *   server-side join to bound it to a window at all, so it takes this same
+ *   branch as fleet/console/runs/playback — the daemon's `window` IS the
+ *   aggregate (mean → avg, max → high, p95 → p95), and `now` comes from the
+ *   daemon too — the daemon samples continuously regardless of whether a
+ *   dispatch happens to be running, so it is always the more current answer
+ *   than a rolling slice of flow records.
  * - No daemon `load` at all (older daemon, disabled sampler, or the fetch
  *   hasn't resolved yet): unchanged fallback to the dispatch-derived
  *   aggregate — today's pre-#2107 behavior, byte for byte.
  *
- * The boolean param is named for what it actually gates (a dispatch route's
- * genuinely-scoped samples), not for which routes call it `true` — kept
- * generic rather than importing `Route` here, since the decision of WHICH
- * routes pass `true` belongs to the caller (`useMachineStatsContent`'s
- * `isDispatch`), not to this merge rule.
+ * The boolean param is named for what it actually gates (a dispatch
+ * route's own time-windowed join — narrower than the rolling window every
+ * other route uses, though not process-exclusive within that window; see
+ * #2647), not for which routes call it `true` — kept generic rather than
+ * importing `Route` here, since the decision of WHICH routes pass `true`
+ * belongs to the caller (`useMachineStatsContent`'s `isDispatch`), not to
+ * this merge rule.
  */
 export function effectiveHostAggregate(
   isDispatch: boolean,
@@ -884,10 +893,13 @@ export function useMachineStatsContent({
   // the SAME value the Load section shows rather than asserting a figure it
   // cannot back. Rendered last so it reads as a footnote to the whole panel.
   //
-  // (#2270) On a dispatch route, `scopeLabel` ("this dispatch") is TRUE for
-  // the gauges' avg/max — `scope.samples` really is that run's own records
-  // — but thermal/power/energy are not that run's records at all;
-  // `HostExtras` reads `daemonLoad` directly, the same rolling ring every
+  // (#2270) On a dispatch route, `scopeLabel` ("this dispatch") is TRUE as
+  // a WINDOW claim for the gauges' avg/max — `scope.samples` is bounded to
+  // that run's own start/end span — but it is not a process-exclusivity
+  // claim: the samples inside that window are host-wide since #2413 (see
+  // `effectiveHostAggregate`'s own doc and #2647). Thermal/power/energy are
+  // not even windowed to this run at all; `HostExtras` reads `daemonLoad`
+  // directly, the same rolling ring every
   // other route uses (see that component's own doc). A dispatch that ran
   // above-nominal for 1h47m can only ever show up to the ring's own ceiling
   // (10 min), so "measured over this dispatch" on that number claims a
@@ -914,7 +926,7 @@ export function useMachineStatsContent({
   const meterFootnote = scopeLabel ? (
     <div className="machine-drawer__footnote">
       {isDispatch && extrasWindowLabel != null
-        ? `Measured over ${scopeLabel} — each gauge's avg and max. Thermal, power and energy are not this dispatch's; they come from the daemon's host-wide sampler and cover its last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+        ? `Measured over ${scopeLabel}'s window — each gauge's avg and max, host-wide. Thermal, power and energy cover a different window: the daemon's host-wide sampler's last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
         : `Measured over ${scopeLabel} — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
     </div>
   ) : null;

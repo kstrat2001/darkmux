@@ -885,9 +885,10 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     await waitFor(() => expect(screen.getByText("56%")).toBeInTheDocument());
     const footnoteText =
       document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
-    expect(footnoteText).toContain("Measured over this dispatch");
-    expect(footnoteText).toContain("not this dispatch's");
-    expect(footnoteText).toContain("cover its last 2 min");
+    expect(footnoteText).toContain("Measured over this dispatch's window");
+    expect(footnoteText).toContain("host-wide");
+    expect(footnoteText).toContain("a different window");
+    expect(footnoteText).toContain("last 2 min");
   });
 
   /** (#2270 review, narrowed by #2559) The split sentence's SECOND half
