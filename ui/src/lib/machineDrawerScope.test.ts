@@ -12,13 +12,6 @@ const proc = (ts: string, cpu: number, machine_uid?: string): FlowRecord => ({
 });
 
 describe("resolveDrawerScope (#2107)", () => {
-  it("on a mission route, scopes to the mission's own route records and labels it", () => {
-    const routeRecords = [proc("2026-01-01T00:00:00Z", 10), proc("2026-01-01T00:00:02Z", 20)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
-    expect(s.scopeLabel).toBe("this mission");
-    expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
-  });
-
   it("on a dispatch route, scopes to the dispatch's own route records and labels it", () => {
     const routeRecords = [proc("2026-01-01T00:00:00Z", 5)];
     const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, routeRecords, [], null, Date.parse("2026-01-01T00:00:00Z"));
@@ -26,10 +19,60 @@ describe("resolveDrawerScope (#2107)", () => {
     expect(s.samples.map((p) => p.cpu)).toEqual([5]);
   });
 
-  it("mission/dispatch route records are sorted chronologically regardless of input order", () => {
+  it("dispatch route records are sorted chronologically regardless of input order", () => {
     const routeRecords = [proc("2026-01-01T00:00:04Z", 40), proc("2026-01-01T00:00:00Z", 0)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, [], null, 0);
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, routeRecords, [], null, 0);
     expect(s.samples.map((p) => p.cpu)).toEqual([0, 40]);
+  });
+
+  // (#2559) A mission route used to sit in the SAME branch as dispatch,
+  // scoped straight off `routeRecords` — on the premise that `routeRecords`
+  // was already that mission's own record set. It never was (see
+  // `machineDrawerScope.ts`'s own module doc): the caller hands it the
+  // plain live window on a mission route. So a mission route now takes the
+  // SAME rolling-window path as fleet/console/every other non-dispatch
+  // route. This is the INVERTED case of the dispatch tests above — proving
+  // `routeRecords` is now IGNORED for a mission route, not merely relabeled.
+  it("(#2559) on a mission route, routeRecords is IGNORED — the rolling window supplies the samples instead", () => {
+    const now = Date.parse("2026-01-01T00:10:00Z");
+    // A mission's own (fake, pre-#2559-shaped) routeRecords — must NOT
+    // appear in the result.
+    const routeRecords = [proc("2026-01-01T00:00:00Z", 999)];
+    // The rolling window's own last-10-minute sample — MUST appear.
+    const rolling = [proc("2026-01-01T00:09:00Z", 42)];
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, rolling, null, now);
+    expect(s.scopeLabel).toBe(DRAWER_ROLLING_SCOPE_LABEL);
+    expect(s.samples.map((p) => p.cpu)).toEqual([42]);
+  });
+
+  it("(#2559) a mission route's rolling window still respects the 10-minute cutoff and the local machine uid, exactly like fleet", () => {
+    const now = Date.parse("2026-01-01T00:20:00Z");
+    const rolling = [
+      proc("2026-01-01T00:05:00Z", 1, "this-machine"), // 15 min ago — outside the window
+      proc("2026-01-01T00:19:00Z", 2, "peer-machine"), // inside the window, wrong machine
+      proc("2026-01-01T00:19:30Z", 3, "this-machine"), // inside, right machine
+    ];
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, "this-machine", now);
+    expect(s.samples.map((p) => p.cpu)).toEqual([3]);
+  });
+
+  // (PR #2646 CONSIDER 2) `rollingWindowSamples`'s `uid == null` branch
+  // disables the machine filter entirely — it is documented as "unfiltered
+  // when `uid` is unresolved" (this module's own doc, above), not "show
+  // nothing". Pre-existing on the rolling branch, and the mission route is
+  // strictly better off than before #2559 (which had no window at all), so
+  // this is not a regression — but nothing pinned the DIRECTION of the
+  // fallback for any route before this test: with `localUid` null (a
+  // daemon build before `/machine/specs` resolves, or that endpoint
+  // failing/returning no id), a mission-route drawer averages a peer
+  // machine's GPU into "this machine"'s gauges. #2647 tracks the
+  // dispatch-route host-wide-sample gap; this is the SAME shape of gap on
+  // the localUid side, reachable on any non-dispatch route.
+  it("(#2646 CONSIDER 2) with no known local uid, a mission route's rolling window does NOT filter by machine — a peer's sample leaks in alongside the local one", () => {
+    const now = Date.parse("2026-01-01T00:10:00Z");
+    const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine"), proc("2026-01-01T00:09:30Z", 11, "this-machine")];
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
+    expect(s.samples.map((p) => p.cpu)).toEqual([99, 11]);
   });
 
   it("on every other route, rolls a last-10-minute window of the live tail", () => {
@@ -60,10 +103,21 @@ describe("resolveDrawerScope (#2107)", () => {
 });
 
 describe("lastKnown (#2107 phone feedback)", () => {
-  it("is null on the mission/dispatch branch even when samples is empty", () => {
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], [], null, 0);
+  it("is null on the dispatch branch even when samples is empty", () => {
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, [], [], null, 0);
     expect(s.samples).toEqual([]);
     expect(s.lastKnown).toBeNull();
+  });
+
+  // (#2559) A mission route is no longer paired with dispatch here — it now
+  // takes the rolling branch, so `lastKnown` CAN be populated for it, the
+  // same as fleet/console, unlike the dispatch case just above.
+  it("(#2559) a mission route with an empty rolling window still finds a last-known sample outside it", () => {
+    const now = Date.parse("2026-01-01T01:00:00Z");
+    const rolling = [proc("2026-01-01T00:20:00Z", 70)]; // 40 min ago — outside the 10-min window
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
+    expect(s.samples).toEqual([]);
+    expect(s.lastKnown?.point.cpu).toBe(70);
   });
 
   it("is null on the rolling branch when the window has real samples", () => {
@@ -137,9 +191,18 @@ describe("machine.telemetry recognition (#2413)", () => {
     expect(found?.point.cpu).toBe(40);
   });
 
-  it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first", () => {
+  it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first, on a dispatch route", () => {
     const routeRecords = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
+    const s = resolveDrawerScope({ kind: "dispatch", dispatchId: "d1" }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
+    expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
+  });
+
+  // (#2559) The same mixed-shape fold-in, but through the rolling-window
+  // path a mission route now takes.
+  it("a mixed window of old telemetry.process and new machine.telemetry records both fold in, oldest first, on a mission route's rolling window", () => {
+    const now = Date.parse("2026-01-01T00:00:02Z");
+    const rolling = [machineTelemetry("2026-01-01T00:00:02Z", 20), proc("2026-01-01T00:00:00Z", 10)];
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], rolling, null, now);
     expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
   });
 });

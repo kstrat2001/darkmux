@@ -1,18 +1,46 @@
 /**
  * (#2107) Pure scope resolution for the global machine drawer/modal — which
- * `telemetry.process` samples the CPU/GPU/MEM meters aggregate, and what to
- * call that window.
+ * `telemetry.process`/`machine.telemetry` samples the CPU/GPU/MEM meters
+ * aggregate, and what to call that window.
  *
  * Two windows, per the operator's own scope rule:
- * - On a mission (`#mission=<id>`) or dispatch (`#dispatch=<sid>`) route,
- *   the window is THAT mission's/dispatch's own samples — live while
- *   running, and naturally frozen once it stops (no new samples arrive, so
- *   the aggregate simply stops changing; no separate "frozen" flag needed).
- * - On every other route, the window is a ROLLING last-10-minutes tail of
- *   the live flow window, scoped to the local machine only (a hub serving
- *   a fleet's flow stream carries every peer's `telemetry.process` records
- *   too — the pill reads "machine", singular, so it must not average
- *   another box's GPU into this one's number).
+ * - On a dispatch (`#dispatch=<sid>`) route, the window is bounded to THAT
+ *   dispatch's own start/end span — live while running, and naturally
+ *   frozen once it stops (no new samples arrive within the span, so the
+ *   aggregate simply stops changing; no separate "frozen" flag needed).
+ *   The caller's `routeRecords` for a dispatch route is the daemon's
+ *   `/flow-session/<id>` fetch, which time+machine-joins the MACHINE-scoped
+ *   `machine.telemetry` sampler's records into that window server-side
+ *   (`join_host_samples_into_session_records`,
+ *   `crates/darkmux-serve/src/lib.rs`). Since schema 1.42.0 / #2413 that
+ *   sampler carries no `session_id` (or any other dispatch-identifying
+ *   field) at all, so the join genuinely bounds the WINDOW to this
+ *   dispatch but not the SAMPLES to it — they're the whole machine's
+ *   readings during that span, host-wide; #2647 tracks that gap.
+ * - On EVERY other route — including a mission (`#mission=<id>`) route — the
+ *   window is a ROLLING last-10-minutes tail of the live flow window, scoped
+ *   to the local machine only (a hub serving a fleet's flow stream carries
+ *   every peer's host-sample records too — the pill reads "machine",
+ *   singular, so it must not average another box's GPU into this one's
+ *   number).
+ *
+ * (#2559) A mission route used to sit in the FIRST bucket above too, on the
+ * premise that the caller's `routeRecords` was already that mission's own
+ * scoped record set. It never was: `useRouteRecords` (`hooks/useRouteRecords
+ * .ts`) has no mission branch, so a mission route's `routeRecords` resolves
+ * to the plain live rolling window — unfiltered by mission, by machine, or
+ * even by a 10-minute cutoff. And since #2413 retired the per-dispatch
+ * `telemetry.process` sampler in favor of ONE machine-scoped
+ * `machine.telemetry` sampler (which carries no `mission_id` — a mission can
+ * span many machines and dispatches, so there is no single id to stamp), a
+ * mission-scoped fix can't be a client-side id filter even in principle: it
+ * would need the SAME server-side time+machine join the dispatch route gets,
+ * generalized to resolve a mission's window across however many sessions and
+ * machines it spans. That join is real, unbuilt work (`join_host_samples_
+ * into_session_records` is gated on `field == "session_id"` and stays that
+ * way here). Until it exists, a mission route gets the same honest,
+ * genuinely-computed rolling window every other non-dispatch route gets,
+ * labeled the same way — never a "this mission" claim the data can't back.
  *
  * Kept separate from the React component so the scope decision is testable
  * without rendering anything.
@@ -82,10 +110,12 @@ export interface DrawerScope {
   /** (#2107 phone feedback) Set only when `samples` is empty on the
    * ROLLING branch — a dashboard reading "— avg — max" three times over
    * with no other information is not a state, it is a missing one. `null`
-   * on the mission/dispatch branch always (that scope IS the dispatch's
-   * own full record set already — there is no separate "last known"
-   * outside it) and on the rolling branch when nothing was ever seen for
-   * this machine within the lookback window either. */
+   * on the dispatch branch always (that scope is bounded to the dispatch's
+   * own start/end window already — there is no separate "last known"
+   * outside it) and
+   * on the rolling branch (every other route, mission included — see the
+   * module doc's #2559 note) when nothing was ever seen for this machine
+   * within the lookback window either. */
   lastKnown: LastKnownSample | null;
 }
 
@@ -130,10 +160,18 @@ export function resolveDrawerScope(
   localUid: string | null,
   nowMs: number,
 ): DrawerScope {
-  if (route.kind === "mission" || route.kind === "dispatch") {
+  // (#2559) A mission route is deliberately NOT here — see the module doc.
+  // Only a dispatch route's `routeRecords` is genuinely bounded to that
+  // run's own time window (the server-side time+machine join makes it so
+  // — though the samples inside that window are still host-wide, not
+  // process-exclusive; see the module doc's #2647 note); a mission
+  // route's `routeRecords` is the plain live window, and filtering it here
+  // with no id/time/machine bound would just be the same unscoped window
+  // wearing a "this mission" label.
+  if (route.kind === "dispatch") {
     const scoped = routeRecords.filter(isHostSampleRecord).sort((a, b) => T(a.ts) - T(b.ts));
     return {
-      scopeLabel: route.kind === "mission" ? "this mission" : "this dispatch",
+      scopeLabel: "this dispatch",
       samples: scoped.map(toPoint),
       lastKnown: null,
     };

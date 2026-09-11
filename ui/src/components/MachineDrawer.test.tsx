@@ -238,13 +238,22 @@ describe("MachineDrawer (#2107)", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("scopes to the mission's own samples and label when on a mission route", () => {
-    const missionRecords = [proc("2026-01-01T00:00:00Z", 30, 55, 40)];
+  // (#2559) A mission route no longer claims "this mission" for the gauges
+  // — `routeRecords` on a mission route is the plain live window, never
+  // that mission's own scoped set (see `machineDrawerScope.ts`'s module
+  // doc), so the gauges take the SAME honest rolling-window path every
+  // other non-dispatch route does. `routeRecords` here is deliberately a
+  // DIFFERENT (fake, would-be-mission-only) reading than the rolling
+  // window's own sample — proving it is genuinely ignored, not merely
+  // relabeled while still secretly read.
+  it("(#2559) on a mission route, scopes to the rolling window (routeRecords is ignored) and labels it honestly", () => {
+    const rolling = [proc("2026-01-01T00:19:00Z", 30, 55, 40)]; // 1 min before NOW — inside the 10-min window
+    const ignoredRouteRecords = [proc("2026-01-01T00:00:00Z", 1, 2, 3)];
     render(
       <MachineDrawer
         route={{ kind: "mission", missionId: "m1", stepId: null }}
-        routeRecords={missionRecords}
-        flowWindow={[]}
+        routeRecords={ignoredRouteRecords}
+        flowWindow={rolling}
         localUid={null}
         nowMsOverride={NOW}
         liveMachines={new Map()}
@@ -254,9 +263,10 @@ describe("MachineDrawer (#2107)", () => {
       />,
     );
     openDesktop();
-    expect(
-      document.querySelector(".machine-drawer__footnote")!.textContent,
-    ).toContain("this mission");
+    const footnoteText =
+      document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
+    expect(footnoteText).not.toContain("this mission");
+    expect(footnoteText).toContain("last 10 min");
     expect(
       document.querySelector('[data-meter="gpu"] .meter-now')?.textContent,
     ).toBe("55%");
@@ -487,13 +497,15 @@ describe("MachineDrawer — idle state (no samples)", () => {
     expect(screen.getByText(/MEM 30%/)).toBeInTheDocument();
   });
 
-  it("a mission with real samples never shows the idle line", () => {
-    const missionRecords = [proc("2026-01-01T00:00:00Z", 30, 55, 40)];
+  // (#2559) The mission's samples now come from the rolling window
+  // (`flowWindow`), not `routeRecords` — see the sibling test above.
+  it("a mission with real samples (in the rolling window) never shows the idle line", () => {
+    const rolling = [proc("2026-01-01T00:19:00Z", 30, 55, 40)]; // 1 min before NOW
     render(
       <MachineDrawer
         route={{ kind: "mission", missionId: "m1", stepId: null }}
-        routeRecords={missionRecords}
-        flowWindow={[]}
+        routeRecords={[]}
+        flowWindow={rolling}
         localUid={null}
         liveMachines={new Map()}
         specs={null}
@@ -803,14 +815,23 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(document.querySelector(".meter-row")).not.toBeNull();
   });
 
-  it("on a mission route, `now` still comes from the daemon while avg/max keep the mission's own scope label", async () => {
+  // (#2559) A mission route used to keep its own "this mission" scope
+  // label for avg/max while only `now` was overridden by the daemon — on
+  // the premise that `routeRecords` really was that mission's own record
+  // set. It never was (see `machineDrawerScope.ts`'s module doc), so a
+  // mission route now takes the SAME daemon-window branch as fleet: avg,
+  // max AND `now` all come from `daemonLoad`, and `routeRecords` is
+  // ignored entirely — proven here by giving it a DIFFERENT (would-be
+  // mission) sample than the daemon reports, and asserting the daemon's
+  // numbers win, not the ignored one.
+  it("(#2559) on a mission route, avg/max/now all come from the daemon's own window, not from routeRecords", async () => {
     stubDaemonFetch();
-    const missionRecords = [proc("2026-01-01T00:00:00Z", 30, 55, 40)];
+    const ignoredRouteRecords = [proc("2026-01-01T00:00:00Z", 30, 55, 40)];
 
     render(
       <MachineDrawer
         route={{ kind: "mission", missionId: "m1", stepId: null }}
-        routeRecords={missionRecords}
+        routeRecords={ignoredRouteRecords}
         flowWindow={[]}
         localUid={null}
         liveMachines={new Map()}
@@ -822,34 +843,27 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     );
     openDesktop();
 
-    // The body's `now` reading is overridden to the daemon's 56%, even
-    // though the mission's own last sample was GPU 55%.
+    // `now` = the daemon's own GPU reading (56%), same as before.
     await waitFor(() => expect(screen.getByText("56%")).toBeInTheDocument());
 
-    // Gauge scope label stays the mission's own — the "sampler cost" kv
-    // row is a non-mission/non-dispatch-only affordance, unaffected by
-    // #2270 below (it never claimed a mission scope to begin with).
-    expect(
-      document.querySelector(".machine-drawer__footnote")!.textContent,
-    ).toContain("this mission");
-    expect(screen.queryByText(/sampler cost/)).toBeNull();
-    // avg/max stay the mission's OWN dispatch-derived numbers (55, the
-    // single sample's own value), not the daemon's window (50/60).
-    expect(screen.getByText(/55% avg/)).toBeInTheDocument();
+    // avg/max ALSO come from the daemon's window (GPU mean=50, max=60) now
+    // — not the ignored routeRecords sample's 55.
+    expect(screen.getByText(/50% avg/)).toBeInTheDocument();
+    expect(screen.getByText(/60% max/)).toBeInTheDocument();
+    expect(screen.queryByText(/55% avg/)).toBeNull();
 
-    // (#2270) Thermal/power/energy are NOT the mission's own records —
-    // `HostExtras` reads `daemonLoad` directly on every route, so those
-    // three rows are still the daemon ring's rolling window here, exactly
-    // like a non-mission route. The footnote used to claim "this mission"
-    // for them too (a scope the reading never had, and one that silently
-    // caps at the ring's 10-minute ceiling for any longer mission) — it
-    // must now name the ring's own window instead, honestly, alongside
-    // (not instead of) the mission scope it correctly keeps for the
-    // gauges.
+    // The "sampler cost" row is a non-dispatch-only affordance now — a
+    // mission route gets it too, exactly like fleet/console, since the
+    // daemon is genuinely supplying the aggregate here.
+    expect(kvValue("sampler cost")).toBe("4.2 ms/sample");
+
+    // The footnote no longer claims "this mission" anywhere — it is
+    // byte-identical to the single-sentence form every other daemon-backed
+    // non-dispatch route gets, naming the daemon's own real window.
     const footnoteText =
       document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
-    expect(footnoteText).toContain("not this mission's");
-    expect(footnoteText).toContain("cover its last 2 min");
+    expect(footnoteText).not.toContain("this mission");
+    expect(footnoteText).toContain("Measured over last 2 min · daemon sampler");
   });
 
   it("(#2270) on a dispatch route, the footnote names the dispatch scope for the gauges and the daemon ring for thermal/power/energy separately", async () => {
@@ -871,22 +885,27 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     await waitFor(() => expect(screen.getByText("56%")).toBeInTheDocument());
     const footnoteText =
       document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
-    expect(footnoteText).toContain("Measured over this dispatch");
-    expect(footnoteText).toContain("not this dispatch's");
-    expect(footnoteText).toContain("cover its last 2 min");
+    expect(footnoteText).toContain("Measured over this dispatch's window");
+    expect(footnoteText).toContain("host-wide");
+    expect(footnoteText).toContain("a different window");
+    expect(footnoteText).toContain("last 2 min");
   });
 
-  /** (#2270 review) The split sentence's SECOND half describes the
-   * thermal/power/energy rows — which only exist when there is a daemon
-   * reading. With none (an older daemon, `runtime.host_sampler_interval_ms:
-   * 0`, an unreachable one, or a poll that hasn't resolved), gating the
-   * split on `isMissionOrDispatch` ALONE made both halves resolve to the
-   * run's own scope, so one sentence said thermal/power/energy were "not
-   * this mission's" and then that they were measured "over this mission" —
-   * wrong in both directions at once, about rows that are not even on the
-   * page. The footnote must fall back to its single-sentence form here,
-   * byte for byte the same text every other daemon-less route gets. */
-  it("(#2270) on a mission route with NO daemon load, the footnote keeps the single-sentence form instead of contradicting itself", async () => {
+  /** (#2270 review, narrowed by #2559) The split sentence's SECOND half
+   * describes the thermal/power/energy rows — which only exist when there
+   * is a daemon reading. This "contradiction" scenario (`isMissionOrDispatch`
+   * gating the split on ANY reading, so a load-less mission route said
+   * thermal/power/energy were "not this mission's" and then that they were
+   * measured "over this mission" in the same breath) could only happen on
+   * a route the split branch actually took. #2559 removed mission from
+   * that branch entirely — a mission route never takes the split sentence
+   * now, load-less or not — so the scenario this test guarded against is
+   * no longer reachable for mission. What's still worth pinning: a mission
+   * route with no daemon load renders its OWN rolling-window numbers (not
+   * the ignored `routeRecords`) and the exact single-sentence text every
+   * other daemon-less non-dispatch route gets, with no residual "this
+   * mission" wording anywhere. */
+  it("(#2559) on a mission route with NO daemon load, the footnote is the honest single-sentence rolling-window form", async () => {
     // An older daemon: `/machine/resources` resolves fine, but carries no
     // `load` block at all, so `useDaemonLoad` returns null on a settled
     // query rather than merely a pending one.
@@ -895,8 +914,8 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     render(
       <MachineDrawer
         route={{ kind: "mission", missionId: "m1", stepId: null }}
-        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
-        flowWindow={[]}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 1, 2, 3)]}
+        flowWindow={[proc("2026-01-01T00:19:00Z", 30, 55, 40)]}
         localUid={null}
         liveMachines={new Map()}
         specs={null}
@@ -919,7 +938,8 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
-    // The mission's own numbers, unoverridden — no daemon `now` to take.
+    // The rolling window's own numbers — not the ignored `routeRecords`
+    // sample (2%/3%).
     expect(screen.getByText(/55% avg/)).toBeInTheDocument();
     // No thermal/power/energy row on the page for a second sentence to
     // describe, so there must not be one.
@@ -928,7 +948,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(
       document.querySelector(".machine-drawer__footnote")!.textContent,
     ).toBe(
-      "Measured over this mission — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.",
+      "Measured over last 10 min — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.",
     );
   });
 
@@ -972,13 +992,15 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(screen.queryByText(/last 2 min/)).toBeNull();
   });
 
-  /** (#2270 review) The two tests above run against a fixture whose
-   * thermal, power and energy are all null, so neither ever co-observes
-   * the split sentence with the rows it describes. This one populates all
-   * three: the sentence's claim ("not this mission's; ... cover its last
-   * 7 min") is asserted alongside the rendered rows themselves, at a span
-   * that is not the file's default 2 min. */
-  it("(#2270 review) on a mission route the split sentence's window matches the thermal/power rows actually rendered beside it", async () => {
+  /** (#2270 review, narrowed to dispatch by #2559) This fixture (thermal,
+   * power and energy all populated, at a 7-min span rather than the file's
+   * default 2 min) used to prove the SPLIT sentence's window matched the
+   * thermal/power rows on a mission route. #2559 removed mission from the
+   * split branch entirely — the gauges now come from this SAME daemon
+   * window too, so there is nothing left to split: ONE sentence, ONE
+   * window, covering the gauges AND the thermal/power/energy rows
+   * together, with no "this mission" claim anywhere. */
+  it("(#2559) on a mission route, one footnote sentence covers both the gauges and the thermal/power rows — no split, no 'this mission'", async () => {
     stubDaemonFetch({
       ...RESOURCES_WITH_LOAD,
       load: {
@@ -1007,7 +1029,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     render(
       <MachineDrawer
         route={{ kind: "mission", missionId: "m1", stepId: null }}
-        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 1, 2, 3)]}
         flowWindow={[]}
         localUid={null}
         liveMachines={new Map()}
@@ -1018,9 +1040,10 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
       />,
     );
     openDesktop();
-    // The rows the second sentence is ABOUT are on the page here: the
-    // window's thermal peak (serious, differing from the lit fair), the
-    // time above nominal, and the power/energy block.
+    // The thermal peak (serious, differing from the lit fair), the time
+    // above nominal, and the power/energy block all still render exactly
+    // as before — `HostExtras` reads `daemonLoad` directly regardless of
+    // route, unaffected by #2559.
     await waitFor(() =>
       expect(screen.getByText("peak (7 min)")).toBeInTheDocument(),
     );
@@ -1030,13 +1053,17 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(kvValue("peak (7 min)")).toBe("Serious");
     expect(kvValue("above nominal")).toBe("45s");
     expect(kvValue("energy")).not.toBeNull();
+    // The gauges ALSO come from this same daemon window now (GPU mean
+    // 50%) — not the ignored `routeRecords` sample (2%).
+    expect(screen.getByText(/50% avg/)).toBeInTheDocument();
     const footnoteText =
       document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
-    expect(footnoteText).toContain("Measured over this mission");
-    expect(footnoteText).toContain("not this mission's");
-    // The SAME span the "peak (7 min)" row above reports — one window, one
-    // number, no drift between the row and the sentence describing it.
-    expect(footnoteText).toContain("cover its last 7 min");
+    expect(footnoteText).not.toContain("this mission");
+    expect(footnoteText).not.toContain("not this");
+    // The SAME span the "peak (7 min)" row above reports, as the ONE
+    // lead-in for the whole sentence — one window, one number, covering
+    // everything on the page.
+    expect(footnoteText).toContain("Measured over last 7 min · daemon sampler");
     expect(footnoteText).not.toContain("2 min");
   });
 });
