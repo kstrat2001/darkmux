@@ -26,6 +26,16 @@ use std::path::{Path, PathBuf};
 /// darkmux home. Phase 4 CLI verbs read/write this path. Operators
 /// who want a custom location can hand-edit + move; the resolver
 /// always honors the canonical name under `{root}`.
+///
+/// (#2613) Every production caller resolves `paths` here via
+/// `ResolveScope::ForceUser` (`DARKMUX_HOME` when set, else `~/.darkmux`)
+/// — never `Auto`. The fixture registry is operator-level state, like the
+/// crew/mission board (#1012) and mission configs (#2432, #2554/#2583) and
+/// the workload document itself (#2611): a fixture registered once must be
+/// visible from every directory, not just the one it happened to be
+/// registered from. This function itself stays generic over `&DarkmuxPaths`
+/// (tests build one directly via `DarkmuxPaths::under_root`), but no
+/// production call site may pass an `Auto`-resolved value.
 pub(crate) fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
     paths.root.join("lab-registry.json")
 }
