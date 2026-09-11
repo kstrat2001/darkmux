@@ -72,6 +72,13 @@ export const LAB_POLL_FAILURE_THRESHOLD = 3;
 export const queryKeys = {
   fleetMachinesLive: () => ["fleet", "machines", "live"] as const,
   fleetSessionsLive: () => ["fleet", "sessions", "live"] as const,
+  /** `GET /fleet/roster` (#1855) — the operator's DECLARED topology
+   * (`darkmux machine add`), independent of presence. Distinct cache entry
+   * from `fleetMachinesLive` above: that one is "who's beating right now",
+   * this one is "who did the operator say belongs here" — see
+   * `cards.ts::rosterOnlyEntries` for how the two are reconciled into one
+   * card list without double-reporting a machine that is both. */
+  fleetRoster: () => ["fleet", "roster"] as const,
   runs: () => ["runs"] as const,
   labRuns: () => ["lab", "runs"] as const,
   machineSpecs: () => ["machine", "specs"] as const,

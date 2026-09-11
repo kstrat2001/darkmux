@@ -62,6 +62,16 @@ function installCorpusRoutes(page, meta) {
     if (p === "/lab/runs") return json("lab-runs.json");
     if (p === "/fleet/machines/live") return json("fleet-machines-live.json");
     if (p === "/fleet/sessions/live") return json("fleet-sessions-live.json");
+    // (#1855) `/fleet/roster` — the operator's DECLARED topology. Not part
+    // of the original recorded corpus (the endpoint didn't exist yet); this
+    // fixture is a hand-authored empty roster (`{"machines":[],"error":null}`)
+    // rather than a `record.mjs` capture, matching the honest "no roster
+    // file" default this corpus's own two machines never needed one to
+    // reach — both are already accounted for via presence
+    // (`fleet-machines-live.json` above), so a real roster capture from this
+    // same fleet would answer no differently for the goldens this corpus
+    // feeds.
+    if (p === "/fleet/roster") return json("fleet-roster.json");
     if (p === "/machine/resources") return json("machine-resources.json");
     if (p === "/machine/specs") return json("machine-specs.json");
 
@@ -190,6 +200,7 @@ function installBlankRoutes(page) {
       "/lab/runs",
       "/fleet/machines/live",
       "/fleet/sessions/live",
+      "/fleet/roster",
       "/machine/resources",
       "/machine/specs",
     ];

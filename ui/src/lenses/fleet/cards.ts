@@ -26,8 +26,8 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
-import { nameOf, machineNames } from "../../lib/flow";
+import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import { nameOf, machineNames, machineUids } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
@@ -188,6 +188,86 @@ export function topLevelRunSessionIds(data: FlowRecord[], sessionIds: string[]):
  * post-#2060), and counting it again here would double-count it. */
 export function runningLabRunCount(machineRuns: Run[]): number {
   return machineRuns.filter((r) => r.kind === "lab" && r.status === "running").length;
+}
+
+/** (#1855) Which of the operator's DECLARED roster entries have NO known
+ * identity in this window at all — no flow record under that name, no live
+ * presence beat under it either. These are the entries the card list would
+ * otherwise drop silently: `machineUids` only ever unions flow-derived uids
+ * with CURRENTLY-beating presence keys, so a machine the operator added via
+ * `darkmux machine add` and which has never once started its daemon (or is
+ * down right now, with zero history) produces no uid for it to fall back
+ * on — the exact "rostered-but-silent machine vanishes entirely" defect.
+ *
+ * A roster entry IS excluded here — deliberately NOT double-reported —
+ * when its `id` matches any alias (`machineNames`) any known uid has ever
+ * used, whether that uid is currently beating or only has past flow
+ * history, OR when it matches THIS machine's own confirmed identity
+ * (`specs.machine_id`, see below), OR when a normalized form of it
+ * (`normalizeMachineAlias`) matches a normalized known alias.
+ *
+ * Two review findings, one fix:
+ *
+ * (F1 — self-machine phantom) Presence self-disables when Redis is unset
+ * (`darkmux-flow/src/presence.rs`'s `spawn_emitter_thread` doc), which is
+ * the off-by-default state. So on a quiet flow window a machine can have
+ * ZERO beats and zero flow history under its own roster name — including
+ * the machine serving the very page rendering the card, whose roster entry
+ * this project's own `darkmux-add-machine` skill walks the operator
+ * through creating at step 7. Without a self-check that entry then falls
+ * through `knownNames` exactly like a genuinely-silent peer, and the card
+ * renders "offline" / "hardware not reported" for the daemon that is
+ * answering the request right now, with the hardware it calls unreported
+ * sitting in the very `/machine/specs` response used to draw the page.
+ * `specs.machine_id` is `machine_specs_handler`'s own identity read
+ * (`darkmux_flow::resolve_machine_id()`), unconditionally available for
+ * whichever daemon answers `/machine/specs` — it does not depend on Redis,
+ * a beat, or any flow record existing at all, which is exactly the
+ * guarantee `knownNames` cannot make on a quiet window. `specOf` (above)
+ * already trusts this same field for the identical question three
+ * functions away.
+ *
+ * (F2 — mismatched-name duplicate) Matching used to be exact-string only,
+ * and the roster `id` is operator-typed prose (`src/cli.rs`'s `machine add`
+ * prompt) with nothing validating it against what the peer actually beats
+ * or logs as — the issue's own wire dump showed real fleet members beating
+ * under macOS hostname defaults, not necessarily the id an operator typed.
+ * A live peer beating as one name and rostered under a near-miss of that
+ * name (case, whitespace, or the mDNS `.local` suffix legacy already hits
+ * for a SINGLE machine's own two aliases — `nameOf`'s #2030 doc,
+ * `localMachineUid`'s alias set) used to render THREE cards for two
+ * machines: the live one, plus a dim "offline" phantom beside it asserting
+ * the same machine is down. `normalizeMachineAlias` folds case, leading and
+ * trailing whitespace, and a trailing `.local` out of the comparison, on
+ * both sides, so those near-misses land in the same alias bucket instead of
+ * drawing a second card. It does not — and structurally cannot — resolve a
+ * roster id that shares no substring with what the peer actually beats as;
+ * that remains the operator's to align, same as before. */
+function normalizeMachineAlias(name: string): string {
+  return name.trim().toLowerCase().replace(/\.local$/, "");
+}
+
+export function rosterOnlyEntries(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  roster: RosterMachineEntry[],
+  /** (#1855 follow-up) This machine's own `/machine/specs` read, when
+   * available — see this function's own doc, F1. `null` on a build that
+   * hasn't fetched it (a static build, or before the live query resolves);
+   * every pre-existing call site keeps behaving exactly as before. */
+  specs: MachineSpecs | null = null,
+): RosterMachineEntry[] {
+  const knownNames = new Set<string>();
+  for (const uid of machineUids(data, liveMachines)) {
+    for (const name of machineNames(data, liveMachines, uid)) knownNames.add(name);
+  }
+  if (specs?.machine_id) knownNames.add(specs.machine_id);
+
+  const normalizedKnown = new Set([...knownNames].map(normalizeMachineAlias));
+  return roster.filter((entry) => {
+    if (knownNames.has(entry.id)) return false;
+    return !normalizedKnown.has(normalizeMachineAlias(entry.id));
+  });
 }
 
 export interface FleetCard {
