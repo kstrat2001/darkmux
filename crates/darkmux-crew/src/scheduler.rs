@@ -1346,7 +1346,11 @@ pub fn run_step_graph(
         // closure ever having run, so it lands here too (#1877 item 3).
         let mut applied: HashSet<usize> = HashSet::new();
         let results = std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
+            // (#2632) Named, not `scope.spawn` — see
+            // `concurrent_dispatch::spawn_scoped_named`'s doc: every hop a
+            // job's DARKMUX_* env reads cross needs to propagate the test
+            // thread's name for the #2632 audit to attribute them.
+            let worker = crate::concurrent_dispatch::spawn_scoped_named(scope, || {
                 crate::concurrent_dispatch::run_bounded(
                     jobs,
                     facts,
@@ -3330,7 +3334,11 @@ mod tests {
         assert_eq!(report.iterations, 3, "A, then B+C together, then D");
     }
 
+    // (#2632) This test's `procedural.shell` step reads
+    // `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` on a worker thread — races
+    // `bounded_command`'s own two tests that mutate that key.
     #[test]
+    #[serial_test::serial]
     fn run_step_graph_reports_errored_step_and_still_completes_independent_task() {
         let (task_fails, mut step_fails) = task_and_step("fails", &[]);
         step_fails.kind = "procedural.shell".to_string();
@@ -3433,7 +3441,11 @@ mod tests {
         );
     }
 
+    // (#2632) This test's `procedural.shell` step reads
+    // `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` on a worker thread — races
+    // `bounded_command`'s own two tests that mutate that key.
     #[test]
+    #[serial_test::serial]
     fn run_step_graph_downstream_task_of_errored_task_is_cascade_abandoned() {
         // (#2310 P4a) Pre-cascade, this task wedged permanently `Planned`
         // (see this test's old name) — nobody watching the graph could
@@ -3484,7 +3496,12 @@ mod tests {
         graph(vec![(task_a, step_a), (task_b, step_b), (task_c, step_c), (task_d, step_d)])
     }
 
+    // (#2632) This test's `procedural.shell` step reads
+    // `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` (`bounded_command::
+    // configured_timeout`) on a worker thread — races `bounded_command`'s
+    // own two tests that mutate that key.
     #[test]
+    #[serial_test::serial]
     fn cascade_abandon_test_a_chain_with_accepting_leaf_runs_the_leaf() {
         // (a) A errors ⇒ B and C (both default run_on) are cascade-
         // abandoned; D (run_on: ["complete", "error"]) sees its one
@@ -3504,7 +3521,10 @@ mod tests {
         assert!(report.completed.contains(&"d-step".to_string()));
     }
 
+    // (#2632) Same `procedural.shell` DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS
+    // race as the sibling cascade-abandon tests in this file.
     #[test]
+    #[serial_test::serial]
     fn cascade_abandon_test_b_chain_without_accepting_leaf_abandons_everything() {
         // (b) Same chain, D left at the default run_on (no "error") — the
         // cascade does not stop at D either; nothing downstream of A ever
@@ -3538,7 +3558,10 @@ mod tests {
         assert!(step_is_ready(&step_x, &task_x, &tasks, &steps));
     }
 
+    // (#2632) Same `procedural.shell` DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS
+    // race as the sibling cascade-abandon tests in this file.
     #[test]
+    #[serial_test::serial]
     fn cascade_abandon_test_d_does_not_touch_tasks_outside_the_errored_dependents() {
         // (d) A sibling task with NO relation to the errored task (not a
         // dependent, direct or transitive) must run to completion exactly
@@ -3564,7 +3587,10 @@ mod tests {
         assert!(report.completed.contains(&"unrelated-step".to_string()));
     }
 
+    // (#2632) Same `procedural.shell` DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS
+    // race as the sibling cascade-abandon tests in this file.
     #[test]
+    #[serial_test::serial]
     fn cascade_abandon_test_e_accepting_intermediate_shields_its_default_dependents() {
         // A errors. B (run_on: ["complete", "error"]) depends on A — B is
         // NOT abandoned; the cascade stops there and B gets a real chance
@@ -3752,7 +3778,11 @@ mod tests {
 
     /// (#1397) An errored step is ALSO persisted at its transition — the
     /// hook fires on every terminal status, not just the happy path.
+    // (#2632) This test's `procedural.shell` step reads
+    // `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` on a worker thread — races
+    // `bounded_command`'s own two tests that mutate that key.
     #[test]
+    #[serial_test::serial]
     fn run_step_graph_persists_error_status_at_transition() {
         let (task_fails, mut step_fails) = task_and_step("fails", &[]);
         step_fails.kind = "procedural.shell".to_string();

@@ -18,6 +18,7 @@
 
     // ─── #2413 round 3 MF2: maybe_build_machine_telemetry_record pins the CALL SITE ─
 
+    #[serial]
     #[test]
     fn maybe_build_machine_telemetry_record_emits_once_per_5s_across_2s_ticks_and_stamps_the_measured_gap() {
         // Drives the REAL decision+build function across a fake sequence of
@@ -1152,6 +1153,7 @@
     /// must reach `bounds.turn_delay_ms`'s `forced-agentic-remote` shape
     /// (MUST FIX 2) through this real call path, not just through
     /// `resolved_runtime_bounds_json` called directly.
+    #[serial]
     #[test]
     fn dispatch_start_payload_json_forces_turn_delay_ms_for_agentic_remote() {
         let payload = dispatch_start_payload_json(
@@ -7555,6 +7557,7 @@
     /// on the record, and a key is the address its store answers to — so the
     /// refs are their own field, not something a reader has to recover from
     /// `prompt`.
+    #[serial]
     #[test]
     fn the_dispatch_start_payload_names_the_records_that_were_briefed() {
         let refs = vec![
@@ -13301,6 +13304,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
 
     // ─── (#2413) build_machine_scoped_telemetry_record — no session fields ─
 
+    #[serial]
     #[test]
     fn build_machine_scoped_telemetry_record_carries_full_payload_and_interval_no_session_fields() {
         use crate::host_probe::{
@@ -13617,6 +13621,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     // (#2268) The requested tool list rides on the dispatch-start record —
     // `null` when the role declares no palette (full catalog), the names
     // otherwise — so a request/advertised gap is visible in the artifact.
+    #[serial]
     #[test]
     fn dispatch_start_payload_json_carries_tools_requested_or_null() {
         let none = dispatch_start_payload_json(

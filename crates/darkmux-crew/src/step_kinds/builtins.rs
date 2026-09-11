@@ -3248,6 +3248,7 @@ mod tests {
     /// #2585 never reached — proved here by driving the SCHEDULER-FACING
     /// trait method directly, on the real production kind, with NO
     /// `run_step_graph`/Docker/model involved.
+    #[serial_test::serial]
     #[test]
     fn dispatch_internal_resume_precheck_refuses_a_missing_checkpoint() {
         let resume_from = TempDir::new().unwrap(); // no checkpoint.json written
@@ -3871,6 +3872,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn dispatch_map_local_streaming_drop_path_error_bookend_carries_the_namespaced_identifier() {
         // (Also fix, second review round) `dispatch.map`'s twin of the test
@@ -4275,6 +4277,7 @@ mod tests {
     /// nothing observable there changes. What DOES change for it is the
     /// other half of this fix: a `tree_root` that no longer exists now
     /// hard-errors a step that previously ignored it.
+    #[serial_test::serial]
     #[test]
     fn procedural_shell_step_config_workdir_key_sets_the_cwd() {
         let dir = tempfile::tempdir().unwrap();
@@ -4294,6 +4297,7 @@ mod tests {
     /// mission's own tree root") is honored when the step itself names no
     /// `cwd`/`workdir`, matching the same fallback `dispatch.internal`
     /// already uses (`dispatch_opts_for`'s `task.workdir.clone().or_else(...)`).
+    #[serial_test::serial]
     #[test]
     fn procedural_shell_task_workdir_is_the_default_cwd() {
         let dir = tempfile::tempdir().unwrap();
@@ -4316,6 +4320,7 @@ mod tests {
     /// so nothing pinned it in either direction. Red-proved by swapping the
     /// `task.workdir` and `config_str(step, "workdir")` branches in
     /// `resolve_shell_cwd`: this test then reports the step's directory.
+    #[serial_test::serial]
     #[test]
     fn procedural_shell_task_workdir_outranks_a_step_config_workdir() {
         let task_dir = tempfile::tempdir().unwrap();
@@ -4341,6 +4346,7 @@ mod tests {
     /// meaning ("an explicit `cwd` on the step is where the command runs")
     /// is preserved exactly. `src/acp_panel.rs`'s `apply_default_cwd`
     /// depends on this — it injects the panel session's directory as `cwd`.
+    #[serial_test::serial]
     #[test]
     fn procedural_shell_step_cwd_outranks_the_task_workdir() {
         let task_dir = tempfile::tempdir().unwrap();
@@ -6861,6 +6867,7 @@ mod tests {
     /// dispatch will: explicit name > `role_profiles` binding > default.
     /// Before, the binding was skipped, so a bound role's wave leased one
     /// model while its dispatch loaded another.
+    #[serial_test::serial]
     #[test]
     fn placement_honors_the_role_profiles_binding_exactly_like_the_dispatch() {
         let dir = tempfile::TempDir::new().unwrap();

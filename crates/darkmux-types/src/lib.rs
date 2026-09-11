@@ -10,6 +10,8 @@ pub mod child_registry;
 pub mod config;
 pub mod config_access;
 pub mod dispatch_liveness;
+#[cfg(any(test, feature = "test-support"))]
+pub mod env_audit;
 #[cfg(unix)]
 pub mod flock;
 #[cfg(unix)]
@@ -1009,6 +1011,7 @@ mod tests {
         assert!(!serde_json::to_string(&m).unwrap().contains("endpoint"));
     }
 
+    #[serial_test::serial]
     #[test]
     fn endpoint_default_is_local_not_remote() {
         // No url ⇒ not remote; base_url resolves to the LMStudio default (a URL).

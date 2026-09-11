@@ -56,6 +56,15 @@ httpmock = "0.7"
 # operator's real runtime.inactivity_timeout_seconds. Dev-dep only; off in the
 # release binary.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
+# (#2632 CONSIDER 3) Same shape as the `darkmux-types` dev-dep above, one
+# hop further out: darkmux-profiles' own `test-support` feature forwards to
+# `darkmux-types/test-support`, so crew's TEST build compiles the
+# `audit_env_read` calls into `profiles.rs`'s `DARKMUX_HOME`/
+# `DARKMUX_PROFILES` reads even though `darkmux-profiles` is a NORMAL
+# (non-dev) dependency above — without this, those two reads (crew calls
+# `load_registry` at five sites) stay invisible to the #2632 env-read audit.
+# Dev-dep only; off in the release binary.
+darkmux-profiles = { path = "../darkmux-profiles", features = ["test-support"] }
 
 # (#2108) The host probe's mach kernel-counter reads (`host_processor_info`,
 # `host_statistics64`, `sysctlbyname`) and its `dlopen`/`dlsym` of the PRIVATE

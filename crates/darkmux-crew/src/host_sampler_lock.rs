@@ -366,6 +366,7 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
     #[test]
     fn a_second_in_process_acquire_with_the_real_pid_is_declined() {
         // (#2413 M1) Same-process parallel dispatches (concurrent_dispatch.rs
@@ -387,6 +388,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn releasing_the_first_in_process_holder_lets_a_later_acquire_succeed() {
         with_isolated_home(|| {
@@ -398,6 +400,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn acquire_when_absent_then_release_removes_the_file() {
         with_isolated_home(|| {
@@ -412,6 +415,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn mf1_a_dispatch_first_attempt_against_a_daemon_held_fresh_lock_is_declined() {
         // (#2413 round 3 MF1) A decline by the DESIGNED holder (a daemon
@@ -437,6 +441,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn a_second_acquire_against_a_fresh_lock_is_declined() {
         with_isolated_home(|| {
@@ -451,6 +456,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn a_stale_heartbeat_is_stolen() {
         with_isolated_home(|| {
@@ -468,6 +474,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn a_dead_pid_lock_is_stolen_even_with_a_fresh_heartbeat() {
         with_isolated_home(|| {
@@ -485,6 +492,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn heartbeat_refreshes_timestamp_and_returns_true_while_still_owner() {
         with_isolated_home(|| {
@@ -497,6 +505,7 @@ mod tests {
         });
     }
 
+    #[serial_test::serial]
     #[test]
     fn heartbeat_returns_false_and_does_not_resurrect_after_being_stolen() {
         with_isolated_home(|| {
@@ -527,6 +536,7 @@ mod tests {
         g.pid
     }
 
+    #[serial_test::serial]
     #[test]
     fn drop_only_removes_the_lock_when_still_owned() {
         with_isolated_home(|| {

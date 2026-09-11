@@ -44,10 +44,12 @@
     ///   (#1053, same lever as the tool-less reviewer).
     #[test]
     fn pr_reviewer_agentic_contract() {
-        let role = load_roles()
-            .expect("builtin roles load")
-            .into_iter()
-            .find(|r| r.id == "pr-reviewer-agentic")
+        // (#2632, #2268) Embedded-only load via `builtin_role` — this test
+        // asserts a property of the BUILTIN manifest, never a user
+        // override, so it must not pay for (or race) `load_roles()`'s
+        // DARKMUX_CREW_DIR/DARKMUX_HOME merge.
+        let role = builtin_role("pr-reviewer-agentic")
+            .expect("pr-reviewer-agentic builtin role parses")
             .expect("pr-reviewer-agentic must be embedded");
         assert!(
             role.output_schema.is_none(),
@@ -94,11 +96,17 @@
     ///   room open — a JSON-only grammar suppresses it).
     #[test]
     fn dialectic_seats_contract() {
-        let roles = load_roles().expect("builtin roles load");
+        // (#2632, #2268) Embedded-only load via `builtin_role`, not
+        // `load_roles()` — this test asserts properties of the BUILTIN
+        // dialectic-seat manifests only, so it has no reason to touch
+        // `DARKMUX_CREW_DIR`/`DARKMUX_HOME` at all. Before this fix it
+        // raced any other test's transient override of either var:
+        // `serial_test::serial` only serializes tests that carry it, and
+        // this one carried nothing — it once observed a `TempDir` another,
+        // unrelated test had already dropped and deleted.
         for seat in ["dialectic-prosecutor", "dialectic-defender"] {
-            let role = roles
-                .iter()
-                .find(|r| r.id == seat)
+            let role = builtin_role(seat)
+                .unwrap_or_else(|e| panic!("{seat} builtin role failed to parse: {e:#}"))
                 .unwrap_or_else(|| panic!("{seat} must be embedded"));
             assert!(
                 role.output_schema.is_none(),
@@ -116,9 +124,8 @@
                 );
             }
         }
-        let judge = roles
-            .iter()
-            .find(|r| r.id == "dialectic-judge")
+        let judge = builtin_role("dialectic-judge")
+            .expect("dialectic-judge builtin role parses")
             .expect("dialectic-judge must be embedded");
         assert!(
             judge.output_schema.is_none(),
@@ -205,10 +212,10 @@
     ///   DMX- token definition the provider's scoring parses against.
     #[test]
     fn tool_bench_role_contract() {
-        let role = load_roles()
-            .expect("builtin roles load")
-            .into_iter()
-            .find(|r| r.id == "tool-bench")
+        // (#2632, #2268) Embedded-only load via `builtin_role` — same
+        // reasoning as the two seats above.
+        let role = builtin_role("tool-bench")
+            .expect("tool-bench builtin role parses")
             .expect("tool-bench must be embedded");
         assert!(
             role.output_schema.is_none(),

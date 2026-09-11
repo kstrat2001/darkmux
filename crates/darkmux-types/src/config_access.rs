@@ -201,6 +201,8 @@ pub fn set_config_for_test(cfg: DarkmuxConfig) -> ConfigOverrideGuard {
 /// and is strictly forgiving everywhere this feeds — paths, ids, and numeric
 /// parses all want surrounding whitespace gone. The single env-read idiom.
 pub(crate) fn env_str(key: &str) -> Option<String> {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::env_audit::audit_env_read(key);
     std::env::var(key)
         .ok()
         .map(|s| s.trim().to_string())
@@ -2239,14 +2241,35 @@ mod tests {
     // (darkmux-crew) and `host_sampler` tests (darkmux-serve) for the
     // machine-scoped replacement's cadence coverage.
 
+    // (#2632) `liveness_dir()` resolves through `paths::resolve()`, which
+    // reads `DARKMUX_HOME` live on every call — the same chokepoint the
+    // loader's `roles_dir()` goes through. Before this fix the test relied
+    // on AMBIENT absence (no test here ever set `DARKMUX_HOME` itself) and
+    // carried no `#[serial_test::serial]`, so it raced every other test in
+    // this file that transiently sets the var: `serial_test` only
+    // serializes tests that carry the annotation, so a guarded writer still
+    // races an unguarded reader. It reproduced live on the first
+    // instrumented run of this suite (#2632's audit): the two
+    // `liveness_dir()` calls below observed two DIFFERENT roots within the
+    // same test. This one can't take the structural fix `dialectic_seats_
+    // contract` (crew) took — its whole point IS the env resolution
+    // behavior — so instead it scopes `DARKMUX_HOME` explicitly (serial +
+    // save/clear/restore) rather than depending on whatever the ambient
+    // value happens to be.
+    #[serial_test::serial]
     #[test]
     fn liveness_dir_and_host_sampler_lock_path_are_test_isolated() {
-        // Mirrors `flows_dir`'s own isolation test: in a test build with no
-        // `DARKMUX_HOME` override, the path must NOT resolve to the
-        // operator's real `~/.darkmux/liveness`.
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::remove_var("DARKMUX_HOME") };
         let real = dirs::home_dir().map(|h| h.join(".darkmux").join("liveness"));
         assert_ne!(Some(liveness_dir()), real, "must not resolve to the real ~/.darkmux/liveness");
         assert_eq!(host_sampler_lock_path(), liveness_dir().join("host-sampler.lock"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
     }
 
     /// Ships objective: the RADIO persona's humor is low out of the box and
@@ -2886,6 +2909,7 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
     #[test]
     fn hooks_outbox_dir_default_is_darkmux_hooks() {
         // No config tier in test builds → default only. Lenient suffix

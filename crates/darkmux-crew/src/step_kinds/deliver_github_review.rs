@@ -2431,6 +2431,7 @@ mod tests {
     /// payload — set by the step (`DeliverGithubReviewStepKind::run`), not
     /// by `render_github_review` itself (the sha names WHEN the run
     /// looked, never what it found).
+    #[serial_test::serial]
     #[test]
     fn reviewed_at_sha_rides_the_emitted_payload() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2475,6 +2476,7 @@ mod tests {
     /// (#2429 part 4) A blank `head_sha` (the mission-launch param unset,
     /// so `{{head_sha}}` resolves to an empty string) reads as absent, not
     /// as a real sha a poster would compare against.
+    #[serial_test::serial]
     #[test]
     fn a_blank_head_sha_reads_as_absent() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3016,6 +3018,7 @@ mod tests {
         assert!(registry.ids().iter().any(|id| id == DELIVER_GITHUB_REVIEW_KIND));
     }
 
+    #[serial_test::serial]
     #[test]
     fn the_step_kind_run_reads_config_and_emits_to_the_named_path() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3075,6 +3078,7 @@ mod tests {
     /// step output carries is the RUN's, not a constant: a degraded run
     /// promotes `"degraded"`. Without this, hardcoding `"noop"` in `run`
     /// would leave the test above green.
+    #[serial_test::serial]
     #[test]
     fn the_step_outputs_verdict_is_the_runs_own_mode() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3910,6 +3914,7 @@ mod tests {
     /// interceptable from a plain `#[test]`) — it proves the DESTINATION
     /// decision, not the byte-for-byte "one JSON line and nothing else"
     /// purity claim the old name implied.
+    #[serial_test::serial]
     #[test]
     fn emit_dash_step_output_names_stdout_not_a_path() {
         let step = Step {
