@@ -387,27 +387,35 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  * meters render — a pure function so the merge rule is unit-testable
  * without mounting anything.
  *
- * - Mission/dispatch route: `avg`/`high`/`p95` stay the dispatch's OWN
- *   samples (that scope IS the run's own record set — the daemon's window
- *   spans unrelated time before/after it); only `now` is overridden by the
- *   daemon's live reading when present, since the daemon is always the
- *   freshest possible "right this instant" number.
- * - Every other route: the daemon's `window` IS the aggregate (mean → avg,
- *   max → high, p95 → p95), and `now` comes from the daemon too — the
- *   daemon samples continuously regardless of whether a dispatch happens
- *   to be running, so it is always the more current answer than a rolling
- *   slice of per-dispatch flow records.
+ * - Dispatch route: `avg`/`high`/`p95` stay the dispatch's OWN samples (that
+ *   scope IS the run's own record set — the daemon's window spans unrelated
+ *   time before/after it); only `now` is overridden by the daemon's live
+ *   reading when present, since the daemon is always the freshest possible
+ *   "right this instant" number.
+ * - Every other route — mission included, per #2559: a mission route has no
+ *   server-side join to genuinely scope it, so it takes this same branch as
+ *   fleet/console/runs/playback — the daemon's `window` IS the aggregate
+ *   (mean → avg, max → high, p95 → p95), and `now` comes from the daemon
+ *   too — the daemon samples continuously regardless of whether a dispatch
+ *   happens to be running, so it is always the more current answer than a
+ *   rolling slice of flow records.
  * - No daemon `load` at all (older daemon, disabled sampler, or the fetch
  *   hasn't resolved yet): unchanged fallback to the dispatch-derived
  *   aggregate — today's pre-#2107 behavior, byte for byte.
+ *
+ * The boolean param is named for what it actually gates (a dispatch route's
+ * genuinely-scoped samples), not for which routes call it `true` — kept
+ * generic rather than importing `Route` here, since the decision of WHICH
+ * routes pass `true` belongs to the caller (`useMachineStatsContent`'s
+ * `isDispatch`), not to this merge rule.
  */
 export function effectiveHostAggregate(
-  isMissionOrDispatch: boolean,
+  isDispatch: boolean,
   dispatchAgg: HostAggregate,
   load: MachineLoad | null,
 ): HostAggregate {
   if (load == null) return dispatchAgg;
-  if (isMissionOrDispatch) {
+  if (isDispatch) {
     return {
       cpu: { ...dispatchAgg.cpu, now: load.now.cpu_pct },
       mem: { ...dispatchAgg.mem, now: load.now.mem_pct },
@@ -537,27 +545,30 @@ export function useMachineStatsContent({
     () => aggregateHostSamples(scope.samples),
     [scope.samples],
   );
-  const isMissionOrDispatch =
-    route.kind === "mission" || route.kind === "dispatch";
+  // (#2559) Only a dispatch route's gauges are genuinely scoped to the run —
+  // see `machineDrawerScope.ts`'s own module doc. A mission route used to be
+  // grouped in here too, on a premise that was never actually true (that
+  // module's #2559 note has the full story); it now takes every branch
+  // below the same way fleet/console/runs/playback do.
+  const isDispatch = route.kind === "dispatch";
   // (#2107, #1833) The daemon's continuous host sampler — polled ONLY
   // while `isOpen` (see [[MachineStatsInput.isOpen]]'s own doc), so
   // "idle · no samples" between dispatches stops being the default state
-  // on every non-mission/non-dispatch view WHILE OPEN, without polling a
-  // number nobody can see while closed. `null` when disabled/unreachable/
-  // not-yet-resolved/closed, in which case [[effectiveHostAggregate]]
-  // falls back to the pre-#2107 dispatch-derived aggregate unchanged.
+  // on every non-dispatch view WHILE OPEN, without polling a number nobody
+  // can see while closed. `null` when disabled/unreachable/not-yet-resolved
+  // /closed, in which case [[effectiveHostAggregate]] falls back to the
+  // pre-#2107 dispatch-derived aggregate unchanged.
   const daemonLoad = useDaemonLoad(isOpen);
   const agg = useMemo(
-    () => effectiveHostAggregate(isMissionOrDispatch, dispatchAgg, daemonLoad),
-    [isMissionOrDispatch, dispatchAgg, daemonLoad],
+    () => effectiveHostAggregate(isDispatch, dispatchAgg, daemonLoad),
+    [isDispatch, dispatchAgg, daemonLoad],
   );
-  // A mission/dispatch route is idle only when that run genuinely has no
-  // samples of its own (the daemon's `now` override above doesn't change
-  // that — the daemon isn't scoped to the run). Every other route is idle
-  // only when there's neither a dispatch-derived rolling sample NOR a
-  // daemon reading — once the daemon is sampling continuously, a
-  // non-mission/non-dispatch view is never idle again.
-  const isIdle = isMissionOrDispatch
+  // A dispatch route is idle only when that run genuinely has no samples of
+  // its own (the daemon's `now` override above doesn't change that — the
+  // daemon isn't scoped to the run). Every other route is idle only when
+  // there's neither a rolling sample NOR a daemon reading — once the daemon
+  // is sampling continuously, a non-dispatch view is never idle again.
+  const isIdle = isDispatch
     ? scope.samples.length === 0
     : scope.samples.length === 0 && daemonLoad == null;
 
@@ -566,31 +577,31 @@ export function useMachineStatsContent({
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
 
-  // (#2107, #1833, warm-up finding) On a non-mission/non-dispatch view where
-  // the daemon actually supplies the aggregate, the label reflects the
-  // ring's ACTUAL span (`daemonWindowLabel`) — never a hardcoded "last 10
-  // min" claim the ring may not have earned yet. Every other case keeps
-  // `scope.scopeLabel` unchanged ("this mission" / "this dispatch" / the
-  // pre-daemon "last 10 min" fallback).
+  // (#2107, #1833, warm-up finding) On a non-dispatch view where the daemon
+  // actually supplies the aggregate, the label reflects the ring's ACTUAL
+  // span (`daemonWindowLabel`) — never a hardcoded "last 10 min" claim the
+  // ring may not have earned yet. A dispatch route keeps `scope.scopeLabel`
+  // unchanged ("this dispatch"); every other route (mission included, per
+  // #2559) either gets the daemon's real span or, absent a daemon reading,
+  // the pre-daemon "last 10 min" rolling-window fallback.
   // (#2108 review finding 7) `daemonLoad.window` is typed as always-present;
   // `?? 0` covers a v1-shaped/absent `window` the same way the sibling
   // guards above do (`daemonWindowLabel(0)` reads "last <1 min", the
   // correct degraded answer — never a thrown TypeError).
   const scopeLabel =
-    !isMissionOrDispatch && daemonLoad != null
+    !isDispatch && daemonLoad != null
       ? daemonWindowLabel(daemonLoad.window?.span_ms ?? 0)
       : scope.scopeLabel;
-  // (#2270) `HostExtras` (below) renders thermal/power/energy off
-  // `daemonLoad` DIRECTLY, unconditionally on every route — see that
-  // component's own doc for why (those readings are never scoped to a
-  // dispatch on the wire). On a mission/dispatch route that means those
+  // (#2270, narrowed to dispatch-only by #2559) `HostExtras` (below) renders
+  // thermal/power/energy off `daemonLoad` DIRECTLY, unconditionally on every
+  // route — see that component's own doc for why (those readings are never
+  // scoped to a dispatch on the wire). On a dispatch route that means those
   // three rows are NOT the same window `scopeLabel` above just promised
-  // ("this mission"/"this dispatch") — they are still the daemon ring's
-  // rolling window, exactly like every other route. This is the BARE span
-  // of that window ("2 min", "<1 min"), for `meterFootnote` to name in a
-  // sentence of its own; the composed `daemonWindowLabel` form reads
-  // correctly only as a standalone lead-in, which is what `scopeLabel`
-  // above uses it for.
+  // ("this dispatch") — they are still the daemon ring's rolling window,
+  // exactly like every other route. This is the BARE span of that window
+  // ("2 min", "<1 min"), for `meterFootnote` to name in a sentence of its
+  // own; the composed `daemonWindowLabel` form reads correctly only as a
+  // standalone lead-in, which is what `scopeLabel` above uses it for.
   //
   // `null` when there is NO daemon reading at all (an older daemon, a
   // disabled sampler, an unreachable one, or a poll that hasn't resolved
@@ -598,7 +609,7 @@ export function useMachineStatsContent({
   // there is nothing for the second sentence to describe and the footnote
   // keeps its single-sentence form. Deriving a fallback from
   // `scope.scopeLabel` here would make both halves of that sentence say
-  // "this mission" and contradict itself.
+  // "this dispatch" and contradict itself.
   const extrasWindowLabel =
     daemonLoad != null
       ? windowMinutesLabel(daemonLoad.window?.span_ms ?? 0)
@@ -606,8 +617,10 @@ export function useMachineStatsContent({
   // (#2250 layout model) "sampler cost" is a fact like any other, so it is
   // a kv row in Load rather than a free-floating caption line with its own
   // one-off style rule (`.machine-drawer__sampler-cost`, now deleted).
+  // (#2559) Now shown on a mission route too — the daemon genuinely IS
+  // sampling for it, same as fleet/console.
   const samplerCostValue =
-    !isMissionOrDispatch && daemonLoad != null
+    !isDispatch && daemonLoad != null
       ? `${Math.round(daemonLoad.now.sampler_cost_ms * 10) / 10} ms/sample`
       : "";
 
@@ -615,9 +628,9 @@ export function useMachineStatsContent({
   // readings, not scoped to any one dispatch — they render off the raw
   // `daemonLoad` directly (never `agg`/`isIdle`, which are the
   // dispatch-vs-daemon MERGE this hook already does for CPU/GPU/MEM), so
-  // they show on a mission/dispatch route too: "what is the HOST doing
-  // right now" is orthogonal to "what did THIS dispatch use." Each row
-  // hides independently on its own null field — see this module's own
+  // they show on a dispatch route too: "what is the HOST doing right now"
+  // is orthogonal to "what did THIS dispatch use." Each row hides
+  // independently on its own null field — see this module's own
   // `HostExtras` doc.
   // (#2250) Read here rather than in `HostExtras`: these describe the GPU
   // gauge, so they are Load-section facts and the parent owns that section.
@@ -670,8 +683,8 @@ export function useMachineStatsContent({
     </div>
   );
 
-  // (#2107, #1833) On a non-mission/non-dispatch view with NO daemon load at
-  // all — an older daemon that predates the sampler, one disabled via
+  // (#2107, #1833) On a non-dispatch view with NO daemon load at all — an
+  // older daemon that predates the sampler, one disabled via
   // `runtime.host_sampler_interval_ms: 0`, or a fixture/fetch that hasn't
   // resolved (or hasn't been ASKED — see `isOpen`) — the wording says so
   // explicitly rather than reusing the generic "idle" line, which used to be
@@ -680,7 +693,7 @@ export function useMachineStatsContent({
   const idleLine =
     scope.lastKnown == null && scope.scopeLabel !== "last 10 min"
       ? `no host samples for ${scope.scopeLabel}`
-      : !isMissionOrDispatch && daemonLoad == null
+      : !isDispatch && daemonLoad == null
         ? "daemon does not sample yet"
         : "idle · no samples in the last 10 min";
   const lastKnownLine = scope.lastKnown
@@ -871,29 +884,37 @@ export function useMachineStatsContent({
   // the SAME value the Load section shows rather than asserting a figure it
   // cannot back. Rendered last so it reads as a footnote to the whole panel.
   //
-  // (#2270) On a mission/dispatch route, `scopeLabel` ("this mission"/"this
-  // dispatch") is TRUE for the gauges' avg/max — `scope.samples` really is
-  // that run's own records — but thermal/power/energy are not that run's
-  // records at all; `HostExtras` reads `daemonLoad` directly, the same
-  // rolling ring every other route uses (see that component's own doc). A
-  // mission that ran above-nominal for 1h47m can only ever show up to the
-  // ring's own ceiling (10 min), so "measured over this mission" on that
-  // number claims a scope the reading never had. One sentence can't
-  // honestly cover both windows when they differ, so this splits into two
-  // — but ONLY when there is a daemon reading for the second half to
-  // describe (`extrasWindowLabel != null`; see its own doc). Every other
-  // route has one window for everything and keeps the single sentence.
+  // (#2270) On a dispatch route, `scopeLabel` ("this dispatch") is TRUE for
+  // the gauges' avg/max — `scope.samples` really is that run's own records
+  // — but thermal/power/energy are not that run's records at all;
+  // `HostExtras` reads `daemonLoad` directly, the same rolling ring every
+  // other route uses (see that component's own doc). A dispatch that ran
+  // above-nominal for 1h47m can only ever show up to the ring's own ceiling
+  // (10 min), so "measured over this dispatch" on that number claims a
+  // scope the reading never had. One sentence can't honestly cover both
+  // windows when they differ, so this splits into two — but ONLY when there
+  // is a daemon reading for the second half to describe (`extrasWindowLabel
+  // != null`; see its own doc). Every other route has one window for
+  // everything and keeps the single sentence.
+  //
+  // (#2559) A mission route used to take this same split branch, on the
+  // premise that its gauges were genuinely mission-scoped the way a
+  // dispatch's are. They never were (`machineDrawerScope.ts`'s module doc
+  // has the full story), so `isDispatch` no longer includes it — a mission
+  // route now falls to the single-sentence branch below, unconditionally,
+  // exactly like fleet/console/runs/playback: no clause on this panel
+  // claims a "this mission" scope any more.
   //
   // The split branch also says "current and host-wide" rather than plain
-  // "current": on a mission/dispatch route with a daemon reading,
+  // "current": on a dispatch route with a daemon reading,
   // `effectiveHostAggregate` overrides every one of those live figures —
   // the gauges' large numbers included — with the daemon's own host-wide
   // sample. Saying only "current" there would repeat, one clause later,
   // exactly the scope conflation the sentence before it just corrected.
   const meterFootnote = scopeLabel ? (
     <div className="machine-drawer__footnote">
-      {isMissionOrDispatch && extrasWindowLabel != null
-        ? `Measured over ${scopeLabel} — each gauge's avg and max. Thermal, power and energy are not this ${route.kind === "mission" ? "mission" : "dispatch"}'s; they come from the daemon's host-wide sampler and cover its last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+      {isDispatch && extrasWindowLabel != null
+        ? `Measured over ${scopeLabel} — each gauge's avg and max. Thermal, power and energy are not this dispatch's; they come from the daemon's host-wide sampler and cover its last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
         : `Measured over ${scopeLabel} — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
     </div>
   ) : null;
