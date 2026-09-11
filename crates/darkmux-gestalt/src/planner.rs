@@ -67,8 +67,12 @@ pub struct AcquireOpts {
     /// concurrency-safety input). Seeded into the same `claimed` set that
     /// already shields a reused/reconciled resident: never pass-1
     /// `Unload(NoLongerDesired)`-ed, never an eviction candidate in the
-    /// #1243 budget or #1140 pool-headroom passes, even when absent from
-    /// `desired`. Because a pinned resident is therefore never removed from
+    /// #1243 budget or #1140 pool-headroom passes, and (#2669) never
+    /// unloaded by the per-desired `Reconcile` arm either — a pinned
+    /// resident sharing a model key with a desired placement at
+    /// insufficient context refuses honestly (`Block`) instead of being
+    /// unloaded-and-reloaded out from under the command that pinned it,
+    /// even when absent from `desired`. Because a pinned resident is therefore never removed from
     /// residency, it stays counted as occupied bytes in both passes — a
     /// desired load that cannot co-fit with the pinned set is refused
     /// honestly (the existing named `Block`), never satisfied by evicting
@@ -138,7 +142,8 @@ pub fn plan_acquire(
     // command is actively dispatching to, seeded into `claimed` up front so
     // every check below that already skips a claimed resident (pass-1,
     // the #1243 budget eviction loop, the #1140 pool-headroom eviction
-    // loop) protects the pin too, with zero new branching. Because a
+    // loop, and — #2669 — the per-desired `Reconcile` arm) protects the pin
+    // too, with zero new branching. Because a
     // pinned-but-claimed resident is therefore never added to `removed`,
     // it stays counted as occupied in `resident_base`/`single_pool_headroom`
     // — the occupancy half of the contract falls out of the SAME mechanism,
@@ -198,32 +203,61 @@ pub fn plan_acquire(
                 push_reuse(&mut decisions, &mut warnings, identifier, resident_ctx, p.min_ctx);
             }
             ResidencyDecision::Reconcile { stale_identifier, stale_ctx } => {
-                claimed.insert(stale_identifier.clone());
-                let stale_target = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
-                    .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
-                reconcile_frees.push(ReconcileFree {
-                    stale: ReconcileStale::locate(facts, &stale_identifier, decisions.len()),
-                    unload: PlannedAction {
-                        action: Action::Unload { target: stale_target },
-                        reason: Reason::InsufficientCtx,
-                        precondition: Precondition::ResidentPresent {
-                            identifier: stale_identifier,
-                            at_ctx: Some(stale_ctx),
+                // (#2669) A stale resident already in `claimed` — seeded
+                // from `opts.pinned` up front, or claimed by an earlier
+                // decision in THIS same plan — must never be targeted by an
+                // unload-then-reload: unloading it here is the exact #1487
+                // hazard pass-1/budget/pool already refuse to commit,
+                // reached through a different arm. `decide_residency` picks
+                // this arm purely from ctx vs. `facts.residents`, with no
+                // visibility into `claimed`, so the check has to live here,
+                // before the stale is claimed a SECOND time (the "a claimed
+                // resident is targeted at most once" invariant documented
+                // on `claimed` above). Refuse honestly instead — the same
+                // shape the budget arm already uses for a pinned resident
+                // (`pinned_resident_blocks_budget_load_never_evicted_1487`):
+                // a `Block` naming the claimed instance, never an eviction.
+                if claimed.contains(&stale_identifier) {
+                    decisions.push(PlannedAction {
+                        action: Action::Block {
+                            model_key: p.model_key.clone(),
+                            resident_identifier: Some(stale_identifier.clone()),
                         },
-                    },
-                });
-                decisions.push(PlannedAction {
-                    action: Action::Load {
-                        model_key: p.model_key.clone(),
-                        identifier: p.identifier.clone(),
-                        min_ctx: p.min_ctx,
-                    },
-                    reason: Reason::InsufficientCtx,
-                    precondition: Precondition::NoOwnedResidentForModelKey {
-                        model_key: p.model_key.clone(),
-                        identifier: p.identifier.clone(),
-                    },
-                });
+                        reason: Reason::ClaimedResidentInsufficientCtx {
+                            identifier: stale_identifier,
+                            resident_ctx: stale_ctx,
+                            min_ctx: p.min_ctx,
+                        },
+                        precondition: Precondition::None,
+                    });
+                } else {
+                    claimed.insert(stale_identifier.clone());
+                    let stale_target = OwnedTarget::claim(&stale_identifier, Some(&p.identifier))
+                        .expect("decide_residency only reconciles darkmux-owned or exact-alias residents");
+                    reconcile_frees.push(ReconcileFree {
+                        stale: ReconcileStale::locate(facts, &stale_identifier, decisions.len()),
+                        unload: PlannedAction {
+                            action: Action::Unload { target: stale_target },
+                            reason: Reason::InsufficientCtx,
+                            precondition: Precondition::ResidentPresent {
+                                identifier: stale_identifier,
+                                at_ctx: Some(stale_ctx),
+                            },
+                        },
+                    });
+                    decisions.push(PlannedAction {
+                        action: Action::Load {
+                            model_key: p.model_key.clone(),
+                            identifier: p.identifier.clone(),
+                            min_ctx: p.min_ctx,
+                        },
+                        reason: Reason::InsufficientCtx,
+                        precondition: Precondition::NoOwnedResidentForModelKey {
+                            model_key: p.model_key.clone(),
+                            identifier: p.identifier.clone(),
+                        },
+                    });
+                }
             }
             ResidencyDecision::ForeignDuplicate { foreign_identifier } => {
                 // Absolute ownership (operator, 2026-07-10, #1274): the
@@ -1446,6 +1480,142 @@ mod tests {
                 Action::Unload { target } if target.identifier() == "darkmux:busy"
             )),
             "the pinned model must never be the evicted one"
+        );
+    }
+
+    // ── #2669: the Reconcile arm must honor `claimed` too ────────────────
+    //
+    // #1487 seeded `pinned` into `claimed`, but only pass-1, the #1243
+    // budget loop, and the #1140 pool-headroom loop actually consulted it —
+    // the per-desired `Reconcile` arm picked purely off `decide_residency`
+    // (ctx vs. `facts.residents`), with zero visibility into `claimed`, so
+    // a pinned resident sharing a model key with a desired placement at
+    // insufficient context was STILL unloaded-and-reloaded out from under
+    // whoever pinned it. Each row below asserts the delta against the
+    // identical un-pinned fixture, same pattern as the #1487 rows above.
+
+    #[test]
+    fn reconcile_arm_never_unloads_a_pinned_same_process_resident_2669() {
+        // RED-PROVE, same shape as the issue's own repro: a same-process
+        // sibling's lease pins "darkmux:m" (via `opts.pinned`, exactly how
+        // `LeaseGuard::all_live_leased_models` feeds `ensure_wave_loaded`),
+        // the host has it resident at ctx 32_000, and the wave wants it at
+        // 68_000. WITHOUT the pin, this reconciles — unload then reload —
+        // `reconcile_undersized` covers that shape already. WITH the pin,
+        // the stale must never be unloaded: the placement Blocks honestly
+        // instead, naming the claimed instance.
+        let f = facts(vec![resident("darkmux:m", "m", 32_000, None)]);
+
+        let unpinned = plan_acquire(&[placement("m", 68_000)], &f, additive_auto(), &no_est());
+        assert!(
+            unpinned.actions.iter().any(|a| matches!(
+                &a.action,
+                Action::Unload { target } if target.identifier() == "darkmux:m"
+            )),
+            "sanity: without a pin the stale reconciles (unloads) — got {:?}",
+            unpinned.actions
+        );
+
+        let pinned = opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:m"]);
+        let plan = plan_acquire(&[placement("m", 68_000)], &f, pinned, &no_est());
+        assert_eq!(
+            plan,
+            Plan {
+                actions: vec![PlannedAction {
+                    action: Action::Block {
+                        model_key: "m".into(),
+                        resident_identifier: Some("darkmux:m".into()),
+                    },
+                    reason: Reason::ClaimedResidentInsufficientCtx {
+                        identifier: "darkmux:m".into(),
+                        resident_ctx: 32_000,
+                        min_ctx: 68_000,
+                    },
+                    precondition: Precondition::None,
+                }],
+                ..Default::default()
+            },
+            "a pinned resident must never be unloaded by the Reconcile arm either"
+        );
+        assert!(
+            plan.actions.iter().all(|a| !matches!(&a.action, Action::Unload { .. })),
+            "no Unload of any kind may appear when the stale is pinned: {:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn reconcile_arm_still_reconciles_once_unclaimed_2669() {
+        // INVERTED direction: the identical stale-ctx fixture, but nothing
+        // has it claimed — this must still reconcile normally (unload then
+        // reload at the required ctx), never silently Block just because
+        // the #2669 guard now exists. A fix that stops evicting things it
+        // legitimately should would mean a routine reconcile — the #1135
+        // class this arm exists to close — starts refusing every time.
+        let f = facts(vec![resident("darkmux:m", "m", 32_000, None)]);
+        let plan = plan_acquire(&[placement("m", 68_000)], &f, additive_auto(), &no_est());
+        assert_eq!(
+            plan.actions,
+            vec![reconcile_unload_action("darkmux:m", 32_000), reconcile_load_action("m", 68_000)],
+            "an unclaimed stale resident must still reconcile — the #2669 guard is not a \
+             blanket refusal: {:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn reconcile_arm_blocks_a_resident_claimed_earlier_in_the_same_plan_2669() {
+        // The general form of the invariant, not just the #1487 pinned
+        // case: `claimed` also grows as THIS call's own earlier decisions
+        // land, and the doc on `claimed` already promised "a claimed
+        // resident is targeted at most once." Two placements sharing one
+        // model key both resolve against the SAME stale resident (`facts`
+        // is a snapshot — the second placement's `decide_residency` call
+        // sees the exact same pre-reconcile ctx the first one did, never
+        // the first's in-progress plan): the first legitimately reconciles
+        // it, claiming "darkmux:shared"; the second must Block rather than
+        // reconcile the SAME identifier a second time. Pre-#2669 this
+        // emitted a physically broken plan instead — TWO Unloads of the
+        // identical resident (the `commit_surviving_stales` free-phase
+        // commit has no dedup of its own), which a real executor would run
+        // as a double-unload and fail the second one as #1279 NotResident.
+        let f = facts(vec![resident("darkmux:shared", "shared", 4_096, None)]);
+        let desired = vec![placement("shared", 8_000), placement("shared", 68_000)];
+        let plan = plan_acquire(&desired, &f, additive_auto(), &no_est());
+
+        let unloads: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(&a.action, Action::Unload { .. }))
+            .collect();
+        assert_eq!(
+            unloads.len(),
+            1,
+            "the stale resident is unloaded at most once, never per-collision: {:?}",
+            plan.actions
+        );
+        assert!(
+            matches!(&plan.actions[0], PlannedAction { reason: Reason::InsufficientCtx, .. }),
+            "the FIRST placement's reconcile survives: {:?}",
+            plan.actions[0]
+        );
+        let second = plan.actions.last().expect("two decisions");
+        assert_eq!(
+            second,
+            &PlannedAction {
+                action: Action::Block {
+                    model_key: "shared".into(),
+                    resident_identifier: Some("darkmux:shared".into()),
+                },
+                reason: Reason::ClaimedResidentInsufficientCtx {
+                    identifier: "darkmux:shared".into(),
+                    resident_ctx: 4_096,
+                    min_ctx: 68_000,
+                },
+                precondition: Precondition::None,
+            },
+            "the SECOND placement Blocks — its stale is already claimed by the first: {:?}",
+            plan.actions
         );
     }
 

@@ -90,7 +90,7 @@ use crate::step_kinds::SeatClaim;
 use darkmux_flow::FlowRecord;
 use darkmux_gestalt::{
     plan_acquire, Action, AcquireOpts, AcquireScope, CallerIntent, Deadline, Facts,
-    FootprintEstimator, HostError, ModelHost, Placement, Plan, ResourceProbe, WaveMode,
+    FootprintEstimator, HostError, ModelHost, Placement, Plan, Reason, ResourceProbe, WaveMode,
     WaveSchedule,
 };
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
@@ -423,7 +423,14 @@ const BLOCKED_BY_HOLDER_RETRY_DELAY: Duration = Duration::from_millis(300);
 /// explains).
 enum PlanExecOutcome {
     Loaded,
-    Blocked { model_key: String, reason: String },
+    /// `reason` is the TYPED `Reason`, not a rendered string (#2669) — so
+    /// the caller can distinguish [`Reason::ClaimedResidentInsufficientCtx`]
+    /// (the one Block reason that can genuinely resolve with time, since
+    /// its cause is a live claim that may clear) from every other Block
+    /// reason (unknown model key, a foreign duplicate over capacity, a
+    /// load that alone exceeds the whole budget), none of which any amount
+    /// of waiting ever fixes.
+    Blocked { model_key: String, reason: Reason },
     HostFailed { detail: String, host_error: HostError },
 }
 
@@ -457,7 +464,7 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
             Action::Block { model_key, .. } => {
                 return PlanExecOutcome::Blocked {
                     model_key: model_key.clone(),
-                    reason: planned.reason.to_string(),
+                    reason: planned.reason.clone(),
                 };
             }
         }
@@ -508,14 +515,16 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 /// function, which excludes only `own_pid` and so missed a live
 /// same-process sibling entirely) — are read fresh on every attempt and
 /// fed in as `AcquireOpts.pinned` (#1487 PR1) — `plan_acquire` never
-/// pass-1-unloads a pinned resident as not-desired, and always counts it
-/// as occupied, whether that pin comes from a different process or a
-/// sibling dispatch in THIS one. **This guards pass-1 not-desired
-/// eviction, the budget eviction loop, and the pool-headroom eviction
-/// loop only — it does NOT guard the per-desired `Reconcile` arm, which
-/// can still unload a pinned identifier that shares a model key with a
-/// desired placement at insufficient context (#2669, filed, not yet
-/// fixed).** This process's OWN lease is written/refreshed to
+/// pass-1-unloads a pinned resident as not-desired, always counts it
+/// as occupied, and (#2669) never unloads it via the per-desired
+/// `Reconcile` arm either — a pinned identifier that shares a model key
+/// with a desired placement at insufficient context now `Block`s that
+/// placement (`Reason::ClaimedResidentInsufficientCtx`) instead of being
+/// unloaded-and-reloaded out from under the command that pinned it,
+/// whether that pin comes from a different process or a sibling dispatch
+/// in THIS one — see this function's own retry-hold section below for how
+/// that specific Block still gets a bounded chance to clear rather than
+/// failing the wave outright. This process's OWN lease is written/refreshed to
 /// this wave's placements BEFORE planning, via the CALLER-SUPPLIED `lease`
 /// guard's own [`residency_lease::LeaseGuard::write`] (#2651 — never the
 /// old bare `write_lease` free function, which clobbered a concurrent
@@ -543,10 +552,17 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 ///   - No pin explains it → this placement likely does not fit the machine
 ///     AT ALL, alone; retrying can never help, so this fails immediately.
 ///
-/// A planning-level `Action::Block` (unknown model key, a foreign duplicate
-/// with no capacity, or — once #1243 is wired — a single profile that
-/// exceeds the WHOLE budget) is never retried: no wait changes what
-/// `plan_acquire` already refused to plan.
+/// A planning-level `Action::Block` is never retried EXCEPT for one reason:
+/// [`Reason::ClaimedResidentInsufficientCtx`] (#2669) — a resident sharing
+/// the desired model key at insufficient context, but already claimed by a
+/// live pinned dispatch. Its cause is a live claim that may clear (the
+/// pinning command finishing its own dispatch), so it gets the SAME bounded
+/// hold-not-fail retry as the analogous `HostFailed`+pinned shortfall below,
+/// never an eviction of the claimed resident. Every OTHER Block reason
+/// (unknown model key, a foreign duplicate with no capacity, or — once
+/// #1243 is wired — a single profile that exceeds the WHOLE budget) is
+/// still never retried: no wait changes what `plan_acquire` already refused
+/// to plan for those.
 ///
 /// `pub(crate)` (#2628): [`crate::dispatch_reconciled`] calls this directly
 /// for a single-placement "wave" of one, giving a standalone (non-graph,
@@ -644,7 +660,22 @@ pub(crate) fn ensure_wave_loaded(
         match execute_plan(&plan, host, deadline) {
             PlanExecOutcome::Loaded => return Ok(()),
             PlanExecOutcome::Blocked { model_key, reason } => {
-                bail!("darkmux: cannot load \"{model_key}\" for this wave — {reason}");
+                // (#2669) The one Block reason that can genuinely resolve
+                // with time: the claimed resident's holder may finish and
+                // release its lease before the next attempt. Same bounded
+                // hold-not-fail budget as the analogous HostFailed+pinned
+                // shortfall below — never an unbounded wait, never an
+                // eviction of the claimed resident either way.
+                if matches!(reason, Reason::ClaimedResidentInsufficientCtx { .. })
+                    && attempt < BLOCKED_BY_HOLDER_RETRY_ATTEMPTS
+                {
+                    std::thread::sleep(BLOCKED_BY_HOLDER_RETRY_DELAY);
+                    continue;
+                }
+                bail!(
+                    "darkmux: cannot load \"{model_key}\" for this wave after {attempt} \
+                     attempt(s) — {reason}"
+                );
             }
             PlanExecOutcome::HostFailed { detail, host_error } => {
                 let insufficient = matches!(host_error, HostError::InsufficientResources { .. });
@@ -945,6 +976,192 @@ mod tests {
 
         let _ = holder.kill();
         let _ = holder.wait();
+    }
+
+    // ── #2669: the Reconcile arm must honor a pin too ────────────────────
+    //
+    // #1487/#2663 closed the pass-1 not-desired eviction hazard for a
+    // pinned resident, same-process and cross-process alike — but
+    // `plan_acquire`'s per-desired `Reconcile` arm (unload + reload at a
+    // higher context for the SAME model key) never consulted `pinned` at
+    // all. The exact issue repro: a sibling guard holds `["darkmux:m"]`,
+    // the host has `darkmux:m` resident at ctx 32_000, and this wave wants
+    // `placement("m", 68_000)` — pre-fix this produced `[ListResident,
+    // Unload { identifier: "darkmux:m" }, Load { model_key: "m",
+    // identifier: "darkmux:m", min_ctx: 68_000 }]`, killing the sibling's
+    // in-flight dispatch mid-generation.
+
+    /// RED-PROVE (same-process): a live same-process sibling's lease pins
+    /// "darkmux:m" — resident at ctx 32_000 — while this wave wants it at
+    /// 68_000. Must Block, never Unload.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_never_reconciles_over_a_live_same_process_sibling_at_insufficient_ctx_2669(
+    ) {
+        let _env = LeaseTestEnv::new();
+
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:m".to_string()]).expect("sibling writes its lease");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:m", "m", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 68_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+            .expect_err("a live sibling's model at insufficient ctx must Block, not reconcile");
+
+        assert!(
+            host.ops.iter().all(|op| !matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. })),
+            "the pinned sibling's model must never be unloaded: {:?}",
+            host.ops
+        );
+        assert!(
+            host.residents.iter().any(|r| r.identifier == "darkmux:m" && r.ctx == 32_000),
+            "the pinned sibling's model must still be resident, at its original ctx, afterward: \
+             {:?}",
+            host.residents
+        );
+        assert!(err.to_string().contains("darkmux:m"), "the error names the claimed model: {err:#}");
+
+        drop(sibling_guard);
+        drop(own_guard);
+    }
+
+    /// RED-PROVE (cross-process): the identical shape, but the pin comes
+    /// from a hand-written `<pid>.lease` file belonging to a genuinely
+    /// different, live process (never `ACTIVE_LEASES` — this exercises the
+    /// `live_leased_models` half of `all_live_leased_models`'s union, not
+    /// the same-process half the test above exercises). Must Block, never
+    /// Unload — the SAME outcome, proving the fix is process-shape-agnostic.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_never_reconciles_over_a_live_external_process_lease_at_insufficient_ctx_2669(
+    ) {
+        let env = LeaseTestEnv::new();
+        let mut holder = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawning a short-lived holder process");
+        let holder_pid = holder.id();
+        let residency_dir = env.home().join("residency");
+        std::fs::create_dir_all(&residency_dir).unwrap();
+        std::fs::write(
+            residency_dir.join(format!("{holder_pid}.lease")),
+            format!(r#"{{"pid":{holder_pid},"models":["darkmux:m"]}}"#),
+        )
+        .expect("hand-writing a lease for the external holder pid");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:m", "m", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 68_000)];
+
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect_err(
+            "a live EXTERNAL process's pinned model at insufficient ctx must Block, not reconcile",
+        );
+
+        assert!(
+            host.ops.iter().all(|op| !matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. })),
+            "the externally-pinned model must never be unloaded: {:?}",
+            host.ops
+        );
+        assert!(
+            host.residents.iter().any(|r| r.identifier == "darkmux:m" && r.ctx == 32_000),
+            "the externally-pinned model must still be resident, at its original ctx, afterward: \
+             {:?}",
+            host.residents
+        );
+        assert!(err.to_string().contains("darkmux:m"), "the error names the claimed model: {err:#}");
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// INVERTED direction: the identical stale-ctx resident, but nothing
+    /// has it pinned or leased — this must still reconcile normally (the
+    /// #1135 class the Reconcile arm exists to close), never Block just
+    /// because the #2669 guard now exists.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_still_reconciles_an_unpinned_stale_resident_2669() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:m", "m", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 68_000)];
+
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
+            .expect("an unpinned stale resident still reconciles");
+
+        assert_eq!(
+            host.ops,
+            vec![
+                darkmux_gestalt::mock::HostOp::ListResident,
+                darkmux_gestalt::mock::HostOp::Unload { identifier: "darkmux:m".to_string() },
+                darkmux_gestalt::mock::HostOp::Load {
+                    model_key: "m".to_string(),
+                    identifier: "darkmux:m".to_string(),
+                    min_ctx: 68_000,
+                },
+            ],
+            "the #2669 guard must not block a routine, un-pinned reconcile"
+        );
+    }
+
+    /// The retry-hold half of #2669: a Block from `Reason::
+    /// ClaimedResidentInsufficientCtx` gets the SAME bounded hold-not-fail
+    /// retry as the analogous `HostFailed`+pinned shortfall
+    /// (`ensure_wave_loaded_retries_past_a_transient_shortfall_when_a_holder_is_pinned`
+    /// below) rather than failing the wave on the very first Block — a
+    /// sibling that holds its claim for the WHOLE test (never drops) must
+    /// still see `BLOCKED_BY_HOLDER_RETRY_ATTEMPTS` attempts (one
+    /// `ListResident` per attempt — the claimed resident is never touched)
+    /// before failing loud, naming the claimed model.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_retries_a_permanently_claimed_reconcile_before_failing_loud_2669() {
+        let _env = LeaseTestEnv::new();
+
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:m".to_string()]).expect("sibling writes its lease");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = MockHost::new()
+            .resident("darkmux:m", "m", 32_000, Some(1_000))
+            .cataloged("m", 1_000);
+        let wave = vec![placement("m", 68_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+            .expect_err("a permanently claimed resident never becomes reconcilable");
+
+        let list_attempts = host
+            .ops
+            .iter()
+            .filter(|op| matches!(op, darkmux_gestalt::mock::HostOp::ListResident))
+            .count();
+        assert_eq!(
+            list_attempts as u32, BLOCKED_BY_HOLDER_RETRY_ATTEMPTS,
+            "the claimed-reconcile Block retries the same bounded budget as the analogous \
+             HostFailed+pinned shortfall before giving up: {:?}",
+            host.ops
+        );
+        assert!(
+            host.ops.iter().all(|op| !matches!(op, darkmux_gestalt::mock::HostOp::Unload { .. })),
+            "the claimed resident must never be unloaded across any attempt: {:?}",
+            host.ops
+        );
+        assert!(err.to_string().contains("darkmux:m"), "{err:#}");
+
+        drop(sibling_guard);
+        drop(own_guard);
     }
 
     // ── #2663: same-process sibling protection ──────────────────────────

@@ -114,18 +114,27 @@
 //! choosing to pass-1-evict its model as not-desired, and a sibling that
 //! has actually withdrawn (dropped cleanly, or via panic-unwind — `Drop`
 //! runs on every exit path, #2651) stops being pinned the moment it
-//! withdraws, never "pinned forever." **This does NOT cover every
-//! eviction path: `plan_acquire`'s per-desired `Reconcile` arm (unload +
-//! reload at a higher context for the SAME model key) never consults
+//! withdraws, never "pinned forever." **This left one eviction path open
+//! at the time: `plan_acquire`'s per-desired `Reconcile` arm (unload +
+//! reload at a higher context for the SAME model key) never consulted
 //! `pinned` at all, so a live sibling resident at the same model key but
-//! insufficient context can still be unloaded out from under it — filed
-//! as #2669, not fixed here.** Wiring `radio.rs`/`radio_answer.rs`
-//! through `dispatch_reconciled` is no longer blocked on the pass-1
-//! not-desired hazard this PR closes — but #2669 remains open, and is
-//! most likely to bite exactly when an operator sets
-//! `radio.router_profile` and `radio.answerer_profile` to two profiles
-//! naming the same catalog model at different contexts (both default to
-//! empty today, which is why this has not yet been observed live). That
+//! insufficient context could still be unloaded out from under it — filed
+//! as #2669.**
+//!
+//! **#2669 (fixed):** the `Reconcile` arm now checks the SAME `claimed` set
+//! (seeded from `pinned`, plus every earlier decision in the same plan)
+//! before committing to an unload-then-reload. A claimed stale resident
+//! Blocks the placement instead (`Reason::ClaimedResidentInsufficientCtx`),
+//! and — because that cause can genuinely clear with time (the pinning
+//! command finishing its own dispatch) — `ensure_wave_loaded` gives that
+//! specific Block the SAME bounded hold-not-fail retry the analogous
+//! `HostFailed`+pinned shortfall already got, rather than failing the wave
+//! on the very first attempt. Two profiles naming the same catalog model at
+//! different contexts are no longer mutually exclusive outright: the later
+//! one waits a bounded window for the first to finish, then fails loud
+//! naming the claimed model if it hasn't. Wiring `radio.rs`/`radio_answer.rs`
+//! through `dispatch_reconciled` is no longer blocked on either the pass-1
+//! not-desired hazard #2663 closed or this Reconcile-arm hazard — that
 //! wiring itself remains a separate, unattempted follow-up.
 //!
 //! # What this does not change

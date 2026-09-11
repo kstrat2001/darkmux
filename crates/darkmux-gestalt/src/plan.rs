@@ -180,6 +180,16 @@ pub enum Reason {
     /// where the model alone exceeds the whole budget, which is refused for
     /// BOTH caller intents.
     BudgetRefuse { est_bytes: u64, budget_bytes: u64 },
+    /// Block: the per-desired `Reconcile` arm found a resident sharing this
+    /// placement's model key at insufficient context, but that resident is
+    /// already `claimed` — pinned by a CONCURRENT darkmux command actively
+    /// dispatching to it (#1487), or already targeted by an earlier
+    /// decision in this same plan — so unloading it to reconcile would kill
+    /// a live dependency instead of freeing an idle one (#2669). Never an
+    /// eviction candidate, same as a pinned resident in the #1243 budget or
+    /// #1140 pool-headroom passes; this is that same refusal reached
+    /// through the Reconcile arm instead.
+    ClaimedResidentInsufficientCtx { identifier: String, resident_ctx: u64, min_ctx: u32 },
 }
 
 /// Display-only GB rendering for the operator-facing suggestion strings
@@ -261,6 +271,10 @@ impl fmt::Display for Reason {
             Reason::BudgetRefuse { est_bytes, budget_bytes } => write!(
                 f,
                 "an estimated {est_bytes}-byte load cannot be satisfied within the {budget_bytes}-byte AI RAM budget by any eviction of darkmux-owned residents — refused (#1243, applies to every caller intent)"
+            ),
+            Reason::ClaimedResidentInsufficientCtx { identifier, resident_ctx, min_ctx } => write!(
+                f,
+                "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed (a live pinned dispatch, same-process or a concurrent darkmux command, or another placement already targeting it in this same plan), so it is never unloaded to reconcile; wait for the claim to clear, or point this placement at a distinct identifier (#2669)"
             ),
         }
     }
@@ -421,6 +435,11 @@ mod tests {
                 eviction_order: EvictionOrder::HostReported,
             },
             Reason::BudgetRefuse { est_bytes: 22, budget_bytes: 8 },
+            Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 32_000,
+                min_ctx: 68_000,
+            },
         ];
         for r in &all {
             assert!(!r.to_string().is_empty(), "{r:?} renders");
