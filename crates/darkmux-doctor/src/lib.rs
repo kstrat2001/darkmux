@@ -170,6 +170,7 @@ pub fn run() -> DoctorReport {
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
         check_host_sampler(),
+        check_liveness_retention(),
         check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
@@ -2782,6 +2783,71 @@ fn check_host_sampler_interval() -> Check {
 /// a healthy install as faulty. The file-based lock could only ever show
 /// ONE current holder either way, so the marker never actually proved a
 /// second emitter was active; deleting the channel loses no real signal.
+/// (#2653) Surface `<darkmux-home>/liveness/`'s current heartbeat-file count
+/// and the retention window pruning it. The growth this reports on (10,249
+/// files, 40 MB on one laptop, oldest two months old) was invisible until an
+/// operator went and looked by hand; this makes it visible from `darkmux
+/// doctor` without leaving the machine. Counts only `<pid>.log` files (the
+/// `host-sampler.lock` file living in the same directory is a different
+/// mechanism, see `check_host_sampler` below, and is never counted here).
+fn check_liveness_retention() -> Check {
+    let name = "liveness retention";
+    // (#2653 MUST FIX 2) One call resolves BOTH the number and its
+    // provenance, so they can no longer disagree — this replaced two
+    // separate hand-rolled reads (a raw env peek + a strict
+    // `DarkmuxConfig::load_resolved()` field check) that used to go out of
+    // sync the moment an UNRELATED known field elsewhere in `config.json`
+    // was wrong-typed: the strict parse failed the WHOLE document, so this
+    // check printed "(default)" while the actual prune pass — reading the
+    // same file through `dispatch_liveness`'s own raw peek — kept pruning
+    // on the operator's real, correctly-typed value the entire time.
+    let (hours, source) = darkmux_types::config_access::liveness_retention_hours_with_source();
+    let provenance = match source {
+        darkmux_types::config_access::Source::Env => "from DARKMUX_LIVENESS_RETENTION_HOURS env",
+        darkmux_types::config_access::Source::Config => "from config.json",
+        darkmux_types::config_access::Source::BuiltIn => "default",
+    };
+    let dir = darkmux_types::config_access::liveness_dir();
+    // (#2653 CONSIDER 10) `is_pid_log_file` is the SAME predicate
+    // `dispatch_liveness`'s own prune pass applies — sharing it here means
+    // this count can never drift from what actually gets pruned the way
+    // MUST FIX 2/3's two resolvers already had.
+    let count = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries.filter_map(|e| e.ok()).filter(|e| darkmux_types::dispatch_liveness::is_pid_log_file(&e.path())).count()
+        })
+        .unwrap_or(0);
+    // (#2653 MUST FIX 6) `0` disables pruning entirely (this codebase's own
+    // zero-means-off convention — `runtime.host_sampler_interval_ms`,
+    // `redis.maxlen` — never "retain nothing"); warn loudly rather than
+    // silently letting the directory grow unbounded with a Pass status.
+    let (status, hint) = if hours == 0 {
+        (
+            Status::Warn,
+            Some(
+                "`runtime.liveness_retention_hours: 0` disables pruning (0 means \"off\", the \
+                 same convention as `runtime.host_sampler_interval_ms` / `redis.maxlen` — never \
+                 \"retain nothing\"), so this directory will grow unbounded. Set a real window \
+                 in hours (e.g. 168 for 7 days) or remove the key for the default."
+                    .to_string(),
+            ),
+        )
+    } else {
+        (Status::Pass, None)
+    };
+    Check {
+        name: name.into(),
+        status,
+        message: format!(
+            "{count} heartbeat file(s) in {} — retention {hours}h / {:.1}d ({provenance}); \
+             pruned automatically as new dispatches write markers",
+            dir.display(),
+            hours as f64 / 24.0
+        ),
+        hint,
+    }
+}
+
 fn check_host_sampler() -> Check {
     let name = "host sampler";
     let now_ms = darkmux_crew::host_sampler_lock::epoch_ms_now();
@@ -7845,6 +7911,201 @@ mod tests {
         );
     }
 
+    // ─── (#2653) check_liveness_retention ───
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_reports_default_window_and_zero_files() {
+        with_isolated_liveness_dir(|| {
+            let check = check_liveness_retention();
+            assert_eq!(check.status, Status::Pass, "{}", check.message);
+            assert!(check.message.contains("0 heartbeat file"), "{}", check.message);
+            assert!(check.message.contains("168h"), "{}", check.message);
+            assert!(check.message.contains("(default)"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_counts_only_pid_named_log_files() {
+        with_isolated_liveness_dir(|| {
+            let dir = darkmux_types::config_access::liveness_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("123.log"), "hi").unwrap();
+            std::fs::write(dir.join("456.log"), "hi").unwrap();
+            // Neither counted: not a pid name, and not a `.log` file.
+            std::fs::write(dir.join("not-a-pid.log"), "hi").unwrap();
+            std::fs::write(dir.join("host-sampler.lock"), "{}").unwrap();
+            let check = check_liveness_retention();
+            assert!(check.message.contains("2 heartbeat file"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_env_override_shows_in_provenance() {
+        with_isolated_liveness_dir(|| {
+            let k = "DARKMUX_LIVENESS_RETENTION_HOURS";
+            let prev = std::env::var(k).ok();
+            unsafe { std::env::set_var(k, "24") };
+            let check = check_liveness_retention();
+            assert!(check.message.contains("24h"), "{}", check.message);
+            assert!(check.message.contains("DARKMUX_LIVENESS_RETENTION_HOURS env"), "{}", check.message);
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_survives_a_wrong_typed_sibling_field() {
+        // (#2653 MUST FIX 2) `max_turns: "oops"` is a KNOWN field with the
+        // wrong JSON type — nothing to do with liveness at all. Before the
+        // fix, `DarkmuxConfig::load_from`'s whole-document strict
+        // `serde_json::from_str` failed on THIS field and fell back to an
+        // all-`None` default, silently discarding the correctly-typed
+        // `liveness_retention_hours: 1` sitting right next to it. This
+        // check then printed "168h ... (default)" while the real prune
+        // pass (reading the same file through `dispatch_liveness`'s own
+        // raw peek) kept pruning on `1`. Reproduces the reviewer's exact
+        // config shape.
+        with_isolated_liveness_dir(|| {
+            let home = std::env::var("DARKMUX_HOME").expect("set by with_isolated_liveness_dir");
+            std::fs::write(
+                std::path::Path::new(&home).join("config.json"),
+                r#"{"runtime":{"liveness_retention_hours":1,"max_turns":"oops"}}"#,
+            )
+            .unwrap();
+
+            // Sanity: the strict-typed struct really does drop the field —
+            // proves this test exercises the drift, not a no-op.
+            let strict =
+                darkmux_types::config::DarkmuxConfig::load_from(&std::path::PathBuf::from(&home).join("config.json"));
+            assert!(
+                strict.runtime.is_none(),
+                "sanity: the wrong-typed sibling field must fail the WHOLE strict parse"
+            );
+
+            let check = check_liveness_retention();
+            assert!(check.message.contains("1h"), "{}", check.message);
+            assert!(check.message.contains("from config.json"), "{}", check.message);
+            assert!(!check.message.contains("(default)"), "{}", check.message);
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_zero_hours_warns_instead_of_silently_wiping() {
+        // (#2653 MUST FIX 6) `0` means "pruning disabled" (this codebase's
+        // own zero-means-off convention), not "retain nothing" — and an
+        // operator who writes `0` expecting the former deserves a loud
+        // Warn, not a Pass that hides the fact their directory is about to
+        // grow unbounded.
+        with_isolated_liveness_dir(|| {
+            let k = "DARKMUX_LIVENESS_RETENTION_HOURS";
+            let prev = std::env::var(k).ok();
+            unsafe { std::env::set_var(k, "0") };
+            let check = check_liveness_retention();
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            assert_eq!(check.status, Status::Warn, "{}", check.message);
+            assert!(check.message.contains("0h"), "{}", check.message);
+            assert!(
+                check.hint.as_deref().is_some_and(|h| h.contains("disables")),
+                "{:?}",
+                check.hint
+            );
+        });
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_liveness_retention_never_diverges_from_the_writer_dir_via_project_local_darkmux() {
+        // (#2653 MUST FIX 3) Before the fix, this check read
+        // `config_access::liveness_dir()`, which resolved through
+        // `paths::resolve(Auto)` — auto-detecting a project-local
+        // `./.darkmux` (a supported layout `lab run`/`lab fixture` create).
+        // `dispatch_liveness` (the actual WRITER) never does that
+        // auto-detect. So with a project-local `.darkmux/` in cwd, doctor
+        // read/counted the WRONG directory (a decoy file below) while the
+        // real liveness dir — where every heartbeat actually lands — grew
+        // unpruned and unseen underneath a "Pass".
+        let proj = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(proj.path().join(".darkmux").join("liveness")).unwrap();
+        std::fs::write(proj.path().join(".darkmux").join("liveness").join("999999.log"), "decoy")
+            .unwrap();
+
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_cwd = std::env::current_dir().unwrap();
+        unsafe { std::env::remove_var("DARKMUX_HOME") };
+        std::env::set_current_dir(proj.path()).unwrap();
+
+        // Sanity: Auto really does diverge from the writer's own resolution
+        // in this setup, so the guard below exercises the actual choice.
+        let auto_dir =
+            darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto).root.join("liveness");
+        // The writer's dir here is the FIXED test-isolation scratch path
+        // (#2653 MUST FIX 1) — shared with every other test in this binary
+        // that also runs with `DARKMUX_HOME` unset, so count by DELTA
+        // rather than an absolute number to stay deterministic under
+        // parallel/repeated runs. A pid-derived filename keeps this run's
+        // own marker distinguishable, and it is removed again below.
+        let writer_dir = darkmux_types::dispatch_liveness::liveness_dir();
+        std::fs::create_dir_all(&writer_dir).unwrap();
+        let baseline = count_pid_log_files(&writer_dir);
+        let marker = writer_dir.join(format!("{}.log", std::process::id()));
+        std::fs::write(&marker, "hi").unwrap();
+
+        let check = check_liveness_retention();
+        let after = count_pid_log_files(&writer_dir);
+        let _ = std::fs::remove_file(&marker);
+
+        // Restore env/cwd FIRST so a failed assert can't poison other
+        // serial tests.
+        std::env::set_current_dir(&prev_cwd).unwrap();
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("DARKMUX_HOME", h),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert_ne!(
+            auto_dir, writer_dir,
+            "sanity: a project-local .darkmux/ must actually diverge from the writer's dir here"
+        );
+        assert!(
+            check.message.contains(&writer_dir.display().to_string()),
+            "doctor must report the WRITER's directory, not the project-local one: {}",
+            check.message
+        );
+        assert_eq!(
+            after,
+            baseline + 1,
+            "doctor must count the writer's dir (one marker added), not the project-local decoy: {}",
+            check.message
+        );
+    }
+
+    /// Same `.log` + pid-named-stem filter `check_liveness_retention` itself
+    /// applies, for tests that need to compute a baseline/delta rather than
+    /// an absolute count against the shared test-isolation scratch dir.
+    fn count_pid_log_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).filter(|e| darkmux_types::dispatch_liveness::is_pid_log_file(&e.path())).count()
+            })
+            .unwrap_or(0)
+    }
+
     // ─── (#2413) check_host_sampler — singleton lock Pass/Warn/Warn ───
 
     /// Isolate `host_sampler_lock_path()` to a fresh tempdir for the
@@ -9264,22 +9525,30 @@ mod tests {
         // hooks checks are a different, disabled-by-default surface] + one
         // per active eureka rule.
         //
-        // (round-3 merge fix) The constant here is 57, not 56: #1944 added
-        // `check_unreachable_darkmux_residents` to the static array (recount
-        // it before touching this number — `grep -c` inside the
-        // `let checks = vec![...]` block), `check_hooks()` always
-        // contributes exactly 1 more (disabled by default → the single
-        // overview check), and only THEN does `eureka_checks()` add one per
-        // active rule. A prior rebase kept an origin/main-side "53" that
-        // predated this branch's own `check_runtime_binary_cache` addition
-        // to the static array, silently undercounting by exactly the one
-        // check the OTHER side of that same merge conflict had just added —
-        // proof that a colliding-file rebase needs its literal counts
-        // re-derived, not just its prose reconciled.
+        // (#2653 MUST FIX 5) The constant here is 58, not 57: this branch's
+        // own `check_liveness_retention` (added to the static array above,
+        // alongside `check_host_sampler`) landed without this literal being
+        // bumped alongside it — a plain CI red (`left: 59, right: 58`),
+        // fixed by recounting rather than guessing. Re-derive it the same
+        // way every prior bump here did: `grep -c` inside the `let checks =
+        // vec![...]` block for the static count, `darkmux_eureka::all_rules().len()`
+        // for the dynamic half (one entry today — `memory-headroom-tight`).
+        //
+        // (round-3 merge fix, historical) The constant was 57, not 56:
+        // #1944 added `check_unreachable_darkmux_residents` to the static
+        // array, `check_hooks()` always contributes exactly 1 more
+        // (disabled by default → the single overview check), and only THEN
+        // does `eureka_checks()` add one per active rule. A prior rebase
+        // kept an origin/main-side "53" that predated this branch's own
+        // `check_runtime_binary_cache` addition to the static array,
+        // silently undercounting by exactly the one check the OTHER side of
+        // that same merge conflict had just added — proof that a
+        // colliding-file rebase needs its literal counts re-derived, not
+        // just its prose reconciled. Same lesson, same fix, one more time.
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 57 + darkmux_eureka::all_rules().len();
+        let expected = 58 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -803,6 +803,54 @@ pub fn acp_idle_exit_minutes() -> u64 {
     pick_parsed("DARKMUX_ACP_IDLE_EXIT_MINUTES", cfg, Some(30)).unwrap()
 }
 
+// ── Liveness heartbeat retention (#2653) ──
+/// Retention window, in hours, for `<darkmux-home>/liveness/<pid>.log`
+/// per-dispatch heartbeat files (`darkmux_types::dispatch_liveness`) — a
+/// file older than this is pruned the next time any dispatch writes a
+/// marker. Resolves `env(DARKMUX_LIVENESS_RETENTION_HOURS) >
+/// config.runtime.liveness_retention_hours > 168` (7 days). This is the
+/// doctor-facing / operator-visible reader; `dispatch_liveness`'s own prune
+/// pass resolves the SAME precedence through its own minimal raw peek
+/// rather than calling this function — see that module's doc for why (it
+/// must work before config/Redis/audit/flow are touched).
+pub fn liveness_retention_hours() -> u64 {
+    liveness_retention_hours_with_source().0
+}
+
+/// (#2653 MUST FIX 2) `liveness_retention_hours` plus WHICH tier resolved
+/// it — the doctor row's provenance string, made structurally impossible to
+/// disagree with the number next to it (they now come from the same call).
+///
+/// The `config.json` half falls back to `dispatch_liveness`'s own raw JSON
+/// peek (`raw_config_liveness_retention_hours`) when the strict-typed
+/// `DarkmuxConfig` struct carries no value for this field — which covers
+/// TWO different cases identically, on purpose: the field genuinely absent,
+/// AND the field present but the WHOLE document failing strict
+/// `serde_json` deserialize because some UNRELATED known field elsewhere is
+/// wrong-typed (`DarkmuxConfig::load_from`'s `.unwrap_or_default()`
+/// silently drops every field, not just the bad one). Before this fallback,
+/// that second case made doctor report "168h (default)" while the actual
+/// prune pass — reading the same file through the same raw peek — pruned on
+/// the operator's real, correctly-typed value the whole time. Falling back
+/// to `dispatch_liveness`'s peek is safe: it never calls back into
+/// `config_access`, so no cycle.
+pub fn liveness_retention_hours_with_source() -> (u64, Source) {
+    if let Some(v) =
+        env_str("DARKMUX_LIVENESS_RETENTION_HOURS").and_then(|s| s.parse::<u64>().ok())
+    {
+        return (v, Source::Env);
+    }
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.liveness_retention_hours)
+        .or_else(crate::dispatch_liveness::raw_config_liveness_retention_hours);
+    match cfg {
+        Some(v) => (v, Source::Config),
+        None => (168, Source::BuiltIn),
+    }
+}
+
 // ── Role -> profile map (#1475 packet 1) ──
 /// (#1475 packet 1) Normalize a raw role->profile map: trim BOTH the role key
 /// AND the profile value, and drop any binding whose profile is blank (a
@@ -1017,25 +1065,32 @@ pub fn liveness_dir() -> std::path::PathBuf {
     liveness_dir_default()
 }
 
-/// (#994/#2359-style isolation) In test / `test-support` builds, never
-/// resolve to the operator's real `~/.darkmux/liveness` unless the test
-/// explicitly isolated itself (`DARKMUX_HOME` or a project-local
-/// `./.darkmux`) — mirrors `flows_dir_default`'s own test-build variant
-/// exactly, for the same reason: a test that forgets to isolate must not
-/// touch real operator state.
-#[cfg(not(any(test, feature = "test-support")))]
+/// (#2653 MUST FIX 3) Delegates straight to `dispatch_liveness::liveness_dir()`
+/// — the WRITER's own resolution — instead of `paths::resolve(Auto)`.
+///
+/// `paths::resolve(Auto)` auto-detects a project-local `./.darkmux` (a
+/// supported layout `lab run`/`lab fixture` create); `dispatch_liveness`
+/// deliberately never does that project-local auto-detect — its entire
+/// reason for existing is to avoid a cwd stat (or any config read) before
+/// config/Redis/audit/flow are even touched. With a project-local
+/// `.darkmux` present in cwd, this function used to resolve to a DIFFERENT
+/// directory than the one every heartbeat actually lands in: the doctor row
+/// whose whole purpose is making growth visible counted 0 files in the cwd
+/// directory while the real directory (`$HOME/.darkmux/liveness`, or
+/// `DARKMUX_HOME`) kept growing, unpruned and unseen, the entire time the
+/// check said "Pass". `host_sampler_lock_path` rides this same function, so
+/// the identical divergence would have put the host-sampler lock file
+/// somewhere `dispatch_liveness` never writes to either — this closes both
+/// at the resolution root rather than patching each consumer.
+///
+/// `dispatch_liveness::liveness_dir()` carries its OWN test isolation
+/// (#2653 MUST FIX 1: `DARKMUX_HOME` if set, else a fixed
+/// `/tmp/darkmux-test-isolated` scratch path in test / `test-support`
+/// builds — never the real home), so this needs no separate test-cfg
+/// variant of its own any more; the (#994/#2359-style) isolation guarantee
+/// carries through automatically.
 fn liveness_dir_default() -> std::path::PathBuf {
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("liveness")
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn liveness_dir_default() -> std::path::PathBuf {
-    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
-    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
-    if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/liveness");
-    }
-    resolved.root.join("liveness")
+    crate::dispatch_liveness::liveness_dir()
 }
 
 /// `<darkmux-home>/liveness/host-sampler.lock` — the singleton-sampler
@@ -2201,6 +2256,29 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(turn_delay_ms(), 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── liveness_retention_hours (#2653): env > config > 168 default,
+    //    mirroring turn_delay_ms's resolution exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn liveness_retention_hours_env_overrides_then_default() {
+        let k = "DARKMUX_LIVENESS_RETENTION_HOURS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + the empty test config (#811) → the built-in 168h default.
+        assert_eq!(liveness_retention_hours(), 168);
+        unsafe { std::env::set_var(k, "24") };
+        assert_eq!(liveness_retention_hours(), 24, "env wins live");
+        // An unparseable env value falls through (here, to the default).
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(liveness_retention_hours(), 168);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
