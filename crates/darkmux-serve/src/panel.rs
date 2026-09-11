@@ -458,9 +458,43 @@ fn extract_opt_params(raw: &HashMap<String, String>) -> HashMap<String, String> 
 }
 
 /// Whole-response cache entry.
+///
+/// (#2479 audit — not in the original MUST FIX list, found during the
+/// audit enumeration and fixed for the same reason) `SystemTime`,
+/// deliberately not `Instant`: `captured`'s ONLY purpose is the
+/// `age_ms`/freshness pair restamped into the served body (this module's
+/// own doc, above `cached_if_fresh`) — the OUTSIDE-WORLD bucket, same
+/// shape as the fleet cache in `darkmux-serve/src/lib.rs`. A daemon that
+/// survives a host sleep would otherwise serve a pre-sleep-cached panel
+/// (mission-status, doctor, etc.) within `PANEL_CACHE_TTL` of AWAKE time
+/// after wake, restamping a falsely small `age_ms` that claims the body
+/// is fresh when it may be hours old.
 struct CacheEntry {
     body: serde_json::Value,
-    captured: Instant,
+    captured: SystemTime,
+}
+
+/// Whether a [`CacheEntry`] captured at `captured` is still fresh at
+/// `now`, given `ttl` (#2479 audit). Explicit `now` — no internal
+/// `SystemTime::now()` call — for the same testability reason as
+/// `manual_floor_wait`/`wall_clock_cache_is_fresh`. A backward wall-clock jump
+/// (`duration_since` errs) is treated as NOT fresh: the safe failure
+/// direction for a freshness gate is one extra (cheap, local) spawn, never
+/// serving a body whose real age is unknown as though it were fresh.
+fn cache_entry_is_fresh(captured: SystemTime, now: SystemTime, ttl: Duration) -> bool {
+    now.duration_since(captured).map(|age| age <= ttl).unwrap_or(false)
+}
+
+/// Wall-clock milliseconds between `captured` and `now`, for the `age_ms`
+/// restamped into a served cached body (#2479 audit). Mirrors
+/// `wall_clock_age_ms_at` in `lib.rs`: a backward jump reports maximally
+/// stale (`u64::MAX`) rather than `0`, so a clock anomaly never
+/// under-reports how old a served body actually is. In practice this arm
+/// is unreachable from `cached_if_fresh` (which already refuses to serve
+/// on the same backward-jump condition), but the function stays correct
+/// on its own terms rather than relying on that caller's behavior.
+fn cache_entry_age_ms_at(captured: SystemTime, now: SystemTime) -> u64 {
+    now.duration_since(captured).map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)).unwrap_or(u64::MAX)
 }
 
 /// Panel state carried on [`AppState`]: the TTL cache plus the per-variant
@@ -482,12 +516,23 @@ pub(crate) struct PanelState {
     /// [`admit_manual_run`]. Manual panels are uncached by design, so
     /// this is the only record that one ran at all.
     ///
-    /// (#2479) `SystemTime`, deliberately not `Instant` — see
-    /// [`manual_floor_wait`]'s doc for why: this floor protects an
-    /// expensive probe against being re-run more often than an operator
-    /// would predict with a wristwatch, which is exactly the class of
-    /// deadline `Instant` gets wrong across a sleep/wake gap on macOS.
-    last_manual: Arc<tokio::sync::Mutex<HashMap<&'static str, SystemTime>>>,
+    /// (#2479) `SystemTime` is the PRIMARY clock, deliberately not
+    /// `Instant` — see [`manual_floor_wait`]'s doc for why: this floor
+    /// protects an expensive probe against being re-run more often than
+    /// an operator would predict with a wristwatch, which is exactly the
+    /// class of deadline `Instant` gets wrong across a sleep/wake gap on
+    /// macOS.
+    ///
+    /// (#2479 audit CONSIDER 6) Paired with an `Instant` companion anchor,
+    /// same shape as `thermal_governor.rs`'s `real_age_past_interval`: a
+    /// backward `SystemTime` jump (NTP correction) makes the wall-clock
+    /// side read as "no time has passed" (`duration_since` errs), and
+    /// without a second anchor that would fail closed for however long
+    /// the wall clock stays behind — potentially far longer than
+    /// `MANUAL_MIN_INTERVAL` — rather than the bounded worst case the
+    /// pre-#2479 `Instant`-only code had. The monotonic side bounds it
+    /// back down to `MANUAL_MIN_INTERVAL` of real elapsed process time.
+    last_manual: Arc<tokio::sync::Mutex<HashMap<&'static str, (SystemTime, Instant)>>>,
 }
 
 fn clamp_cols(cols: Option<u16>) -> u16 {
@@ -536,12 +581,54 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 /// There is no `.await` between the read and the insert, so a racer
 /// either observes the timestamp or genuinely arrived after the window.
 async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<(), (StatusCode, String)> {
+    admit_manual_run_at(panels, id, SystemTime::now()).await
+}
+
+/// (#2479 audit, MUST FIX 4) `admit_manual_run` with `now` as an explicit
+/// argument — no internal `SystemTime::now()` call — same `_at` convention
+/// as `manual_floor_wait` itself and `src/acp.rs`'s
+/// `idle_self_exit_loop_with`.
+///
+/// This is the seam the fix that introduced `manual_floor_wait` was
+/// missing: every test of the floor OPENING called `manual_floor_wait`
+/// directly (the pure function), never `admit_manual_run` (the real
+/// production call site) — because `admit_manual_run` called the clock
+/// internally, no test could inject a past `prev`/`now` pair through it.
+/// A mutation swapping the two `SystemTime` arguments at the
+/// `manual_floor_wait` call site below (`manual_floor_wait(now, prev, …)`
+/// instead of `(prev, now, …)`) left every existing test green: the
+/// wrapper-level tests only ever exercised "just ran" (immediately
+/// refloored, which a swap also floors), never the floor genuinely
+/// opening after real elapsed time. Under that mutation the subtraction
+/// inside `manual_floor_wait` errors for any forward-moving clock (the
+/// swapped `now` argument, now bound to the function's `prev` parameter,
+/// is always later than the swapped `prev` argument bound to its `now`
+/// parameter), so it always returns the full interval — the manual panel
+/// refuses every click, forever, worse than the sleep-blindness bug this
+/// PR fixes. `admit_manual_run_at` closes the seam: a test can now call
+/// THIS function (the real wrapper, lock acquisition and all) with an
+/// injected `prev` far enough in the past that the floor must open, and
+/// the argument-swap mutation fails it.
+async fn admit_manual_run_at(
+    panels: &PanelState,
+    id: &'static str,
+    now: SystemTime,
+) -> Result<(), (StatusCode, String)> {
+    // (#2479 audit CONSIDER 6) The monotonic companion anchor is always
+    // the REAL clock, never injected — see [`manual_floor_wait`]'s doc for
+    // why only the wall-clock side needs to be test-injectable. A fresh
+    // test process's `Instant::now()` reads as "no time has passed" for
+    // any monotonic comparison against a key it just inserted, which is
+    // correct: these tests exercise the wall-clock dimension, and the
+    // monotonic side only matters when the wall clock is UNRELIABLE
+    // (backward jump), which none of them simulate.
+    let now_instant = Instant::now();
     let mut last = panels.last_manual.lock().await;
-    let now = SystemTime::now();
-    if let Some(&prev) = last.get(id) {
-        if let Some(remaining) = manual_floor_wait(prev, now, MANUAL_MIN_INTERVAL) {
+    if let Some(&(prev, prev_instant)) = last.get(id) {
+        let monotonic_elapsed = now_instant.duration_since(prev_instant);
+        if let Some(remaining) = manual_floor_wait(prev, now, monotonic_elapsed, MANUAL_MIN_INTERVAL) {
             let wait = remaining.as_secs() + 1;
-            let since = now.duration_since(prev).unwrap_or(Duration::ZERO);
+            let since = now.duration_since(prev).unwrap_or(Duration::ZERO).max(monotonic_elapsed);
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
@@ -554,21 +641,22 @@ async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<(), (
         }
     }
     // Claim the window under the SAME guard that just cleared it.
-    last.insert(id, now);
+    last.insert(id, (now, now_instant));
     Ok(())
 }
 
 /// Pure floor math for [`admit_manual_run`] (#2479): given the wall-clock
-/// timestamp of the last admitted run and the current wall-clock time,
-/// return `None` if a new run may be admitted, or `Some(remaining)` if the
-/// floor is still in effect. Both timestamps are explicit parameters — no
-/// internal `SystemTime::now()` call — so a sleep-crossing gap is directly
-/// testable: construct a `prev`/`now` pair whose difference models "the
-/// machine was asleep in between" without ever sleeping it for real.
+/// timestamp of the last admitted run, the current wall-clock time, and
+/// how much MONOTONIC time has separately elapsed since admission, return
+/// `None` if a new run may be admitted, or `Some(remaining)` if the floor
+/// is still in effect. All three time inputs are explicit parameters — no
+/// internal `SystemTime::now()`/`Instant::now()` call — so both a
+/// sleep-crossing gap and a monotonic-vs-wall-clock divergence are
+/// directly testable without ever touching the real clock.
 ///
-/// **`SystemTime`, deliberately not `Instant`, is the fix here.** This
-/// floor protects a probe that costs ~2.2s and touches the Keychain from
-/// being re-run more often than an operator would predict with a
+/// **`SystemTime`, deliberately not `Instant`, is the PRIMARY fix here.**
+/// This floor protects a probe that costs ~2.2s and touches the Keychain
+/// from being re-run more often than an operator would predict with a
 /// wristwatch — "once every [`MANUAL_MIN_INTERVAL`]". On macOS `Instant`
 /// is backed by `CLOCK_UPTIME_RAW`, which does not advance while the
 /// machine sleeps (#2479): a floor built on it reads "just ran" for up to
@@ -585,16 +673,36 @@ async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<(), (
 /// TIMEOUT_SECONDS`, which correctly stay on `Instant` — see the audit
 /// left at their definitions.
 ///
-/// `now` earlier than `prev` (a backward wall-clock jump — an NTP
-/// correction, not sleep) is treated as still-floored: the guarantee this
-/// function exists to keep is "the probe does not run more than once per
-/// window," and failing closed on an unmeasurable gap keeps that rather
-/// than guessing generously.
-fn manual_floor_wait(prev: SystemTime, now: SystemTime, min_interval: Duration) -> Option<Duration> {
-    match now.duration_since(prev) {
-        Ok(since) if since >= min_interval => None,
-        Ok(since) => Some(min_interval - since),
-        Err(_) => Some(min_interval),
+/// **`monotonic_elapsed` is the CONSIDER-6 companion fix**, same shape as
+/// `thermal_governor.rs`'s `real_age_past_interval`: `since` is the
+/// LARGER of the wall-clock gap and the monotonic gap, not the wall-clock
+/// gap alone. A `now` earlier than `prev` (a backward wall-clock jump —
+/// an NTP correction, not sleep) makes the wall-clock side read as zero
+/// elapsed (`duration_since` errs, clamped to `Duration::ZERO` rather
+/// than treated as evidence of staleness or underflowed into a huge
+/// value) — without the monotonic side, that would fail closed for
+/// however long the wall clock stays behind, which is unbounded and can
+/// exceed `min_interval` by a lot (an hour-back NTP step floors the panel
+/// for the better part of an hour, not `min_interval`). The monotonic
+/// side, which cannot jump backward, bounds the floored duration back
+/// down to `min_interval` of real elapsed process time — the same
+/// worst-case bound the pre-#2479 `Instant`-only code had for this exact
+/// scenario. A forward sleep gap is unaffected: `by_wall` alone already
+/// exceeds `min_interval` in that case, so the max is `by_wall` regardless
+/// of what the (necessarily small, process-suspended) monotonic side
+/// reads.
+fn manual_floor_wait(
+    prev: SystemTime,
+    now: SystemTime,
+    monotonic_elapsed: Duration,
+    min_interval: Duration,
+) -> Option<Duration> {
+    let by_wall = now.duration_since(prev).unwrap_or(Duration::ZERO);
+    let since = by_wall.max(monotonic_elapsed);
+    if since >= min_interval {
+        None
+    } else {
+        Some(min_interval - since)
     }
 }
 
@@ -812,7 +920,7 @@ pub(crate) async fn panel_handler(
         // would extend the floor by the spawn's own duration.
     } else {
         let mut cache = state.panels.cache.lock().await;
-        cache.insert(key, CacheEntry { body: body.clone(), captured: Instant::now() });
+        cache.insert(key, CacheEntry { body: body.clone(), captured: SystemTime::now() });
     }
     Ok(axum::Json(body))
 }
@@ -826,12 +934,12 @@ async fn cached_if_fresh(panels: &PanelState, key: &str, ttl: Duration) -> Optio
     }
     let cache = panels.cache.lock().await;
     let entry = cache.get(key)?;
-    let age = entry.captured.elapsed();
-    if age > ttl {
+    let now = SystemTime::now();
+    if !cache_entry_is_fresh(entry.captured, now, ttl) {
         return None;
     }
     let mut body = entry.body.clone();
-    body["age_ms"] = serde_json::json!(age.as_millis() as u64);
+    body["age_ms"] = serde_json::json!(cache_entry_age_ms_at(entry.captured, now));
     Some(body)
 }
 
@@ -1517,7 +1625,7 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_fires_on_the_second_call_within_the_window() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert("doctor", SystemTime::now());
+        panels.last_manual.lock().await.insert("doctor", (SystemTime::now(), Instant::now()));
         let err = admit_manual_run(&panels, "doctor").await.unwrap_err();
         assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
         assert!(err.1.contains("floored"), "{}", err.1);
@@ -1526,9 +1634,46 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_is_independent_per_base_id() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert("doctor", SystemTime::now());
+        panels.last_manual.lock().await.insert("doctor", (SystemTime::now(), Instant::now()));
         // A DIFFERENT base id must not be floored by doctor's own run.
         assert!(admit_manual_run(&panels, "some-other-manual-panel").await.is_ok());
+    }
+
+    /// (#2479 audit, MUST FIX 4) The floor OPENING, through the REAL
+    /// production call site — `admit_manual_run_at`, lock acquisition and
+    /// all — not just the pure `manual_floor_wait` function. Every prior
+    /// test of "the floor opens after enough time" called
+    /// `manual_floor_wait` directly; every prior test that went through
+    /// `admit_manual_run`/`admit_manual_run_at` only ever exercised "just
+    /// ran, still floored." Neither alone would have caught a mutation
+    /// that swaps the two `SystemTime` arguments at the
+    /// `manual_floor_wait` call site inside `admit_manual_run_at` — that
+    /// swap makes the wrapper floor EVERY call forever (see
+    /// `admit_manual_run_at`'s own doc), and every test that predates this
+    /// one stayed green under it because none of them injected a `prev`
+    /// old enough, through the wrapper, for the floor to have to open.
+    #[tokio::test]
+    async fn admit_manual_run_at_opens_the_floor_through_the_real_call_site_after_the_window() {
+        let panels = PanelState::default();
+        let prev = SystemTime::now();
+        panels.last_manual.lock().await.insert("doctor", (prev, Instant::now()));
+        // Immediately after: still floored (sanity check this scenario
+        // actually starts floored, so the assertion below is meaningful).
+        assert!(
+            admit_manual_run_at(&panels, "doctor", prev + Duration::from_secs(1)).await.is_err(),
+            "sanity: 1s after the previous run must still be floored"
+        );
+
+        // Reset, then check well past the window — through the SAME real
+        // call site, not the pure function.
+        panels.last_manual.lock().await.insert("doctor", (prev, Instant::now()));
+        let well_past_the_window = prev + MANUAL_MIN_INTERVAL + Duration::from_secs(5);
+        assert!(
+            admit_manual_run_at(&panels, "doctor", well_past_the_window).await.is_ok(),
+            "the floor must open once MANUAL_MIN_INTERVAL of real elapsed time has passed, \
+             through the actual admission path a real request takes — an argument swap in the \
+             manual_floor_wait call site would floor this forever"
+        );
     }
 
     /// Renamed from `manual_floor_cannot_be_defeated_by_cycling_opt_values`
@@ -1553,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_stays_floored_across_repeated_checks_on_one_base_id() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert("doctor", SystemTime::now());
+        panels.last_manual.lock().await.insert("doctor", (SystemTime::now(), Instant::now()));
         for _ in 0..3 {
             let err = admit_manual_run(&panels, "doctor").await.unwrap_err();
             assert_eq!(
@@ -1570,6 +1715,10 @@ mod tests {
     /// The two ends within the window: a gap one second short of
     /// `min_interval` is still floored, a gap exactly at it is not. Pins
     /// the boundary rather than just "small gap floored, big gap open."
+    /// `monotonic_elapsed: Duration::ZERO` throughout this file's
+    /// wall-clock-only tests isolates the wall-clock dimension being
+    /// pinned — see `manual_floor_wait_monotonic_*` below for the
+    /// monotonic dimension on its own.
     #[test]
     fn manual_floor_wait_boundary_is_exact() {
         let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -1577,14 +1726,14 @@ mod tests {
 
         let just_short = prev + Duration::from_secs(29);
         assert_eq!(
-            manual_floor_wait(prev, just_short, min_interval),
+            manual_floor_wait(prev, just_short, Duration::ZERO, min_interval),
             Some(Duration::from_secs(1)),
             "1s short of the window must still report exactly 1s remaining"
         );
 
         let exactly_at = prev + Duration::from_secs(30);
         assert_eq!(
-            manual_floor_wait(prev, exactly_at, min_interval),
+            manual_floor_wait(prev, exactly_at, Duration::ZERO, min_interval),
             None,
             "a gap exactly equal to min_interval must admit — the check is >=, not >"
         );
@@ -1607,7 +1756,7 @@ mod tests {
         let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let four_hours_later = prev + Duration::from_secs(4 * 60 * 60);
         assert_eq!(
-            manual_floor_wait(prev, four_hours_later, Duration::from_secs(30)),
+            manual_floor_wait(prev, four_hours_later, Duration::ZERO, Duration::from_secs(30)),
             None,
             "a 4-hour real-time gap must admit outright, not report a remaining wait — the \
              defect this fix closes is exactly a deadline that stays 'in the future' across a \
@@ -1622,25 +1771,124 @@ mod tests {
         let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000);
         let ten_seconds_later = prev + Duration::from_secs(10);
         assert_eq!(
-            manual_floor_wait(prev, ten_seconds_later, Duration::from_secs(30)),
+            manual_floor_wait(prev, ten_seconds_later, Duration::ZERO, Duration::from_secs(30)),
             Some(Duration::from_secs(20)),
             "10s into a 30s window must report 20s remaining"
         );
     }
 
-    /// A backward wall-clock jump (NTP correction) fails CLOSED — still
-    /// floored for the full interval — rather than guessing a gap it
-    /// cannot measure. Distinct from the sleep case above: sleep produces
-    /// a `now` far AFTER `prev` (which must admit); this produces a `now`
-    /// BEFORE `prev` (which must not).
+    /// A backward wall-clock jump (NTP correction) with NO offsetting
+    /// monotonic progress fails CLOSED — still floored for the full
+    /// interval — rather than guessing a gap it cannot measure. Distinct
+    /// from the sleep case above: sleep produces a `now` far AFTER `prev`
+    /// (which must admit); this produces a `now` BEFORE `prev` (which
+    /// must not, absent monotonic evidence otherwise — see the next two
+    /// tests for that evidence).
     #[test]
     fn manual_floor_wait_backward_clock_jump_stays_floored() {
         let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000);
         let now = prev - Duration::from_secs(5);
         assert_eq!(
-            manual_floor_wait(prev, now, Duration::from_secs(30)),
+            manual_floor_wait(prev, now, Duration::ZERO, Duration::from_secs(30)),
             Some(Duration::from_secs(30)),
-            "an unmeasurable (backward) gap must fail closed at the full interval, not open"
+            "an unmeasurable (backward) gap, with no monotonic evidence of real elapsed time, \
+             must fail closed at the full interval, not open"
         );
+    }
+
+    /// (#2479 audit CONSIDER 6) The companion fix: a backward wall-clock
+    /// jump does NOT lock the floor for as long as the wall clock stays
+    /// behind — the monotonic side bounds it back down to `min_interval`
+    /// of REAL elapsed process time, the same worst case the pre-#2479
+    /// `Instant`-only code had. Without this, an hour-back NTP correction
+    /// would floor the panel for the better part of an hour instead of
+    /// `min_interval` (30s).
+    #[test]
+    fn manual_floor_wait_monotonic_side_opens_the_floor_despite_a_backward_wall_clock_jump() {
+        let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(5_000_000);
+        let now = prev - Duration::from_secs(3600); // an hour-back NTP step
+        let min_interval = Duration::from_secs(30);
+        // 35 REAL (monotonic) seconds have genuinely passed since
+        // admission, despite the wall clock claiming otherwise.
+        let monotonic_elapsed = Duration::from_secs(35);
+        assert_eq!(
+            manual_floor_wait(prev, now, monotonic_elapsed, min_interval),
+            None,
+            "35 real monotonic seconds since admission must open a 30s floor, even though the \
+             wall clock — having just jumped an hour backward — reads as no time having passed \
+             at all"
+        );
+    }
+
+    /// The same scenario, but the monotonic side hasn't reached
+    /// `min_interval` yet either: the remaining wait must come from
+    /// whichever side is LARGER (here, the monotonic side, since the wall
+    /// side reads zero), not silently ignore it.
+    #[test]
+    fn manual_floor_wait_monotonic_side_still_floors_before_its_own_window_closes() {
+        let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(6_000_000);
+        let now = prev - Duration::from_secs(3600);
+        let min_interval = Duration::from_secs(30);
+        let monotonic_elapsed = Duration::from_secs(20);
+        assert_eq!(
+            manual_floor_wait(prev, now, monotonic_elapsed, min_interval),
+            Some(Duration::from_secs(10)),
+            "20 real monotonic seconds into a 30s window must report 10s remaining, computed \
+             from the monotonic side since the wall-clock side reads zero"
+        );
+    }
+
+    // ── whole-response cache: wall-clock, not process-uptime (#2479) ──
+    // Same defect class as the fleet cache in `lib.rs` and the manual-run
+    // floor above, found during the #2479 audit enumeration rather than
+    // named in the original review — `CacheEntry.captured` was the last
+    // `Instant`-based OUTSIDE-WORLD clock left in this file.
+
+    #[test]
+    fn cache_entry_is_fresh_within_ttl() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
+        let now = captured + Duration::from_millis(500);
+        assert!(cache_entry_is_fresh(captured, now, PANEL_CACHE_TTL));
+    }
+
+    #[test]
+    fn cache_entry_is_stale_after_ttl_of_pure_awake_time() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
+        let now = captured + Duration::from_secs(10); // PANEL_CACHE_TTL is 3s
+        assert!(!cache_entry_is_fresh(captured, now, PANEL_CACHE_TTL));
+    }
+
+    /// The actual defect: a panel cached just before a multi-hour sleep
+    /// must not read as fresh on wake, however small an `Instant`-based
+    /// clock would have said the gap was.
+    #[test]
+    fn cache_entry_is_stale_after_a_simulated_multi_hour_sleep_gap() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
+        let now = captured + Duration::from_secs(4 * 3600);
+        assert!(!cache_entry_is_fresh(captured, now, PANEL_CACHE_TTL));
+    }
+
+    #[test]
+    fn cache_entry_backward_clock_jump_is_treated_as_not_fresh() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
+        let now = captured - Duration::from_secs(60);
+        assert!(
+            !cache_entry_is_fresh(captured, now, PANEL_CACHE_TTL),
+            "a clock that just stepped backward must not also be trusted to vouch for the cache"
+        );
+    }
+
+    #[test]
+    fn cache_entry_age_ms_reports_the_real_wall_clock_gap() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
+        let now = captured + Duration::from_secs(4 * 3600);
+        assert_eq!(cache_entry_age_ms_at(captured, now), 4 * 3600 * 1000);
+    }
+
+    #[test]
+    fn cache_entry_age_ms_fails_loud_not_falsely_fresh_on_backward_jump() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(7_000_000);
+        let now = captured - Duration::from_secs(60);
+        assert_eq!(cache_entry_age_ms_at(captured, now), u64::MAX);
     }
 }

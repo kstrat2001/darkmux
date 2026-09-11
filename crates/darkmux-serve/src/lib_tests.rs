@@ -6727,3 +6727,79 @@ fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
     darkmux_types::child_registry::reset_for_test();
     darkmux_types::interrupt::reset_for_test();
 }
+
+// (#2479 audit — MUST FIX 3) The fleet cache's freshness gate and age
+// report must be wall-clock (`SystemTime`), not `Instant`, because the
+// data it caches is read from OTHER machines over Redis and the age is
+// reported outward as `Stale { age_ms }` — the OUTSIDE-WORLD bucket, not
+// the process's-own-activity one. Both functions take an explicit `now`
+// (the `_at` convention this audit follows elsewhere: `panel.rs`'s
+// `admit_manual_run_at`, `src/acp.rs`'s `idle_self_exit_loop_with`) so a
+// multi-hour sleep gap is directly unit-testable without sleeping the
+// real machine.
+mod fleet_cache_wall_clock {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn wall_clock_cache_is_fresh_within_ttl() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = captured + Duration::from_millis(500);
+        assert!(wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn fleet_cache_is_stale_after_ttl_of_pure_awake_time() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = captured + Duration::from_secs(3);
+        assert!(!wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)));
+    }
+
+    /// The actual defect this audit fixed: a snapshot captured just before
+    /// a multi-hour sleep must NOT read as fresh on wake, however small
+    /// the machine's own "process awake" clock says the gap was. Under
+    /// the prior `Instant`-based cache, this exact scenario — a snapshot
+    /// taken, then a multi-hour lid-close, then a request landing within
+    /// `FLEET_CACHE_TTL` of process-awake time after wake — read as fresh
+    /// with no staleness marker at all, because `Instant::elapsed()` does
+    /// not advance across a host sleep. This test asserts the wall-clock
+    /// replacement gets it right: a 4-hour gap is never "fresh" against a
+    /// 2s TTL, regardless of how the machine's monotonic clock behaved
+    /// across whatever happened in between.
+    #[test]
+    fn fleet_cache_is_stale_after_a_simulated_multi_hour_sleep_gap() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = captured + Duration::from_secs(4 * 3600);
+        assert!(!wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn fleet_cache_backward_clock_jump_is_treated_as_not_fresh() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = captured - Duration::from_secs(60);
+        assert!(
+            !wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)),
+            "a clock that just stepped backward must not also be trusted to vouch for the cache"
+        );
+    }
+
+    #[test]
+    fn wall_clock_age_ms_reports_the_real_wall_clock_gap() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = captured + Duration::from_secs(4 * 3600);
+        assert_eq!(wall_clock_age_ms_at(captured, now), 4 * 3600 * 1000);
+    }
+
+    #[test]
+    fn wall_clock_age_ms_fails_loud_not_falsely_fresh_on_backward_jump() {
+        let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = captured - Duration::from_secs(60);
+        assert_eq!(
+            wall_clock_age_ms_at(captured, now),
+            u64::MAX,
+            "a backward clock jump must report maximally stale, never 0 — reporting 0 would \
+             silently UNDER-report how old the snapshot actually is, the same failure class \
+             this audit exists to close"
+        );
+    }
+}

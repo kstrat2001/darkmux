@@ -1691,15 +1691,20 @@ fn run_with_sleeper(
         ),
     );
     // (#2479 audit) `Instant`, deliberately: this tracks the container's
-    // OWN proof-of-work (tool.completed / compaction), mirroring the
-    // host-side watchdog it races against (darkmux-crew's
-    // `dispatch_internal.rs`, same audit note). Docker Desktop's VM
-    // suspends with the host on sleep, so if the machine sleeps mid-turn
-    // this container is suspended too — no proof-of-work COULD occur, so
-    // none should count against the budget. Wall clock would be wrong
-    // here: it would fire the soft warning / hard kill on a dispatch that
-    // was never actually stuck, purely because the laptop's lid was
-    // closed for a while.
+    // OWN proof-of-work (tool.completed / compaction) inside the Docker
+    // Desktop Linux VM. This is NOT the same clock as the host-side
+    // watchdog it races against (darkmux-crew's `dispatch_internal.rs`,
+    // same audit note) — that one is macOS monotonic time, confirmed by
+    // this audit to sit flat across a host sleep. This one is the guest
+    // VM's clock, and its behavior across a host suspend is UNVERIFIED —
+    // see the `is_suspected_sleep_wake_jump` doc a few hundred lines below
+    // (#2114), which already treats "this clock kept advancing through a
+    // host suspend" as a live possibility worth re-anchoring against, not
+    // a closed question. Don't read this comment as settling that;
+    // wall clock would also be wrong here in the case this audit DID
+    // confirm (a host sleep with no accompanying guest-clock jump): it
+    // would fire the soft warning / hard kill on a dispatch that was never
+    // actually stuck, purely because the laptop's lid was closed a while.
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
 

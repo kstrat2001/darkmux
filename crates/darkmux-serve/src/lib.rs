@@ -2491,7 +2491,16 @@ async fn machine_status_handler() -> axum::Json<serde_json::Value> {
 /// is recorded in the payload (`cache_ttl_ms`) per the observer-effect
 /// constraint — cadence is a visible knob, never adaptive-silent.
 const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(2);
-static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
+/// (#2479 audit — not in the original MUST FIX list, found during the audit
+/// enumeration and fixed for the same reason as [`FleetCache`]) `SystemTime`,
+/// deliberately not `Instant`: this cache's freshness gate is the same
+/// OUTSIDE-WORLD shape — a daemon that survives a host sleep would serve a
+/// pre-sleep-gathered `/machine/resources` payload within
+/// `MACHINE_RESOURCES_CACHE_TTL` of AWAKE time after wake, with no
+/// staleness marker (this payload has no `age_ms` field at all — see
+/// [`machine_resources_handler`]'s `cache_ttl_ms` insert — so the failure
+/// here is silent, not even mislabeled).
+static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(std::time::SystemTime, serde_json::Value)>> =
     std::sync::Mutex::new(None);
 
 /// Single-flight gate for the machine-resources gather (#1286): concurrent
@@ -2509,7 +2518,7 @@ fn machine_resources_gather_lock() -> &'static tokio::sync::Mutex<()> {
 fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
     let guard = MACHINE_RESOURCES_CACHE.lock().ok()?;
     let (at, v) = guard.as_ref()?;
-    (at.elapsed() < MACHINE_RESOURCES_CACHE_TTL).then(|| v.clone())
+    wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), MACHINE_RESOURCES_CACHE_TTL).then(|| v.clone())
 }
 
 /// GET /machine/resources (#1286) — the live machine-scope memory ledger:
@@ -2577,7 +2586,7 @@ async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
         );
     }
     if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {
-        *guard = Some((std::time::Instant::now(), value.clone()));
+        *guard = Some((std::time::SystemTime::now(), value.clone()));
     }
     axum::Json(attach_load(value))
 }
@@ -3729,7 +3738,58 @@ pub(crate) fn flow_record_identity(r: &serde_json::Value) -> String {
 /// already does for `GET /flow/:date`. Bounded by the same `XREVRANGE …
 /// COUNT 10000` cap as every other read of this stream.
 /// The cached fleet snapshot: when it was read, and what it held.
-type FleetCache = Option<(std::time::Instant, Vec<serde_json::Value>)>;
+///
+/// (#2479 audit) `SystemTime`, not `Instant`, deliberately: this is the
+/// OUTSIDE-WORLD bucket, not the process's-own-activity one. The daemon is
+/// long-running and the record it caches is read from OTHER machines over
+/// Redis — a hub never sleeps by fleet topology convention, but a peer
+/// (this laptop) can, and the freshness this cache reports is exactly the
+/// "how long ago, on a wristwatch" question an operator asks of a fleet
+/// panel. `Instant::elapsed()` does not advance across a host sleep, so a
+/// snapshot captured before a multi-hour lid-close would report as
+/// milliseconds old on wake — silently serving a stale fleet view as fresh
+/// with no staleness marker, the exact failure class this issue is about.
+/// See [`fleet_flow_records`]'s freshness check and the `Stale` arm's
+/// `age_ms` below.
+type FleetCache = Option<(std::time::SystemTime, Vec<serde_json::Value>)>;
+
+/// Wall-clock milliseconds between `captured` and `now` (#2479 audit).
+/// `now` is an explicit argument — no internal `SystemTime::now()` call —
+/// so the sleep-crossing behavior is directly unit-testable without
+/// sleeping the real machine, matching the `manual_floor_wait`/`_at`
+/// convention this audit follows elsewhere in this crate (`panel.rs`'s
+/// `admit_manual_run_at`, `src/acp.rs`'s `idle_self_exit_loop_with`).
+/// `SystemTime` can go backward (NTP correction), unlike `Instant` —
+/// `duration_since` then returns `Err`. Fail LOUD, not falsely-fresh:
+/// report `u64::MAX` (maximally stale) rather than `0` on that arm, so a
+/// clock anomaly reads to an operator as "treat this as stale" rather than
+/// silently under-reporting how old a snapshot actually is.
+fn wall_clock_age_ms_at(captured: std::time::SystemTime, now: std::time::SystemTime) -> u64 {
+    now.duration_since(captured)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX)
+}
+
+/// Live wrapper around [`wall_clock_age_ms_at`] for production call sites.
+fn wall_clock_age_ms(captured: std::time::SystemTime) -> u64 {
+    wall_clock_age_ms_at(captured, std::time::SystemTime::now())
+}
+
+/// Whether a fleet-cache entry captured at `captured` is still fresh at
+/// `now`, given `ttl` (#2479 audit). Explicit `now`, same testability
+/// rationale as [`wall_clock_age_ms_at`]. A clock that stepped BACKWARD
+/// since `captured` (`duration_since` returns `Err`) is treated as NOT
+/// fresh — the safe direction to fail in a freshness *gate* (forces one
+/// extra Redis round trip and self-heals), as opposed to an *age report*
+/// like [`wall_clock_age_ms_at`], where failing loud means reporting
+/// maximally stale instead.
+fn wall_clock_cache_is_fresh(
+    captured: std::time::SystemTime,
+    now: std::time::SystemTime,
+    ttl: std::time::Duration,
+) -> bool {
+    now.duration_since(captured).map(|age| age < ttl).unwrap_or(false)
+}
 
 /// What one fleet read produced: the records, AND how completely they cover
 /// the source.
@@ -3900,11 +3960,20 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
     // failure path below serves it if the refresh fails.
     // A hit inside the TTL is a SUCCESSFUL read at most `FLEET_CACHE_TTL`
     // old, never a fallback: the failure path below deliberately leaves the
-    // cache instant untouched, so a stale entry can only be served after the
-    // TTL has already expired — i.e. through the `Stale` arm, never here.
+    // cache timestamp untouched, so a stale entry can only be served after
+    // the TTL has already expired — i.e. through the `Stale` arm, never
+    // here.
+    //
+    // (#2479 audit) Wall-clock (`SystemTime`), not `Instant::elapsed()` —
+    // see [`FleetCache`]'s doc. `duration_since` returning `Err` (the
+    // system clock stepped backward since `at` was captured) is treated as
+    // NOT fresh rather than fresh: it forces exactly one extra Redis round
+    // trip and self-heals on the next call, which is the safe direction to
+    // fail in — the unsafe direction would be trusting a clock that just
+    // proved itself unreliable to also say the cache is still good.
     if let Ok(guard) = cache.lock() {
         if let Some((at, records)) = guard.as_ref() {
-            if at.elapsed() < FLEET_CACHE_TTL {
+            if wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), FLEET_CACHE_TTL) {
                 return FleetRead { records: records.clone(), state: source_state::SourceState::Ok };
             }
         }
@@ -3918,7 +3987,7 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
     match read_flow_records_from_redis(url.expose_for_probe(), None) {
         Ok(records) => {
             if let Ok(mut guard) = cache.lock() {
-                *guard = Some((std::time::Instant::now(), records.clone()));
+                *guard = Some((std::time::SystemTime::now(), records.clone()));
             }
             FleetRead { records, state: source_state::SourceState::Ok }
         }
@@ -3957,10 +4026,11 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
                     FleetRead {
                         records,
                         state: source_state::SourceState::Stale {
-                            // Saturating: `Instant::elapsed` is monotonic, so
-                            // this cannot overflow in practice, but a cast is
-                            // not the place to find out.
-                            age_ms: u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            // (#2479 audit) Wall-clock via `wall_clock_age_ms`
+                            // — see [`FleetCache`]'s doc. Unlike `Instant`,
+                            // this is not monotonic-by-construction, so the
+                            // helper's own doc covers the backward-jump case.
+                            age_ms: wall_clock_age_ms(at),
                             detail: DETAIL,
                         },
                     }
