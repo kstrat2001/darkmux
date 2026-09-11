@@ -137,6 +137,65 @@ fn a_run_that_never_mints_a_session_id_never_gains_one() {
     );
 }
 
+/// (#2511 review CONSIDER 5) An empty string is not a session id — assigning
+/// one would still satisfy every downstream `Option::is_some()` read while
+/// joining to nothing. Must never reach disk, in either direction: not as
+/// the first value, and not as an attempted overwrite of a real one.
+#[test]
+fn set_session_id_ignores_an_empty_string() {
+    let tmp = TempDir::new().unwrap();
+    let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
+    lc.set_session_id("");
+    assert_eq!(read(tmp.path()).unwrap().session_id, None, "an empty string must never be claimed");
+
+    lc.set_session_id("darkmux-coding-real-1");
+    lc.set_session_id("");
+    assert_eq!(
+        read(tmp.path()).unwrap().session_id.as_deref(),
+        Some("darkmux-coding-real-1"),
+        "an empty string offered AFTER a real id must not clobber it"
+    );
+    std::mem::forget(lc);
+}
+
+/// (#2511 review CONSIDER 5) The trait's own doc says `on_session_id` is
+/// "Called AT MOST ONCE" — this is the loud, debug-time half of enforcing
+/// that, so a provider bug (or a future caller that doesn't honor the
+/// contract) is caught where the mistake was made, not silently tolerated.
+#[test]
+#[should_panic(expected = "AT MOST ONCE")]
+fn set_session_id_called_twice_panics_in_a_debug_build() {
+    let tmp = TempDir::new().unwrap();
+    let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
+    lc.set_session_id("darkmux-coding-first-1");
+    lc.set_session_id("darkmux-coding-second-1");
+    std::mem::forget(lc);
+}
+
+/// (#2511 review CONSIDER 5) The other half: a caller that ignores the
+/// debug assertion above (or a release build where `debug_assert!` compiles
+/// out) must still keep the FIRST value, never silently adopt the second —
+/// a session already claimed by a flow-session consumer must not be
+/// re-pointed at a different one out from under it. Exercises the same
+/// double-call the test above proves panics, but continues past the panic
+/// (`catch_unwind`) to inspect the record the debug assertion guards.
+#[test]
+fn set_session_id_called_twice_keeps_the_first_value_past_the_assertion() {
+    let tmp = TempDir::new().unwrap();
+    let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
+    lc.set_session_id("darkmux-coding-first-2");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lc.set_session_id("darkmux-coding-second-2");
+    }));
+    assert!(result.is_err(), "the debug build must have asserted on the second call");
+    assert_eq!(
+        read(tmp.path()).unwrap().session_id.as_deref(),
+        Some("darkmux-coding-first-2"),
+        "the record on disk must still hold the FIRST claimed session, not the second"
+    );
+    std::mem::forget(lc);
+}
+
 // ── the paths nobody writes on purpose ────────────────────────────────────
 
 #[test]

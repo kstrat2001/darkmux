@@ -388,8 +388,31 @@ describe("runDestination", () => {
     expect(runDestination(tracked, false)).toEqual({ kind: "unreachable" });
   });
 
-  it("a lab row always opens its own dir, independent of tracked/session_id", () => {
-    const lab = run({ id: "lab-dir-1", kind: "lab", status: "complete", tracked: true });
+  it("a FINISHED lab row opens its own dir, independent of tracked/session_id", () => {
+    const lab = run({
+      id: "lab-dir-1",
+      kind: "lab",
+      status: "complete",
+      tracked: true,
+      session_id: "some-session-that-must-be-ignored-once-finished",
+    });
     expect(runDestination(lab, true)).toEqual({ kind: "lab", dir: "lab-dir-1" });
+  });
+
+  it("(#2511) a RUNNING lab row with a session_id drills to its live session, not the funnels-only detail view", () => {
+    // Before #2511's record-side fix, this session would ALSO surface as a
+    // duplicate untracked `ghost_runs` dispatch row, and clicking THAT row
+    // was the only way to watch the live dispatch (`LabRunDetail` renders no
+    // `#dispatch=` link and has nothing to show before a terminal artifact
+    // exists). #2511 also suppresses that duplicate ghost row server-side
+    // (`known_session_ids`) — so without this branch, a live lab run would
+    // have no drill-in left at all.
+    const running = run({ id: "live/case-1", kind: "lab", status: "running", tracked: true, session_id: "sess-live-1" });
+    expect(runDestination(running, true)).toEqual({ kind: "hash", hash: "dispatch=sess-live-1" });
+  });
+
+  it("(#2511) a RUNNING lab row with NO session_id yet falls back to its own dir rather than a dead link", () => {
+    const running = run({ id: "live/case-2", kind: "lab", status: "running", tracked: true });
+    expect(runDestination(running, true)).toEqual({ kind: "lab", dir: "live/case-2" });
   });
 });

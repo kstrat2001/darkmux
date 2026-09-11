@@ -237,7 +237,21 @@ export type RunDestination =
  * richer one.
  */
 export function runDestination(run: Run, graphReachable: boolean): RunDestination {
-  if (run.kind === "lab") return { kind: "lab", dir: run.id };
+  // (#2511) A lab row now carries `session_id` too (`Run::session_id`'s own
+  // doc), but it is only CONSULTED here while the run is still `Running`.
+  // Once a lab run reaches a terminal artifact, `LabRunDetail` (funnels +
+  // scores) is the richer destination and stays the default. While it is
+  // still running there is no terminal artifact to show, and the session
+  // this field now carries is the only way to watch the dispatch live — the
+  // same #1982/#2511 fix that stops that session from ALSO surfacing as a
+  // duplicate `ghost_runs` dispatch row (server-side `known_session_ids`)
+  // would otherwise leave it with no drill-in at all.
+  if (run.kind === "lab") {
+    if (run.status === "running" && run.session_id) {
+      return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
+    }
+    return { kind: "lab", dir: run.id };
+  }
   // (#1973) A DISPATCH-kind run drills to the DETAIL view, tracked or not.
   //
   // Previously only UNTRACKED rows came here; a tracked `darkmux dispatch`

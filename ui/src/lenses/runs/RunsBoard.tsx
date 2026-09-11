@@ -69,7 +69,14 @@ import {
  * Row-click destinations (drill-in packet — both now real, see `RunRow`'s
  * own doc for the split):
  * - a `kind==="lab"` row opens `LabRunDetail` (`data-act="labrun"` in
- *   legacy, `drillLabRun(dir)`) — an in-component state swap (`labRunDir`),
+ *   legacy, `drillLabRun(dir)`) UNLESS it is still `status==="running"` AND
+ *   carries a `session_id` (#2511) — that combination drills to the live
+ *   session instead (the untracked-session branch below), because
+ *   `LabRunDetail`'s funnels/scores have nothing to show before a terminal
+ *   artifact exists, and the session is the only way to watch the dispatch
+ *   while it's still in flight (see `runDestination`'s own doc, `format.ts`).
+ *   The finished/abandoned case is unchanged: an in-component state swap
+ *   (`labRunDir`),
  *   NOT a route change, matching legacy's own mechanism exactly: `render()`
  *   just swaps `$("stage").innerHTML` and syncs the address bar via
  *   `history.replaceState` (`syncLabHash`), it never fires a real navigation

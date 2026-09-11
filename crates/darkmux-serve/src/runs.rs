@@ -249,16 +249,22 @@ pub struct Run {
     /// (tracked or not) from its representative session, and for a
     /// [`ghost_runs`] dispatch row from the row's OWN id (a ghost's `id`
     /// already IS a session id — see that function's own `Run` literal).
-    /// Always `None` for a lab row today — NOT because a lab run has no
-    /// flow session (it does: `LabRunSummary::session_id`'s own doc, and
-    /// #2511, cover exactly which lab runs have one and from when). It
-    /// stays `None` here because populating it would change nothing that
-    /// is rendered — `runDestination` (`ui/src/lenses/runs/format.ts`)
-    /// short-circuits every `kind === "lab"` row to the in-page
-    /// `LabRunDetail` before this field is ever consulted, and that view
-    /// takes only a `dir`, with no `#dispatch=` route. Wiring it up is a
-    /// `LabRunDetail` + `runDestination` change (a display decision),
-    /// deliberately kept separate from the record-side fix.
+    /// (#2511) Also populated for a lab row now, from
+    /// `LabRunSummary::session_id` (that field's own doc, and the
+    /// `session_id` resolution in `crates/darkmux-serve/src/lib.rs`, cover
+    /// exactly which lab runs have one and from when — manifest-backed once
+    /// finished, lifecycle-backed for the live window before that).
+    /// `runDestination` (`ui/src/lenses/runs/format.ts`) only reads it for a
+    /// lab row while `status == Running`: a finished/abandoned lab row
+    /// still drills to `LabRunDetail` (the funnels/scores artifact is the
+    /// richer destination once it exists), but a run with no terminal
+    /// artifact yet has none of that to show, and this field's live session
+    /// is the only thing left to drill into. Without this, the same
+    /// #1982/#2511 fix that stops a live lab run's session from also
+    /// surfacing as a duplicate `ghost_runs` row (see `known_session_ids`
+    /// above) would leave that session with NO door in this view at all —
+    /// the record-side fix and this display-side one have to land together
+    /// or the duplicate-row fix regresses the only way to watch the run.
     ///
     /// **Why every mission carries this, not just untracked ones:** a
     /// TRACKED mission never actually needs it — `runDestination`
@@ -1458,28 +1464,18 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // that never happened; as `updated_ts` it's simply true.
         updated_ts: Some(summary.mtime_ms / 1000),
         tracked: true,
-        // (#1915, corrected #1982) NOT because a lab run has no flow session
-        // — the original comment here claimed exactly that, and #1982
-        // disproves it: a completed `coding-task`/`prompt` run DOES have one
-        // (`summary.session_id`), and `build_runs` above now reads it to
-        // claim the run's own dispatch bookends.
-        //
-        // It stays `None` because populating it would change NOTHING that is
-        // rendered. `runDestination` (`ui/src/lenses/runs/format.ts`)
-        // short-circuits every `kind === "lab"` row to the in-page
-        // `LabRunDetail` on its FIRST line, before it ever looks at
-        // `session_id`; and `LabRunDetail` takes only a `dir`, renders no
-        // `#dispatch=` link, and has no other route to a session replay.
-        //
-        // The honest consequence, recorded rather than papered over: the
-        // runs lens currently offers NO door to a lab run's session replay.
-        // Those records are still reachable — the fleet lens's activity
-        // timeline (`FleetLens.tsx`) navigates to `#dispatch=<sid>` — but
-        // restoring the drill-in from HERE is a `LabRunDetail` change
-        // (carry the session in, render a link) plus a `runDestination`
-        // decision about which of the two destinations wins, not a one-line
-        // field assignment.
-        session_id: None,
+        // (#1915, corrected #1982, wired #2511) A lab run DOES have a flow
+        // session — `summary.session_id`, resolved manifest-first /
+        // lifecycle-fallback in `crates/darkmux-serve/src/lib.rs` — and
+        // `build_runs` above already reads it to claim the run's own
+        // dispatch bookends (`known_session_ids`). Carrying it here too is
+        // what lets `runDestination` (`ui/src/lenses/runs/format.ts`) send
+        // a still-RUNNING lab row to its live session replay instead of the
+        // funnels-only `LabRunDetail`, which has nothing to show before a
+        // terminal artifact exists. See this struct's `session_id` field
+        // doc for why this and the record-side dedup fix have to ship
+        // together.
+        session_id: summary.session_id.clone(),
         abandoned_reason,
     }
 }
@@ -3556,6 +3552,32 @@ mod tests {
         assert_eq!(run.abandoned_reason, None);
     }
 
+    /// (#2511) The half of the fix that lives in `lab_summary_to_run` itself:
+    /// the `Run` it builds must carry the summary's own `session_id` through
+    /// verbatim, not drop it on the floor — `runDestination`
+    /// (`ui/src/lenses/runs/format.ts`) is the client-side consumer that
+    /// depends on this for a still-running lab row's live drill-in (see the
+    /// `Run::session_id` field doc for why the two halves have to ship
+    /// together).
+    #[test]
+    fn lab_summary_to_run_carries_the_summarys_session_id_through() {
+        let mut summary = minimal_lab_summary("live/case-2", false, false);
+        summary.session_id = Some("sess-live-2".to_string());
+        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS);
+        assert_eq!(run.session_id.as_deref(), Some("sess-live-2"));
+    }
+
+    /// The inverted case — without it, the test above would pass even if
+    /// `lab_summary_to_run` hard-coded `Some("sess-live-2")` regardless of
+    /// what the summary actually carried.
+    #[test]
+    fn lab_summary_to_run_carries_no_session_id_when_the_summary_has_none() {
+        let summary = minimal_lab_summary("live/case-3", false, false);
+        assert_eq!(summary.session_id, None, "this test's own premise");
+        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS);
+        assert_eq!(run.session_id, None);
+    }
+
     /// (#1907) The staleness-gate `Abandoned` arm (no lifecycle record at
     /// all, or one still reading `Running`/`Unknown` past the idle budget)
     /// has no terminal record of any kind — the honest reason stays
@@ -4563,6 +4585,92 @@ mod tests {
         .unwrap();
     }
 
+    /// (#2511) The end-to-end assertion the fix's own record-side unit
+    /// tests stop short of: a LIVE run — `lifecycle.json` only, `status:
+    /// "running"`, no `manifest.json` yet — whose lifecycle record already
+    /// carries the session id its provider minted before dispatching, must
+    /// produce exactly ONE `Run`, the same as the finished-run case the
+    /// test right below this one covers. Without the record-side fix this
+    /// fixture's lab row would claim no session (manifest doesn't exist
+    /// yet) and the dispatch bookends below would surface as a second,
+    /// untracked ghost — the exact duplicate #1982/#2511 exist to close,
+    /// this time for the run's WHOLE live window rather than only after it
+    /// finishes.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_live_lab_run_with_lifecycle_session_id_is_not_also_listed_as_a_ghost() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+
+        let run_dir = lab.path().join("crawl-error-discard-live-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+            serde_json::to_string(&serde_json::json!({
+                "schema_version": "1.0",
+                "run_id": "crawl-error-discard-live-1",
+                "kind": "lab",
+                "workload": "crawl-error-discard",
+                "profile": "default",
+                "started_at_ms": 1_700_000_000_000u64,
+                "status": "running",
+                "session_id": "darkmux-coding-crawl-error-discard-live-1787676109556",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-07-24T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "darkmux-coding-crawl-error-discard-live-1787676109556",
+                    "handle": "crawler",
+                }),
+                serde_json::json!({
+                    "ts": "2026-07-24T09:05:00Z",
+                    "action": "tool.completed",
+                    "session_id": "darkmux-coding-crawl-error-discard-live-1787676109556",
+                    "handle": "crawler",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run for the run's LIVE window — the lab row, no untracked dispatch \
+             ghost of its own still-in-flight inner dispatch: {runs:?}"
+        );
+        assert_eq!(runs[0].id, "crawl-error-discard-live-1");
+        assert_eq!(runs[0].kind, RunKind::Lab);
+        // Deliberately not asserting `status` here: `lab_run_status`'s
+        // staleness gate reads `LabRunSummary::mtime_ms`, which this crate
+        // only derives from `scores.json`/`funnels.json`/
+        // `funnel-events.jsonl` — none of which `coding-task`/`prompt` write
+        // before they finish, so a fixture like this one (lifecycle-only,
+        // real wall-clock "now") reads `Abandoned` from the very first
+        // instant, independent of the lifecycle record's own `Running`
+        // status. That mismatch predates this PR and is a separate,
+        // out-of-scope gap in what counts as "fresh" for a lab run's
+        // liveness signal — not something #2511's session-id join touches.
+        // What this test exists to pin is the ROW COUNT, not the label.
+        assert!(runs[0].tracked);
+        assert_eq!(
+            runs[0].session_id.as_deref(),
+            Some("darkmux-coding-crawl-error-discard-live-1787676109556"),
+            "the live session must also ride out on `Run.session_id` itself — the client-side \
+             half (`runDestination`, `ui/src/lenses/runs/format.ts`) depends on it to drill a \
+             still-running lab row into its live session rather than a funnels-only detail view \
+             with nothing to show yet: {runs:?}"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn build_runs_lab_run_dispatch_session_is_not_also_listed_as_a_ghost() {
@@ -4682,12 +4790,17 @@ mod tests {
     /// duplicate is the honest outcome of having no claim to make, NOT a
     /// display filter hiding a still-double-counted total.
     ///
-    /// This is also the live-run window, which is the case that actually
-    /// occurs: `lifecycle.json` lands at run start and `manifest.json` at
-    /// run end, so a RUNNING lab run has exactly this shape for its whole
-    /// duration (producer-side gap #2511). The guard that matters: nothing
-    /// here may invent a claim from the run id or any other guessable
-    /// string, which would swallow whichever session happened to match.
+    /// This fixture's `lifecycle.json` deliberately carries no
+    /// `session_id` field, which — after #2511 wired `set_session_id` into
+    /// `coding-task`/`prompt` at dispatch time — is no longer the whole
+    /// live-run window for those two providers. It is still the REAL shape
+    /// for `tool-bench` (never calls the callback at all — see
+    /// `lifecycle_tests.rs`'s own `a_run_that_never_mints_a_session_id_
+    /// never_gains_one`) and for the brief pre-dispatch instant of any
+    /// provider, and for a run whose provider errors before minting one.
+    /// The guard that matters is unchanged: nothing here may invent a claim
+    /// from the run id or any other guessable string, which would swallow
+    /// whichever session happened to match.
     #[test]
     #[serial_test::serial]
     fn build_runs_lab_run_with_no_recorded_session_claims_nothing_and_the_ghost_persists() {

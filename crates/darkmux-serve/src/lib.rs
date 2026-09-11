@@ -2249,6 +2249,20 @@ fn build_lab_run_summary(
         // read fills BOTH fields, for the same reason — a status and an
         // `error` taken from two separate reads could describe two
         // different terminal writes.
+        //
+        // (#2511 review CONSIDER 7) `lifecycle_record` is now read BEFORE
+        // the `manifest.json` read above (previously after) so `session_id`
+        // can fall back to it — which opens a one-CYCLE transient in the
+        // other direction: a run that finishes between the two reads can
+        // observe a `Complete`-or-later `manifest.json` (already written)
+        // alongside a `lifecycle_status` captured a moment earlier, still
+        // `Running`. The reverse ordering had the same kind of transient
+        // (a status read after a since-superseded manifest read), just on
+        // the other field pair — reading either artifact twice to force
+        // agreement would trade one race for a slower, still-racy one, so
+        // this stays a single read per artifact and an accepted one-poll
+        // inconsistency, same as the `status`/`error` pairing this comment
+        // already covers.
         lifecycle_status: lifecycle_record.as_ref().map(|r| r.status),
         lifecycle_error: lifecycle_record.and_then(|r| r.error),
         has_funnels,
