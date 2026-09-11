@@ -331,6 +331,90 @@ describe("tokensOffMeter", () => {
     expect(t.unknownRuns).toBe(0);
   });
 
+  // (#1856) A session id can legitimately span multiple pipeline stages
+  // (worktree → coder → verify all dispatch under the SAME `mission-run-*`
+  // session id, `src/coder_phase.rs`), and each stage's own turn counter
+  // restarts at 1. Sorting by `turn_seq` alone (the pre-fix behavior)
+  // interleaves the two stages' turns — turn_seq=1 from stage 2 sorts
+  // adjacent to turn_seq=1 from stage 1 even though they are 5 minutes
+  // apart — and the overlap estimator then compares prompt sizes across a
+  // stage boundary where no re-read relationship exists. Sorting by `ts`
+  // instead groups each stage's turns together, so only the ONE genuine
+  // stage-boundary pair is ever compared.
+  //
+  // Hand-computed (see PR description for the arithmetic): sorting by ts
+  // yields prompt sequence [1000,50,60, 2000,80,90] → reread=320,
+  // fresh=2960. The pre-fix turn_seq sort ties on turn_seq 1/2/3 across
+  // the two stages and (stable sort, insertion order breaks the tie)
+  // yields [1000,2000,50,80,60,90] → reread=1220, fresh=2060 — 900 tokens
+  // misclassified in this deliberately small repro of the corpus-scale
+  // 663k figure from the issue.
+  it("(#1856) a session id spanning two pipeline stages (turn_seq restarts) sorts by ts, not turn_seq — reread stays confined within each stage", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "spanning", action: "dispatch.start", handle: "worktree" }),
+      // Stage 1 (worktree): turn_seq 1..3, ts T..T+2s.
+      tokenRec("spanning", 1, 1000, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("spanning", 2, 50, 0, "2026-08-08T00:00:01Z"),
+      tokenRec("spanning", 3, 60, 0, "2026-08-08T00:00:02Z"),
+      // Stage 2 (coder): turn_seq RESTARTS at 1, ts 5 minutes later.
+      tokenRec("spanning", 1, 2000, 0, "2026-08-08T00:05:00Z"),
+      tokenRec("spanning", 2, 80, 0, "2026-08-08T00:05:01Z"),
+      tokenRec("spanning", 3, 90, 0, "2026-08-08T00:05:02Z"),
+      rec({ session_id: "spanning", action: "dispatch.complete", payload: { total_tokens: 3280 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.reread).toBe(320);
+    expect(t.fresh).toBe(2960);
+    expect(t.reread + t.fresh).toBe(3280);
+  });
+
+  // (#1856 inverted case) An ORDINARY session — one stage, turn_seq
+  // monotonic AND ts monotonic — must classify identically under the
+  // ts-first sort as it always did. A re-sort that fixes the spanning case
+  // but reclassifies ordinary sessions would be worse than the bug it
+  // fixes.
+  it("(#1856, inverted) an ordinary single-stage session with monotonic turn_seq AND ts is unaffected by the ts-first sort", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "ordinary", action: "dispatch.start", handle: "coder" }),
+      tokenRec("ordinary", 1, 400, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("ordinary", 2, 90, 0, "2026-08-08T00:00:05Z"),
+      tokenRec("ordinary", 3, 30, 0, "2026-08-08T00:00:10Z"),
+      rec({ session_id: "ordinary", action: "dispatch.complete", payload: { total_tokens: 520 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // ts order == turn_seq order here, so the decomposition is exactly the
+    // same as the pre-fix sort would have produced: [400,90,30] →
+    // rr = min(400,90) + min(90,30) = 90 + 30 = 120; fresh = 520-120=400.
+    expect(t.reread).toBe(120);
+    expect(t.fresh).toBe(400);
+  });
+
+  // (#1856 tie case) Equal timestamps are exactly where a sort changes
+  // behavior unpredictably. `ts` is second-precision (`ts_utc_now()`), so
+  // same-second turns are common in real data. Records are pushed into
+  // `data` OUT of turn_seq order (turn_seq=2's record precedes turn_seq=1's)
+  // to prove the tiebreak reads `turn_seq`, not the records' incidental
+  // array/insertion order — a naive `ts`-only sort with no tiebreak would
+  // silently preserve the (wrong) insertion order here instead.
+  it("(#1856 tie case) records sharing one ts tiebreak on turn_seq, not on array insertion order", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "tied", action: "dispatch.start", handle: "coder" }),
+      // Pushed turn_seq=2 BEFORE turn_seq=1 — insertion order disagrees
+      // with turn_seq order on purpose.
+      tokenRec("tied", 2, 999, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("tied", 1, 10, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("tied", 3, 500, 0, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "tied", action: "dispatch.complete", payload: { total_tokens: 1509 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // Correct turn_seq-ordered sequence is [10,999,500]:
+    // rr = min(10,999) + min(999,500) = 10 + 500 = 510; fresh = 1509-510=999.
+    // (Preserving the wrong insertion order [999,10,500] would instead give
+    // rr=20, fresh=1489 — see the PR description's arithmetic.)
+    expect(t.reread).toBe(510);
+    expect(t.fresh).toBe(999);
+  });
+
   it("returns all-zero on an empty window", () => {
     const t = tokensOffMeter([]);
     expect(t).toEqual({

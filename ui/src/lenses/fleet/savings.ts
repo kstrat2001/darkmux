@@ -1,4 +1,4 @@
-import { isDispatchStart, isDispatchComplete } from "../../lib/flow";
+import { isDispatchStart, isDispatchComplete, T } from "../../lib/flow";
 /**
  * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
  * savings hero's summing logic: tokens kept off the (frontier) meter, split
@@ -71,6 +71,14 @@ interface TokenPayload {
   remote_tokens?: number;
   turn_seq?: number;
   endpoint?: string;
+}
+
+/** A `sess`-grouped turn, carrying the record's own `ts` alongside its
+ * payload — needed to sort turns chronologically (#1856) rather than by
+ * `turn_seq` alone, which a session id spanning multiple pipeline stages
+ * (worktree → coder → verify) restarts at 1 per stage. */
+interface SessTurn extends TokenPayload {
+  ts: string;
 }
 
 export interface TokensOffMeter {
@@ -172,7 +180,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   let completion = 0;
   let cloud = 0;
   let unknown = 0;
-  const sess = new Map<string, TokenPayload[]>();
+  const sess = new Map<string, SessTurn[]>();
 
   for (const r of data) {
     if (r.category === "telemetry" && r.source === "tokens") {
@@ -190,7 +198,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       // decomposition below). session_id is the norm; this is defensive.
       const k = r.session_id || `ts:${r.ts}:${r.handle || ""}:${r.machine_uid || ""}`;
       if (!sess.has(k)) sess.set(k, []);
-      sess.get(k)!.push(p);
+      sess.get(k)!.push({ ...p, ts: r.ts });
     }
   }
 
@@ -213,7 +221,29 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     else if (!localSids.has(k)) unknownRuns++;
     const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
     if (recs.every((p) => p.turn_seq != null)) {
-      const turns = recs.slice().sort((a, b) => (a.turn_seq as number) - (b.turn_seq as number));
+      // (#1856) Sort by TIME, turn_seq only as a tiebreak — not the reverse.
+      // A session id can legitimately span multiple pipeline stages
+      // (worktree → coder → verify all dispatch under the SAME mission-run
+      // session id) and each stage's own turn counter restarts at 1, so
+      // sorting by `turn_seq` alone interleaves chronologically unrelated
+      // turns from different stages: turn_seq=1 from stage 2 sorts next to
+      // turn_seq=1 from stage 1 even though they may be minutes apart, and
+      // the overlap estimator below then compares prompt sizes across a
+      // stage boundary where no re-read relationship exists. Sorting by
+      // `ts` groups each stage's turns together (only the ONE true
+      // stage-boundary pair is ever compared, not every same-turn_seq
+      // pair), matching what actually happened. `ts` is second-precision
+      // (`ts_utc_now()`), so same-second turns are common — turn_seq is the
+      // correct tiebreak there (and the fallback for an unparseable `ts`,
+      // via the `Number.isNaN` guard), never the primary key.
+      const turns = recs
+        .slice()
+        .sort((a, b) => {
+          const ta = T(a.ts);
+          const tb = T(b.ts);
+          if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb) return ta - tb;
+          return (a.turn_seq as number) - (b.turn_seq as number);
+        });
       let rr = 0;
       let prev: number | null = null;
       for (const p of turns) {
