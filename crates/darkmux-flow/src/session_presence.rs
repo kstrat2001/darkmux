@@ -183,13 +183,39 @@ impl SessionEmitter {
     /// Pre-claim the reconciler edge, then DEL the presence key — the
     /// teardown shared by the CLEAN [`stop`](Self::stop) path and the
     /// [`Drop`] backstop below (#2344). Idempotent via `beat_removed`, and
-    /// safe to run from an unwinding stack: every call here is bounded by
-    /// `bound_redis_response`'s deadline (#2227), the same bound that lets
-    /// [`stop`](Self::stop) already promise a return within ~3.1s against
-    /// a completely silent peer — so this is not the unbounded
-    /// network-round-trip-from-Drop hazard the type used to avoid by
-    /// skipping it; it is the same already-bounded call, just also reached
+    /// bounded the same way [`stop`](Self::stop) already was: every call
+    /// here goes through `bound_redis_response`'s deadline (#2227), which
+    /// caps each individual socket READ at ~1s. That is NOT the same thing
+    /// as "bounded against any peer" — `bound_redis_response` sets a
+    /// per-read deadline, not a per-command or per-call one, so a peer that
+    /// keeps emitting any byte more often than that deadline (never fully
+    /// silent, just slow) can hold the read open indefinitely; measured
+    /// against such a peer, this can run far longer than the ~3.1s figure
+    /// below (#2344 review CONSIDER 5). This class of hang is pre-existing
+    /// — [`stop`](Self::stop) already had it before this change — so
+    /// running it from `Drop` during a panic unwind is not a NEW hazard
+    /// this type introduced by no longer skipping the network round-trip;
+    /// it is the same hazard `stop()` already accepted, now also reachable
     /// from the backstop.
+    ///
+    /// **Considered and deferred (#2344 review CONSIDER 5):** every
+    /// `spawn_session_emitter` call site declares the dispatch's bookend
+    /// guard BEFORE the `SessionEmitter`, so on scope exit Rust's reverse-
+    /// drop order runs the emitter's (now-slow-peer-hangable) `Drop`
+    /// FIRST — ahead of the bookend guard's own `Drop`, which is what
+    /// emits the dispatch's terminal record for an unclosed unit. A hung
+    /// emitter `Drop` there delays that terminal, which didn't used to
+    /// depend on this call at all. Swapping the declaration order (emitter
+    /// first, bookend second) would let the terminal win regardless — but
+    /// that touches five call sites across two crates (`dispatch_internal.
+    /// rs`'s hosted/container arms, `builtins.rs`'s single-shot/map arms),
+    /// each needing its OWN red-prove against a byte-dribbling peer (the
+    /// existing silent-peer fixtures don't exercise this — a silent peer
+    /// never reaches the ordering question at all, since IT the READ
+    /// itself bounds in ~1s either way). Left as-is for this fix pass; the
+    /// pre-existing class (`stop()` already has it) is not made materially
+    /// worse by this change, and the reorder is real follow-up work, not
+    /// a fold-in.
     fn remove_presence_key(&mut self) {
         if self.beat_removed {
             return;
@@ -368,6 +394,18 @@ mod tests {
         pub struct FakeRedis {
             port: u16,
             store: Arc<Mutex<HashMap<String, String>>>,
+            /// (#2344 review, MUST FIX 3) Log of every `(cmd, key)` this peer
+            /// has answered, in arrival order. State alone (`contains`) can't
+            /// distinguish "`remove_presence_key` ran once" from "it ran
+            /// twice and both times were idempotent no-ops" — a `SET ... NX`
+            /// against an already-claimed key and a `DEL` of an
+            /// already-absent key both leave the store looking identical
+            /// either way. Counting calls is what actually proves the
+            /// `beat_removed` guard is doing something: without it,
+            /// `SessionEmitter::stop()` (which always triggers its own
+            /// subsequent `Drop`) issues the claim `SET` and the beat `DEL`
+            /// TWICE instead of once.
+            calls: Arc<Mutex<Vec<(String, String)>>>,
         }
 
         impl FakeRedis {
@@ -375,15 +413,18 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
                 let port = listener.local_addr().unwrap().port();
                 let store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+                let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
                 let accept_store = Arc::clone(&store);
+                let accept_calls = Arc::clone(&calls);
                 std::thread::spawn(move || {
                     for stream in listener.incoming() {
                         let Ok(stream) = stream else { continue };
                         let conn_store = Arc::clone(&accept_store);
-                        std::thread::spawn(move || handle_conn(stream, conn_store));
+                        let conn_calls = Arc::clone(&accept_calls);
+                        std::thread::spawn(move || handle_conn(stream, conn_store, conn_calls));
                     }
                 });
-                Self { port, store }
+                Self { port, store, calls }
             }
 
             pub fn url(&self) -> String {
@@ -393,9 +434,26 @@ mod tests {
             pub fn contains(&self, key: &str) -> bool {
                 self.store.lock().unwrap().contains_key(key)
             }
+
+            /// How many times this peer has answered `cmd` (e.g. `"SET"` /
+            /// `"DEL"`) addressed at `key`. See the `calls` field doc for why
+            /// this — not `contains` — is the assertion that actually proves
+            /// teardown ran exactly once.
+            pub fn call_count(&self, cmd: &str, key: &str) -> usize {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(c, k)| c.eq_ignore_ascii_case(cmd) && k == key)
+                    .count()
+            }
         }
 
-        fn handle_conn(stream: TcpStream, store: Arc<Mutex<HashMap<String, String>>>) {
+        fn handle_conn(
+            stream: TcpStream,
+            store: Arc<Mutex<HashMap<String, String>>>,
+            calls: Arc<Mutex<Vec<(String, String)>>>,
+        ) {
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
             let mut writer = stream;
             loop {
@@ -404,6 +462,16 @@ mod tests {
                     continue;
                 }
                 let cmd = args[0].to_ascii_uppercase();
+                // (#2344 review, MUST FIX 3) Log every SET/DEL call BY KEY,
+                // regardless of outcome (an NX-miss SET and a no-op DEL of an
+                // already-absent key still count as a call) — this is what
+                // lets a test tell "teardown ran once" from "it ran twice
+                // and both times happened to be idempotent no-ops".
+                if cmd == "SET" || cmd == "DEL" {
+                    if let Some(key) = args.get(1) {
+                        calls.lock().unwrap().push((cmd.clone(), key.clone()));
+                    }
+                }
                 let reply = match cmd.as_str() {
                     "CLIENT" | "HELLO" => "+OK\r\n".to_string(),
                     "PING" => "+PONG\r\n".to_string(),
@@ -482,15 +550,37 @@ mod tests {
         }
     }
 
+    /// The reconciler's edge-claim key for a session's `session-end`
+    /// transition — mirrors `presence_reconciler::EDGE_CLAIM_PREFIX` +
+    /// `claim_edge`'s `"{kind}:{id}"` suffix, duplicated here (rather than
+    /// exposed cross-module) because it's private to that module and this
+    /// is test-only plumbing. (#2344 review, MUST FIX 2)
+    fn edge_claim_key(sid: &str) -> String {
+        format!("darkmux:edge-claim:session-end:{sid}")
+    }
+
     /// (#2344) THE clean-path proof: `stop()` must remove the presence key
     /// immediately, not merely halt the beat thread and leave the key for
     /// the fake peer's (nonexistent) TTL to never actually clean up.
+    ///
+    /// Also covers two review findings (MUST FIX 2 / MUST FIX 3) that a bare
+    /// `!fake.contains(&key)` can't distinguish: (a) the pre-claim actually
+    /// ran — deleting `remove_presence_key`'s `claim_edge` call would still
+    /// leave the beat key removed by the DEL alone, so the edge-claim key's
+    /// presence is the only thing that proves the pre-claim happened; (b)
+    /// teardown ran exactly ONCE — `stop(mut self)` always triggers its own
+    /// subsequent `Drop` when `self` goes out of scope at the end of the
+    /// function, so without the `beat_removed` guard `remove_presence_key`
+    /// runs twice. Both the SET NX and the DEL are idempotent, so the final
+    /// STATE (key gone, claim present) looks identical either way — only a
+    /// call count can tell them apart.
     #[test]
     fn stop_deletes_the_presence_key_immediately() {
         let fake = fake_redis::FakeRedis::spawn();
         let client = redis::Client::open(fake.url().as_str()).expect("open fake client");
         let sid = "sid-2344-stop".to_string();
         let key = session_key(&sid);
+        let claim_key = edge_claim_key(&sid);
 
         let emitter = spawn_with_client(client, sid, Some("coder".into()), None)
             .expect("spawn emitter");
@@ -502,6 +592,20 @@ mod tests {
             !fake.contains(&key),
             "stop() must remove the presence key immediately, not leave it for a TTL that \
              this fake peer doesn't even implement"
+        );
+        assert!(
+            fake.contains(&claim_key),
+            "stop() must pre-claim the reconciler's session-end edge BEFORE removing the \
+             presence key, so the reconciler loses the claim and skips its own redundant \
+             session.end when it later observes the key gone (MUST FIX 2)"
+        );
+        assert_eq!(
+            fake.call_count("DEL", &key),
+            1,
+            "remove_presence_key must run exactly once per stop() — the beat_removed guard \
+             exists because stop(mut self) always triggers its own Drop when self goes out \
+             of scope, and without the guard the DEL (and the claim SET) would fire twice \
+             (MUST FIX 3)"
         );
     }
 
@@ -518,6 +622,7 @@ mod tests {
         let client = redis::Client::open(fake.url().as_str()).expect("open fake client");
         let sid = "sid-2344-early-return".to_string();
         let key = session_key(&sid);
+        let claim_key = edge_claim_key(&sid);
         {
             let _emitter = spawn_with_client(client, sid, Some("coder".into()), None)
                 .expect("spawn emitter");
@@ -533,6 +638,19 @@ mod tests {
              ended this way kept a beat with nothing left in the process to ever remove it — \
              this fake peer has no TTL clock, so a key still present here can ONLY mean Drop \
              never issued the DEL."
+        );
+        assert!(
+            fake.contains(&claim_key),
+            "Drop must also pre-claim the reconciler's session-end edge, same as stop() — \
+             otherwise the reconciler wins the (now-unclaimed) edge and records a redundant \
+             session.end alongside this early-returning dispatch's own dispatch.error \
+             terminal (MUST FIX 2)"
+        );
+        assert_eq!(
+            fake.call_count("DEL", &key),
+            1,
+            "only Drop ran here (no explicit stop()), so remove_presence_key must have run \
+             exactly once (MUST FIX 3)"
         );
     }
 
@@ -550,6 +668,7 @@ mod tests {
         let client = redis::Client::open(fake.url().as_str()).expect("open fake client");
         let sid = "sid-2344-panic".to_string();
         let key = session_key(&sid);
+        let claim_key = edge_claim_key(&sid);
 
         // Silence the expected panic's backtrace so test output stays
         // clean — same convention as `dispatch_internal_tests`'s
@@ -572,6 +691,19 @@ mod tests {
              itself — leaving it behind means a just-panicked dispatch (whose bookend guard \
              already emitted its dispatch.error terminal) keeps reading \"running\" with \
              nothing left in the process to say otherwise."
+        );
+        assert!(
+            fake.contains(&claim_key),
+            "Drop-via-panic must also pre-claim the reconciler's session-end edge — the \
+             dispatch's bookend guard already emitted a dispatch.error for this panic, so an \
+             unclaimed edge would let the reconciler record a redundant session.end on top of \
+             it once the (real) TTL lapsed (MUST FIX 2)"
+        );
+        assert_eq!(
+            fake.call_count("DEL", &key),
+            1,
+            "only Drop ran here (the panic unwound before any explicit stop()), so \
+             remove_presence_key must have run exactly once (MUST FIX 3)"
         );
     }
 
@@ -736,6 +868,48 @@ mod tests {
              peer; expected bounded by 3 x REDIS_RESPONSE_TIMEOUT + connects \
              (~3.1s measured). Before #2227 this wedged (measured 89.42s), \
              stranding the dispatch with no terminal record."
+        );
+    }
+
+    /// (#2344 review, MUST FIX 3) The Drop-path twin of the test above: the
+    /// (#2227) bounded-time proof existed for `stop()` only — but since
+    /// #2344 `Drop` runs the exact same `remove_presence_key` teardown
+    /// (pre-claim `SET NX` then `DEL`), reached from an early `?`-return or
+    /// a caught panic instead of an explicit call. An unbounded Drop there
+    /// would stall a panic unwind indefinitely; this proves it doesn't.
+    #[test]
+    fn drop_without_stop_against_silent_peer_returns_within_bounded_time() {
+        let port = crate::spawn_silent_redis_peer(8);
+        crate::assert_silent_peer_reaches_command_phase(port);
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
+            .expect("open client against the fake peer");
+
+        let start = std::time::Instant::now();
+        {
+            let _emitter = spawn_with_client(
+                client,
+                "sid-2227-drop-teardown".to_string(),
+                Some("coder".to_string()),
+                None,
+            )
+            .expect("spawn emitter");
+
+            // Let the beat thread get INSIDE the SET before tearing down —
+            // same setup as the stop() sibling above, and the state an early
+            // `?`-return or a caught panic would actually unwind from.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            // Scope ends here with NO explicit `.stop()` — Drop alone must
+            // run the same bounded teardown `stop()` does.
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "SessionEmitter::drop() (no explicit stop()) took {elapsed:?} against a \
+             command-silent peer; expected bounded the same way stop() is (~3.1s measured), \
+             since remove_presence_key issues the same three bounded commands from either \
+             path. An unbounded Drop would stall a panic unwind or an early ?-return \
+             indefinitely instead of letting the dispatch's own terminal record land."
         );
     }
 

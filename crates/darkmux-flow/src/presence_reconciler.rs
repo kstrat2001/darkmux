@@ -393,11 +393,14 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
                                     if gone.machine_uid.is_none() {
                                         continue;
                                     }
-                                    // A cleanly-completed session pre-claimed this
-                                    // in SessionEmitter::stop, so the claim loses
-                                    // here and no redundant edge is recorded; an
-                                    // abandoned (crash/kill) session has no
-                                    // pre-claim, so this wins and records the close.
+                                    // A session that reached its own teardown —
+                                    // clean `stop()`, or (#2344) `SessionEmitter::
+                                    // drop` catching an early return or a caught
+                                    // panic — pre-claimed this, so the claim loses
+                                    // here and no redundant edge is recorded; only
+                                    // a session whose whole host process died
+                                    // before Drop could run has no pre-claim, so
+                                    // this wins and records the close.
                                     if claim_edge(&client, "session-end", &gone.session_id) {
                                         // (#902) Release the claim on a failed
                                         // record write so it doesn't suppress a

@@ -79,6 +79,65 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.47.0";
 // Version history:
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2344 fix-pass:
+//           `SessionEmitter`'s `Drop` now shares `stop()`'s
+//           `remove_presence_key` teardown (pre-claim the reconciler's
+//           `session-end` edge, then DEL the presence beat), so a dispatch
+//           that ends via an early `?`-return or a caught panic — not just
+//           a clean `stop()` — now suppresses the reconciler's would-be
+//           redundant `session.end` close-edge. Before this, that class of
+//           dispatch got a `dispatch.error` AND, ~7-15s later, a
+//           `session.end` (once the presence key's TTL lapsed and the
+//           reconciler noticed); after, it gets only `dispatch.error` (the
+//           pre-claim wins the race the reconciler would otherwise win).
+//
+//           Considered and rejected as MINOR under this history's own
+//           "producers changed which records they write" bar (1.43.0,
+//           1.45.0, 1.47.0 above/below this entry): that bar bumps when a
+//           consumer computes a DIFFERENT ANSWER from the same record set.
+//           Traced every real consumer of `session.end` before deciding,
+//           rather than reasoning from the field alone (per this repo's
+//           "instrument, don't read, for claims about behavior" — here the
+//           claim resolves entirely inside our own logic, so tracing +
+//           executing existing/added tests settles it, no live probe
+//           needed):
+//             - `runs.rs`'s `terminal_status_for_action` / the session-agg
+//               loop keeps the FIRST terminal seen in FILE order, not the
+//               chronologically-latest — and `session.end` can only ever be
+//               written strictly AFTER the terminal that caused the
+//               presence key to disappear, so it never wins today either.
+//               Locked in by
+//               `build_flow_session_index_dispatch_error_wins_over_a_later_
+//               redundant_session_end` (added alongside this entry): a
+//               `dispatch.error` at t+5s followed by a `session.end` at
+//               t+20s for the SAME session still resolves to
+//               `RunStatus::Error`.
+//             - `ui/src/lib/flow.ts`'s `sessionCloseEdge` takes
+//               `min(dispatchEnd.ts, sessEnd.ts)` — the dispatch terminal,
+//               being earlier, already wins whether or not `session.end`
+//               also exists.
+//             - `ui/src/lenses/session/sessionRun.ts`'s `close`/`c`/
+//               `wall_ms` selection sorts terminals by `ts` (same result)
+//               and additionally skips `session.end` outright when reading
+//               the payload (`c = attemptCloses.find(r => r.action !==
+//               "session.end")`), since a close-edge carries no payload.
+//           So the suppressed records were dead weight at every consumer
+//           that reads them today — removing them changes record VOLUME,
+//           not any computed answer. This is the genuine difference from
+//           1.43.0/1.45.0/1.47.0: those bumped because an already-live
+//           consumer's answer DID change for records already in the
+//           stream; here, tracing shows none does. `session.end`'s
+//           reserved case (a session whose ONLY terminal is `session.end`
+//           — the true process-level-abandonment interval, no Drop ever
+//           ran) is completely unaffected: that path never had a
+//           dispatch.error/complete to suppress in favor of.
+//
+//           If a future consumer ever keys off "did this session ever
+//           carry a session.end" as an independent signal (rather than via
+//           `sessionCloseEdge`/`terminal_status_for_action`'s
+//           earliest-wins framing), that is the point to revisit this
+//           entry and bump then — the schema's Rust shape and every
+//           existing consumer's computed output are unchanged today.
 //   1.47.0 (#1645 fix-pass) — `dispatch_internal.rs`'s `dispatch_remote`/
 //           `dispatch_local_single_shot` arms (the hosted and container-free
 //           local single-shot dispatch paths) now resolve `mission_id` via

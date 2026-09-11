@@ -32,16 +32,36 @@
 //! **Coverage, and its edge.** The registry walk sees
 //! `StepKindRegistry::with_builtins()`'s five Tier 1 kinds; the roster below
 //! adds the two free-function entry points a registry walk structurally
-//! cannot see. Tier 3 kinds registered by their own mission modules
-//! (`darkmux-lab`'s `crawl.unit`, the binary's `mission.coder`) are NOT
-//! enumerated here — this crate cannot see them — but every one of them
-//! performs its model work by calling `darkmux_crew::dispatch::dispatch`
-//! (see `crawl::unit_step::UnitDispatchFn`, whose production value is that
-//! function), which is `dispatch_internal::dispatch`: the `dispatch.internal`
-//! row below. The remaining model call in this crate,
-//! `probe_remote_endpoint`, is deliberately absent: `doctor --probe` is a
-//! 64-token connectivity check with no session id and no bookends, so there
-//! is no session for a beat to be the liveness of.
+//! cannot see. Two DIFFERENT kinds of gap are NOT enumerated here, and
+//! they are not the same gap (corrected #2344 review, CONSIDER 6 — an
+//! earlier version of this paragraph conflated them):
+//!
+//!   1. Genuine Tier 3 kinds in OTHER crates (`darkmux-lab`'s `crawl.unit`,
+//!      the binary's `mission.coder`) — this crate structurally cannot see
+//!      them at all. Every one of them performs its model work by calling
+//!      `darkmux_crew::dispatch::dispatch` (see `crawl::unit_step::
+//!      UnitDispatchFn`, whose production value is that function), which
+//!      is `dispatch_internal::dispatch`: the `dispatch.internal` row
+//!      below covers the call they all route through.
+//!   2. `mods.gate`, `records.gather`, and `deliver.github_review` — Tier
+//!      1 by classification, physically IN this crate
+//!      (`step_kinds/mods_gate.rs`, `records_gather.rs`,
+//!      `deliver_github_review.rs`) — just not registered via
+//!      `with_builtins()`, so this walk never reaches them. Not a
+//!      visibility gap; a registration-path gap. All three currently
+//!      declare `SeatClaim::NoModel` (`types.rs`'s own doc names them
+//!      there), so nothing is silently uncovered TODAY — but that is this
+//!      module reasoning about their `SeatClaim`, not this module
+//!      enumerating them. A future change to any of their `seat_claim()`
+//!      would not be caught by this sweep. Keying the sweep off
+//!      `StepKind::seat_claim()` directly, rather than this hand-
+//!      maintained `duty_for_kind` table, would close this end-to-end;
+//!      tracked as a follow-up, not done here.
+//!
+//! The remaining model call in this crate, `probe_remote_endpoint`, is
+//! deliberately absent: `doctor --probe` is a 64-token connectivity check
+//! with no session id and no bookends, so there is no session for a beat
+//! to be the liveness of.
 //!
 //! Follows #1511/#1979's registry-conformance shape: the table is keyed off
 //! `StepKindRegistry::ids()`, and a kind with no row PANICS WITH
