@@ -26,7 +26,12 @@ pub fn cmd_register(
     force: bool,
     if_absent: bool,
 ) -> Result<String> {
-    let paths = paths::resolve(ResolveScope::Auto);
+    // (#2613) FORCED to the home (user) tier, never `Auto` — a fixture
+    // registered from one directory must be visible from every other
+    // directory, matching the workload-document fix (#2611) and the
+    // crew/mission-state precedent (#1012, #2432). `DARKMUX_HOME` still
+    // wins when set; a project-local `.darkmux/` in cwd is never consulted.
+    let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
     let reg_path = default_registry_path(&paths);
 
@@ -62,8 +67,9 @@ pub fn cmd_register(
     };
 
     let mut msg = format!(
-        "Registered fixture `{}`\n  path:   {}\n  hash:   {}\n  hashed: {}\n  version: {}{}",
+        "Registered fixture `{}` in registry {}\n  path:   {}\n  hash:   {}\n  hashed: {}\n  version: {}{}",
         registered_name,
+        reg_path.display(),
         entry.path.display(),
         entry.content_hash,
         entry.hashed_at,
@@ -101,7 +107,8 @@ pub fn cmd_register(
 /// `dm lab fixture unregister <name>` — remove pointer from registry.
 /// NEVER touches the underlying dir (operator-sovereignty).
 pub fn cmd_unregister(name: &str) -> Result<String> {
-    let paths = paths::resolve(ResolveScope::Auto);
+    // (#2613) Same forced home tier as `cmd_register` — see its comment.
+    let paths = paths::resolve(ResolveScope::ForceUser);
     paths::ensure(&paths)?;
     let reg_path = default_registry_path(&paths);
 
@@ -109,29 +116,41 @@ pub fn cmd_unregister(name: &str) -> Result<String> {
     let removed = LabRegistry::with_locked(&reg_path, |registry| registry.unregister(name))?;
 
     Ok(format!(
-        "Unregistered `{name}` (was → {})\n  Note: the directory itself was NOT touched.",
+        "Unregistered `{name}` from registry {}\n  (was → {})\n  Note: the directory itself was NOT touched.",
+        reg_path.display(),
         removed.path.display()
     ))
 }
 
 /// `dm lab fixture list` — show registered fixtures table.
 pub fn cmd_list() -> Result<String> {
-    let paths = paths::resolve(ResolveScope::Auto);
+    // (#2613) Same forced home tier as `cmd_register` — see its comment.
+    let paths = paths::resolve(ResolveScope::ForceUser);
     let reg_path = default_registry_path(&paths);
 
     if !reg_path.exists() {
-        return Ok(format!(
+        let mut msg = format!(
             "No registry at {}.\n  To get started:\n    `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
-        ));
+        );
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            msg.push_str("\n\n  ");
+            msg.push_str(&crate::lab::registry::orphan_signpost_line(&orphan));
+        }
+        return Ok(msg);
     }
 
     let registry = LabRegistry::load(&reg_path)?;
     if registry.fixtures.is_empty() {
-        return Ok(format!(
+        let mut msg = format!(
             "Registry at {} has no fixtures registered.\n  Add one: `dm lab fixture register <path-to-fixture>`",
             reg_path.display()
-        ));
+        );
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            msg.push_str("\n\n  ");
+            msg.push_str(&crate::lab::registry::orphan_signpost_line(&orphan));
+        }
+        return Ok(msg);
     }
 
     let mut out = format!(

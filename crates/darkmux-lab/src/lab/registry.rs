@@ -26,8 +26,64 @@ use std::path::{Path, PathBuf};
 /// darkmux home. Phase 4 CLI verbs read/write this path. Operators
 /// who want a custom location can hand-edit + move; the resolver
 /// always honors the canonical name under `{root}`.
+///
+/// (#2613) Every production caller resolves `paths` here via
+/// `ResolveScope::ForceUser` (`DARKMUX_HOME` when set, else `~/.darkmux`)
+/// — never `Auto`. The fixture registry is operator-level state, like the
+/// crew/mission board (#1012) and mission configs (#2432, #2554/#2583) and
+/// the workload document itself (#2611): a fixture registered once must be
+/// visible from every directory, not just the one it happened to be
+/// registered from. This function itself stays generic over `&DarkmuxPaths`
+/// (tests build one directly via `DarkmuxPaths::under_root`), but no
+/// production call site may pass an `Auto`-resolved value.
 pub(crate) fn default_registry_path(paths: &DarkmuxPaths) -> PathBuf {
     paths.root.join("lab-registry.json")
+}
+
+/// (#2613 signpost) The fixture registry always resolves home-tier now —
+/// a project-local `./.darkmux/lab-registry.json` created before this fix
+/// (or by hand) is never consulted, and its file stays on disk untouched
+/// (operator-sovereignty: darkmux never deletes it). Silence about that is
+/// the failure this stats for: an operator standing in a directory whose
+/// OWN `.darkmux/` still holds a populated registry sees `list`/`doctor`
+/// report "no registry" or empty, and reasonably concludes darkmux lost
+/// their fixtures — not that darkmux moved where it looks.
+///
+/// Returns the orphaned project-local registry path when it exists AND
+/// differs from `consulted` (the registry path that was actually read).
+/// Existence-only, no parsing — darkmux describes what it found and
+/// where, it doesn't adjudicate or migrate. Canonicalizes both sides
+/// before comparing so a `consulted` path that happens to already BE the
+/// project-local file (an unusual `DARKMUX_HOME` pointed at cwd's own
+/// `.darkmux`, or cwd literally being the home dir) is correctly treated
+/// as "this IS the consulted registry", not a second orphaned one.
+pub(crate) fn orphaned_project_local_registry(consulted: &Path) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let candidate = cwd.join(".darkmux").join("lab-registry.json");
+    if !candidate.exists() {
+        return None;
+    }
+    let candidate_canon = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+    let consulted_canon = consulted.canonicalize().unwrap_or_else(|_| consulted.to_path_buf());
+    if candidate_canon == consulted_canon {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// One human-readable line naming an orphaned project-local registry plus
+/// the re-home step — appended to a "no registry" / "empty registry"
+/// message when `orphaned_project_local_registry` finds one. Kept as a
+/// single line so it reads as a footnote, not a competing report.
+pub(crate) fn orphan_signpost_line(orphan: &Path) -> String {
+    format!(
+        "Note: {} also exists (in this directory's own `.darkmux/`) but is never consulted — \
+         the fixture registry always resolves to the home tier now. It was left on disk \
+         untouched; inspect it directly (`cat {}`) and re-register any fixtures you still \
+         want from the home tier: `dm lab fixture register <path-to-fixture>`.",
+        orphan.display(),
+        orphan.display()
+    )
 }
 
 /// Sidecar lock-file path for a registry at `path` (`<path>.lock`).

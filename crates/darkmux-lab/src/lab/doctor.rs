@@ -33,7 +33,12 @@ impl DoctorReport {
 }
 
 pub fn lab_doctor() -> Result<DoctorReport> {
-    let paths = paths::resolve(ResolveScope::Auto);
+    // (#2613) FORCED to the home (user) tier, matching every other registry
+    // consumer (`fixture_cli`'s register/unregister/list, and
+    // `resolve_source_sandbox`'s dispatch-time lookup) — never `Auto`, or
+    // doctor could report a different registry than the one a dispatch (or
+    // `lab fixture list`) actually consults from the same directory.
+    let paths = paths::resolve(ResolveScope::ForceUser);
     let reg_path = default_registry_path(&paths);
     let mut report = DoctorReport::default();
 
@@ -42,6 +47,11 @@ pub fn lab_doctor() -> Result<DoctorReport> {
             "no registry found at {}\n  Options:\n    (a) Bootstrap built-in synthetic fixtures:  `scripts/lab-init.sh`\n    (b) Register your own fixture:              `dm lab fixture register /path/to/your/fixture/`\n    (c) Hand-write the registry:                see docs/lab-registry.md (when published)\n  Until then, `dm lab run` can't resolve any fixture by name.",
             reg_path.display()
         ));
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            report
+                .warnings
+                .push(crate::lab::registry::orphan_signpost_line(&orphan));
+        }
         return Ok(report);
     }
     report.registry_present = true;
@@ -54,6 +64,11 @@ pub fn lab_doctor() -> Result<DoctorReport> {
             "registry at {} is empty — no fixtures registered.\n  Add one: `dm lab fixture register /path/to/your/fixture/`",
             reg_path.display()
         ));
+        if let Some(orphan) = crate::lab::registry::orphaned_project_local_registry(&reg_path) {
+            report
+                .warnings
+                .push(crate::lab::registry::orphan_signpost_line(&orphan));
+        }
         return Ok(report);
     }
 

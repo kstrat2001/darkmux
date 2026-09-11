@@ -1834,6 +1834,215 @@ fn lab_unregister_removes_entry_but_not_dir() {
     assert!(!raw.contains("\"demo\""));
 }
 
+/// (#2613) A fixture registered from one directory must be visible from
+/// ANOTHER directory — including one that has its own project-local
+/// `.darkmux/`, which is exactly the state that made them diverge. Unlike
+/// every other fixture test in this file, this one deliberately does NOT
+/// go through `darkmux_cmd_in_project` (which pins the root via an
+/// explicit `DARKMUX_HOME` override — the override wins identically
+/// whether the registry resolves `Auto` or `ForceUser`, so it can't
+/// exercise this divergence at all). Instead: `DARKMUX_HOME` is removed
+/// entirely and only `HOME` is isolated, so `paths::resolve` has to make
+/// its own Auto-vs-ForceUser decision from the real cwd.
+#[test]
+fn fixture_registered_from_one_cwd_is_visible_from_a_project_local_cwd() {
+    let fake_home = TempDir::new().unwrap();
+    let plain_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+    // A GENUINE project-local `.darkmux/` — pre-existing, not created by
+    // this test's own commands — is what makes `Auto` resolution diverge
+    // from the home tier.
+    fs::create_dir_all(project_dir.path().join(".darkmux")).unwrap();
+
+    let fixture_dir = plain_dir.path().join("my-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(
+        fixture_dir.join(".fixture.json"),
+        r#"{"name": "demo", "satisfies": "tiny@1.0"}"#,
+    )
+    .unwrap();
+    fs::write(fixture_dir.join("a.txt"), "x").unwrap();
+
+    let home_registry = fake_home.path().join(".darkmux").join("lab-registry.json");
+
+    // Register from a PLAIN directory (no project-local `.darkmux/`
+    // anywhere in cwd) — lands at the home tier.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(plain_dir.path())
+        .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Registered fixture `demo`"))
+        .stdout(predicate::str::contains(home_registry.display().to_string()));
+    assert!(home_registry.exists(), "registry should exist at {}", home_registry.display());
+
+    // `lab fixture list` from the PROJECT directory — its own `.darkmux/`
+    // exists — must still show the fixture, from the SAME home-rooted
+    // registry, not a fresh empty one.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(project_dir.path())
+        .args(["lab", "fixture", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo"))
+        .stdout(predicate::str::contains("1 fixture"))
+        .stdout(predicate::str::contains(home_registry.display().to_string()));
+
+    // The project-local root never received a registry of its own.
+    assert!(
+        !project_dir.path().join(".darkmux").join("lab-registry.json").exists(),
+        "the project-local .darkmux/ must NOT get its own registry — the fixture registry is \
+         always home-tier"
+    );
+
+    // `lab doctor` from the project directory agrees: it's looking at the
+    // SAME populated registry, not reporting an empty/missing one.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(project_dir.path())
+        .args(["lab", "doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 fixture"));
+
+    // (#2613 MUST FIX 1) Register a SECOND fixture with cwd ITSELF set to
+    // the project directory (its own `.darkmux/` exists) — this is the
+    // leg the read-side assertions above cannot cover. `plain_dir` has no
+    // project-local `.darkmux/` anywhere in cwd, so for the FIRST register
+    // above `Auto` and `ForceUser` resolve identically and a `cmd_register`
+    // reverted back to `Auto` would still pass every assertion in this
+    // test up to this point. Only a register issued FROM a directory whose
+    // own `.darkmux/` exists can catch that regression.
+    let fixture_dir_2 = plain_dir.path().join("my-fixture-2");
+    fs::create_dir_all(&fixture_dir_2).unwrap();
+    fs::write(
+        fixture_dir_2.join(".fixture.json"),
+        r#"{"name": "demo2", "satisfies": "tiny@2.0"}"#,
+    )
+    .unwrap();
+    fs::write(fixture_dir_2.join("a.txt"), "x").unwrap();
+
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(project_dir.path())
+        .args(["lab", "fixture", "register", fixture_dir_2.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Registered fixture `demo2`"))
+        .stdout(predicate::str::contains(home_registry.display().to_string()));
+
+    assert!(
+        !project_dir.path().join(".darkmux").join("lab-registry.json").exists(),
+        "registering FROM a project-local cwd must NOT create a project-local registry — \
+         cmd_register itself must resolve to the home tier, at {}",
+        project_dir.path().join(".darkmux").join("lab-registry.json").display()
+    );
+
+    // And it actually RESOLVES from elsewhere — not just fails to create
+    // a stray project-local file.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(plain_dir.path())
+        .args(["lab", "fixture", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo2"))
+        .stdout(predicate::str::contains("2 fixtures"));
+
+    // And unregistering from the project directory removes it from the
+    // SAME home-tier registry a later `list` from the plain directory
+    // would also read.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(project_dir.path())
+        .args(["lab", "fixture", "unregister", "demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unregistered"))
+        .stdout(predicate::str::contains(home_registry.display().to_string()));
+    let raw = fs::read_to_string(&home_registry).unwrap();
+    assert!(!raw.contains("\"demo\""), "unregister from the project cwd must remove the entry \
+        from the home-tier registry: {raw}");
+}
+
+/// (#2613 CONSIDER 3) `lab fixture list` and `lab doctor`, run from a
+/// directory whose OWN `.darkmux/lab-registry.json` still holds a
+/// populated registry (left behind by a pre-#2613 build, or hand-crafted),
+/// must say so — not just report "no registry" / empty at the home tier
+/// and go silent about the populated file sitting right there in cwd. The
+/// file itself is never touched (operator-sovereignty); this only tests
+/// the DISCLOSURE half.
+#[test]
+fn lab_list_and_doctor_signpost_an_orphaned_project_local_registry() {
+    let fake_home = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+    let project_darkmux = project_dir.path().join(".darkmux");
+    fs::create_dir_all(&project_darkmux).unwrap();
+
+    let fixture_dir = project_dir.path().join("orphaned-fixture");
+    fs::create_dir_all(&fixture_dir).unwrap();
+    fs::write(
+        fixture_dir.join(".fixture.json"),
+        r#"{"name": "orphan", "satisfies": "tiny@1.0"}"#,
+    )
+    .unwrap();
+    fs::write(fixture_dir.join("a.txt"), "x").unwrap();
+
+    // Populate `project_dir/.darkmux/lab-registry.json` DIRECTLY — pointing
+    // `DARKMUX_HOME` straight at it — mimicking a registry that predates
+    // (or was hand-written outside) this fix, sitting in a directory's own
+    // `.darkmux/` rather than the home tier.
+    darkmux_cmd()
+        .env("DARKMUX_HOME", &project_darkmux)
+        .current_dir(project_dir.path())
+        .args(["lab", "fixture", "register", fixture_dir.to_str().unwrap()])
+        .assert()
+        .success();
+    let project_registry = project_darkmux.join("lab-registry.json");
+    assert!(project_registry.exists());
+
+    let expected_home_registry = fake_home.path().join(".darkmux").join("lab-registry.json");
+
+    // `lab fixture list` from that SAME directory, but with the real home
+    // tier empty (no registry there at all) — must name the orphaned
+    // project-local file, not just report "no registry" and stop.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(project_dir.path())
+        .args(["lab", "fixture", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "No registry at {}",
+            expected_home_registry.display()
+        )))
+        .stdout(predicate::str::contains(project_registry.display().to_string()))
+        .stdout(predicate::str::contains("never consulted"));
+
+    // `lab doctor` from the same directory agrees.
+    darkmux_cmd()
+        .env_remove("DARKMUX_HOME")
+        .env("HOME", fake_home.path())
+        .current_dir(project_dir.path())
+        .args(["lab", "doctor"])
+        .assert()
+        .stdout(predicate::str::contains(project_registry.display().to_string()))
+        .stdout(predicate::str::contains("never consulted"));
+
+    // The orphaned file itself was never touched by either read.
+    let raw = fs::read_to_string(&project_registry).unwrap();
+    assert!(raw.contains("\"orphan\""), "orphaned registry content must survive untouched: {raw}");
+}
+
 /// `dm lab doctor` with no registry exits non-zero + emits a warning
 /// with the three options for the operator.
 #[test]
