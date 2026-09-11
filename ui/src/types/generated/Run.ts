@@ -66,8 +66,22 @@ tracked: boolean,
  * (tracked or not) from its representative session, and for a
  * [`ghost_runs`] dispatch row from the row's OWN id (a ghost's `id`
  * already IS a session id — see that function's own `Run` literal).
- * Always `None` for a lab row: a lab run has no flow session backing
- * it to drill into at all.
+ * (#2511) Also populated for a lab row now, from
+ * `LabRunSummary::session_id` (that field's own doc, and the
+ * `session_id` resolution in `crates/darkmux-serve/src/lib.rs`, cover
+ * exactly which lab runs have one and from when — manifest-backed once
+ * finished, lifecycle-backed for the live window before that).
+ * `runDestination` (`ui/src/lenses/runs/format.ts`) only reads it for a
+ * lab row while `status == Running`: a finished/abandoned lab row
+ * still drills to `LabRunDetail` (the funnels/scores artifact is the
+ * richer destination once it exists), but a run with no terminal
+ * artifact yet has none of that to show, and this field's live session
+ * is the only thing left to drill into. Without this, the same
+ * #1982/#2511 fix that stops a live lab run's session from also
+ * surfacing as a duplicate `ghost_runs` row (see `known_session_ids`
+ * above) would leave that session with NO door in this view at all —
+ * the record-side fix and this display-side one have to land together
+ * or the duplicate-row fix regresses the only way to watch the run.
  *
  * **Why every mission carries this, not just untracked ones:** a
  * TRACKED mission never actually needs it — `runDestination`

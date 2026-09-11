@@ -212,7 +212,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // artifacts and meanwhile showed as an untracked DISPATCH), and a run
         // that ERRORS gets a terminal record instead of falling through to an
         // idle-time guess (#1930).
-        let lifecycle = lifecycle::RunLifecycle::start(
+        let mut lifecycle = lifecycle::RunLifecycle::start(
             &run_dir,
             &run_id,
             &opts.workload_id,
@@ -293,6 +293,13 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 &profile_name,
                 opts.config_path.as_deref(),
                 opts.loop_override.as_ref(),
+                // (#2511) The provider calls this at most once, right after
+                // minting its own dispatch session id — attaching it to the
+                // still-`Running` lifecycle record BEFORE the dispatch
+                // fires, so a live lab row is joinable to its own flow
+                // session for the run's whole dispatch phase, not only
+                // once `manifest.json` lands at the end.
+                &mut |sid: &str| lifecycle.set_session_id(sid),
             )
         }) {
             Ok(Ok(r)) => r,
@@ -1384,6 +1391,284 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("default_profile"));
+    }
+
+    /// (#2511) End-to-end wiring proof, with zero dispatch/docker/LMStudio
+    /// involvement: a stub provider (registered the same way
+    /// `workloads::registry`'s own test module registers one) reports a
+    /// session id via `on_session_id`, and `lab_run` must have wired that
+    /// callback all the way to `RunLifecycle::set_session_id` — so the
+    /// run's `lifecycle.json` carries it once the run finishes. This is the
+    /// one link `lifecycle_tests.rs` (the method itself) and
+    /// `darkmux-serve`'s `scan_lab_runs` tests (the read side) can't cover
+    /// on their own: the closure plumbing inside `lab_run` between the two.
+    #[test]
+    #[serial_test::serial]
+    fn lab_run_wires_the_providers_session_id_to_the_lifecycle_record() {
+        use crate::workloads::types::{
+            InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
+        };
+
+        struct StubProvider2511;
+        impl WorkloadProvider for StubProvider2511 {
+            fn id(&self) -> &'static str {
+                "stub-2511-session-join"
+            }
+            fn description(&self) -> &'static str {
+                "stub for #2511's end-to-end wiring proof"
+            }
+            fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn run(
+                &self,
+                _: &LoadedWorkload,
+                _: &Path,
+                _: &Path,
+                _: &darkmux_types::Profile,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+                on_session_id: &mut dyn FnMut(&str),
+            ) -> Result<RunResult> {
+                // Mirrors what `coding-task`/`prompt` do for real: mint,
+                // report, THEN would dispatch. No real dispatch here.
+                on_session_id("darkmux-stub-2511-session-join-test");
+                Ok(RunResult {
+                    ok: true,
+                    duration_ms: 1,
+                    payload_text: Some("stub".into()),
+                    trajectory_path: None,
+                    verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
+                    error: None,
+                })
+            }
+            fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {
+                Ok(InspectionReport::default())
+            }
+        }
+        // Registration is process-global and errors on a second call with
+        // the same id — harmless if some earlier run of this same test left
+        // it registered (the global registry never unregisters), so an
+        // `Err` here is ignored rather than unwrapped.
+        let _ = crate::workloads::registry::register(Box::new(StubProvider2511));
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("profiles.json");
+        fs::write(
+            &cfg,
+            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
+        )
+        .unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("workloads")).unwrap();
+        fs::write(
+            home.join("workloads").join("stub-2511-workload.json"),
+            r#"{"workload":{"id":"stub-2511-workload","provider":"stub-2511-session-join","prompt":"hi"}}"#,
+        )
+        .unwrap();
+        let _home_guard = HomeGuard::set(&home);
+
+        let outcomes = lab_run(RunOpts {
+            workload_id: "stub-2511-workload".into(),
+            profile_name: None,
+            runs: 1,
+            config_path: Some(cfg.to_str().unwrap().into()),
+            quiet: true,
+            loop_override: None,
+            inject_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        let rec = lifecycle::read(&outcomes[0].run_dir).expect("lifecycle record must exist");
+        assert_eq!(rec.status, lifecycle::LifecycleStatus::Complete);
+        assert_eq!(
+            rec.session_id.as_deref(),
+            Some("darkmux-stub-2511-session-join-test"),
+            "lab_run must wire the provider's on_session_id callback through to the \
+             lifecycle record: {rec:?}"
+        );
+    }
+
+    /// (#2511 review CONSIDER 4) The test above only reads the lifecycle
+    /// record AFTER `lab_run` has fully returned — it cannot tell "reported
+    /// before dispatching" from "reported only at the terminal write",
+    /// because its stub never dispatches at all. `coding_task.rs`/
+    /// `prompt.rs` call `on_session_id` BEFORE their real dispatch fires
+    /// (see `coding_task.rs`'s own `run()`), which is what makes a live
+    /// lab row joinable to its session for the run's WHOLE duration rather
+    /// than only its last instant — but nothing before this test would
+    /// have caught a regression that moved the call to AFTER dispatching:
+    /// every existing test, including the one above, would stay green,
+    /// because they only ever observe the record post-completion.
+    ///
+    /// This stub stands in for the real dispatch with a blocking wait
+    /// instead — mint, report, THEN block (simulating "the dispatch is
+    /// still in flight") — and the test reads `lifecycle.json` from disk
+    /// WHILE the stub is still blocked, on a separate thread. If the
+    /// report call were moved to after the block (mirroring "after
+    /// dispatch"), the mid-flight read below would time out with no
+    /// session id ever landing before completion.
+    #[test]
+    #[serial_test::serial]
+    fn lab_run_wires_the_session_id_before_the_simulated_dispatch_completes_not_after() {
+        use crate::workloads::types::{
+            InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
+        };
+        use std::sync::{Condvar, Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        // Process-global, matching the process-global provider registry
+        // this stub also lives in. Reset to "held" at the top of the test
+        // rather than relying on Drop, since a prior failed run of this
+        // same test could have left it released.
+        static GATE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
+        fn gate() -> &'static (Mutex<bool>, Condvar) {
+            GATE.get_or_init(|| (Mutex::new(false), Condvar::new()))
+        }
+        *gate().0.lock().unwrap() = false;
+
+        struct OrderingStubProvider2511;
+        impl WorkloadProvider for OrderingStubProvider2511 {
+            fn id(&self) -> &'static str {
+                "stub-2511-session-join-ordering"
+            }
+            fn description(&self) -> &'static str {
+                "stub for #2511's report-before-dispatch ordering proof"
+            }
+            fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn run(
+                &self,
+                _: &LoadedWorkload,
+                _: &Path,
+                _: &Path,
+                _: &darkmux_types::Profile,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+                on_session_id: &mut dyn FnMut(&str),
+            ) -> Result<RunResult> {
+                // Mirrors the REAL order in `coding_task.rs`/`prompt.rs`:
+                // mint + report, THEN dispatch. The block below stands in
+                // for the dispatch — real code would be calling into
+                // `dispatch_via_internal` at exactly this point.
+                on_session_id("darkmux-stub-2511-ordering-test");
+                let (lock, cvar) = gate();
+                let released = lock.lock().unwrap();
+                let (_released, timeout) =
+                    cvar.wait_timeout_while(released, Duration::from_secs(5), |r| !*r).unwrap();
+                assert!(!timeout.timed_out(), "test thread never released the ordering gate");
+                Ok(RunResult {
+                    ok: true,
+                    duration_ms: 1,
+                    payload_text: Some("stub".into()),
+                    trajectory_path: None,
+                    verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
+                    error: None,
+                })
+            }
+            fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {
+                Ok(InspectionReport::default())
+            }
+        }
+        let _ = crate::workloads::registry::register(Box::new(OrderingStubProvider2511));
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("profiles.json");
+        fs::write(
+            &cfg,
+            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
+        )
+        .unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("workloads")).unwrap();
+        let workload_id = "stub-2511-ordering-workload";
+        fs::write(
+            home.join("workloads").join(format!("{workload_id}.json")),
+            format!(
+                r#"{{"workload":{{"id":"{workload_id}","provider":"stub-2511-session-join-ordering","prompt":"hi"}}}}"#
+            ),
+        )
+        .unwrap();
+        let _home_guard = HomeGuard::set(&home);
+
+        // `HomeGuard` mutates a process-global env var, so the background
+        // thread below inherits it without needing its own guard — the two
+        // threads share one process environment either way.
+        let cfg_str = cfg.to_str().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            lab_run(RunOpts {
+                workload_id: workload_id.into(),
+                profile_name: None,
+                runs: 1,
+                config_path: Some(cfg_str),
+                quiet: true,
+                loop_override: None,
+                inject_context: None,
+            })
+        });
+
+        // Poll for the run directory (name carries a wall-clock second
+        // stamp this test doesn't control) rather than computing it, then
+        // poll for the session id landing on its lifecycle record — both
+        // races against the background thread, bounded so a genuine
+        // regression fails the test instead of hanging the suite.
+        let lab_dir = darkmux_types::config_access::lab_dir();
+        let prefix = format!("{workload_id}-fast-");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut run_dir = None;
+        while run_dir.is_none() && Instant::now() < deadline {
+            if let Ok(entries) = std::fs::read_dir(&lab_dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&prefix) && name.ends_with("-1") && e.path().join("lifecycle.json").is_file()
+                    {
+                        run_dir = Some(e.path());
+                        break;
+                    }
+                }
+            }
+            if run_dir.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let run_dir = run_dir.expect("run directory with a lifecycle record must appear");
+
+        let mid_flight_deadline = Instant::now() + Duration::from_secs(5);
+        let mut mid_flight = None;
+        while mid_flight.is_none() && Instant::now() < mid_flight_deadline {
+            if let Some(rec) = lifecycle::read(&run_dir) {
+                if rec.session_id.is_some() {
+                    mid_flight = Some(rec);
+                }
+            }
+            if mid_flight.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let mid_flight = mid_flight.expect(
+            "the session id must land on the lifecycle record WHILE the simulated dispatch is \
+             still blocked — a regression that reports it only at the terminal write would \
+             time out here instead",
+        );
+        assert_eq!(
+            mid_flight.status,
+            lifecycle::LifecycleStatus::Running,
+            "the record must still read Running at the moment the session id is observed: {mid_flight:?}"
+        );
+        assert_eq!(mid_flight.session_id.as_deref(), Some("darkmux-stub-2511-ordering-test"));
+
+        // Release the stub so it can finish and the background thread joins.
+        *gate().0.lock().unwrap() = true;
+        gate().1.notify_all();
+
+        let outcomes = handle.join().unwrap().unwrap();
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     }
 
     /// (#1004) `apply_inject_context` prepends the engagement-context in front

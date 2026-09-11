@@ -38,6 +38,24 @@
 //! staleness heuristic is for, and it stays — but it is now the backstop for a
 //! narrow, nameable case instead of the primary mechanism for every failure.
 //! "100% of exit paths" means 100% of the paths a process can observe.
+//!
+//! # Joining a live row to its own flow session (#2511)
+//!
+//! `start` writes the `running` bookend before the workload's provider has
+//! even been called, so it cannot carry a dispatch session id yet — nothing
+//! has minted one. A single-dispatch provider (`coding-task`, `prompt`)
+//! mints its session id partway through its own `run()`, immediately before
+//! dispatching, and reports it back via [`RunLifecycle::set_session_id`] at
+//! that exact moment — so the record on disk gains `session_id` while the
+//! run is still genuinely `Running`, not only once `manifest.json` is
+//! written at the end. That is what makes a live lab row joinable to its
+//! own flow session for a dedup/collapse consumer (`darkmux-serve::runs`)
+//! during the run's dispatch phase, not just after it finishes.
+//!
+//! A multi-dispatch provider (`tool-bench` fans out into many sessions, one
+//! per task × trial) has no single id to report and never calls
+//! `set_session_id` — `session_id` stays `None` for its whole run, which is
+//! the honest answer, not a fabricated representative id.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,7 +71,17 @@ pub const LIFECYCLE_FILE: &str = "lifecycle.json";
 /// lenient — an unknown status reads as [`LifecycleStatus::Unknown`] rather
 /// than failing the scan, matching the repo's lenient-on-read posture for
 /// every other on-disk shape.
-pub const LIFECYCLE_SCHEMA_VERSION: &str = "1.0";
+///
+/// `1.1` (#2511) — additive: [`LifecycleRecord::session_id`] appended.
+/// Older records simply lack the key and deserialize with `None` (`Option<T>`
+/// is absent-tolerant on read without a `#[serde(default)]`, same as
+/// `ended_at_ms`/`error` above); a pre-1.1 binary reading a 1.1 record
+/// silently ignores the new key. This is `LifecycleRecord`'s OWN schema,
+/// per-run-local and never written to a `FlowRecord` or the fleet flow
+/// stream — it has nothing to do with `FLOW_SCHEMA_VERSION`
+/// (`crates/darkmux-flow/src/schema.rs`), which versions a disjoint wire
+/// shape governed by the lab/fleet sink boundary.
+pub const LIFECYCLE_SCHEMA_VERSION: &str = "1.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +133,20 @@ pub struct LifecycleRecord {
     pub ended_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// (#2511) The dispatch session id the provider's own inner dispatch
+    /// used, once it exists. `None` at [`RunLifecycle::start`] time — the
+    /// provider hasn't minted one yet — and stays `None` for the run's
+    /// whole duration for a provider with no single governing dispatch
+    /// session (`tool-bench` fans out into many, one per task × trial; see
+    /// its own `run()` for why it never calls
+    /// [`RunLifecycle::set_session_id`]). Set via
+    /// [`RunLifecycle::set_session_id`] the moment a single-dispatch
+    /// provider (`coding-task`, `prompt`) mints its id — BEFORE the
+    /// dispatch fires, so a still-`Running` record is joinable to its own
+    /// flow session for the run's live window, not only after
+    /// `manifest.json` is written at the end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -158,6 +200,7 @@ impl RunLifecycle {
             status: LifecycleStatus::Running,
             ended_at_ms: None,
             error: None,
+            session_id: None,
         };
         let me = Self { path: run_dir.join(LIFECYCLE_FILE), record, finished: false };
         me.write().with_context(|| {
@@ -175,6 +218,59 @@ impl RunLifecycle {
         fs::write(&tmp, json.as_bytes())?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+
+    /// (#2511) Attach the dispatch session id once the provider mints it —
+    /// the record is still `Running` at this point, and stays so; only
+    /// `session_id` changes. This is what closes the join gap: before this
+    /// call, a live lab row has no key a flow-session consumer can match it
+    /// on; after it, the still-`Running` record on disk carries the exact
+    /// string the provider is about to (or already did) dispatch under.
+    ///
+    /// Best-effort like the terminal write below: a write failure here
+    /// degrades to the pre-#2511 gap (the id only becomes visible once
+    /// `manifest.json` is written at the run's end) rather than failing the
+    /// dispatch — this is observability, not correctness.
+    ///
+    /// (#2511 review CONSIDER 5) Enforces both halves of the trait's own
+    /// doc (`WorkloadProvider::run`'s `on_session_id` param: "Called AT
+    /// MOST ONCE"), rather than trusting every current and future caller to
+    /// honor it unchecked:
+    ///
+    /// - **An empty string is never a session id.** Assigning one would
+    ///   still satisfy every downstream `Option::is_some()` read (this
+    ///   struct's own `read`/scan consumers included) while joining to
+    ///   nothing — the same non-empty guard `runs.rs`'s session-id readers
+    ///   already apply is applied here at the write, so the empty case
+    ///   never reaches disk in the first place.
+    /// - **The first call wins.** A second call — a provider bug, or a
+    ///   future caller that doesn't honor "at most once" — is a debug-time
+    ///   assertion (loud in tests/dev, where the mistake belongs) and a
+    ///   silent no-op in release (keeping the first, already-claimed
+    ///   session rather than letting a later value overwrite something a
+    ///   flow session may already be joined to).
+    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        if session_id.is_empty() {
+            return;
+        }
+        debug_assert!(
+            self.record.session_id.is_none(),
+            "set_session_id called more than once on {} (already {:?}, now attempting {session_id:?}) \
+             — the trait's own doc says AT MOST ONCE",
+            self.path.display(),
+            self.record.session_id,
+        );
+        if self.record.session_id.is_some() {
+            return;
+        }
+        self.record.session_id = Some(session_id);
+        if let Err(e) = self.write() {
+            eprintln!(
+                "[lab] warn: could not attach the dispatch session id to {}: {e}",
+                self.path.display()
+            );
+        }
     }
 
     fn terminate(&mut self, status: LifecycleStatus, error: Option<String>) {

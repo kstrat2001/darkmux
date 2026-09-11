@@ -973,6 +973,13 @@ impl WorkloadProvider for ToolBenchProvider {
         profile_name: &str,
         config_path: Option<&str>,
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+        // (#2511) Deliberately never called. Tool-bench fans out into MANY
+        // dispatch sessions (one per task × trial, each with its own
+        // session id below) — there is no single one that governs "this
+        // run's own dispatch", so reporting any one of them here would be a
+        // fabricated representative id, not the honest answer. See
+        // `RunLifecycle::session_id`'s doc for the contract this upholds.
+        _on_session_id: &mut dyn FnMut(&str),
     ) -> Result<RunResult> {
         let wl = &loaded.manifest.workload;
         // (Also consider, second-round frontier review) `trials` still
@@ -2062,7 +2069,16 @@ not json — tolerated
             mock_ok_result()
         }));
         let profile = Profile::default();
-        provider.run(&loaded, run_dir.path(), sandbox_dir.path(), &profile, "default", None, None)?;
+        provider.run(
+            &loaded,
+            run_dir.path(),
+            sandbox_dir.path(),
+            &profile,
+            "default",
+            None,
+            None,
+            &mut |_sid: &str| {},
+        )?;
         let result = seen.lock().unwrap().clone();
         Ok((result, run_dir))
     }

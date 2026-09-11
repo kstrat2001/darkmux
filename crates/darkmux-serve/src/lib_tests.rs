@@ -3827,13 +3827,20 @@
         );
     }
 
-    /// (#1982) The honest-degradation case that actually happens in
-    /// production: `manifest.json` is written at run END, so for a run's
-    /// whole DURATION the dir holds a `lifecycle.json` and no manifest.
-    /// Nothing may be claimed from that — in particular the extraction must
-    /// never fall back to the run id (or any other guessable string), which
-    /// would claim a session this run never dispatched under and could
-    /// swallow an unrelated row.
+    /// (#1982, narrowed by #2511) `manifest.json` is written at run END, so
+    /// for a run's whole DURATION the dir holds a `lifecycle.json` and no
+    /// manifest — but that no longer means nothing is claimable: #2511
+    /// added a lifecycle-record fallback (`RunLifecycle::set_session_id`,
+    /// read in `session_id` resolution in `crates/darkmux-serve/src/
+    /// lib.rs`) for exactly this window. This test still resolves `None`
+    /// because `write_lab_run_with_manifest_bytes`'s fixture `lifecycle.json`
+    /// deliberately carries no `session_id` field either (the shape of the
+    /// pre-dispatch instant, or a `tool-bench` run, which never mints one —
+    /// see `lifecycle_tests.rs`'s own `a_run_that_never_mints_a_session_id_
+    /// never_gains_one`). What still holds regardless of source: the
+    /// extraction must never fall back to the run id (or any other
+    /// guessable string), which would claim a session this run never
+    /// dispatched under and could swallow an unrelated row.
     #[test]
     fn scan_lab_runs_session_id_is_none_when_the_manifest_has_not_been_written_yet() {
         let tmp = TempDir::new().unwrap();
@@ -3842,7 +3849,8 @@
         assert_eq!(runs.len(), 1, "the run is still DISCOVERED via lifecycle.json: {runs:?}");
         assert_eq!(
             runs[0].session_id, None,
-            "no manifest means nothing to claim — never a fallback to the run id: {runs:?}"
+            "neither the manifest nor this fixture's lifecycle record carries a session_id — \
+             never a fallback to the run id: {runs:?}"
         );
     }
 
@@ -3877,6 +3885,112 @@
         let runs = scan_lab_runs(tmp.path());
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].session_id, None, "{runs:?}");
+    }
+
+    /// (#2511) A live-shaped run dir: `lifecycle.json` optionally carrying
+    /// its own `session_id` (the field `RunLifecycle::set_session_id`
+    /// writes mid-run), plus whatever `manifest.json` bytes the caller
+    /// wants (`None` = still executing, matching the real shape).
+    fn write_lab_run_with_lifecycle_session_id(
+        dir: &StdPath,
+        run_id: &str,
+        lifecycle_session_id: Option<&str>,
+        manifest: Option<&str>,
+    ) {
+        fs::create_dir_all(dir).unwrap();
+        let mut lifecycle = serde_json::json!({
+            "schema_version": "1.1",
+            "run_id": run_id,
+            "kind": "lab",
+            "workload": "demo-workload",
+            "profile": "default",
+            "started_at_ms": 1_700_000_000_000u64,
+            "status": "running",
+        });
+        if let Some(sid) = lifecycle_session_id {
+            lifecycle["session_id"] = serde_json::Value::String(sid.to_string());
+        }
+        fs::write(
+            dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+            serde_json::to_string(&lifecycle).unwrap(),
+        )
+        .unwrap();
+        if let Some(bytes) = manifest {
+            fs::write(dir.join("manifest.json"), bytes).unwrap();
+        }
+    }
+
+    /// (#2511) The actual join this issue exists to make possible: while a
+    /// run is still LIVE (no `manifest.json` yet), the session id a
+    /// single-dispatch provider already reported to `lifecycle.json`
+    /// mid-run must surface through `scan_lab_runs` — this is what lets a
+    /// live lab row be claimed by `runs::build_runs`'s dedup, not only a
+    /// finished one.
+    #[test]
+    fn scan_lab_runs_session_id_is_read_from_lifecycle_before_the_manifest_exists() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(
+            &tmp.path().join("run1"),
+            "run1",
+            Some("darkmux-coding-demo-1787676109556"),
+            None,
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id.as_deref(),
+            Some("darkmux-coding-demo-1787676109556"),
+            "a live run's lifecycle-reported session id must surface before the run finishes"
+        );
+    }
+
+    /// The inverted case, required alongside the positive one: a run whose
+    /// provider has not (yet, or ever) minted a session id must NOT gain a
+    /// fabricated one — `lifecycle.json` with no `session_id` key is
+    /// exactly `tool-bench`'s real shape (and any run's shape before its
+    /// provider mints one), and must read back as `None`, never a guess.
+    #[test]
+    fn scan_lab_runs_session_id_is_none_when_lifecycle_never_minted_one() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, None);
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id, None,
+            "no mint means nothing to claim — never a fallback to the run id: {runs:?}"
+        );
+    }
+
+    /// Once `manifest.json` lands at run end, it wins over the lifecycle
+    /// record. Scoped deliberately to `coding-task`/`prompt`, the only two
+    /// providers that ever populate BOTH: for them the two are
+    /// byte-identical (one mint, reported to the lifecycle record before
+    /// dispatching, then carried into the manifest verbatim at the end), so
+    /// "manifest wins" is a no-op in practice and the identity a consumer
+    /// sees never actually changes mid-run. This is NOT a general "the
+    /// manifest is always the authoritative session" rule — `tool-bench`'s
+    /// manifest carries a `session_id` too, but one minted FRESH at
+    /// manifest-write time (see its own `run()`), never reported to
+    /// `set_session_id` and never anything the run actually dispatched
+    /// under; the two never coexist for tool-bench today only because it
+    /// never calls `set_session_id` at all, not because this precedence
+    /// would resolve correctly if it did.
+    #[test]
+    fn scan_lab_runs_session_id_prefers_manifest_over_lifecycle_when_both_exist() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(
+            &tmp.path().join("run1"),
+            "run1",
+            Some("darkmux-coding-demo-mid-run"),
+            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-final"}"#),
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id.as_deref(),
+            Some("darkmux-coding-demo-final"),
+            "the finished-run manifest is authoritative once it exists"
+        );
     }
 
     #[test]

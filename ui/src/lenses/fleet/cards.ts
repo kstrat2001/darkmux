@@ -290,14 +290,17 @@ export function buildFleetCard(
   // than the systematic double-count it replaces, and `active` below is
   // unaffected either way (a live lab run always lights the card).
   //
-  // The durable fix is a real join key, and it is NOT available today: the
-  // lab dispatch's session id is recorded only in the run manifest, which
-  // `providers/coding_task.rs` writes AFTER the dispatch returns — absent
-  // for exactly the live window this count serves. Carrying it on the
-  // start-time `lifecycle.json` (and out through `Run.session_id`, whose
-  // own doc currently asserts a lab row has no flow session at all) would
-  // let this collapse exactly, the way `topLevelRunSessionIds` collapses a
-  // mission's seats. That is a producer-side change, tracked separately.
+  // The durable fix is a real join key, and (#2511) it now EXISTS: the lab
+  // dispatch's session id is carried on the start-time `lifecycle.json` as
+  // soon as a single-dispatch provider mints it — no longer recorded only
+  // in the run manifest `providers/coding_task.rs` writes AFTER the
+  // dispatch returns — and `Run.session_id` is populated for a lab row too
+  // (its own doc covers exactly when). This card has not been updated to
+  // USE that join yet — `runningSessionIds`/`labRunning` still merge by
+  // `Math.max` rather than collapsing on the shared session id the way
+  // `topLevelRunSessionIds` collapses a mission's seats — so the arithmetic
+  // above is unchanged for now; that collapse is a follow-up to this
+  // card specifically, not a producer-side gap any more.
   const runsCount = liveMode ? Math.max(runningSessionIds.length, labRunning) : all.length;
   return {
     uid: m,

@@ -299,6 +299,16 @@ pub(crate) trait WorkloadProvider: Send + Sync {
         // from_profile` derived (the loop-variation axis); `None` (the
         // `lab run` path) leaves the profile's compaction config intact.
         loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+        // (#2511) Called AT MOST ONCE, immediately after minting the
+        // dispatch session id and BEFORE dispatching — the lab harness
+        // (`lab::run`) wires this to `RunLifecycle::set_session_id`, so the
+        // run's still-`Running` lifecycle record becomes joinable to its
+        // own flow session while the dispatch is still live, not only once
+        // `manifest.json` lands at the end. A provider with no single
+        // governing dispatch session (`tool-bench` fans out into many, one
+        // per task × trial) never calls it — `None` stays the honest
+        // answer for that case, not a fabricated representative id.
+        on_session_id: &mut dyn FnMut(&str),
     ) -> Result<RunResult>;
     fn inspect(&self, loaded: &LoadedWorkload, run_dir: &Path) -> Result<InspectionReport>;
     fn teardown(&self, _run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {
