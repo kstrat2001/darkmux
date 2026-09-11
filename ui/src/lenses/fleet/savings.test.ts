@@ -331,6 +331,166 @@ describe("tokensOffMeter", () => {
     expect(t.unknownRuns).toBe(0);
   });
 
+  // (#1856, mechanism corrected in the fix-pass review) A session id can
+  // legitimately be shared by TWO SEPARATE DISPATCHES: `mission_run(
+  // mission_id, phase_id)` (`crates/darkmux-types/src/session_id.rs`) is
+  // DETERMINISTIC, so re-launching or retrying the same mission phase
+  // inside the viewer's 24h window reuses the identical session id, and
+  // each launch's own coder dispatch restarts its turn counter at 1. (An
+  // earlier version of this comment attributed the spanning shape to a
+  // single launch's worktree/coder/verify steps all dispatching under one
+  // session id — that's wrong on inspection: the worktree step makes no
+  // model dispatch at all (`SeatClaim::NoModel`), and the verify step
+  // mints its OWN `phase-review-<secs>` session id
+  // (`phase_review_output_at`, `src/phase_cli.rs`) rather than reusing the
+  // shared one. Only the coder step ever dispatches under the shared
+  // `mission_run` id — so within ONE launch there is exactly one
+  // turn-bearing dispatch, never a spanning shape. The restart only
+  // appears across separate launches of the same phase.)
+  //
+  // Sorting by `turn_seq` alone (the pre-fix behavior) interleaves the two
+  // launches' turns — turn_seq=1 from the later launch sorts adjacent to
+  // turn_seq=1 from the earlier one even though they are 5 minutes apart —
+  // and the overlap estimator then compares prompt sizes across a launch
+  // boundary where no re-read relationship exists. Sorting by `ts` instead
+  // groups each launch's turns together, so only the ONE genuine
+  // launch-boundary pair is ever compared.
+  //
+  // Hand-computed (see PR description for the arithmetic): sorting by ts
+  // yields prompt sequence [1000,50,60, 2000,80,90] → reread=320,
+  // fresh=2960. The pre-fix turn_seq sort ties on turn_seq 1/2/3 across
+  // the two launches and (stable sort, insertion order breaks the tie)
+  // yields [1000,2000,50,80,60,90] → reread=1220, fresh=2060 — 900 tokens
+  // misclassified in this deliberately small repro of the corpus-scale
+  // 663k figure from the issue.
+  it("(#1856) a session id shared by two separate dispatches (turn_seq restarts on re-launch) sorts by ts, not turn_seq — reread stays confined within each dispatch", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "spanning", action: "dispatch.start", handle: "coder" }),
+      // Launch 1's coder dispatch: turn_seq 1..3, ts T..T+2s.
+      tokenRec("spanning", 1, 1000, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("spanning", 2, 50, 0, "2026-08-08T00:00:01Z"),
+      tokenRec("spanning", 3, 60, 0, "2026-08-08T00:00:02Z"),
+      // Launch 2's coder dispatch (the phase re-launched, same deterministic
+      // session id): turn_seq RESTARTS at 1, ts 5 minutes later.
+      tokenRec("spanning", 1, 2000, 0, "2026-08-08T00:05:00Z"),
+      tokenRec("spanning", 2, 80, 0, "2026-08-08T00:05:01Z"),
+      tokenRec("spanning", 3, 90, 0, "2026-08-08T00:05:02Z"),
+      rec({ session_id: "spanning", action: "dispatch.complete", payload: { total_tokens: 3280 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.reread).toBe(320);
+    expect(t.fresh).toBe(2960);
+    expect(t.reread + t.fresh).toBe(3280);
+  });
+
+  // (#1856 inverted case, strengthened in the fix-pass review — CONSIDER 5)
+  // An ORDINARY session — one dispatch, turn_seq monotonic AND ts monotonic
+  // — must classify identically under the ts-first sort as it always did.
+  // A re-sort that fixes the spanning case but reclassifies ordinary
+  // sessions would be worse than the bug it fixes.
+  //
+  // The ORIGINAL version of this test pushed its records into `data` in
+  // ts/turn_seq order — so ANY comparator that happens to leave an
+  // already-sorted array alone (including a no-op "don't sort at all" bug)
+  // passed it too, proving nothing about the comparator specifically.
+  // Pushed here out of insertion order instead (turn 2, then turn 1, then
+  // turn 3) with prompt sizes chosen so insertion order and ts order
+  // produce DIFFERENT reread/fresh splits — a no-sort or insertion-order-
+  // preserving bug now fails this test, while the real ts-first sort
+  // still produces the pre-fix-equivalent numbers.
+  it("(#1856, inverted) an ordinary single-dispatch session with monotonic turn_seq AND ts is unaffected by the ts-first sort", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "ordinary", action: "dispatch.start", handle: "coder" }),
+      // Insertion order (turn 2, turn 1, turn 3) deliberately disagrees
+      // with both ts order and turn_seq order (both of which agree with
+      // each other: turn1@:00 → turn2@:05 → turn3@:10).
+      tokenRec("ordinary", 2, 100, 0, "2026-08-08T00:00:05Z"),
+      tokenRec("ordinary", 1, 500, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("ordinary", 3, 300, 0, "2026-08-08T00:00:10Z"),
+      rec({ session_id: "ordinary", action: "dispatch.complete", payload: { total_tokens: 900 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // Correct ts-ordered sequence is [500,100,300] (turn1, turn2, turn3):
+    // rr = min(500,100) + min(100,300) = 100 + 100 = 200; fresh = 900-200=700.
+    // (Preserving the wrong insertion order [100,500,300] would instead
+    // give rr = min(100,500)+min(500,300) = 100+300 = 400, fresh = 500 —
+    // a different, wrong answer this fixture now catches.)
+    expect(t.reread).toBe(200);
+    expect(t.fresh).toBe(700);
+  });
+
+  // (MUST FIX 2, #1856 fix-pass) Total-order proof. An earlier version of
+  // the comparator branched per-pair ("if BOTH sides parse, compare by ts;
+  // else fall to turn_seq") and was provably intransitive: with a
+  // well-timed turn A, a corrupt-timestamp turn B, and a well-timed-but-
+  // EARLIER turn C, that shape yielded A<B, B<C, AND A>C simultaneously —
+  // three different sorted outputs depending on incidental input order
+  // (`reread` observed swinging between 20 and 1010 purely from
+  // permutation). The current comparator resolves each side to a number
+  // BEFORE branching (an unparseable `ts` maps to `+Infinity`, sorting
+  // last), which restores a real total order: EVERY permutation of these
+  // three turns must sort into the exact same order (C, A, B) and produce
+  // the exact same fresh/reread split.
+  it("(MUST FIX 2, #1856 fix-pass) all six permutations of a well-timed/corrupt-timestamp/earlier-well-timed triple sort identically", () => {
+    // A: well-timed, later. B: corrupt ts. C: well-timed, earlier.
+    const A = () => tokenRec("totalorder", 1, 2000, 0, "2026-08-08T00:05:00Z");
+    const B = () => tokenRec("totalorder", 5, 10, 0, "not-a-timestamp");
+    const C = () => tokenRec("totalorder", 9, 1000, 0, "2026-08-08T00:00:00Z");
+    const bookend = () =>
+      rec({ session_id: "totalorder", action: "dispatch.complete", payload: { total_tokens: 3010 } });
+    const start = () => rec({ session_id: "totalorder", action: "dispatch.start", handle: "coder" });
+
+    const permutations: Record<string, () => FlowRecord[]> = {
+      ABC: () => [A(), B(), C()],
+      ACB: () => [A(), C(), B()],
+      BAC: () => [B(), A(), C()],
+      BCA: () => [B(), C(), A()],
+      CAB: () => [C(), A(), B()],
+      CBA: () => [C(), B(), A()],
+    };
+
+    // Correct total order is C, A, B (B's unparseable ts pushes it last,
+    // regardless of its turn_seq): prompt sequence [1000, 2000, 10] →
+    // rr = min(1000,2000) + min(2000,10) = 1000 + 10 = 1010;
+    // fresh = 3010 - 1010 = 2000.
+    for (const [label, build] of Object.entries(permutations)) {
+      const data: FlowRecord[] = [start(), ...build(), bookend()];
+      const t = tokensOffMeter(data);
+      expect(t.reread, `permutation ${label}`).toBe(1010);
+      expect(t.fresh, `permutation ${label}`).toBe(2000);
+    }
+  });
+
+  // (#1856 tie case) Equal timestamps are exactly where a sort changes
+  // behavior unpredictably. `ts` is second-precision (`ts_utc_now()`), so a
+  // same-second tie is POSSIBLE in principle — measured across both parity
+  // corpora (731 adjacent same-session token-telemetry pairs, fix-pass
+  // review), same-second adjacent turns are ZERO in practice, not common.
+  // The tiebreak below is a defensive floor for the case, not a response to
+  // an observed one. Records are pushed into `data` OUT of turn_seq order
+  // (turn_seq=2's record precedes turn_seq=1's) to prove the tiebreak reads
+  // `turn_seq`, not the records' incidental array/insertion order — a naive
+  // `ts`-only sort with no tiebreak would silently preserve the (wrong)
+  // insertion order here instead.
+  it("(#1856 tie case) records sharing one ts tiebreak on turn_seq, not on array insertion order", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "tied", action: "dispatch.start", handle: "coder" }),
+      // Pushed turn_seq=2 BEFORE turn_seq=1 — insertion order disagrees
+      // with turn_seq order on purpose.
+      tokenRec("tied", 2, 999, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("tied", 1, 10, 0, "2026-08-08T00:00:00Z"),
+      tokenRec("tied", 3, 500, 0, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "tied", action: "dispatch.complete", payload: { total_tokens: 1509 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // Correct turn_seq-ordered sequence is [10,999,500]:
+    // rr = min(10,999) + min(999,500) = 10 + 500 = 510; fresh = 1509-510=999.
+    // (Preserving the wrong insertion order [999,10,500] would instead give
+    // rr=20, fresh=1489 — see the PR description's arithmetic.)
+    expect(t.reread).toBe(510);
+    expect(t.fresh).toBe(999);
+  });
+
   it("returns all-zero on an empty window", () => {
     const t = tokensOffMeter([]);
     expect(t).toEqual({

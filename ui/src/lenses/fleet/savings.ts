@@ -1,4 +1,4 @@
-import { isDispatchStart, isDispatchComplete } from "../../lib/flow";
+import { isDispatchStart, isDispatchComplete, T } from "../../lib/flow";
 /**
  * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
  * savings hero's summing logic: tokens kept off the (frontier) meter, split
@@ -71,6 +71,16 @@ interface TokenPayload {
   remote_tokens?: number;
   turn_seq?: number;
   endpoint?: string;
+}
+
+/** A `sess`-grouped turn, carrying the record's own `ts` alongside its
+ * payload — needed to sort turns chronologically (#1856) rather than by
+ * `turn_seq` alone, which restarts at 1 on every dispatch — including a
+ * RE-LAUNCH of the same mission phase under the same deterministic
+ * `mission_run` session id (see the sort comment below for the corrected
+ * mechanism). */
+interface SessTurn extends TokenPayload {
+  ts: string;
 }
 
 export interface TokensOffMeter {
@@ -172,7 +182,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   let completion = 0;
   let cloud = 0;
   let unknown = 0;
-  const sess = new Map<string, TokenPayload[]>();
+  const sess = new Map<string, SessTurn[]>();
 
   for (const r of data) {
     if (r.category === "telemetry" && r.source === "tokens") {
@@ -190,7 +200,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       // decomposition below). session_id is the norm; this is defensive.
       const k = r.session_id || `ts:${r.ts}:${r.handle || ""}:${r.machine_uid || ""}`;
       if (!sess.has(k)) sess.set(k, []);
-      sess.get(k)!.push(p);
+      sess.get(k)!.push({ ...p, ts: r.ts });
     }
   }
 
@@ -213,7 +223,70 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     else if (!localSids.has(k)) unknownRuns++;
     const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
     if (recs.every((p) => p.turn_seq != null)) {
-      const turns = recs.slice().sort((a, b) => (a.turn_seq as number) - (b.turn_seq as number));
+      // (#1856) Sort by TIME, turn_seq only as a tiebreak — not the reverse.
+      // `mission_run(mission_id, phase_id)` mints a DETERMINISTIC session id
+      // (`crates/darkmux-types/src/session_id.rs`) — the same phase
+      // re-launched or retried inside the viewer's 24h window reuses the
+      // identical session id, and each launch's own coder dispatch restarts
+      // its turn counter at 1. Sorting by `turn_seq` alone interleaves
+      // chronologically unrelated turns from different launches: turn_seq=1
+      // from a later launch sorts next to turn_seq=1 from an earlier one
+      // even though they may be minutes (or longer) apart, and the overlap
+      // estimator below then compares prompt sizes across a launch boundary
+      // where no re-read relationship exists. Sorting by `ts` groups each
+      // launch's turns together (only the ONE true launch-boundary pair is
+      // ever compared, not every same-turn_seq pair), matching what
+      // actually happened.
+      //
+      // (MUST FIX 2, #1856 fix-pass) The comparator below resolves BOTH
+      // sides to a number BEFORE branching — never mixes a ts-comparison on
+      // one pair with a turn_seq-comparison on another, which is what makes
+      // this a genuine total order. An earlier version of this comparator
+      // branched per-pair ("if both sides parse, compare by ts; else fall
+      // to turn_seq") and was provably intransitive: with a well-timed A, a
+      // corrupt-timestamp B, and a well-timed-but-earlier C, that shape
+      // produced A<B, B<C, and A>C simultaneously — three different sorted
+      // outputs depending on incidental input order. Mapping an unparseable
+      // `ts` to `+Infinity` up front (sorting those turns LAST, never used
+      // to decide an ordering relative to a well-timed turn by anything
+      // other than "is it well-timed") restores a real total order: turns
+      // compare on `(resolvedTs, turn_seq)` lexicographically, always.
+      //
+      // `ts` is second-precision (`ts_utc_now()`), so a same-`ts` tie is
+      // POSSIBLE in principle and turn_seq is the correct tiebreak for it —
+      // but measured across both parity corpora (731 adjacent same-session
+      // token-telemetry pairs, `tests/parity/corpus/flow-{today,yesterday}.json`
+      // + `docs/demo/demo-flow.jsonl`), same-second adjacent turns are ZERO,
+      // not common. The tiebreak stays as a defensive floor (and as the
+      // resolution for the corrupt-timestamp case above), not because ties
+      // are expected in practice.
+      //
+      // (Known-narrower alternative, not adopted here — tracked as
+      // #2665) Grouping turns by `session_id` PLUS `payload.step_id`
+      // (stamped on every per-event flow record a graph-bound dispatch
+      // emits, `crates/darkmux-crew/src/dispatch_internal.rs`'s
+      // `TailerState::step_id` doc) would be exact and immune to clock
+      // resolution for the worktree/coder/verify-in-one-launch shape —
+      // but it does NOT disambiguate two SEPARATE launches of the SAME
+      // step (the actual mechanism above): both stamp the identical
+      // `(session_id, step_id)` pair, so grouping alone can't tell them
+      // apart either. Adopting it would also mean changing the OUTER
+      // `sess` grouping key that `runs`/`cloudRuns`/`unknownRuns` are
+      // derived from too — the exact same shape of problem #2659 already
+      // owns. Filed as #2665 rather than folded in here.
+      const turns = recs
+        .slice()
+        .sort((a, b) => {
+          const ta = T(a.ts);
+          const tb = T(b.ts);
+          const na = Number.isNaN(ta) ? Infinity : ta;
+          const nb = Number.isNaN(tb) ? Infinity : tb;
+          if (na !== nb) return na - nb;
+          // A non-numeric `turn_seq` reaching this point is a pre-existing,
+          // unrelated gap (this branch only runs turn_seq!=null records —
+          // see the `recs.every` guard above); not addressed here.
+          return (a.turn_seq as number) - (b.turn_seq as number);
+        });
       let rr = 0;
       let prev: number | null = null;
       for (const p of turns) {

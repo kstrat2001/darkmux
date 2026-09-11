@@ -19,7 +19,7 @@ fleet
 
 === stage ===
 TOKENS · LAST 24H
-17,498
+20,778
 LOCAL TOKENS
 396,926
 CLOUD TOKENS
@@ -27,15 +27,15 @@ CLOUD TOKENS
 UNATTRIBUTED
 93k
 GENERATED
-16k
+19k
 FRESH INPUT
-0
+320
 RE-READ
 308k
 UNCLASSIFIED
-17
+18
 DISPATCHES
-Orchestrator note: 13 dispatches local + 3 via cloud. The hybrid loop is humming, keep it up.
+Orchestrator note: 14 dispatches local + 3 via cloud. The hybrid loop is humming, keep it up.
 MacBook-Pro
 Apple M5 Max · 128 GB
 idle
