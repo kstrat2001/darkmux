@@ -284,6 +284,33 @@ function RunsUnreadableNotice({ unreadable, message }: { unreadable: boolean; me
   );
 }
 
+/**
+ * (#1855 follow-up, CONSIDER 4) `GET /fleet/roster` failed to PARSE (the
+ * file exists but is corrupt — an operator hand-edit gone wrong). Before
+ * this, `useFleetRoster` dropped the error entirely and every consumer saw
+ * exactly what a genuinely-empty roster looks like — every previously-
+ * visible rostered card silently vanishing again, which is the precise
+ * symptom #1855 exists to fix, now caused by this fix's own read path.
+ *
+ * Sibling of `RunsUnreadableNotice` above (same `.fleetcov` shape, same
+ * `role="status"` — informational, never an interruption), worded to share
+ * no phrase with either sibling notice so a reader — or a test's
+ * `getByText` — can tell which source failed when more than one fires at
+ * once. `message` is always the SERVER's fixed literal
+ * (`ROSTER_READ_FAILED`), never the raw parse error — that crate's own doc
+ * says why (the parse error embeds this roster file's local path, which
+ * carries the operator's username on macOS).
+ */
+function RosterUnreadableNotice({ error }: { error: string | null }) {
+  if (!error) return null;
+  return (
+    <div className="fleetcov" data-state="roster-unreadable" role="status">
+      <span className="fleetcov__icon">⚠</span>
+      <span>Fleet roster unreadable ({error}) — a rostered-but-silent machine may be missing from the cards below.</span>
+    </div>
+  );
+}
+
 /** (#1800 P2) `records`/`tMax`/`tMin` OPTIONAL so playback can render this
  * same hero over a historical day. Omitted = the live rolling window, exactly
  * as before, so every existing caller is unchanged.
@@ -396,7 +423,12 @@ export function FleetLens({
   // See `rosterOnlyEntries`'s own doc for how this is reconciled with the
   // presence/flow-derived uids so a machine that's already accounted for
   // (beating, or with flow history under this name) is never duplicated.
-  const roster = useFleetRoster(livePolling);
+  //
+  // (#1855 follow-up, CONSIDER 4) `error` renders via `RosterUnreadableNotice`
+  // below — a corrupt roster file used to read as an empty one with no
+  // signal anywhere that the read had failed, silently reproducing the
+  // exact "machine vanishes" symptom #1855 exists to fix.
+  const { machines: roster, error: rosterError } = useFleetRoster(livePolling);
   // (#2067) A static build cannot poll presence, so its cards' hardware line
   // comes from the committed fleet snapshot instead — spec lookup ONLY;
   // presence at the playhead still derives from the records.
@@ -511,11 +543,16 @@ export function FleetLens({
   );
   const uids = useMemo(() => machineUids(flowWindow.data, liveMachines), [flowWindow.data, liveMachines]);
   // (#1855) The roster entries with NO known identity anywhere in this
-  // window — not beating, no flow history under this name either. See
-  // `rosterOnlyEntries`'s own doc.
+  // window — not beating, no flow history under this name either, not this
+  // machine's own `/machine/specs` identity, not a normalized near-miss of
+  // any of those. See `rosterOnlyEntries`'s own doc (F1/F2 in its comment)
+  // for why `specs` has to be threaded through here: it is the one
+  // confirmed-local identity that survives a quiet flow window with no
+  // beats, which is exactly the state a Redis-off self-machine card can be
+  // rendered in.
   const rosterOnly = useMemo(
-    () => rosterOnlyEntries(flowWindow.data, liveMachines, roster),
-    [flowWindow.data, liveMachines, roster],
+    () => rosterOnlyEntries(flowWindow.data, liveMachines, roster, specs),
+    [flowWindow.data, liveMachines, roster, specs],
   );
 
   const cards = useMemo(
@@ -591,6 +628,7 @@ export function FleetLens({
       <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={scopedData} nowMs={nowMs} />
       <FleetCoverageNotice historical={historical} />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
+      <RosterUnreadableNotice error={rosterError} />
       <div className="fleet">
         {cards.map((card) => (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`

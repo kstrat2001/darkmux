@@ -19,6 +19,23 @@ function rosterEntry(overrides: Partial<RosterMachineEntry> & Pick<RosterMachine
   return { address: "100.64.1.2:8765", added_unix_ms: 1000, ...overrides };
 }
 
+function machineSpecs(overrides: Partial<MachineSpecs> & Pick<MachineSpecs, "machine_id">): MachineSpecs {
+  return {
+    darkmux_version: "3.7.1",
+    flow_schema_version: "1.18.0",
+    os: "macos",
+    ram_total_bytes: null,
+    ram_free_for_ai_bytes: null,
+    cpu_brand: null,
+    loaded_models: [],
+    lms_unreachable: false,
+    utility_model: null,
+    redis_url_redacted: null,
+    generated_at_ms: 0,
+    ...overrides,
+  };
+}
+
 /** The playhead. `/next` has no scrubber, so it is always `tMax`; a value
  *  safely after every fixture timestamp stands in for that. */
 const T_MAX = Date.parse("2026-08-09T00:00:00.000Z");
@@ -424,5 +441,66 @@ describe("rosterOnlyEntries", () => {
   it("an empty roster reports nothing, on an otherwise busy fleet", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "studio" })];
     expect(rosterOnlyEntries(data, new Map(), [])).toEqual([]);
+  });
+
+  // (#1855 follow-up, F1) The self-machine phantom: presence self-disables
+  // when Redis is unset, so a quiet window can carry NO flow record and NO
+  // beat for the daemon serving the page, even though its own roster entry
+  // exists (`darkmux-add-machine`'s own step 7). Without consulting
+  // `/machine/specs` this used to fall straight through `knownNames`,
+  // reporting the daemon's own roster entry as a phantom "offline" card —
+  // served by the very machine it calls offline.
+  it("excludes a roster entry matching THIS machine's own /machine/specs identity, even with zero flow/presence history", () => {
+    const roster = [rosterEntry({ id: "studio" })];
+    const specs = machineSpecs({ machine_id: "studio" });
+    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual([]);
+  });
+
+  // The inverted case pinned again at THIS call site (not just `specOf`'s):
+  // a `specs.machine_id` that doesn't match the roster entry must not
+  // suppress it — this is a targeted self-check, not a blanket "specs
+  // present, trust everything" escape hatch.
+  it("does NOT exclude a roster entry that specs.machine_id doesn't match", () => {
+    const roster = [rosterEntry({ id: "studio" })];
+    const specs = machineSpecs({ machine_id: "some-other-machine" });
+    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual(roster);
+  });
+
+  // No specs at all (the default, pre-existing call sites, or a static
+  // build) behaves exactly as before — `specs` is optional and additive.
+  it("with no specs argument, behaves exactly as before (backward compatible)", () => {
+    const roster = [rosterEntry({ id: "studio" })];
+    expect(rosterOnlyEntries([], new Map(), roster)).toEqual(roster);
+  });
+
+  // (#1855 follow-up, F2) The mismatched-name duplicate: a live peer beating
+  // under one alias and rostered under a near-miss of it (case, stray
+  // whitespace, or the mDNS `.local` suffix) used to render BOTH a live
+  // card and a phantom "offline" roster-only card for the same machine.
+  it("excludes a roster entry that differs from a live beat only by case", () => {
+    const roster = [rosterEntry({ id: "Studio" })];
+    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
+  });
+
+  it("excludes a roster entry that differs from flow history only by the mDNS .local suffix", () => {
+    const roster = [rosterEntry({ id: "MacBook-Pro" })];
+    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" })];
+    expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
+  });
+
+  it("excludes a roster entry with stray leading/trailing whitespace around an otherwise-matching name", () => {
+    const roster = [rosterEntry({ id: "  studio  " })];
+    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
+  });
+
+  // The inverted case for F2: a roster id sharing no normalized substring
+  // with any known alias is still reported — widening the match must not
+  // become "everything on the roster is presumed accounted for."
+  it("still reports a roster entry whose name shares nothing with any known alias", () => {
+    const roster = [rosterEntry({ id: "mini-1" })];
+    const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
   });
 });

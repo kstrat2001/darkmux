@@ -8,6 +8,7 @@ import { FleetLens } from "./FleetLens";
 import type { FlowRecord } from "../../types/handwritten";
 import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
 import { closeOpenModal } from "../../lib/dialogManager";
+import { queryKeys } from "../../lib/queryKeys";
 
 // (#1913) Every fixture below anchors its records at "T10:00" of `today`
 // (`todayUTC()`), and liveness (`flowLiveSessions`, `FLOW_LIVE_TTL_MS`) is
@@ -50,6 +51,29 @@ function renderFleetLens(
   );
 }
 
+/** Waits until `/fleet/machines/live`, `/fleet/roster`, and `/machine/specs`
+ * have all settled (success or error) in `queryClient`'s cache, rather than
+ * inferring settlement from an incidental DOM condition.
+ *
+ * `rosterOnly` (#1855 follow-up) depends on all three of those queries, and
+ * they resolve on THEIR OWN independent schedules — nothing forces them to
+ * settle before an unrelated `waitFor` (e.g. one that only watches the
+ * hero's text, which depends on the flow queries, not these) resolves.
+ * Asserting an ABSENCE (e.g. "no phantom card renders") right after such an
+ * unrelated wait is a race: the assertion can pass merely because the
+ * roster/specs queries haven't resolved YET, which looks identical to the
+ * fix genuinely excluding the entry — exactly the "a probe that passes
+ * without executing is worse than no probe" trap. Waiting on the actual
+ * query states removes the race instead of hoping the timing works out. */
+async function waitForFleetQueriesSettled(queryClient: QueryClient) {
+  await waitFor(() => {
+    for (const key of [queryKeys.fleetMachinesLive(), queryKeys.fleetRoster(), queryKeys.machineSpecs()]) {
+      const state = queryClient.getQueryState(key);
+      expect(state?.status, `query ${JSON.stringify(key)} settled`).not.toBe("pending");
+    }
+  });
+}
+
 /** Routes `fetchJson` calls the same way the real daemon's endpoint set
  * does, keyed on the URL. `flowToday`/`flowYesterday` default to an empty
  * window so a test only has to name the records it actually cares about. */
@@ -72,6 +96,10 @@ function mockFleetFetch(opts: {
    * topology. Omitted defaults to an empty roster (`error: null`), so
    * every pre-#1855 test in this file is unaffected. */
   roster?: unknown[];
+  /** (#1855 follow-up, CONSIDER 4) `GET /fleet/roster`'s `error` field — a
+   * present-but-corrupt roster file. Omitted (the default) keeps `null`,
+   * so every pre-CONSIDER-4 test in this file is unaffected. */
+  rosterError?: string;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -106,7 +134,9 @@ function mockFleetFetch(opts: {
         return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs, generated_at_ms: 1 }), { status: 200 }));
       }
       if (path === "/fleet/roster") {
-        return Promise.resolve(new Response(JSON.stringify({ machines: opts.roster ?? [], error: null }), { status: 200 }));
+        return Promise.resolve(
+          new Response(JSON.stringify({ machines: opts.roster ?? [], error: opts.rosterError ?? null }), { status: 200 }),
+        );
       }
       return Promise.resolve(new Response("not recorded\n", { status: 404 }));
     }),
@@ -346,13 +376,24 @@ describe("FleetLens", () => {
 
   /** (U5-1) The gap the `historical` test below could not see: `App.tsx`
    * renders `<FleetLens />` with NO props, so `historical` sits at its
-   * default `false` and the three live-only endpoints fired on the STATIC
+   * default `false` and the live-only endpoints fired on the STATIC
    * demo — measured on the served build, `#lens=fleet` produced 404s for
    * `/fleet/machines/live`, `/fleet/sessions/live` and `/machine/specs`
    * plus their console errors. The prop describes the CALLER's intent (a
    * replay); only the BUILD can answer "is there a daemon at all" — the
    * #1801 rule `MachineLens`/`useFlowWindow`/`route.ts::isLiveRoute`
-   * already follow. Rendered here exactly as `App.tsx` renders it: propless. */
+   * already follow. Rendered here exactly as `App.tsx` renders it: propless.
+   *
+   * (#1855 follow-up, CONSIDER 6) `/fleet/roster` joined this list without
+   * a DEDICATED gate test of its own — `useFleetRoster(livePolling)` was
+   * asserted three times in a row by comment
+   * (`FleetLens.tsx`'s own doc on `roster`, `rosterOnly`, and the `cards`
+   * useMemo) but never once by a test that would actually catch the gate
+   * being dropped. Mutating `useFleetRoster(livePolling)` to
+   * `useFleetRoster(true)` left the WHOLE suite green before this line was
+   * added — this endpoint is folded into the same list this test already
+   * polices, closing that gap the same way the presence endpoints are
+   * already covered rather than inventing a second test for one more URL. */
   it("(U5-1) on a static build the propless FleetLens App renders never calls a live-only endpoint", async () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-flow-src";
@@ -377,7 +418,11 @@ describe("FleetLens", () => {
       // Give every gated query a chance to fire before asserting none did
       // (a real timer — `vi.useFakeTimers` above fakes `Date` only).
       await new Promise((r) => setTimeout(r, 50));
-      expect(seen.filter((p) => p === "/fleet/machines/live" || p === "/fleet/sessions/live" || p === "/machine/specs")).toEqual([]);
+      expect(
+        seen.filter(
+          (p) => p === "/fleet/machines/live" || p === "/fleet/sessions/live" || p === "/machine/specs" || p === "/fleet/roster",
+        ),
+      ).toEqual([]);
     } finally {
       document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
     }
@@ -837,6 +882,71 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     renderFleetLens();
     await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
     expect(document.querySelector(".mach")).toBeNull();
+  });
+
+  // (#1855 follow-up, F1) THE SELF-MACHINE PHANTOM: presence self-disables
+  // when Redis is unset (the default), so a quiet window can carry ZERO
+  // flow history and ZERO live beats for the daemon serving this very
+  // page — even though its own roster entry exists (this project's
+  // `darkmux-add-machine` skill walks the operator through creating it at
+  // step 7). Before consulting `/machine/specs` here, that roster entry
+  // fell through every other identity check and rendered a false "offline"
+  // card for the machine that is, self-evidently, up and answering this
+  // request. The honest render, absent any presence/flow evidence, is NO
+  // card — same as the "genuinely gone" case just above — not a lying
+  // "offline" one.
+  it("a roster entry matching THIS machine's own /machine/specs identity, with zero flow/presence evidence, renders no phantom offline card", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "studio", cpu_brand: "Apple M5 Max" },
+      roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
+    await waitForFleetQueriesSettled(queryClient);
+    expect(document.querySelector(".mach")).toBeNull();
+  });
+
+  // (#1855 follow-up, F2) THE MISMATCHED-NAME DUPLICATE: the roster id is
+  // operator-typed prose with nothing validating it against what the peer
+  // actually beats as. A live peer beating as one name and rostered under
+  // a near-miss (here, differing only by the mDNS `.local` suffix — the
+  // same alias class #2030 already hit for one machine's own two names)
+  // used to render a SECOND, phantom "offline" card beside the real one —
+  // three cards for two machines.
+  it("a roster entry differing from a live beat only by the mDNS .local suffix does not duplicate its card", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "MacBook-Pro.local", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      roster: [{ id: "MacBook-Pro", address: "100.64.1.2:8765", added_unix_ms: 1000 }],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    await waitForFleetQueriesSettled(queryClient);
+    expect(document.querySelectorAll(".mach").length).toBe(1);
+    expect(document.querySelector(".mach")!.className).not.toContain("absent");
+  });
+
+  // (#1855 follow-up, CONSIDER 4) A present-but-corrupt roster file used to
+  // be indistinguishable from a genuinely empty one: `useFleetRoster`
+  // dropped `error` entirely, so every previously-visible rostered card
+  // vanished again with NO signal that the read had failed — reproducing
+  // #1855's own symptom via the very fix meant to close it. The literal
+  // asserted here is the server's fixed wire string
+  // (`fleet_roster_handler`'s `ROSTER_READ_FAILED`), never a raw parse
+  // error, matching that crate's own redaction discipline.
+  it("a corrupt roster file surfaces a visible notice instead of silently reading as an empty roster", async () => {
+    mockFleetFetch({ rosterError: "the fleet roster file exists but could not be parsed" });
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/fleet roster unreadable/i)).toBeInTheDocument());
+    expect(screen.getByText(/the fleet roster file exists but could not be parsed/)).toBeInTheDocument();
+  });
+
+  it("a healthy (non-corrupt) roster renders no roster-unreadable notice", async () => {
+    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(screen.queryByText(/fleet roster unreadable/i)).not.toBeInTheDocument();
   });
 });
 

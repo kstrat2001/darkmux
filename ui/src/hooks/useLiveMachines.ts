@@ -59,6 +59,22 @@ export function useLiveMachines(enabled = true): Map<string, PresenceBeat> {
   }, [query.data]);
 }
 
+/** `useFleetRoster`'s return shape — the declared roster PLUS whether the
+ * read that produced it actually succeeded. See that hook's own doc. */
+export interface FleetRosterResult {
+  machines: RosterMachineEntry[];
+  /** (#1855 follow-up, CONSIDER 4) The roster file EXISTS but failed to
+   * parse — an operator hand-edit gone wrong, per `FleetRosterResponse`'s
+   * own doc. `null` covers both "no roster file" (the fresh-install
+   * default, not an error) and "query hasn't settled/is disabled yet" —
+   * this hook makes no claim about WHY there's nothing to report, only
+   * about whether the server told it something went wrong. The wire
+   * literal (`fleet_roster_handler`'s `ROSTER_READ_FAILED`), never the raw
+   * parse error — same redaction discipline as every other error surface
+   * this app renders. */
+  error: string | null;
+}
+
 /**
  * (#1855) The operator's DECLARED fleet roster — `GET /fleet/roster` —
  * independent of presence. This is the other half of "rostered-but-silent
@@ -74,8 +90,16 @@ export function useLiveMachines(enabled = true): Map<string, PresenceBeat> {
  * not consult the CURRENT roster over a past day — showing today's fleet
  * membership against a recorded day is the same confidently-wrong class
  * this file's other live-only hooks already guard against.
- */
-export function useFleetRoster(enabled = true): RosterMachineEntry[] {
+ *
+ * (#1855 follow-up, CONSIDER 4) Returns `error` alongside `machines` now,
+ * rather than discarding it. A present-but-corrupt roster file used to
+ * silently read as an EMPTY roster — every previously-visible rostered
+ * card vanishing again, the exact symptom #1855 exists to fix — with no
+ * signal anywhere that the read had actually failed rather than the
+ * roster genuinely being empty. `FleetLens.tsx`'s `RosterUnreadableNotice`
+ * is the one consumer that renders this; every other read of the roster
+ * (`rosterOnlyEntries`) only ever needs `machines`. */
+export function useFleetRoster(enabled = true): FleetRosterResult {
   const query = useQuery({
     enabled,
     queryKey: queryKeys.fleetRoster(),
@@ -86,11 +110,16 @@ export function useFleetRoster(enabled = true): RosterMachineEntry[] {
     // page without a reload, same convenience `/runs` gives the lab count.
     refetchInterval: PRESENCE_POLL_MS,
   });
-  // `?? []` guards a malformed/shape-mismatched 200 the same way `runs`'s own
-  // query does (`FleetLens.tsx`'s own comment on that guard) — `ok: true`
-  // only proves the body parsed as JSON, not that it matches
-  // `FleetRosterResponse`.
-  return query.data?.ok ? (query.data.data.machines ?? []) : [];
+  return useMemo(() => {
+    // `?? []` guards a malformed/shape-mismatched 200 the same way `runs`'s
+    // own query does (`FleetLens.tsx`'s own comment on that guard) —
+    // `ok: true` only proves the body parsed as JSON, not that it matches
+    // `FleetRosterResponse`.
+    if (query.data?.ok) {
+      return { machines: query.data.data.machines ?? [], error: query.data.data.error ?? null };
+    }
+    return { machines: [], error: null };
+  }, [query.data]);
 }
 
 /**

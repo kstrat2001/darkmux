@@ -674,6 +674,16 @@ async fn fleet_machines_live_handler() -> impl IntoResponse {
 /// underlying error — see [`source_state`] on why `detail` excludes it.
 const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
 
+/// The literal a corrupt (present-but-unparseable) roster file reports on
+/// the wire. Never the underlying error: `load_roster`'s failure carries
+/// the roster's own path (`RosterError`'s `Context`), and that path embeds
+/// the operator's username on macOS (`/Users/<name>/.darkmux/fleet.json`)
+/// — the exact class [`source_state`]'s module doc already rules out for
+/// Redis errors, for the same reason: the daemon may bind non-loopback and
+/// this body can be rendered on a phone over a tailnet. The full error
+/// still goes to stderr, where the operator already looks for it.
+const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be parsed";
+
 /// GET /fleet/roster (#1855) — the operator's DECLARED fleet topology
 /// (`darkmux machine add`'s `fleet.json`), independent of whether any of it
 /// is beating right now.
@@ -696,15 +706,17 @@ const PRESENCE_READ_FAILED: &str = "could not read presence beats from Redis";
 ///
 /// Never 500s. A missing file is an empty roster (`load_roster`'s own
 /// fresh-install contract, not an error); a PRESENT but corrupt file
-/// reports the parse failure in `error` rather than silently discarding the
-/// roster and answering as if nothing were ever added.
+/// reports the parse failure in `error` (a fixed literal — see
+/// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
+/// rather than silently discarding the roster and answering as if nothing
+/// were ever added.
 async fn fleet_roster_handler() -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(darkmux_fleet::load_roster).await;
     let (machines, error) = match result {
         Ok(Ok(roster)) => (roster.machines.into_values().collect::<Vec<_>>(), None),
         Ok(Err(e)) => {
             eprintln!("darkmux serve: GET /fleet/roster — reading the roster failed ({e:#})");
-            (Vec::new(), Some(format!("{e:#}")))
+            (Vec::new(), Some(ROSTER_READ_FAILED.to_string()))
         }
         Err(e) => {
             eprintln!("darkmux serve: GET /fleet/roster task failed ({e})");

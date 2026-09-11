@@ -705,6 +705,56 @@
         );
     }
 
+    /// (CONSIDER 4, #1855 follow-up review) A PRESENT-but-corrupt roster
+    /// file must report `error` as an actual non-empty STRING, not merely
+    /// something that satisfies `is_null()`. The two prior tests above both
+    /// asserted `body["error"].is_null()` in the SUCCESS case, and
+    /// `serde_json::Value::Null` is also what an entirely MISSING `error`
+    /// key resolves to (`Value::get` returns `Value::Null` for a missing
+    /// index) — so both tests stayed green through a mutation that deleted
+    /// the `error` field from the response body outright. This test uses
+    /// `.as_str()` instead, which returns `None` (and panics the
+    /// `.expect`) for BOTH a missing key and a null value, closing that
+    /// gap: it fails for a mutation neither existing test would have
+    /// caught. See `ROSTER_READ_FAILED`'s own doc for why the string is a
+    /// fixed literal rather than the underlying parse error text.
+    #[tokio::test]
+    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+    async fn fleet_roster_reports_the_parse_error_for_a_present_but_corrupt_file() {
+        let tmp = TempDir::new().unwrap();
+        let roster_path = tmp.path().join("fleet.json");
+        fs::write(&roster_path, b"{not valid json at all").unwrap();
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "a corrupt roster file must not 500");
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+        }
+
+        let error = body["error"]
+            .as_str()
+            .expect("a corrupt roster file must report a non-null STRING error, not merely a missing/null field");
+        assert!(!error.is_empty(), "the error literal must not be empty: {body}");
+        // The literal, never the underlying parse error text (which would
+        // embed the temp-dir path) — see ROSTER_READ_FAILED's own doc.
+        assert_eq!(error, "the fleet roster file exists but could not be parsed");
+        assert_eq!(
+            body["machines"].as_array().expect("machines must be an array").len(),
+            0,
+            "a corrupt roster must not fabricate machines: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn machine_status_returns_200_with_structured_body() {
         // The handler calls into `lms::list_loaded()`, which shells out to
