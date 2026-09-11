@@ -248,12 +248,13 @@ pub(crate) struct PanelSpec {
     /// variants. See the module doc, "Opts: a declared option space, not
     /// an open one".
     pub(crate) opts: &'static [PanelOpt],
-    /// (#1914) Whether this panel's spawn should hand its child a
-    /// fleet-snapshot handoff file (see `crate::write_fleet_snapshot_file`,
-    /// `crate::FLEET_SNAPSHOT_ENV_VAR`) instead of letting it pay its own
-    /// full Redis round trip. `run-list` is the only panel that reads the
-    /// network today (every other entry is a local-disk read) — see the
-    /// module doc's "every panel until now reads local disk only".
+    /// (#1914, widened #1711) Whether this panel's spawn should hand its
+    /// child a fleet-snapshot handoff file (see
+    /// `crate::write_fleet_snapshot_file`, `crate::FLEET_SNAPSHOT_ENV_VAR`)
+    /// instead of letting it pay its own full Redis round trip. `run-list`
+    /// and `mission-status` are the two panels that read the network today
+    /// (every other entry is a local-disk read) — see the module doc's
+    /// "every panel until now reads local disk only".
     pub(crate) needs_fleet_snapshot: bool,
 }
 
@@ -309,11 +310,18 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         "doctor" => ("doctor", &["doctor"], false, Duration::ZERO, &[]),
         _ => return None,
     };
-    // (#1914) Derived from the SAME `id` just matched above, not a second
-    // table: `run-list` is the one panel that reads the network today (see
-    // the module doc's "every panel until now reads local disk only" and
-    // `PanelSpec::needs_fleet_snapshot`'s own doc).
-    let needs_fleet_snapshot = id == "run-list";
+    // (#1914, widened #1711) Derived from the SAME `id` just matched above,
+    // not a second table. `run-list` was the one panel that read the
+    // network (see the module doc's "every panel until now reads local
+    // disk only" and `PanelSpec::needs_fleet_snapshot`'s own doc) until
+    // `mission-status` joined it: #1711 made the mission board read the
+    // shared flow stream too (`darkmux_serve::fleet_records_for_runs()`,
+    // the SAME call `run-list` makes), so its 3s-auto-refreshing panel
+    // spawn would otherwise pay its own live Redis round trip on every
+    // refresh — exactly the defect #1914 fixed for `run-list`, reintroduced
+    // for its sibling. A future panel that reads the fleet stream must flip
+    // this deliberately too — see `only_these_ids_need_a_fleet_snapshot`.
+    let needs_fleet_snapshot = matches!(id, "run-list" | "mission-status");
     Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot })
 }
 
@@ -816,22 +824,23 @@ mod tests {
         assert_eq!(PANEL_IDS.len(), 8, "allowlist growth is a doctrine decision, not a drive-by");
     }
 
-    /// (#1914) `run-list` is the ONLY panel that reads the network today
-    /// (the module doc: "every panel until now reads local disk only") —
-    /// so it is the only one whose spawn should pay to prepare a fleet
-    /// snapshot handoff file. A future panel added here that also reads
-    /// the fleet stream should flip this to true deliberately, not by
-    /// accident — this guard fails loudly the day that happens to anyone
-    /// who forgets to make the call.
+    /// (#1914, widened #1711) `run-list` and `mission-status` are the ONLY
+    /// panels that read the network today (every other entry is a
+    /// local-disk read) — so they are the only ones whose spawn should pay
+    /// to prepare a fleet snapshot handoff file. A future panel added here
+    /// that also reads the fleet stream should flip this to true
+    /// deliberately, not by accident — this guard fails loudly the day
+    /// that happens to anyone who forgets to make the call.
     #[test]
-    fn only_run_list_needs_a_fleet_snapshot() {
+    fn only_these_ids_need_a_fleet_snapshot() {
+        let needs_one: &[&str] = &["run-list", "mission-status"];
         for id in PANEL_IDS {
             let spec = panel_spec(id).unwrap();
             assert_eq!(
                 spec.needs_fleet_snapshot,
-                *id == "run-list",
+                needs_one.contains(id),
                 "{id}.needs_fleet_snapshot should be {} but was {}",
-                *id == "run-list",
+                needs_one.contains(id),
                 spec.needs_fleet_snapshot
             );
         }

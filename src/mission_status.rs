@@ -9,29 +9,45 @@
 //! work-tracking board).
 //!
 //! READ-ONLY by design (operator-sovereignty, #44): it surfaces drift and
-//! prints copy-pasteable reconcile commands, but never mutates state. The
-//! operator (or the frontier reading `--json`) runs the suggested commands.
+//! prints copy-pasteable reconcile commands, but never MUTATES OPERATOR
+//! STATE — no `Mission`/`Phase`/`Task`/`Step` JSON, no config, no profile
+//! registry. The operator (or the frontier reading `--json`) runs the
+//! suggested commands.
 //!
 //! The LOCAL board is computed purely from the durable mission + phase JSON
 //! (the loader), so it works offline with no Redis/flow dependency — exactly
 //! what a session-start housekeeping cue needs. (#1711) On top of that,
-//! `run()` ALSO reads the shared flow stream — the same
-//! `darkmux_serve::fleet_records_for_runs()` + `build_runs()` union `darkmux
-//! run list` already calls (#1905), itself the CLI twin of the daemon's
-//! `/runs` fix (#1705) — so a mission executing on a PEER machine, which has
+//! `run()` ALSO reads the shared flow stream via
+//! `darkmux_serve::fleet_records_for_runs()` + the narrow
+//! `darkmux_serve::peer_mission_runs()` (the SAME substrate `darkmux run
+//! list` already calls — #1905 — itself the CLI twin of the daemon's
+//! `/runs` fix, #1705) — so a mission executing on a PEER machine, which has
 //! no durable JSON here at all, still surfaces as a thin "observed, not
 //! owned" row instead of being structurally invisible. This is best-effort
 //! and degrades legibly (`darkmux_serve::source_state::SourceState`): a
-//! standalone install with no `DARKMUX_REDIS_URL` gets `Off` and the board
-//! prints byte-identical output to before #1711 — no new dependency is
-//! introduced on the path that made this module offline-first.
+//! standalone install with no `DARKMUX_REDIS_URL` gets `Off`, and the LOCAL
+//! half of the board — every section, row, and the final rollup line for a
+//! board with no peer rows — prints byte-identical output to before #1711.
+//!
+//! **Honest scope of "read-only" once Redis is configured.** When
+//! `config.redis.enabled` (or `DARKMUX_REDIS_URL`) is set, resolving the
+//! Redis connection reads the macOS Keychain
+//! (`darkmux_flow::redis_url()` → `keychain_redis_password()`), which — like
+//! every other Keychain-secret read in this codebase (#1311) — emits a
+//! `credential-read:*` liveness marker to `~/.darkmux/liveness/`. That is
+//! diagnostic telemetry, not operator state, and it is the SAME cost
+//! `darkmux run list` already pays on a fleet-configured machine today —
+//! #1711 does not introduce a new mechanism, it makes `mission status`
+//! subject to the one `darkmux run list` already accepted. Filed as a
+//! separate concern: whether that reaper-less liveness directory should
+//! itself be bounded (out of scope here).
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::crew;
 use crate::crew::types::{Mission, MissionStatus, Phase, PhaseStatus};
-use darkmux_serve::{source_state::SourceState, AbandonReason, Run, RunKind, RunStatus};
+use darkmux_serve::{source_state::SourceState, AbandonReason, Run, RunStatus};
 use darkmux_types::{config_access, style};
 
 /// A flagged inconsistency on one mission, with concrete reconcile commands.
@@ -420,27 +436,36 @@ fn relative_age(now: u64, then: u64) -> String {
 /// `crew::loader::load_missions()` no matter how much of its work crosses
 /// the flow stream.
 ///
-/// This calls the EXACT aggregation #1705 built
-/// (`darkmux_serve::build_runs`, already `pub` and already reused as-is by
-/// `darkmux run list` — #1905) rather than re-deriving the rollup a second
-/// time, per the issue's own "Fix direction": two independent answers to
-/// "what's running on the fleet" would be worse than one incomplete one.
-/// `build_runs` already de-dupes against every locally-tracked mission
-/// (`known_mission_ids`), so nothing here can double-print a mission this
-/// machine owns.
+/// Calls `darkmux_serve::peer_mission_runs` — the NARROW half of #1705's
+/// aggregation, taking the caller's own already-loaded `known_mission_ids`
+/// rather than reloading `Mission`/`Phase` JSON or rebuilding a `Run` for
+/// every LOCAL mission the way the full `darkmux_serve::build_runs` (used
+/// by `darkmux run list`) does. `mission status` already has its own local
+/// mission set in hand for the board above; paying for `build_runs`'s local
+/// half a second time here measured as the dominant cost of this command
+/// (#1711 review finding) for no benefit — this board never uses it.
 ///
-/// Filtered to `RunKind::Mission` rows with `tracked == false` — a bare
-/// dispatch ghost or a lab run was never part of this board's scope (it
-/// only ever showed missions), and `tracked: true` rows are exactly the
-/// mission board's own local half, already covered by `load_missions()`.
-///
-/// `lab_dir: None` — `build_runs`'s lab-run union is `run list`'s concern,
-/// not this board's.
-fn peer_mission_runs(flows_dir: &std::path::Path, fleet: &[serde_json::Value]) -> Vec<Run> {
-    darkmux_serve::build_runs(flows_dir, None, fleet)
-        .into_iter()
-        .filter(|r| r.kind == RunKind::Mission && !r.tracked)
-        .collect()
+/// Sorted here (`darkmux_serve::peer_mission_runs` folds a `HashMap`, so
+/// its own order is not stable run to run) by the SAME recency-first key
+/// `darkmux run list` sorts by (`run_activity` in `run_list.rs`) — one
+/// consistent "what's running on the fleet" ordering across both CLI
+/// surfaces, and a `--json` payload that doesn't reshuffle between two
+/// identical daemon-panel polls.
+fn peer_mission_runs(
+    flows_dir: &std::path::Path,
+    fleet: &[serde_json::Value],
+    known_mission_ids: &std::collections::HashSet<String>,
+) -> Vec<Run> {
+    let mut peer = darkmux_serve::peer_mission_runs(flows_dir, fleet, known_mission_ids);
+    peer.sort_by(|a, b| peer_activity(b).cmp(&peer_activity(a)).then_with(|| a.id.cmp(&b.id)));
+    peer
+}
+
+/// `updated_ts || completed_ts || started_ts || 0` — the same fallback
+/// chain `run_list.rs::run_activity` uses, so a peer row and a local run
+/// row agree on what "most recently active" means.
+fn peer_activity(r: &Run) -> u64 {
+    r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(0)
 }
 
 /// (#1711) The status word for one peer-observed mission row.
@@ -515,17 +540,18 @@ fn format_age_span(secs: u64) -> String {
 /// only exists on the machine that ran it (see [`peer_mission_runs`]'s doc).
 /// A no-op when `peer` is empty, which includes every standalone install —
 /// this is what keeps the local-only board byte-identical to before #1711.
-fn print_peer_missions(peer: &[Run], now: u64) {
+fn print_peer_missions(peer: &[Run], now: u64, width: Option<usize>) {
     if peer.is_empty() {
         return;
     }
-    println!(
-        "\n{}",
-        style::dim(&format!(
-            "OBSERVED ON THE FLEET ({}) — seen via the shared flow stream, not owned by this machine",
-            peer.len()
-        ))
+    println!();
+    let header = format!(
+        "OBSERVED ON THE FLEET ({}) — seen via the shared flow stream, not owned by this machine",
+        peer.len()
     );
+    for line in wrap_indented(&header, 0, width) {
+        println!("{}", style::dim(&line));
+    }
     let id_w = peer.iter().map(|r| r.id.chars().count()).max().unwrap_or(0).clamp(1, 40);
     let machine_w = peer
         .iter()
@@ -853,9 +879,17 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // with no `DARKMUX_REDIS_URL`, so this costs nothing there. See
     // [`peer_mission_runs`]'s doc for why this reuses #1705's aggregation
     // rather than re-deriving it.
+    //
+    // `known_mission_ids` is passed to `peer_mission_runs` so it never
+    // re-loads `Mission`/`Phase` JSON this function already has in hand
+    // (#1711 review finding — the earlier version called the full
+    // `darkmux_serve::build_runs`, which reloads that JSON AND rebuilds a
+    // `Run` for every local mission, neither of which this board uses).
+    let known_mission_ids: std::collections::HashSet<String> =
+        missions.iter().map(|m| m.id.clone()).collect();
     let flows_dir = config_access::flows_dir();
     let fleet = darkmux_serve::fleet_records_for_runs();
-    let peer = peer_mission_runs(&flows_dir, &fleet.records);
+    let peer = peer_mission_runs(&flows_dir, &fleet.records, &known_mission_ids);
     let fleet_complete = matches!(fleet.state, SourceState::Ok | SourceState::Off);
 
     // (#1562, restated for #1709) `--json` is deliberately NEVER filtered —
@@ -1159,13 +1193,18 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // qualified by what this printed (or admits it could not check). A
     // no-op on a standalone install: `print_peer_missions` is a no-op on an
     // empty slice and `fleet_scope_note` is `None` for `Off`.
-    print_peer_missions(&peer, now);
+    //
+    // (#1711 review finding) The scope note prints BEFORE the rows it
+    // qualifies, not after — same rule `run_list.rs`'s own `fleet_warning`
+    // states: "an incomplete answer has to be qualified where the reader
+    // meets it, not in a footnote under rows they have already believed."
     if let Some(note) = fleet_scope_note(&fleet.state) {
         println!();
         for line in wrap_indented(&note, 0, width) {
             println!("{}", style::warn(&line));
         }
     }
+    print_peer_missions(&peer, now, width);
 
     println!();
     // "above" is only true for the drifted missions that were PRINTED as full
@@ -1711,6 +1750,7 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use crate::crew::types::MissionSpec;
+    use darkmux_serve::RunKind;
 
     fn mission(id: &str, status: MissionStatus) -> Mission {
         Mission {
@@ -3221,47 +3261,115 @@ mod tests {
         })
     }
 
+    /// Isolates `DARKMUX_HOME` to a fresh tempdir for the duration of `f`,
+    /// restoring the previous value afterward — the SAME pattern
+    /// `display_label_prefers_the_config_name_over_a_config_launched_
+    /// missions_own_long_description` above uses, applied here because
+    /// `peer_mission_runs` → `darkmux_serve::peer_mission_runs` →
+    /// `resolve_machine_id` → `config_access::machine_id()` reads
+    /// `DARKMUX_HOME`-scoped config (#1711 review finding: this file's own
+    /// tests must never read whatever the OPERATOR'S real `~/.darkmux/`
+    /// happens to hold on the machine running the suite). Callers must be
+    /// `#[serial_test::serial]` — this mutates process-global env.
+    fn with_isolated_darkmux_home<R>(f: impl FnOnce() -> R) -> R {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: caller is `#[serial_test::serial]`; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let result = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        result
+    }
+
     #[test]
+    #[serial_test::serial]
     fn peer_mission_runs_surfaces_a_mission_seen_only_via_the_shared_stream() {
         // The exact defect #1711 was filed over: a mission with real flow
         // records and NO local durable `Mission` JSON (because it ran on a
         // peer) must still produce a row here, `tracked: false`, carrying
         // the peer's machine id.
-        let flows = tempfile::tempdir().unwrap();
-        let fleet = vec![
-            flow_record("review-peer-1", "hub", "mission start", "2026-09-01T00:00:00Z", "s1"),
-            flow_record("review-peer-1", "hub", "mission close", "2026-09-01T00:05:00Z", "s1"),
-        ];
-        let peer = peer_mission_runs(flows.path(), &fleet);
-        assert_eq!(peer.len(), 1, "a peer-only mission must produce exactly one row: {peer:?}");
-        assert_eq!(peer[0].id, "review-peer-1");
-        assert_eq!(peer[0].machine.as_deref(), Some("hub"));
-        assert!(!peer[0].tracked, "an observed-not-owned row must be marked untracked");
-        assert_eq!(peer[0].status, RunStatus::Complete);
+        with_isolated_darkmux_home(|| {
+            let flows = tempfile::tempdir().unwrap();
+            let fleet = vec![
+                flow_record("review-peer-1", "hub", "mission start", "2026-09-01T00:00:00Z", "s1"),
+                flow_record("review-peer-1", "hub", "mission close", "2026-09-01T00:05:00Z", "s1"),
+            ];
+            let known = std::collections::HashSet::new();
+            let peer = peer_mission_runs(flows.path(), &fleet, &known);
+            assert_eq!(peer.len(), 1, "a peer-only mission must produce exactly one row: {peer:?}");
+            assert_eq!(peer[0].id, "review-peer-1");
+            assert_eq!(peer[0].machine.as_deref(), Some("hub"));
+            assert!(!peer[0].tracked, "an observed-not-owned row must be marked untracked");
+            assert_eq!(peer[0].status, RunStatus::Complete);
+        });
     }
 
     #[test]
+    #[serial_test::serial]
     fn peer_mission_runs_is_empty_on_a_standalone_install_with_no_fleet_records() {
         // (#1711 hard requirement) The local-only case must be UNCHANGED:
         // no fleet records at all (the `Off`/standalone shape) must yield
         // zero peer rows, not a synthesized one.
-        let flows = tempfile::tempdir().unwrap();
-        let peer = peer_mission_runs(flows.path(), &[]);
-        assert!(peer.is_empty(), "a standalone install must see no peer missions: {peer:?}");
+        with_isolated_darkmux_home(|| {
+            let flows = tempfile::tempdir().unwrap();
+            let known = std::collections::HashSet::new();
+            let peer = peer_mission_runs(flows.path(), &[], &known);
+            assert!(peer.is_empty(), "a standalone install must see no peer missions: {peer:?}");
+        });
     }
 
     #[test]
+    #[serial_test::serial]
     fn peer_mission_runs_a_still_running_peer_reads_running() {
         // "A live peer" — the issue's own contrast case against "rostered
         // but silent" below. No terminal record, but the session is
         // recent enough to read as live.
-        let flows = tempfile::tempdir().unwrap();
-        let now = now_unix();
-        let recent = chrono_like_ts(now.saturating_sub(5));
-        let fleet = vec![flow_record("review-peer-2", "peer-2", "mission start", &recent, "s2")];
-        let peer = peer_mission_runs(flows.path(), &fleet);
-        assert_eq!(peer.len(), 1, "{peer:?}");
-        assert_eq!(peer[0].status, RunStatus::Running, "a fresh, non-terminal record must read live");
+        with_isolated_darkmux_home(|| {
+            let flows = tempfile::tempdir().unwrap();
+            let now = now_unix();
+            let recent = chrono_like_ts(now.saturating_sub(5));
+            let fleet = vec![flow_record("review-peer-2", "peer-2", "mission start", &recent, "s2")];
+            let known = std::collections::HashSet::new();
+            let peer = peer_mission_runs(flows.path(), &fleet, &known);
+            assert_eq!(peer.len(), 1, "{peer:?}");
+            assert_eq!(
+                peer[0].status,
+                RunStatus::Running,
+                "a fresh, non-terminal record must read live"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_runs_excludes_a_locally_known_mission_id() {
+        // (#1711 review finding) A caller's `known_mission_ids` must be
+        // honored even when the flow stream also carries records for that
+        // same mission — this is the SAME de-dup `darkmux_serve::build_runs`
+        // gives its own callers, now exercised through the narrow entry
+        // point `mission status` actually calls.
+        with_isolated_darkmux_home(|| {
+            let flows = tempfile::tempdir().unwrap();
+            let fleet = vec![flow_record(
+                "review-local-1",
+                "hub",
+                "mission start",
+                "2026-09-01T00:00:00Z",
+                "s1",
+            )];
+            let mut known = std::collections::HashSet::new();
+            known.insert("review-local-1".to_string());
+            let peer = peer_mission_runs(flows.path(), &fleet, &known);
+            assert!(
+                peer.is_empty(),
+                "a mission in `known_mission_ids` must never surface as a peer row: {peer:?}"
+            );
+        });
     }
 
     /// A minimal RFC3339 stamp from a Unix-seconds value — just enough for

@@ -9095,6 +9095,12 @@ fn fail_probe_board_reports_the_mixed_phase_as_degraded_not_complete() {
 // `build_flow_mission_index` — the function does not care whether the
 // `Vec<serde_json::Value>` it folds came from a local day-file or a fleet
 // read. This is "test against fakes", never a real peer.
+//
+// `mission status` calls `darkmux_serve::peer_mission_runs` — the NARROW
+// half of #1705's aggregation (#1711 review finding: the full
+// `darkmux_serve::build_runs`, also used by `darkmux run list`, redundantly
+// reloads `Mission`/`Phase` JSON and rebuilds a `Run` for every local
+// mission this board never uses).
 
 /// One flow day-file with a mission this machine never launched — a
 /// `mission start`/`mission close` (or no terminal record at all) pair
@@ -9298,4 +9304,59 @@ fn mission_status_is_byte_identical_on_a_standalone_machine_with_no_peers() {
     assert_eq!(board["peer_missions"].as_array().map(Vec::len), Some(0));
     assert_eq!(board["fleet"]["state"], "off");
     assert_eq!(board["summary"]["fleet_complete"], true);
+}
+
+/// (#1711 review finding, PROVEN against real operator data) A mission with
+/// no durable `Mission` JSON here, but whose flow records carry THIS
+/// machine's OWN resolved id, is an ORPHAN — not a peer. Mislabeling it
+/// "OBSERVED ON THE FLEET ... not owned by this machine" is actively wrong
+/// when it IS this machine (a deleted mission dir, a malformed
+/// `mission.json` the loader silently skips, or a subsystem that stamped
+/// `mission_id` without minting under `missions_dir()`). This pins the
+/// fix end to end through the real binary, not just the unit-level
+/// aggregation.
+#[test]
+fn mission_status_never_labels_a_same_machine_orphan_as_observed_on_the_fleet() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    // Same shape `write_peer_mission_day_file` uses, but `machine_id`
+    // matches the child's OWN `DARKMUX_MACHINE_ID` below — that is the
+    // whole point of this test.
+    write_peer_mission_day_file(flows.path(), "orphan-local-1711", "this-machine", Some("mission close"));
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_MACHINE_ID", "this-machine")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("mission status --json must be JSON: {e}"));
+    assert_eq!(
+        board["peer_missions"].as_array().map(Vec::len),
+        Some(0),
+        "a same-machine orphan must never surface as a peer row: {board}"
+    );
+    assert_eq!(
+        board["missions"].as_array().map(Vec::len),
+        Some(0),
+        "an orphan has no durable JSON, so it cannot be a local `missions` row either: {board}"
+    );
+
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_MACHINE_ID", "this-machine")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        !text.contains("OBSERVED ON THE FLEET"),
+        "a same-machine orphan must not spawn a fleet section at all:\n{text}"
+    );
 }

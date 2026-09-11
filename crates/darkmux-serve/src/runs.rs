@@ -394,14 +394,9 @@ pub fn build_runs(
     // (#1705) Missions seen only in the record stream — i.e. executing on a
     // peer. Emitted BEFORE ghosts so their sessions are claimed and don't
     // also surface as loose dispatch rows.
-    let mut remote_mission_ids: HashSet<String> = HashSet::new();
-    for (mission_id, agg) in &flow_missions {
-        if known_mission_ids.contains(mission_id) {
-            continue;
-        }
-        remote_mission_ids.insert(mission_id.clone());
-        runs.push(flow_mission_to_run(mission_id, agg, &flow_index, now_ms));
-    }
+    let (peer_runs, remote_mission_ids) =
+        peer_runs_from_index(&flow_missions, &known_mission_ids, &flow_index, now_ms);
+    runs.extend(peer_runs);
 
     runs.extend(ghost_runs(
         &flow_index,
@@ -412,6 +407,82 @@ pub fn build_runs(
     ));
 
     runs
+}
+
+/// (#1711) Every `flow_missions` entry NOT in `known_mission_ids` — i.e. a
+/// mission this reader can SEE via the merged flow record set but does not
+/// OWN, because no durable `Mission` JSON for it exists here (either it
+/// executed on a peer, or its record survived a locally-deleted mission).
+/// Returns the `Run`s alongside the set of ids emitted, so [`build_runs`]
+/// can feed that set to [`ghost_runs`] without a second pass.
+///
+/// Split out so [`peer_mission_runs`] (a narrower public entry point for a
+/// caller that already has its own `known_mission_ids` in hand — `mission
+/// status`, #1711) shares this ONE implementation with [`build_runs`]
+/// rather than each maintaining its own copy of the filter+map.
+fn peer_runs_from_index(
+    flow_missions: &HashMap<String, FlowMissionAgg>,
+    known_mission_ids: &HashSet<String>,
+    flow_index: &HashMap<String, SessionAgg>,
+    now_ms: u64,
+) -> (Vec<Run>, HashSet<String>) {
+    // (#1711) A "peer" claim requires knowing WHO ran it — an entry whose
+    // `machine` matches THIS reader's own identity (resolved the same way
+    // records are stamped at write time: `DARKMUX_MACHINE_ID` >
+    // `config.machine_id` > `hostname(1)`) is not a peer at all, it is an
+    // ORPHAN: a mission with no durable JSON here that ALSO ran here — a
+    // deleted mission dir, a malformed `mission.json` the loader silently
+    // skipped, or a subsystem that stamped `mission_id` without minting
+    // under `missions_dir()`. Mislabeling that "observed on the fleet, not
+    // owned by this machine" is actively wrong: it IS this machine. `None`
+    // (no `machine` on the record at all) is left alone — that is exactly
+    // the case this reader cannot rule out, and the honest answer under
+    // uncertainty is to keep showing it, not to guess it away.
+    let local_machine = darkmux_flow::resolve_machine_id();
+    let mut runs = Vec::new();
+    let mut remote_mission_ids: HashSet<String> = HashSet::new();
+    for (mission_id, agg) in flow_missions {
+        if known_mission_ids.contains(mission_id) {
+            continue;
+        }
+        if local_machine.is_some() && agg.machine.as_deref() == local_machine.as_deref() {
+            // Not claimed as remote — its session(s) fall through to the
+            // ordinary per-session ghost-dispatch synthesis below, exactly
+            // as they would have before the peer-mission concept existed.
+            continue;
+        }
+        remote_mission_ids.insert(mission_id.clone());
+        runs.push(flow_mission_to_run(mission_id, agg, flow_index, now_ms));
+    }
+    (runs, remote_mission_ids)
+}
+
+/// (#1711) The peer-mission half of [`build_runs`], standalone — for a
+/// caller that wants ONLY the "observed, not owned" rows and already has
+/// its own local mission id set in hand (`mission status`'s board, which
+/// loads `Mission`/`Phase` JSON itself for its own local half). Calling
+/// `build_runs` for this would pay for the local mission→`Run` build
+/// (`classify_mission`/`collect_mission_step_sessions` per mission) and a
+/// SECOND `load_missions()`/`load_phases()` disk read the caller's own
+/// load already did — both wasted work for a caller that only wants this
+/// slice.
+///
+/// `known_mission_ids` is the caller's own already-resolved local mission
+/// id set, so a mission this reader OWNS never double-appears as a
+/// "peer" row (the same guarantee [`build_runs`]'s `known_mission_ids`
+/// gives its own callers).
+pub fn peer_mission_runs(
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+    known_mission_ids: &HashSet<String>,
+) -> Vec<Run> {
+    let flow_index = build_flow_session_index(flows_dir, fleet);
+    let flow_missions = build_flow_mission_index(flows_dir, fleet);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    peer_runs_from_index(&flow_missions, known_mission_ids, &flow_index, now_ms).0
 }
 
 /// Per-`mission_id` rollup over the merged record stream (#1705) — the
@@ -5913,6 +5984,132 @@ mod tests {
         assert!(
             !runs.iter().any(|r| r.id == "review-on-the-hub"),
             "the peer row must come from the fleet stream, not from thin air"
+        );
+    }
+
+    // ─── #1711: `peer_mission_runs` — the standalone narrow entry point ────
+
+    #[test]
+    fn peer_mission_runs_matches_build_runs_peer_half_for_the_same_input() {
+        // The narrow entry point must not silently diverge from the
+        // aggregation `build_runs` already ships — `mission status` and
+        // `/runs`/`darkmux run list` are answering the SAME question, and
+        // two different answers is exactly #1711's own complaint.
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![peer_record("mission start", &darkmux_flow::ts_utc_now())];
+        let known: HashSet<String> = HashSet::new();
+
+        let via_build_runs = build_runs(flows.path(), None, &fleet);
+        let from_build_runs =
+            via_build_runs.iter().find(|r| r.id == "review-on-the-hub").expect("peer row from build_runs");
+
+        let narrow = peer_mission_runs(flows.path(), &fleet, &known);
+        let from_narrow =
+            narrow.iter().find(|r| r.id == "review-on-the-hub").expect("peer row from peer_mission_runs");
+
+        assert_eq!(from_narrow.status, from_build_runs.status);
+        assert_eq!(from_narrow.machine, from_build_runs.machine);
+        assert_eq!(from_narrow.tracked, from_build_runs.tracked);
+        assert!(!from_narrow.tracked);
+    }
+
+    #[test]
+    fn peer_mission_runs_excludes_a_known_local_mission_id() {
+        // The exact bug this function exists to make impossible: a caller
+        // that already knows a mission is LOCAL (its own `known_mission_ids`
+        // from `load_missions()`) must never see it echoed back as a "peer"
+        // row just because it also has flow records.
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![peer_record("mission start", &darkmux_flow::ts_utc_now())];
+        let mut known: HashSet<String> = HashSet::new();
+        known.insert("review-on-the-hub".to_string());
+
+        let narrow = peer_mission_runs(flows.path(), &fleet, &known);
+        assert!(
+            !narrow.iter().any(|r| r.id == "review-on-the-hub"),
+            "a mission in `known_mission_ids` must never appear as a peer row: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn peer_mission_runs_is_empty_with_no_fleet_records_and_no_local_orphans() {
+        let flows = TempDir::new().unwrap();
+        let known: HashSet<String> = HashSet::new();
+        let narrow = peer_mission_runs(flows.path(), &[], &known);
+        assert!(narrow.is_empty(), "{narrow:?}");
+    }
+
+    /// (#1711 review finding) A mission whose only flow records are LOCAL
+    /// (in `flows_dir`, not the fleet) and stamped with THIS reader's own
+    /// resolved machine id must never render as a "peer" — that machine
+    /// is not a peer, it is this one. This is an orphan (no durable
+    /// `Mission` JSON here for a mission that DID run here), and the
+    /// honest fallback is the same untracked-ghost-dispatch synthesis any
+    /// unclaimed session already gets — never a mislabeled peer row.
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_runs_never_labels_a_same_machine_orphan_as_a_peer() {
+        let prev = std::env::var("DARKMUX_MACHINE_ID").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_MACHINE_ID", "this-reader") };
+
+        let flows = TempDir::new().unwrap();
+        let rec = serde_json::json!({
+            "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work",
+            "tier": "local", "stage": "dispatch", "action": "mission start",
+            "handle": "review", "session_id": "orphan-s1", "machine_id": "this-reader",
+            "mission_id": "orphan-local-1",
+        });
+        write_day_file(flows.path(), &today(), &[rec]);
+
+        let known: HashSet<String> = HashSet::new();
+        let narrow = peer_mission_runs(flows.path(), &[], &known);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+
+        assert!(
+            !narrow.iter().any(|r| r.id == "orphan-local-1"),
+            "a same-machine orphan must never render as a peer row: {narrow:?}"
+        );
+    }
+
+    /// The inverted case: a FOREIGN machine id on the identical shape of
+    /// record must still surface. Without this, the exclusion above could
+    /// have been over-broad (e.g. matching on `mission_id` alone) and this
+    /// file would have no test proving peer visibility still works at all.
+    #[test]
+    #[serial_test::serial]
+    fn peer_mission_runs_still_surfaces_a_genuinely_foreign_machine() {
+        let prev = std::env::var("DARKMUX_MACHINE_ID").ok();
+        unsafe { std::env::set_var("DARKMUX_MACHINE_ID", "this-reader") };
+
+        let flows = TempDir::new().unwrap();
+        let rec = serde_json::json!({
+            "ts": darkmux_flow::ts_utc_now(), "level": "info", "category": "work",
+            "tier": "local", "stage": "dispatch", "action": "mission start",
+            "handle": "review", "session_id": "peer-s1", "machine_id": "genuinely-a-peer",
+            "mission_id": "peer-local-1",
+        });
+        write_day_file(flows.path(), &today(), &[rec]);
+
+        let known: HashSet<String> = HashSet::new();
+        let narrow = peer_mission_runs(flows.path(), &[], &known);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ID"),
+            }
+        }
+
+        assert!(
+            narrow.iter().any(|r| r.id == "peer-local-1"),
+            "a genuinely foreign machine id must still surface as a peer row: {narrow:?}"
         );
     }
 
