@@ -39,6 +39,8 @@ describe("tokensOffMeter", () => {
     expect(t.reread).toBe(100);
     expect(t.fresh).toBe(150); // (100+150) - 100
     expect(t.runs).toBe(1);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("counts a session with an endpoint-bearing dispatch bookend as cloud, not local", () => {
@@ -53,6 +55,7 @@ describe("tokensOffMeter", () => {
     expect(t.local).toBe(0);
     expect(t.unknown).toBe(0);
     expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("excludes a session with NO dispatch bookend at all from the local claim — unknown, not free (#1607)", () => {
@@ -70,6 +73,11 @@ describe("tokensOffMeter", () => {
     // Still counted as a real dispatch for the run count, just not credited
     // as free.
     expect(t.runs).toBe(1);
+    // (#2637) And the run-count analog of `unknown` above: this run is
+    // unattributed, not silently folded into "local" the way a bare
+    // `runs - cloudRuns` subtraction would.
+    expect(t.unknownRuns).toBe(1);
+    expect(t.cloudRuns).toBe(0);
   });
 
   it("a dispatch.error (died before classifying itself) does NOT count its session as local", () => {
@@ -84,6 +92,7 @@ describe("tokensOffMeter", () => {
     // has no endpoint either, so it's unknown, not local.
     expect(t.unknown).toBe(85);
     expect(t.local).toBe(0);
+    expect(t.unknownRuns).toBe(1);
   });
 
   it("a session missing turn_seq on any of its records falls into `uncls`, not fresh/reread", () => {
@@ -113,6 +122,7 @@ describe("tokensOffMeter", () => {
     expect(t.fresh).toBe(800); // one turn = the whole prompt is first-read
     expect(t.runs).toBe(1);
     expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#1853) the single-shot LOCAL fallback (no telemetry family, no endpoint, dispatch.complete carries the totals) counts as local — not invisible", () => {
@@ -132,8 +142,9 @@ describe("tokensOffMeter", () => {
     expect(t.fresh).toBe(900); // one turn = the whole prompt is first-read
     expect(t.runs).toBe(1);
     // A local direct run must not inflate the cloud run count — hybridNote
-    // derives local runs as `t.runs - t.cloudRuns`.
+    // (#2637) derives local runs as `t.runs - t.cloudRuns - t.unknownRuns`.
     expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#1853, inverted) a session with BOTH a telemetry family AND a token-bearing local dispatch.complete is not double-counted", () => {
@@ -156,6 +167,7 @@ describe("tokensOffMeter", () => {
     expect(t.cloud).toBe(0);
     expect(t.unknown).toBe(0);
     expect(t.runs).toBe(1); // NOT 2 (no phantom directRun for s9)
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#1853, inverted) a cloud single-shot session is still classified cloud, never local, once collection is endpoint-blind", () => {
@@ -173,6 +185,7 @@ describe("tokensOffMeter", () => {
     expect(t.local).toBe(0);
     expect(t.unknown).toBe(0);
     expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
   });
 
   // (#2635) `dispatch.single_shot`'s session id is deliberately TASK-scoped
@@ -203,6 +216,7 @@ describe("tokensOffMeter", () => {
     expect(t.unknown).toBe(0);
     expect(t.cloudRuns).toBe(1);
     expect(t.runs).toBe(2);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#2635) task-scoped session collision — local-then-hosted — same totals regardless of order", () => {
@@ -221,6 +235,7 @@ describe("tokensOffMeter", () => {
     expect(t.unknown).toBe(0);
     expect(t.cloudRuns).toBe(1);
     expect(t.runs).toBe(2);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("(#2635) task-scoped session collision — two local seats — both counted, neither dropped", () => {
@@ -235,6 +250,7 @@ describe("tokensOffMeter", () => {
     expect(t.unknown).toBe(0);
     expect(t.cloudRuns).toBe(0);
     expect(t.runs).toBe(2);
+    expect(t.unknownRuns).toBe(0);
   });
 
   // (CONSIDER 3, #2635) Documents a currently-inert gap rather than fixing
@@ -259,6 +275,45 @@ describe("tokensOffMeter", () => {
     expect(t.local).toBe(640);
     expect(t.cloud).toBe(0);
     expect(t.unknown).toBe(0);
+    expect(t.unknownRuns).toBe(0);
+  });
+
+  // (#2637) The issue's own reproduction shape: five sessions where only
+  // one is POSITIVELY local, two are positively cloud, and two carry token
+  // telemetry but no dispatch bookend at all (darkmux has no evidence
+  // either way). Before this fix, `hybridNote` read `runs - cloudRuns` and
+  // credited both unattributed sessions to "local" (reading "3 local + 2
+  // cloud" instead of the true "1 local + 2 cloud"). This test pins the
+  // run-count-level three-way split `tokensOffMeter` now exposes;
+  // hybridNote.test.ts pins the corrected rendered text.
+  it("(#2637) five sessions — one local, two cloud, two unattributed — unknownRuns separates them from local", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "cloud1", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
+      tokenRec("cloud1", 1, 200, 40),
+      rec({ session_id: "cloud1", action: "dispatch.complete", payload: { total_tokens: 240, endpoint: "gemini" } }),
+
+      rec({ session_id: "cloud2", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
+      tokenRec("cloud2", 1, 100, 20),
+      rec({ session_id: "cloud2", action: "dispatch.complete", payload: { total_tokens: 120, endpoint: "gemini" } }),
+
+      rec({ session_id: "local1", action: "dispatch.start", handle: "coder" }),
+      tokenRec("local1", 1, 80, 10),
+      rec({ session_id: "local1", action: "dispatch.complete", payload: { total_tokens: 90 } }),
+
+      // Both of these have token telemetry but NO dispatch.start/complete
+      // anywhere for their session — no evidence of where they ran.
+      tokenRec("unknown1", 1, 50, 5),
+      tokenRec("unknown2", 1, 30, 5),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(5);
+    expect(t.cloudRuns).toBe(2);
+    expect(t.unknownRuns).toBe(2);
+    // The implicit local-run count a consumer derives is runs - cloudRuns -
+    // unknownRuns = 5 - 2 - 2 = 1, matching the ONE session with positive
+    // local evidence (local1) — not 3, which is what the pre-fix
+    // `runs - cloudRuns` subtraction would have produced.
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
   });
 
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
@@ -272,6 +327,8 @@ describe("tokensOffMeter", () => {
     // No prompt/completion split to decompose — it has to land somewhere
     // visible, or the headline would silently exceed the row beneath it.
     expect(t.uncls).toBe(1200);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("returns all-zero on an empty window", () => {
@@ -288,6 +345,7 @@ describe("tokensOffMeter", () => {
       uncls: 0,
       runs: 0,
       cloudRuns: 0,
+      unknownRuns: 0,
     });
   });
 });

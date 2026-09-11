@@ -46,6 +46,17 @@ import { isDispatchStart, isDispatchComplete } from "../../lib/flow";
  * protect: a number that silently under-counts (or over-credits) is the
  * failure mode the whole viewer-port arc is fixing, so don't "simplify" this
  * away.
+ *
+ * (#2637) The RUN count gets the same three-way treatment, not just a
+ * `runs`/`cloudRuns` pair — `unknownRuns` is the run-level analog of
+ * `unknown`. Before this, no consumer could tell "positively local" from
+ * "unattributed" among runs, and `hybridNote` derived local runs as
+ * `runs - cloudRuns` — the exact residual-absorbs-everything mistake #1607
+ * already ruled out for tokens, recurring one field over. Same rule here: a
+ * run counts as `cloudRuns` when its own bookend named an endpoint,
+ * `unknownRuns` when it has no positive evidence either way, and is
+ * otherwise implicitly local (`runs - cloudRuns - unknownRuns` — never a
+ * residual credited by default).
  */
 
 import type { FlowRecord } from "../../types/handwritten";
@@ -74,6 +85,10 @@ export interface TokensOffMeter {
   uncls: number;
   runs: number;
   cloudRuns: number;
+  /** (#2637) Runs with no positive evidence either way — same "unknown,
+   * not free" honesty as `unknown` above, at run granularity. Excluded from
+   * both `cloudRuns` and the implicit local count; never guessed. */
+  unknownRuns: number;
 }
 
 /** (#2206/#2207, slop-chop pilot) Does this dispatch payload carry ANY
@@ -186,8 +201,16 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   let reread = 0;
   let uncls = 0;
   let cloudRuns = 0;
+  let unknownRuns = 0;
   for (const [k, recs] of sess) {
+    // (#2637) Mutually exclusive with the implicit-local fallthrough below:
+    // cloud when this session's bookend named an endpoint, unknown when it
+    // has no positive local evidence (`localSids`) either — a sessionless
+    // composite key (`k` has no real `session_id`) can never be in
+    // `localSids`, so it always lands here, same as the token-level
+    // classification above treats a sessionless record as unknown.
     if (epBySid.has(k)) cloudRuns++;
+    else if (!localSids.has(k)) unknownRuns++;
     const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
     if (recs.every((p) => p.turn_seq != null)) {
       const turns = recs.slice().sort((a, b) => (a.turn_seq as number) - (b.turn_seq as number));
@@ -222,13 +245,20 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // sibling under the same task-scoped sid happened to name an endpoint.
   // Each `dcTok` payload IS itself the `dispatch.complete` record that
   // proves its own classification, so it needs no session-level lookup.
-  // The `unknown` branch stays a defensive floor: a payload lacking
-  // `endpoint` satisfies the exact same criterion `localSids` used to add
-  // this sid (`isDispatchComplete` + no `endpoint`, on this very record),
-  // so `!localSids.has(sid)` should never fire — kept anyway rather than
-  // assuming that invariant can't drift, same posture as before. One turn
-  // means the whole prompt is first-read, so `fresh += prompt` is exact
-  // here, not an approximation.
+  // The `unknown`/`unknownRuns` branch stays a defensive floor: a payload
+  // lacking `endpoint` satisfies the exact same criterion `localSids` used
+  // to add this sid (`isDispatchComplete` + no `endpoint`, on this very
+  // record), so `!localSids.has(sid)` should never fire — kept anyway
+  // rather than assuming that invariant can't drift, same posture as
+  // before. Concretely: `unknownRuns++` here is NOT a second live
+  // contribution symmetric with the `sess`-loop classification above —
+  // it is structurally unreachable under the current invariant (proved by
+  // mutation: deleting it leaves `savings.test.ts` green). `unknownRuns`
+  // has exactly ONE live producer today, the `sess`-loop branch a few dozen
+  // lines up; this one is kept for the same reason its sibling `unknown +=
+  // tt` always was — a floor against the invariant drifting, not evidence
+  // it currently does anything. One turn means the whole prompt is
+  // first-read, so `fresh += prompt` is exact here, not an approximation.
   let directRuns = 0;
   for (const [sid, payloads] of dcTok) {
     if (sess.has(sid)) continue;
@@ -243,6 +273,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
         cloudRuns++;
       } else if (!localSids.has(sid)) {
         unknown += tt;
+        unknownRuns++; // (#2637) same "unknown, not free" at run granularity
       }
       // Known, currently-inert gap: a completion that itself carries no
       // `endpoint` but whose endpoint-bearing `dispatch.start` sibling has
@@ -278,5 +309,6 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     uncls,
     runs: sess.size + directRuns,
     cloudRuns,
+    unknownRuns,
   };
 }

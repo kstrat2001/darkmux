@@ -23,17 +23,17 @@ TOKENS · LAST 24H
 LOCAL TOKENS
 396,926
 CLOUD TOKENS
-0
+2,209
 UNATTRIBUTED
-92k
+93k
 GENERATED
-15k
+16k
 FRESH INPUT
 0
 RE-READ
 308k
 UNCLASSIFIED
-16
+17
 DISPATCHES
 Orchestrator note: 13 dispatches local + 3 via cloud. The hybrid loop is humming, keep it up.
 MacBook-Pro

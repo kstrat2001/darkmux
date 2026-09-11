@@ -19,6 +19,7 @@ const ZERO_TOKENS: TokensOffMeter = {
   uncls: 0,
   runs: 0,
   cloudRuns: 0,
+  unknownRuns: 0,
 };
 
 describe("hybridNote", () => {
@@ -75,5 +76,62 @@ describe("hybridNote", () => {
     const note = hybridNote([], ZERO_TOKENS);
     expect(note.text).toBe("going hybrid takes nerve. the fleet is ready when you are.");
     expect(note.hasHistory).toBe(false);
+  });
+
+  // (#2637) The issue's own reproduction: `local=1000 cloud=5700 unknown=1200
+  // runs=5 cloudRuns=2` rendered "3 dispatches local + 2 via cloud" — crediting
+  // both unattributed sessions to "local". With `unknownRuns` in the picture,
+  // the true local count is 5 - 2 - 2 = 1.
+  it("(#2637) unattributed sessions are excluded from the local count, not credited to it", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2, unknownRuns: 2 });
+    expect(note.text).toBe("1 dispatch local + 2 via cloud. The hybrid loop is humming, keep it up.");
+    // Never claim anything about the two unattributed sessions — no mention
+    // of "unattributed"/"unknown" and no implication they were free.
+    expect(note.text).not.toMatch(/unattributed|unknown|free/i);
+  });
+
+  it("(#2637) a mix of local and cloud runs with NO unattributed sessions is unaffected by the fix", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2, unknownRuns: 0 });
+    expect(note.text).toBe("3 dispatches local + 2 via cloud. The hybrid loop is humming, keep it up.");
+  });
+
+  it("(#2637) local + unattributed, no cloud at all — the unattributed count is silently excluded, never folded into local", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 0, unknownRuns: 2 });
+    expect(note.text).toBe("3 local dispatches. The hybrid loop is humming, keep it up.");
+  });
+
+  it("(#2637) cloud + unattributed, no local at all — the unattributed count is silently excluded, never folded into cloud", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 3, unknownRuns: 2 });
+    expect(note.text).toBe("3 dispatches via cloud. The right brain for the job, keep it up.");
+  });
+
+  it("(#2637) every run this window is unattributed — a dedicated honest line, not a local-only or cloud-only guess", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 4, cloudRuns: 0, unknownRuns: 4 });
+    expect(note.text).toBe("4 dispatches just getting started. The fleet is warming up, keep it up.");
+    expect(note.text).not.toMatch(/\blocal\b|\bcloud\b|\bfree\b|\bunattributed\b|\bunknown\b|\bconfirm\b/i);
+  });
+
+  // (post-review CONSIDER) The all-unattributed branch is NOT a rare edge
+  // case — it's what a fresh window looks like before any dispatch's
+  // bookend has posted an endpoint, and it renders on the public demo
+  // (first ~2% of the replay). Its copy must match the upbeat register of
+  // its two siblings above (a short observation + ", keep it up.") rather
+  // than reading as a diagnostic ("no attribution darkmux could confirm").
+  it("(post-review) the all-unattributed line matches its siblings' upbeat register, not a diagnostic one", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 1, cloudRuns: 0, unknownRuns: 1 });
+    expect(note.text).toBe("1 dispatch just getting started. The fleet is warming up, keep it up.");
+    expect(note.text).toMatch(/keep it up\.$/);
+  });
+
+  // (post-review CONSIDER, PROVEN) `hybridNote` takes its `TokensOffMeter`
+  // argument as given — it does not re-derive `unknownRuns` from `data`, so
+  // a caller-supplied struct where `unknownRuns` overcounts relative to
+  // `runs`/`cloudRuns` must not render a negative dispatch count.
+  // `hybridNote([], { runs: 2, cloudRuns: 2, unknownRuns: 1 })` rendered
+  // "-1 dispatches local + 2 via cloud." before the `Math.max(0, …)` clamp.
+  it("(post-review) a hostile TokensOffMeter (unknownRuns overcounting) never renders a negative dispatch count", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 2, cloudRuns: 2, unknownRuns: 1 });
+    expect(note.text).not.toMatch(/-\d/);
+    expect(note.text).toBe("2 dispatches via cloud. The right brain for the job, keep it up.");
   });
 });

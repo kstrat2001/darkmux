@@ -10,7 +10,12 @@
  *  2. The latest `mission.run*` record's mission — a deterministic
  *     template naming the mission.
  *  3. A deterministic template keyed on the local/cloud run split
- *     (`t.runs`/`t.cloudRuns`) — local-only, cloud-only, or a mixed count.
+ *     (`t.runs`/`t.cloudRuns`/`t.unknownRuns`) — local-only, cloud-only, a
+ *     mixed count, or (#2637) an all-unattributed line when neither local
+ *     nor cloud has any positive evidence. Unattributed runs are otherwise
+ *     left OUT of this template's local/cloud narrative rather than folded
+ *     into either side — see the comment on the branching below for why
+ *     silence, not a third number, is the honest choice here.
  *  4. An invitation, at zero.
  *
  * Deterministic templates only (no generation); the ONE real free-text
@@ -75,16 +80,60 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
   }
 
   if (t.runs) {
-    const lr = t.runs - t.cloudRuns;
+    // (#2637) `lr` is runs with POSITIVE local evidence — total minus both
+    // cloud AND unattributed, never a residual that silently absorbs
+    // whatever isn't cloud. `t.unknownRuns` never appears as a number in
+    // this template: mentioning it here as a bare figure would either read
+    // as a third bucket nobody asked about, or tempt a reader into assuming
+    // it means "neither, so it must be free" (or "cloud", or "local") —
+    // exactly what darkmux must not imply. When there is nothing POSITIVE
+    // to say about either side, the dedicated all-unattributed branch below
+    // says so plainly instead of guessing.
+    //
+    // The DISPATCHES chip (`t.runs`) sits right next to this note and is
+    // real, adjacent evidence that unattributed sessions are counted
+    // *somewhere* on this card — but it is weaker cover than "exhaustive"
+    // implies: the chip carries no qualifier naming what it counts (an
+    // operator has to notice a local+cloud+unattributed gap and infer it),
+    // no chip on this card names unattributed RUNS specifically (the
+    // UNATTRIBUTED tile is a TOKEN count, a different unit), and `t.runs`
+    // itself under-counts in general — a dispatch whose completion carries
+    // no token totals and emits no telemetry contributes 0 to `runs` too.
+    // So this omission clears "describe, don't adjudicate" cleanly, but
+    // "record exhaustively, display selectively" only partially: the
+    // record this note leans on is real but incomplete, not a full ledger.
+    //
+    // Clamped at zero: a caller-supplied `TokensOffMeter` with
+    // `unknownRuns` overcounting relative to `runs`/`cloudRuns` (this
+    // function takes the struct as given, it doesn't re-derive it) must
+    // never render a negative dispatch count — see the guard test below.
+    const lr = Math.max(0, t.runs - t.cloudRuns - t.unknownRuns);
     const d = (n: number) => `dispatch${n === 1 ? "" : "es"}`;
-    if (!t.cloudRuns) {
-      return { text: `${t.runs} local ${d(t.runs)}. The hybrid loop is humming, keep it up.`, hasHistory };
+    if (lr && t.cloudRuns) {
+      return {
+        text: `${lr} ${d(lr)} local + ${t.cloudRuns} via cloud. The hybrid loop is humming, keep it up.`,
+        hasHistory,
+      };
     }
-    if (!lr) {
-      return { text: `${t.runs} ${d(t.runs)} via cloud. The right brain for the job, keep it up.`, hasHistory };
+    if (lr) {
+      return { text: `${lr} local ${d(lr)}. The hybrid loop is humming, keep it up.`, hasHistory };
     }
+    if (t.cloudRuns) {
+      return { text: `${t.cloudRuns} ${d(t.cloudRuns)} via cloud. The right brain for the job, keep it up.`, hasHistory };
+    }
+    // Neither side has any positive evidence — every run this window is
+    // unattributed. This branch is NOT rare in practice: it is what a fresh
+    // window looks like before any dispatch's bookend has posted an
+    // endpoint (an in-flight dispatch is unattributed by construction until
+    // it closes), so it renders on ordinary, healthy activity — including
+    // the public demo's own replay, which opens on exactly this state (see
+    // the parity corpus's dedicated in-flight fixture, #2637 follow-up).
+    // The copy therefore stays in the SAME upbeat, non-diagnostic register
+    // as its two siblings above (a short observation + ", keep it up.") —
+    // it must never read like an error state, and it must still never say
+    // or imply local, cloud, or free.
     return {
-      text: `${lr} ${d(lr)} local + ${t.cloudRuns} via cloud. The hybrid loop is humming, keep it up.`,
+      text: `${t.runs} ${d(t.runs)} just getting started. The fleet is warming up, keep it up.`,
       hasHistory,
     };
   }
