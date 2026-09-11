@@ -393,12 +393,18 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  *   start/end span, but not process-exclusive to it: since schema 1.42.0
  *   / #2413, `machine.telemetry` is a single MACHINE-scoped sampler with
  *   no `session_id` to join on, so the samples inside that window are the
- *   whole machine's readings during that span, host-wide (#2647 tracks
- *   giving that window real process exclusivity, or being explicit in the
- *   UI that it can't have any). The daemon's own window spans unrelated
- *   time before/after it; only `now` is overridden by the daemon's live
- *   reading when present, since the daemon is always the freshest possible
- *   "right this instant" number.
+ *   whole machine's readings during that span, host-wide. #2647 weighed
+ *   making that window genuinely process-exclusive against being explicit
+ *   in the UI that it can't have any — the former would mean reintroducing
+ *   the per-dispatch sampler #2413 retired specifically for its cost
+ *   (37,455 records/day) and for violating the observer-must-not-perturb-
+ *   the-observed doctrine, so #2647 lands on the latter: every surface
+ *   that names this scope (this doc, the footnote below, and the gauges'
+ *   own `aria-label`s — see `gaugeAriaScope` in `useMachineStatsContent`)
+ *   says "host-wide," not exclusive to this dispatch. The daemon's own
+ *   window spans unrelated time before/after it; only `now` is overridden
+ *   by the daemon's live reading when present, since the daemon is always
+ *   the freshest possible "right this instant" number.
  * - Every other route — mission included, per #2559: a mission route has no
  *   server-side join to bound it to a window at all, so it takes this same
  *   branch as fleet/console/runs/playback — the daemon's `window` IS the
@@ -412,11 +418,11 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  *
  * The boolean param is named for what it actually gates (a dispatch
  * route's own time-windowed join — narrower than the rolling window every
- * other route uses, though not process-exclusive within that window; see
- * #2647), not for which routes call it `true` — kept generic rather than
- * importing `Route` here, since the decision of WHICH routes pass `true`
- * belongs to the caller (`useMachineStatsContent`'s `isDispatch`), not to
- * this merge rule.
+ * other route uses, though not process-exclusive within that window, per
+ * #2647's resolution above), not for which routes call it `true` — kept
+ * generic rather than importing `Route` here, since the decision of WHICH
+ * routes pass `true` belongs to the caller (`useMachineStatsContent`'s
+ * `isDispatch`), not to this merge rule.
  */
 export function effectiveHostAggregate(
   isDispatch: boolean,
@@ -601,6 +607,32 @@ export function useMachineStatsContent({
     !isDispatch && daemonLoad != null
       ? daemonWindowLabel(daemonLoad.window?.span_ms ?? 0)
       : scope.scopeLabel;
+  // (#2647) The gauges' `aria-label`s are a SECOND surface naming this same
+  // scope, reachable without ever passing through the footnote text node —
+  // a screen-reader user who reaches a gauge (in browse mode; the SVG
+  // carries no `tabindex` and `role="img"` is not itself focusable, so this
+  // isn't reached by tabbing) hears this label as the WHOLE contribution of
+  // that image node: `role="img"` on the SVG (`Meter.tsx`) prunes the
+  // element's own descendants from the accessibility tree (verified via
+  // CDP — the image node reports zero children), so none of the SVG's own
+  // internals (paths, needle, etc.) are announced piecemeal. That does NOT
+  // silence the caption or the avg/max numerals next to it — `Meter.tsx`
+  // renders those as plain text SIBLINGS after the closing `</svg>`, not
+  // nested inside it, so they are announced too, right after the image
+  // label, as their own separate nodes. So on a dispatch route the bare
+  // label was still A false claim reachable on its own, just not the only
+  // thing read aloud. Bare `scopeLabel` ("this dispatch") makes exactly the
+  // false process-exclusivity implication the #2559 review fix pass
+  // corrected in the footnote (`meterFootnote` below) and in this file's
+  // own doc comments, but left standing here — since #2413, the samples
+  // inside a dispatch route's join window are the whole machine's, not
+  // that one process's (see `effectiveHostAggregate`'s doc and #2647).
+  // Every other route's `scopeLabel` already carries no ownership claim to
+  // correct (mission dropped "this mission" in #2559; fleet/console/runs/
+  // playback never had one), so this only branches on `isDispatch`.
+  const gaugeAriaScope = isDispatch
+    ? `${scopeLabel}'s window, host-wide`
+    : scopeLabel;
   // (#2270, narrowed to dispatch-only by #2559) `HostExtras` (below) renders
   // thermal/power/energy off `daemonLoad` DIRECTLY, unconditionally on every
   // route — see that component's own doc for why (those readings are never
@@ -655,7 +687,7 @@ export function useMachineStatsContent({
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
-        ariaLabel={`CPU: ${scopeLabel}`}
+        ariaLabel={`CPU: ${gaugeAriaScope}`}
         {...compactMeterProps(
           "CPU",
           "mm-gauge-fill-compact",
@@ -667,7 +699,7 @@ export function useMachineStatsContent({
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
-        ariaLabel={`GPU: ${scopeLabel}`}
+        ariaLabel={`GPU: ${gaugeAriaScope}`}
         {...compactMeterProps(
           "GPU",
           "mm-gauge-fill-compact",
@@ -679,7 +711,7 @@ export function useMachineStatsContent({
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
-        ariaLabel={`MEM: ${scopeLabel}`}
+        ariaLabel={`MEM: ${gaugeAriaScope}`}
         warnAt={MEM_WARN_AT}
         criticalAt={MEM_CRITICAL_AT}
         {...compactMeterProps(
@@ -913,9 +945,9 @@ export function useMachineStatsContent({
   // premise that its gauges were genuinely mission-scoped the way a
   // dispatch's are. They never were (`machineDrawerScope.ts`'s module doc
   // has the full story), so `isDispatch` no longer includes it — a mission
-  // route now falls to the single-sentence branch below, unconditionally,
-  // exactly like fleet/console/runs/playback: no clause on this panel
-  // claims a "this mission" scope any more.
+  // route now falls to the plain single-sentence branch below,
+  // unconditionally, exactly like fleet/console/runs/playback: no clause on
+  // this panel claims a "this mission" scope any more.
   //
   // The split branch also says "current and host-wide" rather than plain
   // "current": on a dispatch route with a daemon reading,
@@ -923,10 +955,34 @@ export function useMachineStatsContent({
   // the gauges' large numbers included — with the daemon's own host-wide
   // sample. Saying only "current" there would repeat, one clause later,
   // exactly the scope conflation the sentence before it just corrected.
+  //
+  // (#2647 review follow-up, MUST FIX) The split above is gated on
+  // `extrasWindowLabel != null` — i.e. on a daemon reading actually
+  // existing — but #2646/#2655 only ever wrote the CORRECTED text into that
+  // branch. A dispatch route with NO daemon reading at all
+  // (`runtime.host_sampler_interval_ms: 0`, a daemon that predates the
+  // sampler or is unreachable, or simply the first open of the drawer
+  // before the 3s poll resolves — none of these are exotic) fell through to
+  // the PLAIN branch below, which makes exactly the bare "Measured over
+  // this dispatch" ownership claim this issue exists to remove, on a path
+  // reachable every time a dispatch drawer is opened before its first poll
+  // lands. It also claimed the thermal peak, power avg/p95/max, energy,
+  // lit thermal state, W now, CPU cluster readings and GPU clock/memory —
+  // none of which render at all in this state, since `HostExtras` returns
+  // null outright when `load` is null (see that component's own doc) and
+  // `gpuMhz`/`gpuMem` above are `null` too. A THIRD branch is required:
+  // `isDispatch` with no daemon reading gets the host-wide correction
+  // (matching `gaugeAriaScope` right above) but drops every claim about a
+  // reading that isn't on the page — only the gauges' own avg/max (from
+  // `scope.samples`, this dispatch's own join window) and "memory free for
+  // AI" (from `specs`, independent of `daemonLoad` entirely) are named,
+  // because those are the only two facts this state actually shows.
   const meterFootnote = scopeLabel ? (
     <div className="machine-drawer__footnote">
-      {isDispatch && extrasWindowLabel != null
-        ? `Measured over ${scopeLabel}'s window — each gauge's avg and max, host-wide. Thermal, power and energy cover a different window: the daemon's host-wide sampler's last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+      {isDispatch
+        ? extrasWindowLabel != null
+          ? `Measured over ${scopeLabel}'s window — each gauge's avg and max, host-wide. Thermal, power and energy cover a different window: the daemon's host-wide sampler's last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+          : `Measured over ${scopeLabel}'s window, host-wide — each gauge's avg and max. Everything else is current: the large number on each gauge and the memory free for AI.`
         : `Measured over ${scopeLabel} — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
     </div>
   ) : null;

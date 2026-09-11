@@ -16,7 +16,15 @@
  *   sampler carries no `session_id` (or any other dispatch-identifying
  *   field) at all, so the join genuinely bounds the WINDOW to this
  *   dispatch but not the SAMPLES to it — they're the whole machine's
- *   readings during that span, host-wide; #2647 tracks that gap.
+ *   readings during that span, host-wide. #2647 concluded that gap can't
+ *   be closed at the data layer without reintroducing the per-dispatch
+ *   sampler #2413 retired (cost + the observer-must-not-perturb-the-
+ *   observed doctrine both argue against it), so the resolution is
+ *   display-only: `scopeLabel` below still names the WINDOW ("this
+ *   dispatch"), and every consumer that turns it into user-facing text
+ *   (`machineStatsContent.tsx`'s footnote and its gauge `aria-label`s)
+ *   qualifies it with "host-wide" rather than letting the window claim
+ *   read as a sample-ownership claim.
  * - On EVERY other route — including a mission (`#mission=<id>`) route — the
  *   window is a ROLLING last-10-minutes tail of the live flow window, scoped
  *   to the local machine only (a hub serving a fleet's flow stream carries

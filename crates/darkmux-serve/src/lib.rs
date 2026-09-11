@@ -3465,6 +3465,17 @@ struct HostSampleJoinStats {
 /// `dispatch.start` — the run-detail pane's own "no host samples" tile
 /// covers that case, not a synthesized window here.
 ///
+/// (#2647) This join bounds the WINDOW to the session, never the SAMPLES:
+/// `machine.telemetry` carries no dispatch-identifying field to filter on
+/// (schema 1.42.0 / #2413), so a second dispatch running concurrently on
+/// the same machine contributes its own activity to this window too. #2647
+/// concluded that gap can't close without reintroducing the per-dispatch
+/// sampler #2413 retired for its cost (37,455 records/day) and for
+/// violating the observer-must-not-perturb-the-observed doctrine — so the
+/// fix is the UI naming the samples "host-wide" rather than this join
+/// pretending to exclude them (`ui/src/components/machineStatsContent.tsx`'s
+/// `effectiveHostAggregate` doc + gauge `aria-label`s).
+///
 /// `now_ms` is the request time (`current_millis()` at the real call site,
 /// injected here for testability) — see the `end_ms` computation below for
 /// why an open/abandoned run needs it.
