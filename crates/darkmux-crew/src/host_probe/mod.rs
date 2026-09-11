@@ -1067,9 +1067,10 @@ mod tests {
     // was never wrong about a developer's own machine. Set the env var
     // locally (or in a workflow running on real Apple Silicon) to restore
     // the strict check; documented as a test-only knob in
-    // docs/ENVIRONMENT.md. Unconditional either way: no panic, the cost
-    // budget, and every field in range or `None` — the degradation
-    // contract this module exists to guarantee.
+    // docs/ENVIRONMENT.md. Unconditional either way: no panic, and every
+    // field in range or `None` — the degradation contract this module
+    // exists to guarantee. The cost budget below is gated by its own,
+    // differently-shaped knob — see `expect_tight_host_probe_budget`.
     // Only called from the aarch64-gated live-probe test below — cfg-gated
     // the same way so a non-Apple-Silicon TEST build doesn't flag it as
     // dead code under `-D warnings` (the same class of finding as #1's
@@ -1080,11 +1081,100 @@ mod tests {
         std::env::var("DARKMUX_EXPECT_IOREPORT").as_deref() == Ok("1")
     }
 
+    // (#2631, round 2: the opt-in-by-hand shape was itself a defect) The
+    // cost-budget assertion below measures the probe's own wall-clock stamp
+    // — the number that makes the observability doctrine's "the observer
+    // must not perturb the observed" claim checkable at all (see CLAUDE.md's
+    // "observer must not join the observed"). Round 1 re-aimed the gate from
+    // "are we under coverage" (measured false — instrumentation never
+    // touches the foreign `mach`/`sysctl`/IOReport calls that dominate this
+    // probe's cost) to "can we vouch for this host", via an opt-in env var
+    // that DEFAULTED TO THE LOOSE 300ms CEILING EVERYWHERE, because nothing
+    // — no workflow, no script, no harness — ever sets it. That made 300ms
+    // the only cost guard this module has, on every machine, including the
+    // developer's own. A reviewer proved it: a 250ms `sleep` inserted at the
+    // top of `sample()` (a stand-in for a genuine regression IN THE PROBE
+    // ITSELF, not host noise) passes clean under the unset default.
+    //
+    // Fix: stop asking the operator to opt in by hand and use a
+    // discriminator the probe already computes for free.
+    // `sources().ioreport` is exactly "did IOReport resolve" — the same
+    // fact `expect_ioreport` above already treats as "this is a real Apple
+    // Silicon Mac, not a GitHub-hosted VM" (#2108). So the tight 60ms
+    // ceiling is now the DEFAULT wherever IOReport resolves — every
+    // developer machine, every dedicated/self-hosted Apple Silicon runner,
+    // no env var required — and the relaxed 300ms ceiling is the fallback
+    // ONLY where the probe itself reports it can't vouch for the host (a
+    // GitHub-hosted `macos-latest` VM, which has no IOReport channels).
+    // `DARKMUX_EXPECT_TIGHT_HOST_BUDGET` still exists as an explicit
+    // override for the case the discriminator gets wrong in either
+    // direction: `1` forces tight even where IOReport didn't resolve, `0`
+    // forces relaxed even where it did (e.g. a self-hosted runner that has
+    // real hardware but is shared with other contending jobs). Documented
+    // as a test-only knob in docs/ENVIRONMENT.md. Both thresholds are real
+    // `assert!`s in every case — there is no silent skip in either branch.
+    //
+    // The relaxed 300ms ceiling is still only a partial guard, not a full
+    // one: it catches a full reintroduction of the pre-#2108 ~780ms
+    // four-spawn shell-out path with room to spare, but a PARTIAL
+    // reintroduction (one or two spawns instead of four, at ~195ms each per
+    // that same measurement) could plausibly land under it. That gap is
+    // accepted, not hidden, for hosts this probe can't vouch for; the real
+    // guarantee is the tight ceiling, which is now the default for the
+    // hosts that matter (see above).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn expect_tight_host_probe_budget(ioreport_resolved: bool) -> bool {
+        match std::env::var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => ioreport_resolved,
+        }
+    }
+
+    // Exhaustive, fast (no real probe involved), and exercises both
+    // directions of the discriminator plus both override directions —
+    // doesn't depend on running on hardware that actually lacks IOReport
+    // (nothing on hand does) to prove the "can't vouch for this host"
+    // branch is reachable and real. `#[serial]`: mutates process-global env.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[serial_test::serial]
+    fn tight_host_probe_budget_follows_the_ioreport_discriminator_unless_overridden() {
+        let saved = std::env::var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET");
+        std::env::remove_var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET");
+        assert!(
+            expect_tight_host_probe_budget(true),
+            "IOReport resolved + no override ⇒ tight by default (this is the fix: round 1 never reached this branch)"
+        );
+        assert!(
+            !expect_tight_host_probe_budget(false),
+            "IOReport unresolved + no override ⇒ relaxed by default (the host we can't vouch for)"
+        );
+        std::env::set_var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET", "1");
+        assert!(
+            expect_tight_host_probe_budget(false),
+            "override=1 forces tight even where IOReport did not resolve"
+        );
+        std::env::set_var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET", "0");
+        assert!(
+            !expect_tight_host_probe_budget(true),
+            "override=0 forces relaxed even where IOReport resolved"
+        );
+        match saved {
+            Ok(v) => std::env::set_var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET", v),
+            Err(_) => std::env::remove_var("DARKMUX_EXPECT_TIGHT_HOST_BUDGET"),
+        }
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[serial_test::serial]
     fn real_probe_samples_within_the_cost_budget_and_in_range() {
         let mut probe = HostProbe::new();
+        // Sources resolve once at construction (`HostProbe::new`) and never
+        // change; read it now so the cost-budget discriminator below and the
+        // per-source assertions further down share the one snapshot.
+        let src = probe.sources();
         // First sample seeds the deltas; it reports no cpu_pct/power by design.
         let first = probe.sample();
         assert_eq!(
@@ -1106,9 +1196,58 @@ mod tests {
         let s = complete.expect("twenty samples");
         let mean = costs.iter().sum::<u64>() as f64 / costs.len() as f64;
         let max = *costs.iter().max().unwrap();
+        // (#2631 round 2) See `expect_tight_host_probe_budget` above for the
+        // full history, including the mutation that proved the round-1
+        // opt-in shape never actually applied the tight ceiling anywhere.
+        // Two REAL assertions — never a silent skip — chosen by a
+        // discriminator the probe already computed at construction
+        // (`src.ioreport`, snapshotted above), not by an env var nobody
+        // sets:
+        //   * IOReport resolved (`src.ioreport`, i.e. a real Apple Silicon
+        //     Mac — the same fact `expect_ioreport` treats as "this is not
+        //     a GitHub-hosted VM", #2108) — the DEFAULT on every such host:
+        //     60ms, the number this module's own measurements support with
+        //     wide margin (mean ~7.4ms).
+        //   * IOReport unresolved (a GitHub-hosted `macos-latest` VM, which
+        //     genuinely has none) — the fallback: 300ms, an order of
+        //     magnitude above the noise this same measurement pass observed
+        //     (23ms on one sample, otherwise single-digit), and comfortably
+        //     below the ~780ms a FULL pre-#2108 four-spawn shell-out path
+        //     cost. This fallback ceiling is a partial guard, not a full
+        //     one: a partial reintroduction (one or two spawns instead of
+        //     four) could plausibly land under it — accepted for hosts this
+        //     probe can't vouch for, not claimed as caught.
+        // `DARKMUX_EXPECT_TIGHT_HOST_BUDGET` overrides the discriminator in
+        // either direction (`1` forces tight, `0` forces relaxed) for the
+        // case it misjudges a specific host.
+        let (ceiling_ms, tier) = if expect_tight_host_probe_budget(src.ioreport) {
+            (60, "tight (IOReport resolved)")
+        } else {
+            (300, "relaxed (IOReport unresolved — can't vouch for this host)")
+        };
+        // Visibility for the number itself, independent of pass/fail and
+        // independent of `--nocapture` (which neither macOS CI job passes,
+        // so a bare `eprintln!` here would be silently discarded on a
+        // passing run — the exact gap that let the round-1 300ms default
+        // go unvalidated against any real environment). `GITHUB_STEP_SUMMARY`
+        // is a plain file path GitHub Actions sets on every job; appending
+        // to it works whether the test passes or fails and needs no test
+        // runner flag.
+        if let Ok(summary_path) = std::env::var("GITHUB_STEP_SUMMARY") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&summary_path) {
+                let _ = writeln!(
+                    f,
+                    "- `host_probe` cost budget: max {max} ms, mean {mean:.1} ms over {} samples \
+                     (tier: {tier}, ceiling {ceiling_ms} ms)",
+                    costs.len()
+                );
+            }
+        }
         assert!(
-            max < 60,
-            "the observer must stay negligible: max {max} ms, mean {mean:.1} ms over {} samples",
+            max < ceiling_ms,
+            "the observer must stay within its {tier} budget of {ceiling_ms}ms: \
+             max {max} ms, mean {mean:.1} ms over {} samples",
             costs.len()
         );
 
@@ -1119,7 +1258,6 @@ mod tests {
         for v in [s.mem_pct, s.gpu_pct].into_iter().flatten() {
             assert!(v <= 100, "percent field out of range: {v}");
         }
-        let src = probe.sources();
         assert!(src.mach, "mach counters are always available on macOS");
         assert!(src.thermal, "ProcessInfo.thermalState did not resolve");
         // Apple Silicon + IOReport is the configuration darkmux is marketed
@@ -1133,8 +1271,11 @@ mod tests {
         // IORegistry node — a fact about the VM, not a regression — so
         // these assertions are opt-in via `DARKMUX_EXPECT_IOREPORT=1`
         // (`expect_ioreport`, above). Everything outside this block still
-        // runs unconditionally: no panic, the cost budget, and every field
-        // in range or `None`.
+        // runs unconditionally: no panic, and every field in range or
+        // `None`. The cost budget above runs unconditionally too — as a
+        // real `assert!` in both cases — but at one of two thresholds
+        // depending on `expect_tight_host_probe_budget` (see above), which
+        // is a SEPARATE knob from this one.
         if expect_ioreport() {
             assert!(
                 src.ioreport,
