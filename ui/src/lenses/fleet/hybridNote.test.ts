@@ -19,6 +19,7 @@ const ZERO_TOKENS: TokensOffMeter = {
   uncls: 0,
   runs: 0,
   cloudRuns: 0,
+  unknownRuns: 0,
 };
 
 describe("hybridNote", () => {
@@ -75,5 +76,38 @@ describe("hybridNote", () => {
     const note = hybridNote([], ZERO_TOKENS);
     expect(note.text).toBe("going hybrid takes nerve. the fleet is ready when you are.");
     expect(note.hasHistory).toBe(false);
+  });
+
+  // (#2637) The issue's own reproduction: `local=1000 cloud=5700 unknown=1200
+  // runs=5 cloudRuns=2` rendered "3 dispatches local + 2 via cloud" — crediting
+  // both unattributed sessions to "local". With `unknownRuns` in the picture,
+  // the true local count is 5 - 2 - 2 = 1.
+  it("(#2637) unattributed sessions are excluded from the local count, not credited to it", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2, unknownRuns: 2 });
+    expect(note.text).toBe("1 dispatch local + 2 via cloud. The hybrid loop is humming, keep it up.");
+    // Never claim anything about the two unattributed sessions — no mention
+    // of "unattributed"/"unknown" and no implication they were free.
+    expect(note.text).not.toMatch(/unattributed|unknown|free/i);
+  });
+
+  it("(#2637) a mix of local and cloud runs with NO unattributed sessions is unaffected by the fix", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2, unknownRuns: 0 });
+    expect(note.text).toBe("3 dispatches local + 2 via cloud. The hybrid loop is humming, keep it up.");
+  });
+
+  it("(#2637) local + unattributed, no cloud at all — the unattributed count is silently excluded, never folded into local", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 0, unknownRuns: 2 });
+    expect(note.text).toBe("3 local dispatches. The hybrid loop is humming, keep it up.");
+  });
+
+  it("(#2637) cloud + unattributed, no local at all — the unattributed count is silently excluded, never folded into cloud", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 3, unknownRuns: 2 });
+    expect(note.text).toBe("3 dispatches via cloud. The right brain for the job, keep it up.");
+  });
+
+  it("(#2637) every run this window is unattributed — a dedicated honest line, not a local-only or cloud-only guess", () => {
+    const note = hybridNote([], { ...ZERO_TOKENS, runs: 4, cloudRuns: 0, unknownRuns: 4 });
+    expect(note.text).toBe("4 dispatches with no attribution darkmux could confirm. keep going.");
+    expect(note.text).not.toMatch(/\blocal\b|\bcloud\b|\bfree\b/i);
   });
 });

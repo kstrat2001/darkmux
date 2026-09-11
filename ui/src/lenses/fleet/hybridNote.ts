@@ -10,7 +10,12 @@
  *  2. The latest `mission.run*` record's mission — a deterministic
  *     template naming the mission.
  *  3. A deterministic template keyed on the local/cloud run split
- *     (`t.runs`/`t.cloudRuns`) — local-only, cloud-only, or a mixed count.
+ *     (`t.runs`/`t.cloudRuns`/`t.unknownRuns`) — local-only, cloud-only, a
+ *     mixed count, or (#2637) an all-unattributed line when neither local
+ *     nor cloud has any positive evidence. Unattributed runs are otherwise
+ *     left OUT of this template's local/cloud narrative rather than folded
+ *     into either side — see the comment on the branching below for why
+ *     silence, not a third number, is the honest choice here.
  *  4. An invitation, at zero.
  *
  * Deterministic templates only (no generation); the ONE real free-text
@@ -75,16 +80,36 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
   }
 
   if (t.runs) {
-    const lr = t.runs - t.cloudRuns;
+    // (#2637) `lr` is runs with POSITIVE local evidence — total minus both
+    // cloud AND unattributed, never a residual that silently absorbs
+    // whatever isn't cloud. `t.unknownRuns` never appears as a number in
+    // this template: the fleet total chip (`t.runs`) already records it
+    // exhaustively, so this note's job is only to describe what's actually
+    // known about the local/cloud split — mentioning "N unattributed" here
+    // would either read as a third bucket nobody asked about, or tempt a
+    // reader into assuming it means "neither, so it must be free" (or
+    // "cloud", or "local") — exactly what darkmux must not imply. When
+    // there is nothing POSITIVE to say about either side, the dedicated
+    // all-unattributed branch below says so plainly instead of guessing.
+    const lr = t.runs - t.cloudRuns - t.unknownRuns;
     const d = (n: number) => `dispatch${n === 1 ? "" : "es"}`;
-    if (!t.cloudRuns) {
-      return { text: `${t.runs} local ${d(t.runs)}. The hybrid loop is humming, keep it up.`, hasHistory };
+    if (lr && t.cloudRuns) {
+      return {
+        text: `${lr} ${d(lr)} local + ${t.cloudRuns} via cloud. The hybrid loop is humming, keep it up.`,
+        hasHistory,
+      };
     }
-    if (!lr) {
-      return { text: `${t.runs} ${d(t.runs)} via cloud. The right brain for the job, keep it up.`, hasHistory };
+    if (lr) {
+      return { text: `${lr} local ${d(lr)}. The hybrid loop is humming, keep it up.`, hasHistory };
     }
+    if (t.cloudRuns) {
+      return { text: `${t.cloudRuns} ${d(t.cloudRuns)} via cloud. The right brain for the job, keep it up.`, hasHistory };
+    }
+    // Neither side has any positive evidence — every run this window is
+    // unattributed. Say so plainly rather than defaulting to either the
+    // local-only or cloud-only template with a zero-dressed-up count.
     return {
-      text: `${lr} ${d(lr)} local + ${t.cloudRuns} via cloud. The hybrid loop is humming, keep it up.`,
+      text: `${t.runs} ${d(t.runs)} with no attribution darkmux could confirm. keep going.`,
       hasHistory,
     };
   }
