@@ -34,15 +34,26 @@
 //! `remote_chat_attempt`) by pid, registered before the blocking wait. This
 //! guard's `Drop` always reaps (best-effort, defensive default — a Drop
 //! reached still armed means something unexpected happened, so assume a
-//! child might still be alive). A launcher that runs its dispatch on a
-//! SEPARATE worker thread it can't safely join on a caught signal (review;
-//! now also `mission_launch.rs`'s generic-graph/coder-phase path) calls
-//! [`reap_and_exit_on_signal`] explicitly once its own terminal record is
-//! durable — see that function's own doc for why this is a launcher
-//! decision, not something the guard forces unconditionally in `close`. A
-//! launcher whose dispatch is a plain synchronous loop with its own
-//! between-units polling seam (the crawl launcher's, retired in #2301) never needed to call it at
-//! all — its own loop already stops cleanly once `close` runs.
+//! child might still be alive). The now-deleted dedicated review launcher
+//! genuinely ran its dispatch on a SEPARATE worker thread it deliberately
+//! abandoned on a caught signal (joining would block on the same call the
+//! signal is trying to escape) and called [`reap_and_exit_on_signal`]
+//! explicitly once its own terminal record was durable. **`mission_launch.
+//! rs`'s generic-graph/coder-phase path does NOT run this way** — #2248
+//! traced it: `launch()` drives its entire dispatch through
+//! `run_step_graph` synchronously, on its own thread, joined internally via
+//! `std::thread::scope` (see this module's own test suite, below, for the
+//! settling). It still calls `reap_and_exit_on_signal` at its own
+//! error/signal exit points, but only as the same no-op-unless-a-signal-
+//! was-observed backstop every other call site uses (see that function's
+//! own doc) — not because its dispatch is an unjoined worker thread. An
+//! earlier version of this paragraph claimed otherwise; #2248's own
+//! settling proved it wrong, corrected here rather than left standing next
+//! to the proof that contradicts it. A launcher whose dispatch is a plain
+//! synchronous loop with its own between-units polling seam (the crawl
+//! launcher's, retired in #2301) never needed to call
+//! `reap_and_exit_on_signal` at all — its own loop already stops cleanly
+//! once `close` runs.
 
 #[cfg(test)]
 use std::any::Any;
@@ -286,9 +297,15 @@ impl<A: FnMut()> Drop for LaunchFinalizeGuard<A> {
 /// Best-effort rendering of a caught `std::thread::JoinHandle::join()`
 /// panic payload — the two shapes `std::panic!`/`.expect()`/`.unwrap()`
 /// actually produce (`&'static str`, `String`); anything else names itself
-/// honestly rather than guessing. Shared by every launcher that supervises
-/// its dispatch on a worker thread (review; `mission_launch.rs`'s
-/// generic-graph/coder-phase path).
+/// honestly rather than guessing. The now-deleted dedicated review launcher
+/// was its only production caller — it genuinely ran its dispatch on a
+/// worker thread it deliberately abandoned on a caught signal and rendered
+/// that thread's join panic with this. `mission_launch.rs`'s
+/// generic-graph/coder-phase path never called this: #2248 traced its
+/// dispatch to a synchronous `run_step_graph` call, joined internally via
+/// `std::thread::scope`, never a worker thread of `launch()`'s own that
+/// this file's `LaunchFinalizeGuard` would need to render a join panic
+/// for.
 pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
@@ -302,6 +319,7 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crew;
     use std::cell::RefCell;
 
     #[test]
@@ -449,5 +467,317 @@ mod tests {
     fn panic_message_names_an_unrecognized_payload_honestly() {
         let payload: Box<dyn Any + Send> = Box::new(42i32);
         assert_eq!(panic_message(&*payload), "unknown panic payload");
+    }
+
+    // (#2248) SETTLING the suspected hazard: "can `LaunchFinalizeGuard::
+    // drop`'s ungated `kill_all(SIGKILL)` fire while a worker thread is
+    // still inside a live dispatch, turning a genuinely in-progress
+    // dispatch into a signal-killed one with no typed error to show for
+    // it?"
+    //
+    // `Drop`'s `kill_all` (in `impl Drop for LaunchFinalizeGuard` above)
+    // really is the only one of the (now six, not four — `child_registry::
+    // kill_all` grew two more call sites since #2248 was filed:
+    // `crates/darkmux-serve/src/lib.rs`'s `reap_dispatch_children_on_
+    // shutdown` calls `interrupt::mark_interrupted()` immediately before
+    // its own `kill_all`, and `crates/darkmux-crew/src/dispatch_internal.
+    // rs`'s tailer loop is already inside an `if interrupt::is_set()`
+    // block) `kill_all` call sites NOT gated on `interrupt::is_set()`. That
+    // part of the issue is still accurate.
+    //
+    // What is NOT accurate — traced here, not assumed — is that this guard
+    // can reach `Drop` while a dispatch is live. `LaunchFinalizeGuard` has
+    // exactly ONE production construction site in the whole tree:
+    // `mission_launch.rs:988`, inside `launch()`. That function calls
+    // `darkmux-crew::scheduler::run_step_graph` once PER PHASE (`for phase
+    // in &config.phases`, `mission_launch.rs:1306` — NOT "exactly once";
+    // an earlier version of this comment overclaimed that), each call
+    // synchronous and fully joined before the next phase's call begins —
+    // never a worker thread of `launch()`'s own. `run_step_graph`'s wave
+    // loop (`scheduler.rs:1348-1407`) runs each wave's dispatches inside
+    // `std::thread::scope`, blocking on `worker.join()` BEFORE the scope
+    // call returns. `std::thread::scope` guarantees every thread spawned
+    // inside it is joined before the scope call itself returns — normally
+    // OR via a panic — so `launch()`'s stack frame (where `guard` lives)
+    // cannot begin to unwind (the only way `Drop` fires) until every
+    // `run_step_graph` call so far has already returned, which in turn
+    // cannot happen until every worker thread of that call's every wave
+    // has already finished.
+    //
+    // A per-step panic doesn't reach `launch()`'s frame either, but NOT
+    // because anything in the production path catches it. Grepped
+    // exhaustively: every `catch_unwind` in `darkmux-crew` is test-only
+    // (`dispatch_reconciled.rs:702`, `concurrent_dispatch.rs:1082` —
+    // inside `ensure_wave_loaded_after_a_same_process_sibling_panics_
+    // protects_the_survivor_and_frees_the_doomed`, a #[test] fn, not
+    // production — and `step_kinds/builtins.rs:3929`). There is no
+    // production `catch_unwind` anywhere on the dispatch path. An earlier
+    // version of this comment claimed `concurrent_dispatch.rs:1082`
+    // catches a per-step panic in production; that was wrong, and is
+    // corrected here rather than left standing.
+    //
+    // What actually happens: a panicking job re-panics its wave's
+    // `thread::scope` on the IMPLICIT join at the end of that block, which
+    // unwinds the sibling track thread (`run_local_waves`/
+    // `run_capped_batches`, each spawned on `concurrent_dispatch.rs`'s own
+    // OUTER `thread::scope`). The EXPLICIT `let _ = h.join()` on each
+    // track handle (`concurrent_dispatch.rs:292/295/298`, #1452)
+    // deliberately ABSORBS that panic rather than re-propagating it — an
+    // explicit `JoinHandle::join()` does not re-panic the way an implicit
+    // scope-exit join does — and the missing result index is then
+    // reconciled to a terminal `Err` right after the scope returns
+    // (`concurrent_dispatch.rs` ~303-325), so the step surfaces as an
+    // ordinary step error, never an unwind that reaches `launch()`. A
+    // panic CAN still reach `launch()`'s own frame two other ways —
+    // `results.into_inner().expect(...)` (`concurrent_dispatch.rs` ~302)
+    // and `worker.join().expect(...)` (`scheduler.rs:1407`) each panic on
+    // the CALLER's thread if their own preconditions are somehow
+    // violated — but both sit AFTER every join inside `run_step_graph`'s
+    // own `thread::scope`, so even that unwind still can't begin until
+    // every worker thread has already finished, which is the property
+    // this guard's safety actually rests on.
+    //
+    // This pair of tests proves the mechanism with a REAL registered
+    // subprocess (not a mock), rather than asserting it from reading alone
+    // (per this codebase's own "inference stops at the boundary" doctrine
+    // — a claim about thread scheduling is a claim about the runtime, not
+    // about our own code, so it gets executed). The first test drives the
+    // REAL, production `crew::scheduler::run_step_graph` (a
+    // `procedural.shell` step — the same call `launch()` makes once per
+    // phase) rather than merely imitating its shape, and shows the
+    // guard's unconditional `Drop` kill finds nothing left alive to kill
+    // by the time `run_step_graph` has returned. An earlier version of
+    // this test built its own hand-rolled `thread::scope` instead of
+    // calling `run_step_graph` at all — a mutation that made the real
+    // wave loop unreachable (a `panic!` inserted immediately before
+    // `scheduler.rs:1348`'s `thread::scope`) left it green, proving
+    // nothing about the actual production code; this version fails under
+    // that exact mutation. The second test is NOT the production shape —
+    // `run_step_graph` never does this — it exists only to prove the
+    // first test is MEANINGFUL: with a bare, unjoined `thread::spawn` in
+    // place of `thread::scope`, the exact hazard #2248 asked about is
+    // real and reproducible. The difference between the two tests is the
+    // entire reason the hazard does not reach production.
+    /// (#2671 review MUST FIX 2) The version of this test that shipped
+    /// first built its OWN hand-rolled `thread::scope` mirroring
+    /// `run_step_graph`'s shape, rather than calling `run_step_graph`
+    /// itself — so it never actually exercised the production wave loop
+    /// it claimed to pin. Proven vacuous: inserting `panic!("MUTATION:
+    /// run_step_graph wave loop replaced");` immediately before
+    /// `scheduler.rs:1348`'s `let results = std::thread::scope(...)` —
+    /// making the entire wave loop unreachable — left `cargo test --bin
+    /// darkmux launch_guard::tests` at EXIT=0, 9 passed.
+    ///
+    /// This version drives the REAL, production `crew::scheduler::
+    /// run_step_graph` with a real `procedural.shell` step (Tier 1,
+    /// registered by `StepKindRegistry::with_builtins()`) — the same call
+    /// `launch()` makes once per phase (`mission_launch.rs:1508`). The
+    /// shell command echoes its own `sh -c` pid (which IS the pid
+    /// `bounded_command::run_bounded` registers with `child_registry` —
+    /// confirmed directly: a bare `sh -c '...'` execs without an
+    /// intermediate fork, so `$$` names the spawned process itself, not a
+    /// subshell) before sleeping briefly, so this test can look that exact
+    /// pid up in `child_registry` after `run_step_graph` returns, the same
+    /// way `launch()`'s own `guard` would find it. Under the reviewer's
+    /// mutation above, `run_step_graph` panics before ever running the
+    /// step, so the `.expect(...)` below never runs and this test fails —
+    /// unlike its predecessor.
+    #[test]
+    #[serial_test::serial] // `child_registry` is process-wide
+    #[cfg(unix)]
+    fn run_step_graph_actually_runs_the_real_wave_loop_and_drop_finds_no_live_child() {
+        darkmux_types::child_registry::reset_for_test();
+
+        let task = crew::types::Task {
+            run_on: crew::types::default_run_on(),
+            id: "t1".to_string(),
+            phase_id: "p1".to_string(),
+            description: "shell".to_string(),
+            display_name: None,
+            step_ids: vec!["s1".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let step = crew::types::Step {
+            id: "s1".to_string(),
+            task_id: "t1".to_string(),
+            gate: None,
+            kind: "procedural.shell".to_string(),
+            status: crew::types::NodeStatus::Planned,
+            // A real, registered child — `ProceduralShellStepKind::run`
+            // calls `bounded_command::run_bounded`, which registers the
+            // spawned `sh` pid with `child_registry` before blocking on
+            // it, the exact mechanism `LaunchFinalizeGuard::drop`'s
+            // `kill_all` targets. `echo`s its own pid, then sleeps 0.3s so
+            // it has a real, brief lifetime rather than completing
+            // instantly.
+            config: serde_json::json!({"command": "echo pid=$$; sleep 0.3"}),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let mut steps: std::collections::BTreeMap<String, crew::types::Step> =
+            [(step.id.clone(), step)].into_iter().collect();
+        let tasks: std::collections::BTreeMap<String, crew::types::Task> =
+            [(task.id.clone(), task)].into_iter().collect();
+
+        let registry = crew::step_kinds::StepKindRegistry::with_builtins();
+        let facts = crew::step_kinds::Facts::default();
+        let est = crew::step_kinds::FixedEstimator::default();
+
+        crew::scheduler::run_step_graph(
+            &mut steps,
+            &tasks,
+            &registry,
+            &facts,
+            &est,
+            1,
+            &|| {
+                panic!(
+                    "procedural.shell needs no model residency: the host factory must never \
+                     be called"
+                )
+            },
+            &mut |_r| {},
+            &mut |_step| {},
+            None,
+            None,
+            &[],
+        )
+        .expect("the shell step must complete against a real `sh -c` command");
+
+        assert_eq!(
+            steps["s1"].status,
+            crew::types::NodeStatus::Complete,
+            "sanity: the shell step must actually have run to completion, or nothing below \
+             proves anything about a live dispatch"
+        );
+        let stdout = steps["s1"].output.clone().unwrap_or_default();
+        let pid: u32 = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("pid=").and_then(|p| p.trim().parse().ok()))
+            .unwrap_or_else(|| panic!("sanity: expected a `pid=<n>` line in shell output, got: {stdout:?}"));
+
+        // By the time `run_step_graph` has returned — the only place a
+        // `LaunchFinalizeGuard` could possibly `Drop` in `launch()` — the
+        // shell step's child has ALREADY exited and been deregistered
+        // (`bounded_command::run_bounded` reaps + deregisters before
+        // returning). This is the state `launch()` is always in
+        // immediately after `run_step_graph` returns: nothing left alive
+        // for a still-armed guard's unconditional `kill_all` to reach.
+        assert!(
+            darkmux_types::child_registry::kill_pid(pid, 0).is_err(),
+            "the shell step's child must already be gone before a guard could ever Drop — \
+             there is no window where a live dispatch and an unwinding guard coexist on this \
+             thread"
+        );
+
+        let abort_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let abort_calls_for_writer = std::sync::Arc::clone(&abort_calls);
+        {
+            let guard = LaunchFinalizeGuard::new(move || {
+                abort_calls_for_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+            // Left armed on purpose (no `close()` call) — Drop's abort
+            // writer still fires as the backstop it's meant to be; the
+            // point of this test is that its `kill_all` has nothing left
+            // to kill, not that Drop never runs at all.
+            drop(guard);
+        }
+
+        assert_eq!(
+            abort_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Drop's abort writer still fires as the backstop it's designed to be"
+        );
+        assert!(
+            darkmux_types::child_registry::kill_pid(pid, 0).is_err(),
+            "the child must still be gone after Drop's kill_all ran — confirms the kill was a \
+             no-op, not a coincidence of timing"
+        );
+        darkmux_types::child_registry::reset_for_test();
+    }
+
+    /// NOT the production shape — `run_step_graph` never runs a dispatch
+    /// this way. This test exists purely to prove the test above is
+    /// meaningful: swap `thread::scope` + `.join()` for a bare, unjoined
+    /// `thread::spawn` (a launcher that fires dispatch on a worker thread
+    /// and does not wait for it before its own function can return/unwind)
+    /// and the #2248 hazard is real — `LaunchFinalizeGuard::drop`'s
+    /// unconditional `kill_all` reaches a child that is still genuinely
+    /// doing work, not one that already finished. `run_step_graph`'s choice
+    /// to use `thread::scope` (proven above) is what keeps this codebase on
+    /// the safe side of this line, not luck.
+    #[test]
+    #[serial_test::serial] // `child_registry` is process-wide
+    #[cfg(unix)]
+    fn an_unjoined_worker_thread_would_let_drop_kill_a_live_child_the_shape_scheduler_rs_avoids() {
+        darkmux_types::child_registry::reset_for_test();
+
+        let guard = LaunchFinalizeGuard::new(|| {});
+        // Deliberately far longer than anything this test's own deadlines
+        // below wait for — natural completion must NEVER be able to
+        // masquerade as the guard's kill. If this ever raced its own
+        // 30s natural exit, the assertions below would already have timed
+        // out and failed long before that could happen.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a real `sleep` child");
+        let pid = child.id();
+        darkmux_types::child_registry::register(pid);
+
+        // Detached: nothing waits for this before the "launcher" below
+        // considers itself done — the anti-pattern this file's own module
+        // doc and `spawn_reap_watchdog`'s doc warn a launcher's dispatch
+        // must never take.
+        let _detached = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        // Give the child a real head start so it is genuinely still
+        // working, not merely spawned.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let child_was_genuinely_alive = darkmux_types::child_registry::kill_pid(pid, 0).is_ok();
+
+        // `guard` drops HERE, still armed, while the `sleep 30` above is
+        // only ~150ms into its run — exactly the live-dispatch window
+        // #2248 asked whether the guard could observe.
+        drop(guard);
+
+        // Give the SIGKILL a moment to land — bounded well short of the
+        // child's own 30s natural exit, so "dead" here can only mean the
+        // guard's kill actually reached it, never a coincidence of timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut child_now_dead = false;
+        while std::time::Instant::now() < deadline {
+            if darkmux_types::child_registry::kill_pid(pid, 0).is_err() {
+                child_now_dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Best-effort cleanup regardless of what the assertions below find
+        // — never leave a `sleep 30` running past this test.
+        let _ = darkmux_types::child_registry::kill_pid(pid, darkmux_types::child_registry::SIGKILL);
+        darkmux_types::child_registry::reset_for_test();
+
+        assert!(
+            child_was_genuinely_alive,
+            "the child must have been genuinely alive/working before Drop — otherwise this test \
+             proves nothing about a live-dispatch race"
+        );
+        assert!(
+            child_now_dead,
+            "Drop's kill_all must have reached a child that was still ~29.85s from finishing on \
+             its own — this is the #2248 hazard, reproduced in the one shape that can exhibit it \
+             (an unjoined worker thread); `run_step_graph` never takes this shape (see the \
+             companion test above), which is why production never sees it"
+        );
     }
 }
