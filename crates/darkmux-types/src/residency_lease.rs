@@ -18,10 +18,35 @@
 //! — the same home-resolution convention as
 //! [`crate::dispatch_liveness`]'s `<darkmux-home>/liveness/<pid>.log`
 //! (honor `DARKMUX_HOME`, else `~/.darkmux`). Each file holds `{"pid":
-//! <pid>, "models": ["darkmux:foo", ...]}` — the process's CURRENT set of
-//! actively-dispatched-to models, overwritten wholesale on every
-//! [`write_lease`] call (the caller always passes its complete current set,
-//! never a delta).
+//! <pid>, "models": ["darkmux:foo", ...]}` — the UNION of every concurrent
+//! in-process holder's current set (see "same-process aggregation" below).
+//!
+//! # Same-process aggregation (#2651)
+//!
+//! A `darkmux acp` daemon process can have more than one dispatch in flight
+//! at once — `src/acp.rs` tracks `in_flight` per session and runs each
+//! `session/prompt` as its own spawned task, and `src/acp_panel.rs`'s
+//! ephemeral-panel path reaches [`LeaseGuard::acquire`] via
+//! `run_step_graph` → `run_local_waves` on its own `spawn_blocking` thread.
+//! Two such dispatches overlapping in the SAME process therefore hold TWO
+//! [`LeaseGuard`]s at once, both stamped with the SAME `std::process::id()`
+//! — the file is keyed by pid, not by holder.
+//!
+//! [`LeaseGuard::write`] and `Drop` account for this: each guard is minted a
+//! process-unique token at [`LeaseGuard::acquire`] and contributes its own
+//! current model set to a process-wide in-memory registry (`ACTIVE_LEASES`,
+//! keyed by token). The on-disk `<pid>.lease` file always reflects the
+//! UNION of every token currently registered — a guard's own
+//! [`LeaseGuard::write`] call replaces only ITS OWN contribution (still
+//! wholesale, never a delta, from that one caller's perspective), and its
+//! `Drop` removes only ITS OWN contribution, rewriting the file to the
+//! remaining union (or deleting it once the registry is empty — no holder
+//! left in this process). This is what makes two concurrent same-process
+//! dispatches safe: neither's write clobbers the other's, and neither's
+//! early completion deletes a lease the other still needs. See
+//! [`ACTIVE_LEASES`]'s own doc for the locking discipline that keeps every
+//! mutation — including one that unwinds through a panic — leave the
+//! registry and the on-disk file consistent.
 //!
 //! # `lms ps` stays the truth
 //!
@@ -59,8 +84,11 @@
 use crate::paths::expand_tilde;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LeaseFile {
@@ -68,39 +96,105 @@ struct LeaseFile {
     models: Vec<String>,
 }
 
-/// RAII guard releasing this process's lease file on drop — the clean-exit
-/// release half of the contract (the pid-liveness sweep in
-/// [`live_leased_models`] is the crash backstop for when `Drop` never
-/// runs). Acquire ONCE per command near the start of the window during
-/// which it will call [`write_lease`], and hold it for that window's
-/// lifetime — a normal return OR a panic-unwind through the holding scope
-/// both run `Drop`; only a hard crash (SIGKILL, power loss) leaves the
-/// lease for the sweep to reclaim.
+/// The process-wide same-process-aggregation registry (#2651): every
+/// currently-acquired [`LeaseGuard`] in THIS process contributes its own
+/// current model set here, keyed by its own unique token — never by pid,
+/// since every guard in one process shares the same pid. The on-disk
+/// `<pid>.lease` file is always the union of every value in this map.
+///
+/// Both [`LeaseGuard::write`] and `Drop` hold this mutex across their WHOLE
+/// critical section — map mutation AND the resulting file write/delete —
+/// so two concurrent callers can never interleave a stale union onto disk;
+/// whichever call finishes last always leaves the file matching the map's
+/// state as of that call. `.lock().unwrap_or_else(PoisonError::into_inner)`
+/// rather than a bare `.unwrap()`: nothing inside the critical section can
+/// itself panic (map mutation + a `Result`-returning file write, no
+/// arbitrary caller code runs while the lock is held), but recovering from
+/// poisoning defensively means a hypothetical future panic elsewhere never
+/// wedges every OTHER live holder's lease bookkeeping for the rest of the
+/// process's life.
+static ACTIVE_LEASES: LazyLock<Mutex<HashMap<u64, Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// RAII guard releasing this holder's OWN contribution to the process's
+/// residency lease on drop — the clean-exit release half of the contract
+/// (the pid-liveness sweep in [`live_leased_models`] is the crash backstop
+/// for when `Drop` never runs). Acquire ONCE per local track / standalone
+/// dispatch near the start of the window during which it will call
+/// [`LeaseGuard::write`], and hold it for that window's lifetime — a normal
+/// return OR a panic-unwind through the holding scope both run `Drop`; only
+/// a hard crash (SIGKILL, power loss) leaves the lease for the sweep to
+/// reclaim.
+///
+/// Multiple `LeaseGuard`s may be live at once IN THE SAME PROCESS (#2651 —
+/// see the module doc's "same-process aggregation" section): each is
+/// tracked independently via its own token, so one guard's `write`/`Drop`
+/// never clobbers or prematurely releases another's still-live contribution.
 pub struct LeaseGuard {
     pid: u32,
+    token: u64,
 }
 
 impl LeaseGuard {
-    /// Acquire a guard for the CURRENT process. Does not itself write a
-    /// lease file — pair with one or more [`write_lease`] calls while the
-    /// guard is held.
+    /// Acquire a guard for the CURRENT process, minting a token unique to
+    /// this acquisition. Does not itself write a lease file — pair with one
+    /// or more [`LeaseGuard::write`] calls while the guard is held.
     pub fn acquire() -> Self {
-        Self { pid: std::process::id() }
+        Self { pid: std::process::id(), token: NEXT_LEASE_TOKEN.fetch_add(1, Ordering::SeqCst) }
+    }
+
+    /// Write (or overwrite) THIS guard's own contribution with `models` —
+    /// the COMPLETE current set of `darkmux:*` identifiers IT is actively
+    /// dispatching to, not a delta from its own last call. Never a delta
+    /// against any OTHER concurrent guard's contribution either: the
+    /// on-disk file is recomputed as the union across every currently-live
+    /// guard's own wholesale set. Atomic (temp file + rename within the
+    /// same directory) so a concurrent reader never observes a
+    /// partially-written lease.
+    pub fn write(&self, models: &[String]) -> Result<()> {
+        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        active.insert(self.token, models.to_vec());
+        let union = union_of(&active);
+        write_lease_file(self.pid, &union)
     }
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        let _ = remove_lease(self.pid);
+        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        active.remove(&self.token);
+        // The lock stays held (`active` is not dropped early) through
+        // whichever file operation follows — matching `write`'s own
+        // discipline (see `ACTIVE_LEASES`'s doc) so a concurrent `write`/
+        // `Drop` on another guard can never interleave a stale result onto
+        // disk between this map mutation and its corresponding file write.
+        if active.is_empty() {
+            let _ = remove_lease(self.pid);
+        } else {
+            let union = union_of(&active);
+            let _ = write_lease_file(self.pid, &union);
+        }
     }
 }
 
-/// Write (or overwrite) this process's lease with `models` — the COMPLETE
-/// current set of `darkmux:*` identifiers it is actively dispatching to,
-/// not a delta. Atomic (temp file + rename within the same directory) so a
-/// concurrent reader never observes a partially-written lease.
-pub fn write_lease(models: &[String]) -> Result<()> {
-    let pid = std::process::id();
+/// Sorted, deduplicated union of every currently-registered holder's model
+/// set — sorted so the on-disk file (and every test asserting its content)
+/// is deterministic regardless of token-insertion order or `HashMap`
+/// iteration order.
+fn union_of(active: &HashMap<u64, Vec<String>>) -> Vec<String> {
+    let mut union: Vec<String> = active.values().flatten().cloned().collect();
+    union.sort();
+    union.dedup();
+    union
+}
+
+/// Write `models` to `<pid>.lease`, wholesale — the shared private I/O this
+/// module's TWO writers ([`LeaseGuard::write`] and its `Drop`, both already
+/// holding [`ACTIVE_LEASES`]'s lock when they call this) use, so the
+/// serialize-atomic-rename mechanics live in exactly one place.
+fn write_lease_file(pid: u32, models: &[String]) -> Result<()> {
     let dir = residency_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = lease_path(&dir, pid);
@@ -254,7 +348,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _env = EnvGuard::set(tmp.path());
 
-        write_lease(&["darkmux:foo".to_string(), "darkmux:bar".to_string()]).unwrap();
+        let guard = LeaseGuard::acquire();
+        guard.write(&["darkmux:foo".to_string(), "darkmux:bar".to_string()]).unwrap();
 
         // Read as if from some OTHER process (own_pid deliberately wrong —
         // the real test process's pid, which genuinely IS alive, stands in
@@ -271,7 +366,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _env = EnvGuard::set(tmp.path());
 
-        write_lease(&["darkmux:self-model".to_string()]).unwrap();
+        let guard = LeaseGuard::acquire();
+        guard.write(&["darkmux:self-model".to_string()]).unwrap();
 
         let own_pid = std::process::id();
         let models = live_leased_models(own_pid);
@@ -321,8 +417,8 @@ mod tests {
         let pid = std::process::id();
         let path = lease_path(&residency_dir(), pid);
         {
-            let _guard = LeaseGuard::acquire();
-            write_lease(&["darkmux:held".to_string()]).unwrap();
+            let guard = LeaseGuard::acquire();
+            guard.write(&["darkmux:held".to_string()]).unwrap();
             assert!(path.exists(), "the lease file exists while the guard is held");
         }
         assert!(!path.exists(), "the lease file is removed once the guard drops");
@@ -330,19 +426,21 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn write_lease_overwrites_the_complete_set_not_a_delta() {
+    fn a_single_holders_second_write_replaces_its_own_contribution_not_a_delta() {
         let tmp = TempDir::new().unwrap();
         let _env = EnvGuard::set(tmp.path());
 
-        write_lease(&["darkmux:a".to_string()]).unwrap();
-        write_lease(&["darkmux:b".to_string()]).unwrap();
+        let guard = LeaseGuard::acquire();
+        guard.write(&["darkmux:a".to_string()]).unwrap();
+        guard.write(&["darkmux:b".to_string()]).unwrap();
 
         let other_own_pid = std::process::id().wrapping_add(1);
         let models = live_leased_models(other_own_pid);
         assert_eq!(
             models,
             vec!["darkmux:b".to_string()],
-            "a second write_lease call replaces the set wholesale, never accumulates: {models:?}"
+            "a second write from the SAME guard replaces its own contribution wholesale, \
+             never accumulates: {models:?}"
         );
     }
 
@@ -354,5 +452,190 @@ mod tests {
 
         let models = live_leased_models(std::process::id());
         assert!(models.is_empty());
+    }
+
+    // ── #2651: same-process aggregation ─────────────────────────────────
+    //
+    // The race this fixes: `darkmux acp` can have more than one ephemeral
+    // panel dispatch in flight at once in the SAME process (`src/acp.rs`
+    // tracks `in_flight` per session; `src/acp_panel.rs`'s dispatch path
+    // reaches `LeaseGuard::acquire` via `run_step_graph` → `run_local_
+    // waves`, each on its own `spawn_blocking` thread). Before this fix,
+    // `write_lease` was a bare wholesale overwrite keyed only by
+    // `std::process::id()` — with no per-holder identity, a second
+    // concurrent guard's write silently clobbered the first's, and
+    // whichever guard dropped FIRST deleted the shared per-pid file even
+    // though the other was still actively dispatching. Confirmed against
+    // the pre-fix code (captured in the PR): `write_lease(&["darkmux:a"])`
+    // then `write_lease(&["darkmux:b"])` from two guards in one process
+    // left ONLY `["darkmux:b"]` visible to a concurrent reader, and
+    // dropping the first guard deleted the lease file outright.
+
+    /// Two concurrent in-process holders must UNION their contributions —
+    /// never clobber. Deleting the union step in `LeaseGuard::write` (i.e.
+    /// writing only `models` for the current call instead of the union
+    /// across `ACTIVE_LEASES`) reproduces the pre-fix clobber and fails
+    /// this test's first assertion the same way the pre-fix code failed
+    /// (`left: ["darkmux:b"], right: ["darkmux:a", "darkmux:b"]`).
+    #[serial_test::serial]
+    #[test]
+    fn two_concurrent_in_process_holders_union_rather_than_clobber() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        let guard_a = LeaseGuard::acquire();
+        guard_a.write(&["darkmux:a".to_string()]).unwrap();
+
+        let guard_b = LeaseGuard::acquire();
+        guard_b.write(&["darkmux:b".to_string()]).unwrap();
+
+        let other_own_pid = std::process::id().wrapping_add(1);
+        let models = live_leased_models(other_own_pid);
+        assert_eq!(
+            models,
+            vec!["darkmux:a".to_string(), "darkmux:b".to_string()],
+            "two concurrent in-process holders must union their leases, never clobber each other"
+        );
+
+        // Direction 1 (a wrong fix that never releases): guard_a finishes
+        // first (its dispatch completed) while guard_b is still actively
+        // mid-dispatch. Dropping A must remove ONLY A's contribution, never
+        // touch B's still-live one — a lease that outlives its work pins
+        // memory forever, the exact failure this module exists to prevent.
+        drop(guard_a);
+        let models_after_a_drops = live_leased_models(other_own_pid);
+        assert_eq!(
+            models_after_a_drops,
+            vec!["darkmux:b".to_string()],
+            "dropping one concurrent holder must not delete another still-live holder's lease"
+        );
+        let path = lease_path(&residency_dir(), std::process::id());
+        assert!(path.exists(), "the lease file must still exist while holder B remains active");
+
+        // Direction 2 (a wrong fix that never deletes): once the LAST
+        // holder drops, the file must actually go away — a lease that is
+        // never released lets nothing evict it and pins the model forever.
+        drop(guard_b);
+        assert!(!path.exists(), "the lease file is removed once the LAST concurrent holder drops");
+    }
+
+    /// #2662 review finding: deleting `union.sort()` in `union_of` left all
+    /// 9 pre-existing tests green — but only SOMETIMES. Eight repeats of
+    /// `two_concurrent_in_process_holders_union_rather_than_clobber` under
+    /// that mutant gave 5 passes and 3 failures, because that test's raw
+    /// (pre-sort) flatten order depends on `HashMap`'s iteration order over
+    /// `ACTIVE_LEASES`, which varies by process (a fresh random hasher seed
+    /// per run) — for some seeds the two single-element contributions
+    /// happen to land already in sorted order by luck, and a `dedup()`
+    /// with no `sort()` first can't tell the difference.
+    ///
+    /// This test is constructed so that can never happen — it fails under
+    /// the mutant on EVERY run, not just some, regardless of which of the
+    /// `HashMap`'s many possible iteration orders occurs:
+    ///
+    /// 1. Guard 1's own contribution (`[b, zzdup, c]`) is internally out of
+    ///    sorted order on its own (`"darkmux:zzdup"` > `"darkmux:c"`, yet
+    ///    `zzdup` is written before `c`). Each guard's own `Vec` is
+    ///    flattened as one contiguous block — `union_of` never reorders
+    ///    WITHIN a single guard's contribution, only decides which
+    ///    guard's block comes first — so that inversion survives into the
+    ///    raw flatten no matter how `HashMap` orders the guards' blocks
+    ///    relative to each other. A raw flatten containing `zzdup`
+    ///    immediately before `c` can never equal the correctly sorted
+    ///    vector (where every `c` precedes every `zzdup`), so the assertion
+    ///    below is guaranteed to catch a missing `.sort()` on every run.
+    /// 2. `"darkmux:zzdup"` is contributed by BOTH guard 1 and guard 2, and
+    ///    in each case sandwiched strictly INTERIOR to that guard's own
+    ///    block (never at a block's edge) — so its two occurrences can
+    ///    never land adjacent to each other in the flatten regardless of
+    ///    block order, meaning a mutant `dedup()` (which only ever
+    ///    collapses ADJACENT duplicates) can never accidentally collapse
+    ///    them by luck either. Real `dedup()` after a real `sort()`
+    ///    collapses them unconditionally, so this also pins the "two
+    ///    guards naming the same model" case named in review.
+    #[serial_test::serial]
+    #[test]
+    fn sort_and_dedup_are_order_independent_across_concurrent_holders() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        let guard1 = LeaseGuard::acquire();
+        guard1
+            .write(&["darkmux:b".to_string(), "darkmux:zzdup".to_string(), "darkmux:c".to_string()])
+            .unwrap();
+
+        let guard2 = LeaseGuard::acquire();
+        guard2
+            .write(&["darkmux:e".to_string(), "darkmux:zzdup".to_string(), "darkmux:f".to_string()])
+            .unwrap();
+
+        let guard3 = LeaseGuard::acquire();
+        guard3.write(&["darkmux:a".to_string()]).unwrap();
+
+        let guard4 = LeaseGuard::acquire();
+        guard4.write(&["darkmux:g".to_string()]).unwrap();
+
+        let other_own_pid = std::process::id().wrapping_add(1);
+        let models = live_leased_models(other_own_pid);
+        assert_eq!(
+            models,
+            vec![
+                "darkmux:a".to_string(),
+                "darkmux:b".to_string(),
+                "darkmux:c".to_string(),
+                "darkmux:e".to_string(),
+                "darkmux:f".to_string(),
+                "darkmux:g".to_string(),
+                "darkmux:zzdup".to_string(),
+            ],
+            "the union across 4 concurrent same-process holders must be fully sorted and \
+             deduplicated, regardless of HashMap iteration order over ACTIVE_LEASES"
+        );
+
+        drop(guard1);
+        drop(guard2);
+        drop(guard3);
+        drop(guard4);
+    }
+
+    /// The panic path (mandatory per #2651's review): a holder that panics
+    /// mid-dispatch (its wave/job panics while the lease guard is held,
+    /// unwinding through `run_local_waves`) must still release ONLY its own
+    /// contribution via `Drop` — never the whole file, and never a
+    /// survivor's still-live lease. Proves both directions the operator
+    /// named: the panicked holder's model is no longer wrongfully pinned
+    /// (Drop still ran during unwind), and the survivor's live dispatch is
+    /// never evicted by the panic (its own contribution is untouched).
+    #[serial_test::serial]
+    #[test]
+    fn a_panicking_holder_releases_only_its_own_contribution_never_a_survivors() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        let survivor = LeaseGuard::acquire();
+        survivor.write(&["darkmux:survivor".to_string()]).unwrap();
+
+        let unwound = std::panic::catch_unwind(|| {
+            let doomed = LeaseGuard::acquire();
+            doomed.write(&["darkmux:doomed".to_string()]).unwrap();
+            panic!("simulated mid-dispatch panic (#2651 panic-path proof)");
+        });
+        assert!(unwound.is_err(), "precondition: the simulated panic must actually have unwound");
+
+        let other_own_pid = std::process::id().wrapping_add(1);
+        let models = live_leased_models(other_own_pid);
+        assert_eq!(
+            models,
+            vec!["darkmux:survivor".to_string()],
+            "a panicking holder's Drop must remove its own contribution (never pinning the \
+             model forever) without touching a survivor's still-live lease (never evicting the \
+             survivor's model mid-generation)"
+        );
+
+        let path = lease_path(&residency_dir(), std::process::id());
+        assert!(path.exists(), "the survivor's lease file must still exist after the panic unwound");
+
+        drop(survivor);
+        assert!(!path.exists(), "the lease file is removed once the survivor itself drops");
     }
 }

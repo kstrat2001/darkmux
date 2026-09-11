@@ -353,16 +353,21 @@ fn run_local_waves<T: Send + 'static>(
     // so a single mutable host handles every `ensure_wave_loaded` call
     // safely without needing to reconstruct one per wave.
     let mut host = host_factory();
-    // (#1487 PR2) Held for this WHOLE local track's lifetime — a normal
-    // return or a panic-unwind through this function both run `Drop`,
-    // removing this process's residency lease so a concurrent darkmux
-    // command's own reconcile no longer sees anything pinned here. Only a
-    // hard crash (SIGKILL) skips `Drop`, leaving the lease for the
-    // pid-liveness sweep in `residency_lease::live_leased_models` to
-    // reclaim. `ensure_wave_loaded` itself refreshes the LEASE CONTENT
-    // (`write_lease`) once per wave; this guard only owns the file's
-    // lifetime, not its contents.
-    let _lease_guard = residency_lease::LeaseGuard::acquire();
+    // (#1487 PR2; same-process aggregation #2651) Held for this WHOLE local
+    // track's lifetime — a normal return or a panic-unwind through this
+    // function both run `Drop`, removing THIS guard's own contribution to
+    // the process's residency lease (never the whole file — see
+    // `residency_lease`'s module doc) so a concurrent darkmux command's own
+    // reconcile no longer sees this track's models pinned. Only a hard
+    // crash (SIGKILL) skips `Drop`, leaving the lease for the pid-liveness
+    // sweep in `residency_lease::live_leased_models` to reclaim.
+    // `ensure_wave_loaded` itself refreshes the LEASE CONTENT
+    // (`lease_guard.write`) once per wave — passed down explicitly (#2651)
+    // rather than resolved implicitly by pid, since ANOTHER local track
+    // (a concurrent same-process dispatch) may hold its OWN `LeaseGuard`
+    // at the same time; the on-disk file is the union of every live guard's
+    // contribution, never a single wholesale overwrite.
+    let lease_guard = residency_lease::LeaseGuard::acquire();
     for refusal in &schedule.refusals {
         if let Some((index, _job)) = by_seat.remove(&refusal.placement.seat) {
             results.lock().expect("results mutex poisoned").push((
@@ -376,7 +381,7 @@ fn run_local_waves<T: Send + 'static>(
         }
     }
     for wave in &schedule.waves {
-        if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut()) {
+        if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut(), &lease_guard) {
             for placement in wave {
                 if let Some((index, _job)) = by_seat.remove(&placement.seat) {
                     results.lock().expect("results mutex poisoned").push((
@@ -502,11 +507,15 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 /// `plan_acquire` never pass-1-unloads a pinned resident and always counts
 /// it as occupied, so a concurrent command's in-use model is never yanked
 /// out from under it. This process's OWN lease is written/refreshed to
-/// this wave's placements BEFORE planning, so OTHER commands protect them
-/// symmetrically; [`run_local_waves`] holds the [`residency_lease::LeaseGuard`]
-/// for the whole local track's lifetime, so a normal return or a
-/// panic-unwind releases it, and a hard crash leaves it for the pid-liveness
-/// sweep to reclaim.
+/// this wave's placements BEFORE planning, via the CALLER-SUPPLIED `lease`
+/// guard's own [`residency_lease::LeaseGuard::write`] (#2651 — never the
+/// old bare `write_lease` free function, which clobbered a concurrent
+/// same-process holder's contribution), so OTHER commands protect them
+/// symmetrically; [`run_local_waves`] holds the guard for the whole local
+/// track's lifetime, so a normal return or a panic-unwind releases ONLY
+/// this guard's own contribution (see `residency_lease`'s module doc for
+/// how two concurrent same-process guards union rather than clobber), and
+/// a hard crash leaves it for the pid-liveness sweep to reclaim.
 ///
 /// # The honest ceiling — hold-not-fail, kept simple (v1)
 ///
@@ -543,10 +552,19 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 /// here would see its concurrent siblings' models as "not desired" and
 /// evict them. See `dispatch_reconciled`'s own module doc for the full
 /// list of which callers this is and is not safe for.
+///
+/// `lease` (#2651) is the CALLER's own already-acquired
+/// [`residency_lease::LeaseGuard`] — never acquired here, and never a bare
+/// pid-keyed write. Threading the specific guard through explicitly is what
+/// makes two concurrent callers in the SAME process (two ACP sessions each
+/// running an ephemeral panel dispatch, say) safe: each writes through its
+/// OWN guard, and the on-disk lease is the union of every currently-live
+/// guard's contribution rather than a single caller-agnostic overwrite.
 pub(crate) fn ensure_wave_loaded(
     placements: &[Placement],
     est: &(dyn FootprintEstimator + Sync),
     host: &mut dyn ModelHost,
+    lease: &residency_lease::LeaseGuard,
 ) -> Result<()> {
     // (#1442 ship-2b, found live) A wave's placements are per-STEP, and the
     // seats x k fan-out makes SAME-MODEL duplicates the norm (k sibling
@@ -571,18 +589,23 @@ pub(crate) fn ensure_wave_loaded(
         }
     }
 
-    // (#1487 PR2) Write/refresh THIS process's own lease BEFORE planning —
-    // the models this wave is actively dispatching to, so a CONCURRENT
-    // darkmux command's own reconcile sees them as pinned as early as
-    // possible. Wholesale overwrite, never a delta (`write_lease`'s
-    // contract): `run_local_waves`'s wave loop only reaches the NEXT wave
-    // after every job in THIS wave has completed (the `thread::scope` join
-    // there), so there is no cross-wave overlap WITHIN one process to
-    // protect against — this lease only ever needs to protect against
-    // OTHER processes.
+    // (#1487 PR2; #2651) Write/refresh THIS guard's own lease contribution
+    // BEFORE planning — the models this wave is actively dispatching to, so
+    // a CONCURRENT darkmux command's own reconcile sees them as pinned as
+    // early as possible. Wholesale overwrite of THIS guard's OWN
+    // contribution, never a delta against its own last write
+    // (`LeaseGuard::write`'s contract): `run_local_waves`'s wave loop only
+    // reaches the NEXT wave after every job in THIS wave has completed (the
+    // `thread::scope` join there), so there is no cross-wave overlap WITHIN
+    // one local track to protect against. There CAN be a concurrent
+    // SIBLING local track in the same process (a second ACP session's own
+    // ephemeral dispatch, holding its own `LeaseGuard`) — `LeaseGuard::
+    // write` unions this contribution with every other currently-live
+    // guard's own, rather than overwriting the shared per-pid file
+    // outright (#2651).
     let own_pid = std::process::id();
     let own_models: Vec<String> = unique.iter().map(|p| p.identifier.clone()).collect();
-    residency_lease::write_lease(&own_models)
+    lease.write(&own_models)
         .map_err(|e| anyhow!("darkmux: could not write this wave's residency lease: {e}"))?;
 
     let deadline = resolved_load_deadline();
@@ -760,7 +783,8 @@ mod tests {
             Placement { model_key: "m".into(), identifier: "darkmux:m".into(), min_ctx: 68_000, seat: "step:probe-0".into() },
             Placement { model_key: "m".into(), identifier: "darkmux:m".into(), min_ctx: 64_000, seat: "step:probe-1".into() },
         ];
-        ensure_wave_loaded(&wave, &est, &mut host)
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
             .expect("duplicate placements reconcile once, never a second NotResident unload");
 
         let unloads: Vec<_> = host
@@ -794,7 +818,8 @@ mod tests {
             .cataloged("m", 1_000);
         let wave = vec![placement("m", 8_000)];
 
-        ensure_wave_loaded(&wave, &est, &mut host).expect("the wanted model loads");
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect("the wanted model loads");
 
         assert_eq!(
             host.ops,
@@ -842,7 +867,8 @@ mod tests {
             .cataloged("m", 1_000);
         let wave = vec![placement("m", 8_000)];
 
-        ensure_wave_loaded(&wave, &est, &mut host).expect("the wanted model loads");
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect("the wanted model loads");
 
         let unloads: Vec<_> = host
             .ops
@@ -880,7 +906,8 @@ mod tests {
         let mut host = MockHost::new().cataloged("m", 1_000);
         let wave = vec![placement("m", 8_000)];
 
-        ensure_wave_loaded(&wave, &est, &mut host).expect("the model loads");
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard).expect("the model loads");
 
         // Read back as if from a DIFFERENT process — own-pid exclusion is
         // exactly what `residency_lease`'s own unit tests already prove, so
@@ -921,7 +948,8 @@ mod tests {
         host.fail_next_load = Some(HostError::InsufficientResources { detail: "no room right now".into() });
         let wave = vec![placement("m", 8_000)];
 
-        ensure_wave_loaded(&wave, &est, &mut host)
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
             .expect("a pinned-external shortfall retries past the scripted failure and succeeds");
 
         let load_attempts = host
@@ -948,7 +976,8 @@ mod tests {
         host.fail_next_load = Some(HostError::InsufficientResources { detail: "too big alone".into() });
         let wave = vec![placement("m", 8_000)];
 
-        let err = ensure_wave_loaded(&wave, &est, &mut host)
+        let lease_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &lease_guard)
             .expect_err("no pinned holder explains the shortfall — this can never be transient");
         assert!(
             err.to_string().contains("no concurrent darkmux"),

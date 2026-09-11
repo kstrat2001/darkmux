@@ -1159,11 +1159,12 @@ mod tests {
         let opts = test_opts("coder", "build the thing");
         dispatch_as_crew_of_one_with(opts, &registry, &host_factory).unwrap();
 
-        // (#1487) The lease this process's `run_step_graph` -> `ensure_wave_
-        // loaded` call wrote for the crew-of-one dispatch's model — the
-        // core correctness win this PR exists for. `write_lease`
-        // overwrites (never appends), and `LeaseGuard`'s `Drop` isn't held
-        // here (`ensure_wave_loaded` holds it only for the LOCAL TRACK's
+        // (#1487; #2651) The lease this process's `run_step_graph` ->
+        // `ensure_wave_loaded` call wrote for the crew-of-one dispatch's
+        // model — the core correctness win this PR exists for.
+        // `LeaseGuard::write` overwrites this guard's own contribution
+        // (never appends), and `LeaseGuard`'s `Drop` isn't held here
+        // (`ensure_wave_loaded` holds it only for the LOCAL TRACK's
         // lifetime, inside `run_bounded`), so by the time
         // `dispatch_as_crew_of_one_with` returns the guard has already
         // dropped and released the lease file — read it INSIDE
@@ -1174,8 +1175,8 @@ mod tests {
         // all is proven by the host having recorded exactly one `Load` op
         // for the resolved identifier (below) — `ensure_wave_loaded` is the
         // ONLY code path that calls `ModelHost::load`, and it ALWAYS calls
-        // `residency_lease::write_lease` immediately before planning (see
-        // that function's own doc) — so a recorded Load call is only
+        // the caller's own `LeaseGuard::write` immediately before planning
+        // (see that function's own doc) — so a recorded Load call is only
         // reachable through a lease write having happened first.
         let ops = host.lock().unwrap().ops.clone();
         let loads: Vec<_> = ops

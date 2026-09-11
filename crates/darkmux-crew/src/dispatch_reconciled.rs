@@ -64,34 +64,44 @@
 //!   post-wave no-op pattern `DispatchInternalStepKind` uses, not a
 //!   bypass.
 //!
-//! Two more named call sites are deliberately left UNCHANGED for a
+//! Two more named call sites were, until #2651 landed, left UNCHANGED for a
 //! different reason — not because they're already protected, but because
-//! this module's single-writer lease-write contract (mirrored from
-//! `ensure_wave_loaded`/`run_local_waves`: one process, one lease file,
-//! wholesale-overwritten, never a delta) is only safe when at most ONE
-//! dispatch is active in the process at a time. `src/radio.rs` and
-//! `src/radio_answer.rs` route through `darkmux acp`, an async (tokio)
-//! daemon that tracks dispatches `in_flight` per session and can plausibly
-//! run more than one concurrently in the same process.
+//! this module's lease-write contract (mirrored from `ensure_wave_loaded`/
+//! `run_local_waves`) used to be a bare pid-keyed wholesale overwrite,
+//! which was only safe when at most ONE dispatch was active in the process
+//! at a time. `src/radio.rs` and `src/radio_answer.rs` route through
+//! `darkmux acp`, an async (tokio) daemon that tracks dispatches
+//! `in_flight` per session and can plausibly run more than one concurrently
+//! in the same process.
 //!
-//! **Correction (#2628 CONSIDER 7):** wiring them through here would NOT
-//! be introducing a new hazard from scratch — that same `darkmux acp`
-//! process already has a concurrent lease writer today.
-//! `src/acp_panel.rs`'s ephemeral-panel dispatch path calls
-//! `crate::scheduler::run_step_graph` in-process, which reaches
-//! `run_local_waves` → the SAME `LeaseGuard::acquire()` + `write_lease`
-//! this module uses. Two concurrent ACP sessions each running an
-//! ephemeral panel dispatch already race to overwrite and delete each
-//! other's lease content, independent of anything in this module. Wiring
-//! `radio.rs`/`radio_answer.rs` through `dispatch_reconciled` without
-//! first solving the same-process-aggregation problem would add a
-//! SECOND INSTANCE of that EXISTING hazard, not a new class of one — but
-//! a second instance is still worth deferring rather than compounding
-//! silently. Filed as its own issue rather than left as an inference:
-//! see [#2651](https://github.com/kstrat2001/darkmux/issues/2651)
-//! (read-not-executed — a code-reading finding, not yet reproduced with
-//! a live race). Deferred here, named explicitly rather than silently
-//! dropped — see the PR body for this follow-up issue too.
+//! **#2651 (reproduced live, then fixed):** `src/acp_panel.rs`'s
+//! ephemeral-panel dispatch path calls `crate::scheduler::run_step_graph`
+//! in-process, which reaches `run_local_waves` → the SAME
+//! `LeaseGuard::acquire()` + write this module uses. Two concurrent ACP
+//! sessions each running an ephemeral panel dispatch DID race to overwrite
+//! and delete each other's lease content — confirmed with a live
+//! reproduction against the pre-fix code (see the #2651 PR), independent of
+//! anything in this module. `darkmux_types::residency_lease` now unions
+//! every concurrent in-process `LeaseGuard`'s own contribution instead of a
+//! single caller-agnostic overwrite (its module doc has the full design),
+//! and [`ensure_wave_loaded`](crate::concurrent_dispatch::ensure_wave_loaded)
+//! (and this module's own call into it, above) both thread their own guard
+//! through explicitly rather than resolving one implicitly by pid — so the
+//! on-disk lease FILE is now correct no matter how many guards this
+//! process holds concurrently: no clobber, no premature deletion, for
+//! every caller of that primitive, this module included. **That is not
+//! the same claim as "concurrent same-process dispatches can no longer
+//! evict each other's model."** `live_leased_models` excludes `own_pid`
+//! by construction (see that function's own doc), so a SIBLING
+//! same-process holder's contribution — correctly written into the union
+//! on disk — is never read back by THIS process's own reconcile; the
+//! `pinned` set `ensure_wave_loaded` plans against only ever contains
+//! OTHER processes' leases. A same-process sibling's model can therefore
+//! still be evicted mid-generation by this process's own Exclusive
+//! reconcile. Confirmed live post-fix (#2662 review) and tracked
+//! separately as #2663. Wiring `radio.rs`/`radio_answer.rs` through
+//! `dispatch_reconciled` is NOT yet safe on that hazard — it stays
+//! deferred, now blocked on #2663 rather than merely unattempted.
 //!
 //! # What this does not change
 //!
@@ -145,16 +155,27 @@ pub(crate) fn dispatch_reconciled_with(
         SeatClaim::LocalModel(placement) => {
             // Scoped to exactly this reconcile-and-dispatch window — a
             // normal return or a panic-unwind through this function both
-            // run `Drop`, removing this process's lease so a concurrent
-            // command's own reconcile no longer sees this placement
-            // pinned. Matches `run_local_waves`'s guard lifetime, scoped
-            // down from "one local track" to "one standalone dispatch"
-            // (this module's single-writer contract — see its own doc for
-            // why that scope is the safety boundary, not a shortcut).
-            let _lease_guard = residency_lease::LeaseGuard::acquire();
+            // run `Drop`, removing ONLY this guard's own contribution to
+            // the process's lease (#2651 — never the whole shared file; see
+            // `residency_lease`'s module doc) so a concurrent command's own
+            // reconcile no longer sees this placement pinned. Matches
+            // `run_local_waves`'s guard lifetime, scoped down from "one
+            // local track" to "one standalone dispatch". Passed explicitly
+            // into `ensure_wave_loaded` (#2651) rather than resolved by pid,
+            // since a concurrent SAME-PROCESS caller (e.g. an ephemeral ACP
+            // panel dispatch's own `run_local_waves` track) may hold its
+            // OWN `LeaseGuard` at the same time — see this module's own
+            // doc for why that same-process aggregation keeps the on-disk
+            // lease FILE consistent across them (never clobbered, never
+            // prematurely deleted). It does NOT make a same-process
+            // sibling's dispatch safe from eviction by THIS reconcile:
+            // `live_leased_models` excludes this process's own pid, so a
+            // sibling guard's models never appear in the `pinned` set
+            // `ensure_wave_loaded` plans against below — tracked as #2663.
+            let lease_guard = residency_lease::LeaseGuard::acquire();
             let est = FixedEstimator::default();
             let mut host = host_factory();
-            crate::concurrent_dispatch::ensure_wave_loaded(&[placement], &est, host.as_mut()).with_context(
+            crate::concurrent_dispatch::ensure_wave_loaded(&[placement], &est, host.as_mut(), &lease_guard).with_context(
                 || {
                     format!(
                         "darkmux: reconciling darkmux-owned residency before dispatching role `{}`",
@@ -616,9 +637,9 @@ mod tests {
             test_opts("coder"),
             SeatClaim::LocalModel(placement("m", 8_000)),
             move |opts| {
-                // Mid-call: the lease guard is held and `write_lease` has
-                // already run as part of `ensure_wave_loaded` — the file
-                // must exist right now, not just "eventually."
+                // Mid-call: the lease guard is held and `LeaseGuard::write`
+                // has already run as part of `ensure_wave_loaded` — the
+                // file must exist right now, not just "eventually."
                 assert!(path_for_closure.exists(), "lease file must exist while the guard is held: {path_for_closure:?}");
                 Ok(DispatchResult {
                     exit_code: 0,
