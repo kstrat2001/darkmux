@@ -609,19 +609,27 @@ export function useMachineStatsContent({
       : scope.scopeLabel;
   // (#2647) The gauges' `aria-label`s are a SECOND surface naming this same
   // scope, reachable without ever passing through the footnote text node —
-  // a screen-reader user tabbing straight to a gauge hears only this
-  // string. `role="img"` on the SVG (`Meter.tsx`) means assistive tech
-  // announces the label alone, not the numerals drawn inside it, so on a
-  // dispatch route the label is the ENTIRE scope claim that reader gets.
-  // Bare `scopeLabel` ("this dispatch") makes exactly the false
-  // process-exclusivity implication the #2559 review fix pass corrected in
-  // the footnote (`meterFootnote` below) and in this file's own doc
-  // comments, but left standing here — since #2413, the samples inside a
-  // dispatch route's join window are the whole machine's, not that one
-  // process's (see `effectiveHostAggregate`'s doc and #2647). Every other
-  // route's `scopeLabel` already carries no ownership claim to correct
-  // (mission dropped "this mission" in #2559; fleet/console/runs/playback
-  // never had one), so this only branches on `isDispatch`.
+  // a screen-reader user who reaches a gauge (in browse mode; the SVG
+  // carries no `tabindex` and `role="img"` is not itself focusable, so this
+  // isn't reached by tabbing) hears this label as the WHOLE contribution of
+  // that image node: `role="img"` on the SVG (`Meter.tsx`) prunes the
+  // element's own descendants from the accessibility tree (verified via
+  // CDP — the image node reports zero children), so none of the SVG's own
+  // internals (paths, needle, etc.) are announced piecemeal. That does NOT
+  // silence the caption or the avg/max numerals next to it — `Meter.tsx`
+  // renders those as plain text SIBLINGS after the closing `</svg>`, not
+  // nested inside it, so they are announced too, right after the image
+  // label, as their own separate nodes. So on a dispatch route the bare
+  // label was still A false claim reachable on its own, just not the only
+  // thing read aloud. Bare `scopeLabel` ("this dispatch") makes exactly the
+  // false process-exclusivity implication the #2559 review fix pass
+  // corrected in the footnote (`meterFootnote` below) and in this file's
+  // own doc comments, but left standing here — since #2413, the samples
+  // inside a dispatch route's join window are the whole machine's, not
+  // that one process's (see `effectiveHostAggregate`'s doc and #2647).
+  // Every other route's `scopeLabel` already carries no ownership claim to
+  // correct (mission dropped "this mission" in #2559; fleet/console/runs/
+  // playback never had one), so this only branches on `isDispatch`.
   const gaugeAriaScope = isDispatch
     ? `${scopeLabel}'s window, host-wide`
     : scopeLabel;
@@ -937,9 +945,9 @@ export function useMachineStatsContent({
   // premise that its gauges were genuinely mission-scoped the way a
   // dispatch's are. They never were (`machineDrawerScope.ts`'s module doc
   // has the full story), so `isDispatch` no longer includes it — a mission
-  // route now falls to the single-sentence branch below, unconditionally,
-  // exactly like fleet/console/runs/playback: no clause on this panel
-  // claims a "this mission" scope any more.
+  // route now falls to the plain single-sentence branch below,
+  // unconditionally, exactly like fleet/console/runs/playback: no clause on
+  // this panel claims a "this mission" scope any more.
   //
   // The split branch also says "current and host-wide" rather than plain
   // "current": on a dispatch route with a daemon reading,
@@ -947,10 +955,34 @@ export function useMachineStatsContent({
   // the gauges' large numbers included — with the daemon's own host-wide
   // sample. Saying only "current" there would repeat, one clause later,
   // exactly the scope conflation the sentence before it just corrected.
+  //
+  // (#2647 review follow-up, MUST FIX) The split above is gated on
+  // `extrasWindowLabel != null` — i.e. on a daemon reading actually
+  // existing — but #2646/#2655 only ever wrote the CORRECTED text into that
+  // branch. A dispatch route with NO daemon reading at all
+  // (`runtime.host_sampler_interval_ms: 0`, a daemon that predates the
+  // sampler or is unreachable, or simply the first open of the drawer
+  // before the 3s poll resolves — none of these are exotic) fell through to
+  // the PLAIN branch below, which makes exactly the bare "Measured over
+  // this dispatch" ownership claim this issue exists to remove, on a path
+  // reachable every time a dispatch drawer is opened before its first poll
+  // lands. It also claimed the thermal peak, power avg/p95/max, energy,
+  // lit thermal state, W now, CPU cluster readings and GPU clock/memory —
+  // none of which render at all in this state, since `HostExtras` returns
+  // null outright when `load` is null (see that component's own doc) and
+  // `gpuMhz`/`gpuMem` above are `null` too. A THIRD branch is required:
+  // `isDispatch` with no daemon reading gets the host-wide correction
+  // (matching `gaugeAriaScope` right above) but drops every claim about a
+  // reading that isn't on the page — only the gauges' own avg/max (from
+  // `scope.samples`, this dispatch's own join window) and "memory free for
+  // AI" (from `specs`, independent of `daemonLoad` entirely) are named,
+  // because those are the only two facts this state actually shows.
   const meterFootnote = scopeLabel ? (
     <div className="machine-drawer__footnote">
-      {isDispatch && extrasWindowLabel != null
-        ? `Measured over ${scopeLabel}'s window — each gauge's avg and max, host-wide. Thermal, power and energy cover a different window: the daemon's host-wide sampler's last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+      {isDispatch
+        ? extrasWindowLabel != null
+          ? `Measured over ${scopeLabel}'s window — each gauge's avg and max, host-wide. Thermal, power and energy cover a different window: the daemon's host-wide sampler's last ${extrasWindowLabel}. Everything else is current and host-wide: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`
+          : `Measured over ${scopeLabel}'s window, host-wide — each gauge's avg and max. Everything else is current: the large number on each gauge and the memory free for AI.`
         : `Measured over ${scopeLabel} — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
     </div>
   ) : null;

@@ -947,6 +947,76 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(gaugeLabels.some((l) => l === "CPU: this dispatch")).toBe(false);
   });
 
+  /** (#2647 review follow-up, MUST FIX) #2646/#2655 only corrected the
+   * SPLIT footnote branch (`isDispatch && extrasWindowLabel != null`) — a
+   * dispatch route with NO daemon reading at all (`runtime.host_sampler_
+   * interval_ms: 0`, a daemon predating the sampler, an unreachable one, or
+   * simply the first open of the drawer before the 3s poll resolves) fell
+   * through to the single-sentence branch, which rendered bare `Measured
+   * over this dispatch` — the exact process-exclusivity claim #2647 set out
+   * to remove, and reachable on every dispatch route's first paint. Mirrors
+   * the mission twin below (`(#2559) on a mission route with NO daemon
+   * load`), but for `isDispatch`, where the corrected text must ALSO say
+   * "host-wide" (matching `gaugeAriaScope` right above it) and must NOT
+   * claim thermal/power/energy/CPU-clusters/GPU-clock readings that
+   * `HostExtras` never renders when `load` is null. */
+  it("(#2647 follow-up) on a dispatch route with NO daemon load, the footnote is host-wide and names only what actually renders", async () => {
+    const { load: _noLoad, ...RESOURCES_WITHOUT_LOAD } = RESOURCES_WITH_LOAD;
+    stubDaemonFetch(RESOURCES_WITHOUT_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "dispatch", dispatchId: "d1" }}
+        routeRecords={[proc("2026-01-01T00:00:00Z", 30, 55, 40)]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    // The dispatch's own sample (55% GPU), not a daemon reading — proves
+    // the panel isn't stuck in a pending/idle state before asserting text.
+    await waitFor(() => expect(screen.getByText("55%")).toBeInTheDocument());
+
+    // No thermal/power/CPU-cluster rows: `HostExtras` renders nothing at
+    // all when `load` is null.
+    expect(document.querySelector(".thermal-row")).toBeNull();
+    expect(document.querySelector(".power-block")).toBeNull();
+    expect(document.querySelector(".cluster-block")).toBeNull();
+
+    const footnoteText =
+      document.querySelector(".machine-drawer__footnote")!.textContent ?? "";
+    // The bare ownership claim this test exists to kill.
+    expect(footnoteText).not.toBe(
+      "Measured over this dispatch — each gauge's avg and max, the thermal peak and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.",
+    );
+    expect(footnoteText.startsWith("Measured over this dispatch's window, host-wide")).toBe(true);
+    // Never claims a reading that isn't on the page.
+    expect(footnoteText).not.toContain("thermal");
+    expect(footnoteText).not.toContain("power");
+    expect(footnoteText).not.toContain("energy");
+    expect(footnoteText).not.toContain("CPU cluster");
+    expect(footnoteText).not.toContain("GPU clock");
+    expect(footnoteText).toBe(
+      "Measured over this dispatch's window, host-wide — each gauge's avg and max. Everything else is current: the large number on each gauge and the memory free for AI.",
+    );
+
+    // The gauge aria-labels already say host-wide (#2655) — pinned again
+    // here so this test also guards against the two surfaces drifting
+    // apart in either direction.
+    const gaugeLabels = Array.from(
+      document.querySelectorAll("svg[role='img']"),
+    ).map((svg) => svg.getAttribute("aria-label"));
+    expect(gaugeLabels).toEqual([
+      "CPU: this dispatch's window, host-wide",
+      "GPU: this dispatch's window, host-wide",
+      "MEM: this dispatch's window, host-wide",
+    ]);
+  });
+
   /** (#2270 review, narrowed by #2559) The split sentence's SECOND half
    * describes the thermal/power/energy rows — which only exist when there
    * is a daemon reading. This "contradiction" scenario (`isMissionOrDispatch`
