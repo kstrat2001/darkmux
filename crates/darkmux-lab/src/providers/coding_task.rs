@@ -220,6 +220,7 @@ impl WorkloadProvider for CodingTaskProvider {
         profile_name: &str,
         config_path: Option<&str>,
         loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+        on_session_id: &mut dyn FnMut(&str),
     ) -> Result<RunResult> {
         // (#365/#544) The profile↔loaded envelope check now lives once at
         // the lab-run level (`lab::run` → `profile_check::envelope_warnings`,
@@ -241,6 +242,10 @@ impl WorkloadProvider for CodingTaskProvider {
                 .unwrap_or(0)
                 .to_string(),
         );
+        // (#2511) Report the id back to the lab harness BEFORE dispatching —
+        // this is the ONE mint for this run, so it is the run's own
+        // governing dispatch session.
+        on_session_id(&session_id);
 
         // (#421) Pre-dispatch workspace snapshot. Pure observability:
         // the diff against the post-dispatch snapshot becomes

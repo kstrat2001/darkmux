@@ -44,6 +44,7 @@ impl WorkloadProvider for PromptProvider {
         // no compaction config to override — the loop lab targets coding-task
         // workloads. Accepted to satisfy the trait; intentionally unused.
         _loop_override: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+        on_session_id: &mut dyn FnMut(&str),
     ) -> Result<RunResult> {
         let prompt = resolve_prompt(loaded)?;
         let role = pick_role(loaded);
@@ -57,6 +58,10 @@ impl WorkloadProvider for PromptProvider {
                 .unwrap_or(0)
                 .to_string(),
         );
+        // (#2511) Report the id back to the lab harness BEFORE dispatching —
+        // this is the ONE mint for this run, so it is the run's own
+        // governing dispatch session.
+        on_session_id(&session_id);
 
         let started = std::time::Instant::now();
         let (stdout, stderr, ok) = dispatch_via_internal(

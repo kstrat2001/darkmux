@@ -212,7 +212,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // artifacts and meanwhile showed as an untracked DISPATCH), and a run
         // that ERRORS gets a terminal record instead of falling through to an
         // idle-time guess (#1930).
-        let lifecycle = lifecycle::RunLifecycle::start(
+        let mut lifecycle = lifecycle::RunLifecycle::start(
             &run_dir,
             &run_id,
             &opts.workload_id,
@@ -293,6 +293,13 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 &profile_name,
                 opts.config_path.as_deref(),
                 opts.loop_override.as_ref(),
+                // (#2511) The provider calls this at most once, right after
+                // minting its own dispatch session id — attaching it to the
+                // still-`Running` lifecycle record BEFORE the dispatch
+                // fires, so a live lab row is joinable to its own flow
+                // session for the run's whole dispatch phase, not only
+                // once `manifest.json` lands at the end.
+                &mut |sid: &str| lifecycle.set_session_id(sid),
             )
         }) {
             Ok(Ok(r)) => r,
@@ -1384,6 +1391,105 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("default_profile"));
+    }
+
+    /// (#2511) End-to-end wiring proof, with zero dispatch/docker/LMStudio
+    /// involvement: a stub provider (registered the same way
+    /// `workloads::registry`'s own test module registers one) reports a
+    /// session id via `on_session_id`, and `lab_run` must have wired that
+    /// callback all the way to `RunLifecycle::set_session_id` — so the
+    /// run's `lifecycle.json` carries it once the run finishes. This is the
+    /// one link `lifecycle_tests.rs` (the method itself) and
+    /// `darkmux-serve`'s `scan_lab_runs` tests (the read side) can't cover
+    /// on their own: the closure plumbing inside `lab_run` between the two.
+    #[test]
+    #[serial_test::serial]
+    fn lab_run_wires_the_providers_session_id_to_the_lifecycle_record() {
+        use crate::workloads::types::{
+            InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
+        };
+
+        struct StubProvider2511;
+        impl WorkloadProvider for StubProvider2511 {
+            fn id(&self) -> &'static str {
+                "stub-2511-session-join"
+            }
+            fn description(&self) -> &'static str {
+                "stub for #2511's end-to-end wiring proof"
+            }
+            fn setup(&self, _: &LoadedWorkload, _: &Path, _: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn run(
+                &self,
+                _: &LoadedWorkload,
+                _: &Path,
+                _: &Path,
+                _: &darkmux_types::Profile,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+                on_session_id: &mut dyn FnMut(&str),
+            ) -> Result<RunResult> {
+                // Mirrors what `coding-task`/`prompt` do for real: mint,
+                // report, THEN would dispatch. No real dispatch here.
+                on_session_id("darkmux-stub-2511-session-join-test");
+                Ok(RunResult {
+                    ok: true,
+                    duration_ms: 1,
+                    payload_text: Some("stub".into()),
+                    trajectory_path: None,
+                    verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
+                    error: None,
+                })
+            }
+            fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {
+                Ok(InspectionReport::default())
+            }
+        }
+        // Registration is process-global and errors on a second call with
+        // the same id — harmless if some earlier run of this same test left
+        // it registered (the global registry never unregisters), so an
+        // `Err` here is ignored rather than unwrapped.
+        let _ = crate::workloads::registry::register(Box::new(StubProvider2511));
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("profiles.json");
+        fs::write(
+            &cfg,
+            r#"{"default_profile":"fast","profiles":{"fast":{"models":[{"id":"model-a","n_ctx":32000,"role":"primary"}]}}}"#,
+        )
+        .unwrap();
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("workloads")).unwrap();
+        fs::write(
+            home.join("workloads").join("stub-2511-workload.json"),
+            r#"{"workload":{"id":"stub-2511-workload","provider":"stub-2511-session-join","prompt":"hi"}}"#,
+        )
+        .unwrap();
+        let _home_guard = HomeGuard::set(&home);
+
+        let outcomes = lab_run(RunOpts {
+            workload_id: "stub-2511-workload".into(),
+            profile_name: None,
+            runs: 1,
+            config_path: Some(cfg.to_str().unwrap().into()),
+            quiet: true,
+            loop_override: None,
+            inject_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        let rec = lifecycle::read(&outcomes[0].run_dir).expect("lifecycle record must exist");
+        assert_eq!(rec.status, lifecycle::LifecycleStatus::Complete);
+        assert_eq!(
+            rec.session_id.as_deref(),
+            Some("darkmux-stub-2511-session-join-test"),
+            "lab_run must wire the provider's on_session_id callback through to the \
+             lifecycle record: {rec:?}"
+        );
     }
 
     /// (#1004) `apply_inject_context` prepends the engagement-context in front

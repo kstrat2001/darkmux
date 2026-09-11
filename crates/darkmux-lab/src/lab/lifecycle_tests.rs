@@ -81,6 +81,62 @@ fn explicit_interrupted_records_the_reason() {
     assert!(rec.ended_at_ms.is_some());
 }
 
+// ── session-id join (#2511) ───────────────────────────────────────────────
+
+/// A provider that has minted its dispatch session id reports it back
+/// mid-run, WHILE the record is still `Running` — this is the whole point:
+/// a live row must be joinable to its own flow session before it finishes,
+/// not only afterward.
+#[test]
+fn set_session_id_attaches_it_while_still_running() {
+    let tmp = TempDir::new().unwrap();
+    let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
+    lc.set_session_id("darkmux-coding-demo-123");
+
+    let rec = read(tmp.path()).expect("record must exist");
+    assert_eq!(rec.status, LifecycleStatus::Running, "attaching the id must not terminate the run");
+    assert_eq!(rec.session_id.as_deref(), Some("darkmux-coding-demo-123"));
+    std::mem::forget(lc); // this test is about the mid-run write only
+}
+
+/// The id set mid-run must survive the terminal write — `terminate()` only
+/// touches `status`/`ended_at_ms`/`error`; a session id already on the
+/// in-memory record must not be clobbered back to `None` by the final
+/// serialize.
+#[test]
+fn set_session_id_survives_the_terminal_write() {
+    let tmp = TempDir::new().unwrap();
+    let mut lc = RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap();
+    lc.set_session_id("darkmux-prompt-demo-456");
+    lc.finish_complete();
+
+    let rec = read(tmp.path()).unwrap();
+    assert_eq!(rec.status, LifecycleStatus::Complete);
+    assert_eq!(
+        rec.session_id.as_deref(),
+        Some("darkmux-prompt-demo-456"),
+        "the terminal write must not erase a session id set earlier in the run"
+    );
+}
+
+/// The inverted case (required alongside the positive one): a run whose
+/// provider never calls `set_session_id` — `tool-bench`'s real shape, and
+/// any run that fails before minting one — must NOT gain a fabricated id
+/// anywhere along the way, including at the terminal write.
+#[test]
+fn a_run_that_never_mints_a_session_id_never_gains_one() {
+    let tmp = TempDir::new().unwrap();
+    RunLifecycle::start(tmp.path(), "r", "w", "p").unwrap().finish_complete();
+
+    let rec = read(tmp.path()).unwrap();
+    assert_eq!(rec.status, LifecycleStatus::Complete);
+    assert_eq!(
+        rec.session_id, None,
+        "no mint call means nothing to claim — never a fallback to the run id \
+         or any other guessable string"
+    );
+}
+
 // ── the paths nobody writes on purpose ────────────────────────────────────
 
 #[test]

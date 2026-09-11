@@ -66,8 +66,16 @@ tracked: boolean,
  * (tracked or not) from its representative session, and for a
  * [`ghost_runs`] dispatch row from the row's OWN id (a ghost's `id`
  * already IS a session id — see that function's own `Run` literal).
- * Always `None` for a lab row: a lab run has no flow session backing
- * it to drill into at all.
+ * Always `None` for a lab row today — NOT because a lab run has no
+ * flow session (it does: `LabRunSummary::session_id`'s own doc, and
+ * #2511, cover exactly which lab runs have one and from when). It
+ * stays `None` here because populating it would change nothing that
+ * is rendered — `runDestination` (`ui/src/lenses/runs/format.ts`)
+ * short-circuits every `kind === "lab"` row to the in-page
+ * `LabRunDetail` before this field is ever consulted, and that view
+ * takes only a `dir`, with no `#dispatch=` route. Wiring it up is a
+ * `LabRunDetail` + `runDestination` change (a display decision),
+ * deliberately kept separate from the record-side fix.
  *
  * **Why every mission carries this, not just untracked ones:** a
  * TRACKED mission never actually needs it — `runDestination`

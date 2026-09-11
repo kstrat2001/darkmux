@@ -3879,6 +3879,103 @@
         assert_eq!(runs[0].session_id, None, "{runs:?}");
     }
 
+    /// (#2511) A live-shaped run dir: `lifecycle.json` optionally carrying
+    /// its own `session_id` (the field `RunLifecycle::set_session_id`
+    /// writes mid-run), plus whatever `manifest.json` bytes the caller
+    /// wants (`None` = still executing, matching the real shape).
+    fn write_lab_run_with_lifecycle_session_id(
+        dir: &StdPath,
+        run_id: &str,
+        lifecycle_session_id: Option<&str>,
+        manifest: Option<&str>,
+    ) {
+        fs::create_dir_all(dir).unwrap();
+        let mut lifecycle = serde_json::json!({
+            "schema_version": "1.1",
+            "run_id": run_id,
+            "kind": "lab",
+            "workload": "demo-workload",
+            "profile": "default",
+            "started_at_ms": 1_700_000_000_000u64,
+            "status": "running",
+        });
+        if let Some(sid) = lifecycle_session_id {
+            lifecycle["session_id"] = serde_json::Value::String(sid.to_string());
+        }
+        fs::write(
+            dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+            serde_json::to_string(&lifecycle).unwrap(),
+        )
+        .unwrap();
+        if let Some(bytes) = manifest {
+            fs::write(dir.join("manifest.json"), bytes).unwrap();
+        }
+    }
+
+    /// (#2511) The actual join this issue exists to make possible: while a
+    /// run is still LIVE (no `manifest.json` yet), the session id a
+    /// single-dispatch provider already reported to `lifecycle.json`
+    /// mid-run must surface through `scan_lab_runs` — this is what lets a
+    /// live lab row be claimed by `runs::build_runs`'s dedup, not only a
+    /// finished one.
+    #[test]
+    fn scan_lab_runs_session_id_is_read_from_lifecycle_before_the_manifest_exists() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(
+            &tmp.path().join("run1"),
+            "run1",
+            Some("darkmux-coding-demo-1787676109556"),
+            None,
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id.as_deref(),
+            Some("darkmux-coding-demo-1787676109556"),
+            "a live run's lifecycle-reported session id must surface before the run finishes"
+        );
+    }
+
+    /// The inverted case, required alongside the positive one: a run whose
+    /// provider has not (yet, or ever) minted a session id must NOT gain a
+    /// fabricated one — `lifecycle.json` with no `session_id` key is
+    /// exactly `tool-bench`'s real shape (and any run's shape before its
+    /// provider mints one), and must read back as `None`, never a guess.
+    #[test]
+    fn scan_lab_runs_session_id_is_none_when_lifecycle_never_minted_one() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, None);
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id, None,
+            "no mint means nothing to claim — never a fallback to the run id: {runs:?}"
+        );
+    }
+
+    /// Once `manifest.json` lands at run end, it wins over the lifecycle
+    /// record — both are byte-identical for the two providers that ever
+    /// populate either, but the manifest is the authoritative end-of-run
+    /// artifact and should not silently depend on `lifecycle.json` still
+    /// being present or unmodified.
+    #[test]
+    fn scan_lab_runs_session_id_prefers_manifest_over_lifecycle_when_both_exist() {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(
+            &tmp.path().join("run1"),
+            "run1",
+            Some("darkmux-coding-demo-mid-run"),
+            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-final"}"#),
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].session_id.as_deref(),
+            Some("darkmux-coding-demo-final"),
+            "the finished-run manifest is authoritative once it exists"
+        );
+    }
+
     #[test]
     fn tail_lab_events_backfills_from_zero_then_returns_only_new_lines() {
         let tmp = TempDir::new().unwrap();

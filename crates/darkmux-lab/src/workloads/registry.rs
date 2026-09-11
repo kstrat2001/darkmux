@@ -96,6 +96,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+            _: &mut dyn FnMut(&str),
         ) -> Result<RunResult> {
             Ok(RunResult {
                 ok: true,
