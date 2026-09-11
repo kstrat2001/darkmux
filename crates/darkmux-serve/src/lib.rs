@@ -50,7 +50,7 @@ pub mod mission_graph;
 mod host_sampler;
 mod panel;
 mod runs;
-pub use runs::{build_runs, AbandonReason, Run, RunKind, RunStatus};
+pub use runs::{build_runs, peer_mission_runs, AbandonReason, Run, RunKind, RunStatus};
 pub mod source_state;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
