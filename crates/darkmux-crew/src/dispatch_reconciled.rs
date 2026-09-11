@@ -110,13 +110,23 @@
 //! holder's own live contribution to `ACTIVE_LEASES`, excluding the
 //! CALLING guard's own token (so a guard never pins its own
 //! about-to-be-superseded placement against itself). A live same-process
-//! sibling is now protected from eviction by this process's own Exclusive
-//! reconcile, and a sibling that has actually withdrawn (dropped
-//! cleanly, or via panic-unwind — `Drop` runs on every exit path, #2651)
-//! stops being pinned the moment it withdraws, never "pinned forever."
-//! Wiring `radio.rs`/`radio_answer.rs` through `dispatch_reconciled` is no
-//! longer blocked on this hazard — that wiring itself remains a separate,
-//! unattempted follow-up.
+//! sibling is now protected from this process's own Exclusive reconcile
+//! choosing to pass-1-evict its model as not-desired, and a sibling that
+//! has actually withdrawn (dropped cleanly, or via panic-unwind — `Drop`
+//! runs on every exit path, #2651) stops being pinned the moment it
+//! withdraws, never "pinned forever." **This does NOT cover every
+//! eviction path: `plan_acquire`'s per-desired `Reconcile` arm (unload +
+//! reload at a higher context for the SAME model key) never consults
+//! `pinned` at all, so a live sibling resident at the same model key but
+//! insufficient context can still be unloaded out from under it — filed
+//! as #2669, not fixed here.** Wiring `radio.rs`/`radio_answer.rs`
+//! through `dispatch_reconciled` is no longer blocked on the pass-1
+//! not-desired hazard this PR closes — but #2669 remains open, and is
+//! most likely to bite exactly when an operator sets
+//! `radio.router_profile` and `radio.answerer_profile` to two profiles
+//! naming the same catalog model at different contexts (both default to
+//! empty today, which is why this has not yet been observed live). That
+//! wiring itself remains a separate, unattempted follow-up.
 //!
 //! # What this does not change
 //!

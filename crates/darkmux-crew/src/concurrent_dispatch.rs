@@ -508,10 +508,14 @@ fn execute_plan(plan: &Plan, host: &mut dyn ModelHost, deadline: Deadline) -> Pl
 /// function, which excludes only `own_pid` and so missed a live
 /// same-process sibling entirely) — are read fresh on every attempt and
 /// fed in as `AcquireOpts.pinned` (#1487 PR1) — `plan_acquire` never
-/// pass-1-unloads a pinned resident and always counts it as occupied, so
-/// a concurrent command's in-use model is never yanked out from under it,
-/// whether that command is a different process or a sibling dispatch in
-/// THIS one. This process's OWN lease is written/refreshed to
+/// pass-1-unloads a pinned resident as not-desired, and always counts it
+/// as occupied, whether that pin comes from a different process or a
+/// sibling dispatch in THIS one. **This guards pass-1 not-desired
+/// eviction, the budget eviction loop, and the pool-headroom eviction
+/// loop only — it does NOT guard the per-desired `Reconcile` arm, which
+/// can still unload a pinned identifier that shares a model key with a
+/// desired placement at insufficient context (#2669, filed, not yet
+/// fixed).** This process's OWN lease is written/refreshed to
 /// this wave's placements BEFORE planning, via the CALLER-SUPPLIED `lease`
 /// guard's own [`residency_lease::LeaseGuard::write`] (#2651 — never the
 /// old bare `write_lease` free function, which clobbered a concurrent
@@ -715,6 +719,46 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Conformance (#2666 CONSIDER 2): the bare
+    /// `residency_lease::live_leased_models` free function excludes only
+    /// `own_pid` — it is right for `LeaseGuard::all_live_leased_models`'s
+    /// own internal use (which additionally unions in same-process
+    /// siblings) and wrong for anything computing `AcquireOpts.pinned`
+    /// directly, which is exactly the #2663 bug shape (a caller reaching
+    /// past `all_live_leased_models` and missing same-process siblings).
+    /// Scans this file's and `dispatch_reconciled.rs`'s own PRODUCTION
+    /// source (everything before their `mod tests` boundary, with
+    /// comments skipped) for a bare call to the free function — i.e. an
+    /// occurrence of `live_leased_models(` not part of
+    /// `all_live_leased_models(`. A future edit that reintroduces #2663 by
+    /// wiring `pinned` straight to the free function fails this test
+    /// before it ever gets to a real dispatch.
+    #[test]
+    fn no_production_pinned_computation_bypasses_all_live_leased_models() {
+        for (name, src) in [
+            ("concurrent_dispatch.rs", include_str!("concurrent_dispatch.rs")),
+            ("dispatch_reconciled.rs", include_str!("dispatch_reconciled.rs")),
+        ] {
+            let production = src.split("\nmod tests").next().unwrap_or(src);
+            for (line_no, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue; // doc/line comments reference the free function by name
+                }
+                if let Some(idx) = line.find("live_leased_models(") {
+                    let prefix = &line[..idx];
+                    assert!(
+                        prefix.ends_with("all_"),
+                        "{name}:{}: production code calls the bare `live_leased_models` \
+                         free function directly — every `AcquireOpts.pinned` computation \
+                         must go through `LeaseGuard::all_live_leased_models` instead \
+                         (#2663): {line:?}",
+                        line_no + 1,
+                    );
+                }
+            }
+        }
+    }
+
     /// Hermetic `host_factory` for these fixtures — synthetic `Facts`/
     /// placements (fake model keys like "m"/"small-a") were never intended
     /// to touch a real LMStudio; `ensure_wave_loaded`'s host is injected
@@ -854,8 +898,8 @@ mod tests {
     fn ensure_wave_loaded_never_evicts_a_model_pinned_by_a_live_external_lease() {
         let env = LeaseTestEnv::new();
         // A genuinely live OTHER process (this test's own pid would be
-        // excluded as "own" by `ensure_wave_loaded`'s internal
-        // `live_leased_models(std::process::id())` call — the lease must
+        // excluded as "own" by the `live_leased_models(self.pid)` read
+        // inside `LeaseGuard::all_live_leased_models` — the lease must
         // belong to some OTHER live pid to prove the cross-process path).
         let mut holder = std::process::Command::new("sleep")
             .arg("5")

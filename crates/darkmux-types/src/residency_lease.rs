@@ -116,17 +116,23 @@ struct LeaseFile {
 /// since every guard in one process shares the same pid. The on-disk
 /// `<pid>.lease` file is always the union of every value in this map.
 ///
-/// Both [`LeaseGuard::write`] and `Drop` hold this mutex across their WHOLE
-/// critical section — map mutation AND the resulting file write/delete —
-/// so two concurrent callers can never interleave a stale union onto disk;
-/// whichever call finishes last always leaves the file matching the map's
-/// state as of that call. `.lock().unwrap_or_else(PoisonError::into_inner)`
-/// rather than a bare `.unwrap()`: nothing inside the critical section can
-/// itself panic (map mutation + a `Result`-returning file write, no
-/// arbitrary caller code runs while the lock is held), but recovering from
-/// poisoning defensively means a hypothetical future panic elsewhere never
-/// wedges every OTHER live holder's lease bookkeeping for the rest of the
-/// process's life.
+/// Three accessors touch this mutex. [`LeaseGuard::write`] and `Drop` both
+/// hold it across their WHOLE critical section — map mutation AND the
+/// resulting file write/delete — so two concurrent callers can never
+/// interleave a stale union onto disk; whichever call finishes last always
+/// leaves the file matching the map's state as of that call.
+/// [`LeaseGuard::all_live_leased_models`] is the third: a read-only
+/// accessor that holds the lock only for its own map iteration + `sort` +
+/// `dedup` (no file write), and calls [`live_leased_models`] — the ONE
+/// piece of this function that does file I/O — BEFORE taking the lock, so
+/// the lock is never held across I/O on any of the three paths.
+/// `.lock().unwrap_or_else(PoisonError::into_inner)` rather than a bare
+/// `.unwrap()`: nothing inside any of the three critical sections can
+/// itself panic (map mutation, a `Vec` sort/dedup, and a `Result`-returning
+/// file write — no arbitrary caller code runs while the lock is held), but
+/// recovering from poisoning defensively means a hypothetical future panic
+/// elsewhere never wedges every OTHER live holder's lease bookkeeping for
+/// the rest of the process's life.
 static ACTIVE_LEASES: LazyLock<Mutex<HashMap<u64, Vec<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -750,6 +756,36 @@ mod tests {
 
         let _ = holder.kill();
         let _ = holder.wait();
+    }
+
+    /// Dedup contract (#2666 CONSIDER 5): `all_live_leased_models`'s own
+    /// doc + its `models.sort(); models.dedup();` tail promise a
+    /// sorted-deduplicated result, but nothing exercised it — two DIFFERENT
+    /// same-process siblings naming the SAME model id (a realistic shape:
+    /// two overlapping dispatches both routed to the same catalog model)
+    /// must collapse to one entry, not leak the duplicate into the
+    /// operator-facing "holding {pinned:?}" string.
+    #[serial_test::serial]
+    #[test]
+    fn all_live_leased_models_deduplicates_the_same_model_named_by_two_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+
+        // Two DIFFERENT same-process sibling guards, both naming the SAME
+        // model id — the union before dedup would contain it twice.
+        let sibling_a = LeaseGuard::acquire();
+        sibling_a.write(&["darkmux:shared".to_string()]).unwrap();
+        let sibling_b = LeaseGuard::acquire();
+        sibling_b.write(&["darkmux:shared".to_string()]).unwrap();
+
+        let calling = LeaseGuard::acquire();
+        let models = calling.all_live_leased_models();
+
+        assert_eq!(
+            models,
+            vec!["darkmux:shared".to_string()],
+            "two siblings naming the same model id must collapse to ONE entry, sorted: {models:?}"
+        );
     }
 
     /// Withdrawal (INVERTED direction, #2663): once a same-process
