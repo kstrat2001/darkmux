@@ -245,13 +245,20 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // sibling under the same task-scoped sid happened to name an endpoint.
   // Each `dcTok` payload IS itself the `dispatch.complete` record that
   // proves its own classification, so it needs no session-level lookup.
-  // The `unknown` branch stays a defensive floor: a payload lacking
-  // `endpoint` satisfies the exact same criterion `localSids` used to add
-  // this sid (`isDispatchComplete` + no `endpoint`, on this very record),
-  // so `!localSids.has(sid)` should never fire — kept anyway rather than
-  // assuming that invariant can't drift, same posture as before. One turn
-  // means the whole prompt is first-read, so `fresh += prompt` is exact
-  // here, not an approximation.
+  // The `unknown`/`unknownRuns` branch stays a defensive floor: a payload
+  // lacking `endpoint` satisfies the exact same criterion `localSids` used
+  // to add this sid (`isDispatchComplete` + no `endpoint`, on this very
+  // record), so `!localSids.has(sid)` should never fire — kept anyway
+  // rather than assuming that invariant can't drift, same posture as
+  // before. Concretely: `unknownRuns++` here is NOT a second live
+  // contribution symmetric with the `sess`-loop classification above —
+  // it is structurally unreachable under the current invariant (proved by
+  // mutation: deleting it leaves `savings.test.ts` green). `unknownRuns`
+  // has exactly ONE live producer today, the `sess`-loop branch a few dozen
+  // lines up; this one is kept for the same reason its sibling `unknown +=
+  // tt` always was — a floor against the invariant drifting, not evidence
+  // it currently does anything. One turn means the whole prompt is
+  // first-read, so `fresh += prompt` is exact here, not an approximation.
   let directRuns = 0;
   for (const [sid, payloads] of dcTok) {
     if (sess.has(sid)) continue;

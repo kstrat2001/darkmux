@@ -83,15 +83,31 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
     // (#2637) `lr` is runs with POSITIVE local evidence — total minus both
     // cloud AND unattributed, never a residual that silently absorbs
     // whatever isn't cloud. `t.unknownRuns` never appears as a number in
-    // this template: the fleet total chip (`t.runs`) already records it
-    // exhaustively, so this note's job is only to describe what's actually
-    // known about the local/cloud split — mentioning "N unattributed" here
-    // would either read as a third bucket nobody asked about, or tempt a
-    // reader into assuming it means "neither, so it must be free" (or
-    // "cloud", or "local") — exactly what darkmux must not imply. When
-    // there is nothing POSITIVE to say about either side, the dedicated
-    // all-unattributed branch below says so plainly instead of guessing.
-    const lr = t.runs - t.cloudRuns - t.unknownRuns;
+    // this template: mentioning it here as a bare figure would either read
+    // as a third bucket nobody asked about, or tempt a reader into assuming
+    // it means "neither, so it must be free" (or "cloud", or "local") —
+    // exactly what darkmux must not imply. When there is nothing POSITIVE
+    // to say about either side, the dedicated all-unattributed branch below
+    // says so plainly instead of guessing.
+    //
+    // The DISPATCHES chip (`t.runs`) sits right next to this note and is
+    // real, adjacent evidence that unattributed sessions are counted
+    // *somewhere* on this card — but it is weaker cover than "exhaustive"
+    // implies: the chip carries no qualifier naming what it counts (an
+    // operator has to notice a local+cloud+unattributed gap and infer it),
+    // no chip on this card names unattributed RUNS specifically (the
+    // UNATTRIBUTED tile is a TOKEN count, a different unit), and `t.runs`
+    // itself under-counts in general — a dispatch whose completion carries
+    // no token totals and emits no telemetry contributes 0 to `runs` too.
+    // So this omission clears "describe, don't adjudicate" cleanly, but
+    // "record exhaustively, display selectively" only partially: the
+    // record this note leans on is real but incomplete, not a full ledger.
+    //
+    // Clamped at zero: a caller-supplied `TokensOffMeter` with
+    // `unknownRuns` overcounting relative to `runs`/`cloudRuns` (this
+    // function takes the struct as given, it doesn't re-derive it) must
+    // never render a negative dispatch count — see the guard test below.
+    const lr = Math.max(0, t.runs - t.cloudRuns - t.unknownRuns);
     const d = (n: number) => `dispatch${n === 1 ? "" : "es"}`;
     if (lr && t.cloudRuns) {
       return {
@@ -106,10 +122,18 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
       return { text: `${t.cloudRuns} ${d(t.cloudRuns)} via cloud. The right brain for the job, keep it up.`, hasHistory };
     }
     // Neither side has any positive evidence — every run this window is
-    // unattributed. Say so plainly rather than defaulting to either the
-    // local-only or cloud-only template with a zero-dressed-up count.
+    // unattributed. This branch is NOT rare in practice: it is what a fresh
+    // window looks like before any dispatch's bookend has posted an
+    // endpoint (an in-flight dispatch is unattributed by construction until
+    // it closes), so it renders on ordinary, healthy activity — including
+    // the public demo's own replay, which opens on exactly this state (see
+    // the parity corpus's dedicated in-flight fixture, #2637 follow-up).
+    // The copy therefore stays in the SAME upbeat, non-diagnostic register
+    // as its two siblings above (a short observation + ", keep it up.") —
+    // it must never read like an error state, and it must still never say
+    // or imply local, cloud, or free.
     return {
-      text: `${t.runs} ${d(t.runs)} with no attribution darkmux could confirm. keep going.`,
+      text: `${t.runs} ${d(t.runs)} just getting started. The fleet is warming up, keep it up.`,
       hasHistory,
     };
   }

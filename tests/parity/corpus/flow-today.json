@@ -19274,6 +19274,27 @@
     }
   },
   {
+    "ts": "2026-08-08T14:15:00Z",
+    "level": "info",
+    "category": "telemetry",
+    "tier": "local",
+    "stage": "dispatch",
+    "action": "telemetry.tokens",
+    "handle": "coder-role-step",
+    "session_id": "dispatch-inflight-demo-0",
+    "source": "tokens",
+    "model": "qwen3.6-35b-a3b",
+    "machine_id": "MacBook-Pro",
+    "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+    "orchestrator": "claude-code",
+    "payload": {
+      "completion_tokens": 929,
+      "prompt_tokens": 1280,
+      "total_tokens": 2209,
+      "turn_seq": 1
+    }
+  },
+  {
     "_type": "schema",
     "version": "1.18.0",
     "darkmux_version": "2.5.0"
