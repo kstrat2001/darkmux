@@ -35,6 +35,14 @@ redis = { version = "0.27", default-features = false, features = ["streams"] }
 # `needs_fleet_snapshot` in panel.rs) is production code, not test fixture
 # plumbing.
 tempfile = "3.10"
+# (#1466) `peer_graph`'s best-effort peer-mission-graph fetch — the daemon's
+# first outbound HTTP call. Already a workspace dependency (both the root
+# crate's `fleet_cli.rs` GET path and `darkmux-flow`'s hook-delivery POST
+# side, #2093); promoted to direct here for the same reason #2093 promoted
+# it into `darkmux-flow` — already resolved in Cargo.lock, no new version.
+# `default-features = false` matches both existing usages: plain HTTP/1.1 +
+# timeouts, no TLS/gzip surface needed to reach a peer over the tailnet.
+ureq = { version = "2.10", default-features = false }
 
 [dev-dependencies]
 serial_test = "3.1"

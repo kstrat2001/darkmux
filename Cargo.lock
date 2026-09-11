@@ -899,6 +899,7 @@ dependencies = [
  "tower",
  "tower-http",
  "ts-rs",
+ "ureq",
 ]
 
 [[package]]

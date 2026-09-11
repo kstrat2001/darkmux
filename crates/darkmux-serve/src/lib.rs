@@ -49,6 +49,9 @@ pub mod mission_graph;
 /// machine stats drawer's live `load` block — see the module's own doc.
 mod host_sampler;
 mod panel;
+/// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
+/// for the full attribution → roster → presence → fetch decision chain.
+mod peer_graph;
 mod runs;
 pub use runs::{build_runs, peer_mission_runs, AbandonReason, Run, RunKind, RunStatus};
 pub mod source_state;
@@ -1767,12 +1770,23 @@ async fn mission_graph_html(Path(id): Path<String>) -> axum::response::Response 
     axum::response::Redirect::permanent(&format!("/#mission={id}")).into_response()
 }
 
+/// The outcome of the blocking task `mission_graph_json_handler` spawns:
+/// a graph built from THIS machine's own disk, one fetched live from the
+/// peer that ran it (#1466 — see `peer_graph`'s own doc), or genuinely
+/// nothing found anywhere.
+enum GraphSource {
+    Local(mission_graph::MissionGraph),
+    Peer(serde_json::Value),
+    NotFound,
+}
+
 /// `GET /mission/:id/graph.json` — the node/edge snapshot
 /// `mission_graph::build_mission_graph` builds from the persisted
-/// Phase/Task/Step JSON. `404` when no mission with this id exists;
-/// otherwise always `200` — a mission with phases but no task/step graph
-/// still returns a (phases-only) graph with `legacy: true` + a `note`,
-/// never an error (item 6).
+/// Phase/Task/Step JSON. `404` when no mission with this id exists ANYWHERE
+/// this daemon can reach (locally, or via a live peer — #1466); otherwise
+/// always `200` — a mission with phases but no task/step graph still
+/// returns a (phases-only) graph with `legacy: true` + a `note`, never an
+/// error (item 6).
 async fn mission_graph_json_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1789,13 +1803,28 @@ async fn mission_graph_json_handler(
     // token/turn totals into graph.json at page load — read from the daemon's
     // flows_dir once, off the async runtime.
     let flows_dir = state.flows_dir.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        mission_graph::build_mission_graph(&id_owned, &flows_dir)
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<GraphSource> {
+        match mission_graph::build_mission_graph(&id_owned, &flows_dir)? {
+            Some(graph) => Ok(GraphSource::Local(graph)),
+            // (#1466) Not on this machine's disk — try the peer the flow
+            // stream says ran it before giving up. `fleet_flow_records()`
+            // is the SAME short-TTL-cached read `/flow-missions`/`/runs`
+            // already pay for, so this costs nothing extra on a fleet
+            // that's already being polled.
+            None => {
+                let fleet = fleet_flow_records();
+                match peer_graph::try_peer_graph(&id_owned, &flows_dir, &fleet.records) {
+                    Some(graph) => Ok(GraphSource::Peer(graph)),
+                    None => Ok(GraphSource::NotFound),
+                }
+            }
+        }
     })
     .await;
     match result {
-        Ok(Ok(Some(graph))) => axum::Json(graph).into_response(),
-        Ok(Ok(None)) => (
+        Ok(Ok(GraphSource::Local(graph))) => axum::Json(graph).into_response(),
+        Ok(Ok(GraphSource::Peer(graph))) => axum::Json(graph).into_response(),
+        Ok(Ok(GraphSource::NotFound)) => (
             StatusCode::NOT_FOUND,
             format!("no mission with id `{id}` found\n"),
         )

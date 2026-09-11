@@ -3325,6 +3325,121 @@
                 "expected XADD'd record to surface as SSE event; got: {got:?}"
             );
         }
+
+        // ─── #1466: `mission_graph_json_handler` proxies a live peer's
+        // graph end-to-end ───────────────────────────────────────────
+        //
+        // `peer_graph`'s own unit tests (`crates/darkmux-serve/src/
+        // peer_graph.rs`) exhaustively cover the decision logic
+        // (unrostered/silent/unreachable/401/peer-404/malformed/success)
+        // against the dependency-injected `try_peer_graph_with`, with no
+        // Redis needed. This ONE test proves the real, non-injected
+        // production wiring — `mission_graph_json_handler` →
+        // `fleet_flow_records()` → `peer_graph::try_peer_graph` → a REAL
+        // roster file + a REAL presence beat (this crate's existing
+        // `RedisFixture`) + a REAL loopback HTTP peer — actually composes
+        // end to end, which no amount of pure unit testing can show on
+        // its own (CLAUDE.md: "inference stops at the boundary" — this
+        // crosses TWO of them, the roster file and Redis).
+        #[tokio::test]
+        #[serial]
+        async fn mission_graph_json_handler_proxies_a_live_peers_graph() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let _crew_guard = CrewDirGuard::new(); // build_mission_graph finds nothing locally
+            let redis = spawn_redis();
+            let today = today_utc_date();
+            const MISSION_ID: &str = "peer-live-mission-1";
+            const PEER: &str = "peer1";
+
+            // 1. Attribution: a local day-file record naming the peer as
+            //    `machine_id` — `mission_owner_machine`'s local-disk half
+            //    (no Redis needed for THIS part; the fleet stream is the
+            //    OTHER, not-exercised-here half of that same union).
+            let flows_dir = TempDir::new().unwrap();
+            let day_file = flows_dir.path().join(format!("{today}.jsonl"));
+            fs::write(
+                &day_file,
+                format!(
+                    r#"{{"ts":"{today}T10:00:00Z","action":"mission start","mission_id":"{MISSION_ID}","machine_id":"{PEER}"}}"#
+                ) + "\n",
+            )
+            .unwrap();
+
+            // 2. Roster: `peer1` -> a real loopback mock daemon.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let peer_addr = listener.local_addr().unwrap().to_string();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = format!(
+                        r#"{{"mission_id":"{MISSION_ID}","mission_status":"active","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            let fleet_file = flows_dir.path().join("fleet.json");
+            unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &fleet_file) };
+            darkmux_fleet::mutate_roster(|roster| {
+                darkmux_fleet::add_machine(roster, PEER, &peer_addr, None)?;
+                Ok(())
+            })
+            .unwrap();
+
+            // 3. Presence: `peer1` is LIVE right now (not merely rostered).
+            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+            let redis_client = redis::Client::open(redis.url.as_str()).unwrap();
+            let beat = darkmux_flow::presence::PresenceBeat {
+                machine_uid: "uid-peer1".to_string(),
+                display_name: PEER.to_string(),
+                schema_version: "1.0.0".to_string(),
+                beat_ts_ms: darkmux_flow::presence::now_ms(),
+                specs: None,
+                loaded_models: Vec::new(),
+                darkmux_version: None,
+            };
+            darkmux_flow::presence::write_beat(&redis_client, &beat, 60).unwrap();
+
+            let app = build_router_local(flows_dir.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/mission/{MISSION_ID}/graph.json"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            unsafe {
+                std::env::remove_var("DARKMUX_REDIS_URL");
+                std::env::remove_var("DARKMUX_FLEET_FILE");
+            }
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a local miss attributed to a live, rostered, reachable peer must render, not 404"
+            );
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["mission_id"], MISSION_ID);
+            assert_eq!(
+                body["note"], "fetched live from peer `peer1`",
+                "provenance must name the peer that actually answered: {body}"
+            );
+        }
     }
 
     // ─── #1387: worktree-summary endpoint tests (shared session-resolution
