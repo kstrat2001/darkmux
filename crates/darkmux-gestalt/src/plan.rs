@@ -180,6 +180,25 @@ pub enum Reason {
     /// where the model alone exceeds the whole budget, which is refused for
     /// BOTH caller intents.
     BudgetRefuse { est_bytes: u64, budget_bytes: u64 },
+    /// Block: the per-desired `Reconcile` arm found a resident sharing this
+    /// placement's model key at insufficient context, but that resident is
+    /// already `claimed` — pinned by a CONCURRENT darkmux command actively
+    /// dispatching to it (#1487), or already targeted by an earlier
+    /// decision in this same plan — so unloading it to reconcile would kill
+    /// a live dependency instead of freeing an idle one (#2669). Never an
+    /// eviction candidate, same as a pinned resident in the #1243 budget or
+    /// #1140 pool-headroom passes; this is that same refusal reached
+    /// through the Reconcile arm instead.
+    ///
+    /// `clearable` (#2672 CONSIDER 3): `true` when the claim's origin is an
+    /// EXTERNAL pin (`opts.pinned` — a live holder that may genuinely
+    /// release it), `false` when it's a SAME-PLAN collision (an earlier
+    /// decision in this identical `desired` list already claimed it) that
+    /// no amount of waiting can ever clear, since `plan_acquire` decides
+    /// from one fixed `facts` snapshot and would regenerate the identical
+    /// Block on every retry. Callers use this to gate whether a bounded
+    /// retry-hold is worth attempting at all (see `ensure_wave_loaded`).
+    ClaimedResidentInsufficientCtx { identifier: String, resident_ctx: u64, min_ctx: u32, clearable: bool },
 }
 
 /// Display-only GB rendering for the operator-facing suggestion strings
@@ -262,6 +281,23 @@ impl fmt::Display for Reason {
                 f,
                 "an estimated {est_bytes}-byte load cannot be satisfied within the {budget_bytes}-byte AI RAM budget by any eviction of darkmux-owned residents — refused (#1243, applies to every caller intent)"
             ),
+            Reason::ClaimedResidentInsufficientCtx { identifier, resident_ctx, min_ctx, clearable } => {
+                write!(
+                    f,
+                    "\"{identifier}\" shares this model key but is resident at {resident_ctx} context, below the {min_ctx} this placement needs — it is already claimed"
+                )?;
+                if *clearable {
+                    write!(
+                        f,
+                        " (a live pinned dispatch, same-process or a concurrent darkmux command), so it is never unloaded to reconcile; wait for the claim to clear (a concurrent acquirer racing for this same identifier resolves this automatically once its own load lands — #2672), or lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling — pointing it at a DIFFERENT identifier does NOT help: residency is decided by model key, not identifier, so an aliased placement collides with this identical claimed resident just the same (#2669)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        " by ANOTHER placement already targeting it earlier in this SAME plan, so it is never unloaded to reconcile; this can never resolve by waiting — the plan is decided from one fixed snapshot, so retrying regenerates the identical collision every time (#2672) — lower this placement's own minimum context to {resident_ctx} or below so it reuses the resident as-is instead of reconciling"
+                    )
+                }
+            }
         }
     }
 }
@@ -421,9 +457,50 @@ mod tests {
                 eviction_order: EvictionOrder::HostReported,
             },
             Reason::BudgetRefuse { est_bytes: 22, budget_bytes: 8 },
+            Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 32_000,
+                min_ctx: 68_000,
+                clearable: true,
+            },
+            Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 32_000,
+                min_ctx: 68_000,
+                clearable: false,
+            },
         ];
         for r in &all {
             assert!(!r.to_string().is_empty(), "{r:?} renders");
+        }
+        {
+            let clearable = Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 32_000,
+                min_ctx: 68_000,
+                clearable: true,
+            }
+            .to_string();
+            let not_clearable = Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:m".into(),
+                resident_ctx: 32_000,
+                min_ctx: 68_000,
+                clearable: false,
+            }
+            .to_string();
+            assert!(
+                clearable.contains("wait for the claim to clear"),
+                "the clearable case must still advise waiting: {clearable}"
+            );
+            assert!(
+                !not_clearable.contains("wait for the claim to clear"),
+                "the non-clearable (same-plan collision) case must NEVER advise waiting — \
+                 retrying regenerates the identical Block: {not_clearable}"
+            );
+            assert!(
+                not_clearable.contains("never resolve by waiting"),
+                "the non-clearable case must say so plainly: {not_clearable}"
+            );
         }
         // The capacity Block names the foreign instance, its pool cost, and
         // the eject-or-load-via-darkmux suggestion (operator decision

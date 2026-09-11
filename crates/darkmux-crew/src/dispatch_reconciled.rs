@@ -114,18 +114,47 @@
 //! choosing to pass-1-evict its model as not-desired, and a sibling that
 //! has actually withdrawn (dropped cleanly, or via panic-unwind — `Drop`
 //! runs on every exit path, #2651) stops being pinned the moment it
-//! withdraws, never "pinned forever." **This does NOT cover every
-//! eviction path: `plan_acquire`'s per-desired `Reconcile` arm (unload +
-//! reload at a higher context for the SAME model key) never consults
+//! withdraws, never "pinned forever." **This left one eviction path open
+//! at the time: `plan_acquire`'s per-desired `Reconcile` arm (unload +
+//! reload at a higher context for the SAME model key) never consulted
 //! `pinned` at all, so a live sibling resident at the same model key but
-//! insufficient context can still be unloaded out from under it — filed
-//! as #2669, not fixed here.** Wiring `radio.rs`/`radio_answer.rs`
-//! through `dispatch_reconciled` is no longer blocked on the pass-1
-//! not-desired hazard this PR closes — but #2669 remains open, and is
-//! most likely to bite exactly when an operator sets
-//! `radio.router_profile` and `radio.answerer_profile` to two profiles
-//! naming the same catalog model at different contexts (both default to
-//! empty today, which is why this has not yet been observed live). That
+//! insufficient context could still be unloaded out from under it — filed
+//! as #2669.**
+//!
+//! **#2669 (fixed, narrowed #2672):** the `Reconcile` arm now checks the
+//! SAME `claimed` set (seeded from `pinned`, plus every earlier decision in
+//! the same plan) before committing to an unload-then-reload. A claimed
+//! stale resident Blocks the placement instead (`Reason::
+//! ClaimedResidentInsufficientCtx`), and — ONLY when the claim's own
+//! `clearable` field says its cause is an external pin that can genuinely
+//! resolve with time (the pinning command finishing its own dispatch), not
+//! a same-plan collision that no amount of waiting ever resolves (#2672
+//! CONSIDER 3) — `ensure_wave_loaded` gives that specific Block the SAME
+//! bounded hold-not-fail retry the analogous `HostFailed`+pinned shortfall
+//! already got, rather than failing the wave on the very first attempt.
+//! That retry window is a maximum of `BLOCKED_BY_HOLDER_RETRY_ATTEMPTS - 1`
+//! sleeps of `BLOCKED_BY_HOLDER_RETRY_DELAY` each (600ms at the current
+//! 3-attempt/300ms constants, not the ~900ms an earlier draft of this
+//! module doc claimed — the attempt counter is pre-incremented, so the
+//! loop sleeps twice and bails on the third) — honest about what it
+//! actually covers: against a claim held for a WHOLE dispatch (seconds to
+//! minutes), this window only ever helps a claim that was already nearly
+//! done, not a genuine wait-out. Two profiles naming the same catalog
+//! model at different contexts are therefore not fully "no longer
+//! mutually exclusive" in general — what #2672 actually closes is the
+//! narrower, common case of two siblings BOTH still racing to acquire the
+//! identical identifier (neither loaded yet): exactly one leads the real
+//! reconcile and the other converges to a plain reuse once it lands,
+//! typically well inside that same window (see `residency_lease::
+//! LeaseGuard::identifiers_i_should_lead`'s own doc). **Known residual
+//! gap (#2672 CONSIDER 6, inherited from earlier work):** this protection
+//! is seeded from `pinned` identifiers that pass a bare `darkmux:` prefix
+//! check — a pin naming a genuinely live EXPLICIT ALIAS (a non-namespaced
+//! identifier) never enters `claimed` at all, so it is not yet protected
+//! by this arm; see `AcquireOpts.pinned`'s own doc for the reproduction.
+//! Wiring `radio.rs`/`radio_answer.rs` through `dispatch_reconciled` is no
+//! longer blocked on either the pass-1
+//! not-desired hazard #2663 closed or this Reconcile-arm hazard — that
 //! wiring itself remains a separate, unattempted follow-up.
 //!
 //! # What this does not change

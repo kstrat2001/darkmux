@@ -18,8 +18,15 @@
 //! — the same home-resolution convention as
 //! [`crate::dispatch_liveness`]'s `<darkmux-home>/liveness/<pid>.log`
 //! (honor `DARKMUX_HOME`, else `~/.darkmux`). Each file holds `{"pid":
-//! <pid>, "models": ["darkmux:foo", ...]}` — the UNION of every concurrent
-//! in-process holder's current set (see "same-process aggregation" below).
+//! <pid>, "models": ["darkmux:foo", ...], "loaded": ["darkmux:foo"]}` —
+//! `models` is the UNION of every concurrent in-process holder's currently
+//! DESIRED set (see "same-process aggregation" below); `loaded`
+//! (`#[serde(default)]` — an older file with no key reads as "nothing
+//! confirmed yet") is the subset each holder has actually confirmed
+//! resident via [`LeaseGuard::mark_loaded`] — the intent-vs-in-use
+//! distinction [`LeaseGuard::identifiers_i_should_lead`] (#2672) needs to
+//! tell "this pin is another holder racing to acquire the same resource I
+//! am" from "this pin is a holder already mid-generation on it."
 //!
 //! # Same-process aggregation (#2651)
 //!
@@ -98,16 +105,25 @@
 use crate::paths::expand_tilde;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+/// `models` (unchanged name/shape from before #2672 — every existing
+/// hand-written test/production lease JSON with no `loaded` key stays
+/// valid) is the FULL desired set; `loaded` (`#[serde(default)]`, so an
+/// older file / a lease from a pre-#2672 binary reads as "nothing
+/// confirmed loaded yet") is the subset of `models` this holder has
+/// actually confirmed resident — see `LeaseGuard::mark_loaded`'s doc for
+/// why that distinction exists and how it's used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LeaseFile {
     pid: u32,
     models: Vec<String>,
+    #[serde(default)]
+    loaded: Vec<String>,
 }
 
 /// The process-wide same-process-aggregation registry (#2651): every
@@ -116,24 +132,36 @@ struct LeaseFile {
 /// since every guard in one process shares the same pid. The on-disk
 /// `<pid>.lease` file is always the union of every value in this map.
 ///
-/// Three accessors touch this mutex. [`LeaseGuard::write`] and `Drop` both
-/// hold it across their WHOLE critical section — map mutation AND the
-/// resulting file write/delete — so two concurrent callers can never
-/// interleave a stale union onto disk; whichever call finishes last always
-/// leaves the file matching the map's state as of that call.
-/// [`LeaseGuard::all_live_leased_models`] is the third: a read-only
-/// accessor that holds the lock only for its own map iteration + `sort` +
-/// `dedup` (no file write), and calls [`live_leased_models`] — the ONE
-/// piece of this function that does file I/O — BEFORE taking the lock, so
-/// the lock is never held across I/O on any of the three paths.
-/// `.lock().unwrap_or_else(PoisonError::into_inner)` rather than a bare
-/// `.unwrap()`: nothing inside any of the three critical sections can
-/// itself panic (map mutation, a `Vec` sort/dedup, and a `Result`-returning
-/// file write — no arbitrary caller code runs while the lock is held), but
-/// recovering from poisoning defensively means a hypothetical future panic
-/// elsewhere never wedges every OTHER live holder's lease bookkeeping for
-/// the rest of the process's life.
-static ACTIVE_LEASES: LazyLock<Mutex<HashMap<u64, Vec<String>>>> =
+/// One holder's contribution: the models it currently DESIRES (the full
+/// set `write` was last called with) and the subset it has actually
+/// confirmed LOADED via `mark_loaded` (#2672) — see that method's doc.
+/// `loaded` is always a subset of `desired`; `write` prunes it defensively
+/// on every call so a model dropped from `desired` never lingers as stale
+/// "loaded" state.
+#[derive(Debug, Clone, Default)]
+struct LeaseEntry {
+    desired: Vec<String>,
+    loaded: Vec<String>,
+}
+
+/// Several accessors touch this mutex: [`LeaseGuard::write`] and
+/// [`LeaseGuard::mark_loaded`] (both new in #2672) and `Drop` all hold it
+/// across their WHOLE critical section — map mutation AND the resulting
+/// file write/delete — so two concurrent callers can never interleave a
+/// stale union onto disk; whichever call finishes last always leaves the
+/// file matching the map's state as of that call. [`LeaseGuard::all_live_leased_models`]
+/// (and [`LeaseGuard::identifiers_i_should_lead`]'s same-process half) are
+/// read-only: they hold the lock only for their own map iteration + sort +
+/// dedup (no file write), and call `live_leased_models`/`live_foreign_leases`
+/// — the file-I/O pieces — BEFORE taking the lock, so the lock is never
+/// held across I/O on any of these paths. A bare `.lock().unwrap_or_else(PoisonError::into_inner)`
+/// rather than a bare `.unwrap()` is used throughout: nothing inside any
+/// critical section can itself panic (map mutation, a `Vec` sort/dedup, and
+/// a `Result`-returning file write — no arbitrary caller code runs while
+/// the lock is held), but recovering from poisoning defensively means a
+/// hypothetical future panic elsewhere never wedges every OTHER live
+/// holder's lease bookkeeping for the rest of the process's life.
+static ACTIVE_LEASES: LazyLock<Mutex<HashMap<u64, LeaseEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -175,9 +203,62 @@ impl LeaseGuard {
     /// partially-written lease.
     pub fn write(&self, models: &[String]) -> Result<()> {
         let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        active.insert(self.token, models.to_vec());
-        let union = union_of(&active);
-        write_lease_file(self.pid, &union)
+        {
+            let entry = active.entry(self.token).or_default();
+            entry.desired = models.to_vec();
+            // A model no longer desired can't still be "loaded" (#2672) —
+            // prune defensively rather than trust every caller to also call
+            // `mark_loaded` again for a narrower re-`write`.
+            entry.loaded.retain(|m| entry.desired.contains(m));
+        }
+        let (desired, loaded) = union_of(&active);
+        write_lease_file(self.pid, &desired, &loaded)
+    }
+
+    /// (#2672) Mark `models` — a subset of THIS guard's own current
+    /// `desired` set (anything not currently desired is ignored, never
+    /// added) — as CONFIRMED resident: the "genuinely in use" phase, as
+    /// opposed to merely "intends to acquire." Call exactly once
+    /// [`crate::residency_lease`]'s caller (`ensure_wave_loaded`) has
+    /// observed a successful `PlanExecOutcome::Loaded` for these models —
+    /// never speculatively, and never before the host call actually
+    /// returned success.
+    ///
+    /// This is the intent-vs-in-use distinction MUST FIX 1 (#2672) needs:
+    /// [`LeaseGuard::identifiers_i_should_lead`] treats an identifier ANY
+    /// live holder has marked `loaded` as an unconditional, un-overridable
+    /// pin (#2669's original protection, completely untouched) — but an
+    /// identifier only ever `write`-ed as DESIRED, never marked `loaded`,
+    /// is a holder that is itself STILL racing to acquire the same
+    /// resource, not one already mid-generation on it. Only ADDS to this
+    /// guard's own `loaded` set (intersected with its current `desired`) —
+    /// never removes an existing entry; a subsequent `write()` narrowing
+    /// `desired` is what retires a stale `loaded` entry (see `write`'s own
+    /// pruning above).
+    pub fn mark_loaded(&self, models: &[String]) -> Result<()> {
+        let mut active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        {
+            let entry = active.entry(self.token).or_default();
+            for m in models {
+                if entry.desired.contains(m) && !entry.loaded.contains(m) {
+                    entry.loaded.push(m.clone());
+                }
+            }
+        }
+        let (desired, loaded) = union_of(&active);
+        write_lease_file(self.pid, &desired, &loaded)
+    }
+
+    /// This guard's own tie-break priority for [`identifiers_i_should_lead`]
+    /// (#2672): `(pid, token)`, a strict total order across every live
+    /// guard on the machine — `pid` differs across processes (so a
+    /// cross-process comparison always resolves on `pid` alone), and
+    /// `token` (minted from the single process-wide [`NEXT_LEASE_TOKEN`]
+    /// counter) already orders every guard WITHIN this one process
+    /// consistently, so a same-pid comparison (same-process siblings)
+    /// resolves on `token`.
+    fn priority(&self) -> (u32, u64) {
+        (self.pid, self.token)
     }
 
     /// Every `darkmux:*` model id leased by ANY other LIVE holder this
@@ -214,16 +295,111 @@ impl LeaseGuard {
     pub fn all_live_leased_models(&self) -> Vec<String> {
         let mut models = live_leased_models(self.pid);
         let active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        for (token, sibling_models) in active.iter() {
+        for (token, entry) in active.iter() {
             if *token == self.token {
                 continue;
             }
-            models.extend(sibling_models.iter().cloned());
+            models.extend(entry.desired.iter().cloned());
         }
         drop(active);
         models.sort();
         models.dedup();
         models
+    }
+
+    /// (#2672 MUST FIX 1) Of `candidates` (this wave's own about-to-be-
+    /// desired identifiers), which ones THIS guard should treat as NOT
+    /// pinned despite appearing in [`all_live_leased_models`] — because
+    /// every OTHER live holder naming that identifier is itself still only
+    /// ACQUIRING it (`write`-ed as desired, never confirmed via
+    /// [`mark_loaded`]), and this guard's own [`priority`] is the lowest
+    /// among every such acquiring-only holder.
+    ///
+    /// The bug this closes: two concurrent same-process (or cross-process)
+    /// waves that both merely INTEND to acquire the same identifier —
+    /// neither one yet resident on it — each wrote their lease BEFORE
+    /// planning (the existing #1487/#2651 discipline, unchanged), so each
+    /// saw the OTHER as an already-claimed pin and both hit `Reason::
+    /// ClaimedResidentInsufficientCtx`, burning their retry budget and
+    /// failing where pre-#2669 both had simply succeeded. This method lets
+    /// exactly ONE of them (the lowest-priority live holder — `priority`'s
+    /// own doc: a strict total order, so never a tie) exclude the
+    /// identifier and proceed with the real reconcile, while every OTHER
+    /// racing guard keeps it pinned and takes the existing bounded
+    /// retry-hold path in `ensure_wave_loaded`, which re-checks fresh
+    /// residency on each attempt and converges to a plain `Reuse` once the
+    /// leader's own reconcile has landed.
+    ///
+    /// An identifier ANY live holder has confirmed `loaded` (genuinely
+    /// mid-generation, not merely intending to acquire) is NEVER returned
+    /// here, regardless of priority — this is intent-vs-in-use, not
+    /// "lower priority always wins": #2669's original protection against
+    /// evicting a live, already-loaded sibling is completely untouched.
+    pub fn identifiers_i_should_lead(&self, candidates: &[String]) -> Vec<String> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let candidate_set: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+        let my_priority = self.priority();
+
+        let mut in_use: HashSet<String> = HashSet::new();
+        let mut acquiring_min: HashMap<String, (u32, u64)> = HashMap::new();
+
+        {
+            let active = ACTIVE_LEASES.lock().unwrap_or_else(|poison| poison.into_inner());
+            for (token, entry) in active.iter() {
+                if *token == self.token {
+                    continue;
+                }
+                for m in &entry.loaded {
+                    if candidate_set.contains(m.as_str()) {
+                        in_use.insert(m.clone());
+                    }
+                }
+                for m in &entry.desired {
+                    if !candidate_set.contains(m.as_str()) || entry.loaded.contains(m) {
+                        continue;
+                    }
+                    let p = (self.pid, *token);
+                    acquiring_min
+                        .entry(m.clone())
+                        .and_modify(|existing| *existing = (*existing).min(p))
+                        .or_insert(p);
+                }
+            }
+        }
+
+        for lease in live_foreign_leases(self.pid) {
+            for m in &lease.loaded {
+                if candidate_set.contains(m.as_str()) {
+                    in_use.insert(m.clone());
+                }
+            }
+            for m in &lease.models {
+                if !candidate_set.contains(m.as_str()) || lease.loaded.contains(m) {
+                    continue;
+                }
+                // No per-guard token crosses the process boundary (the
+                // on-disk file already collapses a foreign process's own
+                // same-process siblings into one union — see the module
+                // doc) — `pid` alone is enough: it's never equal to our
+                // own `self.pid` (a foreign lease is always some OTHER
+                // live pid, by `live_foreign_leases`'s own construction),
+                // so the tuple compare always resolves on the first
+                // element for a cross-process pair.
+                let p = (lease.pid, 0u64);
+                acquiring_min
+                    .entry(m.clone())
+                    .and_modify(|existing| *existing = (*existing).min(p))
+                    .or_insert(p);
+            }
+        }
+
+        acquiring_min
+            .into_iter()
+            .filter(|(m, min_priority)| !in_use.contains(m) && my_priority < *min_priority)
+            .map(|(m, _)| m)
+            .collect()
     }
 }
 
@@ -239,33 +415,37 @@ impl Drop for LeaseGuard {
         if active.is_empty() {
             let _ = remove_lease(self.pid);
         } else {
-            let union = union_of(&active);
-            let _ = write_lease_file(self.pid, &union);
+            let (desired, loaded) = union_of(&active);
+            let _ = write_lease_file(self.pid, &desired, &loaded);
         }
     }
 }
 
-/// Sorted, deduplicated union of every currently-registered holder's model
-/// set — sorted so the on-disk file (and every test asserting its content)
-/// is deterministic regardless of token-insertion order or `HashMap`
-/// iteration order.
-fn union_of(active: &HashMap<u64, Vec<String>>) -> Vec<String> {
-    let mut union: Vec<String> = active.values().flatten().cloned().collect();
-    union.sort();
-    union.dedup();
-    union
+/// Sorted, deduplicated union of every currently-registered holder's
+/// `desired` set and, separately, `loaded` set — sorted so the on-disk file
+/// (and every test asserting its content) is deterministic regardless of
+/// token-insertion order or `HashMap` iteration order.
+fn union_of(active: &HashMap<u64, LeaseEntry>) -> (Vec<String>, Vec<String>) {
+    let mut desired: Vec<String> = active.values().flat_map(|e| e.desired.iter().cloned()).collect();
+    desired.sort();
+    desired.dedup();
+    let mut loaded: Vec<String> = active.values().flat_map(|e| e.loaded.iter().cloned()).collect();
+    loaded.sort();
+    loaded.dedup();
+    (desired, loaded)
 }
 
-/// Write `models` to `<pid>.lease`, wholesale — the shared private I/O this
-/// module's TWO writers ([`LeaseGuard::write`] and its `Drop`, both already
-/// holding [`ACTIVE_LEASES`]'s lock when they call this) use, so the
-/// serialize-atomic-rename mechanics live in exactly one place.
-fn write_lease_file(pid: u32, models: &[String]) -> Result<()> {
+/// Write `models`/`loaded` to `<pid>.lease`, wholesale — the shared private
+/// I/O this module's writers ([`LeaseGuard::write`], [`LeaseGuard::
+/// mark_loaded`], and `Drop`, all already holding [`ACTIVE_LEASES`]'s lock
+/// when they call this) use, so the serialize-atomic-rename mechanics live
+/// in exactly one place.
+fn write_lease_file(pid: u32, models: &[String], loaded: &[String]) -> Result<()> {
     let dir = residency_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = lease_path(&dir, pid);
     let tmp = dir.join(format!("{pid}.lease.tmp"));
-    let payload = LeaseFile { pid, models: models.to_vec() };
+    let payload = LeaseFile { pid, models: models.to_vec(), loaded: loaded.to_vec() };
     let json = serde_json::to_string_pretty(&payload).context("serializing residency lease")?;
     fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, &path)
@@ -273,20 +453,23 @@ fn write_lease_file(pid: u32, models: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Every `darkmux:*` model id leased by an OTHER live process — i.e. every
-/// `<pid>.lease` file in the registry whose pid is (a) not `own_pid` and
-/// (b) still alive. A lease belonging to a dead pid is skipped from the
-/// result AND best-effort removed (the crash-orphan sweep, folded into this
-/// read — see module docs). A malformed or unreadable lease file is
-/// skipped silently; this function never panics and never fails — a
+/// Every live-and-parseable lease file belonging to an OTHER pid — i.e.
+/// every `<pid>.lease` file in the registry whose pid is (a) not `own_pid`
+/// and (b) still alive — scanning `residency_dir()` once. The shared read
+/// [`live_leased_models`] and [`LeaseGuard::identifiers_i_should_lead`]'s
+/// cross-process half both build on, so the directory scan / pid-liveness
+/// sweep / malformed-file leniency live in exactly one place. A lease
+/// belonging to a dead pid is skipped from the result AND best-effort
+/// removed (the crash-orphan sweep). A malformed or unreadable lease file
+/// is skipped silently; this function never panics and never fails — a
 /// registry read that can't be trusted degrades to "nothing pinned," which
 /// is the same fail-open leniency `config.json` reads use elsewhere.
-pub fn live_leased_models(own_pid: u32) -> Vec<String> {
+fn live_foreign_leases(own_pid: u32) -> Vec<LeaseFile> {
     let dir = residency_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut models = Vec::new();
+    let mut out = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("lease") {
@@ -304,6 +487,17 @@ pub fn live_leased_models(own_pid: u32) -> Vec<String> {
             let _ = fs::remove_file(&path); // best-effort crash-orphan sweep
             continue;
         }
+        out.push(lease);
+    }
+    out
+}
+
+/// Every `darkmux:*` model id leased (desired) by an OTHER live process —
+/// see [`live_foreign_leases`] for the scan/liveness/leniency mechanics
+/// this builds on.
+pub fn live_leased_models(own_pid: u32) -> Vec<String> {
+    let mut models = Vec::new();
+    for lease in live_foreign_leases(own_pid) {
         models.extend(lease.models);
     }
     models
@@ -450,7 +644,7 @@ mod tests {
 
         let pid = dead_pid();
         let path = lease_path(&dir, pid);
-        let payload = LeaseFile { pid, models: vec!["darkmux:orphan".to_string()] };
+        let payload = LeaseFile { pid, models: vec!["darkmux:orphan".to_string()], loaded: vec![] };
         fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
         assert!(path.exists(), "precondition: the orphan lease file exists");
 
@@ -732,6 +926,7 @@ mod tests {
         let cross_process_lease = LeaseFile {
             pid: holder_pid,
             models: vec!["darkmux:cross-process".to_string()],
+            loaded: vec![],
         };
         fs::write(lease_path(&dir, holder_pid), serde_json::to_string(&cross_process_lease).unwrap())
             .expect("hand-writing a lease for the external holder pid");
