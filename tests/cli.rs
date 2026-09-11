@@ -9076,3 +9076,226 @@ fn fail_probe_board_reports_the_mixed_phase_as_degraded_not_complete() {
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(text.contains("degraded"), "the board never says `degraded`:\n{text}");
 }
+
+// ─── #1711: `mission status` is no longer fleet-blind ──────────────────
+//
+// The daemon (#1705) fixed this by rolling missions up from the merged
+// flow record set — local day-files PLUS the shared Redis stream — rather
+// than from durable per-machine JSON alone. `mission status` reuses that
+// EXACT aggregation (`darkmux_serve::build_runs`, already `pub` and
+// already called by `darkmux run list` — #1905) rather than a second
+// implementation.
+//
+// These tests never touch Redis (no `DARKMUX_REDIS_URL` is set, so the
+// fleet half resolves to `SourceState::Off`) — they simulate "a peer's
+// mission" the same way `build_runs`'s own aggregation is source-agnostic:
+// a flow record naming a `mission_id` this machine has no durable JSON
+// for, stamped with a foreign `machine_id`. That is exactly the shape a
+// record arriving over the shared Redis stream would have once it reaches
+// `build_flow_mission_index` — the function does not care whether the
+// `Vec<serde_json::Value>` it folds came from a local day-file or a fleet
+// read. This is "test against fakes", never a real peer.
+
+/// One flow day-file with a mission this machine never launched — a
+/// `mission start`/`mission close` (or no terminal record at all) pair
+/// stamped with `machine_id: "peer-host"`, and zero corresponding
+/// `~/.darkmux/missions/<id>/mission.json` on this machine.
+fn write_peer_mission_day_file(
+    flows: &std::path::Path,
+    mission_id: &str,
+    machine_id: &str,
+    terminal_action: Option<&str>,
+) {
+    fs::create_dir_all(flows).unwrap();
+    let rec = |ts: &str, action: &str| {
+        serde_json::json!({
+            "ts": ts, "level": "info", "category": "work", "tier": "local",
+            "stage": "dispatch", "action": action, "handle": "review",
+            "session_id": format!("{mission_id}-s1"), "machine_id": machine_id,
+            "mission_id": mission_id,
+        })
+        .to_string()
+    };
+    let mut lines = vec![rec("2026-09-10T01:00:00Z", "mission start")];
+    if let Some(action) = terminal_action {
+        lines.push(rec("2026-09-10T01:05:00Z", action));
+    }
+    fs::write(flows.join("2026-09-10.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn mission_status_json_surfaces_a_peer_mission_seen_only_via_the_flow_stream() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    write_peer_mission_day_file(flows.path(), "review-peer-1711", "peer-host", Some("mission close"));
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("mission status --json must be JSON: {e}"));
+
+    // Never in the local `missions` array — this machine has no durable
+    // record for it, and #1711's whole point is that the OLD behavior
+    // (silently absent everywhere) must not be replaced by a NEW bug
+    // (silently merged into the local array as if it were owned here).
+    assert_eq!(
+        board["missions"].as_array().map(Vec::len),
+        Some(0),
+        "a peer mission must never land in the local `missions` array: {board}"
+    );
+    let peer = board["peer_missions"].as_array().expect("peer_missions must be an array");
+    assert_eq!(peer.len(), 1, "the peer mission must surface exactly once: {board}");
+    assert_eq!(peer[0]["id"], "review-peer-1711");
+    assert_eq!(peer[0]["machine"], "peer-host");
+    assert_eq!(peer[0]["tracked"], false, "an observed-not-owned row must say so on the wire");
+    assert_eq!(peer[0]["status"], "complete", "a seen `mission close` must read as complete");
+    assert_eq!(board["fleet"]["state"], "off", "no DARKMUX_REDIS_URL was set — this is a real Off");
+    assert_eq!(board["summary"]["fleet_complete"], true, "`Off` is a correct, complete answer");
+}
+
+#[test]
+fn mission_status_text_shows_a_rostered_but_silent_peer_distinctly_from_a_running_one() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    // No terminal record at all, and the one session is far in the past —
+    // this is the "rostered but silent" case: seen once, gone quiet, never
+    // torn down on purpose. Must NOT read as "abandoned" (a verdict this
+    // board cannot support) or "running" (it is not live).
+    write_peer_mission_day_file(flows.path(), "review-peer-silent", "peer-2", None);
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("OBSERVED ON THE FLEET"),
+        "a peer mission must get its own labeled section:\n{text}"
+    );
+    assert!(text.contains("peer-2"), "the row must name the machine that ran it:\n{text}");
+    assert!(
+        text.contains("silent") && !text.contains("aborted"),
+        "a mission with no terminal record must read as silent, never as an aborted verdict:\n{text}"
+    );
+    // The board must not hang and must not crash — this is the exact
+    // "degraded case" the issue asks for: a peer that went quiet, not one
+    // that answered cleanly.
+    assert!(out.status.success());
+}
+
+#[test]
+fn mission_status_degrades_legibly_when_the_fleet_stream_could_not_be_read() {
+    // (#1711 hard requirement) An unreachable-fleet simulation: point
+    // `DARKMUX_REDIS_URL` at a host that refuses the connection outright
+    // (loopback, a port nothing listens on) — bounded by
+    // `REDIS_CONNECT_TIMEOUT`, so this must return promptly, never hang.
+    // This is a fake unreachable service, never a real peer or a real
+    // operator credential.
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_REDIS_URL", "redis://127.0.0.1:1/")
+        .args(["mission", "status", "--json", "--all"])
+        .timeout(std::time::Duration::from_secs(15))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("mission status --json must be JSON: {e}"));
+    assert_eq!(
+        board["fleet"]["state"], "unavailable",
+        "an unreachable Redis with nothing cached must read as unavailable: {board}"
+    );
+    assert_eq!(board["summary"]["fleet_complete"], false);
+    assert_eq!(board["missions"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        board["peer_missions"].as_array().map(Vec::len),
+        Some(0),
+        "no cached snapshot exists, so peer_missions must be empty, never fabricated: {board}"
+    );
+
+    // …and the human board admits it, never a false "board is clean".
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .env("DARKMUX_REDIS_URL", "redis://127.0.0.1:1/")
+        .args(["mission", "status", "--all"])
+        .timeout(std::time::Duration::from_secs(15))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        !text.contains("✓ board is clean"),
+        "an incomplete fleet read must never render the unqualified green checkmark:\n{text}"
+    );
+    assert!(
+        text.to_lowercase().contains("fleet"),
+        "the board must name that the fleet-wide read did not complete:\n{text}"
+    );
+}
+
+#[test]
+fn mission_status_is_byte_identical_on_a_standalone_machine_with_no_peers() {
+    // (#1711 hard requirement) The local-only case is UNCHANGED: a real
+    // mission, launched and finalized exactly as before #1711, with no
+    // flow records for any other mission and no Redis configured, must
+    // still print the exact pre-#1711 clean-board line — no new section,
+    // no new caveat.
+    let (home, flows) = forward_dep_fixture();
+    let launched = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "launch", "forward-dep"])
+        .output()
+        .unwrap();
+    assert_eq!(launched.status.code(), Some(0));
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("OBSERVED ON THE FLEET"),
+        "a standalone board with no peers must show no fleet section:\n{text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("fleet:"),
+        "a standalone board must show no fleet-scope warning:\n{text}"
+    );
+    assert!(
+        text.trim_end().ends_with("✓ board is clean — every mission's phases are reconciled"),
+        "the exact pre-#1711 clean-board line must be unchanged:\n{text}"
+    );
+
+    let json_out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "status", "--json", "--all"])
+        .output()
+        .unwrap();
+    let board: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(board["peer_missions"].as_array().map(Vec::len), Some(0));
+    assert_eq!(board["fleet"]["state"], "off");
+    assert_eq!(board["summary"]["fleet_complete"], true);
+}

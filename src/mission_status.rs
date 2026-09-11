@@ -12,15 +12,26 @@
 //! prints copy-pasteable reconcile commands, but never mutates state. The
 //! operator (or the frontier reading `--json`) runs the suggested commands.
 //!
-//! The board is computed purely from the durable mission + phase JSON (the
-//! loader), so it works offline with no Redis/flow dependency — exactly what
-//! a session-start housekeeping cue needs.
+//! The LOCAL board is computed purely from the durable mission + phase JSON
+//! (the loader), so it works offline with no Redis/flow dependency — exactly
+//! what a session-start housekeeping cue needs. (#1711) On top of that,
+//! `run()` ALSO reads the shared flow stream — the same
+//! `darkmux_serve::fleet_records_for_runs()` + `build_runs()` union `darkmux
+//! run list` already calls (#1905), itself the CLI twin of the daemon's
+//! `/runs` fix (#1705) — so a mission executing on a PEER machine, which has
+//! no durable JSON here at all, still surfaces as a thin "observed, not
+//! owned" row instead of being structurally invisible. This is best-effort
+//! and degrades legibly (`darkmux_serve::source_state::SourceState`): a
+//! standalone install with no `DARKMUX_REDIS_URL` gets `Off` and the board
+//! prints byte-identical output to before #1711 — no new dependency is
+//! introduced on the path that made this module offline-first.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::crew;
 use crate::crew::types::{Mission, MissionStatus, Phase, PhaseStatus};
+use darkmux_serve::{source_state::SourceState, AbandonReason, Run, RunKind, RunStatus};
 use darkmux_types::{config_access, style};
 
 /// A flagged inconsistency on one mission, with concrete reconcile commands.
@@ -402,6 +413,139 @@ fn relative_age(now: u64, then: u64) -> String {
     }
 }
 
+/// (#1711) Missions this machine can SEE via the shared flow stream but does
+/// not OWN — the CLI twin of #1705's `/runs`/`/flow-missions` fix. A
+/// mission's durable `Mission`/`Phase` JSON lives only on the machine that
+/// ran it, so a peer's mission is structurally invisible to
+/// `crew::loader::load_missions()` no matter how much of its work crosses
+/// the flow stream.
+///
+/// This calls the EXACT aggregation #1705 built
+/// (`darkmux_serve::build_runs`, already `pub` and already reused as-is by
+/// `darkmux run list` — #1905) rather than re-deriving the rollup a second
+/// time, per the issue's own "Fix direction": two independent answers to
+/// "what's running on the fleet" would be worse than one incomplete one.
+/// `build_runs` already de-dupes against every locally-tracked mission
+/// (`known_mission_ids`), so nothing here can double-print a mission this
+/// machine owns.
+///
+/// Filtered to `RunKind::Mission` rows with `tracked == false` — a bare
+/// dispatch ghost or a lab run was never part of this board's scope (it
+/// only ever showed missions), and `tracked: true` rows are exactly the
+/// mission board's own local half, already covered by `load_missions()`.
+///
+/// `lab_dir: None` — `build_runs`'s lab-run union is `run list`'s concern,
+/// not this board's.
+fn peer_mission_runs(flows_dir: &std::path::Path, fleet: &[serde_json::Value]) -> Vec<Run> {
+    darkmux_serve::build_runs(flows_dir, None, fleet)
+        .into_iter()
+        .filter(|r| r.kind == RunKind::Mission && !r.tracked)
+        .collect()
+}
+
+/// (#1711) The status word for one peer-observed mission row.
+///
+/// Distinguishes a mission that was DELIBERATELY torn down (a `mission
+/// abort` record was seen) from one that simply went quiet with no
+/// terminal record at all — the "rostered but silent" case named in the
+/// issue is not the same fact as "aborted", and darkmux describes rather
+/// than adjudicates: it must not claim a peer mission failed or was
+/// abandoned on purpose when all it actually knows is that the stream went
+/// quiet (the peer could be asleep, offline, or between heartbeats — this
+/// board attempted one read of the shared stream and reports what came
+/// back, nothing more).
+fn peer_status_word(status: RunStatus, reason: Option<AbandonReason>) -> &'static str {
+    match (status, reason) {
+        (RunStatus::Running, _) => "running",
+        (RunStatus::Complete, _) => "complete",
+        (RunStatus::Abandoned, Some(AbandonReason::Aborted)) => "aborted",
+        // No terminal record and not currently live — silent, not a verdict.
+        (RunStatus::Abandoned, _) => "silent (no terminal record seen)",
+        (RunStatus::Error, _) => "error",
+        (RunStatus::Planned, _) => "planned",
+        (RunStatus::Unparseable, _) => "unparseable",
+    }
+}
+
+/// (#1711) One line naming an INCOMPLETE fleet read, or `None` when the
+/// answer is whole. Mirrors `darkmux run list`'s own `fleet_warning`
+/// (`run_list.rs`) state-for-state — kept as a separate small function
+/// (this one folds into `style::warn` for this file's renderer; that one is
+/// a bare `eprintln`) but deliberately says the SAME thing for the SAME
+/// state: two surfaces answering "what's running on the fleet" with
+/// different words for the same outage would just be a quieter version of
+/// the disagreement #1711 was filed over.
+///
+/// `Off` and `Ok` are both `None` — `Off` is a correctly-configured
+/// standalone machine (warning would be the bug), `Ok` is a complete
+/// answer. Never interpolates the source's `detail`: a Redis error can
+/// carry the connection string, which may embed a password (#661 Slice 5).
+fn fleet_scope_note(state: &SourceState) -> Option<String> {
+    match state {
+        SourceState::Ok | SourceState::Off => None,
+        SourceState::Stale { age_ms, .. } => Some(format!(
+            "fleet: could not reach the shared stream; showing a peer-mission snapshot {} old — \
+             this board's fleet view may be missing recent work",
+            format_age_span(*age_ms / 1000)
+        )),
+        SourceState::Unavailable { .. } => Some(
+            "fleet: could not reach the shared stream and nothing was cached — this board covers \
+             this machine's own missions only"
+                .to_string(),
+        ),
+    }
+}
+
+/// One-unit span (`Ns`/`Nm`/`Nh`/`Nd`), rounding down. Same shape as
+/// `relative_age` above and `run_list.rs::format_span` — kept local rather
+/// than shared (four lines, and the two callers format for different
+/// renderers; see that module's own precedent for the same call).
+fn format_age_span(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// (#1711) The peer-mission section: missions this machine can SEE via the
+/// shared flow stream but does not OWN. Thinner than a local row by
+/// necessity — no phase graph, no per-task detail, because that structure
+/// only exists on the machine that ran it (see [`peer_mission_runs`]'s doc).
+/// A no-op when `peer` is empty, which includes every standalone install —
+/// this is what keeps the local-only board byte-identical to before #1711.
+fn print_peer_missions(peer: &[Run], now: u64) {
+    if peer.is_empty() {
+        return;
+    }
+    println!(
+        "\n{}",
+        style::dim(&format!(
+            "OBSERVED ON THE FLEET ({}) — seen via the shared flow stream, not owned by this machine",
+            peer.len()
+        ))
+    );
+    let id_w = peer.iter().map(|r| r.id.chars().count()).max().unwrap_or(0).clamp(1, 40);
+    let machine_w = peer
+        .iter()
+        .map(|r| r.machine.as_deref().unwrap_or("unknown machine").chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(1, 24);
+    for r in peer {
+        let id = ellipsize(&r.id, id_w);
+        let machine = ellipsize(r.machine.as_deref().unwrap_or("unknown machine"), machine_w);
+        let ts = r.updated_ts.or(r.completed_ts).or(r.started_ts).unwrap_or(now);
+        let age = relative_age(now, ts);
+        let status = peer_status_word(r.status, r.abandoned_reason);
+        println!(
+            "  ◇ {id:<id_w$}  {machine:<machine_w$}  {age:>age_w$}  {status}",
+            age_w = AGE_COLS,
+        );
+    }
+}
+
 /// Pure drift detection for one mission given its phases. `now` and
 /// `stale_days` are passed in (rather than read internally) so the function
 /// stays IO-free and unit-testable with fixed timestamps — see the module
@@ -702,19 +846,36 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         .collect();
     views.sort_by(board_order);
 
+    // (#1711) Peer half of the board: missions this machine can SEE via the
+    // shared flow stream but does not OWN. Fetched unconditionally (both the
+    // `--json` and human paths need it) — `fleet_records_for_runs()`
+    // degrades to an empty vec + `SourceState::Off` on a standalone install
+    // with no `DARKMUX_REDIS_URL`, so this costs nothing there. See
+    // [`peer_mission_runs`]'s doc for why this reuses #1705's aggregation
+    // rather than re-deriving it.
+    let flows_dir = config_access::flows_dir();
+    let fleet = darkmux_serve::fleet_records_for_runs();
+    let peer = peer_mission_runs(&flows_dir, &fleet.records);
+    let fleet_complete = matches!(fleet.state, SourceState::Ok | SourceState::Off);
+
     // (#1562, restated for #1709) `--json` is deliberately NEVER filtered —
     // not by `--missions`, not by anything — because this branch returns
     // before `board_partition` even runs. A machine reader always gets the
     // whole board (`record exhaustively, display selectively`: the filter is
     // display-only). `--limit`/pagination already followed this same rule.
     if json {
-        return run_json(&views);
+        return run_json(&views, &peer, &fleet.state);
     }
 
     // Resolved once, above the early return, so every prose line in this
     // renderer — including the empty-board hint — wraps to the same width.
     let width = style::terminal_width();
-    if views.is_empty() {
+    // (#1711) A peer mission means there IS something on the board, even
+    // with zero local missions — "no missions yet, propose one" would be
+    // actively wrong advice while a peer's mission is running. Fall through
+    // to the normal renderer instead, which prints an empty local section
+    // set, the peer section, and the fleet-scoped rollup.
+    if views.is_empty() && peer.is_empty() {
         // (#1582) The prose wraps; the command does not. Same rule the drift
         // suggestions follow, for the same reason — this is the one command a
         // brand-new operator will copy, and it is the worst possible one to
@@ -723,6 +884,12 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
             println!("{}", style::dim(&line));
         }
         println!("  {} darkmux mission propose", style::dim("→"));
+        if let Some(note) = fleet_scope_note(&fleet.state) {
+            println!();
+            for line in wrap_indented(&note, 0, width) {
+                println!("{}", style::warn(&line));
+            }
+        }
         return Ok(0);
     }
 
@@ -986,14 +1153,33 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // into the same flag rather than a second, competing qualifier.
     let any_drift_hidden = any_drift_hidden || hidden_attention > 0;
 
+    // (#1711) The fleet half of the board — printed after every local
+    // section so the operator's own machine stays visually primary, and
+    // before the final rollup so the clean-board claim just below can be
+    // qualified by what this printed (or admits it could not check). A
+    // no-op on a standalone install: `print_peer_missions` is a no-op on an
+    // empty slice and `fleet_scope_note` is `None` for `Off`.
+    print_peer_missions(&peer, now);
+    if let Some(note) = fleet_scope_note(&fleet.state) {
+        println!();
+        for line in wrap_indented(&note, 0, width) {
+            println!("{}", style::warn(&line));
+        }
+    }
+
     println!();
     // "above" is only true for the drifted missions that were PRINTED as full
     // rows; a section limit or the named-first default can leave others
     // unshown (each warns its own way above), so the rollup admits it rather
     // than pointing at commands that never appeared.
     let visible_attention: usize = visible.iter().filter(|v| !v.drifts.is_empty()).count();
-    let (clean, summary) =
-        attention_rollup(visible_attention, hidden_attention, any_drift_hidden, all_link.is_some());
+    let (clean, summary) = attention_rollup(
+        visible_attention,
+        hidden_attention,
+        any_drift_hidden,
+        all_link.is_some(),
+        fleet_complete,
+    );
     for line in wrap_indented(&summary, 0, width) {
         println!("{}", if clean { style::success(&line) } else { style::warn(&line) });
     }
@@ -1081,8 +1267,30 @@ fn attention_rollup(
     hidden_attention: usize,
     any_drift_hidden: bool,
     all_link_present: bool,
+    // (#1711) Whether the fleet-wide peer-mission read covered the whole
+    // fleet (`SourceState::Ok`/`Off`) or came back degraded
+    // (`Stale`/`Unavailable`). The issue's own complaint was specifically
+    // about this line: "✓ board is clean" is currently scoped to one
+    // machine while claiming to be scoped to everything. `true` on every
+    // pre-#1711 call site preserves the exact old wording.
+    fleet_complete: bool,
 ) -> (bool, String) {
+    // (#1711) Appended to every branch below so the scope caveat travels
+    // with whichever message actually prints, rather than living only in
+    // the separate `fleet_scope_note` line above it (which a narrow
+    // terminal or a script grepping just this line could miss).
+    let fleet_tail =
+        if fleet_complete { "" } else { " — the fleet-wide read did not complete; peer missions may be missing" };
     if visible_attention == 0 && hidden_attention == 0 {
+        if !fleet_complete {
+            // Never the green checkmark here: this machine's own missions
+            // are reconciled, but that is not the claim the summary line
+            // makes — it says "board", and the board includes the fleet.
+            return (
+                false,
+                format!("this machine's missions are reconciled{fleet_tail} (see note above)"),
+            );
+        }
         return (true, "✓ board is clean — every mission's phases are reconciled".to_string());
     }
     if visible_attention == 0 {
@@ -1100,7 +1308,7 @@ fn attention_rollup(
             false,
             format!(
                 "{hidden_attention} filtered-out run instance{plural} {verb} attention — drop \
-                 `--missions` to see {it} and {its} reconcile command{plural}",
+                 `--missions` to see {it} and {its} reconcile command{plural}{fleet_tail}",
                 its = if hidden_attention == 1 { "its" } else { "their" },
             ),
         );
@@ -1116,7 +1324,7 @@ fn attention_rollup(
         false,
         format!(
             "{visible_attention} mission{s} {verb} attention — run the suggested commands above to \
-             reconcile{tail}",
+             reconcile{tail}{fleet_tail}",
             s = if visible_attention == 1 { "" } else { "s" },
             verb = if visible_attention == 1 { "needs" } else { "need" },
         ),
@@ -1129,7 +1337,7 @@ fn attention_rollup(
 /// `partition_visibility`, so a test can assert the mission count here
 /// matches the input slice regardless of what a human-board `--all` would
 /// show. No I/O, no printing.
-fn board_json(views: &[MissionView]) -> serde_json::Value {
+fn board_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) -> serde_json::Value {
     let arr: Vec<serde_json::Value> = views
         .iter()
         .map(|v| {
@@ -1159,14 +1367,35 @@ fn board_json(views: &[MissionView]) -> serde_json::Value {
         })
         .collect();
     let attention = views.iter().filter(|v| !v.drifts.is_empty()).count();
+    // (#1711) `fleet_complete` mirrors `SourceState::is_complete` (that
+    // method is `pub(crate)` inside `darkmux-serve`, not visible from this
+    // crate) — `Ok`/`Off` both mean the fleet-wide read covers everything it
+    // claims to; `Stale`/`Unavailable` mean a peer's mission could be
+    // missing from `peer_missions` below.
+    let fleet_complete = matches!(fleet_state, SourceState::Ok | SourceState::Off);
     serde_json::json!({
         "missions": arr,
-        "summary": { "total": views.len(), "needs_attention": attention },
+        // (#1711) Peer missions — observed via the shared flow stream, not
+        // owned by this machine (see `peer_mission_runs`'s doc). Always
+        // present (possibly empty), same "record exhaustively" posture as
+        // `missions` above — a machine reader must be able to tell "no peer
+        // missions" from "the fleet read never ran".
+        "peer_missions": peer,
+        // The SAME wire shape `darkmux run list --json` emits for this
+        // field (`run_list.rs::run_json`) — one state vocabulary for
+        // "what's running on the fleet" across both CLI surfaces (#1711's
+        // own complaint was two surfaces disagreeing).
+        "fleet": fleet_state,
+        "summary": {
+            "total": views.len(),
+            "needs_attention": attention,
+            "fleet_complete": fleet_complete,
+        },
     })
 }
 
-fn run_json(views: &[MissionView]) -> Result<i32> {
-    println!("{}", serde_json::to_string_pretty(&board_json(views))?);
+fn run_json(views: &[MissionView], peer: &[Run], fleet_state: &SourceState) -> Result<i32> {
+    println!("{}", serde_json::to_string_pretty(&board_json(views, peer, fleet_state))?);
     Ok(0)
 }
 
@@ -2808,7 +3037,7 @@ mod tests {
 
     #[test]
     fn attention_rollup_is_clean_only_when_both_counts_are_zero() {
-        let (clean, msg) = attention_rollup(0, 0, false, false);
+        let (clean, msg) = attention_rollup(0, 0, false, false, true);
         assert!(clean);
         assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
     }
@@ -2819,12 +3048,12 @@ mod tests {
         // the board must not read as clean, and (#1709) must point at
         // DROPPING `--missions`, the only thing that could have hidden it,
         // matching the footer's advice rather than competing with it.
-        let (clean, msg) = attention_rollup(0, 1, true, false);
+        let (clean, msg) = attention_rollup(0, 1, true, false, true);
         assert!(!clean, "a hidden actionable run must never look like a clean board");
         assert!(msg.contains("1 filtered-out run instance needs attention"), "{msg}");
         assert!(msg.contains("--missions"), "{msg}");
 
-        let (clean, msg) = attention_rollup(0, 2, true, false);
+        let (clean, msg) = attention_rollup(0, 2, true, false, true);
         assert!(!clean);
         assert!(msg.contains("2 filtered-out run instances need attention"), "{msg}");
         assert!(msg.contains("--missions"), "{msg}");
@@ -2832,24 +3061,63 @@ mod tests {
 
     #[test]
     fn attention_rollup_uses_the_existing_wording_when_visible_missions_need_attention() {
-        let (clean, msg) = attention_rollup(3, 0, false, false);
+        let (clean, msg) = attention_rollup(3, 0, false, false, true);
         assert!(!clean);
         assert_eq!(msg, "3 missions need attention — run the suggested commands above to reconcile");
 
-        let (_, msg) = attention_rollup(1, 0, false, false);
+        let (_, msg) = attention_rollup(1, 0, false, false, true);
         assert_eq!(msg, "1 mission needs attention — run the suggested commands above to reconcile");
     }
 
     #[test]
     fn attention_rollup_tail_reflects_hidden_drift_and_panel_presence() {
-        let (_, msg) = attention_rollup(3, 2, true, false);
+        let (_, msg) = attention_rollup(3, 2, true, false, true);
         assert!(msg.ends_with("(some are hidden — `--all` to see them)"), "{msg}");
 
-        let (_, msg) = attention_rollup(3, 2, true, true);
+        let (_, msg) = attention_rollup(3, 2, true, true, true);
         assert!(msg.ends_with("(some are hidden — open the full board above)"), "{msg}");
 
-        let (_, msg) = attention_rollup(3, 0, false, false);
+        let (_, msg) = attention_rollup(3, 0, false, false, true);
         assert!(!msg.contains("hidden"), "{msg}");
+    }
+
+    // ─── #1711: the clean-board claim must cover — or admit the scope of —
+    // the fleet, not just this machine ───────────────────────────────────
+
+    #[test]
+    fn attention_rollup_never_shows_the_green_checkmark_when_the_fleet_read_is_incomplete() {
+        // This machine's own missions are perfectly reconciled (0, 0), but
+        // the fleet-wide read never completed — the summary line says
+        // "board", and the board is supposed to include the fleet. The
+        // green checkmark is a claim of full coverage this run cannot make.
+        let (clean, msg) = attention_rollup(0, 0, false, false, false);
+        assert!(!clean, "an incomplete fleet read must never render as the clean checkmark");
+        assert!(!msg.starts_with('✓'), "{msg}");
+        assert!(
+            msg.contains("did not complete") || msg.contains("fleet"),
+            "the message must name the fleet gap, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn attention_rollup_still_says_board_is_clean_when_fleet_is_off_or_ok() {
+        // `Off` (no fleet substrate configured) and `Ok` (a complete read)
+        // are both real "nothing is missing" answers — a standalone
+        // install must see the EXACT pre-#1711 wording, unchanged.
+        let (clean, msg) = attention_rollup(0, 0, false, false, true);
+        assert!(clean);
+        assert_eq!(msg, "✓ board is clean — every mission's phases are reconciled");
+    }
+
+    #[test]
+    fn attention_rollup_names_the_fleet_gap_even_when_local_missions_need_attention() {
+        // The fleet-incomplete caveat must travel with whichever branch
+        // actually renders, not just the all-clean one — an operator
+        // reconciling local drift should also know the fleet half of the
+        // board could not be verified.
+        let (_, msg) = attention_rollup(3, 0, false, false, false);
+        assert!(msg.contains("3 missions need attention"), "{msg}");
+        assert!(msg.contains("fleet"), "the local-attention branch must still name the fleet gap: {msg}");
     }
 
     #[test]
@@ -2863,7 +3131,7 @@ mod tests {
         minted.spec = Some(minted_spec());
         let views = vec![view(&named, 1, 0), drifted(&minted)];
 
-        let payload = board_json(&views);
+        let payload = board_json(&views, &[], &SourceState::Off);
         let ids: Vec<&str> =
             payload["missions"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), 2, "both named and minted missions must be present");
@@ -2918,7 +3186,7 @@ mod tests {
         // can rely on.
         let m = mission("m1", MissionStatus::Finalized);
         let v = view_with_degraded(&m, 2, 1, 0);
-        let payload = board_json(std::slice::from_ref(&v));
+        let payload = board_json(std::slice::from_ref(&v), &[], &SourceState::Off);
         let phases = &payload["missions"][0]["phases"];
         assert_eq!(phases["complete"], 2, "the degraded phase must NOT be folded in here");
         assert_eq!(phases["degraded"], 1);
@@ -2928,5 +3196,200 @@ mod tests {
             .map(|k| phases[*k].as_u64().unwrap())
             .sum::<u64>();
         assert_eq!(sum, phases["total"].as_u64().unwrap(), "the buckets must partition `total`");
+    }
+
+    // ─── #1711: peer missions — the CLI board is no longer fleet-blind ────
+
+    /// One fabricated flow record — a plain `serde_json::Value`, the SAME
+    /// shape `darkmux_serve::build_runs`/`build_flow_mission_index` consume
+    /// whether it came from a local day-file or the shared Redis stream.
+    /// Used to simulate "what a peer wrote to the fleet" with zero network
+    /// or Redis involvement — the whole point of testing at this layer.
+    fn flow_record(
+        mission_id: &str,
+        machine_id: &str,
+        action: &str,
+        ts: &str,
+        session_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "mission_id": mission_id,
+            "machine_id": machine_id,
+            "action": action,
+            "ts": ts,
+            "session_id": session_id,
+        })
+    }
+
+    #[test]
+    fn peer_mission_runs_surfaces_a_mission_seen_only_via_the_shared_stream() {
+        // The exact defect #1711 was filed over: a mission with real flow
+        // records and NO local durable `Mission` JSON (because it ran on a
+        // peer) must still produce a row here, `tracked: false`, carrying
+        // the peer's machine id.
+        let flows = tempfile::tempdir().unwrap();
+        let fleet = vec![
+            flow_record("review-peer-1", "hub", "mission start", "2026-09-01T00:00:00Z", "s1"),
+            flow_record("review-peer-1", "hub", "mission close", "2026-09-01T00:05:00Z", "s1"),
+        ];
+        let peer = peer_mission_runs(flows.path(), &fleet);
+        assert_eq!(peer.len(), 1, "a peer-only mission must produce exactly one row: {peer:?}");
+        assert_eq!(peer[0].id, "review-peer-1");
+        assert_eq!(peer[0].machine.as_deref(), Some("hub"));
+        assert!(!peer[0].tracked, "an observed-not-owned row must be marked untracked");
+        assert_eq!(peer[0].status, RunStatus::Complete);
+    }
+
+    #[test]
+    fn peer_mission_runs_is_empty_on_a_standalone_install_with_no_fleet_records() {
+        // (#1711 hard requirement) The local-only case must be UNCHANGED:
+        // no fleet records at all (the `Off`/standalone shape) must yield
+        // zero peer rows, not a synthesized one.
+        let flows = tempfile::tempdir().unwrap();
+        let peer = peer_mission_runs(flows.path(), &[]);
+        assert!(peer.is_empty(), "a standalone install must see no peer missions: {peer:?}");
+    }
+
+    #[test]
+    fn peer_mission_runs_a_still_running_peer_reads_running() {
+        // "A live peer" — the issue's own contrast case against "rostered
+        // but silent" below. No terminal record, but the session is
+        // recent enough to read as live.
+        let flows = tempfile::tempdir().unwrap();
+        let now = now_unix();
+        let recent = chrono_like_ts(now.saturating_sub(5));
+        let fleet = vec![flow_record("review-peer-2", "peer-2", "mission start", &recent, "s2")];
+        let peer = peer_mission_runs(flows.path(), &fleet);
+        assert_eq!(peer.len(), 1, "{peer:?}");
+        assert_eq!(peer[0].status, RunStatus::Running, "a fresh, non-terminal record must read live");
+    }
+
+    /// A minimal RFC3339 stamp from a Unix-seconds value — just enough for
+    /// `flow_record`'s `ts` field and the staleness clock the aggregation
+    /// reads it against. Not a general-purpose formatter; this file's tests
+    /// need exactly one shape.
+    fn chrono_like_ts(secs: u64) -> String {
+        // `1970-01-01T00:00:00Z` plus `secs` — computed by hand (no chrono
+        // dependency in this crate) via civil-from-days, good enough for
+        // dates in the 2020s this test actually uses.
+        let days = secs / 86_400;
+        let rem = secs % 86_400;
+        let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        // 1970-01-01 is a Thursday; civil_from_days below is the standard
+        // Howard Hinnant algorithm, days since epoch -> (y, m, d).
+        let z = days as i64 + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if mth <= 2 { y + 1 } else { y };
+        format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    }
+
+    #[test]
+    fn peer_status_word_distinguishes_silent_from_aborted_from_running() {
+        // The issue's own load-bearing distinction: "a rostered-but-silent
+        // machine and a live peer are different states and should read
+        // differently" — and neither is the same claim as a deliberate
+        // teardown.
+        assert_eq!(peer_status_word(RunStatus::Running, None), "running");
+        assert_eq!(peer_status_word(RunStatus::Complete, None), "complete");
+        assert_eq!(
+            peer_status_word(RunStatus::Abandoned, Some(AbandonReason::Aborted)),
+            "aborted",
+            "a real `mission abort` record must read as a deliberate teardown"
+        );
+        assert_eq!(
+            peer_status_word(RunStatus::Abandoned, Some(AbandonReason::NoTerminal)),
+            "silent (no terminal record seen)",
+            "no terminal record and not live must NOT be worded as a verdict — darkmux describes, \
+             never adjudicates"
+        );
+        assert_eq!(
+            peer_status_word(RunStatus::Abandoned, None),
+            "silent (no terminal record seen)",
+            "the reason-less Abandoned case (defensive) must fall to the same honest wording"
+        );
+    }
+
+    #[test]
+    fn fleet_scope_note_is_silent_for_ok_and_off() {
+        // `Off` (no fleet substrate) must never warn — that's a correctly
+        // configured standalone machine, and warning about it would be the
+        // bug (`source_state`'s own doctrine). `Ok` is a complete answer.
+        assert_eq!(fleet_scope_note(&SourceState::Ok), None);
+        assert_eq!(fleet_scope_note(&SourceState::Off), None);
+    }
+
+    #[test]
+    fn fleet_scope_note_names_an_unreachable_fleet_without_hanging_or_adjudicating() {
+        // (#1711 degraded case: "a peer that is unreachable") `Unavailable`
+        // is also what a Redis AUTH failure collapses to — the substrate
+        // deliberately never distinguishes "network unreachable" from "bad
+        // credential" this far up (a Redis error can embed the connection
+        // URL/password — #661 Slice 5), so this ONE rendering path is the
+        // honest answer for both underlying causes. The note must say what
+        // was attempted, never render a verdict about the operator's
+        // network.
+        let note = fleet_scope_note(&SourceState::Unavailable { detail: "could not reach Redis" })
+            .expect("an unavailable fleet read must be disclosed, not swallowed");
+        assert!(note.contains("could not reach the shared stream"), "{note}");
+        assert!(!note.contains("could not reach Redis"), "the raw `detail` must never leak: {note}");
+    }
+
+    #[test]
+    fn fleet_scope_note_names_a_stale_fleet_snapshot_with_its_age() {
+        let note = fleet_scope_note(&SourceState::Stale { age_ms: 125_000, detail: "x" })
+            .expect("a stale fleet read must be disclosed");
+        assert!(note.contains("2m"), "the age must be legible: {note}");
+        assert!(!note.contains('x'), "the raw `detail` must never leak: {note}");
+    }
+
+    #[test]
+    fn board_json_carries_peer_missions_and_fleet_state() {
+        // (#1711) `--json` must stay coherent: a peer mission is additive
+        // (never mixed into `missions`), and the fleet's own coverage state
+        // rides alongside it so a script can tell "no peer missions" from
+        // "the fleet read never ran".
+        let peer_run = Run {
+            id: "review-peer-3".to_string(),
+            kind: RunKind::Mission,
+            status: RunStatus::Running,
+            machine: Some("peer-3".to_string()),
+            route: None,
+            role: None,
+            model: None,
+            started_ts: Some(100),
+            completed_ts: None,
+            updated_ts: Some(100),
+            tracked: false,
+            session_id: None,
+            abandoned_reason: None,
+        };
+        let payload = board_json(&[], std::slice::from_ref(&peer_run), &SourceState::Ok);
+        assert_eq!(payload["peer_missions"][0]["id"], "review-peer-3");
+        assert_eq!(payload["peer_missions"][0]["tracked"], false);
+        assert_eq!(payload["fleet"]["state"], "ok");
+        assert_eq!(payload["summary"]["fleet_complete"], true);
+        assert!(
+            payload["missions"].as_array().unwrap().is_empty(),
+            "a peer mission must never land in the local `missions` array"
+        );
+    }
+
+    #[test]
+    fn board_json_fleet_complete_is_false_only_for_stale_and_unavailable() {
+        let ok = board_json(&[], &[], &SourceState::Ok);
+        assert_eq!(ok["summary"]["fleet_complete"], true);
+        let off = board_json(&[], &[], &SourceState::Off);
+        assert_eq!(off["summary"]["fleet_complete"], true, "`Off` is a correct standalone machine");
+        let unavailable = board_json(&[], &[], &SourceState::Unavailable { detail: "x" });
+        assert_eq!(unavailable["summary"]["fleet_complete"], false);
+        let stale = board_json(&[], &[], &SourceState::Stale { age_ms: 1, detail: "x" });
+        assert_eq!(stale["summary"]["fleet_complete"], false);
     }
 }
