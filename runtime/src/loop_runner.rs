@@ -3896,51 +3896,53 @@ fn run_with_sleeper(
                     // draws from it; a reasoning-bound continuation of the
                     // same turn (a thinking model that later starts writing
                     // its answer) never does.
-                    if sent_generation_bound {
+                    //
+                    // (#2633) The budget is DRAWN here — the counter moves on
+                    // the same call it always did — but it is ACTED ON below,
+                    // AFTER the degeneracy gate has judged this call's slice.
+                    // Acting on it here, ahead of the gate, made the gate
+                    // UNREACHABLE on this arm at the shipped defaults, because
+                    // the two independently-tuned numbers collide at the same
+                    // checkpoint by construction:
+                    //
+                    //   - The gate's metric is `distinct windows / total
+                    //     windows` over a tail of `TAIL_SAMPLE_INTERVALS`
+                    //     intervals. A verbatim loop whose every call exactly
+                    //     fills the interval accumulates `k` identical copies
+                    //     by checkpoint `k`, so the ratio is ~`1/k` — it first
+                    //     dips under the 0.25 threshold at `k = 5`, and that
+                    //     crossing is a fixed `k` regardless of the interval's
+                    //     SIZE (both numerator and denominator scale with it).
+                    //   - `max_generation_continuations` floors at 4 whenever
+                    //     `answer_max_tokens / generation_interval <= 4`. The
+                    //     shipped defaults are 10000/4000 = 2.5, so the budget
+                    //     escalates on continuation 5 — the same call.
+                    //
+                    // Measured on the merged code at the literal shipped
+                    // defaults, against a 4000-token verbatim block: tail
+                    // ratios 1.0000 / 0.5007 / 0.3336 / 0.2502 across
+                    // checkpoints 1-4 (all `continue`), then the 5th call
+                    // returned EscalationTriggered(GenerationCheckpointBudget
+                    // Exhausted) with only four `dispatch.checkpoint` records
+                    // written — the call whose slice first reads 0.2001,
+                    // DEGENERATE, never got judged, and never got a record.
+                    //
+                    // Deferring the ACTION (rather than raising the floor)
+                    // is what removes the race instead of re-tuning it: the
+                    // gate now runs on EVERY checkpoint including the one that
+                    // exhausts the budget, so its reachability no longer
+                    // depends on any relationship between these two constants
+                    // at any operator config. It also costs nothing — the
+                    // budget's allowance is unchanged, so a turn that is NOT
+                    // repeating still stops on exactly the same call it
+                    // stopped on before.
+                    let generation_budget_exhausted = if sent_generation_bound {
                         generation_continuations_this_turn =
                             generation_continuations_this_turn.saturating_add(1);
-                        if generation_continuations_this_turn > max_generation_continuations {
-                            eprintln!(
-                                "darkmux-runtime: escalation_triggered — turn {turns} hit the \
-                                 generation check-in ({generation_interval} tokens) \
-                                 {generation_continuations_this_turn} times, exceeding the \
-                                 budget of {max_generation_continuations} continuations \
-                                 (answer_max_tokens {answer_max_tokens} / \
-                                 generation_checkpoint_interval_tokens {generation_interval}). \
-                                 Emitting EscalationTriggered for frontier handoff with \
-                                 everything banked so far ATTACHED. (#2171)"
-                            );
-                            trajectory.append_escalation_triggered(
-                                turns,
-                                escalation_reason_str(
-                                    EscalationReason::GenerationCheckpointBudgetExhausted,
-                                ),
-                                model,
-                                latest_prompt_tokens,
-                            );
-                            return Ok(LoopOutcome {
-                                final_answer: turn.pending_answer(),
-                                terminal_reason: TerminalReason::EscalationTriggered(
-                                    EscalationReason::GenerationCheckpointBudgetExhausted,
-                                ),
-                                messages,
-                                turns,
-                                total_prompt_tokens,
-                                total_completion_tokens,
-                                total_reasoning_tokens,
-                                total_cached_tokens,
-                                compactions,
-                                turns_this_run: this_run_delta(resume_seed_turns, turns),
-                                total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
-                                total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
-                                compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
-                                rest_ms,
-                                rests,
-                                turn_delay_effective_ms: turn_delay_ms,
-                                failed_to_run: failed_to_run.clone(),
-                            });
-                        }
-                    }
+                        generation_continuations_this_turn > max_generation_continuations
+                    } else {
+                        false
+                    };
                     // Only judge while the thought is still open. After the
                     // close the accumulation is reasoning PLUS the answer being
                     // written, and its ratio stays low forever — judging it
@@ -4097,6 +4099,71 @@ fn run_with_sleeper(
                             final_answer: turn.pending_answer(),
                             terminal_reason: TerminalReason::EscalationTriggered(
                                 EscalationReason::IntraTurnStallExhausted,
+                            ),
+                            messages,
+                            turns,
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            total_reasoning_tokens,
+                            total_cached_tokens,
+                            compactions,
+                            turns_this_run: this_run_delta(resume_seed_turns, turns),
+                            total_prompt_tokens_this_run: this_run_delta(resume_seed_prompt_tokens, total_prompt_tokens),
+                            total_completion_tokens_this_run: this_run_delta(resume_seed_completion_tokens, total_completion_tokens),
+                            compactions_this_run: this_run_delta(resume_seed_compactions, compactions),
+                            rest_ms,
+                            rests,
+                            turn_delay_effective_ms: turn_delay_ms,
+                            failed_to_run: failed_to_run.clone(),
+                        });
+                    }
+                    // (#2633) The generation check-in's continuation budget,
+                    // acted on HERE rather than ahead of the gate — see the
+                    // long note at the draw site above for the collision this
+                    // ordering removes. The counter already moved; this is
+                    // only the decision to stop on it.
+                    //
+                    // Deliberately AFTER the degeneracy escalation above and
+                    // BEFORE the remedy branches below. Both orderings are
+                    // load-bearing:
+                    //
+                    //   - After the gate, because on a call where BOTH are
+                    //     true the repetition is the more specific account of
+                    //     what was observed. "The budget ran out" is an
+                    //     accounting fact that would be true of any turn this
+                    //     long; "the output is repeating verbatim" is the
+                    //     reason it never converged. darkmux reports what it
+                    //     saw, and it saw a loop.
+                    //   - Before the remedy branches, because closing a
+                    //     repeating thought so the model can answer from what
+                    //     it has is only a remedy if there is a continuation
+                    //     left to spend on it. There is not — so a degenerate
+                    //     THOUGHT on the exhausting call stops here, with the
+                    //     checkpoint record above already carrying the
+                    //     `conclude` verdict and the tail ratio that say why.
+                    if generation_budget_exhausted {
+                        eprintln!(
+                            "darkmux-runtime: escalation_triggered — turn {turns} hit the \
+                             generation check-in ({generation_interval} tokens) \
+                             {generation_continuations_this_turn} times, exceeding the \
+                             budget of {max_generation_continuations} continuations \
+                             (answer_max_tokens {answer_max_tokens} / \
+                             generation_checkpoint_interval_tokens {generation_interval}). \
+                             Emitting EscalationTriggered for frontier handoff with \
+                             everything banked so far ATTACHED. (#2171)"
+                        );
+                        trajectory.append_escalation_triggered(
+                            turns,
+                            escalation_reason_str(
+                                EscalationReason::GenerationCheckpointBudgetExhausted,
+                            ),
+                            model,
+                            latest_prompt_tokens,
+                        );
+                        return Ok(LoopOutcome {
+                            final_answer: turn.pending_answer(),
+                            terminal_reason: TerminalReason::EscalationTriggered(
+                                EscalationReason::GenerationCheckpointBudgetExhausted,
                             ),
                             messages,
                             turns,
@@ -6561,18 +6628,43 @@ mod tests {
     /// gets. `max_tokens_per_call=2000`, `generation_checkpoint_interval=
     /// 1000` → the naive ratio is 2000/1000=2, but the FLOOR
     /// (`max(4, ratio)`) governs: the budget is 4 continuations, so the
-    /// 5th generation-bound cut is what exhausts it, and exactly 4
-    /// `dispatch.checkpoint` records must exist before the escalation —
-    /// proving the floor overrides the ratio rather than merely happening
-    /// not to matter here.
+    /// 5th generation-bound cut is what exhausts it, and a `dispatch.
+    /// checkpoint` record must exist for each of the 5 — proving the floor
+    /// overrides the ratio rather than merely happening not to matter here.
+    ///
+    /// (#2633) Two things changed here, both consequences of the budget now
+    /// being acted on AFTER the degeneracy gate rather than ahead of it:
+    ///
+    /// 1. The record count is 5, not 4. The call that exhausts the budget
+    ///    now gets judged and recorded like every other checkpoint, so its
+    ///    tail ratio is visible to the operator instead of being dropped.
+    ///    The budget ALLOWANCE is unchanged — the 5th generation-bound cut
+    ///    is still what stops the turn.
+    /// 2. The mock's content block is 8100 distinct tokens rather than the
+    ///    original 9-token phrase, because the gate now judges checkpoint 5
+    ///    in this fixture and the fixture has to mean what it says: this is
+    ///    the BUDGET path, so the slice must be robustly NOT degenerate.
+    ///    The original phrase was 0.2647 at checkpoint 5 against a 0.25
+    ///    threshold — clean by 0.015, i.e. a reworded mock string could have
+    ///    silently turned this into a degeneracy test. Any exactly-periodic
+    ///    block scores ~`1/k` at checkpoint `k` and so goes degenerate at
+    ///    k=5 by construction; the way OUT of that is the property #2258's
+    ///    fixtures already rely on — make one period WIDER than the judged
+    ///    tail (`TAIL_SAMPLE_INTERVALS * 1000 = 8000` here), so the sampled
+    ///    tail is a sub-period run of unique tokens and every window is
+    ///    distinct (ratio 1.0) no matter how many times the block repeats.
+    ///    `completion_tokens` stays 999 (cap-1, the cap-cliff tolerance the
+    ///    original fixture already used) — the gate judges CONTENT while the
+    ///    budget counts CALLS, so the two are independent here by design.
     #[test]
     #[serial_test::serial]
     fn generation_checkpoint_budget_exhausts_at_the_floor_not_the_naive_ratio() {
+        let block: String = (0..8100).map(|i| format!("w{i} ")).collect();
         let server = crate::test_support::GuardedMockServer::start();
         let _mock = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
-                Some("prose that never converges and keeps re-hitting the cap"),
+                Some(&block),
                 None,
                 "length",
                 100,
@@ -6612,9 +6704,29 @@ mod tests {
             .filter(|e| e["type"] == "dispatch.checkpoint")
             .count();
         assert_eq!(
-            checkpoint_count, 4,
+            checkpoint_count, 5,
             "the floor (max(4, 2000/1000)=4), not the naive ratio (2), must govern — \
-             exactly 4 successful continuations before the 5th exhausts the budget"
+             4 successful continuations, then the 5th draws the last of the budget and \
+             stops the turn. All 5 are judged and recorded (#2633): the exhausting call \
+             is a checkpoint like any other, and dropping its record hid the very ratio \
+             an operator needs to tell a runaway from a loop"
+        );
+        // (#2633) The exhausting call must be stopped by the BUDGET, not by
+        // the gate — this fixture exists to pin the budget path, and its
+        // fifth checkpoint reading `conclude` would mean the fixture had
+        // quietly become a degeneracy test (see the doc comment above).
+        let fifth = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .find(|e| e["checkpoint"] == serde_json::json!(5))
+            .expect("a checkpoint 5 record must exist");
+        assert_eq!(
+            fifth["verdict"],
+            serde_json::json!("continue"),
+            "checkpoint 5's slice must read CLEAN (one 8100-token period is wider than \
+             the 8000-token judged tail, so every window is distinct) — a `conclude` \
+             here means the fixture is no longer testing the budget, got {fifth:?}"
         );
     }
 
@@ -11540,6 +11652,323 @@ mod tests {
             outcome.terminal_reason
         );
         assert_eq!(outcome.turns, 1, "every hit is a continuation of the same logical turn");
+    }
+
+    /// (#2633) The degeneracy gate must actually RUN on the generation-bound
+    /// length-finish arm at the LITERAL shipped defaults — no overrides, so
+    /// `MAX_TOKENS_PER_CALL` (10000) and `GENERATION_CHECKPOINT_INTERVAL`
+    /// (4000) govern, a ratio of **2.5**.
+    ///
+    /// That ratio is the whole point. #2258's two fixtures run at
+    /// `max_tokens_per_call=1000` against a 50-token interval — a ratio of
+    /// **20** — which puts `max_generation_continuations` at 20 and leaves
+    /// the gate all the room it needs. They passed while the shipped
+    /// configuration could not reach the gate at all, which is exactly the
+    /// mistake this fixture exists not to repeat: it takes its numbers from
+    /// the constants themselves rather than from convenient literals, so it
+    /// cannot drift away from what operators actually run.
+    ///
+    /// The collision it pins, in arithmetic:
+    ///
+    /// - The gate's metric is distinct-windows over total-windows across a
+    ///   tail of `TAIL_SAMPLE_INTERVALS` (8) intervals. A verbatim loop
+    ///   whose every call exactly fills the interval has `k` identical
+    ///   copies accumulated by checkpoint `k`, so the ratio is `interval /
+    ///   (k * interval - (TAIL_WINDOW_TOKENS - 1))` — about `1/k`. It first
+    ///   dips under the 0.25 threshold at **k = 5**, and that crossing is a
+    ///   fixed `k` no matter how large the interval is, because numerator
+    ///   and denominator scale together.
+    /// - `max_generation_continuations` is `(answer_max_tokens /
+    ///   generation_interval).max(4)`, which floors at **4** for every ratio
+    ///   at or below 4:1 — 2.5 included.
+    ///
+    /// So the budget's stop and the gate's first possible verdict land on
+    /// the same call, and whichever runs first wins. Measured on the merged
+    /// code at these defaults: checkpoints 1-4 at 1.0000 / 0.5007 / 0.3336 /
+    /// 0.2502, all `continue`, then `EscalationTriggered(GenerationCheckpoint
+    /// BudgetExhausted)` with only FOUR checkpoint records — the 5th call's
+    /// slice, which reads 0.2001 and is plainly degenerate, was never judged.
+    ///
+    /// The assertions below are the after-state of that same measurement.
+    #[test]
+    #[serial_test::serial]
+    fn degeneracy_gate_runs_at_the_shipped_generation_ratio_not_just_a_roomy_one() {
+        // The fixture's numbers come from the constants, never from
+        // literals — a future retune of either one keeps this honest.
+        assert!(
+            (MAX_TOKENS_PER_CALL / GENERATION_CHECKPOINT_INTERVAL.max(1)).max(4) == 4,
+            "this fixture pins the FLOORED case (ratio <= 4:1); at the shipped defaults \
+             {MAX_TOKENS_PER_CALL}/{GENERATION_CHECKPOINT_INTERVAL} the budget must be \
+             the floor, 4 — if that stops being true the collision this test describes \
+             has changed shape and the doc comment above needs rewriting, not the assert"
+        );
+        // One call's worth of output, exactly filling the check-in interval,
+        // with every token distinct so the accumulation's period is exactly
+        // the interval — the verbatim-loop shape the gate is tuned for.
+        let block: String = (0..GENERATION_CHECKPOINT_INTERVAL).map(|i| format!("w{i} ")).collect();
+
+        let server = crate::test_support::GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some(&block),
+                None,
+                "length",
+                100,
+                GENERATION_CHECKPOINT_INTERVAL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("shipped-ratio-gate").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("write forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        // Every interval knob is None: the shipped constants govern.
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(50), None, None, None, None,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a degenerate generation-bound repeat is a clean escalation, not an Err");
+
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let checkpoints: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .collect();
+
+        // Checkpoint 4 is the near-miss that makes this the SHIPPED case and
+        // not a roomier one: 4000/(4*4000-11) = 0.2502, above the 0.25
+        // threshold by 0.0002. If this fired early, the fixture would prove
+        // nothing about the call the budget used to take.
+        let fourth = checkpoints
+            .iter()
+            .find(|c| c["checkpoint"] == serde_json::json!(4))
+            .unwrap_or_else(|| panic!("expected a checkpoint 4 record, got {checkpoints:?}"));
+        assert_eq!(
+            fourth["verdict"],
+            serde_json::json!("continue"),
+            "checkpoint 4 sits just ABOVE the threshold (0.2502 vs 0.25) — a conclude \
+             here means the gate fired a call early and the fixture is no longer \
+             exercising the collision, got {fourth:?}"
+        );
+
+        let fifth = checkpoints
+            .iter()
+            .find(|c| c["checkpoint"] == serde_json::json!(5))
+            .unwrap_or_else(|| {
+                panic!(
+                    "(#2633) NO checkpoint 5 record — the call that first reads DEGENERATE \
+                     was never judged, because the generation-continuation budget escalated \
+                     ahead of the gate. This is the defect verbatim. Got {checkpoints:?}"
+                )
+            });
+        assert_eq!(
+            fifth["bound"]["kind"],
+            serde_json::json!("generation_checkpoint_interval"),
+            "this dispatch never reasons, so every call is generation-bound — a different \
+             bound here means the fixture drifted off the arm under test, got {fifth:?}"
+        );
+        let ratio = fifth["tail_ratio"].as_f64().unwrap_or_else(|| {
+            panic!("checkpoint 5 must have a numeric tail_ratio, got {fifth:?}")
+        });
+        // 5 * 4000 accumulated tokens, all inside the 8 * 4000 tail, so the
+        // whole accumulation is sampled: 19989 windows over a period-4000
+        // sequence gives exactly 4000 distinct.
+        let expected = 4000.0_f64 / 19989.0_f64;
+        assert!(
+            (ratio - expected).abs() < 1e-4,
+            "checkpoint 5's tail ratio must be exactly 4000/19989 ≈{expected:.4} — a \
+             different value means the tail was sized by something other than the \
+             generation interval that governed the call. Got {ratio}"
+        );
+        assert_eq!(
+            fifth["verdict"],
+            serde_json::json!("conclude"),
+            "a ratio under the 0.25 threshold must verdict conclude, got {fifth:?}"
+        );
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "(#2633) a turn that is REPEATING must terminate as a repeat. \
+             GenerationCheckpointBudgetExhausted here means the budget check ran ahead of \
+             the gate again and the operator is told an accounting fact ('this turn spent \
+             its continuations') in place of the diagnosis ('this turn is emitting the \
+             same block over and over'). Got {:?}",
+            outcome.terminal_reason
+        );
+        assert_eq!(outcome.turns, 1, "every hit is a continuation of the SAME logical turn");
+    }
+
+    /// (#2633 fix-pass) The SECOND half of the budget block's ordering: it
+    /// must act BEFORE the remedy branches, not just after the degeneracy
+    /// escalation. The fixture above pins "after the gate"; nothing pinned
+    /// "before the remedy", and moving the whole block down past the
+    /// `degenerate && writing_thought` chain left the suite green.
+    ///
+    /// What the mutation costs, concretely: the remedy for a degenerate
+    /// THOUGHT is `turn.close_thought()`, and a closed thought changes what
+    /// `pending_answer()` hands over — `deliverable("")` emits the thought
+    /// region ONLY while the block is still open (see its doc). Run the
+    /// remedy first and the escalation below it hands the frontier the
+    /// answer region alone, with the entire thought this turn banked
+    /// silently dropped. That is #1221's discard-the-turn bug, re-entered
+    /// through the ordering rather than through the region machine.
+    ///
+    /// Reaching all three conditions on ONE call takes some care, because
+    /// `sent_generation_bound` and an open thought pull against each other:
+    /// an open thought makes `in_answer_region()` false, so the only way a
+    /// call carrying one is still generation-bound is
+    /// `dispatch_has_reasoned == false` at REQUEST time — and any call that
+    /// leaves an open thought sets that flag true for every call after it.
+    /// So the one reachable shape is exactly this: four generation-bound
+    /// calls that never reason at all, then a fifth whose content OPENS a
+    /// `<think>` it does not close and whose slice reads degenerate. The
+    /// fifth call's request was built while the flag was still false, so it
+    /// is generation-bound and draws the continuation that exhausts the
+    /// budget; its response is what makes `writing_thought()` true.
+    ///
+    /// The numbers: `max_tokens_per_call=200` / `generation_checkpoint_
+    /// interval=50` puts `max_generation_continuations` at
+    /// `max(200/50, 4) == 4`, so call 5 is the one that exhausts it, and
+    /// `tail_sample_tokens(50)` is 400 tokens.
+    ///
+    /// - Calls 1-4 return a 500-token block of DISTINCT tokens. One period
+    ///   (500) is deliberately WIDER than the judged tail (400) — the same
+    ///   property #2258's fixtures rely on — so the sampled tail is always a
+    ///   sub-period run of unique tokens, ratio 1.0, robustly CLEAN. Without
+    ///   that these four would escalate early through the ANSWER-region arm
+    ///   and the fixture would never reach the call it exists to test.
+    /// - Call 5 returns `<think>` + `"loop forever "` x300. Its tail is 400
+    ///   tokens of a period-2 sequence: 389 windows, 2 distinct, ratio
+    ///   ≈0.0051 — degenerate with a ~49x margin.
+    ///
+    /// The two mocks are told apart by counting `ZZBLOCK` (one per absorbed
+    /// block) in the outgoing prefill: 0-3 copies is a call in the first
+    /// group, 4 is the fifth call.
+    #[test]
+    #[serial_test::serial]
+    fn the_generation_budget_escalates_before_the_thought_is_closed() {
+        let plain_block: String = std::iter::once("ZZBLOCK ".to_string())
+            .chain((0..499).map(|i| format!("a{i} ")))
+            .collect();
+        let thought_block = format!("<think>\n{}", "loop forever ".repeat(300));
+
+        let server = crate::test_support::GuardedMockServer::start();
+        // Calls 1-4: plain content, never any reasoning, so every request is
+        // built with `dispatch_has_reasoned == false` and carries the
+        // generation bound.
+        let _plain = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req
+                    .body
+                    .as_ref()
+                    .map(|v| String::from_utf8_lossy(v).to_string())
+                    .unwrap_or_default();
+                b.matches("ZZBLOCK").count() <= 3
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some(&plain_block), None, "length", 100, 50));
+        });
+        // Call 5: opens a thought it never closes, degenerate inside.
+        let _thinking = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req
+                    .body
+                    .as_ref()
+                    .map(|v| String::from_utf8_lossy(v).to_string())
+                    .unwrap_or_default();
+                b.matches("ZZBLOCK").count() >= 4
+            });
+            then.status(200).json_body(chat_response_json(
+                Some(&thought_block),
+                None,
+                "length",
+                100,
+                50,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("budget-before-remedy").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("write forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(50), None, Some(200), None, Some(50),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("budget exhaustion on a thought-carrying call is a clean escalation, not an Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(
+                EscalationReason::GenerationCheckpointBudgetExhausted
+            ),
+            "call 5 is the one that exhausts the 4-continuation budget, and its thought is \
+             still OPEN — so the budget, not the ANSWER-region degeneracy arm, is what \
+             stops this turn. Got {:?}",
+            outcome.terminal_reason
+        );
+
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let checkpoints: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .collect();
+        let fifth = checkpoints
+            .iter()
+            .find(|c| c["checkpoint"] == serde_json::json!(5))
+            .unwrap_or_else(|| panic!("expected a checkpoint 5 record, got {checkpoints:?}"));
+        assert_eq!(
+            fifth["verdict"],
+            serde_json::json!("conclude"),
+            "checkpoint 5's slice is a period-2 verbatim loop — if this reads `continue` the \
+             fixture has drifted off the shape under test (a clean slice never reaches the \
+             remedy branch this test guards). Got {fifth:?}"
+        );
+        assert_eq!(
+            fifth["bound"]["kind"],
+            serde_json::json!("generation_checkpoint_interval"),
+            "call 5 must still be GENERATION-bound — a reasoning bound here means \
+             `dispatch_has_reasoned` flipped before the request was built and the budget \
+             was never drawn. Got {fifth:?}"
+        );
+
+        // THE GUARD. Both regions must reach the frontier. `close_thought()`
+        // running before this escalation would drop the thought half — the
+        // marker below is the only thing that distinguishes the two
+        // orderings, because every other observable (terminal reason, record
+        // count, verdict, ratio, call count) is identical under both.
+        let delivered = outcome
+            .final_answer
+            .as_deref()
+            .expect("the escalation must hand over everything banked, not None");
+        assert!(
+            delivered.contains("loop forever"),
+            "(#2633 fix-pass) the THOUGHT this turn banked is missing from the deliverable. \
+             That is what acting on the budget AFTER the `degenerate && writing_thought` \
+             remedy costs: the remedy closes the thought, and a closed thought is excluded \
+             from `deliverable()`, so the frontier receives the answer region alone. \
+             Got {delivered:?}"
+        );
+        assert!(
+            delivered.contains("ZZBLOCK"),
+            "the four earlier calls' ANSWER region must survive too — this half held even \
+             under the wrong ordering, and it is here so a future change that trades one \
+             region for the other is caught in both directions. Got {delivered:?}"
+        );
+        assert_eq!(outcome.turns, 1, "every hit is a continuation of the SAME logical turn");
     }
 
     /// (#2258) The INVERTED direction of the fixture above — a fix that
