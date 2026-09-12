@@ -424,11 +424,33 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 ///
 /// This is a TEXT SCAN. What it holds is narrower than "a sixth copy
 /// cannot be added quietly": **a sixth copy written in one of the four
-/// recognized textual forms in `SPAWN_TOKENS` cannot be added quietly.**
+/// recognized textual forms in `SPAWN_TOKENS` cannot be added quietly,
+/// unless its fence contains any textual occurrence of the call form that
+/// does not execute.** The scan checks that the call APPEARS on a
+/// non-`//` line inside the fence; it never checks that it RUNS.
 /// Everything outside that set is invisible to it, and no amount of
 /// further token-matching closes the gap — each of these was demonstrated
 /// against this guard, not imagined:
 ///
+/// * A call that appears but never executes satisfies the rule. All three
+///   of these were measured with a real spawn through a recognized token
+///   in the same fence — guard EXIT=0, target EXIT=0 and green, two files
+///   leaked:
+///
+///   ```ignore
+///   /* removed for speed: neutralize_state_vars(&mut cmd); */
+///   const HOWTO: &str = "remember to neutralize_state_vars(&mut cmd) first";
+///   #[cfg(any())] fn unused() { neutralize_state_vars(&mut cmd); }
+///   ```
+///
+///   The first is the one that matters, because it is an ACCIDENT rather
+///   than an evasion: `is_code` excludes `//` but not `/* */`, and
+///   commenting out a SELECTION with a block comment is what most editors
+///   do by default. Someone temporarily disabling the call while chasing
+///   an unrelated failure leaves the guard green and the leak live — this
+///   issue's own harm, re-entering through the mechanism built to prevent
+///   it. Presence is not effect; catching it belongs to an
+///   execution-side check, not to more matching here.
 /// * A fenced block that spawns darkmux RAW while calling the helper on an
 ///   unrelated decoy `Command` passes both assertions. Guard green, target
 ///   green, two files leaked. That is exactly the green-and-leaking shape
@@ -445,8 +467,9 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 ///   `runtime/tests/` and `examples/` are out of scope — nothing there
 ///   spawns darkmux today, and nothing prevents it tomorrow.
 ///
-/// These four are filed as a follow-up rather than patched here, because
-/// the durable answer is a structural chokepoint, not a longer token list.
+/// These are filed as #2717 rather than patched here, because the durable
+/// answer is a structural chokepoint plus an execution-side check, not a
+/// longer token list.
 #[test]
 fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
     // Split with `concat!` on purpose: written as one literal, these two
