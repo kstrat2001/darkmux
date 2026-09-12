@@ -1878,13 +1878,42 @@ const MAX_REJECTION_REASONS: usize = 3;
 /// [`MAX_REJECTION_REASONS`]'s doc for why a bound exists at all.
 const MAX_REJECTION_REASON_LEN: usize = 200;
 
-/// Truncate `s` to at most [`MAX_REJECTION_REASON_LEN`] bytes, walking
-/// back to the nearest UTF-8 char boundary so a truncated multi-byte
-/// character never panics or produces invalid UTF-8. Appends `…` when
-/// truncation actually happened.
+/// Strip control characters (the Unicode `Cc` category — C0 controls
+/// including `\n`/`\r`, ESC, and DEL, plus the C1 range) from a
+/// receiver-supplied reason string. This codebase already applies this
+/// exact discipline twice: `sanitize_header_value` (above) allowlists
+/// printable ASCII for HTTP header values specifically so CR/LF injection
+/// is caught by the filter rather than a special case, and
+/// `style::link` (`darkmux-types/src/style.rs`) strips control bytes from
+/// a URL before embedding it in an OSC-8 escape, with the doc there
+/// naming the goal precisely: making the corruption unreachable rather
+/// than merely unlikely. A receiver's `results[].error` text is the same
+/// class of untrusted input, and it rides straight into `flow status`,
+/// `darkmux doctor`, and an `eprintln!` — all rendered to a real
+/// terminal. Left unfiltered, an embedded `\n` forges extra status rows
+/// indistinguishable from real ones, a `\r` overwrites the visible line,
+/// and a raw ANSI escape (including a screen-clear) executes on whatever
+/// terminal is watching. Printable non-ASCII text is kept (this is
+/// prose an operator reads, not a wire-protocol value like a header), so
+/// this deliberately doesn't reuse `sanitize_header_value`'s ASCII-only
+/// allowlist.
+fn sanitize_reason_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Sanitize `s` (see [`sanitize_reason_text`]) and then truncate the
+/// SANITIZED string to at most [`MAX_REJECTION_REASON_LEN`] bytes,
+/// walking back to the nearest UTF-8 char boundary so a truncated
+/// multi-byte character never panics or produces invalid UTF-8. Appends
+/// `…` when truncation actually happened. Sanitizing before truncating
+/// (not after) matters for two reasons: the byte bound is a promise
+/// about what actually rides downstream, and filtering after truncation
+/// could still cut a multi-byte sequence at the wrong point relative to
+/// the removed bytes.
 fn truncate_reason(s: &str) -> String {
+    let s = sanitize_reason_text(s);
     if s.len() <= MAX_REJECTION_REASON_LEN {
-        return s.to_string();
+        return s;
     }
     let mut end = MAX_REJECTION_REASON_LEN;
     while end > 0 && !s.is_char_boundary(end) {
@@ -6390,6 +6419,197 @@ mod tests {
         assert!(last.last_receiver_rejected_reasons.is_empty(), "{last:?}");
         let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
         assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196 fix-round MUST FIX 2 — the real gate) The prior boundary
+    /// test above only exercises `{"ok":true}` — no `results` array at
+    /// all, so `extract_rejection_reasons` returns empty trivially and
+    /// the `if rejected_for_status.is_some() { reasons } else { vec![] }`
+    /// gate at the delivery call site is never actually exercised. THIS
+    /// is the real boundary: a `results[]` entry explicitly marked
+    /// `"ok": false` with an `error` string (so `extract_rejection_reasons`
+    /// DOES produce a non-empty reason list), but with NO top-level
+    /// `rejected` count — a shape the local tracker's own contract never
+    /// produces (a rejected entry always accompanies a non-zero
+    /// `rejected`), but the sink must not assume that; the gate exists
+    /// specifically because this shape is not the defined contract.
+    ///
+    /// Deleting that `if` (making `reasons_for_status` unconditional)
+    /// leaves every existing test green — proven by running this exact
+    /// mutation before writing this test — while producing a `hook.fired`
+    /// carrying a rejection reason with NO count (an Info-level record,
+    /// since `rejected_count` in `emit_hook_record_with` is computed
+    /// independently from the raw `receiver_rejected` and stays `None`
+    /// here), and a `.last` sidecar with reasons but
+    /// `last_receiver_rejected: None` — a clean delivery, falsely marked.
+    #[test]
+    fn hook_fired_stays_clean_when_results_reject_without_a_top_level_rejected_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"results":[{"ok":false,"error":"CLEAN-MISMARK"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
+            "the delivery must land"
+        );
+        assert!(
+            wait_until(
+                || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+                Duration::from_secs(3)
+            ),
+            "hook.fired must land"
+        );
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "no top-level `rejected` key in the body means no count to disclose: {fired:?}"
+        );
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            "a reason must never ride without the count that names it: {fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        assert!(
+            last.last_receiver_rejected_reasons.is_empty(),
+            "the sidecar must not carry a reason with no matching count: {last:?}"
+        );
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        assert!(summary.last_receiver_rejected_reasons.is_empty(), "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196 fix-round MUST FIX 1) `truncate_reason` (the single choke
+    /// point every `results[].error` string passes through — see
+    /// `extract_rejection_reasons`) must strip control characters BEFORE
+    /// a receiver's text reaches `flow status`, `darkmux doctor`, or the
+    /// `eprintln!` at the `DeliveryOutcome::Success` call site — all of
+    /// which render the string directly to a real terminal. Three probes,
+    /// each a distinct terminal-corruption primitive a raw receiver
+    /// string could otherwise carry: an embedded newline that would forge
+    /// extra status-line rows, a carriage return that would overwrite the
+    /// visible line, and a raw ANSI escape (here, a screen-clear plus a
+    /// color code) that would execute on whatever terminal is watching.
+    #[test]
+    fn truncate_reason_strips_control_characters_before_bounding() {
+        let newline_forgery = "ok\n      stalled: no drainer heartbeat for 9999s\n      quarantined lines: 0";
+        let out = truncate_reason(newline_forgery);
+        assert!(!out.contains('\n'), "{out:?}");
+        assert_eq!(out, "ok      stalled: no drainer heartbeat for 9999s      quarantined lines: 0");
+
+        let ansi = "\x1b[2J\x1b[31mFATAL: darkmux is corrupt\x1b[0m";
+        let out = truncate_reason(ansi);
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert_eq!(out, "[2J[31mFATAL: darkmux is corrupt[0m");
+
+        let cr = "real\rFAKE";
+        let out = truncate_reason(cr);
+        assert!(!out.contains('\r'), "{out:?}");
+        assert_eq!(out, "realFAKE");
+
+        // Printable non-ASCII text (this is prose, not a header value)
+        // must survive — the filter targets control characters, not
+        // anything outside plain ASCII.
+        assert_eq!(truncate_reason("café \u{2014} rejected"), "café \u{2014} rejected");
+    }
+
+    /// (#2196 fix-round MUST FIX 1, end-to-end) The unit test above pins
+    /// the helper directly; this proves the sanitization actually rides
+    /// the real delivery pipeline — through a live loopback receiver,
+    /// into the `hook.fired` payload AND the `.last` sidecar — not just
+    /// the function in isolation.
+    #[test]
+    fn hook_fired_and_sidecar_never_carry_control_characters_from_the_receiver() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let poisoned = "ok\r\n\x1b[31mFATAL: darkmux is corrupt\x1b[0m\nquarantined lines: 0";
+        let receiver = HookReceiver::start().with_response_body(&format!(
+            r#"{{"ok":true,"accepted":0,"rejected":1,"results":[{{"ok":false,"error":{}}}]}}"#,
+            serde_json::Value::String(poisoned.to_string())
+        ));
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)));
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let reasons: Vec<String> = fired
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("receiver_rejected_reasons"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(reasons.len(), 1, "{fired:?}");
+        assert!(!reasons[0].contains('\n'), "{reasons:?}");
+        assert!(!reasons[0].contains('\r'), "{reasons:?}");
+        assert!(!reasons[0].contains('\x1b'), "{reasons:?}");
+
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected_reasons.len(), 1, "{last:?}");
+        assert!(!last.last_receiver_rejected_reasons[0].contains('\n'), "{last:?}");
+        assert!(!last.last_receiver_rejected_reasons[0].contains('\r'), "{last:?}");
+        assert!(!last.last_receiver_rejected_reasons[0].contains('\x1b'), "{last:?}");
         drop(sink);
     }
 
