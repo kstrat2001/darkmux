@@ -7195,6 +7195,168 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
     assert!(human_out.contains("1 of 4 steps minted (3 left out by config)"), "got:\n{human_out}");
 }
 
+// ── (#2682 fix-pass MUST FIX 3) `running-phase-session-dead` end-to-end ────
+//
+// The unit tests inside `src/mission_status.rs` (`detect_drift`,
+// `running_phase_session_drift`) all hand-type the `local_status`/
+// `local_evidence` values `run()` is supposed to compute — none of them go
+// through `run()` itself, and `tests/cli.rs` had NO `mission status`
+// invocation that touched this rule at all. Mutation-proven per the review:
+// replacing `run()`'s own `local_dispatch_status.get(&m.id)` lookup with a
+// constant `(None, None)` left `cargo test -p darkmux --bin darkmux
+// mission_status::` at 93/93 green — nothing proved the CLI's own wiring
+// was connected to the rule the unit tests were exercising. These two tests
+// go through the REAL `darkmux mission status --json` subprocess.
+
+/// Writes a bare-minimum `mission.json` + one `phases/<id>.json` directly
+/// (no `mission launch`, no dispatch, no container — pure static JSON, so
+/// this never touches a model or the network). `started_ts` is a caller-
+/// supplied Unix-seconds value so each test can place it however far in
+/// the past its scenario needs.
+fn write_running_mission(home: &std::path::Path, mission_id: &str, phase_id: &str, started_ts: u64) {
+    let mission_dir = home.join("missions").join(mission_id);
+    fs::create_dir_all(mission_dir.join("phases")).unwrap();
+    fs::write(
+        mission_dir.join("mission.json"),
+        serde_json::json!({
+            "id": mission_id,
+            "description": "fix-pass e2e fixture",
+            "status": "active",
+            "phase_ids": [phase_id],
+            "created_ts": started_ts,
+            "started_ts": started_ts,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        mission_dir.join("phases").join(format!("{phase_id}.json")),
+        serde_json::json!({
+            "id": phase_id,
+            "mission_id": mission_id,
+            "description": "fix-pass e2e phase",
+            "status": "running",
+            "created_ts": started_ts,
+            "started_ts": started_ts,
+            "task_ids": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn mission_drift<'a>(board: &'a serde_json::Value, mission_id: &str) -> &'a serde_json::Value {
+    board["missions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no missions array in board: {board}"))
+        .iter()
+        .find(|m| m["id"] == mission_id)
+        .unwrap_or_else(|| panic!("mission {mission_id} not on the board: {board}"))
+}
+
+/// (#2682 fix-pass MUST FIX 1) Probe A: an Active mission whose Running
+/// phase has NEVER dispatched anything at all — no flow records exist for
+/// it — but `started_ts` is old enough (25 real minutes, well past the
+/// default 20-minute `stale_after_ms`) that `mission_run_status_and_evidence`
+/// reads it `Abandoned` on the mission's own AGE. The board must NOT invent
+/// a dispatch session that was never there, and must NOT suggest `mission
+/// abort` on pure absence.
+#[test]
+fn mission_status_running_phase_with_no_dispatch_ever_names_age_not_a_phantom_session() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap(); // deliberately left empty
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_running_mission(home.path(), "never-dispatched-e2e", "p1", now - 25 * 60);
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let m = mission_drift(&board, "never-dispatched-e2e");
+    let drifts = m["drift"].as_array().unwrap();
+    let hit = drifts
+        .iter()
+        .find(|d| d["kind"] == "running-phase-session-dead")
+        .unwrap_or_else(|| panic!("no running-phase-session-dead drift for a 25-minute-old, never-dispatched Running phase: {m}"));
+    let detail = hit["detail"].as_str().unwrap().to_lowercase();
+    assert!(
+        !detail.contains("dispatch session shows no evidence"),
+        "must not claim a dispatch session was observed when none was ever recorded: {detail}"
+    );
+    assert!(detail.contains("age"), "{detail}");
+    let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert!(
+        !suggest.iter().any(|s| s.contains("mission abort")),
+        "must never suggest tearing a mission down on pure absence: {suggest:?}"
+    );
+}
+
+/// (#2682 fix-pass MUST FIX 5) darkmux POSITIVELY recorded this mission's
+/// one dispatch session ENDING (a `session.end` crash/kill/timeout
+/// close-edge, attributed via the record's own `mission_id` field). The
+/// board must describe that as an observation, never as "no evidence of
+/// life", and it may still offer `mission abort`.
+#[test]
+fn mission_status_recorded_session_end_describes_an_observation_not_an_absence() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_running_mission(home.path(), "recorded-end-e2e", "p1", now - 25 * 60);
+
+    let day = darkmux_flow::day_utc_now();
+    fs::write(
+        flows.path().join(format!("{day}.jsonl")),
+        serde_json::json!({
+            "ts": "2024-01-01T09:00:00Z",
+            "action": "session.end",
+            "session_id": "e2e-crashed-session",
+            "mission_id": "recorded-end-e2e",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let m = mission_drift(&board, "recorded-end-e2e");
+    let drifts = m["drift"].as_array().unwrap();
+    let hit = drifts
+        .iter()
+        .find(|d| d["kind"] == "running-phase-session-dead")
+        .unwrap_or_else(|| panic!("no running-phase-session-dead drift for a recorded session.end: {m}"));
+    let detail = hit["detail"].as_str().unwrap().to_lowercase();
+    assert!(
+        detail.contains("recorded") && detail.contains("ending"),
+        "must describe the POSITIVE observation: {detail}"
+    );
+    assert!(
+        !detail.contains("no evidence of life"),
+        "a recorded end is a fact, not the same claim as silence: {detail}"
+    );
+    let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert!(
+        suggest.iter().any(|s| s.contains("mission abort")),
+        "a positively recorded end is a reasonable abort case: {suggest:?}"
+    );
+}
+
 // ── (#2300) growth: a step's OUTPUT grows tasks into the graph ───────────
 //
 // The invariant under test is the SEAM, not any one mission: phase 1 writes

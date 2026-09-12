@@ -166,6 +166,40 @@ pub enum AbandonReason {
     NoTerminal,
 }
 
+/// (#2682 fix-pass) Which of THREE genuinely different situations produced
+/// an `Active`/`Paused` mission's `RunStatus::Abandoned` verdict inside
+/// [`mission_run_status_and_evidence`] — never surfaced on the `/runs` wire
+/// (that's [`AbandonReason`]'s job, and its two-way split is a different
+/// axis: deliberate teardown vs. everything else). This is consumed
+/// directly by `mission status`'s own drift rule
+/// (`src/mission_status.rs::running_phase_session_drift`) so it can
+/// describe what was actually OBSERVED instead of asserting the same fixed
+/// sentence for three different facts — see that function's own doc for
+/// the review finding this closes (#2682 fix-pass MUST FIX 1/2/5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSessionEvidence {
+    /// darkmux POSITIVELY recorded this mission's dispatch session ending —
+    /// the presence reconciler's crash/kill/timeout close-edge (a
+    /// `session.end` record, see [`terminal_status_for_action`]). This is
+    /// an observation, not an absence: something darkmux was watching
+    /// stopped, and darkmux saw it stop.
+    RecordedEnd,
+    /// No dispatch session can be attributed to this mission at all —
+    /// either none was ever recorded, or every session this mission's
+    /// bookend/step ids named was refused as AMBIGUOUS (`is_ambiguous`,
+    /// #1918/#2487 — shared by more than one mission). The Abandoned
+    /// verdict here rests entirely on the MISSION's own age
+    /// (`started_ts` vs. `stale_after_ms`), never on an observed dispatch
+    /// — there is no session to have "shown no evidence of life" in.
+    NoAttributableSession,
+    /// At least one attributable session was found, but none of them ever
+    /// reached a terminal record and none looks live under the same
+    /// staleness budget [`session_is_live`] applies everywhere else in
+    /// this module — the dispatch went quiet without ever announcing it
+    /// stopped.
+    StaleNoTerminal,
+}
+
 /// One row of the `/runs` view-model. Lenient-on-read WIRE shape (every
 /// field but `id`/`kind`/`status`/`tracked` is optional) — this is NEVER
 /// persisted, so there's no schema-version discipline to carry; a future
@@ -933,6 +967,35 @@ fn build_mission_id_index(flow_index: &HashMap<String, SessionAgg>) -> HashMap<S
     idx
 }
 
+/// (#2682 fix-pass) The RAW `(session_id, agg)` candidates one mission
+/// structurally or historically claims — every step-dispatch session
+/// [`collect_mission_step_sessions`] predicts for it, UNIONed with every
+/// session the merged flow record set has actually seen carrying this
+/// mission's own id (`mission_id_index`). Pre-ambiguity-filter: each caller
+/// applies its own `!is_ambiguous()` filter afterward.
+///
+/// Extracted out of [`mission_to_run`] (which used to inline this) so
+/// [`local_dispatch_status`] draws from the IDENTICAL pool `darkmux run
+/// list`'s own row-builder does — two independently hand-written versions
+/// of "which sessions belong to this mission" is exactly the kind of drift
+/// CLAUDE.md's cross-system-contracts section warns about, and is how
+/// #1918/#2487's ambiguity corruption slipped through in the first place.
+fn mission_candidate_sessions<'a>(
+    mission: &Mission,
+    step_sessions: &'a HashSet<String>,
+    mission_id_index: &'a HashMap<String, Vec<String>>,
+    flow_index: &'a HashMap<String, SessionAgg>,
+) -> Vec<(&'a str, &'a SessionAgg)> {
+    let mut candidate_ids: HashSet<&str> = step_sessions.iter().map(String::as_str).collect();
+    if let Some(ids) = mission_id_index.get(&mission.id) {
+        candidate_ids.extend(ids.iter().map(String::as_str));
+    }
+    candidate_ids
+        .into_iter()
+        .filter_map(|sid| flow_index.get(sid).map(|agg| (sid, agg)))
+        .collect()
+}
+
 /// Normalize one loaded `Mission` into a [`Run`]. Joins to its flow
 /// session(s) by the UNION of `step_sessions` (structural — covers both
 /// mission_id gaps, see the module doc) and `mission_id_index`'s lookup
@@ -957,19 +1020,17 @@ fn mission_to_run(
     // this falls through to the flow-derived role there, same as before.
     let dispatch_role = shape.and_then(|(task, _)| task.role_id.clone());
 
-    let mut candidate_ids: HashSet<&str> = step_sessions.iter().map(String::as_str).collect();
-    if let Some(ids) = mission_id_index.get(&mission.id) {
-        candidate_ids.extend(ids.iter().map(String::as_str));
-    }
     // (#1915) Pairs, not bare aggs — see `earliest_by_start`'s own doc for
     // why: carrying the id alongside its agg is what lets `representative`
     // hand its OWN session id to the `Run` (`session_id` below) without a
     // second, separately-implemented search that could disagree about
     // which session actually won.
-    let sessions: Vec<(&str, &SessionAgg)> = candidate_ids
-        .into_iter()
-        .filter_map(|sid| flow_index.get(sid).map(|agg| (sid, agg)))
-        .collect();
+    //
+    // (#2682 fix-pass) The candidate-gathering itself now lives in
+    // `mission_candidate_sessions`, shared with `local_dispatch_status` —
+    // see that helper's own doc for why the sharing matters.
+    let sessions: Vec<(&str, &SessionAgg)> =
+        mission_candidate_sessions(mission, step_sessions, mission_id_index, flow_index);
 
     // (#2487) Filtered to unambiguous sessions BEFORE picking `representative`
     // — the SAME `is_ambiguous()` guard `sessions_by_start` below already
@@ -1260,19 +1321,42 @@ fn mission_to_run(
 /// yet is real and must not be misread as abandoned — `started_ts` itself
 /// is the activity anchor for that case.
 fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) -> RunStatus {
+    mission_run_status_and_evidence(mission, sessions, now_ms).0
+}
+
+/// (#2682 fix-pass) As [`mission_run_status`], but for the `Active`/`Paused`
+/// arm ALSO names which of the three genuinely different situations
+/// produced an `Abandoned` verdict — see [`DispatchSessionEvidence`]'s own
+/// doc for what each means and why the distinction matters. `None` evidence
+/// covers every non-`Abandoned` status, plus the `Aborted`/`Finalized` arms
+/// below (a deliberate teardown, or a finished mission, are their own
+/// established facts — this rule is only about the "went quiet" family).
+///
+/// `mission_run_status` is a thin wrapper over this (`.0`) so its ~20
+/// existing plain-`RunStatus` callers/tests are untouched — this is the ONE
+/// place the actual judgment lives; nothing re-derives it.
+fn mission_run_status_and_evidence(
+    mission: &Mission,
+    sessions: &[&SessionAgg],
+    now_ms: u64,
+) -> (RunStatus, Option<DispatchSessionEvidence>) {
     match mission.status {
         MissionStatus::Active | MissionStatus::Paused => {
             let Some(started_ts) = mission.started_ts else {
-                return RunStatus::Planned;
+                return (RunStatus::Planned, None);
             };
             if !sessions.is_empty() && sessions.iter().all(|s| s.terminal_status.is_some()) {
                 if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Abandoned)) {
-                    return RunStatus::Abandoned;
+                    // A `session.end` terminal really did land — darkmux
+                    // OBSERVED this session stop (see
+                    // `terminal_status_for_action`), never a guess from
+                    // silence.
+                    return (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd));
                 }
                 if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Error)) {
-                    return RunStatus::Error;
+                    return (RunStatus::Error, None);
                 }
-                return RunStatus::Running;
+                return (RunStatus::Running, None);
             }
             // (#1642) A PAUSED mission is deliberately idle, so the staleness
             // gate must not touch it. The gate reads "went quiet without
@@ -1286,26 +1370,49 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
             // KNOWS they paused costs nothing, while calling it abandoned
             // actively misinforms.
             if mission.status == MissionStatus::Paused {
-                return RunStatus::Running;
+                return (RunStatus::Running, None);
             }
-            let live = if sessions.is_empty() {
+            if sessions.is_empty() {
+                // (#2682 fix-pass MUST FIX 1/2) No session — real or
+                // ambiguous — was ever attributable to this mission at
+                // all. The verdict below rests SOLELY on the mission's own
+                // AGE against `stale_after_ms()`; it says nothing about
+                // any dispatch, because there is no dispatch in evidence
+                // here to say anything about.
                 let idle_ms = now_ms.saturating_sub(started_ts.saturating_mul(1_000));
-                idle_ms <= stale_after_ms()
+                return if idle_ms <= stale_after_ms() {
+                    (RunStatus::Running, None)
+                } else {
+                    (
+                        RunStatus::Abandoned,
+                        Some(DispatchSessionEvidence::NoAttributableSession),
+                    )
+                };
+            }
+            if sessions.iter().any(|s| session_is_live(s, now_ms)) {
+                (RunStatus::Running, None)
             } else {
-                sessions.iter().any(|s| session_is_live(s, now_ms))
-            };
-            if live {
-                RunStatus::Running
-            } else {
-                RunStatus::Abandoned
+                // At least one real session exists, but none ever reached
+                // a terminal record and none looks live — genuinely "went
+                // quiet without announcing it," the one case the old fixed
+                // wording actually described accurately.
+                (RunStatus::Abandoned, Some(DispatchSessionEvidence::StaleNoTerminal))
             }
         }
         // (#1627) A torn-down mission is NOT a completed one, and must never
         // resolve through the envelope branch below — an abort leaves whatever
         // envelope the run had written before it died, so reading it would let
         // a killed run inherit a success verdict it never earned.
-        MissionStatus::Aborted => RunStatus::Abandoned,
-        MissionStatus::Finalized => match darkmux_crew::lifecycle::load_envelope(&mission.id) {
+        MissionStatus::Aborted => (RunStatus::Abandoned, None),
+        MissionStatus::Finalized => (mission_finalized_status(mission), None),
+    }
+}
+
+/// The `Finalized`-arm half of [`mission_run_status_and_evidence`], split
+/// out only so that function's `match` can wrap this whole arm's result in
+/// `(_, None)` without repeating the inner match's own arms three times.
+fn mission_finalized_status(mission: &Mission) -> RunStatus {
+    match darkmux_crew::lifecycle::load_envelope(&mission.id) {
             // (#1881) `load_envelope` failed to deserialize `envelope.json`
             // — a newer darkmux wrote a `status`/`outcome` shape this
             // reader's `MissionEnvelope` doesn't recognize (the fleet's
@@ -1411,8 +1518,61 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
                     MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => RunStatus::Complete,
                 }
             }
-        },
-    }
+        }
+}
+
+/// (#2682 fix-pass MUST FIX 1/2/3/5) The dispatch-liveness verdict for
+/// every mission in `missions`, computed from the EXACT same session pool
+/// and [`mission_run_status_and_evidence`] judgment `darkmux run list`
+/// applies to the same mission (via [`mission_to_run`]) — so `mission
+/// status`'s drift rule and `run list`'s own row can never independently
+/// disagree about a mission's status OR about WHY it reads `Abandoned`.
+/// See [`mission_candidate_sessions`]'s own doc for why the session POOL
+/// itself is shared code, not a second hand-written copy.
+///
+/// Takes `missions` from the CALLER's own already-loaded snapshot rather
+/// than reloading `darkmux_crew::loader::load_missions()` a second time
+/// here — one fewer Mission/Phase re-read per `mission status` render, and
+/// it does not widen the TOCTOU window `mission_status::run`'s own doc
+/// already names between ITS load and [`build_runs`]'s internal one.
+///
+/// Superseeds the pre-fix-pass approach (`mission status` calling the FULL
+/// [`build_runs`] and filtering its output down to `known_mission_ids`,
+/// #2682 fix-pass review CONSIDER 3 — deleting that filter left the whole
+/// suite green, meaning nothing pinned it): looping directly over `missions`
+/// makes "local missions only" a structural property of the input rather
+/// than a filter that could be silently deleted, and this skips building
+/// every OTHER `Run` attribute (machine/role/model/timestamps) this call
+/// site never reads — strictly cheaper, not just narrower.
+pub fn local_dispatch_status(
+    missions: &[Mission],
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+) -> HashMap<String, (RunStatus, Option<DispatchSessionEvidence>)> {
+    let flow_index = build_flow_session_index(flows_dir, fleet);
+    let mission_id_index = build_mission_id_index(&flow_index);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    missions
+        .iter()
+        .map(|mission| {
+            let step_sessions = collect_mission_step_sessions(mission);
+            let candidates =
+                mission_candidate_sessions(mission, &step_sessions, &mission_id_index, &flow_index);
+            // (#2487) The SAME `!is_ambiguous()` filter `mission_to_run`
+            // applies before it ever calls `mission_run_status` — see that
+            // function's own comment for why an unfiltered pool would let
+            // a session shared across missions win a verdict it has no
+            // right to.
+            let sessions_bare: Vec<&SessionAgg> =
+                candidates.iter().filter(|(_, s)| !s.is_ambiguous()).map(|(_, s)| *s).collect();
+            let verdict = mission_run_status_and_evidence(mission, &sessions_bare, now_ms);
+            (mission.id.clone(), verdict)
+        })
+        .collect()
 }
 
 // ─── Lab normalization ──────────────────────────────────────────────────────
@@ -3445,6 +3605,179 @@ mod tests {
         // 1-second-newer activity — both must read as dead.
         let now_ms = 946_684_800_000 + stale_after_ms() + 5_000;
         assert_eq!(mission_run_status(&m, &[&stale_a, &stale_b], now_ms), RunStatus::Abandoned);
+    }
+
+    // ── mission_run_status_and_evidence / DispatchSessionEvidence (#2682 fix-pass) ──
+
+    #[test]
+    fn mission_run_status_and_evidence_no_sessions_stale_age_is_no_attributable_session() {
+        let mut m = minimal_mission("m-evidence-age", vec![], None);
+        m.started_ts = Some(946_684_800);
+        let stale_now_ms = 946_684_800_000 + stale_after_ms() + 1_000;
+        assert_eq!(
+            mission_run_status_and_evidence(&m, &[], stale_now_ms),
+            (RunStatus::Abandoned, Some(DispatchSessionEvidence::NoAttributableSession)),
+            "an Abandoned verdict with NO sessions at all must name the mission's own age, not \
+             invent an observed dispatch"
+        );
+    }
+
+    #[test]
+    fn mission_run_status_and_evidence_session_end_terminal_is_recorded_end() {
+        let mut m = minimal_mission("m-evidence-end", vec![], None);
+        m.started_ts = Some(946_684_800);
+        let ended = SessionAgg { terminal_status: Some(RunStatus::Abandoned), ..Default::default() };
+        assert_eq!(
+            mission_run_status_and_evidence(&m, &[&ended], 946_684_800_000),
+            (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd)),
+            "a session whose OWN terminal read Abandoned (a real `session.end` record) is a \
+             POSITIVE observation, not the same fact as silence"
+        );
+    }
+
+    #[test]
+    fn mission_run_status_and_evidence_stale_no_terminal_session_is_stale_no_terminal() {
+        let mut m = minimal_mission("m-evidence-stale", vec![], None);
+        m.started_ts = Some(946_684_800);
+        let stale = SessionAgg {
+            has_start: true,
+            terminal_status: None,
+            last_activity_ts: Some("2000-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let now_ms = 946_684_800_000 + stale_after_ms() + 5_000;
+        assert_eq!(
+            mission_run_status_and_evidence(&m, &[&stale], now_ms),
+            (RunStatus::Abandoned, Some(DispatchSessionEvidence::StaleNoTerminal)),
+            "a real session that went quiet without any terminal record is the genuinely \
+             'no evidence of life' case"
+        );
+    }
+
+    #[test]
+    fn mission_run_status_and_evidence_never_names_a_reason_for_a_live_mission() {
+        let mut m = minimal_mission("m-evidence-live", vec![], None);
+        m.started_ts = Some(946_684_800);
+        assert_eq!(
+            mission_run_status_and_evidence(&m, &[], 946_684_800_000),
+            (RunStatus::Running, None),
+            "no evidence should ever be attached to a non-Abandoned verdict"
+        );
+    }
+
+    // ── local_dispatch_status (#2682 fix-pass MUST FIX 1/2/3) ──────────────
+
+    /// (#2682 fix-pass MUST FIX 2, review Probe E2) An ambiguous session —
+    /// shared with another mission, and carrying FRESH activity — must
+    /// never be read as "this mission's dispatch went stale without a
+    /// terminal record" (`StaleNoTerminal`). Once `is_ambiguous()` refuses
+    /// it, the pool this mission can legitimately draw from is EMPTY, so
+    /// the verdict has to fall back to the mission's own age — proving
+    /// MUST FIX 1's fix (the `sessions.is_empty()` branch) is what actually
+    /// closes MUST FIX 2, exactly as the review predicted.
+    #[test]
+    #[serial_test::serial]
+    fn local_dispatch_status_ambiguous_session_reads_no_attributable_session_not_stale() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut m = minimal_mission("m-ambiguous-e2e", vec![], None);
+        // 90 minutes old — well past the default ~20-minute staleness
+        // budget, so the age branch genuinely fires once the session pool
+        // is empty (mirrors the review's Probe E2 fixture exactly).
+        m.started_ts = Some(now_unix().saturating_sub(90 * 60));
+        darkmux_crew::lifecycle::save_mission(&m).unwrap();
+
+        // Two DIFFERENT missions' records under the SAME session_id, both
+        // fresh (the review's "emitted AT THE CURRENT SECOND") — live work
+        // by the clock, but not ATTRIBUTABLE to `m` once ambiguity is
+        // refused.
+        let now_iso = format!("{}T00:00:00Z", today());
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": now_iso,
+                    "action": "step start",
+                    "session_id": "task-shared",
+                    "mission_id": "m-ambiguous-e2e",
+                    "source": "scheduler",
+                }),
+                serde_json::json!({
+                    "ts": now_iso,
+                    "action": "step start",
+                    "session_id": "task-shared",
+                    "mission_id": "some-other-mission",
+                    "source": "scheduler",
+                }),
+            ],
+        );
+
+        let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
+        let (verdict, evidence) =
+            status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
+        assert_eq!(verdict, RunStatus::Abandoned, "unchanged by this fix — #1918 territory");
+        assert_eq!(
+            evidence,
+            Some(DispatchSessionEvidence::NoAttributableSession),
+            "an ambiguous, freshly-active session must never read as a STALE one — there is no \
+             attributable session here at all"
+        );
+    }
+
+    /// The happy path: `local_dispatch_status` must agree with `build_runs`
+    /// for the SAME mission when nothing is ambiguous — the fix-pass's new
+    /// narrower entry point is not a second, independently-derived opinion.
+    #[test]
+    #[serial_test::serial]
+    fn local_dispatch_status_agrees_with_build_runs_for_a_crashed_mission() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mission = minimal_mission(
+            "dispatch-crashed-local-status",
+            vec!["p-crash".to_string()],
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp-local-status".to_string(),
+                origin: None,
+            }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-crash", "dispatch-crashed-local-status", vec!["t-crash".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task =
+            minimal_task("t-crash", "p-crash", vec!["s-crash".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("dispatch-crashed-local-status", &task).unwrap();
+        let step = minimal_step("s-crash", "t-crash", Some("crew-dispatch-coder-local-status"));
+        darkmux_crew::lifecycle::save_step("dispatch-crashed-local-status", "p-crash", &step).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[serde_json::json!({
+                "ts": "2026-01-01T09:00:00Z",
+                "action": "dispatch start",
+                "session_id": "crew-dispatch-coder-local-status",
+                "handle": "coder",
+            })],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let run = runs
+            .iter()
+            .find(|r| r.id == "dispatch-crashed-local-status")
+            .unwrap_or_else(|| panic!("no Run for the crashed mission: {runs:?}"));
+        assert_eq!(run.status, RunStatus::Abandoned, "fixture sanity: {run:?}");
+
+        let status = local_dispatch_status(std::slice::from_ref(&mission), flows.path(), &[]);
+        let (verdict, evidence) = status
+            .get(&mission.id)
+            .copied()
+            .unwrap_or_else(|| panic!("no local_dispatch_status entry for {}", mission.id));
+        assert_eq!(verdict, run.status, "local_dispatch_status disagreed with build_runs");
+        assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
     }
 
     // ── lab normalization ───────────────────────────────────────────────
