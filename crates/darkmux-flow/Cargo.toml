@@ -62,6 +62,36 @@ url = "2.5"
 jaq-core = "=3.1.1"
 jaq-std = "=3.0.3"
 jaq-json = "=2.0.3"
+# #2196 fix-round 2 — hooks.rs's receiver-rejection-reason rendering needs a
+# real column-width and general-category classification of arbitrary
+# receiver-supplied text, not a hand-rolled approximation. Two fix rounds
+# each found real overshoots/gaps in the hand-rolled versions (a byte-index
+# range list for "wide" scripts, and an enumerated list of "invisible"
+# characters) that these crates close structurally instead of one block/
+# character at a time. They come from DIFFERENT publishers and carry
+# DIFFERENT licenses — an earlier revision of this comment called both
+# "the canonical `unicode-rs`-family crates", which was wrong on both
+# counts:
+#   * `unicode-width` — the `unicode-rs` organization; the crate
+#     `ripgrep`/`bat`/`clap`'s wrapping already rely on for exactly this
+#     question. Licensed `MIT OR Apache-2.0`.
+#   * `unicode-general-category` — `yeslogic`
+#     (github.com/yeslogic/unicode-general-category), a different
+#     organization. Licensed **Apache-2.0 only**, with no MIT option.
+# darkmux itself is MIT (the workspace `Cargo.toml`'s `license` field), so
+# the aggregate binary now also carries Apache-2.0 terms — its NOTICE
+# requirement and its patent grant/termination provisions. That composes
+# without conflict and is entirely ordinary for a permissive project, but
+# it is a real change to the binary's license surface, so it is stated
+# here rather than left implied. Both pull in ZERO transitive
+# dependencies of their own (verified via `cargo tree`), and both are
+# regenerated from the real Unicode Character Database rather than
+# hand-maintained, so a future Unicode version's new assignments are
+# picked up by a version bump instead of another hand-rolled range. Both
+# ship Unicode 16.0 tables today — see `is_denylisted_category`'s doc in
+# hooks.rs for the one behavior that couples to that version.
+unicode-width = "0.2.2"
+unicode-general-category = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.10"

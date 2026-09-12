@@ -640,6 +640,17 @@ struct LastStatus {
     /// written before this field existed, defaults to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_receiver_rejected: Option<u64>,
+    /// (#2196) The receiver's own `results[].error` text for the LAST
+    /// successful delivery's rejected record(s) — CONTEXT alongside
+    /// `last_receiver_rejected`, same last-value shape and same erasure
+    /// caveat (a later clean delivery truncate-replaces this sidecar, so
+    /// this is never what a check keys on; see `receiver_rejected_total`
+    /// for the cumulative count doctor/`flow status` use). Empty when the
+    /// last delivery was clean, or when it was rejected but the receiver's
+    /// body carried no `results` detail. Lenient-on-read: absent in a
+    /// sidecar written before this field existed, defaults to empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    last_receiver_rejected_reasons: Vec<String>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -710,15 +721,23 @@ fn write_status_sidecar_locked(path: &Path, json: &[u8]) -> Result<()> {
 /// report (a give-up, a redirect refusal, or a quarantine never got a
 /// 2xx response body to read one from).
 fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
-    write_last_status_full(rt, ok, error, None)
+    write_last_status_full(rt, ok, error, None, Vec::new())
 }
 
 /// (#2273) Full form of [`write_last_status`] — takes the receiver's
 /// per-record rejection count from the delivery this call reports on, so
 /// it survives into the `.last` sidecar for a later `darkmux doctor` run
 /// to surface, not just the `hook.fired` flow record the delivery already
-/// emitted.
-fn write_last_status_full(rt: &RuleRuntime, ok: bool, error: Option<&str>, last_receiver_rejected: Option<u64>) {
+/// emitted. `last_receiver_rejected_reasons` (#2196) is that same
+/// delivery's `results[].error` text, empty when `last_receiver_rejected`
+/// is `None` or the receiver's body carried no per-record detail.
+fn write_last_status_full(
+    rt: &RuleRuntime,
+    ok: bool,
+    error: Option<&str>,
+    last_receiver_rejected: Option<u64>,
+    last_receiver_rejected_reasons: Vec<String>,
+) {
     let status = LastStatus {
         ts: schema::ts_utc_now(),
         ok,
@@ -726,6 +745,7 @@ fn write_last_status_full(rt: &RuleRuntime, ok: bool, error: Option<&str>, last_
         cursor_write_failures: rt.cursor_write_failures.load(Ordering::Acquire),
         stalled: rt.stalled.load(Ordering::Acquire),
         last_receiver_rejected,
+        last_receiver_rejected_reasons,
     };
     if let Ok(json) = serde_json::to_string(&status) {
         // (#2453) Locked on the sidecar's own path — see
@@ -783,6 +803,7 @@ fn write_cursor_write_status(path: &Path, cursor_write_failures: u64, stalled: b
             cursor_write_failures: 0,
             stalled: false,
             last_receiver_rejected: None,
+            last_receiver_rejected_reasons: Vec::new(),
         });
         // (#2453 red-prove seam) Widens the read-to-write window on
         // demand for the concurrency test — see
@@ -1090,6 +1111,12 @@ pub struct HookRuleSummary {
     /// 400 rejections followed by one clean accept reads `None` here.
     /// `receiver_rejected_total` is the durable count.
     pub last_receiver_rejected: Option<u64>,
+    /// (#2196) The receiver's own `results[].error` text for
+    /// `last_receiver_rejected`'s rejected record(s) — same LAST-value,
+    /// self-erasing shape and the same caveat (never the signal a check
+    /// keys on). Empty when the last delivery was clean, or was rejected
+    /// but the receiver's body carried no per-record detail to name.
+    pub last_receiver_rejected_reasons: Vec<String>,
     /// (#2273 fix-round finding 1) CUMULATIVE count of records this
     /// rule's receiver reported rejecting, across every delivery and
     /// every process — read from the persisted `<key>.rejected` counter
@@ -1226,6 +1253,10 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 last_drainer_heartbeat,
                 quarantined_lines,
                 last_receiver_rejected: last.as_ref().and_then(|s| s.last_receiver_rejected),
+                last_receiver_rejected_reasons: last
+                    .as_ref()
+                    .map(|s| s.last_receiver_rejected_reasons.clone())
+                    .unwrap_or_default(),
                 receiver_rejected_total,
                 key,
                 is_file,
@@ -1640,7 +1671,14 @@ enum DeliveryOutcome {
     /// rejections is still CONSUMED (at-least-once, the line advances) but
     /// the count rides on `hook.fired` so it is never silent (#1959 live
     /// loop: every finding was refused inside a 200 and nothing said so).
-    Success { receiver_rejected: Option<u64> },
+    /// `receiver_rejected_reasons` is the same body's `results[].error`
+    /// text for entries the receiver marked `ok: false` (#2196 — the
+    /// count alone told an operator SOMETHING was thrown away, never
+    /// WHY, so finding out required replaying against a scratch receiver
+    /// or reading the receiver's own log). Bounded and lenient-on-read:
+    /// see [`extract_rejection_reasons`]. Empty when the body carries no
+    /// `results` array, or none of its entries are marked rejected.
+    Success { receiver_rejected: Option<u64>, receiver_rejected_reasons: Vec<String> },
     ClientError,
     /// (#2093 merge-gate finding 2) A 3xx response — the receiver telling
     /// us to go elsewhere, which we refuse rather than follow. Treated as
@@ -1827,6 +1865,803 @@ fn build_delivery_headers(
     }
 }
 
+/// (#2196) Cap on how many receiver-reported per-record rejection reason
+/// strings ride the `hook.fired` payload / `.last` sidecar / `doctor` /
+/// `flow status` surfaces. The receiver's `results[]` array is untrusted
+/// input from outside the process; an observability surface must not
+/// become a vector for an unbounded string dump from a receiver that
+/// (deliberately or not) rejects everything with a huge error body.
+const MAX_REJECTION_REASONS: usize = 3;
+
+/// (#2196 fix-round 2, MUST FIX C) The total rendered COLUMN budget for
+/// ONE reason exactly as `flow status`/`doctor` actually print it: quoted
+/// and, if it contains `"`/`\`, backslash-escaped
+/// ([`format_rejection_reasons_for_display`]) — see [`display_width`]
+/// for what "column" means here (not bytes, not `char`s).
+///
+/// (#2196 fix-round MUST FIX 1) The first fix-round set this to 40,
+/// reasoning from an assumed 80-column terminal minus the widest known
+/// inline-label prefix. Reviewed again in fix-round 2: that bound
+/// destroyed the disclosure the feature exists to provide. This PR's own
+/// flagship example — `"payload field \"file\" must be a non-empty
+/// string"` (47 columns) — lost the word naming the constraint
+/// ("string") at 40 columns; a `body.findings[N].severity` validation
+/// error loses the field index; a duplicate-key rejection loses the
+/// fingerprint and run id, which is the whole actionable content. #2196
+/// exists because the count alone told an operator SOMETHING was
+/// discarded and never why — a 40-column cap recreates most of that gap.
+/// The 40-column number was also buying little: at 40 columns the full
+/// row (label + quotes + reason) is 75 columns and doesn't even wrap an
+/// 80-column terminal, and what closes the exact-vocabulary forgery of an
+/// INDENTED row is [`collapse_whitespace_and_trim`] plus stripping the
+/// non-whitespace blank-rendering characters ([`is_stripped_for_display`]),
+/// not this width bound — see those functions' docs. The FLUSH-LEFT rows
+/// are closed separately, at the render site, by
+/// [`rejection_reason_display_lines`] and its wrappers (#2196 fix-rounds
+/// 3 and 4, MUST FIX G — `flow status`, then `doctor` and the delivery
+/// stderr warning); no sanitizer can close those, because what makes
+/// them forgeable is the row's wrap point, which the sanitizer cannot
+/// see. The
+/// bound below exists to cap payload size and keep a report from an
+/// actively hostile receiver bounded, not to defeat forgery.
+///
+/// 120 is chosen as the upper end of "roughly 100-120": generous enough
+/// that realistic receiver validation messages (measured: 47, 83, 108
+/// columns for the reasons named above) survive whole, while still
+/// bounding an actively hostile receiver's payload. [`REJECTION_REASON_TAIL_RESERVE`]
+/// documents how the budget splits between a head and a tail when a
+/// reason IS long enough to need cutting.
+pub const MAX_REJECTION_REASON_DISPLAY_WIDTH: usize = 120;
+
+/// The two literal `"` characters [`format_rejection_reasons_for_display`]
+/// always wraps a reason in, reserved out of [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]
+/// so quoting can never itself push the rendered reason over the cap.
+pub(crate) const REJECTION_REASON_QUOTE_OVERHEAD: usize = 2;
+
+/// The raw (unquoted, sanitized) column budget every reason is bounded to
+/// before quoting — [`MAX_REJECTION_REASON_DISPLAY_WIDTH`] minus the
+/// quote overhead. Applied identically at write time
+/// ([`extract_rejection_reasons`]) and as the first pass at render time
+/// ([`format_rejection_reasons_for_display`]) — see
+/// [`format_rejection_reasons_for_display`]'s doc for why a SECOND pass,
+/// on the escaped text, is also needed (MUST FIX B/D: escaping must not
+/// be able to grow a reason back past the cap).
+pub(crate) const REJECTION_REASON_RAW_BUDGET: usize = MAX_REJECTION_REASON_DISPLAY_WIDTH - REJECTION_REASON_QUOTE_OVERHEAD;
+
+/// (#2196 fix-round 2, MUST FIX C) When a reason IS long enough to need
+/// cutting, this many columns are reserved for a TAIL kept after the
+/// `…`, rather than cutting only the head off. A validation-style reason
+/// (`"...severity must be one of low, medium, high, critical — got
+/// \"catastrophic\""`) loses the offending value with a head-only cut;
+/// a head+tail cut keeps both the constraint AND the value that failed
+/// it — see [`bound_reason_width`]. 24 columns comfortably covers a
+/// short trailing clause like the example above (19 columns) with a
+/// little headroom.
+pub(crate) const REJECTION_REASON_TAIL_RESERVE: usize = 24;
+
+/// (#2196 fix-round 3, MUST FIX F) How many `char`s [`bound_reason_width`]
+/// allows per column of its width budget — the LENGTH ceiling that rides
+/// alongside the COLUMN ceiling.
+///
+/// This exists because fix-round 3 turned the width bound into a
+/// width-ONLY bound and, in doing so, removed the last thing bounding
+/// LENGTH. `unicode-width` is correct that a combining mark occupies ZERO
+/// rendered columns, so under a pure column budget a combining mark costs
+/// nothing: `bound_reason_width`'s head loop never trips on one, and
+/// nothing else in the pipeline caps characters or bytes. Measured on the
+/// real path (the receiver body is read through a 64 KiB `Read::take`, so
+/// this is reachable, not theoretical): a single 2xx response of ~60 KB
+/// put 20,000 combining marks — 40,000 bytes, nominal rendered width 0 —
+/// into the `.last` sidecar, the `hook.fired` payload (which flows on to
+/// the daily JSONL, the audit sink, and Redis `XADD`), the delivery
+/// `eprintln!`, and both `flow status` and `doctor`. Twenty thousand
+/// marks stacked on one cell is also a terminal-corruption primitive in
+/// its own right, not merely volume.
+///
+/// The two earlier rounds bounded length only by accident: round 1 had a
+/// flat 200-BYTE cap, and round 2's hand-rolled width function scored a
+/// combining mark as 1 column, so its column budget doubled as a rough
+/// character cap. Round 3's correct width function removed both. This
+/// constant restores the ceiling EXPLICITLY, as a second budget the head
+/// and tail loops honor alongside the column budget, so it cannot be lost
+/// again by a width-function change.
+///
+/// 4 chars/column is deliberately generous rather than tight: legitimate
+/// text really does spend several `char`s per rendered column — a
+/// decomposed `é` is 2 chars for 1 column, a Devanagari or Thai cluster
+/// can stack several combining marks on one, and a regional-indicator
+/// flag pair is 2 chars for 2 columns. At [`REJECTION_REASON_RAW_BUDGET`]
+/// that is 472 chars — no realistic reason comes close (the longest
+/// measured real one is 108 columns / 108 chars), while the hostile
+/// 20,000-char case above is cut by a factor of 42.
+pub(crate) const REJECTION_REASON_CHARS_PER_COLUMN: usize = 4;
+
+/// (#2196 fix-round 2, MUST FIX A) Is `c` in a Unicode GENERAL CATEGORY
+/// that has no business appearing in a human-facing terminal report,
+/// full stop?
+///
+/// The first fix-round enumerated individual code points and ranges
+/// (bidi controls, ZWSP/ZWJ/BOM, line/paragraph separators) picked out by
+/// hand. Reviewed again in fix-round 2: that approach cannot converge —
+/// the verifier's second pass found FOUR MORE characters the enumeration
+/// missed (U+061C ARABIC LETTER MARK, U+2060 WORD JOINER, U+2061–2064,
+/// U+180E, U+FFF9–FFFB) on its very next look, and a denylist of
+/// individual code points can never structurally close against a
+/// character Unicode assigns tomorrow. This inverts the check: instead of
+/// naming characters to drop, it names the CATEGORIES no receiver-supplied
+/// prose has any legitimate reason to use, and drops everything the
+/// Unicode Character Database currently assigns — or ever assigns in the
+/// future — to one of them:
+///
+/// - `Cc` (Control) — C0/C1 controls: `\n`, `\r`, ESC, DEL, ...
+/// - `Cf` (Format) — the ENTIRE format-character category in one check:
+///   every bidi embedding/override/isolate control (the Trojan Source
+///   class, CVE-2021-42574), every invisible-math/joining control (ZWSP,
+///   ZWNJ, ZWJ, word joiner, the invisible operators), the BOM, the
+///   interlinear-annotation triad, ARABIC LETTER MARK, MONGOLIAN VOWEL
+///   SEPARATOR, and the TAG block (U+E0000–E007F) — verified against
+///   Unicode's own `DerivedCoreProperties.txt`/general-category data,
+///   not hand-picked. A future Unicode version's new format character is
+///   caught automatically; the first fix-round's four misses would all
+///   have been caught by this one check.
+/// - `Co` (Private Use) — no character exists here by definition; its
+///   rendering is whatever a receiver's chosen (unknowable) font happens
+///   to map it to.
+/// - `Cs` (Surrogate) — cannot occur in a real `char` at all (Rust's
+///   `char` type structurally excludes surrogate code points), kept here
+///   only so this function reads as a complete category audit.
+/// - `Cn` (Unassigned) — no character is assigned here yet; a receiver
+///   naming one is sending noise at best. (#2196 fix-round 3, CONSIDER)
+///   This one arm is UCD-VERSION-COUPLED, and knowingly so: both crates
+///   ship Unicode 16.0 tables, so a code point assigned in Unicode 17 or
+///   later reads as `Cn` here and is silently deleted from an otherwise
+///   legitimate reason. The direction is fail-safe (drop, never render
+///   the unknown), and the blast radius is narrow — a message in a newly
+///   encoded script loses those characters with no diagnostic. A crate
+///   version bump picks up each new UCD edition; there is nothing to fix
+///   in this function.
+/// - `Zl`/`Zp` (Line/Paragraph Separator) — U+2028/U+2029, the same
+///   row-forgery primitive as `\n` wearing a category `\n`'s own check
+///   doesn't cover.
+///
+/// This is deliberately a category-level check, not a full "safe to
+/// print" allowlist of individual characters — see [`is_stripped_for_display`]'s
+/// doc for the two narrow, closed exceptions Unicode's category system
+/// cannot express (a handful of characters assigned to ordinary
+/// printable categories that nonetheless render as blank glyphs in every
+/// mainstream terminal font).
+fn is_denylisted_category(c: char) -> bool {
+    use unicode_general_category::GeneralCategory as GC;
+    matches!(
+        unicode_general_category::get_general_category(c),
+        GC::Control
+            | GC::Format
+            | GC::PrivateUse
+            | GC::Surrogate
+            | GC::Unassigned
+            | GC::LineSeparator
+            | GC::ParagraphSeparator
+    )
+}
+
+/// (#2196 fix-round 2, MUST FIX A) A small, CLOSED set of characters
+/// Unicode assigns to an ordinary printable general category (`Lo` —
+/// Other Letter, or `So` — Other Symbol) — so [`is_denylisted_category`]
+/// cannot reach them without also dropping thousands of legitimate
+/// letters and symbols in the same category — that nonetheless render as
+/// a BLANK glyph (no visible mark at all) in every mainstream terminal
+/// font. This is the concrete case where a pure category allowlist
+/// cannot work: Unicode's category system has no "renders blank"
+/// property, so these five have to be named explicitly. They are
+/// permanently fixed, single code points (not ranges, not blocks) tied
+/// to old encoding-compatibility conventions Unicode will not extend:
+///
+/// - `U+115F` HANGUL CHOSEONG FILLER, `U+1160` HANGUL JUNGSEONG FILLER,
+///   `U+3164` HANGUL FILLER, `U+FFA0` HALFWIDTH HANGUL FILLER — blank
+///   placeholder jamo from the old Johab/compatibility Hangul encoding
+///   model; category `Lo` because Unicode classifies all Hangul jamo as
+///   letters, but the FILLER members of that set are defined to have no
+///   visible glyph.
+/// - `U+2800` BRAILLE PATTERN BLANK — the "all raised dots absent" cell
+///   of the braille block; category `So` (Symbol) like every other
+///   braille cell, but this one specific pattern is, by definition, the
+///   blank one.
+///
+/// (#2196 fix-round 3, CONSIDER — investigated, NOT adopted) Four of the
+/// five above (`U+115F`, `U+1160`, `U+3164`, `U+FFA0`) carry Unicode's
+/// `Default_Ignorable_Code_Point` property, so filtering on that property
+/// would subsume four fifths of this hand-maintained list and close the
+/// remaining zero-width `Mn` survivors for free, leaving `U+2800` — a
+/// real glyph that merely happens to render blank — as a one-character
+/// exception. That is the better shape and it is worth revisiting.
+/// **`unicode-general-category` 1.1.0 does not expose the property**
+/// (verified: a case-insensitive grep for `default.?ignorable` across the
+/// whole vendored crate returns nothing; its public surface is
+/// `get_general_category` and the `GeneralCategory` enum, nothing else),
+/// and neither does `unicode-width`. Hand-rolling the property's ~30
+/// ranges here would be a SIXTH hand-maintained list — the exact thing
+/// fix-round 2 inverted this module away from — so the five-element list
+/// stands until a crate that ships the real property table is worth
+/// adding as a third dependency.
+fn is_blank_glyph_exception(c: char) -> bool {
+    matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}')
+}
+
+/// (#2196 fix-round 2, MUST FIX A) Unicode Variation Selectors
+/// (`U+FE00..=FE0F`) and Variation Selectors Supplement
+/// (`U+E0100..=E01EF`) — two permanently closed, dedicated blocks.
+/// Category `Mn` (Nonspacing Mark), the SAME category as a legitimate
+/// combining accent (`café` = `e` + `U+0301`), so [`is_denylisted_category`]
+/// can't reach them without also stripping real diacritics from
+/// legitimate international prose. Left in, a variation selector is both
+/// a zero-width character that can silently modify (or hide inside) the
+/// glyph before it, and a documented steganographic channel (data
+/// smuggled as a sequence of otherwise-invisible selectors) — a receiver
+/// has no legitimate reason to send one in a rejection reason.
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// (#2196 fix-round 2, MUST FIX A) The full "safe to print" test: `false`
+/// for anything [`is_denylisted_category`], [`is_blank_glyph_exception`],
+/// or [`is_variation_selector`] would drop. Named for what it decides,
+/// not what it enumerates — the category check does the structural work;
+/// the two named-exception checks cover what Unicode's category system
+/// itself cannot express (see each function's doc).
+fn is_stripped_for_display(c: char) -> bool {
+    is_denylisted_category(c) || is_blank_glyph_exception(c) || is_variation_selector(c)
+}
+
+/// Strip control characters (the Unicode `Cc` category — C0 controls
+/// including `\n`/`\r`, ESC, and DEL, plus the C1 range) from a
+/// receiver-supplied reason string. This codebase already applies this
+/// exact discipline twice: `sanitize_header_value` (above) allowlists
+/// printable ASCII for HTTP header values specifically so CR/LF injection
+/// is caught by the filter rather than a special case, and
+/// `style::link` (`darkmux-types/src/style.rs`) strips control bytes from
+/// a URL before embedding it in an OSC-8 escape, with the doc there
+/// naming the goal precisely: making the corruption unreachable rather
+/// than merely unlikely. A receiver's `results[].error` text is the same
+/// class of untrusted input, and it rides straight into `flow status`,
+/// `darkmux doctor`, and an `eprintln!` — all rendered to a real
+/// terminal. Left unfiltered, an embedded `\n` forges extra status rows
+/// indistinguishable from real ones, a `\r` overwrites the visible line,
+/// and a raw ANSI escape (including a screen-clear) executes on whatever
+/// terminal is watching. Printable non-ASCII text is kept (this is
+/// prose an operator reads, not a wire-protocol value like a header), so
+/// this deliberately doesn't reuse `sanitize_header_value`'s ASCII-only
+/// allowlist.
+///
+/// (#2196 fix-round MUST FIX 1; inverted to an allowlist in fix-round 2,
+/// MUST FIX A) `char::is_control()` alone only catches category `Cc` — it
+/// let through the Trojan Source bidi-reordering set, invisible/zero-width
+/// characters, and the Unicode line/paragraph separators on the first
+/// pass, and four MORE format characters plus a family of blank-glyph
+/// letters/symbols on the second. Rather than keep enumerating individual
+/// characters a review happens to test, this keeps everything EXCEPT what
+/// [`is_stripped_for_display`] names — see that function's doc for the
+/// category-level check plus the two small closed exceptions Unicode's
+/// category system can't express. The result is also passed through
+/// [`collapse_whitespace_and_trim`], which defeats the exact-vocabulary
+/// forgery of an INDENTED row — and only that. (#2196 fix-round 4) An
+/// earlier revision of this line said it "actually defeats the
+/// exact-vocabulary row forgery", full stop, which was the same
+/// overstatement the whole premise rested on: all three surfaces that
+/// render this text have FLUSH-LEFT rows the whitespace collapse cannot
+/// protect (`flow status` has eight, `doctor` three, and every one of
+/// this module's sixteen stderr rows). Those are closed at their render
+/// sites instead, by [`rejection_reason_display_lines`] and its two
+/// wrappers — see [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s doc.
+fn sanitize_reason_text(s: &str) -> String {
+    let filtered: String = s.chars().filter(|c| !is_stripped_for_display(*c)).collect();
+    strip_leading_zero_width(&collapse_whitespace_and_trim(&filtered))
+}
+
+/// (#2196 fix-round 3, CONSIDER) Drop any LEADING zero-column characters
+/// left after [`collapse_whitespace_and_trim`].
+///
+/// That function trims WHITESPACE, and a combining mark is not
+/// whitespace, so a reason beginning with one survives to the front of
+/// the string — where [`format_rejection_reasons_for_display`] then puts
+/// darkmux's own opening `"` immediately before it. A combining mark
+/// applies to the character that PRECEDES it, so a reason starting with
+/// U+0336 COMBINING LONG STROKE OVERLAY or U+20DD COMBINING ENCLOSING
+/// CIRCLE renders the quote itself struck through or circled. That quote
+/// is the single character carrying the attribution — the mark that tells
+/// a reader "everything after this is the receiver's words, not
+/// darkmux's" — so receiver-controlled text must not be able to deface
+/// it. The marks are kept everywhere else in the string, where they are
+/// ordinary prose (`café` decomposed is `e` + U+0301).
+///
+/// Zero-COLUMN rather than a category test on purpose: it is exactly the
+/// characters that cost no cell of their own — and therefore land on the
+/// preceding one — that can reach the quote. An empty result is fine;
+/// [`extract_rejection_reasons`] drops an empty reason.
+fn strip_leading_zero_width(s: &str) -> String {
+    s.trim_start_matches(|c| display_width(c) == 0).to_string()
+}
+
+/// (#2196 fix-round MUST FIX 1 + MUST FIX 5) Collapse any run of Unicode
+/// whitespace (regular space, NBSP, and every other `char::is_whitespace()`
+/// code point — not just ASCII space) down to a single ASCII space, then
+/// trim the ends.
+///
+/// This is part of the fix for the forged-row primitive, not just
+/// cosmetic tidying: every darkmux-owned row in `flow status`'s per-rule
+/// block (`status.rs`, e.g. `"      cursor-write failures: {} (recovered)"`,
+/// `"      STALLED: ..."`, `"      last drainer heartbeat: ..."`) indents
+/// with a RUN of six literal spaces. A receiver forging one of those rows
+/// needs that exact run to land at column 0 of a wrapped continuation
+/// line. Collapsing every whitespace run to one character means no
+/// receiver-supplied text can ever contain six (or two, or any run
+/// length ≥ 2) consecutive spaces after sanitization — an INDENTED row
+/// cannot be constructed, independent of terminal width, wrap point, or
+/// the length bound above.
+///
+/// (#2196 fix-round 3, MUST FIX G) That is the whole of what this
+/// function buys, and an earlier revision of this doc overstated it as
+/// the whole defense. It covers the INDENTED rows only. Eight rows in
+/// `format_status_human` render FLUSH LEFT — the `flow status — {state}`
+/// header, `Hooks`, `Disk`, `Redis`, `Schema`, `Warnings:`, `Failures:`,
+/// and `Redis: not configured (set DARKMUX_REDIS_URL to enable)` — and
+/// none of them needs leading whitespace to look genuine, so collapsing
+/// whitespace runs does nothing for them at all. Those are closed at the
+/// render site instead, by
+/// [`format_rejection_reasons_as_indented_lines`], which takes the
+/// wrapping away from the terminal so no continuation line exists to
+/// carry receiver text to column 0.
+///
+/// Trimming also closes MUST FIX 5 for free: a reason that is empty, or
+/// made of nothing but control/whitespace characters the filter above
+/// just stripped, becomes `""` here, which [`extract_rejection_reasons`]
+/// then drops entirely rather than let an empty-parens
+/// `"... on the last delivery ()"` line ship.
+fn collapse_whitespace_and_trim(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// (#2196 fix-round MUST FIX 1; replaced with the `unicode-width` crate
+/// in fix-round 2, MUST FIX B) Rendered column width of `c` on a typical
+/// terminal.
+///
+/// The first fix-round hand-rolled this as a handful of "wide script"
+/// ranges (CJK, Hangul, fullwidth forms) plus "everything else is 1".
+/// Reviewed again in fix-round 2, the verifier measured up to a 2x
+/// overshoot from that approach — some from EXOTIC input (supplementary-
+/// plane emoji, regional indicators), but two of the three misses needed
+/// nothing exotic at all: CJK Compatibility Forms (`U+FE30..=FE6F`) and
+/// Hangul Jamo Extended-B (`U+D7B0..=D7FF`) are ordinary, assigned
+/// Unicode blocks the hand-rolled range list simply never named. A
+/// hand-rolled table can only ever cover the blocks someone thought to
+/// list; `unicode-width` (the crate the wider Rust ecosystem — `ripgrep`,
+/// `bat`, `clap`'s wrapping — already relies on for exactly this
+/// question) is generated from the real Unicode East-Asian-Width and
+/// general-category data, so it's correct for every block including the
+/// two above, and correct for the *next* Unicode version's new
+/// assignments without this crate's own code changing. It also scores
+/// combining marks and variation selectors at their real width (0) —
+/// the hand-rolled version scored a combining accent as 1, silently
+/// UNDER-counting available budget (safe, but needlessly conservative);
+/// see this crate's doc comment for why this bound is defense in depth
+/// rather than the whole defense in either direction.
+///
+/// Zero dependencies of its own (verified: `cargo tree` under this
+/// crate shows no transitive deps) — see this crate's module-level dep
+/// list for why that matters here.
+fn display_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Rendered column width of a whole string (see [`display_width`]).
+///
+/// Exported so a consumer in another crate can assert the geometry of a
+/// row it prints WITHOUT taking its own `unicode-width` dependency — the
+/// width question has exactly one answer in this workspace, and a second
+/// dependency edge would be a second place for it to drift.
+pub fn display_columns(s: &str) -> usize {
+    s.chars().map(display_width).sum()
+}
+
+/// Truncate already-SANITIZED text `s` to at most `budget` rendered
+/// columns (see [`display_width`]) AND at most
+/// `budget * `[`REJECTION_REASON_CHARS_PER_COLUMN`] characters
+/// (#2196 fix-round 3, MUST FIX F — a column budget alone bounds nothing
+/// a receiver cares about, because a combining mark is correctly scored
+/// at ZERO columns; see that constant's doc for the measured 60 KB /
+/// 20,000-character payload that reached five surfaces on a row of
+/// nominal width 10). Both ceilings are enforced on the same walk, and
+/// either one alone triggers a cut, preserving both a HEAD and a short
+/// TAIL separated by a single `…` when a cut is needed, rather than
+/// chopping the tail off outright (#2196 fix-round 2, MUST FIX C). For a
+/// validation-style reason (`"...severity must be one of low, medium,
+/// high, critical — got \"catastrophic\""`), a head-only cut loses
+/// exactly the value that failed; a head+tail cut keeps both the
+/// constraint AND the offending value — see
+/// [`REJECTION_REASON_TAIL_RESERVE`]'s doc for the split. Returns `s`
+/// unchanged when it already fits, so calling this again on
+/// already-bounded text is a no-op — the idempotence
+/// [`format_rejection_reasons_for_display`]'s doc relies on.
+///
+/// Walks `char_indices` from both ends — every candidate cut point is
+/// therefore already a UTF-8 char boundary BY CONSTRUCTION, eliminating
+/// the panic class a raw byte-offset slice invites (#2196 fix-round MUST
+/// FIX 2: a naive `&s[..N]` on a byte offset that lands mid-character
+/// panics with "byte index N is not a char boundary").
+fn bound_reason_width(s: &str, budget: usize) -> String {
+    // (#2196 fix-round 3, MUST FIX F) Both budgets are enforced: columns
+    // AND characters. A width-only bound does not bound anything a
+    // receiver cares about — see [`REJECTION_REASON_CHARS_PER_COLUMN`].
+    let char_budget = budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
+    let total_width: usize = s.chars().map(display_width).sum();
+    let total_chars = s.chars().count();
+    if total_width <= budget && total_chars <= char_budget {
+        return s.to_string();
+    }
+    let ellipsis_width = display_width('…');
+    if budget <= ellipsis_width {
+        // A budget too small to hold even the ellipsis — never reached
+        // with this module's own constants, but a defensive floor for
+        // any future caller passing a tiny budget.
+        return "…".to_string();
+    }
+    let tail_budget = REJECTION_REASON_TAIL_RESERVE.min((budget - ellipsis_width) / 2);
+    let head_budget = budget - ellipsis_width - tail_budget;
+    let head_char_budget = head_budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
+    let tail_char_budget = tail_budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
+
+    let mut head_end = s.len();
+    let mut w = 0usize;
+    for (n, (idx, c)) in s.char_indices().enumerate() {
+        let cw = display_width(c);
+        if w + cw > head_budget || n + 1 > head_char_budget {
+            head_end = idx;
+            break;
+        }
+        w += cw;
+    }
+
+    let mut tail_start = s.len();
+    let mut w = 0usize;
+    for (n, (idx, c)) in s.char_indices().rev().enumerate() {
+        let cw = display_width(c);
+        if w + cw > tail_budget || n + 1 > tail_char_budget {
+            break;
+        }
+        w += cw;
+        tail_start = idx;
+    }
+
+    if tail_start <= head_end {
+        // The head and tail windows would overlap — a defensive floor,
+        // not a live branch. (#2196 fix-round 3) The character ceiling
+        // added above does NOT make it live, which is worth writing down
+        // because it looks like it should: a first pass at this claimed
+        // zero-width text would let the windows meet, and the test
+        // written to pin that disproved it. Both arms are closed at the
+        // shipped constants (head 93 cols / 372 chars, tail 24 cols / 96
+        // chars, budget 118 cols / 472 chars):
+        //   * Overlap implies `total_chars <= 372 + 96 = 468`, but a
+        //     CHARACTER-triggered cut needs `total_chars > 472`. 468 < 472.
+        //   * Overlap also implies the two windows cover the whole string
+        //     (counting the overlap twice), so `total_width <= 93 + 24 =
+        //     117`, but a WIDTH-triggered cut needs `total_width > 118`.
+        // No input can satisfy either, so no test is written against this
+        // arm — a test that cannot fail is worse than none. Kept anyway
+        // so a future constant change degrades to a correct head-only cut
+        // instead of re-emitting the overlap region twice.
+        format!("{}…", &s[..head_end])
+    } else {
+        format!("{}…{}", &s[..head_end], &s[tail_start..])
+    }
+}
+
+/// Sanitize `s` (see [`sanitize_reason_text`]) and then bound it to
+/// [`REJECTION_REASON_RAW_BUDGET`] rendered columns (see
+/// [`bound_reason_width`]). Sanitizing before bounding (not after)
+/// matters for two reasons: the bound is a promise about what actually
+/// rides downstream, and cutting before filtering could remove a
+/// multi-byte sequence at the wrong point relative to the stripped
+/// characters.
+fn truncate_reason(s: &str) -> String {
+    bound_reason_width(&sanitize_reason_text(s), REJECTION_REASON_RAW_BUDGET)
+}
+
+/// Extract up to [`MAX_REJECTION_REASONS`] per-record rejection reason
+/// strings from a receiver's 2xx JSON response body (#2196). The local
+/// tracker's contract shape is `results: [{"ok": false, "error": "..."}]`
+/// alongside the record's own `rejected` count; this pulls the `error`
+/// text from every entry explicitly marked `"ok": false`.
+///
+/// Lenient-on-read, deliberately: a `results` entry missing `ok`/`error`,
+/// an `error` that isn't a string, a non-array `results`, or no `results`
+/// key at all all yield no reasons for that entry rather than an error —
+/// darkmux describes what the receiver told it and never invents detail
+/// the receiver didn't provide (this project's "describes, never
+/// adjudicates" stance applies to absence of data too).
+///
+/// (#2196 fix-round MUST FIX 5) A reason that sanitizes to empty (an
+/// empty string, or one made of nothing but control/whitespace
+/// characters `sanitize_reason_text` just stripped) is dropped here
+/// rather than kept as `""` — an empty-string "reason" is not a reason;
+/// letting it through produced `"... on the last delivery ()"` in
+/// `doctor` and a bare, contentless `"last rejection reason(s): "` in
+/// `flow status`, leaving the operator unable to tell whether the
+/// receiver gave no reason at all or darkmux lost one it was given.
+///
+/// (#2196 fix-round 2, CONSIDER) The empty-after-sanitize filter runs
+/// BEFORE [`MAX_REJECTION_REASONS`]'s `.take` — not after, as the first
+/// fix-round had it. A body whose first entries are blank/all-control
+/// `error` strings ahead of a real one used to consume the cap on
+/// nothing and then drop every one of them at the trailing filter,
+/// yielding `reasons: []` — count disclosed, reason silently gone. The
+/// width bound ([`bound_reason_width`]) is applied AFTER the take, since
+/// it's a per-reason concern that doesn't affect which entries survive.
+fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
+    body.get("results")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("ok").and_then(serde_json::Value::as_bool) == Some(false))
+                .filter_map(|e| e.get("error").and_then(serde_json::Value::as_str))
+                .map(sanitize_reason_text)
+                .filter(|s| !s.is_empty())
+                .take(MAX_REJECTION_REASONS)
+                .map(|s| bound_reason_width(&s, REJECTION_REASON_RAW_BUDGET))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// (#2196 fix-round MUST FIX 1 + CONSIDER) Render receiver-supplied
+/// rejection reason(s) for a human-facing terminal surface (`flow
+/// status`, `darkmux doctor`, and the delivery `eprintln!` at the
+/// `DeliveryOutcome::Success` call site) — each reason double-quoted and
+/// semicolon-joined, and re-sanitized/re-bounded via [`truncate_reason`]
+/// rather than trusting the caller already did.
+///
+/// Two independent reasons this exists as its own function instead of a
+/// bare `.join("; ")` at each call site:
+///
+/// - **Attribution.** Quoting makes the text unambiguously the
+///   RECEIVER'S words, never darkmux's own voice — a reader scanning for
+///   a closing quote mark can tell where receiver-controlled text ends,
+///   which a bare inline string cannot offer. Internal `"` and `\` are
+///   backslash-escaped (the familiar quoted-string convention) so a
+///   reason that itself contains a literal `"` can never look like the
+///   closing quote and spill unquoted text onto the row.
+/// - **Defense in depth.** Sanitization today lives only at the
+///   producer (`truncate_reason`, called from `extract_rejection_reasons`
+///   at write time). A `.last` sidecar already on disk from before this
+///   fix (this fix's own first commit wrote reasons unsanitized), or any
+///   future producer that forgets to call `truncate_reason`, would
+///   otherwise render raw. Calling `truncate_reason` again here is one
+///   call and closes that window — sanitization and the display-width
+///   bound are both idempotent, so re-applying them to already-clean
+///   text is a no-op.
+///
+/// (#2196 fix-round 2, MUST FIX B/D) The escaping happens AFTER
+/// `truncate_reason`'s width bound, so a reason made mostly of `"`/`\`
+/// characters grows past the bound here: each escaped character costs
+/// TWO rendered columns instead of one, and the bound never accounted
+/// for that — a stored reason at exactly the raw budget in quote
+/// characters renders noticeably wider once escaped, restoring the wrap
+/// precondition the width bound exists to prevent (this is the padding
+/// the fix-round-2 verifier's own proof used). Closing this needs a
+/// SECOND bounding pass on the escaped text itself: `bound_reason_width`
+/// is called again here, on the (by now plain-ASCII, since sanitization
+/// already ran) escaped string, before the wrapping quotes go on. This
+/// composes with the idempotence note above rather than breaking it —
+/// the common case (no `"`/`\` in the reason) never triggers a second
+/// cut at all, since the escaped text is byte-identical to the
+/// already-bounded input.
+pub fn format_rejection_reasons_for_display(reasons: &[String]) -> String {
+    reasons
+        .iter()
+        .map(|r| {
+            let escaped = truncate_reason(r).replace('\\', "\\\\").replace('"', "\\\"");
+            let bounded = bound_reason_width(&escaped, REJECTION_REASON_RAW_BUDGET);
+            format!("\"{bounded}\"")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// (#2196 fix-round 3, MUST FIX G) The narrowest terminal width the
+/// rejection-reason rows are guaranteed against — no line
+/// [`format_rejection_reasons_as_indented_lines`] emits ever reaches this
+/// column, so no terminal at least this wide has anything to wrap.
+///
+/// A "narrowest supported width" has to be a NUMBER somewhere, because
+/// the guarantee is only as good as the assumption it names. 60 is the
+/// narrowest width anyone actually reviews `flow status` at; a terminal
+/// narrower than that wraps darkmux's own rows too, so the forged row
+/// stops being distinguishable from ordinary damage.
+pub const REJECTION_REASON_MIN_TERMINAL_WIDTH: usize = 60;
+
+/// (#2196 fix-round 3, MUST FIX G) Columns of indent every line
+/// [`format_rejection_reasons_as_indented_lines`] emits carries. Deeper
+/// than the six-space indent of the per-rule block it sits inside, so a
+/// reason line reads as subordinate to the `last rejection reason(s):`
+/// label above it.
+pub(crate) const REJECTION_REASON_LINE_INDENT: usize = 8;
+
+/// (#2196 fix-round 3, MUST FIX G) Render receiver-supplied rejection
+/// reasons as a list of COMPLETE, ALREADY-INDENTED output lines, none of
+/// which can reach column [`REJECTION_REASON_MIN_TERMINAL_WIDTH`].
+///
+/// This exists because the anti-forgery premise the earlier rounds relied
+/// on is FALSE, and was stated as an absolute. That premise: "every
+/// darkmux status row indents with a run of spaces, and
+/// [`collapse_whitespace_and_trim`] guarantees receiver text can never
+/// contain such a run, so a wrapped continuation line can never be
+/// mistaken for a darkmux row." Enumerating every `writeln!` in
+/// `status::format_status_human` shows twenty indented rows and EIGHT
+/// FLUSH-LEFT ones: the `flow status — {state}` header, `Hooks`, `Disk`,
+/// `Redis`, `Schema`, `Warnings:`, `Failures:`, and `Redis: not
+/// configured (set DARKMUX_REDIS_URL to enable)`. None of the eight needs
+/// leading whitespace to be plausible, so the whitespace collapse offers
+/// them ZERO protection — proven with 46 filler characters, one space,
+/// and the verbatim row text: no whitespace run, no blank glyph, no
+/// escape expansion, 100 columns against a 118-column budget, surviving
+/// truncation whole, landing at column 0 of the wrapped continuation with
+/// the genuine identical row four lines above. `Warnings:` and
+/// `Failures:` are the two that matter — they change how an operator
+/// reads everything printed below them.
+///
+/// The fix is at the RENDER site, not in the sanitizer, because the
+/// sanitizer cannot see the thing that makes the attack work: the row's
+/// own wrap point. darkmux takes the wrapping back from the terminal —
+/// every line is emitted whole, pre-indented, and short enough that no
+/// terminal at the supported width has a continuation to produce. With no
+/// continuation line, there is no column-0 receiver text, and the
+/// forgery is unreachable by construction rather than by vocabulary —
+/// which also means it holds for the flush-left rows the collapse never
+/// covered, and for any row a future revision adds.
+///
+/// Wrapping prefers a space boundary and falls back to a hard character
+/// split for a single token wider than the budget (a hostile receiver's
+/// unbroken run, or a legitimate long identifier), so a real multi-word
+/// reason stays readable while an adversarial one is still bounded.
+pub fn format_rejection_reasons_as_indented_lines(reasons: &[String]) -> Vec<String> {
+    let indent = " ".repeat(REJECTION_REASON_LINE_INDENT);
+    rejection_reason_display_lines(reasons, REJECTION_REASON_LINE_INDENT)
+        .into_iter()
+        .map(|line| format!("{indent}{line}"))
+        .collect()
+}
+
+/// (#2196 fix-round 4) Columns of prefix `darkmux doctor` puts in front
+/// of a hint line — `"        \u{2192} "`, eight spaces plus the arrow plus a
+/// space, matching `render_check_block`'s own `HINT_HEAD`. A hint
+/// CONTINUATION is padded to the same width, so every line of a hint is
+/// indented by exactly this much.
+pub const REJECTION_REASON_HINT_INDENT: usize = 10;
+
+/// Never wrap receiver text below this many columns, however deep the
+/// caller's prefix. A budget near zero would emit one character per line
+/// — technically bounded, useless to read — so a caller whose prefix
+/// leaves no room gets a line that is wider than the minimum terminal
+/// width instead of a column of confetti. No caller in this workspace is
+/// anywhere near it (the deepest prefix is doctor's 10), and a future one
+/// that is has a layout problem this function cannot fix for it.
+const REJECTION_REASON_MIN_CONTENT_BUDGET: usize = 20;
+
+/// (#2196 fix-round 4) The receiver's rejection reasons, rendered and
+/// wrapped to lines that fit UNDER [`REJECTION_REASON_MIN_TERMINAL_WIDTH`]
+/// once the caller's own `prefix_columns` of indentation go in front of
+/// them. Returned WITHOUT that prefix, because the two consumers attach
+/// it differently: `flow status` prepends spaces itself
+/// ([`format_rejection_reasons_as_indented_lines`]), while `doctor` hands
+/// the lines to its own hint renderer, which supplies `"        \u{2192} "`
+/// for the first and ten spaces for the rest.
+///
+/// Taking the prefix as a parameter is what makes the guarantee travel.
+/// The budget is a property of the FINISHED line, not of this function,
+/// so a helper that hard-coded one indent would silently over-run for any
+/// caller that indents deeper — and the whole defense is that no printed
+/// line reaches the minimum terminal width.
+///
+/// The `+ 1` keeps a full line one column SHORT of that width: terminals
+/// disagree about whether a line that exactly fills the last column wraps
+/// immediately or defers, and the guarantee should not depend on which
+/// behavior the operator's terminal happens to have.
+pub fn rejection_reason_display_lines(reasons: &[String], prefix_columns: usize) -> Vec<String> {
+    let content_budget = REJECTION_REASON_MIN_TERMINAL_WIDTH
+        .saturating_sub(prefix_columns + 1)
+        .max(REJECTION_REASON_MIN_CONTENT_BUDGET);
+    wrap_to_display_width(&format_rejection_reasons_for_display(reasons), content_budget)
+}
+
+/// Greedy word wrap of `s` to at most `budget` rendered columns per line
+/// (see [`display_width`]), hard-splitting any single token wider than
+/// `budget`. Input is expected to be already sanitized, so the only
+/// whitespace it can contain is the single ASCII spaces
+/// [`collapse_whitespace_and_trim`] leaves behind plus the `"; "` joiner
+/// [`format_rejection_reasons_for_display`] adds.
+fn wrap_to_display_width(s: &str, budget: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in s.split(' ') {
+        let word_w: usize = word.chars().map(display_width).sum();
+        if !cur.is_empty() && cur_w + 1 + word_w > budget {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if word_w <= budget {
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += word_w;
+        } else {
+            for c in word.chars() {
+                let cw = display_width(c);
+                if cur_w + cw > budget && !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(c);
+                cur_w += cw;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// (#2196 fix-round 4, MUST FIX G at the stderr surface) The lines the
+/// delivery path writes to stderr when a receiver accepts the request but
+/// reports rejecting records inside it.
+///
+/// A `Vec` of whole lines rather than one interpolated string, for the
+/// same reason `flow status` stopped rendering the reason inline: the
+/// reason used to sit in the middle of a single line that no code
+/// bounded, so the terminal wrapped it and the continuation began at
+/// column 0.
+///
+/// This surface's row inventory is the shortest of the three, and it
+/// makes the fix stronger here than anywhere else: **every** line this
+/// module writes to stderr is flush-left and begins with the literal
+/// `flow::HookSink: ` — 16 sites, ZERO indented ones. So an indented line
+/// cannot be mistaken for a darkmux row no matter what it says, and the
+/// defense needs no vocabulary list at all. It also needed the fix most:
+/// unlike `doctor`, nothing here caps the line's width, so the inline
+/// form wrapped on EVERY terminal rather than only on one narrower than
+/// the renderer assumed.
+///
+/// Split out as a pure function so the geometry is testable without
+/// capturing a process's stderr — the behavior under test is the shape of
+/// the lines, not the IO.
+fn receiver_rejection_stderr_lines(url: &str, n: u64, total: u64, reasons: &[String]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "flow::HookSink: receiver at {url} accepted the request but rejected {n} record(s) inside it \
+         ({total} so far) — see hook.fired.receiver_rejected"
+    )];
+    // Empty in, nothing out: `format_rejection_reasons_as_indented_lines`
+    // yields no lines for no reasons, so a rejection the receiver gave no
+    // reason for prints exactly the one header line it always did.
+    lines.extend(format_rejection_reasons_as_indented_lines(reasons));
+    lines
+}
+
 fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome {
     // (#2093 merge-gate finding 1, belt-and-braces) Re-validate at POST
     // time — the URL was already validated at `resolve_rules` /
@@ -1894,10 +2729,16 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
                 // body is JSON that carries one.
                 let mut buf = String::new();
                 let _ = std::io::Read::take(resp.into_reader(), 65_536).read_to_string(&mut buf);
-                let receiver_rejected = serde_json::from_str::<serde_json::Value>(&buf)
-                    .ok()
-                    .and_then(|v| v.get("rejected").and_then(serde_json::Value::as_u64));
-                DeliveryOutcome::Success { receiver_rejected }
+                let parsed_body = serde_json::from_str::<serde_json::Value>(&buf).ok();
+                let receiver_rejected =
+                    parsed_body.as_ref().and_then(|v| v.get("rejected").and_then(serde_json::Value::as_u64));
+                // (#2196) A body that isn't JSON at all, or is JSON with
+                // no `results` array, yields no reasons — darkmux
+                // describes what the receiver told it, never invents
+                // detail the receiver didn't provide.
+                let receiver_rejected_reasons =
+                    parsed_body.as_ref().map(extract_rejection_reasons).unwrap_or_default();
+                DeliveryOutcome::Success { receiver_rejected, receiver_rejected_reasons }
             }
         }
         Err(ureq::Error::Status(code, _resp)) if is_retryable_client_status(code) => DeliveryOutcome::RetryableFailure,
@@ -2218,7 +3059,7 @@ fn emit_hook_record(
     error: Option<&str>,
     delivery_id: &str,
 ) {
-    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None, delivery_id)
+    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None, &[], delivery_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2230,6 +3071,7 @@ fn emit_hook_record_with(
     attempt: u32,
     error: Option<&str>,
     receiver_rejected: Option<u64>,
+    receiver_rejected_reasons: &[String],
     delivery_id: &str,
 ) {
     let rule = &rt.rule;
@@ -2272,6 +3114,15 @@ fn emit_hook_record_with(
     let rejected_count = receiver_rejected.filter(|n| *n > 0);
     if let Some(n) = rejected_count {
         payload["receiver_rejected"] = serde_json::Value::from(n);
+    }
+    // (#2196) The receiver's own `results[].error` text — WHY, not just
+    // how many. Rides alongside `receiver_rejected` only (never on a
+    // clean delivery, and never invented when the receiver's body
+    // carried no such detail); an empty array is never emitted so an
+    // older reader that doesn't know this key sees no difference from
+    // before.
+    if !receiver_rejected_reasons.is_empty() {
+        payload["receiver_rejected_reasons"] = serde_json::Value::from(receiver_rejected_reasons.to_vec());
     }
 
     let action = if success { "hook.fired" } else { "hook.failed" };
@@ -2683,7 +3534,7 @@ fn drainer_loop(
                 continue;
             }
             match try_post(&rt.rule.url, &body, &headers) {
-                DeliveryOutcome::Success { receiver_rejected } => {
+                DeliveryOutcome::Success { receiver_rejected, receiver_rejected_reasons } => {
                     let attempt = {
                         let mut c = rt.attempt_count.lock().unwrap();
                         *c += 1;
@@ -2701,17 +3552,47 @@ fn drainer_loop(
                     // ACCUMULATES and is never reset — that one is what
                     // doctor / `flow status` key on, so one clean
                     // delivery seconds later cannot erase the signal.
+                    //
+                    // (#2196) `reasons_for_status` rides the SAME gate as
+                    // the count (`rejected_for_status`) rather than an
+                    // independent one keyed on `receiver_rejected_reasons`
+                    // being non-empty — a receiver's `results[]` entries
+                    // without a top-level `rejected` count is not a shape
+                    // this contract defines, so reasons are only surfaced
+                    // as context for a rejection the count already named.
                     let rejected_for_status = receiver_rejected.filter(|n| *n > 0);
-                    write_last_status_full(rt, true, None, rejected_for_status);
+                    let reasons_for_status: Vec<String> =
+                        if rejected_for_status.is_some() { receiver_rejected_reasons } else { Vec::new() };
+                    write_last_status_full(rt, true, None, rejected_for_status, reasons_for_status.clone());
                     if let Some(n) = rejected_for_status {
                         let total =
                             add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
-                        eprintln!(
-                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it ({total} so far) — see hook.fired.receiver_rejected",
-                            rt.rule.url
-                        );
+                        // (#2196 fix-round MUST FIX 1) Quoted +
+                        // re-sanitized; (#2196 fix-round 4, MUST FIX G)
+                        // and on its own INDENTED line(s) rather than
+                        // inline, because this string reaches a real
+                        // terminal, the same as `flow status` and
+                        // `doctor` — see `receiver_rejection_stderr_lines`.
+                        for line in receiver_rejection_stderr_lines(
+                            &rt.rule.url,
+                            n,
+                            total,
+                            &reasons_for_status,
+                        ) {
+                            eprintln!("{line}");
+                        }
                     }
-                    emit_hook_record_with(report_sink.as_ref(), true, rt, &line, attempt, None, receiver_rejected, &delivery_id);
+                    emit_hook_record_with(
+                        report_sink.as_ref(),
+                        true,
+                        rt,
+                        &line,
+                        attempt,
+                        None,
+                        receiver_rejected,
+                        &reasons_for_status,
+                        &delivery_id,
+                    );
                 }
                 DeliveryOutcome::ClientError => {
                     let attempt = {
@@ -6046,6 +6927,1164 @@ mod tests {
              that, seconds after the loss: {summary:?}"
         );
         drop(sink);
+    }
+
+    // ─── (#2196) the receiver's own rejection REASON, not just the count ──
+
+    /// (#2196) One of many: a receiver's `results[]` can carry both
+    /// accepted and rejected entries in the same 2xx response. The
+    /// rejected entry's `error` text must ride the `hook.fired` payload,
+    /// the `.last` sidecar, and the summary `doctor`/`flow status` read —
+    /// so an operator learns WHY, not just that something was thrown
+    /// away.
+    #[test]
+    fn hook_fired_surfaces_the_receivers_rejection_reason_alongside_the_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"accepted":2,"rejected":1,"results":[{"ok":true},{"ok":true},{"ok":false,"error":"payload field \"file\" must be a non-empty string"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let reasons: Vec<String> = fired
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("receiver_rejected_reasons"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        // (#2196 fix-round 2, MUST FIX C) The receiver's raw text is 47
+        // display columns — well under the fix-round-2 budget
+        // (`REJECTION_REASON_RAW_BUDGET`, 118) — so it now survives
+        // WHOLE: this is the PR's own flagship example of the 40-column
+        // cap destroying the disclosure the feature exists to provide
+        // (it used to lose the word "string", the actual constraint
+        // named in the message). These assertions check what's actually
+        // stored, before the render layer's separate quoting/escaping.
+        assert_eq!(
+            reasons,
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            "{fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "warn", "{fired:?}");
+
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
+        assert_eq!(
+            last.last_receiver_rejected_reasons,
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            "{last:?}"
+        );
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(
+            summary.last_receiver_rejected_reasons,
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            "{summary:?}"
+        );
+        drop(sink);
+    }
+
+    /// (#2196 boundary) Every record in the delivery rejected — the
+    /// `results` array has no `ok: true` entries at all. Every reason
+    /// (up to the bound) must still surface, not just the first.
+    #[test]
+    fn hook_fired_surfaces_every_reason_when_the_whole_delivery_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"accepted":0,"rejected":2,"results":[{"ok":false,"error":"reason A"},{"ok":false,"error":"reason B"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(
+                || read_last_status(&last_path).is_some_and(|s| s.last_receiver_rejected == Some(2)),
+                Duration::from_secs(5)
+            ),
+            "the fully-rejected delivery must land"
+        );
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(
+            last.last_receiver_rejected_reasons,
+            vec!["reason A".to_string(), "reason B".to_string()],
+            "{last:?}"
+        );
+        drop(sink);
+    }
+
+    /// (#2196 boundary) A 2xx body the sink cannot parse as JSON at all —
+    /// no `rejected` count, no reasons, and the delivery must still read
+    /// as an ordinary clean accept (Info level, nothing persisted). The
+    /// sink must never crash on garbage in a 2xx body, and must never
+    /// invent a rejection where the receiver never claimed one.
+    #[test]
+    fn hook_fired_stays_clean_when_a_2xx_body_is_not_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body("not valid json at all {{{");
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "an unparseable body must never be read as a rejection: {fired:?}"
+        );
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            "no reasons can exist without a parseable body: {fired:?}"
+        );
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        assert!(summary.last_receiver_rejected_reasons.is_empty(), "{summary:?}");
+        let _ = key;
+        drop(sink);
+    }
+
+    /// (#2196 boundary) A receiver that answers 2xx with a body carrying
+    /// no per-record detail whatsoever (no `rejected`, no `results`) —
+    /// darkmux has nothing to disclose, so nothing is disclosed. Distinct
+    /// from the unparseable-body case above: this body IS valid JSON,
+    /// just not the rejection-reporting contract.
+    #[test]
+    fn hook_fired_stays_clean_when_a_2xx_body_carries_no_per_record_detail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(r#"{"ok":true}"#);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
+            "the clean delivery must land"
+        );
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        assert!(last.last_receiver_rejected_reasons.is_empty(), "{last:?}");
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196 fix-round MUST FIX 2 — the real gate) The prior boundary
+    /// test above only exercises `{"ok":true}` — no `results` array at
+    /// all, so `extract_rejection_reasons` returns empty trivially and
+    /// the `if rejected_for_status.is_some() { reasons } else { vec![] }`
+    /// gate at the delivery call site is never actually exercised. THIS
+    /// is the real boundary: a `results[]` entry explicitly marked
+    /// `"ok": false` with an `error` string (so `extract_rejection_reasons`
+    /// DOES produce a non-empty reason list), but with NO top-level
+    /// `rejected` count — a shape the local tracker's own contract never
+    /// produces (a rejected entry always accompanies a non-zero
+    /// `rejected`), but the sink must not assume that; the gate exists
+    /// specifically because this shape is not the defined contract.
+    ///
+    /// Deleting that `if` (making `reasons_for_status` unconditional)
+    /// leaves every existing test green — proven by running this exact
+    /// mutation before writing this test — while producing a `hook.fired`
+    /// carrying a rejection reason with NO count (an Info-level record,
+    /// since `rejected_count` in `emit_hook_record_with` is computed
+    /// independently from the raw `receiver_rejected` and stays `None`
+    /// here), and a `.last` sidecar with reasons but
+    /// `last_receiver_rejected: None` — a clean delivery, falsely marked.
+    #[test]
+    fn hook_fired_stays_clean_when_results_reject_without_a_top_level_rejected_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"results":[{"ok":false,"error":"CLEAN-MISMARK"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
+            "the delivery must land"
+        );
+        assert!(
+            wait_until(
+                || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+                Duration::from_secs(3)
+            ),
+            "hook.fired must land"
+        );
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "no top-level `rejected` key in the body means no count to disclose: {fired:?}"
+        );
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            "a reason must never ride without the count that names it: {fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        assert!(
+            last.last_receiver_rejected_reasons.is_empty(),
+            "the sidecar must not carry a reason with no matching count: {last:?}"
+        );
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        assert!(summary.last_receiver_rejected_reasons.is_empty(), "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196 fix-round MUST FIX 1) `truncate_reason` (the single choke
+    /// point every `results[].error` string passes through — see
+    /// `extract_rejection_reasons`) must strip every terminal-corruption
+    /// primitive BEFORE a receiver's text reaches `flow status`,
+    /// `darkmux doctor`, or the `eprintln!` at the `DeliveryOutcome::Success`
+    /// call site — all of which render the string directly to a real
+    /// terminal — AND collapse whitespace runs, which is what actually
+    /// defeats the exact-vocabulary row forgery (see
+    /// [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s doc).
+    ///
+    /// This REPLACES the PR's original version of this test, which
+    /// asserted the OLD, defective behavior verbatim: it expected the
+    /// newline-forgery input's six-space indentation to survive fully
+    /// intact (`"ok      stalled: ..."`) — exactly the primitive the
+    /// terminal-wrap row forgery in MUST FIX 1 depends on. That
+    /// assertion encoded the defect as expected behavior; it's gone now,
+    /// and whitespace runs collapse to one space.
+    #[test]
+    fn truncate_reason_strips_forgery_primitives_and_collapses_whitespace() {
+        // (#2196 fix-round 2, MUST FIX C) The collapsed string is 63
+        // columns — well under the fix-round-2 raw budget (118) — so it
+        // now survives WHOLE, unlike under the first fix-round's 40
+        // column cap. The whitespace-collapse property is still what
+        // this probe pins: the forged six-space indentation must not
+        // survive even though nothing here is long enough to need
+        // truncating.
+        let newline_forgery = "ok\n      stalled: no drainer heartbeat for 9999s\n      quarantined lines: 0";
+        let out = truncate_reason(newline_forgery);
+        assert!(!out.contains('\n'), "{out:?}");
+        assert!(!out.contains("  "), "no run of 2+ spaces may survive sanitization: {out:?}");
+        assert_eq!(out, "ok stalled: no drainer heartbeat for 9999s quarantined lines: 0", "{out:?}");
+
+        let ansi = "\x1b[2J\x1b[31mFATAL: darkmux is corrupt\x1b[0m";
+        let out = truncate_reason(ansi);
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert_eq!(out, "[2J[31mFATAL: darkmux is corrupt[0m");
+
+        let cr = "real\rFAKE";
+        let out = truncate_reason(cr);
+        assert!(!out.contains('\r'), "{out:?}");
+        assert_eq!(out, "realFAKE");
+
+        // Printable non-ASCII text (this is prose, not a header value)
+        // must survive — the filter targets control/forgery characters,
+        // not anything outside plain ASCII.
+        assert_eq!(truncate_reason("café \u{2014} rejected"), "café \u{2014} rejected");
+
+        // (#2196 fix-round MUST FIX 1) Trojan Source class (CVE-2021-42574):
+        // RLO reorders the VISUAL rendering of everything after it
+        // without touching logical byte order — this exact payload would
+        // otherwise display as an approval-reading string.
+        let rlo = "delivered OK \u{202e})deppord( deriuqer dleif";
+        let out = truncate_reason(rlo);
+        assert!(!out.contains('\u{202e}'), "{out:?}");
+
+        // Directional isolates + RLM — the rest of the Trojan Source set.
+        for c in ['\u{2066}', '\u{2067}', '\u{2069}', '\u{200f}'] {
+            let poisoned = format!("ok{c}text");
+            assert!(!truncate_reason(&poisoned).contains(c), "{c:?} must be stripped");
+        }
+
+        // Invisible / zero-width characters.
+        for c in ['\u{200b}', '\u{feff}', '\u{00ad}'] {
+            let poisoned = format!("ok{c}text");
+            assert!(!truncate_reason(&poisoned).contains(c), "{c:?} must be stripped");
+        }
+
+        // Unicode line/paragraph separators — the same row-forgery
+        // primitive as `\n`, wearing a category `is_control()` misses.
+        for c in ['\u{2028}', '\u{2029}'] {
+            let poisoned = format!("ok{c}      stalled: fake");
+            let out = truncate_reason(&poisoned);
+            assert!(!out.contains(c), "{c:?} must be stripped: {out:?}");
+            assert!(!out.contains("  "), "whitespace run must still collapse: {out:?}");
+        }
+    }
+
+    /// (#2196 fix-round MUST FIX 1, forgery pin — short case) A reason
+    /// SHORT ENOUGH to survive `truncate_reason`'s width cap WHOLE (no
+    /// ellipsis) must still have an embedded darkmux-row-shaped
+    /// indentation collapsed — proving the fix isn't merely "the width
+    /// cap cuts off anything long enough to reach a wrap point", which
+    /// would leave a reason deliberately engineered to fit inside the
+    /// cap free to forge a row. `"      cursor-write failures: 0
+    /// (recovered)"` alone is 43 columns — already longer than the
+    /// entire cap — so a forgery attempt reproducing that exact row
+    /// verbatim can never survive truncation at all; this is the
+    /// complementary case where the forged text is short enough that
+    /// truncation isn't what saves it.
+    #[test]
+    fn truncate_reason_collapses_a_forged_row_prefix_even_when_it_fits_whole() {
+        let short_forgery = "x      cursor-write failures: 0";
+        let out = truncate_reason(short_forgery);
+        assert!(!out.ends_with('…'), "must survive whole, not truncated: {out:?}");
+        assert!(!out.contains("  "), "the forged indentation must collapse: {out:?}");
+        assert_eq!(out, "x cursor-write failures: 0");
+    }
+
+    /// (#2196 fix-round MUST FIX 2, extended in fix-round 2 for the
+    /// head+tail split MUST FIX C introduced) `bound_reason_width` walks
+    /// `char_indices` from BOTH ends — forward for the head cut, in
+    /// reverse for the tail cut — so every candidate cut point is a
+    /// UTF-8 char boundary BY CONSTRUCTION in both directions. Pins that
+    /// against exactly the inputs a naive byte-offset slice panics on: a
+    /// multi-byte character straddling the HEAD cut point, and an
+    /// all-wide-CJK reason (every character multi-byte) straddling BOTH
+    /// cut points at once. Numbers are derived from the real constants,
+    /// not hardcoded, so this stays correct if the budget/tail-reserve is
+    /// ever retuned. Red-proved: reverting to a raw byte-offset slice on
+    /// either cut panics on these inputs with "byte index N is not a
+    /// char boundary".
+    #[test]
+    fn truncate_reason_never_panics_on_a_multibyte_char_straddling_the_cut() {
+        let ellipsis_w = display_width('…');
+        let head_budget = REJECTION_REASON_RAW_BUDGET - ellipsis_w - REJECTION_REASON_TAIL_RESERVE;
+
+        // `head_budget` ASCII columns, then one 3-byte character (総,
+        // U+7DCF, display width 2) straddling the head cut point, then
+        // enough trailing filler to push the total past the overall
+        // budget so truncation actually engages.
+        let straddle =
+            format!("{}{}{}", "a".repeat(head_budget), '\u{7dcf}', "b".repeat(REJECTION_REASON_TAIL_RESERVE + 10));
+        let out = truncate_reason(&straddle);
+        assert!(out.is_char_boundary(out.len()), "{out:?}");
+        assert!(out.contains('…'), "{out:?}");
+
+        // All-wide CJK: every character is 2 display columns, so BOTH
+        // the head cut (walked forward) and the tail cut (walked
+        // backward) land on a multi-byte character — 201 bytes total,
+        // nowhere near an ASCII byte boundary anywhere.
+        let all_cjk = "一".repeat(67); // 201 bytes, 67 chars, 134 display columns
+        let out = truncate_reason(&all_cjk);
+        assert!(out.is_char_boundary(out.len()), "{out:?}");
+        assert!(out.contains('…'), "{out:?}");
+        assert!(!out.ends_with('…'), "a middle cut must leave a real tail: {out:?}");
+        // Every surviving character (head + tail) must be an intact 一 —
+        // no partial byte sequence anywhere — and the count matches what
+        // the same width-2-per-char arithmetic the production walk uses
+        // predicts for the head and tail budgets.
+        assert!(out.chars().all(|c| c == '一' || c == '…'), "{out:?}");
+        let tail_budget = REJECTION_REASON_TAIL_RESERVE.min((REJECTION_REASON_RAW_BUDGET - ellipsis_w) / 2);
+        let expected_head_chars = head_budget / 2;
+        let expected_tail_chars = tail_budget / 2;
+        assert_eq!(
+            out.chars().filter(|c| *c == '一').count(),
+            expected_head_chars + expected_tail_chars,
+            "{out:?}"
+        );
+    }
+
+    /// (#2196 fix-round 2, MUST FIX A) The verifier's second pass found
+    /// four MORE `Cf` format characters (U+061C, U+2060–2064, U+180E,
+    /// U+FFF9–FFFB) plus a family of characters Unicode assigns to an
+    /// ordinary PRINTABLE category (`Lo`/`So`) that nonetheless render as
+    /// a blank glyph in every mainstream terminal font (the Hangul
+    /// filler jamo, `U+2800` BRAILLE PATTERN BLANK) — none caught by the
+    /// first fix-round's enumerated denylist. `is_stripped_for_display`
+    /// closes the format-character class STRUCTURALLY (by general
+    /// category — see its doc), and names the small closed set of
+    /// blank-glyph/variation-selector exceptions the category check
+    /// can't reach. This pins that every character actually named in the
+    /// finding is stripped with NO trace and NO gap left behind — not
+    /// just that the category check compiles.
+    #[test]
+    fn sanitize_reason_text_strips_the_expanded_format_and_blank_glyph_set() {
+        let cases: &[(char, &str)] = &[
+            ('\u{2800}', "BRAILLE PATTERN BLANK"),
+            ('\u{3164}', "HANGUL FILLER"),
+            ('\u{115F}', "HANGUL CHOSEONG FILLER"),
+            ('\u{1160}', "HANGUL JUNGSEONG FILLER"),
+            ('\u{FFA0}', "HALFWIDTH HANGUL FILLER"),
+            ('\u{061C}', "ARABIC LETTER MARK"),
+            ('\u{2060}', "WORD JOINER"),
+            ('\u{2061}', "FUNCTION APPLICATION"),
+            ('\u{2062}', "INVISIBLE TIMES"),
+            ('\u{2063}', "INVISIBLE SEPARATOR"),
+            ('\u{2064}', "INVISIBLE PLUS"),
+            ('\u{180E}', "MONGOLIAN VOWEL SEPARATOR"),
+            ('\u{FFF9}', "INTERLINEAR ANNOTATION ANCHOR"),
+            ('\u{FFFA}', "INTERLINEAR ANNOTATION SEPARATOR"),
+            ('\u{FFFB}', "INTERLINEAR ANNOTATION TERMINATOR"),
+            ('\u{FE00}', "VARIATION SELECTOR-1"),
+            ('\u{FE0F}', "VARIATION SELECTOR-16"),
+            ('\u{E0100}', "VARIATION SELECTOR-17 (supplement, first)"),
+            ('\u{E01EF}', "VARIATION SELECTOR SUPPLEMENT (last)"),
+            ('\u{E0000}', "TAG (block start)"),
+            ('\u{E0001}', "LANGUAGE TAG"),
+            ('\u{E007F}', "CANCEL TAG (block end)"),
+        ];
+        for (c, name) in cases {
+            let poisoned = format!("real{c}text");
+            let out = sanitize_reason_text(&poisoned);
+            assert_eq!(out, "realtext", "{name} (U+{:06X}) must be stripped with no gap left behind: {out:?}", *c as u32);
+        }
+    }
+
+    /// (#2196 fix-round 2, inverted case) [`is_denylisted_category`]
+    /// shares a general category (`Lo`, `So`, or `Mn`) with every
+    /// exception the previous test pins as stripped — a category check
+    /// that accidentally dropped the WHOLE category instead of the
+    /// specific closed exception would pass that test for the wrong
+    /// reason. This proves ordinary international prose, a real
+    /// combining accent, and an ordinary emoji all survive untouched.
+    #[test]
+    fn sanitize_reason_text_keeps_legitimate_letters_symbols_and_combining_marks() {
+        assert_eq!(sanitize_reason_text("café — 総 例 プ 你好"), "café — 総 例 プ 你好");
+        // A real combining accent — category `Mn`, the SAME category as
+        // the variation selectors the previous test proves get stripped.
+        assert_eq!(sanitize_reason_text("cafe\u{0301}"), "cafe\u{0301}");
+        // An ordinary emoji — category `So`, the SAME category as
+        // BRAILLE PATTERN BLANK, which the previous test proves gets
+        // stripped.
+        assert_eq!(sanitize_reason_text("done \u{2705}"), "done \u{2705}");
+    }
+
+    /// (#2196 fix-round 2, MUST FIX B) `display_width` now delegates to
+    /// the `unicode-width` crate instead of a hand-rolled range table.
+    /// Pins the delegation itself — using the crate's real API on every
+    /// call, not silently falling back to a stale default — against the
+    /// exact characters the verifier's second pass found overshooting:
+    /// two ordinary, non-exotic Unicode blocks (CJK Compatibility Forms
+    /// `U+FE30..=FE6F` and Hangul Jamo Extended-B `U+D7B0..=D7FF`) the
+    /// hand-rolled table never named at all, plus supplementary-plane
+    /// emoji it scored narrow. These are `unicode-width` 0.2.2's actual
+    /// classifications (verified against the pinned crate version) —
+    /// this pins correct DELEGATION, not a re-derivation of the crate's
+    /// own East-Asian-Width table.
+    #[test]
+    fn display_width_delegates_to_unicode_width_for_blocks_the_old_table_missed() {
+        let cases: &[(char, usize, &str)] = &[
+            ('\u{1F600}', 2, "emoji GRINNING FACE — supplementary plane, outside every range the old table listed"),
+            ('\u{1F4A5}', 2, "emoji COLLISION — same gap"),
+            ('\u{FE35}', 2, "CJK COMPATIBILITY FORMS (U+FE30..=FE6F) — an ordinary block the old table never named"),
+            ('\u{D7B0}', 0, "HANGUL JAMO EXTENDED-B (U+D7B0..=D7FF) — another ordinary block the old table never named"),
+            ('\u{231A}', 2, "WATCH — East-Asian-Width Wide"),
+            ('\u{2B50}', 2, "STAR — East-Asian-Width Wide"),
+            ('\u{0301}', 0, "COMBINING ACUTE ACCENT — a real zero-width mark, scored 1 (over-conservative) by the old table"),
+            ('a', 1, "ordinary ASCII — the baseline"),
+        ];
+        for (c, expected, why) in cases {
+            assert_eq!(display_width(*c), *expected, "U+{:06X}: {why}", *c as u32);
+        }
+    }
+
+    /// (#2196 fix-round 2, MUST FIX D) No existing test exercised a
+    /// reason containing `"`/`\` through the RENDER path — before this
+    /// fix, deleting `format_rejection_reasons_for_display`'s
+    /// `.replace('\\', "\\\\").replace('"', "\\\"")` left BOTH
+    /// `-p darkmux-flow --lib hooks::` and `--lib status::` fully green.
+    /// The reason below mirrors the verifier's own proof: a
+    /// semicolon-joined SECOND "reason" smuggled inside the first, using
+    /// darkmux's own reason-list format, plus a Windows-style path to
+    /// cover the backslash half of the escape independently. Asserted
+    /// against an exact expected literal (not by re-deriving the escape
+    /// with the same replace calls) so the assertion can't pass
+    /// tautologically.
+    #[test]
+    fn format_rejection_reasons_for_display_escapes_embedded_quotes_and_backslashes() {
+        let reason = r#"bad" ; "dropped: 0 (path C:\Users\test)"#;
+        let rendered = format_rejection_reasons_for_display(&[reason.to_string()]);
+        let expected = r#""bad\" ; \"dropped: 0 (path C:\\Users\\test)""#;
+        assert_eq!(rendered, expected, "{rendered:?}");
+    }
+
+    /// (#2196 fix-round 2, MUST FIX A + D, forgery re-proof) Re-runs the
+    /// verifier's own row-forgery proof against the fixed pipeline: the
+    /// four blank-rendering characters from MUST FIX A, AND the
+    /// escape-expansion path from MUST FIX D (which needed no exotic
+    /// input at all — a purely-ASCII reason made of quote characters
+    /// restored the wrap precondition once escaped). None may produce a
+    /// row containing two-or-more real rendered blank/space columns once
+    /// through `format_rejection_reasons_for_display` — the same
+    /// property [`collapse_whitespace_and_trim`]'s own forgery test pins
+    /// for whitespace, extended here to the non-whitespace blank
+    /// primitives and to escaping.
+    #[test]
+    fn rejection_reason_pipeline_defeats_the_verifiers_blank_glyph_and_escape_forgeries() {
+        // MUST FIX A: each blank-glyph character, repeated enough to
+        // simulate a padded forgery attempt, must vanish entirely rather
+        // than surface as blank columns.
+        for c in ['\u{2800}', '\u{3164}', '\u{115F}', '\u{FFA0}'] {
+            let padded = format!("real{}", c.to_string().repeat(20));
+            let rendered = format_rejection_reasons_for_display(&[padded]);
+            assert!(!rendered.contains(c), "U+{:06X} must not survive to the rendered row: {rendered:?}", c as u32);
+            // No run of 2+ rendered columns can come from what used to
+            // be blank-glyph padding — the visible text must be exactly
+            // the real word, quoted.
+            assert_eq!(rendered, "\"real\"", "U+{:06X}: {rendered:?}", c as u32);
+        }
+
+        // MUST FIX D: a purely-ASCII reason made mostly of quote
+        // characters must not, once escaped, grow past the raw budget —
+        // this is the padding the verifier's own proof used to restore
+        // the wrap precondition without any exotic Unicode at all.
+        let quote_heavy: String = "\"".repeat(200);
+        let rendered = format_rejection_reasons_for_display(&[quote_heavy]);
+        let real_width: usize = rendered.chars().map(display_width).sum();
+        assert!(
+            real_width <= MAX_REJECTION_REASON_DISPLAY_WIDTH,
+            "escaping must never grow the rendered reason past the total budget: {real_width} > \
+             {MAX_REJECTION_REASON_DISPLAY_WIDTH} in {rendered:?}"
+        );
+    }
+
+    /// (#2196 fix-round 3, MUST FIX F) The width bound must bound LENGTH
+    /// as well as COLUMNS.
+    ///
+    /// Fix-round 3 swapped the hand-rolled width function for
+    /// `unicode-width`, which is CORRECT that a combining mark occupies
+    /// zero rendered columns — and in doing so removed the only thing
+    /// bounding length anywhere in this pipeline. Round 1 had a flat
+    /// 200-BYTE cap; round 2's hand-rolled function scored a combining
+    /// mark as 1 column, so its column budget doubled as a rough
+    /// character cap at ~40. Round 3 had neither: zero-width characters
+    /// cost nothing against the budget, so the head loop's
+    /// `w + cw > head_budget` never tripped on them, and nothing else
+    /// capped characters or bytes. Measured on the round-3 code:
+    ///
+    /// ```text
+    /// pure combining : in_chars=20000 out_chars=20000 out_bytes=40000 out_width=0
+    /// mixed          : out_chars=20008 out_bytes=40008 out_width=8
+    /// ```
+    ///
+    /// Reachable, not extrapolated: the response body is read through a
+    /// 64 KiB `Read::take`, so ONE 2xx response under that cap carries
+    /// the whole payload into the `.last` sidecar, the `hook.fired`
+    /// record (and from there the daily JSONL, the audit sink, and Redis
+    /// `XADD MAXLEN ~10000`), the delivery `eprintln!`, and both
+    /// `flow status` and `doctor` — on a row of nominal width 10. Twenty
+    /// thousand marks stacked on one cell is also a terminal-corruption
+    /// primitive, not merely volume.
+    ///
+    /// Red-proves by name: delete `|| n + 1 > head_char_budget` from
+    /// `bound_reason_width`'s head loop, or drop the
+    /// `&& total_chars <= char_budget` term from its early return, and
+    /// the character assertions below fail. The trailing positive control
+    /// keeps the ceiling from being "passed" by a bound that eats real
+    /// reasons.
+    #[test]
+    fn rejection_reason_bounds_length_not_only_rendered_width() {
+        let char_ceiling = REJECTION_REASON_RAW_BUDGET * REJECTION_REASON_CHARS_PER_COLUMN;
+
+        // The exact shape the finding measured: 20,000 U+0301 COMBINING
+        // ACUTE ACCENT, each 2 bytes on the wire and 0 rendered columns,
+        // with a leading real word so `strip_leading_zero_width` (the
+        // separate CONSIDER fix) cannot be what closes this — the
+        // character ceiling has to.
+        let mixed = format!("rejected{}", "\u{0301}".repeat(20_000));
+        let body = serde_json::json!({
+            "rejected": 1,
+            "results": [{"ok": false, "error": &mixed}],
+        });
+        // Honesty check on the "reachable through the real 64 KiB body
+        // cap" claim: this is ONE response that fits under it.
+        assert!(
+            body.to_string().len() < 64 * 1024,
+            "the proof body must fit the real 64 KiB read cap to be reachable: {} bytes",
+            body.to_string().len()
+        );
+
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        let out = &reasons[0];
+        let out_chars = out.chars().count();
+        assert!(
+            out_chars <= char_ceiling,
+            "{out_chars} chars survived a {char_ceiling}-char ceiling (in: {} chars)",
+            mixed.chars().count()
+        );
+        // Bytes follow from chars, but assert them too — the finding was
+        // reported in bytes, and `char`s alone would let a
+        // 4-byte-per-char payload back in at 4x this size.
+        assert!(out.len() <= char_ceiling * 4, "{} bytes survived (ceiling {} bytes)", out.len(), char_ceiling * 4);
+
+        // And the ceiling must hold through the RENDER path, which
+        // bounds a second time after escaping.
+        let rendered = format_rejection_reasons_for_display(&reasons);
+        assert!(
+            rendered.chars().count() <= char_ceiling + REJECTION_REASON_QUOTE_OVERHEAD,
+            "rendered row is {} chars",
+            rendered.chars().count()
+        );
+
+        // The all-combining variant the finding also measured
+        // (`in_chars=20000 out_chars=20000`) is now dropped OUTRIGHT
+        // rather than merely bounded: every character is zero-width, so
+        // `strip_leading_zero_width` empties it and
+        // `extract_rejection_reasons`'s empty filter discards it. Pinned
+        // so a later change that stops dropping it has to re-argue the
+        // ceiling for that shape too.
+        let pure: String = "\u{0301}".repeat(20_000);
+        let dropped = extract_rejection_reasons(&serde_json::json!({
+            "rejected": 1,
+            "results": [{"ok": false, "error": pure}],
+        }));
+        assert!(dropped.is_empty(), "an all-zero-width reason is not a reason: {dropped:?}");
+
+        // Positive control: the ceiling must not be reachable by any
+        // realistic reason, or a "passing" test here would just mean the
+        // bound eats real disclosure.
+        let realistic = "payload field \"file\" must be a non-empty string";
+        let kept = extract_rejection_reasons(&serde_json::json!({
+            "rejected": 1,
+            "results": [{"ok": false, "error": realistic}],
+        }));
+        assert_eq!(kept, vec![realistic.to_string()], "a realistic reason must survive whole: {kept:?}");
+    }
+
+    /// (#2196 fix-round 3, CONSIDER) A reason beginning with a
+    /// zero-width combining mark lands that mark on darkmux's OWN opening
+    /// quote — the single character carrying the attribution that
+    /// everything after it is the receiver's words. `collapse_whitespace_and_trim`
+    /// trims whitespace, and a combining mark is not whitespace, so it
+    /// survived to the front of the string and rendered the quote struck
+    /// through (U+0336 COMBINING LONG STROKE OVERLAY) or circled (U+20DD
+    /// COMBINING ENCLOSING CIRCLE).
+    ///
+    /// Red-proves by name: delete `strip_leading_zero_width`'s call in
+    /// `sanitize_reason_text` and the first assertion fails — the
+    /// rendered row's second character is the mark, not `r`. The
+    /// interior-mark case is the inverted control: legitimate decomposed
+    /// prose (`café` as `e` + U+0301) must be untouched.
+    #[test]
+    fn a_leading_zero_width_mark_never_lands_on_the_attribution_quote() {
+        for mark in ['\u{0336}', '\u{20DD}', '\u{0301}'] {
+            let reason = format!("{mark}rule must be a string");
+            let rendered = format_rejection_reasons_for_display(&[reason]);
+            assert_eq!(
+                rendered, "\"rule must be a string\"",
+                "U+{:04X} must not survive in front of the opening quote: {rendered:?}",
+                mark as u32
+            );
+        }
+
+        // Inverted case: the same mark INSIDE the text is ordinary prose
+        // and must survive — this is what stops the fix from being
+        // "strip all combining marks".
+        let decomposed = "cafe\u{0301} is not a valid value";
+        let rendered = format_rejection_reasons_for_display(&[decomposed.to_string()]);
+        assert_eq!(rendered, format!("\"{decomposed}\""), "{rendered:?}");
+    }
+
+    /// (#2196 fix-round 4) Every line this module writes to stderr,
+    /// enumerated: **16 `eprintln!` sites, all FLUSH LEFT, every one
+    /// beginning with the literal `flow::HookSink: `, and ZERO indented
+    /// ones.** That inventory is what makes this surface's defense the
+    /// simplest of the three — an indented line cannot be mistaken for a
+    /// darkmux row whatever it says, so no vocabulary list is needed.
+    ///
+    /// The `{}`-bearing prefixes, verbatim, as the forgery payloads.
+    const STDERR_ROWS: &[&str] = &[
+        "flow::HookSink: receiver at ",
+        "flow::HookSink: failed to persist ",
+        "flow::HookSink: failed to write last-status ",
+        "flow::HookSink: failed to write cursor-write status ",
+        "flow::HookSink: failed to quarantine invalid outbox line into ",
+        "flow::HookSink: failed to open quarantine file ",
+        "flow::HookSink: outbox compaction failed for ",
+        "flow::HookSink: try_post refusing to send — URL failed re-validation: ",
+        "flow::HookSink: rule #0 failed to persist delivery cursor to ",
+        "flow::HookSink: failed to emit hook.dry_run: ",
+        "flow::HookSink: failed to emit hook.failed (dropped-append warning): ",
+        "flow::HookSink: failed to emit hook.failed (busy warning): ",
+        "flow::HookSink: file-transport write to ",
+        "flow::HookSink: failed to check/fix trailing newline on ",
+        "flow::HookSink: rule #0 disabled — its `transform` failed to load; the rest of the sink still works: ",
+        "flow::HookSink: rule #0 outbox append failed: ",
+    ];
+
+    /// Simulate a terminal `width` columns wide wrapping `lines`, and
+    /// return every VISUAL line that is a CONTINUATION.
+    fn stderr_wrapped_continuations(lines: &[String], width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in lines {
+            let chars: Vec<char> = line.chars().collect();
+            let mut start = width;
+            while start < chars.len() {
+                out.push(chars[start..].iter().take(width).collect::<String>());
+                start += width;
+            }
+        }
+        out
+    }
+
+    /// (#2196 fix-round 4, MUST FIX G at the stderr surface) The delivery
+    /// warning used to carry the receiver's reason INLINE in one long
+    /// line that nothing bounded — no `output_width()` cap, no wrap of
+    /// its own — so it wrapped on EVERY terminal, not merely one narrower
+    /// than a renderer assumed, and the continuation began at column 0
+    /// where all 16 of this module's stderr rows live.
+    ///
+    /// SELF-PROVING, the same shape as the `flow status` and `doctor`
+    /// tests: for each row and width it first SEARCHES for a filler that
+    /// makes the forgery genuinely land at column 0 in the INLINE form,
+    /// asserts at least one exists, then asserts the shipped builder
+    /// produces no such continuation at any width.
+    ///
+    /// Red-proves by name: replace `receiver_rejection_stderr_lines`'s
+    /// body with the pre-fix single interpolated line and the post-fix
+    /// assertion fails on every pair the precondition found.
+    #[test]
+    fn stderr_rejection_warning_cannot_forge_a_flow_hooksink_row() {
+        let widths = [60usize, 72, 80, 100, 120];
+        let url = "http://127.0.0.1:8790/events";
+        let mut proven: Vec<(String, usize, usize)> = Vec::new();
+
+        // The pre-fix shape, reconstructed from the shipped header so it
+        // stays correct as the surrounding wording evolves.
+        let inline = |reason: &String| -> Vec<String> {
+            let header = receiver_rejection_stderr_lines(url, 1, 1, &[]).remove(0);
+            vec![format!("{header} — {}", format_rejection_reasons_for_display(std::slice::from_ref(reason)))]
+        };
+
+        for row in STDERR_ROWS {
+            // Matched on the TRIMMED prefix: `collapse_whitespace_and_trim`
+            // strips a reason's trailing space, so a payload ending in one
+            // never survives verbatim. Trimming here keeps the forgery
+            // honest — the row is still recognizable without its trailing
+            // space, and demanding the space would have made every pair
+            // look unforgeable for a reason that has nothing to do with
+            // the defense.
+            let row = row.trim_end();
+            for width in widths {
+                let max_filler = MAX_REJECTION_REASON_DISPLAY_WIDTH.saturating_sub(row.chars().count() + 3);
+                for filler in 0..=max_filler {
+                    let reason = format!("{} {row}", "z".repeat(filler));
+                    if stderr_wrapped_continuations(&inline(&reason), width).iter().any(|c| c.starts_with(row)) {
+                        proven.push((row.to_string(), width, filler));
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !proven.is_empty(),
+            "the precondition found no forgeable (row, width, filler) at all — this test would prove nothing"
+        );
+        println!("stderr inline forgeries proven (row, terminal width, filler): {} pairs", proven.len());
+
+        for (row, _width, filler) in &proven {
+            let reason = format!("{} {row}", "z".repeat(*filler));
+            let lines = receiver_rejection_stderr_lines(url, 1, 1, std::slice::from_ref(&reason));
+            for w in widths {
+                for continuation in stderr_wrapped_continuations(&lines, w) {
+                    for candidate in STDERR_ROWS {
+                        assert!(
+                            !continuation.starts_with(candidate.trim_end()),
+                            "width {w}: a wrapped continuation forges the stderr row {candidate:?} \
+                             (row {row:?}, filler {filler}): {continuation:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// (#2196 fix-round 4, the mechanism asserted independently of any
+    /// forged vocabulary) Every stderr line carrying receiver text is
+    /// indented and strictly under the narrowest supported terminal
+    /// width; the HEADER line, which is darkmux's own words only, is the
+    /// inverted case — it stays flush-left, as all 16 rows here do.
+    ///
+    /// Red-proves by name: revert `receiver_rejection_stderr_lines` to
+    /// the single interpolated line and the indent assertion fails.
+    #[test]
+    fn every_stderr_reason_line_is_indented_and_narrower_than_the_supported_width() {
+        let url = "http://127.0.0.1:8790/events";
+        for reason in [
+            "q".repeat(400),
+            "漢".repeat(200),
+            "payload field \"file\" must be a non-empty string".to_string(),
+        ] {
+            let lines = receiver_rejection_stderr_lines(url, 1, 1, std::slice::from_ref(&reason));
+            assert!(
+                lines[0].starts_with("flow::HookSink: receiver at "),
+                "the header must stay flush-left and keep its row vocabulary: {:?}",
+                lines[0]
+            );
+            assert!(lines.len() > 1, "the reason must actually produce its own line(s): {lines:?}");
+            for line in &lines[1..] {
+                assert!(line.starts_with("        "), "stderr reason line is not indented: {line:?}");
+                let w = display_columns(line);
+                assert!(
+                    w < REJECTION_REASON_MIN_TERMINAL_WIDTH,
+                    "stderr reason line is {w} columns, must stay under {}: {line:?}",
+                    REJECTION_REASON_MIN_TERMINAL_WIDTH
+                );
+            }
+        }
+
+        // Inverted case: no reasons means no extra lines at all, so a
+        // rejection the receiver gave no reason for still prints exactly
+        // the one warning line it always did.
+        assert_eq!(receiver_rejection_stderr_lines(url, 1, 1, &[]).len(), 1);
+    }
+
+    /// (#2196 fix-round MUST FIX 3) A receiver answering `"rejected": 0`
+    /// EXPLICITLY (as opposed to omitting the key entirely, which
+    /// `hook_fired_stays_clean_when_results_reject_without_a_top_level_rejected_count`
+    /// above covers) must be treated the same as "no count to disclose".
+    /// `receiver_rejected.filter(|n| *n > 0)` at the
+    /// `DeliveryOutcome::Success` call site already does this correctly
+    /// — this test is what was missing, not a code change. Red-proved:
+    /// deleting that `.filter(|n| *n > 0)` reaches the identical failure
+    /// shape this PR wrote the sibling test above for: `hook.fired` at
+    /// Info carrying a reason with a zero count, plus the stderr line
+    /// `"rejected 0 record(s) inside it (0 so far)"`.
+    #[test]
+    fn hook_fired_stays_clean_when_top_level_rejected_is_explicitly_zero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"rejected":0,"results":[{"ok":false,"error":"ZERO-COUNT-LEAK"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
+            "the delivery must land"
+        );
+        assert!(
+            wait_until(
+                || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+                Duration::from_secs(3)
+            ),
+            "hook.fired must land"
+        );
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "rejected: 0 is not a count to disclose: {fired:?}"
+        );
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            "a reason must never ride when the receiver's own count was zero: {fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        assert!(last.last_receiver_rejected_reasons.is_empty(), "{last:?}");
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196 fix-round MUST FIX 4) `extract_rejection_reasons` filters
+    /// on `"ok": false` explicitly — an entry marked `"ok": true` must
+    /// never contribute its `error` text, even when one happens to carry
+    /// one. Every existing fixture's `ok: true` entries carry no `error`
+    /// key at all, so `filter_map` swallows them for a reason unrelated
+    /// to the `ok` filter — this is the case that actually exercises it.
+    /// Red-proved: deleting
+    /// `.filter(|e| e.get("ok").and_then(as_bool) == Some(false))`
+    /// reports BOTH strings below instead of just the real one.
+    #[test]
+    fn extract_rejection_reasons_never_reports_an_accepted_records_text() {
+        let body = serde_json::json!({
+            "rejected": 1,
+            "results": [
+                {"ok": true, "error": "LEAKED-FROM-AN-ACCEPTED-RECORD"},
+                {"ok": false, "error": "the real rejection"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons, vec!["the real rejection".to_string()], "{reasons:?}");
+    }
+
+    /// (#2196 fix-round MUST FIX 5) A reason that sanitizes to empty — an
+    /// empty string, or one made of nothing but control/bidi/whitespace
+    /// characters `truncate_reason` strips — must never appear in the
+    /// returned vector as `""`. Letting it through produced `"... on the
+    /// last delivery ()"` in `doctor` and a bare, contentless "last
+    /// rejection reason(s): " line in `flow status`, leaving an operator
+    /// unable to tell whether the receiver gave no reason at all or
+    /// darkmux lost one it was given.
+    #[test]
+    fn extract_rejection_reasons_drops_reasons_that_sanitize_to_empty() {
+        let body = serde_json::json!({
+            "rejected": 2,
+            "results": [
+                {"ok": false, "error": ""},
+                {"ok": false, "error": "\u{0}\u{1}\u{202e}"},
+                {"ok": false, "error": "real reason"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons, vec!["real reason".to_string()], "{reasons:?}");
+    }
+
+    /// (#2196 fix-round 2, CONSIDER) The empty-after-sanitize filter must
+    /// run BEFORE `MAX_REJECTION_REASONS`'s `.take`, not after. With more
+    /// blank entries ahead of the real ones than the cap allows, a
+    /// filter running AFTER `.take` consumes the entire cap on blanks and
+    /// then drops every one of them, yielding `reasons: []` — count
+    /// disclosed, reason silently gone. Red-proved: swapping the
+    /// `.filter`/`.take` order in `extract_rejection_reasons` back to
+    /// take-then-filter reproduces exactly that on this fixture.
+    #[test]
+    fn extract_rejection_reasons_does_not_let_leading_blanks_consume_the_cap() {
+        let body = serde_json::json!({
+            "rejected": 6,
+            "results": [
+                {"ok": false, "error": ""},
+                {"ok": false, "error": "\u{0}"},
+                {"ok": false, "error": "\u{202e}"},
+                {"ok": false, "error": "\u{2800}"},
+                {"ok": false, "error": "real reason A"},
+                {"ok": false, "error": "real reason B"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(
+            reasons,
+            vec!["real reason A".to_string(), "real reason B".to_string()],
+            "leading blanks must not consume the cap and silently erase the real reasons: {reasons:?}"
+        );
+    }
+
+    /// (#2196 fix-round MUST FIX 1, end-to-end) The unit test above pins
+    /// the helper directly; this proves the sanitization actually rides
+    /// the real delivery pipeline — through a live loopback receiver,
+    /// into the `hook.fired` payload AND the `.last` sidecar — not just
+    /// the function in isolation.
+    #[test]
+    fn hook_fired_and_sidecar_never_carry_control_characters_from_the_receiver() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let poisoned = "ok\r\n\x1b[31mFATAL: darkmux is corrupt\x1b[0m\nquarantined lines: 0";
+        let receiver = HookReceiver::start().with_response_body(&format!(
+            r#"{{"ok":true,"accepted":0,"rejected":1,"results":[{{"ok":false,"error":{}}}]}}"#,
+            serde_json::Value::String(poisoned.to_string())
+        ));
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)));
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let reasons: Vec<String> = fired
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("receiver_rejected_reasons"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(reasons.len(), 1, "{fired:?}");
+        assert!(!reasons[0].contains('\n'), "{reasons:?}");
+        assert!(!reasons[0].contains('\r'), "{reasons:?}");
+        assert!(!reasons[0].contains('\x1b'), "{reasons:?}");
+
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected_reasons.len(), 1, "{last:?}");
+        assert!(!last.last_receiver_rejected_reasons[0].contains('\n'), "{last:?}");
+        assert!(!last.last_receiver_rejected_reasons[0].contains('\r'), "{last:?}");
+        assert!(!last.last_receiver_rejected_reasons[0].contains('\x1b'), "{last:?}");
+        drop(sink);
+    }
+
+    /// (#2196) Unit-level pin on the extraction + bounding helpers, so the
+    /// cap and the truncation are each independently provable without a
+    /// live receiver round-trip.
+    #[test]
+    fn extract_rejection_reasons_is_bounded_and_truncates_long_entries() {
+        let long = "x".repeat(500);
+        let body = serde_json::json!({
+            "rejected": 5,
+            "results": [
+                {"ok": false, "error": "r1"},
+                {"ok": true},
+                {"ok": false, "error": "r2"},
+                {"ok": false, "error": &long},
+                {"ok": false, "error": "r4 — never reached, the cap is 3"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons.len(), MAX_REJECTION_REASONS, "{reasons:?}");
+        assert_eq!(reasons[0], "r1");
+        assert_eq!(reasons[1], "r2");
+        // (#2196 fix-round 2, MUST FIX C) `bound_reason_width` keeps the
+        // total (head + `…` + tail) AT the budget, never over it — unlike
+        // the first fix-round's straight cut, which appended the
+        // ellipsis ON TOP of the budget (budget + 1). A middle cut on an
+        // all-'x' string also always leaves a non-empty tail after the
+        // ellipsis (the tail is real content here, not just a cosmetic
+        // marker), so this also pins that both halves survive.
+        assert_eq!(
+            reasons[2].chars().count(),
+            REJECTION_REASON_RAW_BUDGET,
+            "must truncate to the raw budget, ellipsis included: {reasons:?}"
+        );
+        assert!(reasons[2].contains('…'), "{reasons:?}");
+        assert!(!reasons[2].ends_with('…'), "a middle cut must leave a real tail after the ellipsis: {reasons:?}");
     }
 
     // ─── (#2183) jq transforms + Keychain headers + the `file` transport ──

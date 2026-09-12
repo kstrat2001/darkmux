@@ -77,8 +77,47 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.47.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.48.0";
 // Version history:
+//   1.48.0 (#2196): `hook.fired`'s payload gains an additive
+//           `receiver_rejected_reasons` key — the receiver's own
+//           `results[].error` text (bounded to the first 3, each
+//           truncated to `MAX_REJECTION_REASON_DISPLAY_WIDTH` rendered
+//           columns, sanitized against control/bidi/invisible characters
+//           and with whitespace runs collapsed — see `hooks.rs`'s
+//           `truncate_reason`/`sanitize_reason_text` docs, hardened in
+//           the #2196 fix-round) for the record(s) it reported rejecting
+//           inside an otherwise-2xx response, riding alongside the
+//           existing `receiver_rejected` count. `hook.failed` never
+//           carries this key — `emit_hook_record` (the give-up path)
+//           always passes an empty reasons slice; only the
+//           `DeliveryOutcome::Success` arm (which always emits
+//           `hook.fired`) supplies reasons. MINOR, following this
+//           history's own repeated precedent (1.21.0, 1.25.0, 1.29.0,
+//           1.32.0, 1.33.0, 1.36.0, among others): a new optional payload
+//           key on an existing action is additive, and "only producers
+//           changed which keys they write" is not a reason to skip a
+//           bump under this history's own prior rejections of that
+//           argument (see 1.43.0/1.45.0/1.47.0's entries) — a consumer
+//           that reads this key now gets an answer (the reason text) it
+//           previously could not get from the record at all.
+//
+//           Before this, the count alone told an operator SOMETHING was
+//           thrown away and nothing about WHY — finding out required
+//           replaying the delivery against a scratch receiver or reading
+//           the receiver's own log (#2196, observed live during a
+//           full-corpus crawl: `hook.fired.receiver_rejected` fired three
+//           times with no reason attached). `.last`'s
+//           `last_receiver_rejected_reasons` and
+//           `HookRuleStatus.last_receiver_rejected_reasons` are NOT part
+//           of `FLOW_SCHEMA_VERSION`'s scope (they're sidecar/status
+//           shapes, not the `FlowRecord` this constant versions — see
+//           9eb33a5a's message for why `receiver_rejected_total`
+//           similarly needed no bump) but are additive and
+//           lenient-on-read (`#[serde(default)]`) the same way.
+//
+//           Older readers ignore the new key; no existing consumer's
+//           computed output changes for a record that carries none.
 //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2344 fix-pass:
 //           `SessionEmitter`'s `Drop` now shares `stop()`'s
 //           `remove_presence_key` teardown (pre-claim the reconciler's
