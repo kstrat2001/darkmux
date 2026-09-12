@@ -679,9 +679,17 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                 // change how everything below them reads). Same fix as
                 // the rejection-reason block below: darkmux owns the
                 // wrap, so at the supported width there is no
-                // continuation line to forge from — and
-                // `untrusted_display_lines` re-sanitizes, so a pre-#2694
-                // sidecar on disk is cleaned at render too.
+                // continuation line to forge from.
+                //
+                // The wrap is the narrower half. `untrusted_display_lines`
+                // also SANITIZES, and that is what stops the vector that
+                // needs no wrapping and no width assumption at all: a raw
+                // NEWLINE inside the value, which the jq-transform
+                // producer's excerpt bounds in length but never strips.
+                // Unsanitized, one of those puts remote text at column 0
+                // at 200 columns as readily as at 60, and turns a 60 KB
+                // `.last` sidecar into 1,179 rendered lines. Both are
+                // held by tests named in this module.
                 //
                 // Two shapes, both bounded: a value that fits stays on
                 // the familiar one-line row (the common case — every
@@ -689,20 +697,41 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                 // prose), and only a value too wide for that gets the
                 // label row plus its own indented lines.
                 //
-                // (#2694 surface inventory) The terminal is not the only
-                // consumer of these exact rows: the viewer's console lens
-                // runs `flow status` as a panel and renders its stdout
-                // into a real `<pre class="panelout">` styled
-                // `white-space: pre-wrap` with no `overflow-x`, so it
-                // wraps too — at the panel's width, which on a phone is
-                // narrower than any terminal. React escapes the text, so
-                // there is no markup injection there; the row-forgery
-                // question is inherited whole, and owning the wrap here
-                // is what answers it for both. Below
-                // `MIN_SUPPORTED_TERMINAL_WIDTH` the guarantee lapses for
-                // this row exactly as it does for the rejection block —
-                // at that width darkmux's own rows wrap too, so a forged
-                // row stops being distinguishable from ordinary damage.
+                // (#2694 fix-round MUST FIX 1 — the corrected version of
+                // a claim the first round got backwards, stated here as
+                // measured rather than as assumed.) The terminal is not
+                // the only consumer of these exact rows: the viewer's
+                // console lens runs `flow status` as a panel. But that
+                // panel does NOT inherit the wrap question. Panel STDOUT,
+                // where this row lives, renders into
+                // `<pre class="panelout">` (`ConsolePanel.tsx`), and
+                // `.panelout` is `white-space: pre` with
+                // `overflow-x: auto` (`ui/src/styles.css`; the only phone
+                // override changes font-size and padding, and the built
+                // `docs/demo/index.html` agrees verbatim) — so a long row
+                // CLIPS and scrolls sideways there, it does not wrap, and
+                // the wrap-based forgery was never reachable through it.
+                // `.panelerr` and `.panelwarn` ARE `pre-wrap`, but they
+                // carry stderr only, and `flow status` never writes this
+                // row to stderr. So the surface owning the wrap protects
+                // is the TERMINAL, which is reason enough on its own; the
+                // console lens simply is not a second one.
+                //
+                // What the console lens DOES inherit is the raw-newline
+                // vector, which needs no wrap at all: an unsanitized
+                // newline in this value puts remote text at column 0
+                // under `white-space: pre` exactly as it does in a
+                // terminal at any width. That is what
+                // `untrusted_display_lines`'s sanitize pass stops, and
+                // `flow_status_last_error_cannot_forge_a_flush_left_row_with_a_raw_newline`
+                // is what holds it. React escapes the text, so there is
+                // no markup injection on either path.
+                //
+                // Below `MIN_SUPPORTED_TERMINAL_WIDTH` the wrap guarantee
+                // lapses for this row exactly as it does for the
+                // rejection block — at that width darkmux's own rows wrap
+                // too, so a forged row stops being distinguishable from
+                // ordinary damage.
                 const LAST_ERROR_LABEL: &str = "      last error: ";
                 let inline = crate::hooks::untrusted_display_lines(err, LAST_ERROR_LABEL.chars().count());
                 match inline.len() {
@@ -710,7 +739,18 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                     // only of control characters). The outcome still
                     // happened, so the row is still printed — darkmux
                     // describes what it has, and "no printable text" is
-                    // what it has.
+                    // what it has. Deleting this arm would make a rule
+                    // whose last delivery FAILED read as one that never
+                    // failed, the disclosure-destroying shape #2686
+                    // named.
+                    //
+                    // (#2694 fix round) Not unreachable defense: no
+                    // in-process producer can reach it post-fix (an
+                    // all-stripped `Location` still yields
+                    // `redirect refused: 302 to ""`), but the `.last`
+                    // sidecar is a FILE, and one written by an older
+                    // binary carries whatever that binary wrote. Held by
+                    // `flow_status_still_discloses_a_last_error_that_sanitizes_to_nothing`.
                     0 => {
                         let _ = writeln!(out, "{LAST_ERROR_LABEL}(no printable text)");
                     }
@@ -1867,6 +1907,159 @@ mod hooks_status_tests {
             hooks,
         };
         assert!(!format_status_human(&status).contains("last error"), "no terminal failure, no row");
+    }
+
+    /// Every line `rendered` emits at column zero — a line that is
+    /// neither empty nor indented. These are the rows an operator reads
+    /// as darkmux's own structural voice (`FLUSH_LEFT_ROWS`), so the set
+    /// of them must depend ONLY on the status being described, never on
+    /// the untrusted text inside a value.
+    fn flush_left_lines(rendered: &str) -> Vec<String> {
+        rendered.lines().filter(|l| !l.is_empty() && !l.starts_with(' ')).map(str::to_string).collect()
+    }
+
+    /// The lines `format_status_human` emits for the `last error:` block
+    /// — the label row plus, in the multi-line arm, its indented
+    /// continuation lines.
+    fn last_error_block_lines(rendered: &str) -> Vec<String> {
+        let indent = " ".repeat(crate::hooks::UNTRUSTED_TEXT_LINE_INDENT);
+        let mut out = Vec::new();
+        let mut in_block = false;
+        for line in rendered.lines() {
+            if line.starts_with("      last error:") {
+                in_block = true;
+            } else if in_block && !line.starts_with(&indent) {
+                in_block = false;
+            }
+            if in_block {
+                out.push(line.to_string());
+            }
+        }
+        out
+    }
+
+    /// (#2694 fix-round MUST FIX 2) The WRAP is not the only way remote
+    /// text reaches column zero, and it is not even the live one: a RAW
+    /// NEWLINE does it at ANY width, with no wrapping involved. Producer
+    /// #5 (`hooks.rs`'s jq-transform failure, which writes a "transform
+    /// ... failed: ..." reason into the `.last` sidecar) bounds its
+    /// excerpt to `hook_transform::MAX_ERROR_EXCERPT` characters and
+    /// never strips newlines, and jq writes multi-line diagnostics. Left
+    /// unsanitized, the renderer's own `writeln!` then emits the
+    /// attacker's chosen continuation flush left, under the genuine
+    /// label, in darkmux's own voice — reachable at 200 columns, and
+    /// reachable inside the viewer's console lens too, whose
+    /// `white-space: pre` makes the wrap-based forgery unreachable.
+    ///
+    /// Asserted as a SET EQUALITY against a benign baseline rather than
+    /// as a vocabulary check, so it holds for a flush-left row nobody has
+    /// enumerated yet: the column-zero rows of a status render must be a
+    /// function of the status, not of the bytes inside one of its values.
+    ///
+    /// Red-proves by name: in `hooks::untrusted_display_lines`, drop the
+    /// sanitize pass — `wrap_to_display_width(&truncate_reason(text), …)`
+    /// → `wrap_to_display_width(text, …)`, leaving the wrap intact — and
+    /// this fails while every other test in the crate stays green.
+    #[test]
+    fn flow_status_last_error_cannot_forge_a_flush_left_row_with_a_raw_newline() {
+        let baseline = flush_left_lines(&render_with_last_error("benign"));
+        for payload in FLUSH_LEFT_ROWS {
+            let err =
+                format!("transform `/x/a.jq` failed: jq: error at line 1:\n{payload}\n  - deliveries are healthy");
+
+            // PRECONDITION — the fixture really does put the row text at
+            // the start of a raw line, so a renderer that passed it
+            // through unsanitized would print it at column 0.
+            assert!(
+                err.lines().any(|l| l == *payload),
+                "the fixture must actually carry {payload:?} as a whole raw line, or this proves nothing: {err:?}"
+            );
+
+            let got = flush_left_lines(&render_with_last_error(&err));
+            assert_eq!(
+                got, baseline,
+                "the column-zero rows changed when {payload:?} was embedded in the last error — \
+                 remote text reached darkmux's own structural voice"
+            );
+        }
+    }
+
+    /// (#2694 fix-round MUST FIX 2, the second half of the same guard)
+    /// The sanitize pass also carries the LENGTH bound, and a `.last`
+    /// sidecar is an attacker-sized file on disk, not a header a
+    /// transport capped. Unbounded, one status row becomes a screenful
+    /// and scrolls the rest of the report — including the `Hooks` rows
+    /// above it — off the terminal, which is a disclosure failure of the
+    /// same shape #2686 named even though nothing is forged.
+    ///
+    /// Red-proves by name: the same `truncate_reason` drop as above takes
+    /// this from a 4-line block to 1,178 wrapped lines.
+    #[test]
+    fn one_last_error_row_cannot_become_a_screenful() {
+        // 60 KB, the measured payload size `REJECTION_REASON_CHARS_PER_COLUMN`'s
+        // doc records for the reason row, applied to this one.
+        let err = format!("{REDIRECT_REASON_HEAD}{}", "z".repeat(60_000));
+        let rendered = render_with_last_error(&err);
+        let block = last_error_block_lines(&rendered);
+        assert!(
+            !block.is_empty() && block.len() <= 8,
+            "a single `last error:` row rendered {} lines; the raw-width bound holds it to a handful",
+            block.len()
+        );
+    }
+
+    /// (#2694 fix-round CONSIDER) The `(no printable text)` disclosure —
+    /// reachable through the `.last` sidecar, which is a file on disk
+    /// whose `error` string darkmux did not write this run. Deleting the
+    /// row would make a rule whose last delivery FAILED read as one that
+    /// never failed, the disclosure-destroying shape #2686 named.
+    ///
+    /// Red-proves by name: replace the `0 =>` arm's body with `{}` and
+    /// this fails.
+    #[test]
+    fn flow_status_still_discloses_a_last_error_that_sanitizes_to_nothing() {
+        let rendered = render_with_last_error("\u{0007}\u{0000}\u{001b}\u{200b}");
+        assert!(
+            rendered.contains("      last error: (no printable text)\n"),
+            "an error made only of control characters must still print the row: {rendered}"
+        );
+    }
+
+    /// (#2694 fix-round CONSIDER) The INLINE arm's geometry, asserted at
+    /// the CALL SITE that declares the prefix. `untrusted_content_budget`
+    /// is red-proved one level down, but the budget is only correct if
+    /// the caller hands it the true column count of the prefix it then
+    /// prints — and the inline arm is the common case, since every
+    /// producer of this field other than the redirect refusal writes
+    /// darkmux's own short prose.
+    ///
+    /// Sweeps content lengths across the arm boundary so the single-line
+    /// arm is actually exercised (the multi-line bound test ends with
+    /// `block_lines >= 2` and therefore never reaches it).
+    ///
+    /// Red-proves by name: subtract 1 from the prefix argument at the
+    /// call site — `LAST_ERROR_LABEL.chars().count()` → `… - 1` — and the
+    /// 42-character fixture renders an inline row of exactly
+    /// `MIN_SUPPORTED_TERMINAL_WIDTH` columns, the ambiguity the `+ 1`
+    /// inside the budget exists to avoid.
+    #[test]
+    fn the_inline_last_error_row_stays_under_the_supported_width() {
+        let min_width = crate::hooks::MIN_SUPPORTED_TERMINAL_WIDTH;
+        let mut inline_seen = 0usize;
+        for n in 1..=min_width {
+            let err = "z".repeat(n);
+            let rendered = render_with_last_error(&err);
+            let block = last_error_block_lines(&rendered);
+            assert!(!block.is_empty(), "n={n}: the row must render at all: {rendered}");
+            if block.len() == 1 {
+                inline_seen += 1;
+            }
+            for line in &block {
+                let width = crate::hooks::display_columns(line);
+                assert!(width < min_width, "n={n}: a last-error line is {width} columns, must stay under {min_width}: {line:?}");
+            }
+        }
+        assert!(inline_seen > 0, "the sweep must actually exercise the single-row arm");
     }
 
     /// Render `format_status_human` for one rule carrying `reasons` as

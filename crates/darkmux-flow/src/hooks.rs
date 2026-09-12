@@ -2653,20 +2653,30 @@ fn untrusted_content_budget(prefix_columns: usize) -> usize {
 /// untrusted text is not a LIST of receiver reasons but a single composed
 /// string: `flow status`'s `last error:` row, whose text is darkmux's own
 /// prose with a remote-chosen span quoted inside it (#2694 — the redirect
-/// `Location`). The wrapping is the load-bearing half: a bounded value
-/// under an indent prefix still wraps on a narrow terminal, and the
-/// attacker controls the first character of the continuation row, which
-/// renders at column zero in darkmux's own voice. Owning the wrap here
-/// means no continuation line exists at the supported width, so there is
-/// no column-zero position to forge from — the same reasoning
+/// `Location`). Both halves are load-bearing, against DIFFERENT vectors.
+///
+/// The WRAP answers the width-dependent one: a bounded value under an
+/// indent prefix still wraps on a narrow terminal, and the attacker
+/// controls the first character of the continuation row, which renders
+/// at column zero in darkmux's own voice. Owning the wrap here means no
+/// continuation line exists at the supported width, so there is no
+/// column-zero position to forge from — the same reasoning
 /// [`format_rejection_reasons_as_indented_lines`]'s doc spells out at
 /// length, applied to a second row.
 ///
-/// [`truncate_reason`] (sanitize + bound, no escaping) runs here rather
-/// than [`quote_and_escape_untrusted`] precisely because the input may
-/// already be quoted: this is defense in depth for a `.last` sidecar
-/// written by an older binary, or a future producer that forgets to
-/// sanitize — not a second attribution pass.
+/// The SANITIZE pass ([`truncate_reason`] — sanitize + bound, no
+/// escaping) answers the width-INDEPENDENT one, and on this row that is
+/// the vector actually reachable today (#2694 fix round). A raw NEWLINE
+/// inside the value reaches column zero at ANY width with no wrapping
+/// involved: the caller's own `writeln!` prints it. The jq-transform
+/// producer bounds its excerpt to
+/// [`crate::hook_transform`]'s `MAX_ERROR_EXCERPT` characters but never
+/// strips newlines, and jq writes multi-line diagnostics. The same pass
+/// carries the WIDTH bound, without which a `.last` sidecar — a file on
+/// disk, sized by whoever wrote it, not by a transport — renders one
+/// status row as 1,179 lines. [`quote_and_escape_untrusted`] is not used
+/// here precisely because the input may already be quoted: this is a
+/// second sanitize, not a second attribution pass.
 pub fn untrusted_display_lines(text: &str, prefix_columns: usize) -> Vec<String> {
     wrap_to_display_width(&truncate_reason(text), untrusted_content_budget(prefix_columns))
 }

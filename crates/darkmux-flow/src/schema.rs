@@ -90,9 +90,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.48.0";
 //           `redirect refused: 302 to "<target>"`. No key is added,
 //           removed or retyped — only the VALUE of a string field that
 //           has always carried free prose gets narrower, which is why
-//           this is not a bump: a consumer that could read the field
-//           before reads the same field now, and no consumer's computed
-//           output changes except that hostile text stops rendering.
+//           this is not a bump: every reader of `payload.error` was
+//           traced (the `hook.failed` consumers — `flow tail`'s human
+//           arm, the drain-counting sink, `darkmux-doctor`, the serve
+//           route, and the viewer, where `grep -rn last_error ui/src` is
+//           zero hits) and not one of them PARSES the string, so no
+//           predictor of its shape exists to break. `flow status`'s
+//           HUMAN output does change for every redirect refusal — the
+//           target gains quotes, and a long one now renders as a bare
+//           `last error:` label plus its own indented block rather than
+//           inline — but that is a rendering surface, not a wire
+//           consumer, and the change is the point of the fix.
 //   1.48.0 (#2196): `hook.fired`'s payload gains an additive
 //           `receiver_rejected_reasons` key — the receiver's own
 //           `results[].error` text (bounded to the first 3, each
