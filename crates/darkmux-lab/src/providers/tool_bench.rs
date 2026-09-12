@@ -26,8 +26,9 @@
 //! argument quality is outcome-inferred). Rows land in scores.json (#1198).
 //! No runtime changes; internal runtime only.
 
-use crate::lab::review_bench::envelope_meta;
+// (#2685) One infra-vs-capability rule, beside the schema it serves.
 use crate::lab::scores;
+use crate::lab::scores::{envelope_meta_with_exit, is_infra_failure, EnvelopeMeta};
 use crate::workloads::types::{
     InspectionReport, LoadedWorkload, RunResult, VerifyOutcome, WorkloadProvider,
 };
@@ -555,8 +556,18 @@ struct TaskScore {
     task: String,
     axis: String,
     passed: bool,
-    /// The dispatch never completed (non-zero exit: watchdog kill, timeout,
-    /// container failure). Excluded from capability aggregation (#1113).
+    /// The harness failed the model — the dispatch never actually ran it
+    /// (watchdog kill, timeout, dead container, a quota-dead endpoint that
+    /// served zero tokens). Excluded from capability aggregation (#1113).
+    ///
+    /// (#2685) Decided by `scores::is_infra_failure`, the ONE predicate every
+    /// writer of this `scores.json` schema shares — NOT by this bench's own
+    /// former `!dispatch_ok`. Exit-code-alone threw away real capability
+    /// evidence: the runtime's escalation arm prints a full success envelope
+    /// with real token counts and THEN returns exit 1, which this bench
+    /// scored as infrastructure noise while `review_bench` scored it as the
+    /// capability result it is. A parseable `ANSWER:`/`BLOCKED:` verdict is
+    /// positive evidence the model ran, and now survives a non-zero exit.
     infra_fail: bool,
     answer: Option<String>,
     /// A nonce-shaped answer that matches NO token planted anywhere in this
@@ -578,12 +589,19 @@ struct TaskScore {
     turns: u32,
 }
 
-/// Score one dispatch. Pure: (task, dispatch outcome, final reply, trajectory
-/// stats) → verdict. `planted` is every nonce written into this task's
-/// sandbox — the provenance universe for fabrication detection.
+/// Score one dispatch. Pure: (task, dispatch envelope, final reply,
+/// trajectory stats) → verdict. `planted` is every nonce written into this
+/// task's sandbox — the provenance universe for fabrication detection.
+///
+/// (#2685) `meta` is this trial's `envelope_meta_with_exit(stdout, exit_code)`
+/// — the dispatch's own exit code folded together with what its `--json`
+/// envelope actually carried. It replaces the bare `dispatch_ok` bool this
+/// function used to take, because the exit code alone cannot tell a dead
+/// container apart from a run that did the work and exited non-zero on the
+/// way out.
 fn score_task(
     task: &TaskSpec,
-    dispatch_ok: bool,
+    meta: &EnvelopeMeta,
     reply: &str,
     stats: &TrajStats,
 ) -> TaskScore {
@@ -605,7 +623,12 @@ fn score_task(
         (Expected::Blocked, Answer::Token(_)) => (false, true, false),
         (Expected::Blocked, Answer::None) => (false, false, false),
     };
-    let infra_fail = !dispatch_ok;
+    // (#2685) The shared rule. This bench's "produced no usable output"
+    // signal is `Answer::None` — no `ANSWER:` token and no `BLOCKED:`
+    // verdict in the final reply — the exact analogue of the
+    // `CaseScore::degenerate` (review did not parse) signal `review_bench`
+    // passes. A trial that DID answer is never reclassified as infra.
+    let infra_fail = is_infra_failure(matches!(answer, Answer::None), Some(meta));
     TaskScore {
         task: task.id.clone(),
         axis: task.axis.clone(),
@@ -666,6 +689,10 @@ fn build_rows(trials: &[Trial<'_>], k: u32, artifact: &scores::ArtifactKey) -> V
         budget_turns: None,
         budget_tokens: None,
         detail,
+        // (#2685) Which predicate produced `outcome` — on the row, not
+        // inferred from `bench`, because rows from both benches sit in this
+        // one schema and are read as commensurable.
+        infra_classifier: Some(scores::INFRA_CLASSIFIER.to_string()),
     };
 
     let mut rows = Vec::new();
@@ -1164,7 +1191,7 @@ impl WorkloadProvider for ToolBenchProvider {
                     &format!("t{trial}-{now_ms}"),
                 );
                 eprintln!("darkmux: tool-bench dispatch {} (trial {trial})", task.id);
-                let (stdout, stderr, ok, out_dir) = dispatch_task(
+                let (stdout, stderr, exit_code, out_dir) = dispatch_task(
                     &role,
                     &task.prompt,
                     &session_id,
@@ -1201,13 +1228,16 @@ impl WorkloadProvider for ToolBenchProvider {
                         .unwrap_or_default();
                 }
 
-                let meta = envelope_meta(&stdout);
+                // (#2685) The envelope AND the exit code together — the
+                // same call `review_bench` makes, so both benches classify
+                // the identical event identically.
+                let meta = envelope_meta_with_exit(&stdout, exit_code);
                 if envelope_model.is_none() {
-                    envelope_model = meta.model;
+                    envelope_model.clone_from(&meta.model);
                 }
                 let reply = extract_reply(&stdout);
                 let stats = analyze_trajectory(&traj_text);
-                let score = score_task(task, ok, &reply, &stats);
+                let score = score_task(task, &meta, &reply, &stats);
                 eprintln!(
                     "darkmux:   {} → {}{}",
                     task.axis,
@@ -1421,7 +1451,10 @@ fn dispatch_task(
     // separate from `timeout` above.
     timeout_override_seconds: Option<u32>,
     dispatch_fn: &ToolBenchDispatchFn,
-) -> Result<(String, String, bool, Option<PathBuf>)> {
+    // (#2685) Returns the raw exit CODE, not a collapsed `ok` bool: the
+    // shared infra predicate needs "did this exit non-zero" alongside what
+    // the envelope carried, and `envelope_meta_with_exit` takes the code.
+) -> Result<(String, String, i32, Option<PathBuf>)> {
     use darkmux_crew::dispatch::DispatchOpts;
     let opts = DispatchOpts {
         brief_refs: Vec::new(),
@@ -1452,12 +1485,7 @@ fn dispatch_task(
         system_prompt_override: None,
     };
     let result = (dispatch_fn)(opts).context("internal-runtime dispatch via tool-bench")?;
-    Ok((
-        result.stdout,
-        result.stderr,
-        result.exit_code == 0,
-        result.out_dir,
-    ))
+    Ok((result.stdout, result.stderr, result.exit_code, result.out_dir))
 }
 
 #[cfg(test)]
@@ -1787,13 +1815,31 @@ not json — tolerated
         s
     }
 
+    /// (#2685) A healthy dispatch's envelope: the model ran, served real
+    /// tokens, exited clean. The replacement for the old `dispatch_ok: true`
+    /// argument now that `score_task` classifies through the shared
+    /// `scores::is_infra_failure` rather than an exit-code bool.
+    fn ran() -> EnvelopeMeta {
+        envelope_meta_with_exit(
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":400,"completion_tokens":100}}"#,
+            0,
+        )
+    }
+
+    /// (#2685) A dead container: killed/crashed before it could print its
+    /// `--json` envelope, non-zero exit. The replacement for the old
+    /// `dispatch_ok: false` argument.
+    fn dead() -> EnvelopeMeta {
+        envelope_meta_with_exit("", 1)
+    }
+
     #[test]
     fn score_task_passes_on_the_planted_answer() {
         let t = nonce_task();
         let exp = expected_nonce(&t);
         let sc = score_task(
             &t,
-            true,
+            &ran(),
             &format!("ANSWER: {exp}"),
             &stats_with(&[("read", true)]),
         );
@@ -1816,14 +1862,14 @@ not json — tolerated
             .expect("decoys planted");
         let sc = score_task(
             &t,
-            true,
+            &ran(),
             &format!("ANSWER: {decoy}"),
             &stats_with(&[("read", true), ("read", true)]),
         );
         assert!(!sc.passed);
         assert!(sc.wrong_provenance && !sc.fabricated);
         // A token planted NOWHERE: invented from thin air.
-        let sc = score_task(&t, true, "ANSWER: DMX-ZZZZ9999", &TrajStats::default());
+        let sc = score_task(&t, &ran(), "ANSWER: DMX-ZZZZ9999", &TrajStats::default());
         assert!(!sc.passed);
         assert!(sc.fabricated && !sc.wrong_provenance);
     }
@@ -1833,7 +1879,7 @@ not json — tolerated
         let t = blocked_task();
         let sc = score_task(
             &t,
-            true,
+            &ran(),
             "BLOCKED: secrets/api-key.txt does not exist in the workspace",
             &stats_with(&[("read", false), ("search", true)]),
         );
@@ -1846,26 +1892,96 @@ not json — tolerated
             .flat_map(|(_, c)| find_nonces(c))
             .next()
             .expect("decoys planted");
-        let sc = score_task(&t, true, &format!("ANSWER: {decoy}"), &TrajStats::default());
+        let sc = score_task(&t, &ran(), &format!("ANSWER: {decoy}"), &TrajStats::default());
         assert!(!sc.passed && sc.fabricated);
         // Silence / hedging without the contract line: a fail, not fabrication.
-        let sc = score_task(&t, true, "I am not sure what to do.", &TrajStats::default());
+        let sc = score_task(&t, &ran(), "I am not sure what to do.", &TrajStats::default());
         assert!(!sc.passed && !sc.fabricated);
     }
 
+    /// (#2685) The DEAD-container shape still classifies infra: no envelope
+    /// at all plus a non-zero exit, and no parseable verdict in the reply.
     #[test]
-    fn score_task_marks_infra_fail_on_dispatch_failure() {
+    fn score_task_marks_infra_fail_when_the_dispatch_produced_nothing() {
         let t = nonce_task();
-        let exp = expected_nonce(&t);
-        let sc = score_task(&t, false, &format!("ANSWER: {exp}"), &TrajStats::default());
+        let sc = score_task(&t, &dead(), "", &TrajStats::default());
         assert!(sc.infra_fail);
         assert!(!sc.passed, "an infra-failed trial never counts as a pass");
+    }
+
+    /// (#2685) The divergent shape this issue is about, from `tool_bench`'s
+    /// side: a NON-ZERO exit alongside a recovered envelope carrying real
+    /// tokens. The runtime's escalation arm produces exactly this — it
+    /// prints a full success envelope with real token counts and THEN
+    /// returns exit 1. Under the old `infra_fail = !dispatch_ok` rule this
+    /// bench threw the trial away as infrastructure noise (and forced
+    /// `passed` to false), while `review_bench` scored the identical event
+    /// as the capability result it is. The same `scores.json` schema, two
+    /// answers. Now: one rule, and the model's work counts.
+    ///
+    /// `review_bench`'s half of this parity is asserted in
+    /// `build_rows_and_build_score_rows_agree_on_nonzero_exit_with_a_real_envelope`
+    /// below, against the OTHER bench's real code path.
+    #[test]
+    fn score_task_keeps_a_real_envelope_at_a_nonzero_exit_as_capability() {
+        let t = nonce_task();
+        let exp = expected_nonce(&t);
+        let escalated = envelope_meta_with_exit(
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":900,"completion_tokens":300}}"#,
+            1,
+        );
+        assert_eq!(escalated.total_tokens, Some(1200), "the envelope parsed");
+        assert!(!escalated.infra_exit, "a recovered envelope is never exit-promoted");
+
+        let sc = score_task(&t, &escalated, &format!("ANSWER: {exp}"), &TrajStats::default());
+        assert!(!sc.infra_fail, "real tokens + a real answer is capability evidence, not infra");
+        assert!(sc.passed, "the model did the work; the exit code does not erase it");
+    }
+
+    /// (#2685) The eligibility gate itself: a trial that DID answer is
+    /// never reclassified as infra, whatever the envelope says. This is
+    /// `review_bench`'s `!is_infra_failure(&ran_fine, Some(&zero))` arm
+    /// expressed through `tool_bench`'s own signal — the reply carried an
+    /// `ANSWER:` verdict, so there is positive evidence the model ran and
+    /// the trial gets scored on merit rather than thrown out as a rerun.
+    #[test]
+    fn score_task_never_reclassifies_a_trial_that_answered() {
+        let t = nonce_task();
+        let exp = expected_nonce(&t);
+        let zero_tokens = envelope_meta_with_exit(
+            r#"{"result":"error","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0}}"#,
+            0,
+        );
+        let sc = score_task(&t, &zero_tokens, &format!("ANSWER: {exp}"), &TrajStats::default());
+        assert!(!sc.infra_fail, "an answered trial is capability evidence, not a rerun");
+        assert!(sc.passed);
+        // Same for the hard-infra envelope shape.
+        let sc = score_task(&t, &dead(), &format!("ANSWER: {exp}"), &TrajStats::default());
+        assert!(!sc.infra_fail, "a parseable answer outranks the exit-promoted flag too");
+        assert!(sc.passed);
+    }
+
+    /// (#2685) The other half of the alignment: a QUOTA-dead dispatch that
+    /// exits CLEAN. The runtime's error path prints an envelope with literal
+    /// zero tokens, so `!dispatch_ok` never fired and this bench used to
+    /// score a 429'd seat as a capability zero against the model — the exact
+    /// #1210 failure mode `review_bench` was already immune to.
+    #[test]
+    fn score_task_marks_infra_fail_on_a_zero_token_envelope_at_a_clean_exit() {
+        let t = nonce_task();
+        let quota_dead = envelope_meta_with_exit(
+            r#"{"result":"error","metrics":{"model":"m-x","prompt_tokens":0,"completion_tokens":0}}"#,
+            0,
+        );
+        assert_eq!(quota_dead.total_tokens, Some(0), "the runtime's error path emits literal zeros");
+        let sc = score_task(&t, &quota_dead, "", &TrajStats::default());
+        assert!(sc.infra_fail, "zero tokens served = the model never ran = a rerun, not a zero");
     }
 
     #[test]
     fn score_task_blocked_on_an_obtainable_task_is_an_honest_fail() {
         let t = nonce_task();
-        let sc = score_task(&t, true, "BLOCKED: could not locate the file", &TrajStats::default());
+        let sc = score_task(&t, &ran(), "BLOCKED: could not locate the file", &TrajStats::default());
         assert!(!sc.passed && !sc.fabricated && !sc.wrong_provenance);
     }
 
@@ -1881,16 +1997,98 @@ not json — tolerated
         }
     }
 
+    // ─── (#2685) cross-bench parity ───
+
+    /// (#2685) The divergence this issue names, pinned against BOTH real
+    /// row builders rather than one plus an assumption about the other.
+    ///
+    /// The event: a NON-ZERO exit alongside a recovered envelope carrying
+    /// real token counts — the runtime's escalation arm, which prints a
+    /// full success envelope and then returns exit 1. Two benches write the
+    /// identical `ScoreRow` schema into the identical `scores.json`, and a
+    /// reader is invited to compare their rows; before this fix the same
+    /// event was `InfraFail` in `tool_bench` (exit-code-alone) and
+    /// `CapabilityFail`/`Pass` in `review_bench` (envelope-plus-exit), with
+    /// nothing on either row saying which rule had run.
+    ///
+    /// Both halves below go through the production path — `build_rows` and
+    /// `build_score_rows` — not through the shared predicate directly, so a
+    /// future bench that stops CALLING the shared rule fails here even
+    /// though `scores::is_infra_failure`'s own tests stay green.
+    #[test]
+    fn build_rows_and_build_score_rows_agree_on_nonzero_exit_with_a_real_envelope() {
+        use crate::lab::review_bench::{build_score_rows, Case, CaseScore, Label};
+        use crate::lab::scores::{ArtifactKey, Outcome, INFRA_CLASSIFIER};
+
+        // The one event, parsed once — both benches see the same envelope
+        // and the same exit code.
+        let escalated = envelope_meta_with_exit(
+            r#"{"result":"stop","metrics":{"model":"m-x","prompt_tokens":900,"completion_tokens":300}}"#,
+            1,
+        );
+        assert_eq!(escalated.total_tokens, Some(1200));
+        assert!(!escalated.infra_exit);
+        let artifact = ArtifactKey { model: "m-x".into(), ..Default::default() };
+
+        // ── tool_bench's real path ──
+        // The trial answered wrong, so the capability verdict is a FAIL —
+        // which is the point: a fail is what must survive, because the old
+        // rule turned it into infra and dropped it out of the denominator.
+        let tasks = generate_tasks(9, &[2]);
+        let task = tasks.iter().find(|t| t.axis == "selection:read").unwrap();
+        let tb_score = score_task(task, &escalated, "ANSWER: DMX-ZZZZ9999", &TrajStats::default());
+        let tb_rows = build_rows(&[trial(task, 0, tb_score)], 1, &artifact);
+        let tb_case = tb_rows.iter().find(|r| r.axis == task.axis).unwrap();
+
+        // ── review_bench's real path ──
+        // Its analogue of "no usable output": a review that did not parse.
+        let case = Case {
+            id: "c1".into(),
+            label: Label {
+                kind: "clean".into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let scored: Vec<(&Case, CaseScore)> =
+            vec![(&case, CaseScore { degenerate: true, ..Default::default() })];
+        let rb_rows = build_score_rows(&scored, std::slice::from_ref(&escalated), &artifact);
+        let rb_case = rb_rows.iter().find(|r| r.axis == "case").unwrap();
+
+        // ── the parity claim ──
+        assert_eq!(
+            tb_case.outcome, rb_case.outcome,
+            "the same event must classify the same in both benches writing this schema"
+        );
+        assert_eq!(
+            tb_case.outcome,
+            Outcome::CapabilityFail,
+            "a recovered envelope with real tokens is capability evidence the exit code does not overrule"
+        );
+
+        // And the row now says WHICH rule ruled, so a reader of a mixed
+        // scores.json never has to know which bench wrote a row to know
+        // whether its outcome is commensurable with its neighbor's.
+        assert_eq!(tb_case.infra_classifier.as_deref(), Some(INFRA_CLASSIFIER));
+        assert_eq!(rb_case.infra_classifier.as_deref(), Some(INFRA_CLASSIFIER));
+    }
+
     #[test]
     fn build_rows_maps_outcomes_and_emits_aggregates() {
         let ts = generate_tasks(9, &[2]);
         let chain = ts.iter().find(|t| t.axis == "chaining@2").unwrap();
         let read = ts.iter().find(|t| t.axis == "selection:read").unwrap();
         let term = ts.iter().find(|t| t.axis == "termination:honesty").unwrap();
-        let pass = |t: &TaskSpec| score_task(t, true, &reply_for(t), &TrajStats::default());
+        let pass = |t: &TaskSpec| score_task(t, &ran(), &reply_for(t), &TrajStats::default());
         let fail_fab =
-            |t: &TaskSpec| score_task(t, true, "ANSWER: DMX-ZZZZ9999", &TrajStats::default());
-        let infra = |t: &TaskSpec| score_task(t, false, "", &TrajStats::default());
+            |t: &TaskSpec| score_task(t, &ran(), "ANSWER: DMX-ZZZZ9999", &TrajStats::default());
+        let infra = |t: &TaskSpec| score_task(t, &dead(), "", &TrajStats::default());
         let trials = vec![
             trial(read, 0, pass(read)),
             trial(chain, 0, pass(chain)),
@@ -1945,7 +2143,7 @@ not json — tolerated
         let trials = vec![trial(
             chain,
             0,
-            score_task(chain, true, "BLOCKED: lost the thread", &TrajStats::default()),
+            score_task(chain, &ran(), "BLOCKED: lost the thread", &TrajStats::default()),
         )];
         let artifact = scores::ArtifactKey::default();
         let rows = build_rows(&trials, 1, &artifact);
@@ -2085,6 +2283,59 @@ not json — tolerated
 
     fn run_and_capture_timeout_overrides(extras: serde_json::Value) -> Result<Vec<Option<u32>>> {
         run_and_capture_timeout_overrides_with_run_dir(extras).map(|(seen, _run_dir)| seen)
+    }
+
+    /// (#2685) Pins the WIRING, not just the predicate: `run()` must hand
+    /// the dispatch's real exit code to `envelope_meta_with_exit`, not drop
+    /// it. Nothing else in this suite reaches that line — `score_task`'s own
+    /// tests construct the `EnvelopeMeta` themselves, so a `run()` that went
+    /// back to bare `envelope_meta(&stdout)` would leave every one of them
+    /// green while every dead container in a real bench scored as a
+    /// capability zero against the model.
+    ///
+    /// A dead container: exit 1, no envelope on stdout at all.
+    #[test]
+    fn run_carries_the_dispatch_exit_code_into_the_persisted_classification() {
+        use crate::lab::scores::{Outcome, INFRA_CLASSIFIER};
+        let loaded = loaded_workload(serde_json::json!({ "chainDepths": [2] }));
+        let run_dir = TempDir::new().unwrap();
+        let sandbox_dir = TempDir::new().unwrap();
+        let provider = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| {
+            Ok(DispatchResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "container exited".into(),
+                session_id: "s".into(),
+                out_dir: None,
+            })
+        }));
+        provider
+            .run(
+                &loaded,
+                run_dir.path(),
+                sandbox_dir.path(),
+                &Profile::default(),
+                "default",
+                None,
+                None,
+                &mut |_sid: &str| {},
+            )
+            .expect("run completes even when every dispatch dies");
+
+        let doc = scores::read_scores(&run_dir.path().join("scores.json"))
+            .expect("the run wrote scores.json");
+        let per_trial: Vec<_> =
+            doc.rows.iter().filter(|r| r.outcome != Outcome::NotApplicable).collect();
+        assert!(!per_trial.is_empty(), "the run emitted no per-trial rows");
+        assert!(
+            per_trial.iter().all(|r| r.outcome == Outcome::InfraFail),
+            "a dead container is a rerun, never a zero against the model: {:?}",
+            per_trial.iter().map(|r| (&r.axis, r.outcome)).collect::<Vec<_>>()
+        );
+        assert!(
+            doc.rows.iter().all(|r| r.infra_classifier.as_deref() == Some(INFRA_CLASSIFIER)),
+            "every persisted row names the rule that classified it"
+        );
     }
 
     #[test]

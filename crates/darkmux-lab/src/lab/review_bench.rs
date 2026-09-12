@@ -13,6 +13,8 @@
 //! real CI review exercise the identical path.
 
 use crate::providers::prompt::extract_reply_text;
+// (#2685) The infra-vs-capability rule moved beside the schema it serves.
+use super::scores::{envelope_meta_with_exit, is_infra_failure, EnvelopeMeta};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::fs;
@@ -1107,7 +1109,7 @@ pub(crate) fn infra_partition<'a>(
     let mut capability = Vec::with_capacity(scored.len());
     let mut infra = 0usize;
     for (i, cs) in scored.iter().enumerate() {
-        if is_infra_failure(&cs.1, meta.get(i)) {
+        if is_infra_failure(cs.1.degenerate, meta.get(i)) {
             infra += 1;
         } else {
             capability.push(cs);
@@ -1248,135 +1250,12 @@ fn print_summary(scored: &[(&Case, CaseScore)], meta: &[EnvelopeMeta], opts: &Re
 }
 
 // ─── #1198: scores.json emission ────────────────────────────────────────
-
-/// Per-dispatch metadata pulled from the `--json` envelope (best-effort —
-/// the score math never depends on it, only the artifact's provenance).
-#[derive(Debug, Default, Clone)]
-pub(crate) struct EnvelopeMeta {
-    pub model: Option<String>,
-    pub total_tokens: Option<u64>,
-    /// (#1210 MUST-FIX-1) A CLASSIFICATION-ONLY signal: true when
-    /// [`envelope_meta_with_exit`] promoted this row to the infra reading
-    /// (no envelope recovered AND a non-zero exit code). This must never be
-    /// read as a measurement — `total_tokens` stays whatever was actually
-    /// parsed (`None` when nothing was), so a crashed/killed container that
-    /// may have served real tokens before dying never fabricates a `Some(0)`
-    /// in `total_tokens` (and, downstream, in the persisted
-    /// `ScoreRow::tokens_to_solution`). Same "`None`, not `Some(0)`: nothing
-    /// was measured, not 'zero was measured'" discipline
-    /// `runtime/src/main.rs` documents beside its own hardcoded-zero arms.
-    pub infra_exit: bool,
-}
-
-/// Parse the dispatch envelope (the last stdout line starting with `{` —
-/// tolerant of pull-progress noise ahead of it, unlike `extract_reply_text`
-/// which parses the whole stdout as one JSON value) for `metrics.model` +
-/// token totals. The envelope is compact single-line JSON, so a reply-
-/// internal brace can never appear as its own stdout line.
-pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
-    let candidate = stdout
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .unwrap_or(stdout);
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate.trim()) else {
-        return EnvelopeMeta::default();
-    };
-    let m = v.get("metrics").cloned().unwrap_or(serde_json::Value::Null);
-    let total = m
-        .get("total_tokens")
-        .and_then(|t| t.as_u64())
-        .or_else(|| {
-            let p = m.get("prompt_tokens").and_then(|t| t.as_u64());
-            let c = m.get("completion_tokens").and_then(|t| t.as_u64());
-            match (p, c) {
-                (Some(p), Some(c)) => Some(p + c),
-                _ => None,
-            }
-        });
-    EnvelopeMeta {
-        model: m.get("model").and_then(|s| s.as_str()).map(str::to_string),
-        total_tokens: total,
-        infra_exit: false,
-    }
-}
-
-/// (#1210) [`envelope_meta`] plus the dispatch's own exit code — closes the
-/// gap the issue named as "(or a non-zero exit)" alongside the zero-token
-/// envelope case [`is_infra_failure`] already covers.
-///
-/// `dispatch()` never returns `Err` for a non-zero container exit (see
-/// `dispatch_case`'s doc); a genuinely dead container or a runtime crash
-/// before it can print its `--json` envelope (a harder failure than the
-/// graceful `"result":"error"` envelope a caught 429 produces — that one
-/// still writes literal `Some(0)` tokens and is already handled by
-/// `envelope_meta` alone) leaves stdout with NO parseable envelope at all.
-/// `envelope_meta` alone can't tell that apart from a dialect quirk that
-/// left stdout merely malformed-but-present; the exit code is what
-/// distinguishes them.
-///
-/// Only promotes to the infra reading when BOTH are true: no envelope was
-/// recovered (`model` and `total_tokens` both `None`) AND the exit code is
-/// non-zero. An envelope WAS recovered — even a `"result":"error"` one with
-/// real capability content, however degenerate — is never overridden by
-/// exit status; a non-zero exit alongside a fully-parsed envelope is left
-/// alone. That combination IS reachable, not out of scope: `runtime/src/
-/// main.rs`'s loop-error arm prints a (zeroed) envelope and then returns
-/// exit 1, and its escalation arm returns exit 1 *after* the success branch
-/// already printed a full envelope carrying real token counts. Both are
-/// deliberately left alone here — a recovered envelope is positive
-/// capability evidence the exit code doesn't get to overrule. A CLEAN exit
-/// (0) with no envelope recovered stays the pre-existing ambiguous case —
-/// conservatively NOT reclassified, same "positive evidence only" rule
-/// `is_infra_failure` already applies to an unknown token count.
-///
-/// (#1210 MUST-FIX-1) The promotion sets ONLY the classification signal
-/// (`infra_exit: true`); `total_tokens` stays `None`, never a fabricated
-/// `Some(0)` — a killed/crashed container may have served real tokens
-/// before dying, and this helper has no way to know how many. Zero is a
-/// MEASUREMENT (the runtime's own graceful-error envelope really does emit
-/// literal 0/0), and this path never measured anything, so it doesn't get
-/// to claim zero.
-pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeMeta {
-    let m = envelope_meta(stdout);
-    if exit_code != 0 && m.model.is_none() && m.total_tokens.is_none() {
-        return EnvelopeMeta { model: None, total_tokens: None, infra_exit: true };
-    }
-    m
-}
-
-/// (#1210) A degenerate case whose dispatch served ZERO tokens is an INFRA
-/// failure, not a capability verdict — the #1113 lesson one level up: an
-/// endpoint that produced no tokens (a quota-exhausted / 429 hosted seat, an
-/// unreachable endpoint, a dead container) never RAN the model, so scoring it
-/// `CapabilityFail` writes a junk capability row (observed live 2026-07-05,
-/// Gemini free tier — the whole motivation for this issue). The discriminator
-/// is the envelope's own token count: a model that RAN and emitted unparseable
-/// output served tokens (`total_tokens > 0`) and stays a genuine capability
-/// `degenerate` (#1050); only a zero-token dispatch is reclassified. `None`
-/// tokens (metrics absent/unparsed) is deliberately NOT treated as infra —
-/// we reclassify only on POSITIVE evidence of zero tokens served.
-///
-/// The `Some(0)` discriminator matches the REAL quota-failure shape (verified
-/// against the runtime, 2026-07-17): the container runtime's `--json` envelope
-/// ALWAYS emits numeric `prompt_tokens`/`completion_tokens` — the success path
-/// carries the loop's totals, and the error path calls
-/// `build_json_envelope("error", ..., 0, 0, ...)` (`runtime/src/main.rs`) with
-/// literal zeros — so a quota-dead dispatch parses as `Some(0)`, never `None`.
-/// `None` only arises when stdout carried NO parseable envelope at all (a
-/// crash before envelope emission), which used to leave `total_tokens` at
-/// `None` with no other signal to key off. [`envelope_meta_with_exit`] now
-/// carries that case as its own `infra_exit` flag instead of fabricating a
-/// `Some(0)` token count (#1210 MUST-FIX-1) — so this predicate treats
-/// EITHER positive-zero-tokens evidence OR the exit-promoted flag as infra;
-/// neither one touches `total_tokens`, which keeps recording the genuinely
-/// unknown case as `None`. (The 2026-07-05 junk rows themselves were
-/// operator-cleaned from the corpus, per #1210 — the runtime envelope
-/// contract above is the citable evidence.)
-pub(crate) fn is_infra_failure(s: &CaseScore, m: Option<&EnvelopeMeta>) -> bool {
-    s.degenerate
-        && (matches!(m.and_then(|m| m.total_tokens), Some(0)) || m.is_some_and(|m| m.infra_exit))
-}
+//
+// (#2685) The infra-vs-capability PREDICATE, and the envelope parsing it
+// reads, no longer live here: they moved beside the schema they classify
+// for (`super::scores`), because `providers::tool_bench` writes the same
+// `ScoreRow` shape and was carrying its own, divergent (exit-code-only)
+// copy of the rule. One rule, expressed once — `scores::is_infra_failure`.
 
 /// Build the run's score rows: one capability row per case, plus the
 /// corpus-wide aggregates the summary prints (recall / precision / anchor
@@ -1407,12 +1286,16 @@ pub(crate) fn build_score_rows(
         budget_turns: None,
         budget_tokens: None,
         detail,
+        // (#2685) Which predicate produced `outcome` — on the row, not
+        // inferred from `bench`, because rows from both benches sit in this
+        // one schema and are read as commensurable.
+        infra_classifier: Some(super::scores::INFRA_CLASSIFIER.to_string()),
     };
 
     // (#1210) Which case indices are infra failures (zero-token dispatch) —
     // reused for the per-case outcome AND to exclude them from every
     // capability aggregate denominator below.
-    let is_infra = |i: usize, s: &CaseScore| is_infra_failure(s, meta.get(i));
+    let is_infra = |i: usize, s: &CaseScore| is_infra_failure(s.degenerate, meta.get(i));
 
     let mut rows = Vec::new();
     for (i, (c, s)) in scored.iter().enumerate() {
