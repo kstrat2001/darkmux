@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { tokensOffMeter, hasAnyTokenCounts, isRemoteOnlyTokens } from "./savings";
+import { hybridNote } from "./hybridNote";
 import type { FlowRecord } from "../../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -429,10 +430,32 @@ describe("tokensOffMeter", () => {
   // argument #2635 used to remove the identical lookup from `directRuns`
   // and #2687 used to remove it from the per-bookend loop.
   //
-  // What replaces it: the completion classifies itself. No endpoint of its
-  // own ⇒ LOCAL, the same criterion `localSids` has always used to prove a
-  // session local.
-  it("(#2690) a single-bookend session whose endpoint is on its START but not its lone COMPLETE classifies LOCAL — the completion classifies itself", () => {
+  // What replaces it for the RUN COUNT: the completion classifies itself.
+  // No endpoint of its own ⇒ that RUN was local.
+  //
+  // (fix-pass correction) An earlier revision of this test ALSO asserted
+  // `cloud=0, local=110` on the TOKEN split, on the theory that the two
+  // must always read identical evidence. That is the claim the adversarial
+  // review falsified, and it is why the assertions below now differ by
+  // design — the two numbers answer different questions:
+  //
+  //   The RUN count asks "where did this finished dispatch run?" It holds
+  //   the completion record itself, which names no endpoint, so the answer
+  //   is local and needs no lookup at all.
+  //
+  //   The TOKEN split asks "is the spend arriving under this key hosted?"
+  //   It holds only `telemetry.tokens` records, which carry NO seat
+  //   identity and no endpoint on any producer. Under a key whose own
+  //   start named an endpoint, it cannot prove those tokens belong to the
+  //   endpoint-less seat, and guessing "local" is the one direction that
+  //   credits hosted spend as free.
+  //
+  // In the only way this shape is reachable at all — two SEATS sharing a
+  // task-scoped session id, since no producer stamps an endpoint on a
+  // start without stamping it on that same run's terminal — both answers
+  // are correct about their own question: one seat's completion really was
+  // local, and the task really did bill a hosted endpoint.
+  it("(#2690, corrected) an endpoint on the START but not on the lone COMPLETE: the RUN counts local, the TOKENS count cloud", () => {
     const data: FlowRecord[] = [
       rec({ session_id: "start-only-ep", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
       tokenRec("start-only-ep", 1, 100, 10),
@@ -440,15 +463,16 @@ describe("tokensOffMeter", () => {
     ];
     const t = tokensOffMeter(data);
     expect(t.runs).toBe(1);
+    // The run: classified by its own terminal, which named no endpoint.
     expect(t.cloudRuns).toBe(0);
     expect(t.unknownRuns).toBe(0);
     // Implicit local — never a residual, computed the way every consumer
     // must compute it.
     expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
-    // The token split moves with it: both now read the SAME evidence
-    // (the session's own successful terminals), so they cannot disagree.
-    expect(t.cloud).toBe(0);
-    expect(t.local).toBe(110);
+    // The tokens: this run's own start named an endpoint, so spend
+    // arriving under its key is hosted until its terminal says otherwise.
+    expect(t.cloud).toBe(110);
+    expect(t.local).toBe(0);
     expect(t.unknown).toBe(0);
   });
 
@@ -479,8 +503,30 @@ describe("tokensOffMeter", () => {
   // unknownRuns=0 localRuns=0` and the hero read "1 dispatch via cloud" —
   // the operator's OWN HARDWARE's work reported as cloud with local 0,
   // durably (if the hosted sibling then errors and no second local sibling
-  // closes, it never corrects). Ground truth: 1 local dispatch, 0 cloud.
-  it("(#2690 steady state) a hosted sibling in flight does not paint a completed local sibling cloud", () => {
+  // closes, it never corrects).
+  //
+  // The DISPATCHES line is the half of that measurement this fix owns, and
+  // it is fixed: 1 local dispatch, 0 cloud, because the local seat's own
+  // completion classifies itself and consults no set.
+  //
+  // (fix-pass correction) The TOKEN half is NOT fixed and deliberately so.
+  // An earlier revision asserted `local=100, cloud=0` here; the adversarial
+  // review showed that reading is unprovable and its generalization is what
+  // credits live hosted spend as free. The 100 tokens are
+  // `telemetry.tokens` records under a key with TWO seats, one of them a
+  // hosted endpoint that is billing right now. Nothing in the record says
+  // which seat produced them — no producer stamps an endpoint or a seat id
+  // on a token telemetry record — so "local" is a guess, and it is the
+  // guess that under-reports the meter. Cloud-over-local over-reports it
+  // instead, which is the only direction this function may err in.
+  //
+  // Worth knowing before treating this as a live regression: keyed on
+  // `(session_id, mission_id)`, the committed corpus contains ZERO runs
+  // that mix hosted and local bookends (50 run keys: 3 wholly hosted, 47
+  // wholly local). Keyed on the BARE session id it appears to contain 2 —
+  // and both of those are the recurrence artifact this fix-pass removes,
+  // not real mixed staffing. The per-seat split is the #2665 follow-up.
+  it("(#2690 steady state) a hosted sibling in flight does not paint a completed local sibling's DISPATCH cloud", () => {
     const sid = "task:review-probe-steady";
     const data: FlowRecord[] = [
       // The hosted seat: started, still running, no terminal.
@@ -491,13 +537,16 @@ describe("tokensOffMeter", () => {
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
     ];
     const t = tokensOffMeter(data);
+    // The #2690 fix, intact: the local seat's dispatch counts local.
     expect(t.runs).toBe(1);
     expect(t.cloudRuns).toBe(0);
     expect(t.unknownRuns).toBe(0);
     expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
+    // The tokens: unseparable under one key with a live hosted seat, so
+    // they over-claim CLOUD rather than crediting hosted spend as free.
     expect(t.total).toBe(100);
-    expect(t.local).toBe(100);
-    expect(t.cloud).toBe(0);
+    expect(t.cloud).toBe(100);
+    expect(t.local).toBe(0);
     expect(t.unknown).toBe(0);
   });
 
@@ -511,7 +560,25 @@ describe("tokensOffMeter", () => {
   // that endpoint into `epBySid`, and the lone LOCAL sibling completion
   // under the same task-scoped id read `runs=1 cloudRuns=1 cloud=1000
   // local=0`.
-  it("(#2690, K1) a hosted sibling's dispatch.error does not reclassify a local sibling's clean completion", () => {
+  //
+  // (fix-pass correction) The DISPATCH half of that is what #2690 owns and
+  // it is still fixed below: `cloudRuns=0`, because the run count reads
+  // TERMINALS only and an error is not one. The TOKEN half now reads CLOUD,
+  // and that is a deliberate change from the first version of this PR.
+  //
+  // Leaving errors out of the token-side evidence was measurably a hole in
+  // the guarantee this function exists to provide. A run key carrying a
+  // hosted `dispatch.error` AND an endpoint-less completion — a mixed run
+  // whose hosted seat only has its error in view — matched `localKeys` and
+  // matched no cloud evidence at all, so the whole key's tokens landed on
+  // the LOCAL tile while a hosted endpoint had demonstrably been called.
+  // That is the same class of defect as the one this fix-pass exists to
+  // remove, just reached by a different bookend.
+  //
+  // So the evidence rule is uniform with no carve-outs: ANY bookend of a
+  // run naming an endpoint is cloud evidence for that run's tokens. A
+  // hosted attempt that died still burned hosted tokens.
+  it("(#2690, K1) a hosted sibling's dispatch.error does not reclassify a local sibling's DISPATCH — but its tokens read cloud", () => {
     const sid = "task:review-probe-k1";
     const data: FlowRecord[] = [
       // The hosted seat's start is OUTSIDE the window; only its error is in.
@@ -521,12 +588,16 @@ describe("tokensOffMeter", () => {
       rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 1000 } }),
     ];
     const t = tokensOffMeter(data);
+    // The #2690 fix, intact: an error never makes a local dispatch cloud.
     expect(t.runs).toBe(1);
     expect(t.cloudRuns).toBe(0);
     expect(t.unknownRuns).toBe(0);
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
+    // The tokens: a hosted endpoint was called under this key, so they
+    // over-claim CLOUD rather than being credited free.
     expect(t.total).toBe(1000);
-    expect(t.cloud).toBe(0);
-    expect(t.local).toBe(1000);
+    expect(t.cloud).toBe(1000);
+    expect(t.local).toBe(0);
     expect(t.unknown).toBe(0);
   });
 
@@ -535,9 +606,17 @@ describe("tokensOffMeter", () => {
   // per-bookend path (#2687) and read `runs=2 cloudRuns=0` — "2 local
   // dispatches" — while the token tiles still read the session-wide
   // `epBySid` and showed LOCAL TOKENS 0 / CLOUD TOKENS 2,000 for the very
-  // same session. Both halves now read the same evidence, so the two lines
-  // agree by construction.
-  it("(#2690, K2) the dispatches line and the token tiles agree — no local-dispatches-with-zero-local-tokens screen", () => {
+  // same session.
+  //
+  // (fix-pass correction) The incoherence #2690 named was the DISPATCH line
+  // reading "2 local" — a claim about the operator's hardware that the data
+  // did not support. That is fixed and asserted below. The tokens under a
+  // key with a called hosted endpoint read CLOUD, for the reason given on
+  // K1 above; the screen is coherent because it no longer claims two LOCAL
+  // dispatches produced zero local tokens — it reports two dispatches whose
+  // own terminals were local, sharing a key whose spend cannot be separated
+  // from a hosted seat's. Splitting that is #2665.
+  it("(#2690, K2) the dispatches line no longer claims local work the data cannot support", () => {
     const sid = "task:review-probe-k2";
     const data: FlowRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
@@ -553,13 +632,14 @@ describe("tokensOffMeter", () => {
     expect(t.cloudRuns).toBe(0);
     expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(2000);
-    expect(t.cloud).toBe(0);
-    expect(t.local).toBe(2000);
-    // The invariant the contradiction violated: a screen showing N local
-    // dispatches and zero local tokens for the same data is incoherent.
+    // A hosted endpoint was called under this key, so the spend that cannot
+    // be separated from it over-claims CLOUD (see K1 above).
+    expect(t.cloud).toBe(2000);
+    expect(t.local).toBe(0);
+    // What #2690 actually fixed, and what stays fixed: the DISPATCH line no
+    // longer reports the hosted seat's failure as the operator's hardware.
     const localRuns = t.runs - t.cloudRuns - t.unknownRuns;
     expect(localRuns).toBe(2);
-    expect(t.local).toBeGreaterThan(0);
   });
 
   // (#2690, the ARITY-1 half of the `(CONSIDER 3)` gap #2687 named and
@@ -631,24 +711,34 @@ describe("tokensOffMeter", () => {
   });
 
   // (#2690) The telemetry-present / telemetry-absent pair for LOCAL work,
-  // the mirror of the hosted pair pinned above. Same dispatch shape (a
-  // hosted sibling in flight over a completed local seat), once with the
-  // local seat's per-turn `telemetry.tokens` family present (the container
+  // the mirror of the hosted pair pinned above. The same local dispatch
+  // once with its per-turn `telemetry.tokens` family present (the container
   // path, `dispatch_internal.rs:8539`) and once with only its completion's
   // own totals (the single-shot path). On main these diverged COMPLETELY —
   // `cloud=100 local=0` through the `sess` loop versus `cloud=0 local=100`
   // through `directRuns`, which has classified per-completion since #2635.
+  //
+  // (fix-pass correction) The fixture no longer carries a hosted sibling
+  // start. An earlier revision did, which quietly made this a test about a
+  // MIXED run rather than about local work, and then asserted that both
+  // forms report `local=100`. The adversarial review showed why that
+  // generalizes badly: under a key with a live hosted seat, the
+  // telemetry-present form has genuinely LESS information than the
+  // telemetry-absent form — a `telemetry.tokens` record names no seat and
+  // no endpoint, while a completion's own payload is self-describing — so
+  // demanding they agree forces the better-informed path down to the
+  // weaker path's guess. Parity is asserted where it is real and load
+  // bearing (a purely local run, which is the overwhelmingly common case
+  // and the actual #2690 regression), and the mixed case is pinned
+  // separately below as a documented divergence.
   it("(#2690) telemetry-present and telemetry-absent forms of the same LOCAL work classify identically", () => {
-    const startOnlyHosted = (sid: string) =>
-      rec({ session_id: sid, action: "dispatch.start", handle: "hosted-sibling", payload: { endpoint: "azure-foundry" } });
-
     const dataPresent: FlowRecord[] = [
-      startOnlyHosted("task:pair-present"),
+      rec({ session_id: "task:pair-present", action: "dispatch.start", handle: "local-seat" }),
       tokenRec("task:pair-present", 1, 90, 10, "2026-08-08T00:01:00Z"),
       rec({ session_id: "task:pair-present", action: "dispatch.complete", payload: { total_tokens: 100 } }),
     ];
     const dataAbsent: FlowRecord[] = [
-      startOnlyHosted("task:pair-absent"),
+      rec({ session_id: "task:pair-absent", action: "dispatch.start", handle: "local-seat" }),
       rec({
         session_id: "task:pair-absent",
         action: "dispatch.complete",
@@ -669,6 +759,59 @@ describe("tokensOffMeter", () => {
     expect(tPresent.local).toBe(100);
     expect(tPresent.cloud).toBe(0);
     expect(tPresent.cloudRuns).toBe(0);
+  });
+
+  // (fix-pass) The documented divergence the test above used to hide. With
+  // a hosted seat live under the same key, the two forms answer
+  // DIFFERENTLY, and each is right given what it can see:
+  //
+  //   telemetry-present — token records name no seat, so the run's own
+  //   hosted start decides, and the spend reads CLOUD.
+  //
+  //   telemetry-absent — the tokens are the local completion's OWN
+  //   payload, which is self-describing, so they read LOCAL.
+  //
+  // Pinned so that a future change which "restores parity" here has to
+  // decide WHICH way, deliberately, instead of discovering it by accident.
+  // Resolving it properly means per-seat turn attribution — the #2665
+  // follow-up.
+  //
+  // (adversarial-review follow-up) Worth naming precisely, because the
+  // comment on the token split calls cloud-over-local "the direction this
+  // function is allowed to err in": THREE sites read this evidence and the
+  // `directRuns` site does NOT apply that precedence. Under a key with a
+  // hosted seat in flight, the telemetry-ABSENT form credits LOCAL while
+  // the telemetry-PRESENT form credits CLOUD. Defensible (there, the tokens
+  // ARE the local completion's own self-describing payload) but it is a
+  // divergence, not a uniform rule, and the comment now says so.
+  it("(fix-pass) with a live hosted seat under the same key, the two forms diverge by design", () => {
+    const hostedStart = (sid: string) =>
+      rec({ session_id: sid, action: "dispatch.start", handle: "hosted-sibling", payload: { endpoint: "azure-foundry" } });
+
+    const tPresent = tokensOffMeter([
+      hostedStart("task:mixed-present"),
+      tokenRec("task:mixed-present", 1, 90, 10, "2026-08-08T00:01:00Z"),
+      rec({ session_id: "task:mixed-present", action: "dispatch.complete", payload: { total_tokens: 100 } }),
+    ]);
+    const tAbsent = tokensOffMeter([
+      hostedStart("task:mixed-absent"),
+      rec({
+        session_id: "task:mixed-absent",
+        action: "dispatch.complete",
+        payload: { total_tokens: 100, prompt_tokens: 90, completion_tokens: 10 },
+      }),
+    ]);
+
+    // No seat identity on a token record ⇒ the hosted start decides.
+    expect(tPresent.cloud).toBe(100);
+    expect(tPresent.local).toBe(0);
+    // A self-describing completion payload ⇒ classified on itself.
+    expect(tAbsent.cloud).toBe(0);
+    expect(tAbsent.local).toBe(100);
+    // The DISPATCH count agrees across both forms regardless — it always
+    // reads a terminal, which is self-describing in both.
+    expect(tPresent.cloudRuns).toBe(0);
+    expect(tAbsent.cloudRuns).toBe(0);
   });
 
   // (#2690) MONOTONICITY over the WHOLE arrival sequence, not just one
@@ -1247,5 +1390,369 @@ describe("isRemoteOnlyTokens", () => {
 
   it("is false when remote_tokens is zero", () => {
     expect(isRemoteOnlyTokens({ remote_tokens: 0 })).toBe(false);
+  });
+});
+
+/**
+ * (fix-pass, post-adversarial-review) The RECURRING SESSION ID.
+ *
+ * `darkmux_types::session_id`'s `task` and `mission_run` constructors are
+ * DETERMINISTIC — byte-identical across every launch of the same config,
+ * as `crates/darkmux-types/src/session_id.rs:70-80` says outright. Four
+ * successive passes at `tokensOffMeter` (#2635, #2687, #2688, #2690) each
+ * reasoned about ONE consequence of that (sibling seats fanned out inside a
+ * single task share the key) and none about the other: the same key also
+ * RECURS across entirely unrelated mission runs, and the viewer's 24-hour
+ * window routinely holds several at once.
+ *
+ * Measured on the committed corpus: 14 distinct session ids span more than
+ * one mission. `task-review-probe-high-task` alone spans 5 — it completes
+ * LOCALLY under three separate missions on 2026-08-07 and then runs HOSTED
+ * under a fourth on 2026-08-08.
+ *
+ * These tests pin both directions of the leak that fact creates.
+ */
+describe("tokensOffMeter — run-scoped evidence (the recurring session id)", () => {
+  const SID = "task-review-probe-high-task";
+  const AZURE = "azure:my.endpoint/gpt-4o";
+
+  /** The REAL producer shape for a `dispatch.map` step's completion:
+   * `DispatchMapStepKind`'s bookend stamps `result_class`/`items_in`/
+   * `ok_count`/`failed_count` and adds `remote_tokens` ONLY when the step
+   * is hosted (`stamp_remote_classification` is called `if
+   * endpoint_label.is_some()`). A LOCAL map step's completion therefore
+   * carries NO token total at all, fails `hasAnyTokenCounts`, and never
+   * enters `dcTok` — it registers a verdict without ever contributing a
+   * countable bookend. Every pre-existing test in this file gives its local
+   * completions a `total_tokens`, which is exactly why none of them reached
+   * this path. */
+  const localMapComplete = (mission: string, ts: string): FlowRecord =>
+    rec({
+      ts,
+      session_id: SID,
+      mission_id: mission,
+      action: "dispatch complete",
+      payload: { kind: "dispatch.map", result_class: "ok", items_in: 82, ok_count: 82, failed_count: 0 },
+    });
+
+  const hostedMapStart = (mission: string, ts: string): FlowRecord =>
+    rec({ ts, session_id: SID, mission_id: mission, action: "dispatch start", payload: { kind: "dispatch.map", endpoint: AZURE } });
+
+  const tok = (mission: string | undefined, total: number, ts: string): FlowRecord =>
+    rec({
+      ts,
+      session_id: SID,
+      ...(mission ? { mission_id: mission } : {}),
+      category: "telemetry",
+      source: "tokens",
+      payload: { turn_seq: 1, prompt_tokens: total, completion_tokens: 0, total_tokens: total },
+    });
+
+  /**
+   * THE DEFECT THIS FIX-PASS EXISTS TO REMOVE.
+   *
+   * Three earlier missions completed this session id locally. A fourth,
+   * hosted, is in flight — its `dispatch.map` start names an Azure
+   * endpoint, its 82-item fan-out is streaming `telemetry.tokens`, and its
+   * own completion has not landed yet.
+   *
+   * With verdicts keyed on the BARE session id, the three stale LOCAL
+   * verdicts sat in the local set and swallowed the hosted run's live
+   * telemetry: 144,638 tokens of Azure spend rendered on the LOCAL TOKENS
+   * tile for the 17m14s between the hosted start and its own completion,
+   * with `cloudRuns=0` — so `hybridNote` took its `lr && !cloudRuns` branch
+   * and the hero read "the hybrid loop is humming, keep it up" while an
+   * endpoint billed.
+   *
+   * Keyed on `(session_id, mission_id)`, the stale verdicts live under
+   * their own missions' keys and cannot be reached from here.
+   */
+  it("(MUST FIX 1) an in-flight HOSTED run does not inherit an earlier mission's LOCAL verdict", () => {
+    const data: FlowRecord[] = [
+      // Three earlier missions, each completing this session id locally
+      // with a token-less `dispatch.map` completion.
+      localMapComplete("review-1786070274-89d50b", "2026-08-07T02:40:43Z"),
+      localMapComplete("review-1786071434-f6d2f5", "2026-08-07T02:59:34Z"),
+      localMapComplete("review-1786081556-0eea32", "2026-08-07T06:03:32Z"),
+      // A fourth, hosted, still running.
+      hostedMapStart("review-1786150410-209398", "2026-08-08T00:53:50Z"),
+      tok("review-1786150410-209398", 144638, "2026-08-08T01:11:03Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(144638);
+    // The whole point: hosted spend is NOT on the local tile.
+    expect(t.local).toBe(0);
+    expect(t.cloud).toBe(144638);
+    expect(t.unknown).toBe(0);
+    // The RUN count claims nothing either way while the hosted run is
+    // still in flight — it has no terminal of its own to classify on, so
+    // it is unattributed rather than guessed. What matters is that the
+    // derived local-dispatch count every consumer computes is ZERO; a
+    // non-zero one is what let the hero claim local work.
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(0);
+
+    // The operator-visible surface, asserted directly rather than inferred
+    // from the struct. Before this fix `hybridNote` took its `lr &&
+    // !cloudRuns` branch and rendered "N local dispatches. The hybrid loop
+    // is humming, keep it up." while an Azure endpoint billed.
+    const note = hybridNote(data, t);
+    expect(note.text).not.toMatch(/local/i);
+    expect(note.text).not.toMatch(/hybrid loop is humming/i);
+  });
+
+  /**
+   * The same leak in the OPPOSITE direction, which the corpus also
+   * contains: an in-flight LOCAL run inheriting an earlier mission's
+   * verdict. Benign compared with the one above (it over-claims rather
+   * than under-claims the meter) but the identical root cause, so it is
+   * pinned alongside it rather than left to be rediscovered.
+   *
+   * Observed at `2026-08-07T02:41:04Z` on `flow-yesterday.json`: session
+   * `nbd-sfymfx-bfkdxl-71ns8216` started under mission `review-...-89d50b`
+   * at 02:37:54 and had not completed; its only completion in the window
+   * belonged to mission `review-...-93f404`, 31 minutes earlier. 3,639
+   * tokens read LOCAL on that stale verdict. Run-scoped, an in-flight run
+   * with no verdict of its own reads UNKNOWN — the #1607 bucket — until its
+   * own completion lands.
+   */
+  it("(MUST FIX 1, mirror) an in-flight run does not inherit an earlier mission's verdict in either direction", () => {
+    const data: FlowRecord[] = [
+      localMapComplete("review-1786068582-93f404", "2026-08-07T02:09:46Z"),
+      rec({ ts: "2026-08-07T02:37:54Z", session_id: SID, mission_id: "review-1786070274-89d50b", action: "dispatch start", payload: { kind: "dispatch.map" } }),
+      tok("review-1786070274-89d50b", 3639, "2026-08-07T02:41:04Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(3639);
+    // Not claimed as local on a verdict that belongs to another run.
+    expect(t.local).toBe(0);
+    expect(t.cloud).toBe(0);
+    expect(t.unknown).toBe(3639);
+  });
+
+  /**
+   * The adversarial review's own minimal repro, reproduced VERBATIM in
+   * shape — deliberately carrying NO `mission_id` on any record.
+   *
+   * It is kept exactly this way because it proves the fix does not rest on
+   * `mission_id` being present. Run-scoping alone would NOT fix this case
+   * (with no mission to separate them, both runs collapse to one key); what
+   * fixes it is the second, independent guard — a run's own hosted START is
+   * cloud evidence, and cloud beats local. The two guards are defense in
+   * depth: scoping separates runs when the coordinate is there, and
+   * cloud-over-local holds the line when it is not.
+   */
+  it("(MUST FIX 1, no mission_id) a hosted START out-votes a stale local verdict even with no mission to scope by", () => {
+    const data: FlowRecord[] = [
+      rec({ ts: "2026-08-07T06:00:00Z", session_id: SID, action: "dispatch start" }),
+      tok(undefined, 5000, "2026-08-07T06:01:00Z"),
+      rec({ ts: "2026-08-07T06:02:00Z", session_id: SID, action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
+      rec({ ts: "2026-08-08T00:53:50Z", session_id: SID, action: "dispatch start", payload: { kind: "dispatch.map", endpoint: AZURE } }),
+      tok(undefined, 100000, "2026-08-08T00:54:03Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(105000);
+    // Never local. The review measured `local=105000` before this fix.
+    expect(t.local).toBe(0);
+    expect(t.cloud).toBe(105000);
+  });
+
+  /**
+   * (MUST FIX 3) The zero-bookend run branch's cloud-over-local
+   * precedence — the surviving ninth mutation.
+   *
+   * `savings.ts`'s run branch reads `if (groupCloud) cloudRuns++; else if
+   * (!groupLocal) unknownRuns++;`. Mutating that first condition to
+   * `groupCloud && !groupLocal` left the entire suite green before this
+   * test existed, even though the identical rule on the TOKEN side WAS
+   * pinned. A precedence enforced in one half of a function and unguarded
+   * in the other is exactly how the halves drift apart.
+   *
+   * The fixture: one session key whose turns belong to two runs, one with
+   * a hosted terminal and one with a local terminal, and NO token-bearing
+   * bookend to route it through the per-bookend branch (both completions
+   * are the token-less `dispatch.map` shape). That forces the zero-bookend
+   * branch, with both `groupCloud` and `groupLocal` true.
+   */
+  it("(MUST FIX 3) the zero-bookend run branch counts CLOUD when a group's runs disagree", () => {
+    const data: FlowRecord[] = [
+      // A local run under one mission.
+      localMapComplete("mission-local", "2026-08-08T00:10:00Z"),
+      tok("mission-local", 1000, "2026-08-08T00:09:00Z"),
+      // A hosted run under another, closing with a usage-omitting hosted
+      // completion (`single_shot.rs:51`'s `total_tokens: null` shape), so
+      // it too never enters `dcTok`.
+      rec({ ts: "2026-08-08T00:20:00Z", session_id: SID, mission_id: "mission-hosted", action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE } }),
+      tok("mission-hosted", 2000, "2026-08-08T00:19:00Z"),
+    ];
+    const t = tokensOffMeter(data);
+    // Both groups collapse to ONE `sess` key (the session id), and it has
+    // zero token-bearing bookends, so the zero-bookend branch decides.
+    expect(t.runs).toBe(1);
+    // CLOUD wins the disagreement. Under the mutation this reads 0.
+    expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
+    // The implicit-local count is 0 — never a residual.
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(0);
+  });
+
+  /** The same precedence on the TOKEN side, restated against run keys so
+   * the two halves are pinned by matching tests rather than by one. */
+  it("(MUST FIX 3, token side) cloud beats local when ONE run's own bookends disagree", () => {
+    const data: FlowRecord[] = [
+      rec({ ts: "2026-08-08T00:00:00Z", session_id: SID, mission_id: "m1", action: "dispatch start", payload: { endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:05:00Z", session_id: SID, mission_id: "m1", action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } }),
+      tok("m1", 777, "2026-08-08T00:03:00Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.cloud).toBe(777);
+    expect(t.local).toBe(0);
+    expect(t.unknown).toBe(0);
+  });
+});
+
+/**
+ * KNOWN GAPS — pinned, not claimed away.
+ *
+ * Every test in this block asserts behavior that is WRONG or INCOHERENT,
+ * and every one of them is PRE-EXISTING: identical on `main` and unchanged
+ * by the run-scoped-verdict fix above. They are here because this function
+ * has now been reasoned about five times from comments that overstated what
+ * it guaranteed, and the cheapest way to stop that is a failing-looking
+ * test with the real numbers in it.
+ *
+ * All three share ONE root cause: the verdict sets are keyed by RUN
+ * (`runKey`), but `dcTok` and `sess` — the GROUPING the run count and the
+ * double-count guard are built on — are still keyed by bare `session_id`.
+ * Fixing that moves `runs` itself and every surface derived from it, so it
+ * belongs in its own measured change rather than folded in here.
+ */
+describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
+  const SID = "task-known-gap";
+  const AZURE = "azure:my.endpoint/gpt-4o";
+
+  /** `tokenRec` above stamps no `mission_id`, which would put the telemetry
+   * under a DIFFERENT run key than the bookends these fixtures pair it
+   * with. These gaps are about grouping, so the telemetry has to belong to
+   * the run it is meant to belong to. */
+  const telem = (mission: string, prompt: number, completion: number, ts: string): FlowRecord =>
+    rec({
+      ts,
+      session_id: SID,
+      mission_id: mission,
+      category: "telemetry",
+      source: "tokens",
+      payload: { turn_seq: 1, prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion },
+    });
+
+  /**
+   * GAP A — `cloudRuns` is NOT monotonic.
+   *
+   * `cloudRuns` has two writers: the zero-bookend branch (reads
+   * `cloudTerminalKeys`) and the per-bookend branch (reads each bookend's
+   * own `endpoint`). The second takes over as soon as ONE token-bearing
+   * completion joins the group, and re-decides the whole group from the
+   * bookends it holds — so a hosted terminal that never entered `dcTok`
+   * stops counting.
+   *
+   * The hosted seat here is a real producer shape, not an invention: an
+   * endpoint that omits `usage` yields `total_tokens: null`
+   * (`SingleShotReply::total_tokens` is `Option<u64>`,
+   * `crates/darkmux-crew/src/single_shot.rs:51`) while `endpoint_label` is
+   * stamped unconditionally (`step_kinds/builtins.rs:844`). It fails
+   * `hasAnyTokenCounts` and is invisible to the per-bookend branch.
+   *
+   * The resting state is incoherent on one screen: the tokens tile reads
+   * 100% cloud while the hero says "1 local dispatch".
+   */
+  it("GAP A: cloudRuns falls from 1 to 0 when a local sibling's completion lands", () => {
+    const M = "mission-gap-a";
+    const arrivals: FlowRecord[] = [
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: M, action: "dispatch start", handle: "hosted", payload: { endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: SID, mission_id: M, action: "dispatch complete", handle: "hosted", payload: { endpoint: AZURE, result_class: "ok", total_tokens: null } }),
+      telem(M, 90, 10, "2026-08-08T00:00:03Z"),
+      rec({ ts: "2026-08-08T00:00:04Z", session_id: SID, mission_id: M, action: "dispatch start", handle: "local" }),
+      rec({ ts: "2026-08-08T00:00:05Z", session_id: SID, mission_id: M, action: "dispatch complete", handle: "local", payload: { total_tokens: 100 } }),
+    ];
+    const seq = arrivals.map((_, i) => tokensOffMeter(arrivals.slice(0, i + 1)).cloudRuns);
+    // THE GAP: it goes up, then back down.
+    expect(seq).toEqual([0, 0, 1, 1, 0]);
+
+    const t = tokensOffMeter(arrivals);
+    // The tokens are right — a hosted endpoint was called under this key.
+    expect(t.cloud).toBe(100);
+    expect(t.local).toBe(0);
+    // The dispatch line is not: it reports the hosted seat as local work.
+    expect(t.cloudRuns).toBe(0);
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
+    // And the two disagree on one screen. When this assertion starts
+    // failing, the gap is closed — update it, don't delete it.
+    expect(hybridNote(arrivals, t).text).toBe("1 local dispatch. The hybrid loop is humming, keep it up.");
+  });
+
+  /**
+   * GAP B — `runs` under-counts a recurring session id.
+   *
+   * `dcTok` groups by bare session id, so when ONE run in a group has a
+   * token-bearing bookend, the per-bookend branch classifies the whole
+   * group from that run's bookends alone and every other run in it
+   * contributes nothing.
+   *
+   * Measured on the committed corpus: 50 distinct `(session_id,
+   * mission_id)` keys carry a dispatch bookend; `runs` reports 40.
+   */
+  it("GAP B: three local runs and one hosted run under one session id report as 1 run", () => {
+    const localMapComplete = (m: string, ts: string) =>
+      rec({ ts, session_id: SID, mission_id: m, action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } });
+    const data: FlowRecord[] = [
+      localMapComplete("m1", "2026-08-07T02:40:43Z"),
+      localMapComplete("m2", "2026-08-07T02:59:34Z"),
+      localMapComplete("m3", "2026-08-07T06:03:32Z"),
+      rec({ ts: "2026-08-08T01:11:04Z", session_id: SID, mission_id: "m4", action: "dispatch complete", payload: { kind: "dispatch.map", endpoint: AZURE, remote_tokens: 147824 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // Ground truth is runs=4, cloudRuns=1, three local. Reported:
+    expect(t.runs).toBe(1);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(0);
+    // The hosted run's spend IS counted, which is the part that matters
+    // most — the under-count is of local runs, not of cloud tokens.
+    expect(t.cloud).toBe(147824);
+  });
+
+  /**
+   * GAP C — the worst of the three: a whole RUN's tokens disappear.
+   *
+   * `directRuns` skips any session id that `sess` already holds, to avoid
+   * double-counting a session with both a telemetry family and a
+   * token-bearing completion. Keyed on the bare session id, that guard
+   * fires across RUNS: run B is skipped because a DIFFERENT run A under the
+   * same session id had telemetry. B's tokens then reach no bucket at all —
+   * not cloud, not local, not even `unknown`, because they never enter
+   * `total`.
+   *
+   * With B hosted this UNDER-REPORTS hosted spend, which is a different
+   * failure from misattributing it: the operator sees a smaller number
+   * rather than a wrong one, and nothing on the card says so.
+   */
+  it("GAP C: a second run's tokens are dropped entirely when a sibling run had telemetry", () => {
+    const data: FlowRecord[] = [
+      // Run A: has a telemetry family.
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: "mA", action: "dispatch start" }),
+      telem("mA", 500, 10, "2026-08-08T00:00:02Z"),
+      rec({ ts: "2026-08-08T00:00:03Z", session_id: SID, mission_id: "mA", action: "dispatch complete", payload: { total_tokens: 510 } }),
+      // Run B: a DIFFERENT mission, hosted, token-bearing completion, no
+      // telemetry family of its own.
+      rec({ ts: "2026-08-08T00:10:00Z", session_id: SID, mission_id: "mB", action: "dispatch start", payload: { endpoint: AZURE } }),
+      rec({ ts: "2026-08-08T00:11:00Z", session_id: SID, mission_id: "mB", action: "dispatch complete", payload: { endpoint: AZURE, total_tokens: 9999 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // THE GAP: 9,999 hosted tokens are absent from every figure.
+    expect(t.total).toBe(510);
+    expect(t.cloud).toBe(0);
+    expect(t.local).toBe(510);
+    // The RUN is counted and correctly classified cloud — only its spend
+    // is missing, which is what makes this easy to miss on the card.
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(1);
   });
 });
