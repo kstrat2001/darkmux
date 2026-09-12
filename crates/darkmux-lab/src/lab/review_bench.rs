@@ -453,6 +453,21 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                     // code through `SeatRecord` is deferred rather than
                     // bundled into this fix — revisit if dialectic mode
                     // sees a live crashed-container failure of its own.
+                    //
+                    // (#2685 frontier-QA) Still true after #2685, and worth
+                    // saying because that change closed the neighbouring
+                    // hole everywhere ELSE. Ungating the `infra_exit` arm
+                    // means a dead container is infra even when the caller
+                    // scraped a verdict out of its wreckage — which fixed
+                    // this bench's freeform and agentic modes, where
+                    // `parse_freeform_review` marks any non-empty text
+                    // `parsed`. It CANNOT fire in dialectic mode: the meta
+                    // row below is constructed with `infra_exit: false`
+                    // unconditionally and `envelope_meta_with_exit` is never
+                    // called on this path, because the exit code is dropped
+                    // (`.map(|(stdout, _exit_code)| stdout)`) two lines
+                    // down. The gap is exactly the one described above, not
+                    // a new one.
                     dispatch_case(
                         prompt,
                         &format!("{}-{}", c.id, seat.label()),

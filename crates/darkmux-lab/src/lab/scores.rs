@@ -372,18 +372,34 @@ pub(crate) struct EnvelopeMeta {
     pub infra_exit: bool,
 }
 
+/// (#2685 frontier-QA) Was an envelope recovered at all, and if so what was
+/// in it? The candidate is the last stdout line starting with `{` (falling
+/// back to the whole stdout); `None` means it did not parse as JSON.
+///
+/// Shared by [`envelope_meta`] and [`envelope_meta_with_exit`] so "was an
+/// envelope recovered" is decided in exactly ONE place. The exit-promotion
+/// below used to approximate it as "no model AND no token count", which is a
+/// DIFFERENT predicate: a complete, well-formed envelope that simply carries
+/// no `metrics` object satisfies it while having a perfectly good
+/// `final_assistant` to read a verdict out of. That approximation was
+/// harmless while the promotion was gated on the caller's eligibility bool
+/// and wrong the moment it stopped being — see [`is_infra_failure`].
+fn parse_envelope(stdout: &str) -> Option<serde_json::Value> {
+    let candidate = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or(stdout);
+    serde_json::from_str::<serde_json::Value>(candidate.trim()).ok()
+}
+
 /// Parse the dispatch envelope (the last stdout line starting with `{` —
 /// tolerant of pull-progress noise ahead of it, unlike `extract_reply_text`
 /// which parses the whole stdout as one JSON value) for `metrics.model` +
 /// token totals. The envelope is compact single-line JSON, so a reply-
 /// internal brace can never appear as its own stdout line.
 pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
-    let candidate = stdout
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .unwrap_or(stdout);
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate.trim()) else {
+    let Some(v) = parse_envelope(stdout) else {
         return EnvelopeMeta::default();
     };
     let m = v.get("metrics").cloned().unwrap_or(serde_json::Value::Null);
@@ -420,8 +436,12 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
 /// distinguishes them.
 ///
 /// Only promotes to the infra reading when BOTH are true: no envelope was
-/// recovered (`model` and `total_tokens` both `None`) AND the exit code is
-/// non-zero. An envelope WAS recovered — even a `"result":"error"` one with
+/// recovered (the candidate line did not parse — [`parse_envelope`] returns
+/// `None`) AND the exit code is non-zero. (#2685 frontier-QA: that used to
+/// read "`model` and `total_tokens` both `None`", a proxy that also swept up
+/// a complete, parseable envelope carrying no `metrics` object.)
+///
+/// An envelope WAS recovered — even a `"result":"error"` one with
 /// real capability content, however degenerate — is never overridden by
 /// exit status; a non-zero exit alongside a fully-parsed envelope is left
 /// alone. That combination IS reachable, not out of scope: `runtime/src/
@@ -443,7 +463,11 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
 /// to claim zero.
 pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeMeta {
     let m = envelope_meta(stdout);
-    if exit_code != 0 && m.model.is_none() && m.total_tokens.is_none() {
+    // (#2685 frontier-QA) "No envelope was recovered" is decided by
+    // [`parse_envelope`] — the candidate line did not parse — NOT by the old
+    // proxy "no model and no token count", which also swept up a complete,
+    // parseable, merely metrics-less envelope. See that helper's doc.
+    if exit_code != 0 && parse_envelope(stdout).is_none() {
         return EnvelopeMeta { model: None, total_tokens: None, infra_exit: true };
     }
     m
@@ -494,15 +518,25 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
 ///   verdict in it is trustworthy positive evidence the model ran, and it
 ///   rightly outranks a token count that may be a metrics quirk. Eligibility
 ///   gates this arm.
-/// - **`infra_exit`** means NO envelope was recovered at all AND the
-///   container exited non-zero — [`envelope_meta_with_exit`]'s positive
-///   evidence that the dispatch DIED. There is no well-formed field to have
-///   read a verdict out of: whatever the caller judged was SCRAPED from the
-///   same unparseable stdout (`tool_bench`'s `extract_reply` falls back to
-///   the raw line and its `extract_answer` accepts a lone nonce anywhere in
-///   it; `review_bench`'s freeform parser marks any non-empty text
-///   `parsed`). A scrape off a corpse cannot overrule the evidence that it
-///   IS a corpse, so this arm is NOT gated.
+/// - **`infra_exit`** means NO envelope was recovered at all — the candidate
+///   line did not PARSE ([`parse_envelope`] returned `None`) — AND the
+///   container exited non-zero. That is [`envelope_meta_with_exit`]'s
+///   positive evidence that the dispatch DIED, and it leaves no well-formed
+///   field to have read a verdict out of: whatever the caller judged was
+///   SCRAPED from the same unparseable stdout (`tool_bench`'s
+///   `extract_reply` falls back to the raw line and its `extract_answer`
+///   accepts a lone nonce anywhere in it; `review_bench`'s freeform parser
+///   marks any non-empty text `parsed`). A scrape off a corpse cannot
+///   overrule the evidence that it IS a corpse, so this arm is NOT gated.
+///
+///   (#2685 frontier-QA) The "did not parse" reading is load-bearing for
+///   that justification and is why the promotion condition was corrected
+///   from its old "no model and no token count" proxy: under the proxy, a
+///   complete envelope carrying no `metrics` object was exit-promoted while
+///   holding a perfectly well-formed `final_assistant`, so the sentence
+///   above would have been false for it. Ungating an arm whose stated
+///   premise does not hold is exactly the defect this comment exists to
+///   prevent recurring.
 ///
 /// Gating both arms is what let a hard-killed container — a truncated
 /// envelope, a lone nonce recovered out of the wreckage — score `Pass` at
@@ -715,6 +749,41 @@ mod tests {
         let m = envelope_meta_with_exit("panicked at src/main.rs:42", 137);
         assert_eq!(m.total_tokens, None);
         assert!(m.infra_exit);
+    }
+
+    /// (#2685 frontier-QA) "No envelope was recovered" means the candidate
+    /// line DID NOT PARSE — not "no model and no token count". Those are
+    /// different predicates, and the gap between them is a complete,
+    /// well-formed envelope that simply carries no `metrics` object: it has
+    /// a perfectly good `final_assistant` to read a verdict out of, yet the
+    /// old `model.is_none() && total_tokens.is_none()` condition promoted it
+    /// to the infra reading anyway.
+    ///
+    /// That mattered only once the `infra_exit` arm stopped being gated on
+    /// the caller's eligibility bool: before, a parsed verdict masked it;
+    /// after, it classifies infra unconditionally. The whole justification
+    /// for ungating that arm is "there was no well-formed field to read a
+    /// verdict out of", which is FALSE for this shape — so the condition is
+    /// now the one the justification actually describes.
+    ///
+    /// No live producer reaches it (`runtime/src/main.rs`'s
+    /// `build_json_envelope` always emits a `metrics` object carrying
+    /// `model`), which makes this a CONTRACT defect rather than a
+    /// misclassification. Pinned so it stays fixed.
+    #[test]
+    fn envelope_meta_with_exit_never_promotes_a_parseable_envelope_that_carries_no_metrics() {
+        let stdout = r#"{"result":"stop","final_assistant":"ANSWER: DMX-QBW4MP5J"}"#;
+        let m = envelope_meta_with_exit(stdout, 137);
+        assert_eq!(m.model, None, "no metrics object, so no model");
+        assert_eq!(m.total_tokens, None, "no metrics object, so no token count");
+        assert!(
+            !m.infra_exit,
+            "the envelope PARSED — a well-formed field carried the verdict, so this is not a dead dispatch"
+        );
+        // And therefore it is never reclassified: `None` tokens is the
+        // documented ambiguous case, kept capability-side on purpose.
+        assert!(!is_infra_failure(true, Some(&m)), "unknown tokens is not positive infra evidence");
+        assert!(!is_infra_failure(false, Some(&m)));
     }
 
     /// (#1210 MUST-FIX-2, review-QA) Pins the FIRST of the two conjuncts a
