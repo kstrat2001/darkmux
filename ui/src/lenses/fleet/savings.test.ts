@@ -431,6 +431,157 @@ describe("tokensOffMeter", () => {
     expect(t.local).toBe(0);
   });
 
+  // (post-adversarial-review correction, #2659/#2687 follow-up) An earlier
+  // version of this test asserted that a `dispatch.start`'s endpoint
+  // FLOORS every bookend in a spanning group to cloud even when neither
+  // bookend restates it — that was the defect this fix removes, not
+  // desired behavior. `start-only-multi`'s session id is shared by TWO
+  // real completions with no endpoint of their own; the corrected,
+  // per-bookend rule classifies both LOCAL, exactly matching what a
+  // single-bookend session with an endpoint-only START would NOT do (see
+  // the test above it — that one stays cloud because it is genuinely ONE
+  // dispatch, not a group of siblings).
+  it("(post-review) a spanning group whose bookends carry no endpoint of their own classifies LOCAL, not floored by a dispatch.start", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "start-only-multi", action: "dispatch.start", handle: "coder", payload: { endpoint: "azure-foundry" } }),
+      tokenRec("start-only-multi", 1, 100, 10, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "start-only-multi", action: "dispatch.complete", payload: { total_tokens: 110 } }),
+      tokenRec("start-only-multi", 1, 200, 20, "2026-08-08T00:05:00Z"),
+      rec({ session_id: "start-only-multi", action: "dispatch.complete", payload: { total_tokens: 220 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
+  });
+
+  // (MUST FIX 1, #2659/#2687 follow-up — the FALSIFYING measurement) The
+  // producer this finding was actually named for: a review-probe task with
+  // FOUR sibling seats sharing one task-scoped session id — A (hosted,
+  // ERRORS), B and C (local, complete cleanly), D (hosted, completes with
+  // real usage). Measured against the floored code this fix removes: at
+  // the moment C completes (the second local completion), the group had
+  // `runs=2, cloudRuns=2` — "2 dispatches via cloud" — when ground truth
+  // is 2 local, 0 cloud. The per-bookend rule (no `epBySid` floor) gets
+  // this exactly right.
+  it("(MUST FIX 1) four sibling seats sharing one session id: after the second local completion, cloudRuns=0 and both are local", () => {
+    const sid = "task:review-probe-1";
+    const data: FlowRecord[] = [
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-A", payload: { endpoint: "azure-foundry" } }),
+      rec({ session_id: sid, action: "dispatch.error" }),
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-B" }),
+      tokenRec(sid, 1, 90, 10, "2026-08-08T00:01:00Z"),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-C" }),
+      tokenRec(sid, 1, 180, 20, "2026-08-08T00:02:00Z"),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 200 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(0);
+    // Implicit local = runs - cloudRuns - unknownRuns.
+    expect(t.unknownRuns).toBe(0);
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(2);
+  });
+
+  // (MUST FIX 1 continued) Extending the same four-seat sequence to D's
+  // real hosted completion. `cloudRuns` climbs from 0 (after C) to 1
+  // (after D) — non-decreasing across this transition, which is the exact
+  // shape the FLOORED code got backwards: with the floor, D's own endpoint
+  // disabled `bookendHasEndpoint`'s floor for the WHOLE group, dropping
+  // `cloudRuns` from 2 (after C, floored) to 1 (after D) — a decrease the
+  // operator would have watched happen live. The fix restores the correct
+  // direction for this transition.
+  //
+  // NOT claimed monotone for the FULL arrival sequence: a separate,
+  // pre-existing (CONSIDER 3) gap in the arity<=1 `else` branch — which
+  // this fix does not touch — makes `cloudRuns` read 1 for a few
+  // milliseconds right after B alone completes (before C arrives), because
+  // that branch still floors a LONE bookend via the session-wide `epBySid`
+  // map (A's `dispatch.start`/`dispatch.error` registered the endpoint).
+  // That is a real, measured dip (1 -> 0 as C completes) — identical on
+  // main, not introduced here — named rather than silently claimed fixed.
+  // See the CONSIDER 3 note above the per-bookend loop.
+  it("(MUST FIX 1) cloudRuns is non-decreasing across the arity-2-to-3 transition (C completing, then D)", () => {
+    const sid = "task:review-probe-2";
+    const throughC: FlowRecord[] = [
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-A", payload: { endpoint: "azure-foundry" } }),
+      rec({ session_id: sid, action: "dispatch.error" }),
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-B" }),
+      tokenRec(sid, 1, 90, 10, "2026-08-08T00:01:00Z"),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-C" }),
+      tokenRec(sid, 1, 180, 20, "2026-08-08T00:02:00Z"),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 200 } }),
+    ];
+    const afterC = tokensOffMeter(throughC);
+    expect(afterC.cloudRuns).toBe(0);
+
+    const throughD: FlowRecord[] = [
+      ...throughC,
+      rec({ session_id: sid, action: "dispatch.start", handle: "reviewer-D", payload: { endpoint: "azure-foundry" } }),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 300, endpoint: "azure-foundry" } }),
+    ];
+    const afterD = tokensOffMeter(throughD);
+    expect(afterD.runs).toBe(3);
+    expect(afterD.cloudRuns).toBe(1);
+    // Non-decreasing across THIS transition (0 -> 1), unlike the floored
+    // code's 2 -> 1 drop for the equivalent transition.
+    expect(afterD.cloudRuns).toBeGreaterThanOrEqual(afterC.cloudRuns);
+  });
+
+  // (MUST FIX 1, second independent producer) A hosted seat whose endpoint
+  // omits `usage` entirely stamps `endpoint` on a `total_tokens: null`
+  // complete (`single_shot.rs:51`) — it sets `epBySid` but fails
+  // `hasAnyTokenCounts`, so it never enters `dcTok` and never joins this
+  // group. Before this fix, that alone was enough to float the floor: two
+  // genuinely local siblings under the same task-scoped id both flipped to
+  // cloud. The per-bookend rule is unmoved by evidence outside the group.
+  it("(MUST FIX 1) a hosted sibling reporting no usage doesn't float two local siblings to cloud", () => {
+    const sid = "task:null-usage-hosted";
+    const data: FlowRecord[] = [
+      rec({ session_id: sid, action: "dispatch.start", handle: "hosted", payload: { endpoint: "azure-foundry" } }),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: null } }),
+      rec({ session_id: sid, action: "dispatch.start", handle: "local-1" }),
+      tokenRec(sid, 1, 90, 10, "2026-08-08T00:01:00Z"),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      rec({ session_id: sid, action: "dispatch.start", handle: "local-2" }),
+      tokenRec(sid, 1, 180, 20, "2026-08-08T00:02:00Z"),
+      rec({ session_id: sid, action: "dispatch.complete", payload: { total_tokens: 200 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
+  });
+
+  // (MUST FIX 1) The telemetry-present and telemetry-absent forms of the
+  // same dispatch shape (a hosted single dispatch that names its endpoint
+  // on both bookends) must classify IDENTICALLY — the `sess`-loop path
+  // (telemetry family present) and the `directRuns` fallback (telemetry
+  // family absent) are two different code paths reaching the SAME
+  // `dcTok` evidence, and neither should disagree with the other now that
+  // both are purely per-bookend.
+  it("(MUST FIX 1) telemetry-present and telemetry-absent forms of the same hosted dispatch classify identically", () => {
+    const dataAbsent: FlowRecord[] = [
+      rec({ session_id: "direct-cloud-1", action: "dispatch.start", payload: { endpoint: "azure-foundry" } }),
+      rec({ session_id: "direct-cloud-1", action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: 500 } }),
+    ];
+    const tAbsent = tokensOffMeter(dataAbsent);
+
+    const dataPresent: FlowRecord[] = [
+      rec({ session_id: "direct-cloud-2", action: "dispatch.start", payload: { endpoint: "azure-foundry" } }),
+      tokenRec("direct-cloud-2", 1, 450, 50, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "direct-cloud-2", action: "dispatch.complete", payload: { endpoint: "azure-foundry", total_tokens: 500 } }),
+    ];
+    const tPresent = tokensOffMeter(dataPresent);
+
+    expect(tAbsent.runs).toBe(tPresent.runs);
+    expect(tAbsent.cloudRuns).toBe(tPresent.cloudRuns);
+    expect(tAbsent.cloud).toBe(tPresent.cloud);
+    expect(tAbsent.total).toBe(tPresent.total);
+  });
+
   // (post-review, MINOR — a second population the fix widens) `dispatch.
   // single_shot`'s session id is TASK-scoped (`session_id::task`), so
   // sibling seats fanned out within one task can share it. The `(#2635)`
@@ -457,6 +608,66 @@ describe("tokensOffMeter", () => {
     expect(t.cloudRuns).toBe(0);
     expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(600);
+  });
+
+  // (MUST FIX 2, post-adversarial-review correction, #2659 follow-up)
+  // `hasAnyTokenCounts` is the single conjunct standing between "one real
+  // dispatch bookend" and "any `dispatch.complete` at all" entering
+  // `dcTok` — and per the module doc above `dcTok`'s declaration, a LOCAL
+  // `dispatch.map` step's own summary bookend carries NO token field,
+  // sharing a session id with a sibling seat's genuine, token-bearing
+  // completion. Without the conjunct, that token-less bookend would ALSO
+  // enter `dcTok`, pushing this session's bookend count from 1 to 2 and
+  // routing it through the multi-bookend path — counting TWO runs for
+  // what is really one model dispatch plus one step-completion record
+  // that never called a model at all.
+  //
+  // An earlier version of this test used `payload: {}` for the token-less
+  // completion — a shape NO producer ever emits. `DispatchMapStepKind::
+  // bookend_record` (`crates/darkmux-crew/src/step_kinds/builtins.rs:1626-
+  // 1660`) always seeds `{step_id, kind: "dispatch.map", runtime:
+  // "scheduler"}`, and its "dispatch complete" call site
+  // (`builtins.rs:2053-2064`) merges `{result_class, items_in, ok_count,
+  // failed_count}` on top — `stamp_remote_classification` no-ops both its
+  // fields when `endpoint_label` is `None` (a local step), so NEITHER
+  // `endpoint` NOR any token field is ever added, but the record is never
+  // an empty object. `payload: {}` let a mutant substituting
+  // `hasAnyTokenCounts(p)` for `Object.keys(p).length > 0` pass this test
+  // AND the full suite (44/44 here, 1697/1697 across the UI suite) while
+  // being wrong on exactly this shape: the real 6-key payload below has
+  // `Object.keys(p).length > 0` true, so the mutant would count it as a
+  // second bookend and double the run count. RED-PROVEN by deleting the
+  // `&& hasAnyTokenCounts(p)` conjunct AND by substituting the
+  // `Object.keys` mutant at the `dcTok` collection site: this test flips
+  // from `runs === 1` to `runs === 2` under either mutation.
+  it("(MUST FIX 2) a token-bearing completion plus a token-LESS local map-step completion sharing one session id count as ONE run, not two", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:map-mix", action: "dispatch.start", handle: "coder" }),
+      tokenRec("task:map-mix", 1, 90, 10, "2026-08-08T00:00:00Z"),
+      // The genuine model dispatch's own bookend — carries tokens.
+      rec({ session_id: "task:map-mix", action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      // A LOCAL `dispatch.map` step's own summary bookend under the SAME
+      // session id — the ACTUAL producer shape from `bookend_record` +
+      // its "dispatch complete" call site, carrying no `endpoint` and no
+      // token field, but very much NOT an empty object.
+      rec({
+        session_id: "task:map-mix",
+        action: "dispatch.complete",
+        payload: {
+          step_id: "map-step-1",
+          kind: "dispatch.map",
+          runtime: "scheduler",
+          result_class: "ok",
+          items_in: 3,
+          ok_count: 3,
+          failed_count: 0,
+        },
+      }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(1);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {

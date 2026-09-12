@@ -1,4 +1,4 @@
-import { isDispatchStart, isDispatchComplete, T } from "../../lib/flow";
+import { isDispatchStart, isDispatchComplete, isDispatchError, T } from "../../lib/flow";
 /**
  * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
  * savings hero's summing logic: tokens kept off the (frontier) meter, split
@@ -214,7 +214,21 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   for (const r of data) {
     const p = r.payload as TokenPayload | undefined;
     if (!r.session_id || !p) continue;
-    if (p.endpoint && (isDispatchStart(r.action) || isDispatchComplete(r.action))) {
+    // (post-review fix-pass) `isDispatchError` joins the two terminals
+    // already read here. `DispatchSingleShotStepKind::run` stamps the SAME
+    // `endpoint_label.as_deref()` on its `"dispatch start"`, `"dispatch
+    // error"`, and `"dispatch complete"` bookends alike (verified against
+    // `crates/darkmux-crew/src/step_kinds/builtins.rs:1038-1055` — all
+    // three `Self::bookend_record(...)` calls in `run_single_shot` pass the
+    // identical `endpoint_label.as_deref()`), so a hosted attempt that died
+    // before producing a token-bearing complete is still positively known
+    // to have targeted an endpoint. Reading it here is free evidence for
+    // the session-level token split (`cloud`/`unknown` a few dozen lines
+    // down) and the single/zero-bookend classification branch below — it
+    // does NOT feed the per-bookend group loop's own classification any
+    // more, since that loop no longer consults `epBySid` at all (see its
+    // own comment).
+    if (p.endpoint && (isDispatchStart(r.action) || isDispatchComplete(r.action) || isDispatchError(r.action))) {
       epBySid.set(r.session_id, String(p.endpoint));
     }
     if (isDispatchComplete(r.action) && hasAnyTokenCounts(p)) {
@@ -292,25 +306,60 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     // a session with exactly ONE bookend falls to the `else` below and
     // keeps the ORIGINAL `epBySid.has(k)` aggregate classification, never
     // `bookends[0].endpoint` alone. `epBySid` registers from a
-    // `dispatch.start` OR a `dispatch.complete` (see its own comment
-    // above); a session whose START named an endpoint but whose single
-    // COMPLETE didn't (or vice versa) would silently flip from cloud to
-    // local under a naive `bookends[0].endpoint` check — a real
-    // classification regression for the overwhelmingly common single-
-    // bookend case, in a fix that is supposed to be purely additive.
-    // Restricting the per-bookend path to `length > 1` means every
-    // existing single-bookend session classifies EXACTLY as it did before
-    // this fix; only the genuinely-spanning population (2+ real
-    // completions) takes the new path. See the pinned regression test.
+    // `dispatch.start`, `dispatch.complete`, or `dispatch.error` (see its
+    // own comment above); a session whose START named an endpoint but
+    // whose single COMPLETE didn't (or vice versa) would silently flip
+    // from cloud to local under a naive `bookends[0].endpoint` check — a
+    // real classification regression for the overwhelmingly common
+    // single-bookend case. Restricting the per-bookend path to `length >
+    // 1` means every existing single-bookend session classifies EXACTLY
+    // as it did before this fix; only the genuinely-spanning population
+    // (2+ real completions) takes the new path. See the pinned regression
+    // test.
     const bookends = dcTok.get(k);
     if (bookends && bookends.length > 1) {
+      // (#2659 follow-up, MUST FIX 1 — post-adversarial-review correction)
+      // An earlier version of this branch fell back to a session-wide
+      // `epBySid` FLOOR whenever no bookend in the group carried its own
+      // endpoint, on the theory that the endpoint evidence must simply
+      // live elsewhere (a `dispatch.start` that wasn't restated, or an
+      // errored hosted sibling). That reasoning does not hold for this
+      // population. `dcTok`'s key is TASK-SCOPED for `dispatch.single_shot`
+      // and `dispatch.map` (`dispatch_session_id` in
+      // `crates/darkmux-crew/src/step_kinds/builtins.rs:892-900`, minted by
+      // `darkmux_types::session_id::task` — "sibling seats fanned out
+      // within one task share this key"). So THIS branch's own entry
+      // condition — more than one dispatch.complete bookend under one
+      // session id — selects precisely the concurrent-sibling-seat
+      // population, not a single dispatch spanning multiple completions.
+      // `epBySid` for that key is the UNION of every sibling seat's own
+      // evidence, so using it as a floor paints every endpoint-less
+      // sibling with whatever ANY sibling (including one that errored, or
+      // one whose usage-omitting hosted complete never entered `dcTok`)
+      // happened to report. Measured: a review-probe task with four
+      // sibling seats (one hosted/errored, two local/complete, one
+      // hosted/complete) rendered "2 dispatches via cloud" for its two
+      // local completions under the floor, when ground truth is 2 local,
+      // 0 cloud — pinned in savings.test.ts. A second, error-free producer
+      // hits the same path: a hosted seat whose endpoint omits `usage`
+      // stamps `endpoint` on a `total_tokens: null` complete
+      // (`single_shot.rs:51`), which sets `epBySid` but fails
+      // `hasAnyTokenCounts` and so never joins this group — the same floor
+      // still fires off that evidence alone.
+      //
+      // Classification here is now purely per-bookend: a bookend's OWN
+      // `endpoint` field is the only evidence consulted for THIS bookend.
+      // A sibling with no endpoint of its own is positive local evidence
+      // (same criterion `localSids` uses), never floored by another
+      // sibling's evidence. `epBySid` is deliberately NOT read in this
+      // loop at all.
       for (const b of bookends) {
         if (b.endpoint) cloudRuns++;
         // No `else` for unknownRuns here: a completion (this loop only
-        // sees `isDispatchComplete` records) either names an endpoint
-        // (cloud) or doesn't — and "doesn't" is exactly the criterion
-        // `localSids` uses to prove a session local. An endpoint-less
-        // bookend is therefore positive LOCAL evidence, not unknown; it
+        // sees `isDispatchComplete` records) either carries its own
+        // endpoint or it doesn't — and "doesn't" is exactly the criterion
+        // `localSids` uses to prove a session local. A bookend with no
+        // endpoint is therefore positive LOCAL evidence, not unknown; it
         // contributes to the implicit-local count via
         // `runs - cloudRuns - unknownRuns`, same as the single-bookend
         // case always did.
@@ -331,6 +380,29 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
         // has all-local bookends (no live data exercises the divergent-
         // attribution case). Pinned in savings.test.ts so the gap is
         // visible, not silently assumed away.
+        //
+        // (CONSIDER 3, post-review) A narrower, RELATED gap remains in the
+        // `else` branch just below, not in this loop: a sibling seat whose
+        // OWN completion is the sole `dcTok` entry for its (shared,
+        // task-scoped) session id — because every OTHER sibling either
+        // hasn't completed yet or never entered `dcTok` at all (the
+        // omitted-usage shape above) — still falls to the arity<=1 `else`
+        // branch and inherits `epBySid`'s session-wide evidence there,
+        // same as it always has. That branch's `epBySid` read is REQUIRED
+        // for the genuine single-dispatch case (a lone bookend whose own
+        // START carried the endpoint — see the pinned regression test
+        // below) and this fix does not touch it, so the identical group
+        // (one hosted-endpoint sibling, one endpoint-less sibling) can
+        // still classify its endpoint-less member LOCAL at arity 2 (this
+        // loop) but CLOUD at arity 1 (the `else` branch), depending only
+        // on whether the hosted sibling's own bookend happened to enter
+        // `dcTok`. Not introduced by this fix (identical on main before
+        // it), and not resolved by it either — named here rather than
+        // silently assumed fixed. Distinguishing "one physical dispatch
+        // whose start/complete disagree" from "one sibling seat completing
+        // while others are still in flight or token-less" needs bookend
+        // identity narrower than session id (`payload.step_id`, the same
+        // #2665 mechanism named above) and is left as a follow-up.
         sessRuns++;
       }
     } else {
