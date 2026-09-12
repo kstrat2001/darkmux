@@ -2066,162 +2066,109 @@ mod tests {
     use crate::crew::types::MissionSpec;
     use darkmux_serve::RunKind;
 
-    /// (#2682 fix-pass review CONSIDER: test hygiene) RAII guard for a test
-    /// that needs a scratch `DARKMUX_HOME` — restores the PREVIOUS value on
-    /// `Drop`, including when the test body panics partway through. The
-    /// prior version of `cli_board_and_run_list_agree_on_a_crashed_local_mission`
-    /// restored the env var by hand AFTER several `unwrap()`/`unwrap_or_else
-    /// (|| panic!(..))` calls, so a single real failure in that test left
-    /// `DARKMUX_HOME` pointed at a `TempDir` about to be dropped — every
-    /// subsequent `#[serial]` test in the process would then read/write
-    /// through a directory that no longer exists. Caller must hold
-    /// `#[serial_test::serial]` — this guard does not itself serialize.
+    /// (#2697) Now a thin alias over the ONE guard
+    /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins EVERY
+    /// darkmux write destination under a single throwaway root and restores
+    /// every variable it displaced on `Drop` — including when the test body
+    /// panics partway through.
     ///
-    /// (round 3, MUST FIX 1) It pins `DARKMUX_CREW_DIR` as well, to the
-    /// SAME tempdir, and that half is what actually contains the mission
-    /// writes. `DARKMUX_HOME` alone does not: every mission/phase write in
-    /// this module routes through `crew::loader::user_state_root()`, which
-    /// resolves `config_access::crew_dir_override()` FIRST and only falls
-    /// back to `resolve(ForceUser).root` (the `DARKMUX_HOME` tier) when
-    /// that override is absent. So an operator — or a CI job, or a sibling
-    /// agent session — with `DARKMUX_CREW_DIR` exported outranks the
-    /// scratch root this guard sets, and the fixtures land in the REAL
-    /// board. Measured at this head with a sentinel exported: `cargo test
-    /// --bin darkmux mission_status::` exited 0, 98 passed, and wrote 102
-    /// mission directories (100 `matrix-*`, `dispatch-crashed-2682`, `m1`)
-    /// permanently into the sentinel — a fully green suite mutating
-    /// operator state. Pinning BOTH tiers is the same shape
-    /// `darkmux-serve`'s `runs.rs::CrewGuard` already uses; pointing both
-    /// at one tempdir keeps the child's view coherent whichever tier a
-    /// given accessor resolves through.
-    struct DarkmuxHomeGuard {
-        tmp: tempfile::TempDir,
-        prev: Option<String>,
-        prev_crew: Option<String>,
-    }
-    impl DarkmuxHomeGuard {
-        fn new() -> Self {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_HOME").ok();
-            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
-            // SAFETY: caller holds #[serial_test::serial].
-            unsafe {
-                std::env::set_var("DARKMUX_HOME", tmp.path());
-                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-            }
-            Self { tmp, prev, prev_crew }
-        }
-        fn path(&self) -> &std::path::Path {
-            self.tmp.path()
-        }
-    }
-    impl Drop for DarkmuxHomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: caller holds #[serial_test::serial].
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                    None => std::env::remove_var("DARKMUX_HOME"),
-                }
-                match &self.prev_crew {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
-                }
-            }
-        }
-    }
+    /// **The history this replaces, because it is the argument for the
+    /// alias.** This guard started as a `DARKMUX_HOME`-only pin. That was
+    /// not enough: every mission/phase write in this module routes through
+    /// `crew::loader::user_state_root()`, which resolves
+    /// `config_access::crew_dir_override()` FIRST and only falls back to the
+    /// `DARKMUX_HOME` tier when that override is absent — so anyone with
+    /// `DARKMUX_CREW_DIR` exported outranked the scratch root and the
+    /// fixtures landed in the REAL board. Measured with a sentinel
+    /// exported: `cargo test --bin darkmux mission_status::` exited 0, 98
+    /// passed, and wrote 102 mission directories permanently into the
+    /// sentinel — a fully green suite mutating operator state. So a second
+    /// variable was added. Then #2697 found the same shape one destination
+    /// over, in `darkmux-serve`: a guard pinning the crew dir, and flow
+    /// records going to the operator's real stream anyway.
+    ///
+    /// Two incidents, same cause: the guard knows about the destinations
+    /// whose leak somebody already noticed. Pinning the whole set from one
+    /// place is the fix; adding a third variable here would only have moved
+    /// the next incident. Caller must still hold `#[serial_test::serial]`.
+    type DarkmuxHomeGuard = darkmux_types::test_isolation::IsolatedState;
 
-    /// (#2682 fix-pass round 2, MUST FIX 2) RAII pin for the staleness
-    /// budget every liveness verdict in this module is measured against.
-    /// `stale_after_ms()` is `config_access::inactivity_timeout_seconds()
-    /// * 2`, whose TOP tier is `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` — a
-    /// documented operator knob. A fixture that places a mission "25
-    /// minutes ago" and expects that to read stale is therefore asserting
-    /// against a threshold the ENVIRONMENT owns: with the knob exported at
-    /// `7200`, the budget becomes 4 hours and the fixture's own premise
-    /// evaporates. That is the clock rule one axis over — freeze the
-    /// distance's DENOMINATOR, not just its numerator. Caller must hold
-    /// `#[serial_test::serial]`.
-    struct InactivityBudgetGuard {
-        prev: Option<String>,
-    }
-    impl InactivityBudgetGuard {
-        fn seconds(secs: u64) -> Self {
-            let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
-            // SAFETY: caller holds #[serial_test::serial].
-            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", secs.to_string()) };
-            Self { prev }
-        }
-    }
-    impl Drop for InactivityBudgetGuard {
-        fn drop(&mut self) {
-            // SAFETY: caller holds #[serial_test::serial].
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
-                    None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
-                }
-            }
-        }
-    }
+    /// (#2698) Now a thin alias over the shared
+    /// [`darkmux_types::test_isolation::InactivityBudget`]. Three copies of
+    /// this guard had grown in three test modules and a fourth module
+    /// (`darkmux-serve`'s `lib_tests`) had none at all — which is exactly
+    /// why its two budget-sensitive tests were still unpinned and went red
+    /// at `1` and at `86400`. One implementation, one place.
+    type InactivityBudgetGuard = darkmux_types::test_isolation::InactivityBudget;
 
-    /// (#2682 fix-pass round 3, MUST FIX 1) The guard's own contract,
-    /// asserted rather than documented. The leak this closes is SILENT —
-    /// with `DARKMUX_CREW_DIR` exported, the mission-writing tests in this
-    /// module wrote 102 mission directories into the operator's real board
-    /// and the suite still exited 0, 98 passed. Nothing in a green run
-    /// could have told anyone. So the pin gets a test that goes red when
-    /// it is removed, instead of a leak count only a reviewer running with
-    /// a sentinel directory would ever see.
+    /// The guard's own contract, asserted rather than documented. The leak
+    /// it closes is SILENT — with `DARKMUX_CREW_DIR` exported, the
+    /// mission-writing tests in this module wrote 102 mission directories
+    /// into the operator's real board and the suite still exited 0, 98
+    /// passed. Nothing in a green run could have told anyone.
     ///
     /// It asserts against `user_state_root()` — the resolver every
     /// `missions/` write in this module actually routes through — not
     /// against the env var, so it stays honest if the precedence between
     /// the two tiers is ever rearranged.
+    ///
+    /// (#2698 finding 1) It also asserts the restore of its OWN sentinel,
+    /// not only the guard's. The previous cut delegated that restore to a
+    /// little `CrewDirRestore` RAII and never checked it, so
+    /// `CrewDirRestore::drop` could be made a no-op — 8 applied lines —
+    /// with the suite fully green, 100 passed, EXIT=0. It was harmless
+    /// only by accident: another guard happened to overwrite the leaked
+    /// sentinel path before anything read it. The trap was the next
+    /// mission-writing test added WITHOUT that other guard, which would
+    /// have silently resolved to the leaked sentinel with nothing failing.
+    /// An unasserted restore is not a restore; it is a leak with a
+    /// comment. So the sentinel is now saved and checked inline, and the
+    /// separate RAII — whose whole job was the thing nobody verified — is
+    /// gone.
     #[test]
     #[serial_test::serial]
     fn the_home_guard_also_pins_the_crew_dir_that_outranks_it() {
         const SENTINEL: &str = "/darkmux-round3-sentinel-must-not-be-used";
-        // SAFETY: #[serial]. Held to the end of the test so a panicking
-        // assertion below cannot leave the sentinel exported.
-        let _restore = unsafe {
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-            std::env::set_var("DARKMUX_CREW_DIR", SENTINEL);
-            CrewDirRestore(prev)
-        };
+        let ambient = std::env::var_os("DARKMUX_CREW_DIR");
+        // SAFETY: #[serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", SENTINEL) };
 
         let guard = DarkmuxHomeGuard::new();
         let root = crew::loader::user_state_root();
-        assert_eq!(
-            root,
-            guard.path(),
-            "every missions/ write in this module resolves through user_state_root(), whose \
-             FIRST tier is crew_dir_override() — a DarkmuxHomeGuard that pins only DARKMUX_HOME \
-             leaves the fixtures landing in whatever board the environment names"
-        );
+        let pinned_ok = root == guard.path();
         drop(guard);
 
-        // …and the displaced value comes back, so the guard is not itself a leak.
-        assert_eq!(
-            std::env::var("DARKMUX_CREW_DIR").ok().as_deref(),
-            Some(SENTINEL),
-            "the guard must restore the crew dir it displaced, the same way it restores DARKMUX_HOME"
-        );
-    }
+        // The guard restored what IT displaced…
+        let after_guard = std::env::var("DARKMUX_CREW_DIR").ok();
 
-    /// Tiny RAII for the test above, so its own sentinel cannot outlive a
-    /// panicking assertion.
-    struct CrewDirRestore(Option<String>);
-    impl Drop for CrewDirRestore {
-        fn drop(&mut self) {
-            // SAFETY: the only holder is a #[serial_test::serial] test.
-            unsafe {
-                match &self.0 {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
-                }
+        // …and this test restores what IT displaced, before any assertion
+        // can panic and strand the sentinel in the process environment.
+        // SAFETY: #[serial].
+        unsafe {
+            match &ambient {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
         }
+
+        assert!(
+            pinned_ok,
+            "every missions/ write in this module resolves through user_state_root(), whose \
+             FIRST tier is crew_dir_override() — a guard that pins only DARKMUX_HOME leaves \
+             the fixtures landing in whatever board the environment names"
+        );
+        assert_eq!(
+            after_guard.as_deref(),
+            Some(SENTINEL),
+            "the guard must restore the crew dir it displaced, the same way it restores \
+             DARKMUX_HOME"
+        );
+        assert_eq!(
+            std::env::var_os("DARKMUX_CREW_DIR"),
+            ambient,
+            "and this test must leave the ambient environment exactly as it found it — the \
+             restore that went unasserted in #2698"
+        );
     }
 
     fn mission(id: &str, status: MissionStatus) -> Mission {

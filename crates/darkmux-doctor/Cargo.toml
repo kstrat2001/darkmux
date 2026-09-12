@@ -31,3 +31,12 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # (#2413) `check_host_sampler`'s tests build stale/dead-pid lock fixtures
 # via `host_sampler_lock::write_lock_state_for_test`.
 darkmux-crew = { path = "../darkmux-crew", features = ["test-support"] }
+# (#2704 fix-pass, CONSIDER B) `profiles::load_registry`'s `audit_env_read`
+# for `DARKMUX_PROFILES` sits behind `cfg(any(test, feature = "test-support"))`,
+# and darkmux-profiles is a NORMAL dependency here, so `cfg(test)` is false for
+# it in this crate's test build. Without this the key never reaches the audit
+# log and `the_guards_variable_list_covers_every_destination_the_resolvers_read`
+# cannot see DARKMUX_PROFILES at all — which is why deleting it from
+# CLEARED_STATE_VARS was EXIT=0 in every suite. Same shape as the two entries
+# above; dev-dep only, off in the release binary.
+darkmux-profiles = { path = "../darkmux-profiles", features = ["test-support"] }

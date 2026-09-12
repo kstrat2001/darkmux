@@ -1437,60 +1437,25 @@ mod tests {
     use super::*;
     use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
     use std::env;
-    use tempfile::TempDir;
 
-    /// Test fixture: temp crew_root + DARKMUX_FLOWS_DIR so flow records
-    /// emitted during transitions don't pollute the operator's actual
-    /// flow records. Both env vars get restored on drop.
-    struct CrewGuard {
-        _tmp_crew: TempDir,
-        _tmp_flows: TempDir,
-        prev_crew: Option<String>,
-        prev_flows: Option<String>,
-    }
-
-    impl CrewGuard {
-        fn new() -> Self {
-            let tmp_crew = TempDir::new().unwrap();
-            let tmp_flows = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
-            let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
-            // SAFETY: serialized via `#[serial_test::serial]` on every test
-            // that uses CrewGuard; matches the FlowsDirGuard pattern.
-            unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp_crew.path());
-                env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path());
-            }
-            Self {
-                _tmp_crew: tmp_crew,
-                _tmp_flows: tmp_flows,
-                prev_crew,
-                prev_flows,
-            }
-        }
-
-        /// (#1959) The flows dir this guard pointed `DARKMUX_FLOWS_DIR`
-        /// at — for a test that needs to read back what `flow::record`
-        /// actually wrote.
-        fn flows_path(&self) -> &std::path::Path {
-            self._tmp_flows.path()
-        }
-    }
-
-    impl Drop for CrewGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
-                }
-                match &self.prev_flows {
-                    Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
-                    None => env::remove_var("DARKMUX_FLOWS_DIR"),
-                }
-            }
-        }
-    }
+    /// (#2697) A thin alias over the ONE guard
+    /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
+    /// EVERY darkmux write destination under a single throwaway root.
+    ///
+    /// It used to pin two variables by hand — `DARKMUX_CREW_DIR` and
+    /// `DARKMUX_FLOWS_DIR` — which is the per-variable pattern that
+    /// produced this bug class: each guard knows about the destinations
+    /// whose leak somebody already noticed and is silent about the rest,
+    /// so every newly-added destination leaks until the next incident.
+    /// One list, in one place, kept honest by the resolvers themselves
+    /// (`darkmux-doctor`'s
+    /// `the_guards_variable_list_covers_every_destination_the_resolvers_read`).
+    ///
+    /// The flows dir a test needs to read back is `guard.join("flows")`,
+    /// the subpath `PINNED_STATE_VARS` documents for `DARKMUX_FLOWS_DIR`.
+    ///
+    /// Callers must hold `#[serial_test::serial]`, exactly as before.
+    type CrewGuard = darkmux_types::test_isolation::IsolatedState;
 
     fn seed_phase(id: &str, status: PhaseStatus) -> Phase {
         let s = Phase {
@@ -2386,7 +2351,7 @@ mod tests {
     /// parsed as JSON.
     fn records_with_action(guard: &CrewGuard, action: &str) -> Vec<serde_json::Value> {
         let day = darkmux_flow::day_utc_now();
-        let path = guard.flows_path().join(format!("{day}.jsonl"));
+        let path = guard.join("flows").join(format!("{day}.jsonl"));
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
         raw.lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -2563,30 +2528,25 @@ mod task_step_storage_tests {
     use super::*;
     use crate::types::{NodeStatus, Step, Task};
     use serial_test::serial;
-    use tempfile::TempDir;
 
-    struct CrewGuard {
-        _tmp: TempDir,
-        prev: Option<String>,
-    }
-
-    impl CrewGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-            std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-            Self { _tmp: tmp, prev }
-        }
-    }
-
-    impl Drop for CrewGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
-    }
+    /// (#2697) A thin alias over the ONE guard
+    /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
+    /// EVERY darkmux write destination under a single throwaway root.
+    ///
+    /// It used to pin two variables by hand — `DARKMUX_CREW_DIR` and
+    /// `DARKMUX_FLOWS_DIR` — which is the per-variable pattern that
+    /// produced this bug class: each guard knows about the destinations
+    /// whose leak somebody already noticed and is silent about the rest,
+    /// so every newly-added destination leaks until the next incident.
+    /// One list, in one place, kept honest by the resolvers themselves
+    /// (`darkmux-doctor`'s
+    /// `the_guards_variable_list_covers_every_destination_the_resolvers_read`).
+    ///
+    /// The flows dir a test needs to read back is `guard.join("flows")`,
+    /// the subpath `PINNED_STATE_VARS` documents for `DARKMUX_FLOWS_DIR`.
+    ///
+    /// Callers must hold `#[serial_test::serial]`, exactly as before.
+    type CrewGuard = darkmux_types::test_isolation::IsolatedState;
 
     fn task(id: &str, phase_id: &str) -> Task {
         Task {

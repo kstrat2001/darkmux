@@ -127,13 +127,111 @@ fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
 /// `DARKMUX_HOME`-tier resolution for every spawn at once; the handful of
 /// tests that genuinely exercise the override still set it explicitly
 /// afterward, and a later `.env` wins over this `.env_remove`.
+///
+/// (#2704 fix-pass, MUST FIX 4) And now EVERY other state variable, taken
+/// from `test_isolation`'s two lists rather than one at a time. Hand-
+/// maintaining this helper's own little set is the bug class #2697
+/// filed, reproduced here: `DARKMUX_CREW_DIR` was cleared because someone
+/// hit it, and the other twelve were inherited straight from the ambient
+/// shell. `DARKMUX_AUDIT_DIR` is the one that mattered. Measured at this
+/// head with the dir set exported to a sentinel and a fake `$HOME`:
+/// `cargo test --test cli -- machine_ flow_ init_ config_` returned
+/// EXIT=0, 27 passed, while writing `sentinel/audit/2026-09-12.jsonl`
+/// with 26 BLAKE3-chained records — `mission start`, `phase start`,
+/// `step start` and `dispatch start` for a fabricated mission, with
+/// `model: stub-model`, carrying the operator's real `machine_id` and
+/// `machine_uid`. A green suite, and #2697's stated harm exactly:
+/// hash-chained records cannot be removed without breaking the chain.
+///
+/// They are REMOVED rather than pinned, so each falls back to a default
+/// derived from the `DARKMUX_HOME` this helper already pins — which keeps
+/// `darkmux_cmd_in_project`'s single `.env("DARKMUX_HOME", …)` override
+/// sufficient to move the whole set at once. A later `.env` still wins
+/// over an `env_remove`, so the handful of tests that exercise a specific
+/// override are untouched.
 fn darkmux_std_cmd() -> std::process::Command {
     let (home, darkmux_home) = isolated_roots();
     let mut cmd = std::process::Command::new(darkmux_bin_path());
-    cmd.env("HOME", home)
-        .env("DARKMUX_HOME", darkmux_home)
-        .env_remove("DARKMUX_CREW_DIR");
+    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
+    neutralize_state_vars(&mut cmd);
     cmd
+}
+
+/// Clear every darkmux state variable EXCEPT `DARKMUX_HOME`, so the child
+/// derives all of them from whichever root the caller pinned.
+///
+/// Taken from `test_isolation`'s two lists rather than written out, so a
+/// destination added there later is covered here the moment it lands. A
+/// later `.env` still wins over an `env_remove`, so a test that genuinely
+/// exercises one override sets it after calling this and is unaffected.
+///
+/// Applied to the `sh` spawns too (`run_wait_command`), not just the ones
+/// that name the binary: that command's script calls `$DARKMUX_BIN`, so
+/// the child is a darkmux process either way, and an inherited
+/// `DARKMUX_MODS_DIR` there made the seeding side and the reading side of
+/// the same test resolve to different stores.
+fn neutralize_state_vars(cmd: &mut std::process::Command) {
+    use darkmux_types::test_isolation::{CLEARED_STATE_VARS, PINNED_STATE_VARS};
+    for (var, _) in PINNED_STATE_VARS {
+        if *var != "DARKMUX_HOME" {
+            cmd.env_remove(var);
+        }
+    }
+    for var in CLEARED_STATE_VARS {
+        cmd.env_remove(var);
+    }
+}
+
+/// The helper above, asserted — cheaply, without spawning anything.
+///
+/// `darkmux_std_cmd`'s isolation is a property of the `Command` it
+/// returns, so it can be read back from `get_envs()`. That makes the
+/// contract enforceable in-process: every variable `test_isolation` knows
+/// about must be either pinned under this spawn's own root or explicitly
+/// removed, with nothing left to inherit from the ambient shell.
+///
+/// Self-maintaining off the two lists, which is the point: a destination
+/// added to `PINNED_STATE_VARS` later is covered here the moment it lands,
+/// rather than waiting for someone to notice a fourth hand-rolled copy.
+#[test]
+fn the_spawn_helper_neutralizes_every_variable_the_isolation_guard_knows_about() {
+    use darkmux_types::test_isolation::{CLEARED_STATE_VARS, PINNED_STATE_VARS};
+    use std::ffi::OsStr;
+
+    let cmd = darkmux_std_cmd();
+    let envs: BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+
+    let root = envs
+        .get(OsStr::new("DARKMUX_HOME"))
+        .and_then(|v| *v)
+        .expect("the spawn helper must pin DARKMUX_HOME");
+    assert!(
+        std::path::Path::new(root).starts_with(std::env::temp_dir()),
+        "the spawn root must be a throwaway, got {root:?}"
+    );
+
+    for (var, _) in PINNED_STATE_VARS {
+        if *var == "DARKMUX_HOME" {
+            continue;
+        }
+        assert_eq!(
+            envs.get(OsStr::new(*var)),
+            Some(&None),
+            "{var} is a darkmux write destination and this helper spawns the REAL binary, so \
+             leaving it to be inherited points a child at whatever the ambient shell names — \
+             the operator's own tree in an ordinary terminal. It must be removed (so it \
+             derives from the pinned DARKMUX_HOME) or pinned under the spawn root."
+        );
+    }
+    for var in CLEARED_STATE_VARS {
+        assert_eq!(
+            envs.get(OsStr::new(*var)),
+            Some(&None),
+            "{var}'s PRESENCE changes behavior, so an inherited value is not merely a \
+             misplaced write. DARKMUX_AUDIT_DIR is the sharp one: it turns the hash-chained \
+             audit sink on, and chained records cannot be removed without breaking the chain."
+        );
+    }
 }
 
 /// The default: an `assert_cmd::Command` for the darkmux binary,
@@ -9026,14 +9124,21 @@ fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Outp
     // the same one. `HOME` is a throwaway so the accessors that resolve
     // through `dirs::home_dir()` instead (see `darkmux_std_cmd`'s doc) can't
     // reach the operator either.
-    std::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .env("HOME", isolated_roots().0)
         .env("DARKMUX_HOME", home)
-        .env("DARKMUX_BIN", darkmux_bin_path())
-        .output()
-        .expect("the wait command runs")
+        .env("DARKMUX_BIN", darkmux_bin_path());
+    // (#2704 fix-pass) Same neutralization as `darkmux_std_cmd`. Measured
+    // before this line: with `DARKMUX_MODS_DIR` exported, the seeding side
+    // (`record_mod_for`, which goes through `darkmux_cmd()`) wrote to
+    // `<home>/mods` while THIS child inherited the ambient store and read
+    // somewhere else, so `the_wait_command_returns_at_once…` polled the
+    // full 60-second bound and failed. They agreed before only because
+    // BOTH inherited — agreement by coincidence, not isolation.
+    neutralize_state_vars(&mut cmd);
+    cmd.output().expect("the wait command runs")
 }
 
 /// (#2310 P4e) The SHAPE of the change: no local seat is staffed for mod
@@ -9193,14 +9298,14 @@ fn run_wait_command_with_bin(
     command: &str,
     darkmux_bin: &str,
 ) -> std::process::Output {
-    std::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .env("HOME", isolated_roots().0)
         .env("DARKMUX_HOME", home)
-        .env("DARKMUX_BIN", darkmux_bin)
-        .output()
-        .expect("the wait command runs")
+        .env("DARKMUX_BIN", darkmux_bin);
+    neutralize_state_vars(&mut cmd);
+    cmd.output().expect("the wait command runs")
 }
 
 /// (#2552) `mod list` never runs at all — the binary the step calls back

@@ -10450,34 +10450,37 @@ mod tests {
     /// directly — so it inherits the SAME env>config>default ladder AND the
     /// SAME test-build isolation every sibling accessor already has. This
     /// drives `check_state_file_permissions()` itself (not the pure
-    /// builder), isolated via `DARKMUX_HOME`, and proves a file planted at
-    /// the resolved `findings_dir()` is the one the check finds.
+    /// builder), and proves a file planted at the resolved
+    /// `findings_dir()` is the one the check finds.
+    ///
+    /// (#2695) Isolated with the shared
+    /// [`IsolatedState`](darkmux_types::test_isolation::IsolatedState)
+    /// rather than a hand-rolled `DARKMUX_HOME` pin. It had the SAME
+    /// defect the keystone test below was filed for, one test over:
+    /// `findings_dir()` resolves `env(DARKMUX_FINDINGS_DIR) >
+    /// config.dirs.findings > <root>/findings`, so pinning only the root
+    /// left the higher-precedence override in charge. Measured: with
+    /// `DARKMUX_FINDINGS_DIR` exported, this test failed on its own setup
+    /// sanity assertion ("must resolve under our isolated DARKMUX_HOME,
+    /// got /tmp/…"). Found by sweeping this crate's suite with the whole
+    /// override set exported — not by reading, which had already passed
+    /// over it twice.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn check_state_file_permissions_resolves_paths_through_config_access() {
-        let tmp = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_HOME", tmp.path());
-        }
+        let state = darkmux_types::test_isolation::IsolatedState::new();
 
         let findings_dir = darkmux_types::config_access::findings_dir();
         assert!(
-            findings_dir.starts_with(tmp.path()),
-            "test setup sanity: findings_dir() must resolve under our isolated DARKMUX_HOME, got {}",
+            findings_dir.starts_with(state.path()),
+            "test setup sanity: findings_dir() must resolve under the isolated state root, got {}",
             findings_dir.display()
         );
         write_at_mode(&findings_dir, "leaky.json", 0o644);
 
         let check = check_state_file_permissions();
-
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
+        drop(state);
 
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
@@ -10487,55 +10490,389 @@ mod tests {
         );
     }
 
-    /// (#2452 review) The production wrapper's SIX roots must every one of
-    /// them land under an isolated `DARKMUX_HOME`. Two do not isolate
-    /// themselves in a test build — `fleet_file()` carries no test guard by
-    /// design (`fleet_file_default`'s doc) and `missions_dir()` resolves via
-    /// `darkmux_crew`'s `user_state_root()`, whose `test-support` feature is
-    /// empty — so an un-isolated `run()` would WALK the developer's real
-    /// `~/.darkmux/missions`. This pins that `DARKMUX_HOME` covers all six,
-    /// which is what makes the isolation on the two `run()` tests sufficient.
+    /// The keystone isolation test (#2695).
+    ///
+    /// **What it asserts.** Not "`DARKMUX_HOME` works" — the *property*:
+    /// with [`IsolatedState`](darkmux_types::test_isolation::IsolatedState)
+    /// held, EVERY destination darkmux can write resolves under that one
+    /// throwaway root, and none of them resolves into the operator's real
+    /// `~/.darkmux`. Stated that way it is the thing that goes red when a
+    /// FUTURE destination is added without a guard, which is the only
+    /// durable defense against this bug class. Proven to do so: adding a
+    /// probe destination that resolves outside the isolated root fails
+    /// this test with that destination named.
+    ///
+    /// **Why it used to be backwards.** The previous cut set only
+    /// `DARKMUX_HOME` and then asserted `missions_dir()` landed under it.
+    /// But `user_state_root()` resolves `crew_dir_override()` — that is,
+    /// `env(DARKMUX_CREW_DIR) > config.dirs.crew` — BEFORE `DARKMUX_HOME`
+    /// ever gets a look in. So the assertion was correct and the setup was
+    /// not: anyone who had exported a scratch `DARKMUX_CREW_DIR`, which is
+    /// the careful thing to do and what agent sessions are told to do, got
+    /// a red suite for doing it right, while anyone who exported nothing
+    /// got a green one INCLUDING in the case the guard exists to catch. A
+    /// suite run with `DARKMUX_CREW_DIR` exported wrote 102 mission
+    /// directories into a real board and reported 98 passed.
+    ///
+    /// The fix is to neutralize every override that outranks the root,
+    /// enumerated from the resolvers rather than from memory — which is
+    /// exactly what `IsolatedState` is, so this test simply holds one.
+    ///
+    /// **The residual it also measures.** Six destinations have no env
+    /// tier at all — `hooks_outbox_dir()` and `hooks_adapters_dir()` are
+    /// config-only by design, and `liveness_dir()`,
+    /// `host_sampler_lock_path()`, `cache_dir()` and
+    /// `lessons::global_db_path()` derive straight off the root. They are
+    /// asserted here too, so if a config-tier relocation ever lets one
+    /// escape a root pin, the escape is a red test rather than a silent
+    /// write.
+    ///
+    /// **And the list itself is held, not just its contents.** The
+    /// membership test below
+    /// (`the_guards_variable_list_covers_every_destination_the_resolvers_read`)
+    /// is keyed on env-var READS, so it is structurally blind to exactly
+    /// those six: an entry with no variable to read can be deleted from
+    /// `resolved` and nothing anywhere goes red — the list just quietly
+    /// stops checking it, which is the erosion this whole change exists to
+    /// stop. [`NO_ENV_TIER_DESTINATIONS`] and
+    /// [`RESOLVED_DESTINATION_COUNT`] are what hold them. Red-proven by
+    /// deleting all six entries (6 applied lines): EXIT=101 naming each
+    /// missing label, where before the assertion the same deletion left
+    /// `-p darkmux-doctor --lib` at EXIT=0, 273 passed.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn every_state_root_resolves_under_an_isolated_darkmux_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var("DARKMUX_HOME").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_HOME", tmp.path());
-        }
+        use darkmux_types::config_access as ca;
 
-        let resolved = [
-            ("hooks outbox", darkmux_types::config_access::hooks_outbox_dir()),
-            ("fleet roster", darkmux_types::config_access::fleet_file()),
-            ("mission/phase state", darkmux_crew::loader::missions_dir()),
-            ("findings", darkmux_types::config_access::findings_dir()),
-            ("mods", darkmux_types::config_access::mods_dir()),
-            ("flow records", darkmux_types::config_access::flows_dir()),
+        /// The destinations with NO env tier of their own, named so that
+        /// their membership in `resolved` is held by an assertion rather
+        /// than by memory. The membership test below keys on env-var
+        /// reads and is therefore blind to every one of these.
+        const NO_ENV_TIER_DESTINATIONS: &[&str] = &[
+            "hooks outbox",
+            "hooks adapters",
+            "liveness heartbeats",
+            "host-sampler lock",
+            "cache",
+            "global lessons db",
         ];
 
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
+        /// How many destinations `resolved` must carry. A bare count is
+        /// crude, but it is the only thing that goes red when an entry
+        /// the membership test cannot see is dropped. Bump it — in the
+        /// same commit as the entry — when a real destination is added.
+        const RESOLVED_DESTINATION_COUNT: usize = 21;
+
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+
+        // Every write destination the resolvers name. Derived from
+        // `config_access`'s path accessors + `darkmux_crew`'s own roots,
+        // NOT from the incidents that produced this test — the whole
+        // point is that the list outlives any one incident.
+        let resolved = vec![
+            // ── config-only / root-derived (no env tier of their own) ──
+            ("hooks outbox", ca::hooks_outbox_dir()),
+            ("hooks adapters", ca::hooks_adapters_dir()),
+            ("liveness heartbeats", ca::liveness_dir()),
+            ("host-sampler lock", ca::host_sampler_lock_path()),
+            ("cache", ca::cache_dir()),
+            // ── crew/user state: `DARKMUX_CREW_DIR` OUTRANKS the root ──
+            ("crew user-state root", darkmux_crew::loader::user_state_root()),
+            ("mission/phase state", darkmux_crew::loader::missions_dir()),
+            ("phase state", darkmux_crew::loader::phases_dir()),
+            ("global lessons db", darkmux_crew::lessons::global_db_path()),
+            // ── three-tier dirs (env > config > root-derived default) ──
+            ("fleet roster", ca::fleet_file()),
+            ("findings", ca::findings_dir()),
+            ("mods", ca::mods_dir()),
+            ("flow records", ca::flows_dir()),
+            ("lab runs", ca::lab_dir()),
+            ("notebook", ca::notebook_dir()),
+            // ── override-or-caller-default accessors ──
+            (
+                "audit chain",
+                ca::audit_dir_override().unwrap_or_else(|| state.join("audit")),
+            ),
+            ("acks", ca::ack_dir_override().unwrap_or_else(|| state.join("acks"))),
+            (
+                "identity",
+                // `.md` — production's default is `<root>/identity.md`
+                // (`crew::dispatch::identity_path`). The fallback here
+                // must match it, or this test self-confirms whatever
+                // `PINNED_STATE_VARS` happens to say.
+                ca::identity_path_override().unwrap_or_else(|| state.join("identity.md")),
+            ),
+            // ── the root's own files ──
+            ("config.json", darkmux_types::paths::resolve(Default::default()).config),
+            ("profiles.json", darkmux_types::paths::resolve(Default::default()).profiles),
+            ("sandboxes", darkmux_types::paths::resolve(Default::default()).sandboxes),
+        ];
+
+        // Hold the LIST before iterating it. A loop over `resolved` can
+        // only speak about entries that are still in `resolved`; these two
+        // assertions are what make a deletion red.
+        let labels: Vec<&str> = resolved.iter().map(|(label, _)| *label).collect();
+        for want in NO_ENV_TIER_DESTINATIONS {
+            assert!(
+                labels.contains(want),
+                "destination {want:?} has no env var, so pinning the root is the ONLY thing \
+                 that isolates it and this loop is the only thing that checks. It was dropped \
+                 from `resolved`. Nothing else in the suite covers it — the membership test \
+                 keys on env-var reads, and there is no read to see. Put it back.\n\
+                 Present: {labels:?}"
+            );
         }
+        assert_eq!(
+            labels.len(),
+            RESOLVED_DESTINATION_COUNT,
+            "the destination list changed size. If you ADDED a destination, bump \
+             RESOLVED_DESTINATION_COUNT in the same commit. If you REMOVED one, say why in the \
+             commit message — an entry silently leaving this list is how the per-variable \
+             isolation this test replaced eroded in the first place.\n\
+             Present: {labels:?}"
+        );
 
         let real = dirs::home_dir().map(|h| h.join(".darkmux"));
         for (label, path) in resolved {
             assert!(
-                path.starts_with(tmp.path()),
-                "root {label:?} escaped the isolated DARKMUX_HOME and resolved to {}",
+                path.starts_with(state.path()),
+                "destination {label:?} escaped the isolated state root and resolved to {}. \
+                 Every darkmux write destination must resolve under one guard — if this is a \
+                 NEW destination, give it an entry in `test_isolation::PINNED_STATE_VARS` (or \
+                 `CLEARED_STATE_VARS` when its presence carries meaning), not a new one-off \
+                 guard in whichever suite happened to notice.",
                 path.display()
             );
             if let Some(real) = real.as_ref() {
                 assert!(
                     !path.starts_with(real),
-                    "root {label:?} resolved into the operator's real tree: {}",
+                    "destination {label:?} resolved into the operator's real tree: {}",
                     path.display()
                 );
             }
         }
+    }
+
+    /// The guard's own restore, asserted (#2698 finding 1). A restore that
+    /// is never asserted can be deleted with the suite fully green — which
+    /// is exactly what was measured: making a restore a no-op left 100
+    /// passed, EXIT=0, harmless only by the accident that another guard
+    /// happened to overwrite the leaked path first.
+    ///
+    /// Both shapes matter and only one of them is obvious: a variable that
+    /// HAD a value must get that value back, and a variable that was UNSET
+    /// must be removed again rather than left behind pointing at the
+    /// guard's now-deleted tempdir — a leftover of the second shape is how
+    /// a later, unguarded test silently resolves into a path that no
+    /// longer exists.
+    #[test]
+    #[serial_test::serial]
+    fn the_isolation_guard_restores_every_variable_it_displaced() {
+        use darkmux_types::test_isolation::{
+            IsolatedState, CLEARED_STATE_VARS, PINNED_STATE_VARS,
+        };
+
+        let touched: Vec<&str> = PINNED_STATE_VARS
+            .iter()
+            .map(|(v, _)| *v)
+            .chain(CLEARED_STATE_VARS.iter().copied())
+            .collect();
+        let before: Vec<(&str, Option<std::ffi::OsString>)> =
+            touched.iter().map(|v| (*v, std::env::var_os(v))).collect();
+
+        {
+            let _state = IsolatedState::new();
+        }
+
+        for (var, prev) in before {
+            assert_eq!(
+                std::env::var_os(var),
+                prev,
+                "{var} was not restored to exactly what it was before the guard — a guard \
+                 that leaks its own pin is not isolation, it is a slower leak"
+            );
+        }
+    }
+
+    /// The guard's variable list, kept honest by the RESOLVERS rather than
+    /// by anyone's memory (#2695: "enumerate the overrides from the
+    /// resolver, since the list is the part that will drift").
+    ///
+    /// A list-iterating test cannot notice an entry that was DELETED — it
+    /// simply stops checking it. Measured during the fix: deleting the
+    /// `DARKMUX_FLOWS_DIR` entry left the per-entry contract test green,
+    /// because the loop no longer had anything to say about it. So this
+    /// test works the other direction: it turns on `env_audit`'s existing
+    /// read instrumentation, drives every destination resolver, and reads
+    /// back the set of `DARKMUX_*` keys those resolvers ACTUALLY consulted.
+    /// Every such key that names a location must appear in
+    /// `PINNED_STATE_VARS` or `CLEARED_STATE_VARS`.
+    ///
+    /// **What that is, stated exactly, because the obvious summary of it
+    /// is false.** This test is self-maintaining for **deletions of
+    /// env-keyed entries whose resolver is already in the driver list
+    /// below**: remove `DARKMUX_FLOWS_DIR` from `PINNED_STATE_VARS` and
+    /// this goes red naming the key, because `flows_dir()` still reads it.
+    /// That is the erosion direction, and it is genuinely covered.
+    ///
+    /// It is **hand-maintained in the other direction.** Adding a new
+    /// write destination goes red here only when BOTH of these hold, and
+    /// neither is automatic:
+    ///
+    /// 1. someone adds its resolver to the ~20-call driver list below.
+    ///    There is no registry of destination accessors to enumerate, so
+    ///    this is a manual step — the same convention this change
+    ///    replaces, moved one file over. Stated plainly rather than sold
+    ///    as automation.
+    /// 2. the read goes through `config_access`'s instrumented `env_str`
+    ///    chokepoint rather than a bare `std::env::var`.
+    ///
+    /// And a destination with **no env var at all** is structurally
+    /// invisible to this test in both directions — there is no read to
+    /// record. Those are held instead by the keystone's
+    /// `NO_ENV_TIER_DESTINATIONS` and `RESOLVED_DESTINATION_COUNT`, which
+    /// a future author adding such a destination must extend.
+    ///
+    /// Measured (2026-09-12 review). Three probe destinations appended to
+    /// `config_access` — one reading `DARKMUX_PROBE_A_DIR`, one with no
+    /// env tier resolving outside the root, one reading
+    /// `DARKMUX_PROBE_ROOT` — left this test and the keystone at EXIT=0,
+    /// 3 passed. With only their driver calls added it went EXIT=101
+    /// naming `DARKMUX_PROBE_A_DIR` **and nothing else**: the no-env-tier
+    /// probe had nothing to record, and `DARKMUX_PROBE_ROOT` was dropped
+    /// by what used to be a third condition — **the variable's NAME**, an
+    /// inclusion filter on the `_DIR` / `_FILE` / `_PATH` convention.
+    ///
+    /// That third condition is gone. The filter is now deny-by-default
+    /// (`NOT_A_DESTINATION`, below), so a destination whose name does not
+    /// follow the convention is caught rather than silently dropped.
+    /// Safe to widen because it was measured rather than assumed: the
+    /// driven resolvers read 13 keys and all 13 are destinations, so the
+    /// exclusion list is empty. A behavior knob that a destination
+    /// resolver reads in future belongs in that list — never in
+    /// `PINNED_STATE_VARS`, which would pin a knob to a path.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn the_guards_variable_list_covers_every_destination_the_resolvers_read() {
+        use darkmux_types::config_access as ca;
+        use darkmux_types::test_isolation::{
+            IsolatedState, CLEARED_STATE_VARS, PINNED_STATE_VARS,
+        };
+
+        let log = tempfile::tempdir().unwrap();
+        let log_path = log.path().join("env-reads.tsv");
+        let prev_log = std::env::var_os("DARKMUX_ENV_AUDIT_LOG");
+        // SAFETY: #[serial]. Set BEFORE the guard so every read below is
+        // instrumented, and it is not itself a destination variable.
+        unsafe { std::env::set_var("DARKMUX_ENV_AUDIT_LOG", &log_path) };
+
+        {
+            let _state = IsolatedState::new();
+            // Drive every destination resolver. The audit sink records
+            // which env keys each one consults, however indirectly.
+            let _ = ca::hooks_outbox_dir();
+            let _ = ca::hooks_adapters_dir();
+            let _ = ca::liveness_dir();
+            let _ = ca::cache_dir();
+            let _ = ca::fleet_file();
+            let _ = ca::findings_dir();
+            let _ = ca::mods_dir();
+            let _ = ca::flows_dir();
+            let _ = ca::lab_dir();
+            let _ = ca::notebook_dir();
+            let _ = ca::audit_dir_override();
+            let _ = ca::ack_dir_override();
+            let _ = ca::identity_path_override();
+            let _ = ca::templates_override_dirs();
+            let _ = ca::skills_override_dirs();
+            // (#2704 fix-pass, CONSIDER B) `DARKMUX_PROFILES` was the one
+            // list entry whose deletion NOTHING caught: no `config_access`
+            // accessor reads it, so without this line the key never
+            // reached the audit log and removing it from
+            // `CLEARED_STATE_VARS` was EXIT=0 in darkmux-types,
+            // darkmux-doctor AND tests/cli.rs. `load_registry` is its one
+            // instrumented chokepoint. The `Result` is discarded on
+            // purpose — under the guard there is no registry to find, and
+            // this call is here for the env READ it performs, not its
+            // outcome.
+            let _ = darkmux_profiles::profiles::load_registry(None);
+            let _ = darkmux_crew::loader::user_state_root();
+            let _ = darkmux_crew::loader::missions_dir();
+            let _ = darkmux_crew::loader::phases_dir();
+            let _ = darkmux_crew::lessons::global_db_path();
+            let _ = darkmux_types::paths::resolve(Default::default());
+        }
+
+        // SAFETY: #[serial].
+        unsafe {
+            match prev_log {
+                Some(v) => std::env::set_var("DARKMUX_ENV_AUDIT_LOG", v),
+                None => std::env::remove_var("DARKMUX_ENV_AUDIT_LOG"),
+            }
+        }
+
+        // Keys these resolvers read that are NOT write destinations.
+        //
+        // This is deny-by-default on purpose. The previous cut was an
+        // INCLUSION filter on the project's naming convention (`_DIR` /
+        // `_FILE` / `_PATH`, plus two names), and a destination variable
+        // that did not happen to obey it escaped silently — measured in
+        // review with a probe accessor reading `DARKMUX_PROBE_ROOT`, which
+        // this test did not notice even with its driver call added. An
+        // exclusion list inverts that: a new key is guarded unless someone
+        // writes it down here, and writing it down is a reviewable act.
+        //
+        // Measured 2026-09-12: the resolvers driven below read 13 keys and
+        // all 13 are destinations, so this list is empty. A behavior knob
+        // read by a destination resolver belongs here — NOT in
+        // `PINNED_STATE_VARS`, which would pin a knob to a path.
+        const NOT_A_DESTINATION: &[&str] = &[];
+
+        let raw = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let mut destination_keys: Vec<&str> = raw
+            .lines()
+            .filter_map(|l| l.split('\t').nth(1))
+            .filter(|k| k.starts_with("DARKMUX_") && !NOT_A_DESTINATION.contains(k))
+            .collect();
+        destination_keys.sort_unstable();
+        destination_keys.dedup();
+
+        assert!(
+            !destination_keys.is_empty(),
+            "the env-read audit recorded nothing — this test proves nothing unless the \
+             instrumentation actually fired. Log at {}",
+            log_path.display()
+        );
+
+        let known: Vec<&str> = PINNED_STATE_VARS
+            .iter()
+            .map(|(v, _)| *v)
+            .chain(CLEARED_STATE_VARS.iter().copied())
+            .collect();
+        let unguarded: Vec<&&str> =
+            destination_keys.iter().filter(|k| !known.contains(k)).collect();
+        assert!(
+            unguarded.is_empty(),
+            "these variables are read by darkmux's own resolvers and are accounted for \
+             nowhere: {unguarded:?}. Each needs ONE of three homes. Decide by asking what the \
+             variable IS — not by picking whichever makes this test pass:\n\
+             \n\
+             • It NAMES a write destination and nothing more -> \
+             `test_isolation::PINNED_STATE_VARS`, with the subpath its built-in default \
+             produces.\n\
+             • It names a destination AND its presence changes behavior (the way \
+             `DARKMUX_AUDIT_DIR`'s mere presence turns the hash-chained sink on) -> \
+             `test_isolation::CLEARED_STATE_VARS`, which removes it instead of pinning it.\n\
+             • It is a BEHAVIOR KNOB that a destination resolver happens to read — a bool, a \
+             number, an enum, a mode — -> `NOT_A_DESTINATION`, the list at the top of THIS \
+             test. Never `PINNED_STATE_VARS`: that would write a path string into a knob, \
+             which a bool reads as false and a number or an enum reads as garbage, and this \
+             test would go green having silently changed the behavior under test.\n\
+             \n\
+             Recorded keys: {destination_keys:?}"
+        );
     }
 
     // ─── check_utility_model_binding (#590) ───────────────────────────
