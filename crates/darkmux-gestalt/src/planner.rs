@@ -636,10 +636,29 @@ pub fn plan_acquire(
         }
     }
 
-    // ── assembly: the free phase in host-reported order, then decisions ──
+    // ── assembly: refusals, then the free phase, then the rest ───────────
+    // (#2674 refuse-fast) Every `Block` sorts to the FRONT of the action
+    // list, ahead of the free phase and every load — so no mutating action
+    // can commit before every refusal in this SAME plan has been decided.
+    // This is the same free/commit discipline `ReconcileFree` already
+    // applies to one reconcile's own stale ("a refused reconcile must not
+    // unload its stale"), raised to the whole plan: before #2674, a plan
+    // whose LATER placement Blocked still emitted an EARLIER placement's
+    // pass-1 unload / reconcile pair / fresh load ahead of it, and
+    // `execute_plan` — which runs actions in order and stops at the first
+    // failure, a `Block` included — committed those host-side before ever
+    // reaching the refusal. The wave then failed over a host matching
+    // neither the pre-plan nor the desired state (orphaned residency).
+    // Refusals are non-mutating, so hoisting them costs nothing to execute
+    // and makes a serialized plan lead with WHY it will not proceed.
+    // Relative order among the refusals themselves is preserved
+    // (desired-input order), so the refusal a caller reports is unchanged.
     unloads.sort_by_key(|(idx, _)| *idx);
-    let mut actions: Vec<PlannedAction> = unloads.into_iter().map(|(_, a)| a).collect();
-    actions.extend(decisions);
+    let (blocks, proceeding): (Vec<PlannedAction>, Vec<PlannedAction>) =
+        decisions.into_iter().partition(|d| matches!(d.action, Action::Block { .. }));
+    let mut actions: Vec<PlannedAction> = blocks;
+    actions.extend(unloads.into_iter().map(|(_, a)| a));
+    actions.extend(proceeding);
     Plan {
         actions,
         quarantined: Vec::new(),
@@ -1689,13 +1708,19 @@ mod tests {
             plan.actions
         );
         assert!(
-            matches!(&plan.actions[0], PlannedAction { reason: Reason::InsufficientCtx, .. }),
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, PlannedAction { reason: Reason::InsufficientCtx, .. })),
             "the FIRST placement's reconcile survives: {:?}",
-            plan.actions[0]
+            plan.actions
         );
-        let second = plan.actions.last().expect("two decisions");
+        // (#2674) The refusal leads the plan — the surviving reconcile is
+        // still PLANNED (the artifact shows what would have happened) but
+        // can never COMMIT ahead of it, so a wave that fails on this Block
+        // leaves residency untouched rather than half-reconciled.
+        let refusal = plan.actions.first().expect("two decisions");
         assert_eq!(
-            second,
+            refusal,
             &PlannedAction {
                 action: Action::Block {
                     model_key: "shared".into(),
@@ -2118,6 +2143,184 @@ mod tests {
         for (plan, label) in &battery() {
             assert_two_pass(plan, label);
         }
+        for (plan, label) in &blocking_battery() {
+            assert_two_pass(plan, label);
+        }
+    }
+
+    #[test]
+    fn no_mutation_precedes_a_refusal() {
+        // (#2674) The refuse-fast ordering contract as a global invariant:
+        // in EVERY produced plan, no Load and no Unload may appear before
+        // any Block. `execute_plan` runs actions in order and stops at the
+        // first Block, so a mutating action ahead of one is a host-side
+        // commit on a plan that was always going to fail — the orphaned-
+        // residency exposure #2674 closes. Asserted across both batteries:
+        // the non-blocking one (vacuously true, and the row that catches a
+        // future fixture growing a Block) and the blocking one below, whose
+        // rows all committed something before their refusal pre-#2674.
+        //
+        // Non-vacuity: every blocking row must genuinely carry BOTH a
+        // refusal and a mutation, or the invariant below proves nothing
+        // (a fixture that stopped blocking would pass silently).
+        for (plan, label) in &blocking_battery() {
+            assert!(
+                plan.actions.iter().any(|a| matches!(a.action, Action::Block { .. })),
+                "{label}: blocking fixture produced no Block: {:?}",
+                plan.actions
+            );
+            assert!(
+                plan.actions.iter().any(|a| a.action.is_mutating()),
+                "{label}: blocking fixture produced no mutating action, so it cannot \
+                 demonstrate refuse-fast: {:?}",
+                plan.actions
+            );
+        }
+        for (plan, label) in battery().iter().chain(blocking_battery().iter()) {
+            let first_block =
+                plan.actions.iter().position(|a| matches!(a.action, Action::Block { .. }));
+            let Some(first_block) = first_block else { continue };
+            for (i, pa) in plan.actions.iter().enumerate().take(first_block) {
+                assert!(
+                    !pa.action.is_mutating(),
+                    "{label}: mutating action at index {i} precedes the refusal at index \
+                     {first_block} — executing this plan commits {:?} to the host and THEN \
+                     fails (orphaned residency, #2674): {:?}",
+                    pa.action,
+                    plan.actions
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_blocked_plan_still_records_what_it_would_have_done() {
+        // The deliberate non-goal, pinned so a future "simplification"
+        // doesn't quietly drop it: refuse-fast reorders, it does not PRUNE.
+        // A refused plan still carries the surviving placements' actions
+        // after the Block — the serialized plan stays a full record of what
+        // the planner decided — they simply can never execute ahead of the
+        // refusal. (Pruning them would also change `Plan` equality for
+        // every blocking fixture, a far wider blast radius than a reorder.)
+        let plan = plan_acquire(
+            &[placement("a", 32_000), placement("b", 32_000)],
+            &facts(vec![
+                resident("darkmux:a", "a", 4_096, None),
+                resident("darkmux:b", "b", 4_096, None),
+            ]),
+            opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:b"]),
+            &no_est(),
+        );
+        assert!(
+            matches!(plan.actions[0].action, Action::Block { .. }),
+            "the refusal leads: {:?}",
+            plan.actions
+        );
+        assert_eq!(
+            plan.actions[1..].to_vec(),
+            vec![reconcile_unload_action("darkmux:a", 4_096), reconcile_load_action("a", 32_000)],
+            "placement a's reconcile is still RECORDED after the refusal: {:?}",
+            plan.actions
+        );
+    }
+
+    /// Fixture battery whose every row REFUSES — one per reachable `Block`
+    /// reason, each paired with an earlier placement that (pre-#2674)
+    /// committed a mutation ahead of the refusal.
+    fn blocking_battery() -> Vec<(Plan, &'static str)> {
+        vec![
+            (
+                // A pass-1 unload folded in ahead of a later placement's
+                // Block — the ordering #2674 calls out specifically.
+                plan_acquire(
+                    &[placement("m", 68_000)],
+                    &facts(vec![
+                        resident("darkmux:orphan", "orphan", 8_000, None),
+                        resident("darkmux:m", "m", 4_096, None),
+                    ]),
+                    opts_pinned(CallerIntent::Auto, AcquireScope::Exclusive, &["darkmux:m"]),
+                    &no_est(),
+                ),
+                "exclusive pass-1 unload + claimed-resident Block",
+            ),
+            (
+                // An earlier placement's whole reconcile pair (unload AND
+                // load) ahead of a later placement's claimed-resident
+                // Block — the two-concurrent-sessions shape.
+                plan_acquire(
+                    &[placement("a", 68_000), placement("b", 68_000)],
+                    &facts(vec![
+                        resident("darkmux:a", "a", 4_096, None),
+                        resident("darkmux:b", "b", 4_096, None),
+                    ]),
+                    opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:b"]),
+                    &no_est(),
+                ),
+                "earlier reconcile + claimed-resident Block",
+            ),
+            (
+                // Same-plan collision (`clearable: false`): the first
+                // placement reconciles the shared stale, the second Blocks.
+                plan_acquire(
+                    &[placement("shared", 8_000), placement("shared", 68_000)],
+                    &facts(vec![resident("darkmux:shared", "shared", 4_096, None)]),
+                    additive_auto(),
+                    &no_est(),
+                ),
+                "same-plan collision Block",
+            ),
+            (
+                // An earlier fresh load ahead of an unknown-model-key Block.
+                plan_acquire(
+                    &[placement("known", 8_000), placement("absent", 8_000)],
+                    &Facts {
+                        catalog: Some(vec![CatalogFact {
+                            model_key: "known".into(),
+                            size_bytes: None,
+                        }]),
+                        ..Default::default()
+                    },
+                    additive_auto(),
+                    &no_est(),
+                ),
+                "fresh load + unknown-model-key Block",
+            ),
+            (
+                // A budget eviction ahead of an over-budget refusal.
+                plan_acquire(
+                    &[placement("fits", 8_000), placement("huge", 8_000)],
+                    &Facts {
+                        residents: vec![resident("darkmux:idle", "idle", 8_000, Some(20 * GB))],
+                        budget: Budget { max_darkmux_bytes: Some(30 * GB) },
+                        ..Default::default()
+                    },
+                    additive_auto(),
+                    &est_map(&[("fits", 10 * GB), ("huge", 90 * GB)]),
+                ),
+                "budget eviction + over-budget Block",
+            ),
+            (
+                // A pool-headroom eviction ahead of a foreign-duplicate
+                // no-capacity refusal.
+                plan_acquire(
+                    &[placement("dup", 8_000)],
+                    &Facts {
+                        residents: vec![
+                            resident("darkmux:idle", "idle", 8_000, Some(GB)),
+                            resident("dup-manual", "dup", 16_000, Some(40 * GB)),
+                        ],
+                        pools: BTreeMap::from([(
+                            PoolId("unified".into()),
+                            PoolFact { capacity_bytes: 64 * GB, available_bytes: 2 * GB },
+                        )]),
+                        ..Default::default()
+                    },
+                    additive_auto(),
+                    &est_map(&[("dup", 15 * GB)]),
+                ),
+                "pool eviction + foreign-duplicate no-capacity Block",
+            ),
+        ]
     }
 
     #[test]
@@ -2200,12 +2403,15 @@ mod tests {
             &est_map(&[("fresh", 15 * GB)]),
         );
         assert!(
-            matches!(plan.actions[0].action, Action::Reuse { .. }),
+            plan.actions.iter().any(|a| matches!(a.action, Action::Reuse { .. })),
             "pinned reuse must survive the refusal, got {:?}",
-            plan.actions[0]
+            plan.actions
         );
+        // (#2674) The refusal sorts to the front; the surviving Reuse is
+        // non-mutating, so leading with the Block changes nothing about
+        // what executing this plan does to the host.
         assert_eq!(
-            plan.actions[1],
+            plan.actions[0],
             PlannedAction {
                 action: Action::Block { model_key: "fresh".into(), resident_identifier: None },
                 reason: Reason::BudgetRefuse { est_bytes: 15 * GB, budget_bytes: 30 * GB },

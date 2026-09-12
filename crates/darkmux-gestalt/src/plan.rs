@@ -352,10 +352,18 @@ pub enum ExecHint {
 
 /// TOTAL-EQUALITY, DETERMINISTIC-ORDER plan. Ordering contract (tested):
 ///
+/// 0. REFUSAL phase (#2674): every [`Action::Block`], in desired-input
+///    order. NOTHING MUTATING PRECEDES A REFUSAL — the executor runs
+///    actions in order and stops at the first `Block`, so hoisting refusals
+///    ahead of the free phase is what makes a refused plan commit NOTHING,
+///    rather than leaving an earlier placement's unload/load committed on a
+///    wave that then fails (orphaned residency). Refusals are non-mutating,
+///    so the hoist costs nothing to execute and makes a serialized plan
+///    lead with WHY it will not proceed.
 /// 1. FREE phase: every Unload — Exclusive pass-1 unloads, the unload
 ///    halves of reconciles, and budget/headroom evictions — in
 ///    host-reported resident order
-/// 2. LOAD phase: per-desired decisions (Load/Reuse/Block), in
+/// 2. LOAD phase: the surviving per-desired decisions (Load/Reuse), in
 ///    desired-input order
 ///
 /// ALL frees precede ALL loads — the RAM-headroom two-pass shape of
