@@ -823,7 +823,11 @@ pub(crate) enum MissionCmd {
         /// review gate, must-fix 1); `review` now runs the same generic
         /// path as every other config and gets the same 600s default. A
         /// review whose seats need longer than that should pass
-        /// `--timeout` explicitly.
+        /// `--timeout` explicitly. (#2595) For `crawl`/`review`, this fills
+        /// in a unit's `timeout_seconds` only when the mission config's own
+        /// task doesn't already declare one — a hand-authored per-rule
+        /// override in the document still wins, this flag just stops
+        /// being inert for every unit that doesn't set its own.
         #[arg(long)]
         timeout: Option<u32>,
         /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
