@@ -58,12 +58,24 @@ permissions:
 jobs:
   review:
     runs-on: [self-hosted, darkmux-review]
+    # (#2100) This number is duplicated as a literal `--timeout-minutes 90`
+    # in "Post the review" below (the `job` context exposes `job.status`,
+    # not the configured budget itself, so there is no single source to
+    # read it back from) — change BOTH together, or the disclosure posted
+    # on a real cancellation will name a stale minute count.
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ inputs.pr }}
       REPO: ${{ github.repository }}
     steps:
+      # (#2100) Wall-clock zero for this job — read back by the cancellation
+      # notice below so a job killed by its own `timeout-minutes` can name
+      # how long it actually ran, rather than just repeating the configured
+      # budget. Cheap and has no failure mode (`date +%s` cannot fail).
+      - name: Record job start time
+        run: echo "JOB_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
         with:
@@ -82,6 +94,15 @@ jobs:
         # (main). The reviewed PR's code is never checked out — only its diff
         # (and, inside the review dispatch, individual file contents via the
         # API) are read — so untrusted PR code never lands on the runner.
+
+      # (#2100) Same discipline `quality.yml` uses for
+      # `ci-mutants-summary.py` (and `ci.yml` for
+      # `engagement-sentinel-guard.py`): a CI disclosure script gets its own
+      # proof BEFORE it is trusted to decide what a cancelled run posts to a
+      # real PR. Cheap (no model, no network) and fails fast if the script
+      # itself regresses.
+      - name: Self-test the review-cancellation notice script
+        run: python3 scripts/ci-review-cancellation-notice.py --self-test
 
       - name: Build the darkmux binary (trusted main checkout — #1359)
         run: |
@@ -218,11 +239,52 @@ jobs:
       # (#1583) The step name promised a summary fallback that did not exist
       # for the `review` mode: a 422 on the inline anchors killed the step
       # under `set -e` and discarded the whole run. The fallback is real now.
+      #
+      # (#2100) `if:` widened from a bare `has_diff` check (an IMPLICIT
+      # `success()` gate) to `always() && has_diff` — the exact shape #2550/
+      # #2623 fixed for the mutation gate's own "Report survivors" step, for
+      # the identical failure: a reporting step gated on an implicit
+      # `success()` never runs once the JOB itself (not just the dispatch
+      # step above) is marked `cancelled` by its own `timeout-minutes`. A
+      # large diff's review can legitimately run the whole 90-minute budget
+      # (the dispatch is still emitting telemetry, healthy, just slow, when
+      # GitHub cuts it) — that killed the dispatch process before it ever
+      # reached its own `deliver.github_review` step, so `rendered.json` was
+      # never written, and this step — ungated for cancellation — never got
+      # a turn to say so. The PR read as though no review had ever run.
+      # `always()` lets this step run in GitHub's post-cancellation grace
+      # window; `steps.diff.outputs.has_diff == 'true'` is kept alongside it
+      # because a job cancelled before even that fast, early step ran has
+      # nothing to disclose about a review either (see
+      # `scripts/ci-review-cancellation-notice.py`'s own module doc for the
+      # decision table this step now delegates to).
       - name: Post the review (inline comments, or summary fallback)
-        if: steps.diff.outputs.has_diff == 'true'
+        if: always() && steps.diff.outputs.has_diff == 'true'
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ ! -s "$RUNNER_TEMP/qa/rendered.json" ]; then
+            # (#2100) Ask the dedicated, self-tested script whether THIS is
+            # the job-timeout-cancellation case (its own module doc has the
+            # full decision table; see the self-test above). It prints the
+            # cancellation-specific disclosure when the job was cancelled,
+            # and prints nothing for every other reason `rendered.json`
+            # could be missing/empty (an ordinary crash, a non-cancelled
+            # failure) — the generic warning below still covers those, byte-
+            # for-byte the same as before this fix.
+            NOTICE=$(python3 scripts/ci-review-cancellation-notice.py \
+              --job-status "$JOB_STATUS" \
+              --rendered "$RUNNER_TEMP/qa/rendered.json" \
+              --timeout-minutes 90 \
+              --started-epoch "${JOB_STARTED_EPOCH:-}" \
+              --run-url "$RUN_URL")
+            if [ -n "$NOTICE" ]; then
+              gh pr comment "$PR" --repo "$REPO" --body "$NOTICE"
+              echo "::error::review dispatch was cancelled by the job timeout — no rendered payload"
+              exit 1
+            fi
             # The dispatch above never wrote a rendered payload at all (e.g. it
             # crashed before its own degraded-mode fallback could run). Same
             # "never read as a green check" contract as mode=degraded (#1113).

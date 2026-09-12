@@ -78,8 +78,13 @@ comment launches it — still maintainer-only.
      seat"](https://darkmux.com/guide/missions.html).
    - `jq` + `gh` on PATH (GitHub's runner image bundles both). The review
      payload is rendered as part of `darkmux mission launch review`
-     (`--param emit=...`) — no `python3` needed; `jq` just splits the
-     rendered payload's `mode`/`review`/`fallback_comment` fields for `gh`.
+     (`--param emit=...`); `jq` just splits the rendered payload's
+     `mode`/`review`/`fallback_comment` fields for `gh`.
+   - `python3` on PATH (#2100) — `scripts/ci-review-cancellation-notice.py`
+     decides what to disclose when the job's own `timeout-minutes` cancels
+     the run mid-flight, so a killed review reads as "cancelled after N
+     minutes", never as silence. Any macOS `python3` (Xcode CLT's or a
+     Homebrew one) works; the script is stdlib-only.
 
 ## Staffing the runner's reviewer seat
 
