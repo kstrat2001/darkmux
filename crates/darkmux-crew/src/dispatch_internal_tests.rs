@@ -6380,7 +6380,17 @@
         let tailer_deadline = Arc::clone(&deadline);
         let tailer_stop = Arc::clone(&stop_flag);
         let out_dir = tmp.path().to_path_buf();
-        let handle = thread::spawn(move || {
+        // (#2643 fix-round, MUST FIX 3) `spawn_detached_named`, not a bare
+        // `thread::spawn` — this call site (calling `run_tailer` directly,
+        // bypassing the production `spawn_guarded_tailer` wrapper that
+        // already goes through `spawn_detached_named`) was the source of
+        // the "not-yet-located fourth thread" `env_audit.rs`'s Known Gaps
+        // named as an open residual: a backtrace-instrumented audit run
+        // attributed 2 unnamed `DARKMUX_MACHINE_ID` reads + 2 unnamed
+        // `DARKMUX_FLOWS_DIR` reads (via this thread's `emit()` calls) to
+        // exactly this bare spawn. This test already carries `#[serial]`,
+        // so this is a pure attribution fix, not a hazard fix.
+        let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
             run_tailer(
                 out_dir,
                 "sess-real-watchdog".into(),

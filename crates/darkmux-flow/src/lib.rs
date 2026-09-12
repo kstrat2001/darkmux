@@ -141,6 +141,16 @@ impl Default for LocalFileSink {
 fn local_sink_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
     {
+        // (#2643 fix-round, CONSIDER 5) A FOURTH flow-side resolver that
+        // bypasses `config_access::env_str` by construction — this read is
+        // the one DECIDING between the operator's real flows dir (via
+        // `flows_dir()`, itself already instrumented) and the per-process
+        // temp fallback below, so it has to be wired into the same
+        // `env_audit` sink directly, same as `redis_url`/`serve_token`/
+        // `hook_signing_secret` above. Missing this made the env-audit
+        // sweep blind to exactly the read that decides which of two
+        // directories a test's `LocalFileSink` writes land in.
+        darkmux_types::env_audit::audit_env_read("DARKMUX_FLOWS_DIR");
         if std::env::var_os("DARKMUX_FLOWS_DIR").is_none() {
             static DIR: OnceLock<PathBuf> = OnceLock::new();
             return DIR

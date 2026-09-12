@@ -3862,22 +3862,59 @@ mod tests {
 
     // ─── (#2135 option 2) delivery contract headers + signing ──────────
 
+    /// (#2643 fix-round, MUST FIX 4) RAII clear of `DARKMUX_HOOK_SECRET_0`
+    /// for `delivery_carries_the_contract_headers_and_no_signature_when_unsigned`
+    /// below — this test's own rule is index 0, and the env override wins
+    /// over the Keychain regardless of whether that rule names one (see
+    /// `hook_signing_secret`'s doc). A first pass at this fix-round
+    /// deleted the defensive clear outright on the theory that #2643
+    /// moving the SIGNING test off index 0 (to index 2) removed the only
+    /// source of that env key inside this file's own suite — true for
+    /// the intra-suite race, but the clear was never about that race
+    /// alone: it also guards against an OPERATOR's ambient
+    /// `DARKMUX_HOOK_SECRET_0` (e.g. hook signing configured in their
+    /// shell). Reproduced: setting that var in the environment before
+    /// running this test made it fail — the unsigned rule picked up the
+    /// ambient secret and grew a signature it must never carry. RAII
+    /// (not the raw remove-and-forget the original had) so this reads
+    /// the value once, restores it via `Drop`, and survives a panicking
+    /// assertion cleanly — same shape as `paths::ClearDarkmuxHomeGuard`.
+    struct ClearHookSecret0Guard {
+        prev: Option<String>,
+    }
+
+    impl ClearHookSecret0Guard {
+        fn new() -> Self {
+            let prev = std::env::var("DARKMUX_HOOK_SECRET_0").ok();
+            unsafe {
+                std::env::remove_var("DARKMUX_HOOK_SECRET_0");
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ClearHookSecret0Guard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_HOOK_SECRET_0", v),
+                    None => std::env::remove_var("DARKMUX_HOOK_SECRET_0"),
+                }
+            }
+        }
+    }
+
     #[test]
-    // (#2135 option 2 / #2643) Used to share rule-index 0 with the signing
-    // test below and need `#[serial_test::serial]` against it for exactly
-    // that reason, plus a defensive env-var clear of its own at the top of
-    // the fn body. #2643 moved the signing test's signed rule to index 2
-    // (see that test's own doc comment) so nothing in this file mutates
-    // rule-index 0's signing-secret env key any more — the annotation AND
-    // the defensive clear are both gone, not because either was wrong
-    // when written, but because a defensive clear is itself a mutation as
-    // far as `scripts/env-audit-report.py`'s text-scan half is concerned
-    // (it matches any `remove_var(`/`set_var(` call on a `DARKMUX_`
-    // literal, deliberately not distinguishing "defensive" from
-    // "load-bearing" — see that script's own module doc for why), and
-    // keeping it would have kept every single-rule test in this file
-    // flagged as racing a mutation nothing else here still makes.
+    // (#2135 option 2 / #2643) #2643 moved the signing test's signed rule
+    // to index 2 (see that test's own doc comment), so nothing left in
+    // this file's suite mutates rule-index 0's signing-secret env key —
+    // `#[serial_test::serial]` against that intra-suite race is correctly
+    // gone. The defensive `ClearHookSecret0Guard` above is restored
+    // (MUST FIX 4): it guards a different hazard — an operator's own
+    // ambient `DARKMUX_HOOK_SECRET_0` — that #2643's index move does
+    // nothing to close.
     fn delivery_carries_the_contract_headers_and_no_signature_when_unsigned() {
+        let _clear_secret = ClearHookSecret0Guard::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
@@ -4896,6 +4933,65 @@ mod tests {
         );
 
         drop(sink);
+    }
+
+    // ─── (#2643 fix-round, MUST FIX 1) the default cap is still wired ───
+
+    /// Mutation check (self-QA gate): both capping tests below now inject
+    /// the cap via `new_for_test_with_max_outbox_mb`, which left nothing
+    /// in this file exercising `HookSink::new`'s DEFAULT fallthrough to
+    /// `config_access::hooks_max_outbox_mb()` — a reviewer's mutation
+    /// (`max_outbox_mb_override.unwrap_or(256)` in place of
+    /// `.unwrap_or_else(darkmux_types::config_access::hooks_max_outbox_mb)`)
+    /// left this whole suite green. Proving the wire is live needs the
+    /// live config value to actually differ from the built-in fallback —
+    /// asserting the bare default (256) can't distinguish "read from
+    /// config_access" from "hardcoded", since they'd coincide.
+    ///
+    /// This is the one place in this file that still has to mutate
+    /// `DARKMUX_HOOKS_MAX_OUTBOX_MB` process-globally to prove that (the
+    /// same class of hazard the two tests above just got rid of) — so the
+    /// mutated value is chosen to make the interference PROVABLY inert,
+    /// not just spot-checked: `999_999` MiB is LARGER than the built-in
+    /// default (256), never smaller. Every other `HookSink::new()` caller
+    /// in this file stays comfortably under 256 MiB of undelivered bytes
+    /// (the two tests that intentionally exercise cap-DROPPING behavior
+    /// inject their own tiny cap via `new_for_test_with_max_outbox_mb`
+    /// and never read this env var at all) — so a reader that races this
+    /// window and observes 999,999 instead of 256 is STILL under any cap
+    /// it could ever observe. A smaller substitute value (e.g. picking
+    /// something under 256) would only be "currently" safe, contingent on
+    /// no other test crossing it; a larger one is safe by construction,
+    /// monotonically, for any test this file could ever grow. `#[serial]`
+    /// (matching `wall_clock_and_output_caps_are_wired_from_config_
+    /// defaults` below, which needs it for the same class of reason)
+    /// still applies against any FUTURE serial mutator of this same key —
+    /// it does not, and cannot, protect against a concurrently-running
+    /// NON-serial reader, which is exactly why the safety argument above
+    /// has to hold regardless of interleaving, not because of the
+    /// annotation.
+    #[test]
+    #[serial_test::serial]
+    fn default_outbox_cap_reaches_the_sink_from_config_access() {
+        let prev = std::env::var("DARKMUX_HOOKS_MAX_OUTBOX_MB").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", "999999");
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&[], tmp.path().to_path_buf(), report).unwrap();
+        let got = sink.max_outbox_mb;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
+            }
+        }
+        drop(sink);
+        assert_eq!(
+            got, 999999,
+            "HookSink::new's default path must still reach config_access::hooks_max_outbox_mb(), not a hardcoded fallback"
+        );
     }
 
     // ─── (fix-round finding 2) dropped-appends counter is cross-process ───

@@ -1387,12 +1387,23 @@ mod tests {
                 let guard_a_ref = &guard_a;
                 let guard_b_ref = &guard_b;
 
-                let handle_a = scope.spawn(move || {
+                // (#2643 fix-round, MUST FIX 3) `spawn_scoped_named`, not a
+                // raw `scope.spawn` — this test's own two worker threads
+                // were the source of the "not-yet-located fourth thread"
+                // `env_audit.rs`'s Known Gaps named as an open residual: a
+                // backtrace-instrumented audit run attributed 50 unnamed
+                // `DARKMUX_HOME` reads + 10 unnamed `DARKMUX_MODEL_LOAD_
+                // TIMEOUT_SECONDS` reads (via `ensure_wave_loaded`'s
+                // residency-arbiter calls) to exactly these two spawn
+                // sites. Both were already unreachable by any race (this
+                // test carries `#[serial_test::serial]`), so this is a
+                // pure attribution fix, not a hazard fix.
+                let handle_a = spawn_scoped_named(scope, move || {
                     let mut host_a = host_a;
                     barrier_ref.wait();
                     ensure_wave_loaded(&wave_a, est_ref, &mut host_a, guard_a_ref)
                 });
-                let handle_b = scope.spawn(move || {
+                let handle_b = spawn_scoped_named(scope, move || {
                     let mut host_b = host_b;
                     barrier_ref.wait();
                     ensure_wave_loaded(&wave_b, est_ref, &mut host_b, guard_b_ref)

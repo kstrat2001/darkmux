@@ -93,60 +93,130 @@
 //! trick `spawn_scoped_named` uses for the dispatch-execution path,
 //! adapted for a DETACHED (non-`thread::scope`) spawn. This measurably
 //! re-attributed a large share of `dispatch_internal::tests::*`'s
-//! previously-`<unnamed>` reads to their real spawning test. It did NOT
-//! reach zero: a residual of exactly 4 lines (`DARKMUX_FLOWS_DIR`: 2,
-//! `DARKMUX_MACHINE_ID`: 2 — the SAME keys and count #2632 originally
-//! found) still logs as `<unnamed>`, landing in the log between two named
-//! `dispatch_internal_tests.rs` tests under `--test-threads=1`. Neither
-//! test whose name brackets it in the log calls `spawn_guarded_watchdog`/
-//! `_tailer`/`_sampler` from an unnamed thread (confirmed: zero
-//! `"darkmux-worker"` fallback-name lines appear anywhere in a full crew
-//! sweep, so every call into `spawn_detached_named` in this run had a
-//! real caller-thread name to propagate) — so this residual comes from
-//! a FOURTH, not-yet-located detached thread, not from the three fixed
-//! here. Left open rather than guessed at further; the next person
-//! chasing it should start from the exact log position (immediately
-//! before `spawn_guarded_sampler_wiring_survives_a_real_thread_spawn` in
-//! a `--test-threads=1` run) rather than re-deriving that from scratch.
+//! previously-`<unnamed>` reads to their real spawning test.
+//!
+//! **#2643 fix-round update (MUST FIX 3).** An earlier version of this
+//! doc guessed the remaining residual was "a FOURTH, not-yet-located
+//! detached thread" and separately guessed a much larger unnamed cluster
+//! (~50 `DARKMUX_HOME` + ~10 `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS`) was
+//! "almost certainly a `darkmux-gestalt` residency/host-probe background
+//! thread." Both guesses were wrong, and both are now instrumented and
+//! fixed rather than guessed at:
+//!
+//! - The large cluster came from `darkmux-crew::concurrent_dispatch::
+//!   tests::two_concurrent_same_process_acquirers_of_the_same_identifier_
+//!   both_succeed_2672` — its two `std::thread::scope`/`scope.spawn` calls
+//!   (spawning `ensure_wave_loaded` on two sibling threads, 5 loop
+//!   iterations each) used a raw `scope.spawn` instead of
+//!   `spawn_scoped_named`, so every env read inside them logged
+//!   `<unnamed>`. Fixed by switching both call sites to
+//!   `spawn_scoped_named` — a pure attribution fix; the test already
+//!   carries `#[serial_test::serial]`, so nothing here was ever racing.
+//! - The "fourth thread" was `dispatch_internal_tests.rs`'s
+//!   `run_tailer_real_thread_deadline_expires_on_silence_and_still_
+//!   resets_on_live_activity`, which calls `run_tailer` directly from a
+//!   bare `thread::spawn` (bypassing the production `spawn_guarded_
+//!   tailer` wrapper that already goes through `spawn_detached_named`).
+//!   Fixed the same way — swapped the bare spawn for
+//!   `spawn_detached_named` — again a pure attribution fix (this test
+//!   also already carries `#[serial]`).
+//!
+//! Both fixes were found by instrumenting rather than guessing: adding a
+//! `--test-threads=1` merged sweep across all four swept crates
+//! (`darkmux-types`+`darkmux-crew`+`darkmux-flow`+`darkmux-lab`) and
+//! reading the exact log position bracketing each unnamed run confirmed
+//! the two sites above account for all 64 of the previously-unattributed
+//! `DARKMUX_HOME`/`DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS`/`DARKMUX_MACHINE_
+//! ID`/`DARKMUX_FLOWS_DIR` lines. Fixing them collapsed a 71-line
+//! unattributable bucket (measured on the merged 4-crate sweep, NOT the
+//! crew-only number the original #2632/#2643 passes measured) down to 7.
+//!
+//! The residual 7 (`DARKMUX_HOME`: 3, `DARKMUX_NOTEBOOK_DIR`: 3,
+//! `DARKMUX_LAB_DIR`: 1) is a DIFFERENT, newly-visible source — all seven
+//! bracket `darkmux-lab`'s own `lab::run::tests::lab_run_wires_the_
+//! session_id_before_the_simulated_dispatch_completes_not_after`, whose
+//! test body itself spawns `lab_run(..)` on a raw, unnamed `std::thread::
+//! spawn` (this test is `#[serial]`, so — same as the two fixed above —
+//! this is an attribution gap, not a demonstrated race). Same known-gap
+//! class as the test-local spawns in `absence_backstop.rs`/
+//! `remote_budget.rs`/`workspace_spec/materialize.rs`/`step_kinds/
+//! builtins.rs`'s mock Redis server below, just newly surfaced now that
+//! `darkmux-lab` is swept for the first time (see "Crate coverage"
+//! below) — not chased further in this pass.
 //!
 //! The several test-local `thread::spawn` calls in `absence_backstop.rs`,
 //! `remote_budget.rs`, `workspace_spec/materialize.rs`, and
 //! `step_kinds/builtins.rs`'s mock Redis server are still unnamed — not
-//! implicated in the residual above (per the original #2632 investigation
-//! and this pass's own check), but still a live gap. So is a cluster
-//! found NEW in this pass: a `--test-threads=1` crew sweep shows ~50
-//! unnamed `DARKMUX_HOME` reads (plus ~10 `DARKMUX_MODEL_LOAD_TIMEOUT_
-//! SECONDS`) in tight repeating groups, almost certainly a
-//! `darkmux-gestalt` residency/host-probe background thread rather than
-//! anything in `dispatch_internal.rs` — unidentified beyond that;
-//! tracked as follow-up, not chased further here.
+//! implicated in the residual above, but still a live gap.
 //!
 //! **Crate coverage, as of #2643:** `darkmux-flow` and `darkmux-lab` are
 //! now swept (see `scripts/env-audit-report.py`'s `CRATE_DIRS`). Neither
 //! needed its own chokepoint gauntlet the way `darkmux-crew` did — lab
 //! reaches every `DARKMUX_*` value it needs through this module's
-//! existing `config_access`/`paths` chokepoints; flow's three resolvers
-//! that bypass `config_access` by construction (secrets: `redis_url`,
+//! existing `config_access`/`paths` chokepoints; flow's resolvers that
+//! bypass `config_access` by construction (secrets: `redis_url`,
 //! `serve_token`, `hook_signing_secret`) were wired directly into
-//! `audit_env_read` in `crates/darkmux-flow/src/lib.rs`. Sweeping flow
-//! found and fixed two real, reproduced hazard classes (a shared
-//! hook-rule-signing env key racing ~30 unrelated tests, fixed by giving
-//! the one mutating test a rule index nothing else occupies; a shared
-//! outbox-size-cap env key racing ~25 unrelated tests, fixed by
-//! injecting the cap directly instead of mutating global state) — see
-//! `hooks.rs`'s `delivery_carries_a_signature_the_receiver_can_recompute_
-//! when_signed` and `HookSink::new_for_test_with_max_outbox_mb` for the
-//! detail. A further ~29 empirically-real (mutated-key-vs-named-reader)
-//! findings across `darkmux-home`-flavored races in `darkmux-lab`'s
-//! `crawl`/`providers` tests and `DARKMUX_MACHINE_ID` races in
-//! `darkmux-flow`'s `session_presence`/`hooks` tests remain UNFIXED —
-//! several spot-checked ones turn out to be benign (the mutated key is
-//! read but never observably changes the reading test's own assertion,
-//! e.g. `lab::inspect::tests::resolve_run_dir_id_falls_back_when_missing`
-//! ends up on the same `PathBuf::from(path)` fallback regardless of which
-//! root `DARKMUX_HOME` resolves to for that call) and reflexively
-//! `#[serial]`-annotating all ~29 without that same case-by-case check
-//! would add real suite wall-clock for a mix of real and non-hazards.
+//! `audit_env_read` in `crates/darkmux-flow/src/lib.rs`.
+//!
+//! **#2643 fix-round update (CONSIDER 5).** A FOURTH flow-side resolver
+//! bypasses `config_access` the same way and was missed by the original
+//! enumeration: `local_sink_dir` in `crates/darkmux-flow/src/lib.rs`
+//! reads `DARKMUX_FLOWS_DIR` directly (under the same `#[cfg(any(test,
+//! feature = "test-support"))]` gate) to decide between the operator's
+//! real flows dir and a per-process temp fallback — the DECIDING read
+//! that governs which of two directories a test's `LocalFileSink` writes
+//! land in, invisible to the sweep until now. Now wired into
+//! `audit_env_read` the same way as the other three. Sweeping flow found
+//! and fixed two real, reproduced
+//! hazard classes (a shared hook-rule-signing env key racing ~30
+//! unrelated tests, fixed by giving the one mutating test a rule index
+//! nothing else occupies; a shared outbox-size-cap env key racing ~25
+//! unrelated tests, fixed by injecting the cap directly instead of
+//! mutating global state) — see `hooks.rs`'s
+//! `delivery_carries_a_signature_the_receiver_can_recompute_when_signed`
+//! and `HookSink::new_for_test_with_max_outbox_mb` for the detail.
+//!
+//! **#2643 fix-round update (MUST FIX 4 + CONSIDER 5 side effects).**
+//! Restoring the `ClearHookSecret0Guard` defensive clear (MUST FIX 4) and
+//! wiring `local_sink_dir` into the audit (CONSIDER 5) each reopen
+//! findings the ORIGINAL #2643 pass had closed — the same tension its own
+//! doc already named ("a defensive clear is itself a mutation as far as
+//! the text-scan half is concerned"). Restoring the guard makes
+//! `DARKMUX_HOOK_SECRET_0` a mutated key inside `darkmux-flow` again,
+//! which reflags ~26 single-rule `hooks::tests::*` as unguarded readers
+//! of it (every rule's construction reads its signing secret via
+//! `resolve_one_rule`, match or not) — spot-checked benign: every one of
+//! those 26 passes `signing_secret_keychain_item: None` and never asserts
+//! on a signature header, and the guard's own mutation is a
+//! remove-then-restore around a key that starts absent in the
+//! overwhelming majority of test runs, so the window it opens is a
+//! near-permanent no-op unless an operator's own shell exports
+//! `DARKMUX_HOOK_SECRET_0` while running the suite — the exact ambient
+//! case the guard exists to guard the UNSIGNED test against in the first
+//! place. A real, unavoidable trade — the ambient-env bug MUST FIX 4
+//! fixes is real and reproduced; restoring the guard is the fix.
+//!
+//! A further ~60 empirically-real (mutated-key-vs-named-reader) findings
+//! (~29 from the original #2643 pass, 5 newly surfaced by wiring in
+//! `local_sink_dir` above — `sink_kind_consts_match_real_sinks`,
+//! `summarize_sink_flat_local`, `summarize_sink_nested_tee`,
+//! `find_redis_cfg_walks_into_tee`, `find_redis_cfg_returns_none_when_
+//! absent`, all in `crates/darkmux-flow/src/lib.rs` — plus the ~26
+//! `DARKMUX_HOOK_SECRET_0` readers above) across `darkmux-home`-flavored
+//! races in `darkmux-lab`'s `crawl`/`providers` tests and
+//! `DARKMUX_MACHINE_ID`/`DARKMUX_FLOWS_DIR`/`DARKMUX_HOOK_SECRET_0` races
+//! in `darkmux-flow`'s `session_presence`/`hooks`/`lib.rs` tests remain
+//! UNFIXED — several spot-checked ones turn out to be benign (the
+//! mutated key is read but never observably changes the reading test's
+//! own assertion, e.g. `lab::inspect::tests::resolve_run_dir_id_falls_
+//! back_when_missing` ends up on the same `PathBuf::from(path)` fallback
+//! regardless of which root `DARKMUX_HOME` resolves to for that call;
+//! all 5 of the newly-surfaced `local_sink_dir` readers put the resolved
+//! `DARKMUX_FLOWS_DIR` value into `SinkInfo.config["flows_dir"]`, a field
+//! none of the five ever asserts on; the 26 `DARKMUX_HOOK_SECRET_0`
+//! readers are detailed above) and reflexively `#[serial]`-annotating
+//! all ~60 without that same case-by-case check would add
+//! real suite wall-clock for a mix of real and non-hazards.
 //! Left as named follow-up (see the #2643 PR body for the exact list)
 //! rather than done by rote. `darkmux-serve`, `darkmux-doctor`,
 //! `darkmux-fleet`, top-level `src/`, and the `runtime/` crate
