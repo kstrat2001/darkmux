@@ -57,6 +57,33 @@ import { isDispatchStart, isDispatchComplete, T } from "../../lib/flow";
  * `unknownRuns` when it has no positive evidence either way, and is
  * otherwise implicitly local (`runs - cloudRuns - unknownRuns` — never a
  * residual credited by default).
+ *
+ * (#2659) The run count itself is grouped by distinct `dispatch.complete`
+ * BOOKEND, not by distinct `sess` key. A `sess` key is a session id (or the
+ * sessionless composite fallback), and #1856 established that a
+ * deterministic `mission_run` session id is reused across a re-launch or
+ * retry of the same mission phase inside the viewer's window — so one key
+ * can legitimately close with more than one real completion. Counting
+ * `sess.size` (one per key) undercounted that population to 1; counting
+ * bookends (via `dcTok`, see below) restores "a dispatch" to mean what the
+ * operator reading the number expects. The per-bookend path only engages
+ * for 2-OR-MORE bookends (see the guard's own comment below) — a session
+ * with exactly one bookend keeps the ORIGINAL session-wide classification
+ * unchanged, so this fix is purely additive for the overwhelmingly common
+ * case. For a genuinely spanning session, `cloudRuns`/`unknownRuns` move
+ * together with the count: each bookend is classified on its OWN endpoint,
+ * not the session's aggregate evidence, so a session with a mixed
+ * local+cloud pair of bookends doesn't paint the whole session cloud (the
+ * TOKEN split a few dozen lines down is a known, narrower exception to
+ * this — see the per-bookend loop's own comment).
+ *
+ * A second population this widens, not named in the issue: two sibling
+ * `dispatch.single_shot` seats sharing one TASK-scoped session id
+ * (`session_id::task`, `DispatchSingleShotStepKind::dispatch_session_id`)
+ * that ALSO carry a `telemetry.tokens` family (rather than the token-less-
+ * completion shape `directRuns` below already handled) now count as two
+ * runs instead of one — correct, matching how `directRuns` already counted
+ * task-scoped siblings when telemetry was absent.
  */
 
 import type { FlowRecord } from "../../types/handwritten";
@@ -147,6 +174,40 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // completion but the last, and could paint one seat's tokens on the
   // other seat's tile at classification time. Accumulating means every
   // completion survives to be classified on its own terms below.
+  //
+  // (#2659) The run count below groups by DISTINCT `dcTok` BOOKEND, not by
+  // `sess`'s one-entry-per-key shape — reusing `dcTok` itself rather than a
+  // parallel collection, so "what counts as a real dispatch bookend" stays
+  // ONE definition (`isDispatchComplete` + `hasAnyTokenCounts`) instead of
+  // two that could drift apart. `mission_run(mission_id, phase_id)`
+  // (`crates/darkmux-types/src/session_id.rs`) is a DETERMINISTIC session
+  // id, so re-launching or retrying the same mission phase inside the
+  // viewer's window reuses the identical id, and each launch closes with
+  // its OWN token-bearing `dispatch.complete`. Before this fix the run
+  // count was `sess.size` — one per distinct KEY, regardless of how many
+  // real completions happened under it — so a session that legitimately
+  // spans two (or more) dispatches undercounted to 1.
+  //
+  // Deliberately NOT counting every `isDispatchComplete` record regardless
+  // of content (tried first, reverted): a mission-graph `dispatch.map`
+  // step's own `dispatch complete` bookend (`category: work, source:
+  // scheduler, kind: "dispatch.map"`, `DispatchMapStepKind::bookend_record`
+  // in `crates/darkmux-crew/src/step_kinds/builtins.rs`) only carries a
+  // token total when the step is HOSTED — `stamp_remote_classification` is
+  // called there only `if endpoint_label.is_some()`. A LOCAL `dispatch.map`
+  // step's completion is real model work same as any other, but reports
+  // NO token field at all, so `hasAnyTokenCounts` is false for it and it
+  // never enters `dcTok` — same gap `hybridNote.ts` already documents at
+  // its own module doc ("a dispatch whose completion carries no token
+  // totals ... contributes 0 to `runs` too"), inherited here rather than
+  // introduced by this fix. `hasAnyTokenCounts` is NOT a step-vs-dispatch
+  // filter (a hosted `dispatch.map` step DOES pass it, and always has,
+  // pre- and post- this fix) — it is exactly what its name says, "did this
+  // bookend report any tokens," and this fix reuses that existing bar
+  // rather than inventing a second, looser one that would have counted
+  // the real corpus's local map-step completions (`tests/parity/corpus/
+  // flow-yesterday.json`'s `task-review-probe-*-task` sessions) as extra
+  // runs they aren't.
   const epBySid = new Map<string, string>();
   const dcTok = new Map<string, TokenPayload[]>();
 
@@ -212,15 +273,81 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   let uncls = 0;
   let cloudRuns = 0;
   let unknownRuns = 0;
+  let sessRuns = 0;
   for (const [k, recs] of sess) {
-    // (#2637) Mutually exclusive with the implicit-local fallthrough below:
-    // cloud when this session's bookend named an endpoint, unknown when it
-    // has no positive local evidence (`localSids`) either — a sessionless
-    // composite key (`k` has no real `session_id`) can never be in
-    // `localSids`, so it always lands here, same as the token-level
-    // classification above treats a sessionless record as unknown.
-    if (epBySid.has(k)) cloudRuns++;
-    else if (!localSids.has(k)) unknownRuns++;
+    // (#2659) A `sess` key is one dispatch, UNLESS `dcTok` shows it closed
+    // with MORE THAN ONE real `dispatch.complete` bookend (the spanning-
+    // session-id shape #1856 established) — then it's that many runs, each
+    // classified on ITS OWN bookend rather than the session's aggregate
+    // `epBySid`/`localSids` evidence. Classifying per-bookend (not per-key)
+    // matters here specifically: a session whose two bookends disagree
+    // (one local, one cloud) would otherwise paint the WHOLE session cloud
+    // via `epBySid.has(k)`, same failure shape #1607 already ruled out for
+    // the token-level split. Reusing `dcTok` (rather than a fresh
+    // collection) also means a `sess`-member session's bookends are never
+    // double-counted against `directRuns` below — `directRuns` already
+    // skips any sid `sess.has()`, unchanged by this fix.
+    //
+    // (post-review MUST FIX) The guard is `length > 1`, NOT `length > 0` —
+    // a session with exactly ONE bookend falls to the `else` below and
+    // keeps the ORIGINAL `epBySid.has(k)` aggregate classification, never
+    // `bookends[0].endpoint` alone. `epBySid` registers from a
+    // `dispatch.start` OR a `dispatch.complete` (see its own comment
+    // above); a session whose START named an endpoint but whose single
+    // COMPLETE didn't (or vice versa) would silently flip from cloud to
+    // local under a naive `bookends[0].endpoint` check — a real
+    // classification regression for the overwhelmingly common single-
+    // bookend case, in a fix that is supposed to be purely additive.
+    // Restricting the per-bookend path to `length > 1` means every
+    // existing single-bookend session classifies EXACTLY as it did before
+    // this fix; only the genuinely-spanning population (2+ real
+    // completions) takes the new path. See the pinned regression test.
+    const bookends = dcTok.get(k);
+    if (bookends && bookends.length > 1) {
+      for (const b of bookends) {
+        if (b.endpoint) cloudRuns++;
+        // No `else` for unknownRuns here: a completion (this loop only
+        // sees `isDispatchComplete` records) either names an endpoint
+        // (cloud) or doesn't — and "doesn't" is exactly the criterion
+        // `localSids` uses to prove a session local. An endpoint-less
+        // bookend is therefore positive LOCAL evidence, not unknown; it
+        // contributes to the implicit-local count via
+        // `runs - cloudRuns - unknownRuns`, same as the single-bookend
+        // case always did.
+        //
+        // Known, narrower gap (same shape as the `(CONSIDER 3, #2635)`
+        // gap pinned below for the single-shot fallback): the aggregate
+        // TOKEN split (`cloud`/`unknown` a few dozen lines up) still
+        // classifies every `telemetry.tokens` record in this session via
+        // the session-wide `epBySid`/`localSids`, not per-bookend — so a
+        // genuinely MIXED session (one local dispatch, one cloud
+        // dispatch, same session id) can render "N local + M cloud" on
+        // the DISPATCHES line while the TOKENS tiles still show all of
+        // that session's tokens under a single tier. Fixing that fully
+        // needs per-bookend TURN attribution (partitioning a session's
+        // turns at each bookend's timestamp) — tracked as a #2665
+        // follow-up, not done here: this issue is scoped to the RUN
+        // COUNT, and every session in the corpus with 2+ bookends today
+        // has all-local bookends (no live data exercises the divergent-
+        // attribution case). Pinned in savings.test.ts so the gap is
+        // visible, not silently assumed away.
+        sessRuns++;
+      }
+    } else {
+      // ZERO or exactly ONE bookend for this key — the original single-run
+      // classification, byte-for-byte unchanged (zero bookends: still in
+      // flight, or a sessionless composite key; one bookend: the ordinary
+      // single-dispatch case, which is nearly every session in practice):
+      // cloud when SOME bookend (a start counts too) named an endpoint,
+      // unknown when there's no positive local evidence either. A
+      // sessionless composite key (`k` has no real `session_id`) can never
+      // be in `localSids`, so it always lands here, same as the
+      // token-level classification above treats a sessionless record as
+      // unknown.
+      if (epBySid.has(k)) cloudRuns++;
+      else if (!localSids.has(k)) unknownRuns++;
+      sessRuns++;
+    }
     const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
     if (recs.every((p) => p.turn_seq != null)) {
       // (#1856) Sort by TIME, turn_seq only as a tiebreak — not the reverse.
@@ -380,7 +507,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     fresh,
     reread,
     uncls,
-    runs: sess.size + directRuns,
+    runs: sessRuns + directRuns,
     cloudRuns,
     unknownRuns,
   };
