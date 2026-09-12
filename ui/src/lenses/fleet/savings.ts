@@ -304,13 +304,55 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     // completions) takes the new path. See the pinned regression test.
     const bookends = dcTok.get(k);
     if (bookends && bookends.length > 1) {
+      // (#2659 follow-up — MUST FIX) Per-bookend classification is exact
+      // ONLY when the session's own `dcTok` bookends carry the endpoint
+      // evidence THEMSELVES (the genuinely-mixed session below, where one
+      // bookend's own `endpoint` field proves it cloud). When NONE of a
+      // group's bookends carry an endpoint, any cloud evidence for the
+      // session lives entirely OUTSIDE this group: a `dispatch.start` that
+      // named an endpoint but whose matching `dispatch.complete` didn't
+      // restate it (the same producer edge case the single-bookend `else`
+      // branch below already defers to `epBySid` for), or a HOSTED sibling
+      // seat that ERRORED — `dispatch.error` never registers `epBySid`
+      // (see its own comment above `epBySid`'s declaration) and never
+      // enters `dcTok` at all, so a failed hosted attempt is visible to
+      // this function ONLY through the `dispatch.start` that preceded it.
+      //
+      // Before this fix that evidence was silently dropped the moment a
+      // SECOND local sibling closed under the same session id: with one
+      // local completion (arity 1) the session fell to the `else` branch
+      // below and correctly inherited `epBySid`'s cloud classification;
+      // a second local completion arriving (arity 2+) flipped the WHOLE
+      // group to local, because this loop only ever consulted each
+      // bookend's OWN `endpoint` field — the exact same "let a bookend's
+      // own field override the session-level map" mistake the
+      // single-bookend path is already guarded against, just left
+      // unguarded here. That produced a run count whose classification
+      // (cloud vs local) changed as a function of how many local siblings
+      // happened to close under the shared id, with no new evidence
+      // arriving — proven in savings.test.ts.
+      //
+      // `bookendHasEndpoint` asks whether ANY bookend in this group
+      // carries its own endpoint. If one does, that's real per-bookend
+      // evidence and every OTHER endpoint-less bookend in the group keeps
+      // its local classification untouched (`epBySid` is NOT consulted) —
+      // the mixed-session test below still classifies its local bookend
+      // local, not cloud. Only when NO bookend in the group carries its
+      // own endpoint does `epBySid` act as a FLOOR for every bookend in
+      // the group: the session's only evidence is external to `dcTok`, so
+      // every bookend it covers inherits that evidence uniformly (matching
+      // what the single-bookend `else` branch has always done), rather
+      // than the group silently reverting to "no evidence at all" the
+      // moment there is more than one of them.
+      const bookendHasEndpoint = bookends.some((b) => !!b.endpoint);
       for (const b of bookends) {
-        if (b.endpoint) cloudRuns++;
+        if (b.endpoint || (!bookendHasEndpoint && epBySid.has(k))) cloudRuns++;
         // No `else` for unknownRuns here: a completion (this loop only
-        // sees `isDispatchComplete` records) either names an endpoint
-        // (cloud) or doesn't — and "doesn't" is exactly the criterion
-        // `localSids` uses to prove a session local. An endpoint-less
-        // bookend is therefore positive LOCAL evidence, not unknown; it
+        // sees `isDispatchComplete` records) either has positive cloud
+        // evidence (its own `endpoint`, or the group-wide `epBySid` floor
+        // above) or it doesn't — and "doesn't" is exactly the criterion
+        // `localSids` uses to prove a session local. A bookend with
+        // neither is therefore positive LOCAL evidence, not unknown; it
         // contributes to the implicit-local count via
         // `runs - cloudRuns - unknownRuns`, same as the single-bookend
         // case always did.

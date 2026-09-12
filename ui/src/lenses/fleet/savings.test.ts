@@ -431,6 +431,74 @@ describe("tokensOffMeter", () => {
     expect(t.local).toBe(0);
   });
 
+  // (MUST FIX 1, #2659 follow-up) The multi-bookend twin of the test just
+  // above: TWO local-looking `dispatch.complete` bookends share a session
+  // id whose ONLY endpoint evidence is a `dispatch.start` (neither
+  // COMPLETE restates it). Before this fix, the per-bookend loop only
+  // consulted each bookend's OWN `endpoint` field — since neither has one,
+  // BOTH classified local (`cloudRuns` stayed 0), silently dropping the
+  // session-level cloud evidence the moment a second bookend showed up.
+  // The session-level floor now applies to every bookend in the group
+  // when none of them carries its own endpoint, matching what the
+  // single-bookend case has always done.
+  it("(MUST FIX 1) a spanning session whose ONLY endpoint evidence is a dispatch.start floors BOTH bookends to cloud, not just the first", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "start-only-multi", action: "dispatch.start", handle: "coder", payload: { endpoint: "azure-foundry" } }),
+      tokenRec("start-only-multi", 1, 100, 10, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "start-only-multi", action: "dispatch.complete", payload: { total_tokens: 110 } }),
+
+      // Re-launch under the SAME session id — its own COMPLETE also never
+      // restates the endpoint.
+      tokenRec("start-only-multi", 1, 200, 20, "2026-08-08T00:05:00Z"),
+      rec({ session_id: "start-only-multi", action: "dispatch.complete", payload: { total_tokens: 220 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(2);
+    expect(t.unknownRuns).toBe(0);
+  });
+
+  // (MUST FIX 1, #2659 follow-up) The producer this finding was actually
+  // named for: a HOSTED sibling seat that ERRORED. `dispatch.error` never
+  // registers `epBySid` (see the comment above its declaration) and never
+  // enters `dcTok` (no token counts) — so the failed hosted attempt is
+  // visible to `tokensOffMeter` only through the `dispatch.start` that
+  // preceded it. Two genuinely-local sibling seats then complete cleanly
+  // under the SAME task-scoped session id. Before this fix, the run count
+  // for this exact shape FLIPPED depending purely on how many local
+  // siblings happened to close: one local sibling (arity 1) inherited the
+  // session's cloud classification via `epBySid` (the `else` branch);
+  // a second one arriving (arity 2+) took the per-bookend path and lost
+  // that evidence entirely, rendering "2 dispatches local" for a session
+  // that DID attempt (and fail) a cloud call. The floor makes both arities
+  // agree.
+  it("(MUST FIX 1) a hosted sibling that ERRORED still floors its local siblings' completions to cloud, regardless of how many close", () => {
+    const dataOneLocal: FlowRecord[] = [
+      rec({ session_id: "task:hosted-errored-1", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "gemini" } }),
+      rec({ session_id: "task:hosted-errored-1", action: "dispatch.error" }),
+      rec({ session_id: "task:hosted-errored-1", action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      tokenRec("task:hosted-errored-1", 1, 90, 10, "2026-08-08T00:00:00Z"),
+    ];
+    const one = tokensOffMeter(dataOneLocal);
+    expect(one.runs).toBe(1);
+    expect(one.cloudRuns).toBe(1);
+    expect(one.unknownRuns).toBe(0);
+
+    const dataTwoLocal: FlowRecord[] = [
+      ...dataOneLocal,
+      rec({ session_id: "task:hosted-errored-1", action: "dispatch.complete", payload: { total_tokens: 200 } }),
+      tokenRec("task:hosted-errored-1", 1, 180, 20, "2026-08-08T00:01:00Z"),
+    ];
+    const two = tokensOffMeter(dataTwoLocal);
+    // The count itself correctly grows to 2 real completions — the fix is
+    // about CLASSIFICATION consistency, not the count.
+    expect(two.runs).toBe(2);
+    // Both flip to cloud together, matching the single-local-sibling case
+    // above rather than the pre-fix "0" that arity 2+ used to produce.
+    expect(two.cloudRuns).toBe(2);
+    expect(two.unknownRuns).toBe(0);
+  });
+
   // (post-review, MINOR — a second population the fix widens) `dispatch.
   // single_shot`'s session id is TASK-scoped (`session_id::task`), so
   // sibling seats fanned out within one task can share it. The `(#2635)`
@@ -457,6 +525,35 @@ describe("tokensOffMeter", () => {
     expect(t.cloudRuns).toBe(0);
     expect(t.unknownRuns).toBe(0);
     expect(t.total).toBe(600);
+  });
+
+  // (MUST FIX 2, #2659 follow-up) `hasAnyTokenCounts` is the single
+  // conjunct standing between "one real dispatch bookend" and "any
+  // `dispatch.complete` at all" entering `dcTok` — and per the module doc
+  // above `dcTok`'s declaration, a LOCAL `dispatch.map` step's own summary
+  // bookend carries NO token field, sharing a session id with a sibling
+  // seat's genuine, token-bearing completion. Without the conjunct, that
+  // token-less bookend would ALSO enter `dcTok`, pushing this session's
+  // bookend count from 1 to 2 and routing it through the multi-bookend
+  // path — counting TWO runs for what is really one model dispatch plus
+  // one step-completion record that never called a model at all.
+  // RED-PROVE by deleting `&& hasAnyTokenCounts(p)` at the `dcTok`
+  // collection site: this test flips from `runs === 1` to `runs === 2`.
+  it("(MUST FIX 2) a token-bearing completion plus a token-LESS local map-step completion sharing one session id count as ONE run, not two", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:map-mix", action: "dispatch.start", handle: "coder" }),
+      tokenRec("task:map-mix", 1, 90, 10, "2026-08-08T00:00:00Z"),
+      // The genuine model dispatch's own bookend — carries tokens.
+      rec({ session_id: "task:map-mix", action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      // A LOCAL `dispatch.map` step's own summary bookend under the SAME
+      // session id — `stamp_remote_classification` only stamps a token
+      // field when the step is HOSTED, so this carries none at all.
+      rec({ session_id: "task:map-mix", action: "dispatch.complete", payload: {} }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(1);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
   });
 
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
