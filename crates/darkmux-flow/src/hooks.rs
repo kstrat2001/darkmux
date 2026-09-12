@@ -1685,8 +1685,16 @@ enum DeliveryOutcome {
     /// a PERMANENT failure (never retried), same as `ClientError`'s
     /// give-up path, but distinct so the emitted reason can name the
     /// status + redirect target host rather than "4xx". Carries the
-    /// status code and the `Location` target's host (best-effort — "" if
-    /// the header is absent or unparseable) for the `hook.failed` reason.
+    /// status code and the `Location` target's host (best-effort — the
+    /// header's own text when it does not parse as a URL) for the
+    /// `hook.failed` reason.
+    ///
+    /// (#2694) The `String` is ALREADY sanitized, bounded, escaped and
+    /// double-quoted by [`quote_and_escape_untrusted`] at construction in
+    /// [`try_post`] — it is remote-chosen text, and quoting it at the
+    /// boundary is what keeps every consumer of this variant (the
+    /// `.last` sidecar, the `hook.failed` record, `flow status`) from
+    /// having to remember. Interpolate it as-is; do not quote it again.
     RedirectRefused(u16, String),
     RetryableFailure,
 }
@@ -2469,39 +2477,71 @@ fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
 /// cut at all, since the escaped text is byte-identical to the
 /// already-bounded input.
 pub fn format_rejection_reasons_for_display(reasons: &[String]) -> String {
-    reasons
-        .iter()
-        .map(|r| {
-            let escaped = truncate_reason(r).replace('\\', "\\\\").replace('"', "\\\"");
-            let bounded = bound_reason_width(&escaped, REJECTION_REASON_RAW_BUDGET);
-            format!("\"{bounded}\"")
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+    reasons.iter().map(|r| quote_and_escape_untrusted(r)).collect::<Vec<_>>().join("; ")
 }
 
-/// (#2196 fix-round 3, MUST FIX G) The narrowest terminal width the
-/// rejection-reason rows are guaranteed against — no line
-/// [`format_rejection_reasons_as_indented_lines`] emits ever reaches this
-/// column, so no terminal at least this wide has anything to wrap.
+/// (#2694) Sanitize, bound, escape and QUOTE one span of text chosen by a
+/// remote party, so it can sit on a line darkmux also writes its own
+/// words on.
+///
+/// Lifted VERBATIM out of [`format_rejection_reasons_for_display`]'s
+/// per-reason closure — the same four steps in the same order, including
+/// the second bounding pass MUST FIX B/D added — and given a name that
+/// says what it does rather than which caller first needed it. #2694 is
+/// the second caller: the `Location` header of a refused redirect, chosen
+/// by whatever the hooks target redirects to, which rode into
+/// `LastStatus.error` verbatim. Extracting rather than copying is the
+/// point — the four steps are only correct TOGETHER (escaping AFTER the
+/// bound is exactly what makes the second bound necessary; sanitizing
+/// after the cut could slice a multi-byte sequence at the wrong point),
+/// and a third copy of the sequence is how the next round of findings
+/// gets born.
+///
+/// Idempotent on already-clean text in the sense the callers rely on: the
+/// sanitizer and the width bound are both no-ops on text that already
+/// passed them. It is NOT idempotent across the ESCAPE — calling it twice
+/// double-escapes — so a render site re-applying defense in depth to text
+/// that already carries its quotes uses [`truncate_reason`] (sanitize +
+/// bound only), never this.
+pub(crate) fn quote_and_escape_untrusted(s: &str) -> String {
+    let escaped = truncate_reason(s).replace('\\', "\\\\").replace('"', "\\\"");
+    let bounded = bound_reason_width(&escaped, REJECTION_REASON_RAW_BUDGET);
+    format!("\"{bounded}\"")
+}
+
+/// (#2196 fix-round 3, MUST FIX G) The narrowest terminal width every row
+/// carrying untrusted text is guaranteed against — no line
+/// [`format_rejection_reasons_as_indented_lines`] or
+/// [`untrusted_display_lines`] emits ever reaches this column, so no
+/// terminal at least this wide has anything to wrap.
 ///
 /// A "narrowest supported width" has to be a NUMBER somewhere, because
 /// the guarantee is only as good as the assumption it names. 60 is the
 /// narrowest width anyone actually reviews `flow status` at; a terminal
 /// narrower than that wraps darkmux's own rows too, so the forged row
 /// stops being distinguishable from ordinary damage.
-pub const REJECTION_REASON_MIN_TERMINAL_WIDTH: usize = 60;
+///
+/// (#2694) Renamed from `REJECTION_REASON_MIN_TERMINAL_WIDTH` when the
+/// `last error:` row became a second consumer: the number is a property
+/// of the TERMINAL, not of any one field that prints to it.
+pub const MIN_SUPPORTED_TERMINAL_WIDTH: usize = 60;
 
 /// (#2196 fix-round 3, MUST FIX G) Columns of indent every line
 /// [`format_rejection_reasons_as_indented_lines`] emits carries. Deeper
 /// than the six-space indent of the per-rule block it sits inside, so a
 /// reason line reads as subordinate to the `last rejection reason(s):`
 /// label above it.
-pub(crate) const REJECTION_REASON_LINE_INDENT: usize = 8;
+///
+/// (#2694) Renamed from `REJECTION_REASON_LINE_INDENT` and reused
+/// verbatim by `flow status`'s `last error:` row when that row's text is
+/// long enough to need its own lines — the two blocks sit inside the same
+/// six-space per-rule block, so they indent to the same depth or the
+/// reader sees two conventions where there is one.
+pub(crate) const UNTRUSTED_TEXT_LINE_INDENT: usize = 8;
 
 /// (#2196 fix-round 3, MUST FIX G) Render receiver-supplied rejection
 /// reasons as a list of COMPLETE, ALREADY-INDENTED output lines, none of
-/// which can reach column [`REJECTION_REASON_MIN_TERMINAL_WIDTH`].
+/// which can reach column [`MIN_SUPPORTED_TERMINAL_WIDTH`].
 ///
 /// This exists because the anti-forgery premise the earlier rounds relied
 /// on is FALSE, and was stated as an absolute. That premise: "every
@@ -2537,8 +2577,8 @@ pub(crate) const REJECTION_REASON_LINE_INDENT: usize = 8;
 /// unbroken run, or a legitimate long identifier), so a real multi-word
 /// reason stays readable while an adversarial one is still bounded.
 pub fn format_rejection_reasons_as_indented_lines(reasons: &[String]) -> Vec<String> {
-    let indent = " ".repeat(REJECTION_REASON_LINE_INDENT);
-    rejection_reason_display_lines(reasons, REJECTION_REASON_LINE_INDENT)
+    let indent = " ".repeat(UNTRUSTED_TEXT_LINE_INDENT);
+    rejection_reason_display_lines(reasons, UNTRUSTED_TEXT_LINE_INDENT)
         .into_iter()
         .map(|line| format!("{indent}{line}"))
         .collect()
@@ -2558,10 +2598,10 @@ pub const REJECTION_REASON_HINT_INDENT: usize = 10;
 /// width instead of a column of confetti. No caller in this workspace is
 /// anywhere near it (the deepest prefix is doctor's 10), and a future one
 /// that is has a layout problem this function cannot fix for it.
-const REJECTION_REASON_MIN_CONTENT_BUDGET: usize = 20;
+const MIN_UNTRUSTED_CONTENT_BUDGET: usize = 20;
 
 /// (#2196 fix-round 4) The receiver's rejection reasons, rendered and
-/// wrapped to lines that fit UNDER [`REJECTION_REASON_MIN_TERMINAL_WIDTH`]
+/// wrapped to lines that fit UNDER [`MIN_SUPPORTED_TERMINAL_WIDTH`]
 /// once the caller's own `prefix_columns` of indentation go in front of
 /// them. Returned WITHOUT that prefix, because the two consumers attach
 /// it differently: `flow status` prepends spaces itself
@@ -2580,10 +2620,55 @@ const REJECTION_REASON_MIN_CONTENT_BUDGET: usize = 20;
 /// immediately or defers, and the guarantee should not depend on which
 /// behavior the operator's terminal happens to have.
 pub fn rejection_reason_display_lines(reasons: &[String], prefix_columns: usize) -> Vec<String> {
-    let content_budget = REJECTION_REASON_MIN_TERMINAL_WIDTH
-        .saturating_sub(prefix_columns + 1)
-        .max(REJECTION_REASON_MIN_CONTENT_BUDGET);
-    wrap_to_display_width(&format_rejection_reasons_for_display(reasons), content_budget)
+    wrap_to_display_width(&format_rejection_reasons_for_display(reasons), untrusted_content_budget(prefix_columns))
+}
+
+/// (#2694) The per-line column budget for ANY line that will carry
+/// untrusted text behind `prefix_columns` of caller-supplied indent.
+///
+/// Extracted from [`rejection_reason_display_lines`], unchanged, because
+/// #2694's `last error:` row needs the identical arithmetic and the
+/// guarantee it encodes is not about rejection reasons — it is about the
+/// finished LINE. Two callers computing the same budget independently is
+/// how one of them ends up a column wider than the other after a retune.
+///
+/// The `+ 1` keeps a full line one column SHORT of
+/// [`MIN_SUPPORTED_TERMINAL_WIDTH`]: terminals disagree about whether a
+/// line that exactly fills the last column wraps immediately or defers,
+/// and the guarantee should not depend on which behavior the operator's
+/// terminal happens to have.
+fn untrusted_content_budget(prefix_columns: usize) -> usize {
+    MIN_SUPPORTED_TERMINAL_WIDTH.saturating_sub(prefix_columns + 1).max(MIN_UNTRUSTED_CONTENT_BUDGET)
+}
+
+/// (#2694) One span of untrusted text — already carrying whatever
+/// attribution its producer put on it — sanitized, bounded, and wrapped
+/// to lines that fit UNDER [`MIN_SUPPORTED_TERMINAL_WIDTH`] once the
+/// caller's own `prefix_columns` of indentation go in front of them.
+/// Returned WITHOUT that prefix, same as
+/// [`rejection_reason_display_lines`], because callers attach it
+/// differently.
+///
+/// The `Vec<String>` counterpart to that function for a caller whose
+/// untrusted text is not a LIST of receiver reasons but a single composed
+/// string: `flow status`'s `last error:` row, whose text is darkmux's own
+/// prose with a remote-chosen span quoted inside it (#2694 — the redirect
+/// `Location`). The wrapping is the load-bearing half: a bounded value
+/// under an indent prefix still wraps on a narrow terminal, and the
+/// attacker controls the first character of the continuation row, which
+/// renders at column zero in darkmux's own voice. Owning the wrap here
+/// means no continuation line exists at the supported width, so there is
+/// no column-zero position to forge from — the same reasoning
+/// [`format_rejection_reasons_as_indented_lines`]'s doc spells out at
+/// length, applied to a second row.
+///
+/// [`truncate_reason`] (sanitize + bound, no escaping) runs here rather
+/// than [`quote_and_escape_untrusted`] precisely because the input may
+/// already be quoted: this is defense in depth for a `.last` sidecar
+/// written by an older binary, or a future producer that forgets to
+/// sanitize — not a second attribution pass.
+pub fn untrusted_display_lines(text: &str, prefix_columns: usize) -> Vec<String> {
+    wrap_to_display_width(&truncate_reason(text), untrusted_content_budget(prefix_columns))
 }
 
 /// Greedy word wrap of `s` to at most `budget` rendered columns per line
@@ -2715,11 +2800,29 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
             let status = resp.status();
             if (300..400).contains(&status) {
                 let location = resp.header("Location").unwrap_or("");
+                // (#2694) The `Location` header is chosen by whatever the
+                // hooks target redirects to, and when it does not parse
+                // as a URL the fallback below is the header's RAW TEXT.
+                // That text used to ride verbatim into
+                // `LastStatus.error`, into the `hook.failed` record's
+                // `payload.error`, and out to `flow status`'s indented
+                // `last error:` row — neither sanitized nor bounded, the
+                // same shape #2196 measured on the rejection-reason path
+                // (an unbounded value under an indent prefix wraps, and
+                // the remote party controls the first character of the
+                // continuation row, which renders at column zero in
+                // darkmux's own voice). Sanitized, bounded, escaped and
+                // QUOTED here at the boundary — as close to the wire as
+                // the value exists — so EVERY consumer of this variant
+                // gets attributed text, not just the terminal one; see
+                // `quote_and_escape_untrusted`. The parses-fine branch is
+                // quoted too: one shape for the reader, and a URL host is
+                // remote-chosen either way.
                 let target_host = url::Url::parse(location)
                     .ok()
                     .and_then(|u| u.host_str().map(str::to_string))
                     .unwrap_or_else(|| location.to_string());
-                DeliveryOutcome::RedirectRefused(status, target_host)
+                DeliveryOutcome::RedirectRefused(status, quote_and_escape_untrusted(&target_host))
             } else {
                 // ureq only returns `Ok` for 2xx/3xx by default; any other
                 // status here would already have been `Err(Status(..))`
@@ -5296,6 +5399,90 @@ mod tests {
         assert_never_contacted(&attacker);
     }
 
+    /// (#2694) A `Location` header that does NOT parse as a URL falls
+    /// back to the header's raw text, which is chosen by whatever the
+    /// hooks target redirects to. Before this fix that text rode verbatim
+    /// into the `hook.failed` reason, into `LastStatus.error` on disk,
+    /// and out to `flow status`'s `last error:` row — neither sanitized
+    /// nor bounded.
+    ///
+    /// The hostile fixture needs nothing exotic: printable ASCII filler,
+    /// darkmux's own six-space row indent, and one of darkmux's own row
+    /// literals. (Control characters and the Unicode primitives are
+    /// covered by `truncate_reason`'s own tests — and would not survive a
+    /// real HTTP header transport anyway, which is exactly why the
+    /// ASCII-only shape is the one that matters at this boundary.)
+    ///
+    /// End-to-end through the real drainer: this asserts on what lands in
+    /// the `.last` SIDECAR, not on the helper's return value, so it
+    /// covers the whole producer path rather than the sanitizer alone.
+    #[test]
+    fn redirect_refusal_reason_attributes_and_bounds_a_hostile_location() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Not a URL (`url::Url::parse` needs a scheme), so `try_post`
+        // takes the raw-header fallback — the defective path.
+        let forged_row = "      cursor-write failures: 0";
+        let hostile = format!("{}{forged_row}", "z".repeat(400));
+        assert!(url::Url::parse(&hostile).is_err(), "the fixture must take the unparseable-Location fallback");
+        let receiver = HookReceiver::start().with_status_sequence([302]).with_redirect_location(&hostile);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+
+        assert!(
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)),
+            "a 3xx must be treated as a PERMANENT failure"
+        );
+        assert!(wait_until(
+            || read_last_status(&sink.rules[0].rule.last_status_path).and_then(|s| s.error).is_some(),
+            Duration::from_secs(3)
+        ));
+        let err = read_last_status(&sink.rules[0].rule.last_status_path).unwrap().error.unwrap();
+
+        // PRECONDITION — the unsanitized composition this replaced really
+        // does carry the forged, indented row, so the assertions below
+        // are not vacuous.
+        let unsanitized = format!("redirect refused: 302 to {hostile}");
+        assert!(unsanitized.contains(forged_row), "the fixture must forge a darkmux row before the fix");
+        assert!(
+            display_columns(&unsanitized) > MAX_REJECTION_REASON_DISPLAY_WIDTH,
+            "the fixture must exceed the display bound before the fix"
+        );
+
+        // ATTRIBUTED: the remote party's text is quoted, so a reader can
+        // see where darkmux's own voice stops.
+        assert!(err.starts_with("redirect refused: 302 to \""), "reason must attribute the target: {err}");
+        assert!(err.ends_with('"'), "reason must close the attribution quote: {err}");
+        // SANITIZED: the whitespace run that makes an indented-row
+        // forgery possible cannot survive.
+        assert!(!err.contains("  "), "no run of spaces may survive sanitization: {err}");
+        assert!(!err.contains(forged_row), "the forged row must not survive: {err}");
+        // BOUNDED: the quoted target is capped at the display budget,
+        // however long the header was.
+        let quoted = err.strip_prefix("redirect refused: 302 to ").unwrap();
+        assert!(
+            display_columns(quoted) <= MAX_REJECTION_REASON_DISPLAY_WIDTH,
+            "target must be bounded to {MAX_REJECTION_REASON_DISPLAY_WIDTH} columns, got {}: {err}",
+            display_columns(quoted)
+        );
+        // And the same text is what the flow record carries — the sidecar
+        // is not the only consumer.
+        let guard = capture.0.lock().unwrap();
+        let failed = guard.iter().find(|r| r.action == "hook.failed").unwrap();
+        assert_eq!(failed.payload.as_ref().unwrap()["error"].as_str().unwrap_or_default(), err);
+    }
+
     #[test]
     fn redirect_307_refused_as_permanent_failure_never_followed() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7822,9 +8009,9 @@ mod tests {
                 assert!(line.starts_with("        "), "stderr reason line is not indented: {line:?}");
                 let w = display_columns(line);
                 assert!(
-                    w < REJECTION_REASON_MIN_TERMINAL_WIDTH,
+                    w < MIN_SUPPORTED_TERMINAL_WIDTH,
                     "stderr reason line is {w} columns, must stay under {}: {line:?}",
-                    REJECTION_REASON_MIN_TERMINAL_WIDTH
+                    MIN_SUPPORTED_TERMINAL_WIDTH
                 );
             }
         }

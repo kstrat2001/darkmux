@@ -79,6 +79,20 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.48.0";
 // Version history:
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2694: `hook.failed`'s
+//           existing `payload.error` no longer carries a refused
+//           redirect's `Location` header verbatim. That header is
+//           remote-chosen text, and when it does not parse as a URL
+//           `try_post` fell back to its raw bytes; it is now sanitized,
+//           bounded and double-quoted at the boundary by
+//           `hooks::quote_and_escape_untrusted` (the same helper #2196's
+//           rejection reasons use), so the reason reads
+//           `redirect refused: 302 to "<target>"`. No key is added,
+//           removed or retyped — only the VALUE of a string field that
+//           has always carried free prose gets narrower, which is why
+//           this is not a bump: a consumer that could read the field
+//           before reads the same field now, and no consumer's computed
+//           output changes except that hostile text stops rendering.
 //   1.48.0 (#2196): `hook.fired`'s payload gains an additive
 //           `receiver_rejected_reasons` key — the receiver's own
 //           `results[].error` text (bounded to the first 3, each

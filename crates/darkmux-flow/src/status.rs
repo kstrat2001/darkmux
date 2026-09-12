@@ -667,7 +667,66 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                 }
             }
             if let Some(err) = &r.last_error {
-                let _ = writeln!(out, "      last error: {err}");
+                // (#2694) `last_error` is not all darkmux's own voice: the
+                // redirect-refusal producer embeds the `Location` header
+                // chosen by whatever the hooks target redirects to, and a
+                // `.last` sidecar written by an older binary holds that
+                // text raw. Rendered inline and unbounded — as this row
+                // was — a long value wraps and the remote party controls
+                // the first character of the continuation, which lands at
+                // column 0 where this renderer's EIGHT FLUSH-LEFT rows
+                // live (`Warnings:` and `Failures:` being the two that
+                // change how everything below them reads). Same fix as
+                // the rejection-reason block below: darkmux owns the
+                // wrap, so at the supported width there is no
+                // continuation line to forge from — and
+                // `untrusted_display_lines` re-sanitizes, so a pre-#2694
+                // sidecar on disk is cleaned at render too.
+                //
+                // Two shapes, both bounded: a value that fits stays on
+                // the familiar one-line row (the common case — every
+                // other producer of this field is darkmux's own short
+                // prose), and only a value too wide for that gets the
+                // label row plus its own indented lines.
+                //
+                // (#2694 surface inventory) The terminal is not the only
+                // consumer of these exact rows: the viewer's console lens
+                // runs `flow status` as a panel and renders its stdout
+                // into a real `<pre class="panelout">` styled
+                // `white-space: pre-wrap` with no `overflow-x`, so it
+                // wraps too — at the panel's width, which on a phone is
+                // narrower than any terminal. React escapes the text, so
+                // there is no markup injection there; the row-forgery
+                // question is inherited whole, and owning the wrap here
+                // is what answers it for both. Below
+                // `MIN_SUPPORTED_TERMINAL_WIDTH` the guarantee lapses for
+                // this row exactly as it does for the rejection block —
+                // at that width darkmux's own rows wrap too, so a forged
+                // row stops being distinguishable from ordinary damage.
+                const LAST_ERROR_LABEL: &str = "      last error: ";
+                let inline = crate::hooks::untrusted_display_lines(err, LAST_ERROR_LABEL.chars().count());
+                match inline.len() {
+                    // Sanitized away to nothing (an error string made
+                    // only of control characters). The outcome still
+                    // happened, so the row is still printed — darkmux
+                    // describes what it has, and "no printable text" is
+                    // what it has.
+                    0 => {
+                        let _ = writeln!(out, "{LAST_ERROR_LABEL}(no printable text)");
+                    }
+                    1 => {
+                        let _ = writeln!(out, "{LAST_ERROR_LABEL}{}", inline[0]);
+                    }
+                    _ => {
+                        let _ = writeln!(out, "      last error:");
+                        let indent = " ".repeat(crate::hooks::UNTRUSTED_TEXT_LINE_INDENT);
+                        for line in
+                            crate::hooks::untrusted_display_lines(err, crate::hooks::UNTRUSTED_TEXT_LINE_INDENT)
+                        {
+                            let _ = writeln!(out, "{indent}{line}");
+                        }
+                    }
+                }
             }
             if r.dropped_appends > 0 {
                 let _ = writeln!(out, "      dropped: {} (over the outbox cap, or an append failure)", r.dropped_appends);
@@ -1603,6 +1662,213 @@ mod hooks_status_tests {
         assert!(exercised >= 30, "only {exercised} (width, row) pairs were exercised");
     }
 
+    /// (#2694) The label `format_status_human` prints `last_error` behind,
+    /// in COLUMNS, and the darkmux-voice head of the redirect-refusal
+    /// reason that follows it. The forgery's arithmetic keys on their
+    /// sum: inline, remote-chosen text begins at exactly this column, so
+    /// a filler of `width - LAST_ERROR_PREFIX_COLUMNS - 1` characters plus
+    /// one space lands the payload on column 0 of the first wrapped
+    /// continuation at that width.
+    const LAST_ERROR_LABEL: &str = "      last error: ";
+    const REDIRECT_REASON_HEAD: &str = "redirect refused: 302 to ";
+    const LAST_ERROR_PREFIX_COLUMNS: usize = LAST_ERROR_LABEL.len() + REDIRECT_REASON_HEAD.len();
+
+    /// Render `format_status_human` for one rule whose last terminal
+    /// outcome was a failure carrying `err` — the `.last` sidecar is
+    /// written DIRECTLY, bypassing `try_post`'s own sanitization, which is
+    /// both the pre-#2694 on-disk case (a sidecar written by an older
+    /// binary holds the raw `Location` text) and the way to prove the
+    /// render site defends independently of the producer.
+    fn render_with_last_error(err: &str) -> String {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8794/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = crate::hooks::rule_key(&m, &url);
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            serde_json::json!({ "ts": "2026-01-01T00:00:00Z", "ok": false, "error": err }).to_string(),
+        )
+        .unwrap();
+
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        assert_eq!(hooks.rules[0].last_error.as_deref(), Some(err), "the fixture must reach the renderer verbatim");
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        format_status_human(&status)
+    }
+
+    /// (#2694) The same flush-left row forgery #2196 measured on the
+    /// rejection-reason row, on the `last error:` row — which renders a
+    /// second span of remote-chosen text (the `Location` header of a
+    /// refused redirect, passed through verbatim when it does not parse
+    /// as a URL) and, before this fix, rendered it INLINE and UNBOUNDED.
+    ///
+    /// SELF-PROVING rather than mutation-dependent, the same way
+    /// `flow_status_reason_cannot_forge_a_flush_left_row` is: for every
+    /// (width, row) pair it first asserts the forgery really does land in
+    /// the inline rendering that shipped before this fix — the exact
+    /// `"      last error: {err}"` string — and only then asserts the real
+    /// renderer produces no such continuation at any of the five widths.
+    /// A fixture that stopped forging would fail the precondition instead
+    /// of passing vacuously.
+    ///
+    /// No skip arm is needed here (unlike the rejection version): the
+    /// pre-fix form bounded nothing at all, so every pair forges.
+    #[test]
+    fn flow_status_last_error_cannot_forge_a_flush_left_row() {
+        let widths = [60usize, 72, 80, 100, 120];
+        let mut exercised = 0usize;
+
+        for payload in FLUSH_LEFT_ROWS {
+            for width in widths {
+                let filler = width - LAST_ERROR_PREFIX_COLUMNS - 1;
+                let location = format!("{} {payload}", "z".repeat(filler));
+                let err = format!("{REDIRECT_REASON_HEAD}{location}");
+
+                // PRECONDITION — the inline, unbounded form that shipped
+                // before this fix really does forge this row at this width.
+                let inline = format!("{LAST_ERROR_LABEL}{err}");
+                assert!(
+                    wrapped_continuations(&inline, width).iter().any(|c| c.starts_with(payload)),
+                    "the fixture must actually forge {payload:?} at width {width} in the INLINE form, \
+                     or this test proves nothing: {inline:?}"
+                );
+                exercised += 1;
+
+                // And the shipped renderer must produce no such
+                // continuation, for ANY of the eight rows, at ANY width.
+                let rendered = render_with_last_error(&err);
+                for w in widths {
+                    for continuation in wrapped_continuations(&rendered, w) {
+                        for row in FLUSH_LEFT_ROWS {
+                            assert!(
+                                !continuation.starts_with(row),
+                                "width {w}: a wrapped continuation forges the flush-left row {row:?} \
+                                 (payload {payload:?} sized for width {width}): {continuation:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(exercised, FLUSH_LEFT_ROWS.len() * widths.len(), "the full (width, row) grid must be exercised");
+    }
+
+    /// (#2694, the mechanism — asserted independently of any forged
+    /// vocabulary) Every line `format_status_human` emits for the `last
+    /// error:` row must stay strictly under the narrowest supported
+    /// terminal width, so no terminal at that width or wider has a
+    /// continuation line for remote-chosen text to reach column 0
+    /// through. That, not the vocabulary check above, is what makes the
+    /// forgery unreachable for rows nobody has thought of yet.
+    ///
+    /// Red-proves by name: restore the inline
+    /// `writeln!(out, "      last error: {err}")` and the width assertion
+    /// fails on the first fixture; delete the `- 1` from
+    /// `untrusted_content_budget` and it fails at exactly 60 columns.
+    #[test]
+    fn every_rendered_last_error_line_is_bounded_under_the_supported_width() {
+        let min_width = crate::hooks::MIN_SUPPORTED_TERMINAL_WIDTH;
+        // Four shapes: an unbroken run with no wrap opportunity at all, a
+        // run of wide (2-column) characters, a zero-width run that a
+        // column-only bound would not catch, and the escape-expansion
+        // path (no exotic Unicode needed).
+        let fixtures = [
+            format!("{REDIRECT_REASON_HEAD}{}", "q".repeat(400)),
+            format!("{REDIRECT_REASON_HEAD}{}", "漢".repeat(200)),
+            format!("{REDIRECT_REASON_HEAD}{}", "a\u{0301}".repeat(2000)),
+            format!("{REDIRECT_REASON_HEAD}{}", "\"".repeat(200)),
+        ];
+        for err in &fixtures {
+            let rendered = render_with_last_error(err);
+            let mut block_lines = 0usize;
+            let mut in_block = false;
+            for line in rendered.lines() {
+                // The block is either the one-line `last error: …` row, or
+                // a bare `last error:` label followed by indented lines.
+                if line.starts_with("      last error:") {
+                    in_block = true;
+                } else if in_block && !line.starts_with(&" ".repeat(crate::hooks::UNTRUSTED_TEXT_LINE_INDENT)) {
+                    in_block = false;
+                }
+                if !in_block {
+                    continue;
+                }
+                block_lines += 1;
+                let width: usize = crate::hooks::display_columns(line);
+                assert!(width < min_width, "last-error line is {width} columns, must stay under {min_width}: {line:?}");
+            }
+            assert!(block_lines >= 2, "the fixture must actually produce a wrapped block, saw {block_lines}: {err:?}");
+        }
+    }
+
+    /// (#2694, inverted case) A short error — every OTHER producer of
+    /// `LastStatus.error` writes darkmux's own short prose — still
+    /// renders on the familiar single row, so the test above cannot pass
+    /// because the renderer became unconditionally multi-line, and a
+    /// rule with no terminal failure prints no `last error` row at all.
+    #[test]
+    fn flow_status_keeps_a_short_last_error_on_one_row_and_omits_it_when_absent() {
+        let rendered = render_with_last_error("invalid outbox line");
+        assert!(
+            rendered.contains("      last error: invalid outbox line\n"),
+            "a short internal error must stay on the one-line row: {rendered}"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8795/events".to_string()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        assert!(hooks.rules[0].last_error.is_none());
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        assert!(!format_status_human(&status).contains("last error"), "no terminal failure, no row");
+    }
+
     /// Render `format_status_human` for one rule carrying `reasons` as
     /// its last receiver rejection.
     fn render_with_reasons(reasons: &[String]) -> String {
@@ -1721,8 +1987,8 @@ mod hooks_status_tests {
         };
         let rendered = format_status_human(&status);
 
-        let min_width = crate::hooks::REJECTION_REASON_MIN_TERMINAL_WIDTH;
-        let indent = " ".repeat(crate::hooks::REJECTION_REASON_LINE_INDENT);
+        let min_width = crate::hooks::MIN_SUPPORTED_TERMINAL_WIDTH;
+        let indent = " ".repeat(crate::hooks::UNTRUSTED_TEXT_LINE_INDENT);
         let mut reason_lines = 0usize;
         for line in rendered.lines() {
             // The reason lines are exactly the ones carrying a quote —
