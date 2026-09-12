@@ -1255,12 +1255,22 @@ mod hooks_status_tests {
             extras: Default::default(),
         }];
         let key = crate::hooks::rule_key(&m, &url);
-        // Filler (10 cols) + darkmux's OWN row text, six-space-indented
-        // (30 cols) = exactly 40 — the display-width cap — so this
-        // survives `truncate_reason` WHOLE, unlike a longer padded
-        // attempt that the cap alone would already defeat.
-        let forged_reason = "1234567890      cursor-write failures: 0";
-        assert_eq!(forged_reason.chars().count(), 40, "fixture must sit exactly at the cap");
+        // (#2196 fix-round 2, MUST FIX C) Filler + darkmux's OWN row
+        // text, six-space-indented, sized to sit EXACTLY at
+        // `REJECTION_REASON_RAW_BUDGET` columns (derived from the real
+        // constant, not hardcoded, so this stays exact if the budget is
+        // ever retuned) — so this survives `truncate_reason` WHOLE,
+        // unlike a longer padded attempt that the width bound alone
+        // would already defeat.
+        let own_row = "      cursor-write failures: 0";
+        let filler_len = crate::hooks::REJECTION_REASON_RAW_BUDGET - own_row.chars().count();
+        let filler: String = "1234567890".chars().cycle().take(filler_len).collect();
+        let forged_reason = format!("{filler}{own_row}");
+        assert_eq!(
+            forged_reason.chars().count(),
+            crate::hooks::REJECTION_REASON_RAW_BUDGET,
+            "fixture must sit exactly at the cap"
+        );
         std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
         std::fs::write(
             tmp.path().join(format!("{key}.last")),
@@ -1295,7 +1305,7 @@ mod hooks_status_tests {
         // The rendered reason must never contain the forged run of
         // spaces — the property that makes the forgery impossible
         // regardless of where any wrap lands.
-        assert!(!rendered.contains("1234567890      cursor-write"), "{rendered}");
+        assert!(!rendered.contains(&format!("{filler}      cursor-write")), "{rendered}");
         assert!(!rendered.contains("      cursor-write"), "no 6-space-indented forgery may survive: {rendered}");
 
         // Simulate wrapping every line at a range of plausible terminal
@@ -1316,6 +1326,105 @@ mod hooks_status_tests {
                     assert!(
                         !continuation.starts_with("cursor-write failures"),
                         "wrapped continuation row at width {width} reproduces darkmux's own row \
+                         vocabulary: {continuation:?} (full line: {line:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (#2196 fix-round 2, MUST FIX A + D, re-proof at the widened
+    /// widths) Re-runs the verifier's own row-forgery proof end-to-end
+    /// through `flow status`'s real renderer, at the widths named in the
+    /// fix-round-2 verification brief (60, 72, 80, 100, 120). Covers two
+    /// independent primitives: (1) each of the four blank-glyph
+    /// characters (U+2800, U+3164, U+115F, U+FFA0), used as "an exact
+    /// replica of darkmux's 6-space indent" — none is
+    /// `char::is_whitespace()`, so [`crate::hooks::collapse_whitespace_and_trim`]
+    /// alone would never have caught them, which is exactly why they
+    /// counted as forgeries the first fix-round's whitespace-collapse
+    /// defense didn't reach; and (2) a purely-ASCII quote-heavy reason —
+    /// the escape-expansion path, which needs no exotic Unicode at all
+    /// (this was the padding the verifier's own proof used). The fixture
+    /// writes straight into the `.last` sidecar, bypassing the
+    /// producer's own sanitization, so this also proves the render-time
+    /// re-sanitization catches all of it independently.
+    #[test]
+    fn flow_status_defeats_the_blank_glyph_and_escape_expansion_forgeries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8791/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = crate::hooks::rule_key(&m, &url);
+
+        let blank_glyphs = ['\u{2800}', '\u{3164}', '\u{115F}', '\u{FFA0}'];
+        let mut reasons: Vec<String> = blank_glyphs
+            .iter()
+            .map(|c| format!("{}{}cursor-write failures: 0 (recovered)", "x".repeat(20), c.to_string().repeat(6)))
+            .collect();
+        reasons.push("\"".repeat(200)); // the escape-expansion path — no exotic Unicode needed
+
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            serde_json::json!({
+                "ts": "2026-01-01T00:00:00Z",
+                "ok": true,
+                "last_receiver_rejected": 1,
+                "last_receiver_rejected_reasons": reasons,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+
+        for c in blank_glyphs {
+            assert!(
+                !rendered.contains(c),
+                "U+{:06X} must not survive to the rendered row at all: {rendered}",
+                c as u32
+            );
+        }
+
+        for width in [60usize, 72, 80, 100, 120] {
+            for line in rendered.lines() {
+                let chars: Vec<char> = line.chars().collect();
+                for chunk_start in (width..chars.len()).step_by(width) {
+                    let continuation: String = chars[chunk_start..].iter().take(width).collect();
+                    assert!(
+                        !continuation.starts_with("  "),
+                        "width {width}: wrapped continuation begins with darkmux's own multi-space \
+                         indent — forgery survived: {continuation:?} (full line: {line:?})"
+                    );
+                    assert!(
+                        !continuation.starts_with("cursor-write failures"),
+                        "width {width}: wrapped continuation reproduces darkmux's own row \
                          vocabulary: {continuation:?} (full line: {line:?})"
                     );
                 }

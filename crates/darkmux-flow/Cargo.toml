@@ -62,6 +62,21 @@ url = "2.5"
 jaq-core = "=3.1.1"
 jaq-std = "=3.0.3"
 jaq-json = "=2.0.3"
+# #2196 fix-round 2 — hooks.rs's receiver-rejection-reason rendering needs a
+# real column-width and general-category classification of arbitrary
+# receiver-supplied text, not a hand-rolled approximation. Two fix rounds
+# each found real overshoots/gaps in the hand-rolled versions (a byte-index
+# range list for "wide" scripts, and an enumerated list of "invisible"
+# characters) that these crates close structurally instead of one block/
+# character at a time. Both are the canonical `unicode-rs`-family crates
+# (the same family `unicode-width` — the crate `ripgrep`/`bat`/`clap`'s
+# wrapping already rely on — belongs to), pull in ZERO transitive
+# dependencies of their own (verified via `cargo tree`), and are
+# regenerated from the real Unicode Character Database rather than
+# hand-maintained, so a future Unicode version's new assignments are
+# picked up by a version bump instead of another hand-rolled range.
+unicode-width = "0.2.2"
+unicode-general-category = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.10"

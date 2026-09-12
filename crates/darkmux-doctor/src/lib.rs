@@ -7096,16 +7096,17 @@ mod tests {
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
-        // (#2196 fix-round MUST FIX 1) The fixture's 47-column raw text
-        // is written straight into the `.last` sidecar, bypassing the
-        // producer's own `truncate_reason` call — this proves the
+        // (#2196 fix-round 2, MUST FIX C) The fixture's 47-column raw
+        // text is written straight into the `.last` sidecar, bypassing
+        // the producer's own `truncate_reason` call — this proves the
         // render-time re-sanitization/re-bounding
         // (`darkmux_flow::hooks::format_rejection_reasons_for_display`)
-        // ALSO applies at read time: the rendered text is bounded to 40
-        // columns (+ellipsis) and quoted, with the reason's OWN internal
-        // `"` backslash-escaped.
+        // ALSO applies at read time: quoted, with the reason's OWN
+        // internal `"` backslash-escaped, and — since 47 columns is well
+        // under the fix-round-2 budget of 118 — surviving WHOLE rather
+        // than losing the word "string" to the old 40-column cap.
         assert!(
-            rule.message.contains("\"payload field \\\"file\\\" must be a non-empty…\""),
+            rule.message.contains("\"payload field \\\"file\\\" must be a non-empty string\""),
             "the receiver's own reason must be named, not just the count: {}",
             rule.message
         );

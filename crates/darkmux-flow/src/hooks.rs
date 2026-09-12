@@ -1873,68 +1873,175 @@ fn build_delivery_headers(
 /// (deliberately or not) rejects everything with a huge error body.
 const MAX_REJECTION_REASONS: usize = 3;
 
-/// (#2196 fix-round MUST FIX 1) Each individual reason string is
-/// truncated to at most this many rendered COLUMNS (see [`display_width`]
-/// — not bytes, not `char`s) before it rides anywhere durable. A byte
-/// bound doesn't protect the one surface this text is actually dangerous
-/// on: a fixed-column human report. `flow status`'s widest per-rule
-/// label, `"      last rejection reason(s): "`
-/// (`status.rs::format_status_human`), is 32 columns; a receiver padding
-/// its reason to reach the wrap boundary of even a conservative 80-column
-/// terminal controls everything from that column onward, including the
-/// first character of the WRAPPED CONTINUATION ROW — which a plain byte
-/// cap (the previous 200-byte bound) does nothing to prevent (a 90-byte
-/// all-printable reason reaches column 122, well past any real
-/// terminal's fold point).
+/// (#2196 fix-round 2, MUST FIX C) The total rendered COLUMN budget for
+/// ONE reason exactly as `flow status`/`doctor` actually print it: quoted
+/// and, if it contains `"`/`\`, backslash-escaped
+/// ([`format_rejection_reasons_for_display`]) — see [`display_width`]
+/// for what "column" means here (not bytes, not `char`s).
 ///
-/// The budget: assume an 80-column floor (the POSIX default, and a
-/// reasonable "narrowest terminal an operator plausibly runs `flow
-/// status`/`doctor` in"), subtract the widest known inline-label prefix
-/// (32) and the two quote-mark columns [`format_rejection_reasons_for_display`]
-/// adds, then round down for margin. This bound is defense in depth, not
-/// the whole defense — on a terminal narrower than 80 columns a long
-/// enough reason can still wrap. What actually closes the exact-vocabulary
-/// forgery (a receiver reproducing darkmux's own `"      cursor-write
-/// failures: 0 (recovered)"`-shaped rows) is
-/// [`collapse_whitespace_and_trim`]: darkmux's own rows always indent with
-/// a RUN of spaces, and a run collapses to one, so no receiver-controlled
-/// text can ever reproduce that indentation regardless of where a wrap
-/// lands.
-const MAX_REJECTION_REASON_DISPLAY_WIDTH: usize = 40;
+/// (#2196 fix-round MUST FIX 1) The first fix-round set this to 40,
+/// reasoning from an assumed 80-column terminal minus the widest known
+/// inline-label prefix. Reviewed again in fix-round 2: that bound
+/// destroyed the disclosure the feature exists to provide. This PR's own
+/// flagship example — `"payload field \"file\" must be a non-empty
+/// string"` (47 columns) — lost the word naming the constraint
+/// ("string") at 40 columns; a `body.findings[N].severity` validation
+/// error loses the field index; a duplicate-key rejection loses the
+/// fingerprint and run id, which is the whole actionable content. #2196
+/// exists because the count alone told an operator SOMETHING was
+/// discarded and never why — a 40-column cap recreates most of that gap.
+/// The 40-column number was also buying little: at 40 columns the full
+/// row (label + quotes + reason) is 75 columns and doesn't even wrap an
+/// 80-column terminal, and what actually closes the exact-vocabulary row
+/// forgery is [`collapse_whitespace_and_trim`] plus stripping the
+/// non-whitespace blank-rendering characters ([`is_stripped_for_display`]),
+/// not this width bound — see those functions' docs. The bound below
+/// exists to cap payload size and keep a report from an actively hostile
+/// receiver bounded, not to defeat forgery.
+///
+/// 120 is chosen as the upper end of "roughly 100-120": generous enough
+/// that realistic receiver validation messages (measured: 47, 83, 108
+/// columns for the reasons named above) survive whole, while still
+/// bounding an actively hostile receiver's payload. [`REJECTION_REASON_TAIL_RESERVE`]
+/// documents how the budget splits between a head and a tail when a
+/// reason IS long enough to need cutting.
+pub(crate) const MAX_REJECTION_REASON_DISPLAY_WIDTH: usize = 120;
 
-/// (#2196 fix-round MUST FIX 1) Bidi control / directional-isolate
-/// characters — the Trojan Source class (CVE-2021-42574: RLO/LRO/isolates
-/// reorder how text VISUALLY renders without touching its logical byte
-/// order). Unicode category `Cf` (format), not `Cc` — `char::is_control()`
-/// does not catch these.
-fn is_bidi_control_char(c: char) -> bool {
+/// The two literal `"` characters [`format_rejection_reasons_for_display`]
+/// always wraps a reason in, reserved out of [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]
+/// so quoting can never itself push the rendered reason over the cap.
+pub(crate) const REJECTION_REASON_QUOTE_OVERHEAD: usize = 2;
+
+/// The raw (unquoted, sanitized) column budget every reason is bounded to
+/// before quoting — [`MAX_REJECTION_REASON_DISPLAY_WIDTH`] minus the
+/// quote overhead. Applied identically at write time
+/// ([`extract_rejection_reasons`]) and as the first pass at render time
+/// ([`format_rejection_reasons_for_display`]) — see
+/// [`format_rejection_reasons_for_display`]'s doc for why a SECOND pass,
+/// on the escaped text, is also needed (MUST FIX B/D: escaping must not
+/// be able to grow a reason back past the cap).
+pub(crate) const REJECTION_REASON_RAW_BUDGET: usize = MAX_REJECTION_REASON_DISPLAY_WIDTH - REJECTION_REASON_QUOTE_OVERHEAD;
+
+/// (#2196 fix-round 2, MUST FIX C) When a reason IS long enough to need
+/// cutting, this many columns are reserved for a TAIL kept after the
+/// `…`, rather than cutting only the head off. A validation-style reason
+/// (`"...severity must be one of low, medium, high, critical — got
+/// \"catastrophic\""`) loses the offending value with a head-only cut;
+/// a head+tail cut keeps both the constraint AND the value that failed
+/// it — see [`bound_reason_width`]. 24 columns comfortably covers a
+/// short trailing clause like the example above (19 columns) with a
+/// little headroom.
+pub(crate) const REJECTION_REASON_TAIL_RESERVE: usize = 24;
+
+/// (#2196 fix-round 2, MUST FIX A) Is `c` in a Unicode GENERAL CATEGORY
+/// that has no business appearing in a human-facing terminal report,
+/// full stop?
+///
+/// The first fix-round enumerated individual code points and ranges
+/// (bidi controls, ZWSP/ZWJ/BOM, line/paragraph separators) picked out by
+/// hand. Reviewed again in fix-round 2: that approach cannot converge —
+/// the verifier's second pass found FOUR MORE characters the enumeration
+/// missed (U+061C ARABIC LETTER MARK, U+2060 WORD JOINER, U+2061–2064,
+/// U+180E, U+FFF9–FFFB) on its very next look, and a denylist of
+/// individual code points can never structurally close against a
+/// character Unicode assigns tomorrow. This inverts the check: instead of
+/// naming characters to drop, it names the CATEGORIES no receiver-supplied
+/// prose has any legitimate reason to use, and drops everything the
+/// Unicode Character Database currently assigns — or ever assigns in the
+/// future — to one of them:
+///
+/// - `Cc` (Control) — C0/C1 controls: `\n`, `\r`, ESC, DEL, ...
+/// - `Cf` (Format) — the ENTIRE format-character category in one check:
+///   every bidi embedding/override/isolate control (the Trojan Source
+///   class, CVE-2021-42574), every invisible-math/joining control (ZWSP,
+///   ZWNJ, ZWJ, word joiner, the invisible operators), the BOM, the
+///   interlinear-annotation triad, ARABIC LETTER MARK, MONGOLIAN VOWEL
+///   SEPARATOR, and the TAG block (U+E0000–E007F) — verified against
+///   Unicode's own `DerivedCoreProperties.txt`/general-category data,
+///   not hand-picked. A future Unicode version's new format character is
+///   caught automatically; the first fix-round's four misses would all
+///   have been caught by this one check.
+/// - `Co` (Private Use) — no character exists here by definition; its
+///   rendering is whatever a receiver's chosen (unknowable) font happens
+///   to map it to.
+/// - `Cs` (Surrogate) — cannot occur in a real `char` at all (Rust's
+///   `char` type structurally excludes surrogate code points), kept here
+///   only so this function reads as a complete category audit.
+/// - `Cn` (Unassigned) — no character is assigned here yet; a receiver
+///   naming one is sending noise at best.
+/// - `Zl`/`Zp` (Line/Paragraph Separator) — U+2028/U+2029, the same
+///   row-forgery primitive as `\n` wearing a category `\n`'s own check
+///   doesn't cover.
+///
+/// This is deliberately a category-level check, not a full "safe to
+/// print" allowlist of individual characters — see [`is_stripped_for_display`]'s
+/// doc for the two narrow, closed exceptions Unicode's category system
+/// cannot express (a handful of characters assigned to ordinary
+/// printable categories that nonetheless render as blank glyphs in every
+/// mainstream terminal font).
+fn is_denylisted_category(c: char) -> bool {
+    use unicode_general_category::GeneralCategory as GC;
     matches!(
-        c,
-        '\u{200E}' | '\u{200F}' // LRM, RLM
-        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
-        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+        unicode_general_category::get_general_category(c),
+        GC::Control
+            | GC::Format
+            | GC::PrivateUse
+            | GC::Surrogate
+            | GC::Unassigned
+            | GC::LineSeparator
+            | GC::ParagraphSeparator
     )
 }
 
-/// (#2196 fix-round MUST FIX 1) Invisible / zero-width characters that can
-/// hide arbitrary payload inside otherwise-printable text (ZWSP, ZWNJ,
-/// ZWJ, the BOM/ZWNBSP, and soft hyphen). Also `Cf`, not `Cc`.
-fn is_invisible_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
-        | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
-        | '\u{00AD}' // SOFT HYPHEN
-    )
+/// (#2196 fix-round 2, MUST FIX A) A small, CLOSED set of characters
+/// Unicode assigns to an ordinary printable general category (`Lo` —
+/// Other Letter, or `So` — Other Symbol) — so [`is_denylisted_category`]
+/// cannot reach them without also dropping thousands of legitimate
+/// letters and symbols in the same category — that nonetheless render as
+/// a BLANK glyph (no visible mark at all) in every mainstream terminal
+/// font. This is the concrete case where a pure category allowlist
+/// cannot work: Unicode's category system has no "renders blank"
+/// property, so these five have to be named explicitly. They are
+/// permanently fixed, single code points (not ranges, not blocks) tied
+/// to old encoding-compatibility conventions Unicode will not extend:
+///
+/// - `U+115F` HANGUL CHOSEONG FILLER, `U+1160` HANGUL JUNGSEONG FILLER,
+///   `U+3164` HANGUL FILLER, `U+FFA0` HALFWIDTH HANGUL FILLER — blank
+///   placeholder jamo from the old Johab/compatibility Hangul encoding
+///   model; category `Lo` because Unicode classifies all Hangul jamo as
+///   letters, but the FILLER members of that set are defined to have no
+///   visible glyph.
+/// - `U+2800` BRAILLE PATTERN BLANK — the "all raised dots absent" cell
+///   of the braille block; category `So` (Symbol) like every other
+///   braille cell, but this one specific pattern is, by definition, the
+///   blank one.
+fn is_blank_glyph_exception(c: char) -> bool {
+    matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}')
 }
 
-/// (#2196 fix-round MUST FIX 1) Unicode line/paragraph separators —
-/// category `Zl`/`Zp`, not `Cc` — that some terminals and renderers treat
-/// as a line break exactly like `\n`/`\r`. Left in, these are the same
-/// row-forgery primitive `\n` is, wearing a category `char::is_control()`
-/// doesn't check.
-fn is_unicode_line_break(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}')
+/// (#2196 fix-round 2, MUST FIX A) Unicode Variation Selectors
+/// (`U+FE00..=FE0F`) and Variation Selectors Supplement
+/// (`U+E0100..=E01EF`) — two permanently closed, dedicated blocks.
+/// Category `Mn` (Nonspacing Mark), the SAME category as a legitimate
+/// combining accent (`café` = `e` + `U+0301`), so [`is_denylisted_category`]
+/// can't reach them without also stripping real diacritics from
+/// legitimate international prose. Left in, a variation selector is both
+/// a zero-width character that can silently modify (or hide inside) the
+/// glyph before it, and a documented steganographic channel (data
+/// smuggled as a sequence of otherwise-invisible selectors) — a receiver
+/// has no legitimate reason to send one in a rejection reason.
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// (#2196 fix-round 2, MUST FIX A) The full "safe to print" test: `false`
+/// for anything [`is_denylisted_category`], [`is_blank_glyph_exception`],
+/// or [`is_variation_selector`] would drop. Named for what it decides,
+/// not what it enumerates — the category check does the structural work;
+/// the two named-exception checks cover what Unicode's category system
+/// itself cannot express (see each function's doc).
+fn is_stripped_for_display(c: char) -> bool {
+    is_denylisted_category(c) || is_blank_glyph_exception(c) || is_variation_selector(c)
 }
 
 /// Strip control characters (the Unicode `Cc` category — C0 controls
@@ -1957,26 +2064,21 @@ fn is_unicode_line_break(c: char) -> bool {
 /// this deliberately doesn't reuse `sanitize_header_value`'s ASCII-only
 /// allowlist.
 ///
-/// (#2196 fix-round MUST FIX 1) `char::is_control()` alone only catches
-/// category `Cc` — it lets through the Trojan Source bidi-reordering set,
-/// invisible/zero-width characters, and the Unicode line/paragraph
-/// separators, all of which are the SAME class of terminal-corruption
-/// primitive as a raw control character and are filtered here too (see
-/// [`is_bidi_control_char`]/[`is_invisible_format_char`]/
-/// [`is_unicode_line_break`]'s docs). The result is also passed through
+/// (#2196 fix-round MUST FIX 1; inverted to an allowlist in fix-round 2,
+/// MUST FIX A) `char::is_control()` alone only catches category `Cc` — it
+/// let through the Trojan Source bidi-reordering set, invisible/zero-width
+/// characters, and the Unicode line/paragraph separators on the first
+/// pass, and four MORE format characters plus a family of blank-glyph
+/// letters/symbols on the second. Rather than keep enumerating individual
+/// characters a review happens to test, this keeps everything EXCEPT what
+/// [`is_stripped_for_display`] names — see that function's doc for the
+/// category-level check plus the two small closed exceptions Unicode's
+/// category system can't express. The result is also passed through
 /// [`collapse_whitespace_and_trim`], which is what actually defeats the
 /// exact-vocabulary row forgery — see [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s
 /// doc.
 fn sanitize_reason_text(s: &str) -> String {
-    let filtered: String = s
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !is_bidi_control_char(*c)
-                && !is_invisible_format_char(*c)
-                && !is_unicode_line_break(*c)
-        })
-        .collect();
+    let filtered: String = s.chars().filter(|c| !is_stripped_for_display(*c)).collect();
     collapse_whitespace_and_trim(&filtered)
 }
 
@@ -2019,75 +2121,113 @@ fn collapse_whitespace_and_trim(s: &str) -> String {
     out.trim().to_string()
 }
 
-/// (#2196 fix-round MUST FIX 1) Approximate rendered column width of `c`
-/// on a typical terminal: East-Asian wide/fullwidth scripts occupy two
-/// columns, everything else occupies one. Not a full Unicode
-/// `East_Asian_Width` implementation — no `unicode-width`-class crate is
-/// in this dependency set (see this crate's small, deliberate dep list),
-/// and this is close enough for a length BOUND, not a pixel-exact layout
-/// engine. The ranges below cover the common wide scripts (CJK
-/// ideographs, Hangul syllables, Hiragana/Katakana, CJK compatibility,
-/// fullwidth forms) that the previous byte-only bound completely missed:
-/// 200 bytes is 67 CJK characters, roughly 134 display columns — nearly
-/// double what the byte count suggests. Underestimating a rare wide
-/// codepoint outside these ranges costs a couple of stray columns, not a
-/// forged row; [`collapse_whitespace_and_trim`] is what actually closes
-/// the exact-vocabulary forgery regardless of how this function scores
-/// any given character.
+/// (#2196 fix-round MUST FIX 1; replaced with the `unicode-width` crate
+/// in fix-round 2, MUST FIX B) Rendered column width of `c` on a typical
+/// terminal.
+///
+/// The first fix-round hand-rolled this as a handful of "wide script"
+/// ranges (CJK, Hangul, fullwidth forms) plus "everything else is 1".
+/// Reviewed again in fix-round 2, the verifier measured up to a 2x
+/// overshoot from that approach — some from EXOTIC input (supplementary-
+/// plane emoji, regional indicators), but two of the three misses needed
+/// nothing exotic at all: CJK Compatibility Forms (`U+FE30..=FE6F`) and
+/// Hangul Jamo Extended-B (`U+D7B0..=D7FF`) are ordinary, assigned
+/// Unicode blocks the hand-rolled range list simply never named. A
+/// hand-rolled table can only ever cover the blocks someone thought to
+/// list; `unicode-width` (the crate the wider Rust ecosystem — `ripgrep`,
+/// `bat`, `clap`'s wrapping — already relies on for exactly this
+/// question) is generated from the real Unicode East-Asian-Width and
+/// general-category data, so it's correct for every block including the
+/// two above, and correct for the *next* Unicode version's new
+/// assignments without this crate's own code changing. It also scores
+/// combining marks and variation selectors at their real width (0) —
+/// the hand-rolled version scored a combining accent as 1, silently
+/// UNDER-counting available budget (safe, but needlessly conservative);
+/// see this crate's doc comment for why this bound is defense in depth
+/// rather than the whole defense in either direction.
+///
+/// Zero dependencies of its own (verified: `cargo tree` under this
+/// crate shows no transitive deps) — see this crate's module-level dep
+/// list for why that matters here.
 fn display_width(c: char) -> usize {
-    let cp = c as u32;
-    let wide = matches!(
-        cp,
-        0x1100..=0x115F   // Hangul Jamo
-        | 0x2E80..=0x303E // CJK radicals, Kangxi, CJK symbols/punctuation
-        | 0x3041..=0x33FF // Hiragana, Katakana, CJK compatibility
-        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
-        | 0x4E00..=0x9FFF // CJK Unified Ideographs
-        | 0xA000..=0xA4CF // Yi syllables/radicals
-        | 0xAC00..=0xD7A3 // Hangul syllables
-        | 0xF900..=0xFAFF // CJK compatibility ideographs
-        | 0xFF00..=0xFF60 // Fullwidth forms
-        | 0xFFE0..=0xFFE6 // Fullwidth signs
-        | 0x20000..=0x3FFFD // CJK extension B and beyond (supplementary plane)
-    );
-    if wide {
-        2
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Truncate already-SANITIZED text `s` to at most `budget` rendered
+/// columns (see [`display_width`]), preserving both a HEAD and a short
+/// TAIL separated by a single `…` when a cut is needed, rather than
+/// chopping the tail off outright (#2196 fix-round 2, MUST FIX C). For a
+/// validation-style reason (`"...severity must be one of low, medium,
+/// high, critical — got \"catastrophic\""`), a head-only cut loses
+/// exactly the value that failed; a head+tail cut keeps both the
+/// constraint AND the offending value — see
+/// [`REJECTION_REASON_TAIL_RESERVE`]'s doc for the split. Returns `s`
+/// unchanged when it already fits, so calling this again on
+/// already-bounded text is a no-op — the idempotence
+/// [`format_rejection_reasons_for_display`]'s doc relies on.
+///
+/// Walks `char_indices` from both ends — every candidate cut point is
+/// therefore already a UTF-8 char boundary BY CONSTRUCTION, eliminating
+/// the panic class a raw byte-offset slice invites (#2196 fix-round MUST
+/// FIX 2: a naive `&s[..N]` on a byte offset that lands mid-character
+/// panics with "byte index N is not a char boundary").
+fn bound_reason_width(s: &str, budget: usize) -> String {
+    let total_width: usize = s.chars().map(display_width).sum();
+    if total_width <= budget {
+        return s.to_string();
+    }
+    let ellipsis_width = display_width('…');
+    if budget <= ellipsis_width {
+        // A budget too small to hold even the ellipsis — never reached
+        // with this module's own constants, but a defensive floor for
+        // any future caller passing a tiny budget.
+        return "…".to_string();
+    }
+    let tail_budget = REJECTION_REASON_TAIL_RESERVE.min((budget - ellipsis_width) / 2);
+    let head_budget = budget - ellipsis_width - tail_budget;
+
+    let mut head_end = s.len();
+    let mut w = 0usize;
+    for (idx, c) in s.char_indices() {
+        let cw = display_width(c);
+        if w + cw > head_budget {
+            head_end = idx;
+            break;
+        }
+        w += cw;
+    }
+
+    let mut tail_start = s.len();
+    let mut w = 0usize;
+    for (idx, c) in s.char_indices().rev() {
+        let cw = display_width(c);
+        if w + cw > tail_budget {
+            break;
+        }
+        w += cw;
+        tail_start = idx;
+    }
+
+    if tail_start <= head_end {
+        // The head and tail windows would overlap — total_width > budget
+        // already rules this out given head_budget + tail_budget <=
+        // budget - ellipsis_width, but stay safe rather than panic on a
+        // future constant change.
+        format!("{}…", &s[..head_end])
     } else {
-        1
+        format!("{}…{}", &s[..head_end], &s[tail_start..])
     }
 }
 
-/// Sanitize `s` (see [`sanitize_reason_text`]) and then truncate the
-/// SANITIZED string to at most [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]
-/// rendered columns (see [`display_width`]), appending `…` when
-/// truncation actually happened. Walks `char_indices` — every candidate
-/// cut point is therefore already a UTF-8 char boundary BY CONSTRUCTION,
-/// eliminating the panic class a raw byte-offset slice invites (#2196
-/// fix-round MUST FIX 2: a naive `&s[..N]` on a byte offset that lands
-/// mid-character panics with "byte index N is not a char boundary" —
-/// reachable with a 204-byte reason ending in a multi-byte character
-/// under the OLD 200-byte bound, and just as reachable under a column
-/// bound with a naive implementation). Sanitizing before truncating (not
-/// after) matters for two reasons: the bound is a promise about what
-/// actually rides downstream, and filtering after truncation could still
-/// cut a multi-byte sequence at the wrong point relative to the removed
+/// Sanitize `s` (see [`sanitize_reason_text`]) and then bound it to
+/// [`REJECTION_REASON_RAW_BUDGET`] rendered columns (see
+/// [`bound_reason_width`]). Sanitizing before bounding (not after)
+/// matters for two reasons: the bound is a promise about what actually
+/// rides downstream, and cutting before filtering could remove a
+/// multi-byte sequence at the wrong point relative to the stripped
 /// characters.
 fn truncate_reason(s: &str) -> String {
-    let s = sanitize_reason_text(s);
-    let mut width = 0usize;
-    let mut cut_at = None;
-    for (idx, c) in s.char_indices() {
-        let w = display_width(c);
-        if width + w > MAX_REJECTION_REASON_DISPLAY_WIDTH {
-            cut_at = Some(idx);
-            break;
-        }
-        width += w;
-    }
-    match cut_at {
-        Some(idx) => format!("{}…", &s[..idx]),
-        None => s,
-    }
+    bound_reason_width(&sanitize_reason_text(s), REJECTION_REASON_RAW_BUDGET)
 }
 
 /// Extract up to [`MAX_REJECTION_REASONS`] per-record rejection reason
@@ -2105,12 +2245,21 @@ fn truncate_reason(s: &str) -> String {
 ///
 /// (#2196 fix-round MUST FIX 5) A reason that sanitizes to empty (an
 /// empty string, or one made of nothing but control/whitespace
-/// characters `truncate_reason` just stripped) is dropped here rather
-/// than kept as `""` — an empty-string "reason" is not a reason; letting
-/// it through produced `"... on the last delivery ()"` in `doctor` and a
-/// bare, contentless `"last rejection reason(s): "` in `flow status`,
-/// leaving the operator unable to tell whether the receiver gave no
-/// reason at all or darkmux lost one it was given.
+/// characters `sanitize_reason_text` just stripped) is dropped here
+/// rather than kept as `""` — an empty-string "reason" is not a reason;
+/// letting it through produced `"... on the last delivery ()"` in
+/// `doctor` and a bare, contentless `"last rejection reason(s): "` in
+/// `flow status`, leaving the operator unable to tell whether the
+/// receiver gave no reason at all or darkmux lost one it was given.
+///
+/// (#2196 fix-round 2, CONSIDER) The empty-after-sanitize filter runs
+/// BEFORE [`MAX_REJECTION_REASONS`]'s `.take` — not after, as the first
+/// fix-round had it. A body whose first entries are blank/all-control
+/// `error` strings ahead of a real one used to consume the cap on
+/// nothing and then drop every one of them at the trailing filter,
+/// yielding `reasons: []` — count disclosed, reason silently gone. The
+/// width bound ([`bound_reason_width`]) is applied AFTER the take, since
+/// it's a per-reason concern that doesn't affect which entries survive.
 fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
     body.get("results")
         .and_then(serde_json::Value::as_array)
@@ -2119,9 +2268,10 @@ fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
                 .iter()
                 .filter(|e| e.get("ok").and_then(serde_json::Value::as_bool) == Some(false))
                 .filter_map(|e| e.get("error").and_then(serde_json::Value::as_str))
-                .take(MAX_REJECTION_REASONS)
-                .map(truncate_reason)
+                .map(sanitize_reason_text)
                 .filter(|s| !s.is_empty())
+                .take(MAX_REJECTION_REASONS)
+                .map(|s| bound_reason_width(&s, REJECTION_REASON_RAW_BUDGET))
                 .collect()
         })
         .unwrap_or_default()
@@ -2153,10 +2303,30 @@ fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
 ///   call and closes that window — sanitization and the display-width
 ///   bound are both idempotent, so re-applying them to already-clean
 ///   text is a no-op.
+///
+/// (#2196 fix-round 2, MUST FIX B/D) The escaping happens AFTER
+/// `truncate_reason`'s width bound, so a reason made mostly of `"`/`\`
+/// characters grows past the bound here: each escaped character costs
+/// TWO rendered columns instead of one, and the bound never accounted
+/// for that — a stored reason at exactly the raw budget in quote
+/// characters renders noticeably wider once escaped, restoring the wrap
+/// precondition the width bound exists to prevent (this is the padding
+/// the fix-round-2 verifier's own proof used). Closing this needs a
+/// SECOND bounding pass on the escaped text itself: `bound_reason_width`
+/// is called again here, on the (by now plain-ASCII, since sanitization
+/// already ran) escaped string, before the wrapping quotes go on. This
+/// composes with the idempotence note above rather than breaking it —
+/// the common case (no `"`/`\` in the reason) never triggers a second
+/// cut at all, since the escaped text is byte-identical to the
+/// already-bounded input.
 pub fn format_rejection_reasons_for_display(reasons: &[String]) -> String {
     reasons
         .iter()
-        .map(|r| format!("\"{}\"", truncate_reason(r).replace('\\', "\\\\").replace('"', "\\\"")))
+        .map(|r| {
+            let escaped = truncate_reason(r).replace('\\', "\\\\").replace('"', "\\\"");
+            let bounded = bound_reason_width(&escaped, REJECTION_REASON_RAW_BUDGET);
+            format!("\"{bounded}\"")
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -6479,16 +6649,17 @@ mod tests {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
-        // (#2196 fix-round MUST FIX 1) The receiver's raw text is 47
-        // display columns; `truncate_reason` bounds it to
-        // `MAX_REJECTION_REASON_DISPLAY_WIDTH` (40) at write time, so the
-        // stored value carries the ellipsis already — the render layer
-        // (`format_rejection_reasons_for_display`) additionally quotes
-        // and escapes it, but that's a display concern, not a storage
-        // one; these assertions check what's actually stored.
+        // (#2196 fix-round 2, MUST FIX C) The receiver's raw text is 47
+        // display columns — well under the fix-round-2 budget
+        // (`REJECTION_REASON_RAW_BUDGET`, 118) — so it now survives
+        // WHOLE: this is the PR's own flagship example of the 40-column
+        // cap destroying the disclosure the feature exists to provide
+        // (it used to lose the word "string", the actual constraint
+        // named in the message). These assertions check what's actually
+        // stored, before the render layer's separate quoting/escaping.
         assert_eq!(
             reasons,
-            vec!["payload field \"file\" must be a non-empty…".to_string()],
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
             "{fired:?}"
         );
         assert_eq!(level_wire(fired.level), "warn", "{fired:?}");
@@ -6498,14 +6669,14 @@ mod tests {
         let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
         assert_eq!(
             last.last_receiver_rejected_reasons,
-            vec!["payload field \"file\" must be a non-empty…".to_string()],
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
             "{last:?}"
         );
 
         let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
         assert_eq!(
             summary.last_receiver_rejected_reasons,
-            vec!["payload field \"file\" must be a non-empty…".to_string()],
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
             "{summary:?}"
         );
         drop(sink);
@@ -6755,16 +6926,18 @@ mod tests {
     /// and whitespace runs collapse to one space.
     #[test]
     fn truncate_reason_strips_forgery_primitives_and_collapses_whitespace() {
-        // (Collapsed-then-truncated: the collapsed string is 63 columns,
-        // over the 40-column cap, so the stored value also carries an
-        // ellipsis — the whitespace-collapse property below is what this
-        // probe is pinning, not the exact surviving prefix.)
+        // (#2196 fix-round 2, MUST FIX C) The collapsed string is 63
+        // columns — well under the fix-round-2 raw budget (118) — so it
+        // now survives WHOLE, unlike under the first fix-round's 40
+        // column cap. The whitespace-collapse property is still what
+        // this probe pins: the forged six-space indentation must not
+        // survive even though nothing here is long enough to need
+        // truncating.
         let newline_forgery = "ok\n      stalled: no drainer heartbeat for 9999s\n      quarantined lines: 0";
         let out = truncate_reason(newline_forgery);
         assert!(!out.contains('\n'), "{out:?}");
         assert!(!out.contains("  "), "no run of 2+ spaces may survive sanitization: {out:?}");
-        assert!(out.starts_with("ok stalled: no drainer heartbeat"), "{out:?}");
-        assert!(out.ends_with('…'), "{out:?}");
+        assert_eq!(out, "ok stalled: no drainer heartbeat for 9999s quarantined lines: 0", "{out:?}");
 
         let ansi = "\x1b[2J\x1b[31mFATAL: darkmux is corrupt\x1b[0m";
         let out = truncate_reason(ansi);
@@ -6832,36 +7005,210 @@ mod tests {
         assert_eq!(out, "x cursor-write failures: 0");
     }
 
-    /// (#2196 fix-round MUST FIX 2) `truncate_reason` walks `char_indices`
-    /// so every cut point is a UTF-8 char boundary BY CONSTRUCTION — this
-    /// pins that against exactly the inputs a naive byte-offset slice
-    /// panics on: a multi-byte character straddling the cut point, and an
-    /// all-wide-CJK reason where raw byte length wildly understates
-    /// rendered column width (200 bytes is 67 CJK characters, ~134
-    /// display columns — see [`display_width`]'s doc). Red-proved:
-    /// reverting `truncate_reason` to a raw byte-offset slice on
-    /// `MAX_REJECTION_REASON_DISPLAY_WIDTH` bytes (the shape the
-    /// ORIGINAL `hooks.rs:1918-1921` walk was protecting against) panics
-    /// on both inputs below with "byte index N is not a char boundary".
+    /// (#2196 fix-round MUST FIX 2, extended in fix-round 2 for the
+    /// head+tail split MUST FIX C introduced) `bound_reason_width` walks
+    /// `char_indices` from BOTH ends — forward for the head cut, in
+    /// reverse for the tail cut — so every candidate cut point is a
+    /// UTF-8 char boundary BY CONSTRUCTION in both directions. Pins that
+    /// against exactly the inputs a naive byte-offset slice panics on: a
+    /// multi-byte character straddling the HEAD cut point, and an
+    /// all-wide-CJK reason (every character multi-byte) straddling BOTH
+    /// cut points at once. Numbers are derived from the real constants,
+    /// not hardcoded, so this stays correct if the budget/tail-reserve is
+    /// ever retuned. Red-proved: reverting to a raw byte-offset slice on
+    /// either cut panics on these inputs with "byte index N is not a
+    /// char boundary".
     #[test]
     fn truncate_reason_never_panics_on_a_multibyte_char_straddling_the_cut() {
-        // 39 ASCII columns, then one 3-byte character (総, U+7DCF) whose
-        // 2-column display width pushes the running total from 39 to 41
-        // — over the 40-column cap ON that multi-byte character, the
-        // exact straddle shape a naive byte-offset slice panics on.
-        let straddle = format!("{}\u{7dcf}", "a".repeat(39));
+        let ellipsis_w = display_width('…');
+        let head_budget = REJECTION_REASON_RAW_BUDGET - ellipsis_w - REJECTION_REASON_TAIL_RESERVE;
+
+        // `head_budget` ASCII columns, then one 3-byte character (総,
+        // U+7DCF, display width 2) straddling the head cut point, then
+        // enough trailing filler to push the total past the overall
+        // budget so truncation actually engages.
+        let straddle =
+            format!("{}{}{}", "a".repeat(head_budget), '\u{7dcf}', "b".repeat(REJECTION_REASON_TAIL_RESERVE + 10));
         let out = truncate_reason(&straddle);
         assert!(out.is_char_boundary(out.len()), "{out:?}");
-        assert!(out.ends_with('…'), "{out:?}");
+        assert!(out.contains('…'), "{out:?}");
 
-        // All-wide CJK: every character is 2 display columns, so the
-        // 40-column cap truncates after exactly 20 characters — 201
-        // bytes total, nowhere near an ASCII byte boundary by luck.
+        // All-wide CJK: every character is 2 display columns, so BOTH
+        // the head cut (walked forward) and the tail cut (walked
+        // backward) land on a multi-byte character — 201 bytes total,
+        // nowhere near an ASCII byte boundary anywhere.
         let all_cjk = "一".repeat(67); // 201 bytes, 67 chars, 134 display columns
         let out = truncate_reason(&all_cjk);
         assert!(out.is_char_boundary(out.len()), "{out:?}");
-        assert_eq!(out.chars().filter(|c| *c != '…').count(), 20, "{out:?}");
-        assert!(out.ends_with('…'), "{out:?}");
+        assert!(out.contains('…'), "{out:?}");
+        assert!(!out.ends_with('…'), "a middle cut must leave a real tail: {out:?}");
+        // Every surviving character (head + tail) must be an intact 一 —
+        // no partial byte sequence anywhere — and the count matches what
+        // the same width-2-per-char arithmetic the production walk uses
+        // predicts for the head and tail budgets.
+        assert!(out.chars().all(|c| c == '一' || c == '…'), "{out:?}");
+        let tail_budget = REJECTION_REASON_TAIL_RESERVE.min((REJECTION_REASON_RAW_BUDGET - ellipsis_w) / 2);
+        let expected_head_chars = head_budget / 2;
+        let expected_tail_chars = tail_budget / 2;
+        assert_eq!(
+            out.chars().filter(|c| *c == '一').count(),
+            expected_head_chars + expected_tail_chars,
+            "{out:?}"
+        );
+    }
+
+    /// (#2196 fix-round 2, MUST FIX A) The verifier's second pass found
+    /// four MORE `Cf` format characters (U+061C, U+2060–2064, U+180E,
+    /// U+FFF9–FFFB) plus a family of characters Unicode assigns to an
+    /// ordinary PRINTABLE category (`Lo`/`So`) that nonetheless render as
+    /// a blank glyph in every mainstream terminal font (the Hangul
+    /// filler jamo, `U+2800` BRAILLE PATTERN BLANK) — none caught by the
+    /// first fix-round's enumerated denylist. `is_stripped_for_display`
+    /// closes the format-character class STRUCTURALLY (by general
+    /// category — see its doc), and names the small closed set of
+    /// blank-glyph/variation-selector exceptions the category check
+    /// can't reach. This pins that every character actually named in the
+    /// finding is stripped with NO trace and NO gap left behind — not
+    /// just that the category check compiles.
+    #[test]
+    fn sanitize_reason_text_strips_the_expanded_format_and_blank_glyph_set() {
+        let cases: &[(char, &str)] = &[
+            ('\u{2800}', "BRAILLE PATTERN BLANK"),
+            ('\u{3164}', "HANGUL FILLER"),
+            ('\u{115F}', "HANGUL CHOSEONG FILLER"),
+            ('\u{1160}', "HANGUL JUNGSEONG FILLER"),
+            ('\u{FFA0}', "HALFWIDTH HANGUL FILLER"),
+            ('\u{061C}', "ARABIC LETTER MARK"),
+            ('\u{2060}', "WORD JOINER"),
+            ('\u{2061}', "FUNCTION APPLICATION"),
+            ('\u{2062}', "INVISIBLE TIMES"),
+            ('\u{2063}', "INVISIBLE SEPARATOR"),
+            ('\u{2064}', "INVISIBLE PLUS"),
+            ('\u{180E}', "MONGOLIAN VOWEL SEPARATOR"),
+            ('\u{FFF9}', "INTERLINEAR ANNOTATION ANCHOR"),
+            ('\u{FFFA}', "INTERLINEAR ANNOTATION SEPARATOR"),
+            ('\u{FFFB}', "INTERLINEAR ANNOTATION TERMINATOR"),
+            ('\u{FE00}', "VARIATION SELECTOR-1"),
+            ('\u{FE0F}', "VARIATION SELECTOR-16"),
+            ('\u{E0100}', "VARIATION SELECTOR-17 (supplement, first)"),
+            ('\u{E01EF}', "VARIATION SELECTOR SUPPLEMENT (last)"),
+            ('\u{E0000}', "TAG (block start)"),
+            ('\u{E0001}', "LANGUAGE TAG"),
+            ('\u{E007F}', "CANCEL TAG (block end)"),
+        ];
+        for (c, name) in cases {
+            let poisoned = format!("real{c}text");
+            let out = sanitize_reason_text(&poisoned);
+            assert_eq!(out, "realtext", "{name} (U+{:06X}) must be stripped with no gap left behind: {out:?}", *c as u32);
+        }
+    }
+
+    /// (#2196 fix-round 2, inverted case) [`is_denylisted_category`]
+    /// shares a general category (`Lo`, `So`, or `Mn`) with every
+    /// exception the previous test pins as stripped — a category check
+    /// that accidentally dropped the WHOLE category instead of the
+    /// specific closed exception would pass that test for the wrong
+    /// reason. This proves ordinary international prose, a real
+    /// combining accent, and an ordinary emoji all survive untouched.
+    #[test]
+    fn sanitize_reason_text_keeps_legitimate_letters_symbols_and_combining_marks() {
+        assert_eq!(sanitize_reason_text("café — 総 例 プ 你好"), "café — 総 例 プ 你好");
+        // A real combining accent — category `Mn`, the SAME category as
+        // the variation selectors the previous test proves get stripped.
+        assert_eq!(sanitize_reason_text("cafe\u{0301}"), "cafe\u{0301}");
+        // An ordinary emoji — category `So`, the SAME category as
+        // BRAILLE PATTERN BLANK, which the previous test proves gets
+        // stripped.
+        assert_eq!(sanitize_reason_text("done \u{2705}"), "done \u{2705}");
+    }
+
+    /// (#2196 fix-round 2, MUST FIX B) `display_width` now delegates to
+    /// the `unicode-width` crate instead of a hand-rolled range table.
+    /// Pins the delegation itself — using the crate's real API on every
+    /// call, not silently falling back to a stale default — against the
+    /// exact characters the verifier's second pass found overshooting:
+    /// two ordinary, non-exotic Unicode blocks (CJK Compatibility Forms
+    /// `U+FE30..=FE6F` and Hangul Jamo Extended-B `U+D7B0..=D7FF`) the
+    /// hand-rolled table never named at all, plus supplementary-plane
+    /// emoji it scored narrow. These are `unicode-width` 0.2.2's actual
+    /// classifications (verified against the pinned crate version) —
+    /// this pins correct DELEGATION, not a re-derivation of the crate's
+    /// own East-Asian-Width table.
+    #[test]
+    fn display_width_delegates_to_unicode_width_for_blocks_the_old_table_missed() {
+        let cases: &[(char, usize, &str)] = &[
+            ('\u{1F600}', 2, "emoji GRINNING FACE — supplementary plane, outside every range the old table listed"),
+            ('\u{1F4A5}', 2, "emoji COLLISION — same gap"),
+            ('\u{FE35}', 2, "CJK COMPATIBILITY FORMS (U+FE30..=FE6F) — an ordinary block the old table never named"),
+            ('\u{D7B0}', 0, "HANGUL JAMO EXTENDED-B (U+D7B0..=D7FF) — another ordinary block the old table never named"),
+            ('\u{231A}', 2, "WATCH — East-Asian-Width Wide"),
+            ('\u{2B50}', 2, "STAR — East-Asian-Width Wide"),
+            ('\u{0301}', 0, "COMBINING ACUTE ACCENT — a real zero-width mark, scored 1 (over-conservative) by the old table"),
+            ('a', 1, "ordinary ASCII — the baseline"),
+        ];
+        for (c, expected, why) in cases {
+            assert_eq!(display_width(*c), *expected, "U+{:06X}: {why}", *c as u32);
+        }
+    }
+
+    /// (#2196 fix-round 2, MUST FIX D) No existing test exercised a
+    /// reason containing `"`/`\` through the RENDER path — before this
+    /// fix, deleting `format_rejection_reasons_for_display`'s
+    /// `.replace('\\', "\\\\").replace('"', "\\\"")` left BOTH
+    /// `-p darkmux-flow --lib hooks::` and `--lib status::` fully green.
+    /// The reason below mirrors the verifier's own proof: a
+    /// semicolon-joined SECOND "reason" smuggled inside the first, using
+    /// darkmux's own reason-list format, plus a Windows-style path to
+    /// cover the backslash half of the escape independently. Asserted
+    /// against an exact expected literal (not by re-deriving the escape
+    /// with the same replace calls) so the assertion can't pass
+    /// tautologically.
+    #[test]
+    fn format_rejection_reasons_for_display_escapes_embedded_quotes_and_backslashes() {
+        let reason = r#"bad" ; "dropped: 0 (path C:\Users\test)"#;
+        let rendered = format_rejection_reasons_for_display(&[reason.to_string()]);
+        let expected = r#""bad\" ; \"dropped: 0 (path C:\\Users\\test)""#;
+        assert_eq!(rendered, expected, "{rendered:?}");
+    }
+
+    /// (#2196 fix-round 2, MUST FIX A + D, forgery re-proof) Re-runs the
+    /// verifier's own row-forgery proof against the fixed pipeline: the
+    /// four blank-rendering characters from MUST FIX A, AND the
+    /// escape-expansion path from MUST FIX D (which needed no exotic
+    /// input at all — a purely-ASCII reason made of quote characters
+    /// restored the wrap precondition once escaped). None may produce a
+    /// row containing two-or-more real rendered blank/space columns once
+    /// through `format_rejection_reasons_for_display` — the same
+    /// property [`collapse_whitespace_and_trim`]'s own forgery test pins
+    /// for whitespace, extended here to the non-whitespace blank
+    /// primitives and to escaping.
+    #[test]
+    fn rejection_reason_pipeline_defeats_the_verifiers_blank_glyph_and_escape_forgeries() {
+        // MUST FIX A: each blank-glyph character, repeated enough to
+        // simulate a padded forgery attempt, must vanish entirely rather
+        // than surface as blank columns.
+        for c in ['\u{2800}', '\u{3164}', '\u{115F}', '\u{FFA0}'] {
+            let padded = format!("real{}", c.to_string().repeat(20));
+            let rendered = format_rejection_reasons_for_display(&[padded]);
+            assert!(!rendered.contains(c), "U+{:06X} must not survive to the rendered row: {rendered:?}", c as u32);
+            // No run of 2+ rendered columns can come from what used to
+            // be blank-glyph padding — the visible text must be exactly
+            // the real word, quoted.
+            assert_eq!(rendered, "\"real\"", "U+{:06X}: {rendered:?}", c as u32);
+        }
+
+        // MUST FIX D: a purely-ASCII reason made mostly of quote
+        // characters must not, once escaped, grow past the raw budget —
+        // this is the padding the verifier's own proof used to restore
+        // the wrap precondition without any exotic Unicode at all.
+        let quote_heavy: String = "\"".repeat(200);
+        let rendered = format_rejection_reasons_for_display(&[quote_heavy]);
+        let real_width: usize = rendered.chars().map(display_width).sum();
+        assert!(
+            real_width <= MAX_REJECTION_REASON_DISPLAY_WIDTH,
+            "escaping must never grow the rendered reason past the total budget: {real_width} > \
+             {MAX_REJECTION_REASON_DISPLAY_WIDTH} in {rendered:?}"
+        );
     }
 
     /// (#2196 fix-round MUST FIX 3) A receiver answering `"rejected": 0`
@@ -6984,6 +7331,35 @@ mod tests {
         assert_eq!(reasons, vec!["real reason".to_string()], "{reasons:?}");
     }
 
+    /// (#2196 fix-round 2, CONSIDER) The empty-after-sanitize filter must
+    /// run BEFORE `MAX_REJECTION_REASONS`'s `.take`, not after. With more
+    /// blank entries ahead of the real ones than the cap allows, a
+    /// filter running AFTER `.take` consumes the entire cap on blanks and
+    /// then drops every one of them, yielding `reasons: []` — count
+    /// disclosed, reason silently gone. Red-proved: swapping the
+    /// `.filter`/`.take` order in `extract_rejection_reasons` back to
+    /// take-then-filter reproduces exactly that on this fixture.
+    #[test]
+    fn extract_rejection_reasons_does_not_let_leading_blanks_consume_the_cap() {
+        let body = serde_json::json!({
+            "rejected": 6,
+            "results": [
+                {"ok": false, "error": ""},
+                {"ok": false, "error": "\u{0}"},
+                {"ok": false, "error": "\u{202e}"},
+                {"ok": false, "error": "\u{2800}"},
+                {"ok": false, "error": "real reason A"},
+                {"ok": false, "error": "real reason B"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(
+            reasons,
+            vec!["real reason A".to_string(), "real reason B".to_string()],
+            "leading blanks must not consume the cap and silently erase the real reasons: {reasons:?}"
+        );
+    }
+
     /// (#2196 fix-round MUST FIX 1, end-to-end) The unit test above pins
     /// the helper directly; this proves the sanitization actually rides
     /// the real delivery pipeline — through a live loopback receiver,
@@ -7071,12 +7447,20 @@ mod tests {
         assert_eq!(reasons.len(), MAX_REJECTION_REASONS, "{reasons:?}");
         assert_eq!(reasons[0], "r1");
         assert_eq!(reasons[1], "r2");
+        // (#2196 fix-round 2, MUST FIX C) `bound_reason_width` keeps the
+        // total (head + `…` + tail) AT the budget, never over it — unlike
+        // the first fix-round's straight cut, which appended the
+        // ellipsis ON TOP of the budget (budget + 1). A middle cut on an
+        // all-'x' string also always leaves a non-empty tail after the
+        // ellipsis (the tail is real content here, not just a cosmetic
+        // marker), so this also pins that both halves survive.
         assert_eq!(
             reasons[2].chars().count(),
-            MAX_REJECTION_REASON_DISPLAY_WIDTH + 1,
-            "must truncate + ellipsis: {reasons:?}"
+            REJECTION_REASON_RAW_BUDGET,
+            "must truncate to the raw budget, ellipsis included: {reasons:?}"
         );
-        assert!(reasons[2].ends_with('…'), "{reasons:?}");
+        assert!(reasons[2].contains('…'), "{reasons:?}");
+        assert!(!reasons[2].ends_with('…'), "a middle cut must leave a real tail after the ellipsis: {reasons:?}");
     }
 
     // ─── (#2183) jq transforms + Keychain headers + the `file` transport ──
