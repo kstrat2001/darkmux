@@ -429,6 +429,16 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                     } else {
                         workdir.clone()
                     };
+                    // (#1210) Dialectic mode's per-seat exit code isn't wired
+                    // into infra classification yet — `SeatRecord`'s own
+                    // token accounting (below) is dialectic's existing infra
+                    // signal, and dialectic is the experimental debate mode,
+                    // not the `lab eval` default path this issue's live
+                    // failure (Gemini 429, agentic/diff/strict mode) hit.
+                    // Dropping the exit code here (vs. plumbing it into
+                    // `SeatRecord`) is a deliberate scope cut, not an
+                    // oversight — revisit if dialectic mode sees a live
+                    // quota failure of its own.
                     dispatch_case(
                         prompt,
                         &format!("{}-{}", c.id, seat.label()),
@@ -437,6 +447,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                         profile,
                         &opts,
                     )
+                    .map(|(stdout, _exit_code)| stdout)
                 })
                 .with_context(|| format!("debating case {}", c.id))?;
             // One meta row per case: the prosecutor's model (debug phase: all
@@ -472,7 +483,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             } else {
                 opts.mode.role_id()
             };
-            let stdout = dispatch_case(
+            let (stdout, exit_code) = dispatch_case(
                 &prompt,
                 &c.id,
                 workdir,
@@ -481,7 +492,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                 &opts,
             )
             .with_context(|| format!("dispatching case {}", c.id))?;
-            meta.push(envelope_meta(&stdout));
+            meta.push(envelope_meta_with_exit(&stdout, exit_code));
             let reply = extract_reply_text(&stdout);
             match opts.mode {
                 BenchMode::Strict => parse_review(&reply),
@@ -653,8 +664,19 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
 
 /// Dispatch one case (or one dialectic seat) through `role_id` on the
 /// internal runtime, returning the raw `--json` envelope stdout (parsed by
-/// `extract_reply_text`). `profile` overrides `opts.profile_name` for this
-/// dispatch — the per-seat profile hook (#1222).
+/// `extract_reply_text`) alongside the dispatch's own exit code. `profile`
+/// overrides `opts.profile_name` for this dispatch — the per-seat profile
+/// hook (#1222).
+///
+/// (#1210) The exit code rides along because `dispatch()` never returns
+/// `Err` for a non-zero container exit — it returns `Ok(DispatchResult {
+/// exit_code, .. })` regardless of whether the runtime completed, errored
+/// gracefully, or the container/docker layer crashed outright before any
+/// `--json` line reached stdout. Callers that only kept `.stdout` (as this
+/// function did pre-#1210) silently discarded the one signal that
+/// distinguishes "the model never ran" from "the model ran and produced
+/// nothing" when stdout carries no parseable envelope at all — see
+/// [`envelope_meta_with_exit`].
 fn dispatch_case(
     prompt: &str,
     case_id: &str,
@@ -662,7 +684,7 @@ fn dispatch_case(
     role_id: &str,
     profile: Option<&str>,
     opts: &ReviewBenchOpts,
-) -> Result<String> {
+) -> Result<(String, i32)> {
     use darkmux_crew::dispatch::{dispatch, CompactionDispatchArgs, DispatchOpts};
     // (#1436) Through the canonical session-id helper; byte-identical shape.
     let session_id = darkmux_types::session_id::session_id(
@@ -709,7 +731,7 @@ fn dispatch_case(
         system_prompt_override: None,
     };
     let r = dispatch(d).context("pr-review-bench internal-runtime dispatch")?;
-    Ok(r.stdout)
+    Ok((r.stdout, r.exit_code))
 }
 
 /// Extract the model's review JSON (verdict + findings) from `final_assistant`
@@ -1252,6 +1274,40 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
         model: m.get("model").and_then(|s| s.as_str()).map(str::to_string),
         total_tokens: total,
     }
+}
+
+/// (#1210) [`envelope_meta`] plus the dispatch's own exit code — closes the
+/// gap the issue named as "(or a non-zero exit)" alongside the zero-token
+/// envelope case [`is_infra_failure`] already covers.
+///
+/// `dispatch()` never returns `Err` for a non-zero container exit (see
+/// `dispatch_case`'s doc); a genuinely dead container or a runtime crash
+/// before it can print its `--json` envelope (a harder failure than the
+/// graceful `"result":"error"` envelope a caught 429 produces — that one
+/// still writes literal `Some(0)` tokens and is already handled by
+/// `envelope_meta` alone) leaves stdout with NO parseable envelope at all.
+/// `envelope_meta` alone can't tell that apart from a dialect quirk that
+/// left stdout merely malformed-but-present; the exit code is what
+/// distinguishes them.
+///
+/// Only promotes to the zero-token infra reading when BOTH are true:
+/// no envelope was recovered (`model` and `total_tokens` both `None`) AND
+/// the exit code is non-zero. An envelope WAS recovered — even a
+/// `"result":"error"` one with real capability content, however
+/// degenerate — is never overridden by exit status; a non-zero exit
+/// alongside a fully-parsed envelope is left alone (out of scope: no
+/// case in this bench exits non-zero *after* writing a real envelope,
+/// since the runtime's own `main()` returns `ExitCode::SUCCESS` on every
+/// path that produces one). A CLEAN exit (0) with no envelope recovered
+/// stays the pre-existing ambiguous case — conservatively NOT reclassified,
+/// same "positive evidence only" rule `is_infra_failure` already applies to
+/// an unknown token count.
+pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeMeta {
+    let m = envelope_meta(stdout);
+    if exit_code != 0 && m.model.is_none() && m.total_tokens.is_none() {
+        return EnvelopeMeta { model: None, total_tokens: Some(0) };
+    }
+    m
 }
 
 /// (#1210) A degenerate case whose dispatch served ZERO tokens is an INFRA

@@ -583,6 +583,109 @@
         assert!(g.model.is_none() && g.total_tokens.is_none());
     }
 
+    /// (#1210) The issue's "(or a non-zero exit)" clause: a dead
+    /// container / runtime crash never even writes a `--json` line, so
+    /// `envelope_meta` alone sees `None`/`None` — the exit code is what
+    /// tells this apart from a merely-malformed-but-present envelope.
+    /// Positive evidence only: BOTH "no envelope" AND "non-zero exit"
+    /// are required before the zero-token infra reading kicks in.
+    #[test]
+    fn envelope_meta_with_exit_promotes_no_envelope_plus_nonzero_exit_to_zero_tokens() {
+        // No stdout at all (the runtime never got far enough to print).
+        let m = envelope_meta_with_exit("", 1);
+        assert_eq!(m.model, None);
+        assert_eq!(m.total_tokens, Some(0), "non-zero exit + no envelope reads as zero tokens served");
+
+        // Garbage stdout (docker printed something, but not an envelope).
+        let m = envelope_meta_with_exit("panicked at src/main.rs:42", 137);
+        assert_eq!(m.total_tokens, Some(0));
+    }
+
+    /// (#1210 inverted case) A genuine capability failure — the model RAN,
+    /// wrote a real envelope, and the process exited cleanly — must never be
+    /// reclassified by this helper. Reclassifying real model failures as
+    /// infra would flatter every model's score, which is worse than the bug.
+    #[test]
+    fn envelope_meta_with_exit_never_overrides_a_recovered_envelope() {
+        let stdout = "{\"result\":\"stop\",\"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":180,\"completion_tokens\":20}}";
+        // Clean exit, real envelope, real tokens — untouched.
+        let ok = envelope_meta_with_exit(stdout, 0);
+        assert_eq!(ok.total_tokens, Some(200));
+        // Even a non-zero exit alongside a RECOVERED envelope is left
+        // alone — the envelope is positive capability evidence the exit
+        // code doesn't get to overrule.
+        let weird = envelope_meta_with_exit(stdout, 1);
+        assert_eq!(weird.total_tokens, Some(200), "a recovered envelope is never overridden by exit status");
+    }
+
+    /// (#1210 ambiguous case, stated honestly) A CLEAN exit (0) with no
+    /// envelope recovered is left exactly where the pre-existing
+    /// `is_infra_failure` "None tokens is NOT infra evidence" rule already
+    /// puts it: NOT reclassified. This is the one combination this fix
+    /// deliberately does not attribute either way — a clean exit that wrote
+    /// no envelope is unexplained by anything the bench can observe, and
+    /// guessing it into infra would launder a real capability failure just
+    /// as guessing it into capability would poison the corpus. It stays
+    /// capability-side (via the existing `degenerate` scoring path), which
+    /// is honest: unexplained is not the same claim as "the model is at
+    /// fault", but it is also not silently attributed to infra either.
+    #[test]
+    fn envelope_meta_with_exit_leaves_clean_exit_no_envelope_ambiguous() {
+        let m = envelope_meta_with_exit("", 0);
+        assert_eq!(m.model, None);
+        assert_eq!(m.total_tokens, None, "clean exit + no envelope stays the pre-existing unknown case");
+    }
+
+    /// (#1210 end-to-end) The non-zero-exit crash case, run all the way
+    /// through `build_score_rows`: a dead container (no envelope, exit 1)
+    /// lands `InfraFail` and is excluded from `clean_pass_rate`'s
+    /// denominator — the same treatment the zero-token-envelope case
+    /// already got, now covering the case that never wrote an envelope at
+    /// all.
+    #[test]
+    fn build_score_rows_nonzero_exit_no_envelope_is_infra_not_capability() {
+        use crate::lab::scores::{ArtifactKey, Outcome};
+        let mk_case = |id: &str| Case {
+            id: id.into(),
+            label: Label {
+                kind: "clean".into(),
+                intent_title: "t".into(),
+                intent_body: String::new(),
+                expect_verdict: String::new(),
+                bug_class: None,
+                anchor_contains: None,
+                expected: vec![],
+                notes: None,
+            },
+            diff: String::new(),
+        };
+        let ran_ok = mk_case("c1");
+        let crashed = mk_case("c2");
+        let scored: Vec<(&Case, CaseScore)> = vec![
+            (&ran_ok, CaseScore { correct: true, verdict: "pass".into(), ..Default::default() }),
+            // The dispatch never produced a verdict — the crash left the
+            // review parse empty, same as any other degenerate reply.
+            (&crashed, CaseScore { degenerate: true, ..Default::default() }),
+        ];
+        // Case 2's meta is what `envelope_meta_with_exit("", 1)` produces —
+        // exactly what `run_review_bench` would push after a dead container.
+        let meta = vec![
+            EnvelopeMeta { model: Some("m-x".into()), total_tokens: Some(300) },
+            envelope_meta_with_exit("", 1),
+        ];
+        let artifact = ArtifactKey { model: "m-x".into(), ..Default::default() };
+        let rows = build_score_rows(&scored, &meta, &artifact);
+
+        let case_rows: Vec<_> = rows.iter().filter(|r| r.axis == "case").collect();
+        assert_eq!(case_rows[0].outcome, Outcome::Pass);
+        assert_eq!(case_rows[1].outcome, Outcome::InfraFail, "a dead container is a rerun, not a model zero");
+
+        // clean_pass_rate denominator excludes the crashed case: 1/1, not 1/2.
+        let agg = rows.iter().find(|r| r.axis == "clean_pass_rate").unwrap();
+        assert_eq!(agg.value, Some(1.0));
+        assert_eq!(agg.detail["clean_cases"].as_u64(), Some(1));
+    }
+
     #[test]
     fn build_score_rows_maps_outcomes_and_aggregates() {
         use crate::lab::scores::{ArtifactKey, Outcome};
