@@ -16,7 +16,12 @@ rust-version = "1.80"
 # (which silently flaked default-assertion tests and leaked test records to the
 # real Redis stream). No per-test call; a crate opts its whole test build in.
 # Off in normal/release builds, so the production config path is unchanged.
-test-support = []
+# (#2695/#2697/#2698) test-support also carries `test_isolation::IsolatedState`
+# — the one guard that pins every darkmux write destination under a single
+# throwaway root — so it pulls in `tempfile` as an OPTIONAL dep. Optional, not
+# a plain dependency: the feature is only ever enabled through a dependent
+# crate's DEV-dependency, so no release build gains the dep.
+test-support = ["dep:tempfile"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -27,6 +32,9 @@ dirs = "5.0"
 # extracted from four independent copies across darkmux-lab, darkmux-flow,
 # darkmux-fleet, and the e2e test harness. Already a direct dep of all four.
 libc = "0.2"
+# (#2695) Optional, feature-gated: present only when `test-support` is on.
+# See the feature's own comment.
+tempfile = { version = "3.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"

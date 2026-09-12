@@ -2766,81 +2766,40 @@ mod tests {
         }
     }
 
-    // ── crew dir test harness (mirrors dispatch_as_crew_of_one's RunGuard) ─
+    // ── crew dir test harness ──────────────────────────────────────────
 
-    struct CrewGuard {
-        _tmp: TempDir,
-        prev: Option<String>,
-    }
-    impl CrewGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
-            unsafe {
-                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
-            }
-            Self { _tmp: tmp, prev }
-        }
-    }
-    impl Drop for CrewGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
-                }
-            }
-        }
-    }
+    /// (#2697) Now a thin alias over the ONE guard
+    /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins every
+    /// darkmux write destination under a single throwaway root instead of
+    /// the one variable this guard used to know about.
+    ///
+    /// **Why it had to change.** The `finalize_mission` tests in this
+    /// module hold this guard, and the old version pinned only
+    /// `DARKMUX_CREW_DIR`. That isolates mission state — and the flow sink
+    /// those same tests drive resolves through `flows_dir()`
+    /// (`env(DARKMUX_FLOWS_DIR) > config.dirs.flows > <root>/flows`),
+    /// which this guard never pinned. So `cargo test -p darkmux-serve
+    /// --lib runs::` appended fabricated `mission close` records for test
+    /// missions `m6`/`m7`/`m8` — carrying `reasoning: "mission errored"`
+    /// and `"mission completed (degraded)"` — to a real flow day file,
+    /// where they are indistinguishable from real history, feed `run list`
+    /// and the viewer, and (when `audit.enabled`) enter the hash-chained
+    /// audit sink, in which a record cannot be removed without breaking
+    /// the chain.
+    ///
+    /// The lesson is the alias, not one more variable: adding a
+    /// `FlowsDirGuard` beside this one would have closed the flows dir and
+    /// said nothing about the other destinations. Pinning the whole set
+    /// from one place is what stops the next one leaking.
+    type CrewGuard = darkmux_types::test_isolation::IsolatedState;
 
-    /// (#2682 fix-pass round 2, MUST FIX 2) RAII pin for the staleness
-    /// budget. [`stale_after_ms`] is `config_access::
-    /// inactivity_timeout_seconds() * 2`, whose TOP tier is the
-    /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` env var — a documented operator
-    /// knob, read LIVE per access. A fixture that places a mission "90
-    /// minutes ago" and expects that to read stale is therefore asserting
-    /// against a threshold the ENVIRONMENT owns: with `7200` exported the
-    /// budget becomes 4 hours and the fixture's own premise evaporates.
-    /// That is the clock rule one axis over — freeze the distance's
-    /// DENOMINATOR, not just its numerator. Caller must hold
-    /// `#[serial_test::serial]`.
-    struct InactivityBudgetGuard {
-        prev: Option<String>,
-    }
-    impl InactivityBudgetGuard {
-        fn seconds(secs: u64) -> Self {
-            let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
-            unsafe {
-                std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", secs.to_string());
-            }
-            Self { prev }
-        }
-        /// (round 3, CONSIDER 2) The other pin a test can need: the knob
-        /// CLEARED, so the resolved value is the built-in default rather
-        /// than whatever the environment exports. Under `cfg(test)`
-        /// `config_access::config()` returns `EMPTY_CONFIG` without ever
-        /// opening a file, so `env > config > default` collapses to
-        /// `env > default` here — clearing the env var is the only way to
-        /// reach the default tier, and a test asserting the SHIPPED value
-        /// has to reach it.
-        fn unset() -> Self {
-            let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
-            unsafe {
-                std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
-            }
-            Self { prev }
-        }
-    }
-    impl Drop for InactivityBudgetGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
-                    None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
-                }
-            }
-        }
-    }
+    /// (#2698) Now a thin alias over the shared
+    /// [`darkmux_types::test_isolation::InactivityBudget`]. Three copies of
+    /// this guard had grown in three test modules and a fourth module
+    /// (`darkmux-serve`'s `lib_tests`) had none at all — which is exactly
+    /// why its two budget-sensitive tests were still unpinned and went red
+    /// at `1` and at `86400`. One implementation, one place.
+    type InactivityBudgetGuard = darkmux_types::test_isolation::InactivityBudget;
 
     fn now_unix() -> u64 {
         std::time::SystemTime::now()

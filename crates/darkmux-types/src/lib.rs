@@ -20,6 +20,11 @@ pub mod paths;
 pub mod residency_lease;
 pub mod session_id;
 pub mod size;
+/// (#2695/#2697/#2698) The single test-isolation guard. Gated the same
+/// way `env_audit` is: available to a crate's TEST build via the
+/// `test-support` feature, absent from every release build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_isolation;
 pub mod style;
 pub mod workdir;
 

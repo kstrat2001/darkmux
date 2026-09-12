@@ -718,8 +718,6 @@ pub fn finalize_mission_with_payload(envelope: &MissionEnvelope, payload: Option
 mod tests {
     use super::*;
     use crate::types::{Mission, MissionStatus, Phase, PhaseStatus};
-    use std::env;
-    use tempfile::TempDir;
 
     // ── Finalize refusal classifier (#1406/#1433) — pure, no I/O ──────────
 
@@ -791,45 +789,21 @@ mod tests {
         assert_eq!(classify_mission_close_refusal(None), FinalizeRefusal::Drift);
     }
 
-    /// Mirrors `lifecycle::tests::CrewGuard` — isolates both the crew root
-    /// (mission/phase JSON) and the flow-record sink so these tests never
-    /// touch the operator's real `~/.darkmux` state.
-    struct CrewGuard {
-        _tmp_crew: TempDir,
-        _tmp_flows: TempDir,
-        prev_crew: Option<String>,
-        prev_flows: Option<String>,
-    }
-
-    impl CrewGuard {
-        fn new() -> Self {
-            let tmp_crew = TempDir::new().unwrap();
-            let tmp_flows = TempDir::new().unwrap();
-            let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
-            let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
-            // SAFETY: serialized via #[serial_test::serial] on every caller.
-            unsafe {
-                env::set_var("DARKMUX_CREW_DIR", tmp_crew.path());
-                env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path());
-            }
-            Self { _tmp_crew: tmp_crew, _tmp_flows: tmp_flows, prev_crew, prev_flows }
-        }
-    }
-
-    impl Drop for CrewGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev_crew {
-                    Some(v) => env::set_var("DARKMUX_CREW_DIR", v),
-                    None => env::remove_var("DARKMUX_CREW_DIR"),
-                }
-                match &self.prev_flows {
-                    Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
-                    None => env::remove_var("DARKMUX_FLOWS_DIR"),
-                }
-            }
-        }
-    }
+    /// (#2697) A thin alias over the ONE guard
+    /// ([`darkmux_types::test_isolation::IsolatedState`]), which pins
+    /// EVERY darkmux write destination under a single throwaway root.
+    ///
+    /// It used to pin two variables by hand — `DARKMUX_CREW_DIR` and
+    /// `DARKMUX_FLOWS_DIR` — which is the per-variable pattern that
+    /// produced this bug class: each guard knows about the destinations
+    /// whose leak somebody already noticed and is silent about the rest,
+    /// so every newly-added destination leaks until the next incident.
+    /// One list, in one place, kept honest by the resolvers themselves
+    /// (`darkmux-doctor`'s
+    /// `the_guards_variable_list_covers_every_destination_the_resolvers_read`).
+    ///
+    /// Callers must hold `#[serial_test::serial]`, exactly as before.
+    type CrewGuard = darkmux_types::test_isolation::IsolatedState;
 
     /// `lifecycle::save_json` is private to that module — these tests
     /// write the fixture JSON directly (same atomic-rename discipline

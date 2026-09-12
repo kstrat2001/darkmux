@@ -6631,8 +6631,20 @@ fn join_host_samples_windows_against_the_start_records_machine_not_just_the_firs
     assert_eq!(telemetry[0]["machine_uid"], "m-real");
 }
 
+/// (#2698) `#[serial]` + a pinned budget: every assertion below is
+/// measured against `stale_after_ms()`, which is
+/// `inactivity_timeout_seconds() * 2` — a documented operator knob read
+/// live. Unpinned, this test is EXIT=0 with the knob unset and at `600`
+/// and EXIT=101 at both `1` (the "+5s" record is then already stale, so
+/// the grace window it asserts never applies) and `86400` (the
+/// deliberately-far-future sample at +1.5 days falls INSIDE a 2-day
+/// window and joins, so the count is 2, not 1). Both fixtures below name
+/// distances in seconds; the budget is the denominator they are compared
+/// against, so it has to be frozen too.
 #[test]
+#[serial_test::serial]
 fn join_host_samples_grants_the_grace_window_when_the_run_is_still_recent_at_request_time() {
+    let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(600);
     // (#2413 round 3 CONSIDER 1) An open/abandoned run (no terminal yet)
     // must NOT join every later machine-scoped sample forever — before
     // this, `end_ms` fell back to `u64::MAX` on a missing terminal,
@@ -6687,8 +6699,16 @@ fn join_host_samples_grants_the_grace_window_when_the_run_is_still_recent_at_req
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(11));
 }
 
+/// (#2698) Pinned for the same reason as its sibling above, and it is the
+/// OTHER direction of the same sensitivity: this test asserts a run a full
+/// day past its last record absorbs nothing, which stops being true the
+/// moment the budget exceeds half a day (at `86400` the window is 2 days,
+/// the run is not stale yet, the grace window applies and the sample
+/// joins).
 #[test]
+#[serial_test::serial]
 fn join_host_samples_hard_clamps_when_the_run_is_already_stale_at_request_time() {
+    let _budget = darkmux_types::test_isolation::InactivityBudget::seconds(600);
     // (live finding, 2026-09-06) If liveness has ALREADY given up on this
     // run by the time the request lands (`now_ms` is more than
     // `stale_after_ms()` past the run's last seen record — the same
