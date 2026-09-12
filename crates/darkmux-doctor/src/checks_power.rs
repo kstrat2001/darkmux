@@ -85,7 +85,18 @@ fn describe(p: PowerPosture, is_macos: bool) -> Check {
     match p.low_power_mode {
         Some(true) => warnings.push("Low Power Mode on".into()),
         Some(false) => facts.push("Low Power Mode off".into()),
-        None if is_macos => warnings.push("Low Power Mode: unreadable (pmset unrecognized)".into()),
+        // (#1665 review MUST FIX 1) `None` means two different things and
+        // only one of them is worth a warning: `low_power_mode_unreadable`
+        // distinguishes "the `pmset -g` spawn itself failed" (genuinely
+        // unreadable — warn) from "`pmset -g` succeeded but neither the
+        // `lowpowermode` nor `powermode` key appeared at all" (a healthy
+        // Mac without the feature — Intel desktops, pre-Monterey; see
+        // `parse_low_power_mode`'s own doc). Warning on the latter reads a
+        // healthy machine as broken, which is the bug this split fixes.
+        None if is_macos && p.low_power_mode_unreadable => {
+            warnings.push("Low Power Mode: unreadable (pmset unrecognized)".into())
+        }
+        None if is_macos => facts.push("Low Power Mode: not supported on this Mac".into()),
         None => {}
     }
 
@@ -184,6 +195,7 @@ mod tests {
             source: Some(PowerSource::Ac),
             battery_pct: Some(100),
             low_power_mode: Some(false),
+            low_power_mode_unreadable: false,
             thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
             recent_thermal_emergency: None,
         }
@@ -323,6 +335,10 @@ mod tests {
             source: None,
             battery_pct: None,
             low_power_mode: None,
+            // A total probe failure (every field None) is the scenario this
+            // fixture represents — the underlying `pmset -g` spawn itself
+            // failed, not "succeeded but found no key".
+            low_power_mode_unreadable: true,
             thermal: None,
             recent_thermal_emergency: None,
         }
@@ -381,14 +397,43 @@ mod tests {
         assert!(c.message.contains("power source: unreadable"), "{}", c.message);
     }
 
-    /// Same class of gap, for `low_power_mode` specifically.
+    /// Same class of gap, for `low_power_mode` specifically — the GENUINE
+    /// probe-failure case (`pmset -g` itself failed to run), not a healthy
+    /// Mac lacking the feature. See
+    /// `low_power_mode_absent_on_a_mac_without_the_feature_is_healthy_not_a_warn`
+    /// below for the other `None` case this field exists to distinguish.
     #[test]
     fn low_power_mode_read_failure_on_macos_is_named_not_silently_dropped() {
         let mut p = base();
         p.low_power_mode = None;
+        p.low_power_mode_unreadable = true;
         let c = describe(p, true);
         assert_eq!(c.status, Status::Warn, "{c:?}");
         assert!(c.message.contains("Low Power Mode: unreadable"), "{}", c.message);
+    }
+
+    /// (#1665 review MUST FIX 1) The fail-open-in-miniature this fix
+    /// closes: `parse_low_power_mode` returns `None` when `pmset -g`
+    /// SUCCEEDED but neither the legacy `lowpowermode` key nor the unified
+    /// `powermode` dial appeared at all — a genuinely healthy Mac without
+    /// the feature (Intel desktops, pre-Monterey releases; see that
+    /// function's own doc and its
+    /// `low_power_mode_absent_when_neither_key_appears` test). Before this
+    /// fix `describe` warned on EVERY `None` regardless of why, so this
+    /// exact reading — AC power, nominal thermal, no LPM support — came
+    /// back `Warn` on a machine with nothing wrong.
+    #[test]
+    fn low_power_mode_absent_on_a_mac_without_the_feature_is_healthy_not_a_warn() {
+        let mut p = base();
+        p.low_power_mode = None;
+        p.low_power_mode_unreadable = false;
+        let c = describe(p, true);
+        assert_eq!(c.status, Status::Pass, "a healthy Mac without LPM support must not warn: {c:?}");
+        assert!(
+            !c.message.to_ascii_lowercase().contains("unreadable"),
+            "must not call a successful-but-key-absent read \"unreadable\": {}",
+            c.message
+        );
     }
 
     /// A partial read failure on a non-macOS host must stay silent — there
@@ -401,5 +446,31 @@ mod tests {
         p.battery_pct = None;
         let c = describe(p, false);
         assert!(!c.message.contains("unreadable"), "{}", c.message);
+    }
+
+    /// (#1665 review MUST FIX 2) `check_power_posture()`'s single decision
+    /// — which `is_macos` a real `darkmux doctor` run hands `describe` —
+    /// has ZERO callers anywhere in this test suite; every other test
+    /// above calls `describe` directly with a hardcoded bool. That makes
+    /// the wiring line itself mutation-dead: hardcoding either `true`
+    /// (every non-Mac CI host would warn) or `false` (the fix goes inert
+    /// on every real Mac) leaves all the OTHER tests in this file green.
+    /// A source-conformance assertion — same posture as
+    /// `src/preflight.rs`'s `all_long_running_entry_points_call_the_
+    /// preflight_and_hold_a_sleep_assertion` — mutation-proves it: reading
+    /// a fact directly out of this crate's own source, rather than
+    /// exercising `check_power_posture()` through a real `pmset` on the
+    /// test host (which would defeat the reason `describe` was split out
+    /// in the first place).
+    #[test]
+    fn check_power_posture_wires_the_real_os_flag_not_a_literal() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/checks_power.rs");
+        let text = std::fs::read_to_string(&path).expect("read source");
+        assert!(
+            text.contains("describe(power_posture::sample(), cfg!(target_os = \"macos\"))"),
+            "check_power_posture() must wire the REAL target_os flag into `describe`, not a \
+             hardcoded bool — a hardcoded `true` warns every non-Mac CI host, a hardcoded \
+             `false` makes MUST FIX 1's fix inert on every real Mac"
+        );
     }
 }

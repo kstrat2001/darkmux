@@ -51,6 +51,17 @@ pub struct PowerPosture {
     /// power, reflecting the last known charge level).
     pub battery_pct: Option<u8>,
     pub low_power_mode: Option<bool>,
+    /// (#1665 review MUST FIX 1) `low_power_mode` reads `None` for TWO
+    /// different reasons that `describe`/`checks_power.rs` must not
+    /// conflate: the `pmset -g` spawn itself failing (absent, non-zero
+    /// exit — genuinely unreadable), versus `pmset -g` succeeding but
+    /// [`parse_low_power_mode`] finding neither the `lowpowermode` nor
+    /// `powermode` key at all (a real, healthy Mac that just doesn't have
+    /// the feature — Intel desktops, pre-Monterey releases; see that
+    /// function's own doc). `true` only for the former. A caller that
+    /// warns on every `None` regardless of this flag reads a healthy
+    /// machine as broken — the exact bug this field exists to prevent.
+    pub low_power_mode_unreadable: bool,
     /// Reused from [`thermal::sample`] rather than re-read — same source,
     /// same semantics (`cpu_speed_limit_pct: 100` means "no cap recorded").
     pub thermal: Option<ThermalSample>,
@@ -275,9 +286,25 @@ mod imp {
         let ps_text = run("pmset", &["-g", "ps"]);
         let source = ps_text.as_deref().and_then(parse_power_source);
         let battery_pct = ps_text.as_deref().and_then(parse_battery_pct);
-        let low_power_mode = run("pmset", &["-g"]).as_deref().and_then(parse_low_power_mode);
+        // (#1665 review MUST FIX 1) Captured once so both the parsed value
+        // AND whether the underlying spawn itself failed are available —
+        // `pmset_g_text.is_none()` means the process failed/exited
+        // non-zero (genuinely unreadable); `Some(text)` with
+        // `parse_low_power_mode` still returning `None` means the read
+        // worked and neither key was present (a healthy Mac without the
+        // feature).
+        let pmset_g_text = run("pmset", &["-g"]);
+        let low_power_mode = pmset_g_text.as_deref().and_then(parse_low_power_mode);
+        let low_power_mode_unreadable = pmset_g_text.is_none();
         let thermal = thermal::sample();
-        let mut posture = PowerPosture { source, battery_pct, low_power_mode, thermal, recent_thermal_emergency: None };
+        let mut posture = PowerPosture {
+            source,
+            battery_pct,
+            low_power_mode,
+            low_power_mode_unreadable,
+            thermal,
+            recent_thermal_emergency: None,
+        };
         let should_scan_log = always_scan_thermal_log
             || severity(&posture).map(|s| s >= 1).unwrap_or(false)
             || matches!(posture.source, Some(PowerSource::Battery))
@@ -312,7 +339,14 @@ pub use imp::{sample, sample_for_preflight};
 
 #[cfg(not(target_os = "macos"))]
 pub fn sample() -> PowerPosture {
-    PowerPosture { source: None, battery_pct: None, low_power_mode: None, thermal: None, recent_thermal_emergency: None }
+    PowerPosture {
+        source: None,
+        battery_pct: None,
+        low_power_mode: None,
+        low_power_mode_unreadable: false,
+        thermal: None,
+        recent_thermal_emergency: None,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -439,6 +473,7 @@ mod tests {
                 source: None,
                 battery_pct: None,
                 low_power_mode: None,
+                low_power_mode_unreadable: false,
                 thermal: Some(ThermalSample { state: state.into(), cpu_speed_limit_pct: 100 }),
                 recent_thermal_emergency: None,
             })
@@ -452,7 +487,14 @@ mod tests {
 
     #[test]
     fn severity_is_none_when_there_is_no_thermal_sample_at_all() {
-        let p = PowerPosture { source: None, battery_pct: None, low_power_mode: None, thermal: None, recent_thermal_emergency: None };
+        let p = PowerPosture {
+            source: None,
+            battery_pct: None,
+            low_power_mode: None,
+            low_power_mode_unreadable: false,
+            thermal: None,
+            recent_thermal_emergency: None,
+        };
         assert_eq!(severity(&p), None, "unreadable thermal (e.g. Intel Mac) must not read as any known severity");
     }
 

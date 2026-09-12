@@ -397,11 +397,19 @@ pub struct RuntimeBehaviorConfig {
     /// 2 with no operator override available.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_stall_recoveries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
-    // (#1311) Verbosity for the diagnostic surfaces. `"info"` (default) emits
-    // the informative dispatch-liveness phase markers; `"debug"` additionally
-    // logs per-call detail (hosted call host/model/tokens/wall_ms). NEVER
-    // carries a secret at any level. Resolved via `config_access::log_level`
-    // (`env(DARKMUX_LOG) > this > "info"`); surfaced by `darkmux doctor`.
+    // (#1311) Diagnostic verbosity. NEVER carries a secret at any level.
+    // Resolved via `config_access::log_level` (`env(DARKMUX_LOG) > this >
+    // "info"`).
+    //
+    // (#1665 review CONSIDER 7) Scope, stated honestly — see
+    // `config_access::log_level`'s own doc for the full explanation: the
+    // ONLY reader anywhere in this tree is `config_access::debug_logging`,
+    // whose ONLY caller is the tool-less remote `single_shot` dispatch
+    // path. It is NOT surfaced by `darkmux doctor` (no reader there), and
+    // an `"info"` value has no `"info"`-specific behavior of its own — it
+    // is just the absence of `"debug"`'s. The internal-runtime Docker
+    // container path (`dispatch`/`mission launch`/`lab run`) never reads
+    // this field at all.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub log_level: Option<String>,
     /// (#1548) Whether the runtime injects feedback (nudge) messages into a
     /// struggling dispatch's next turn. Resolved via
@@ -655,10 +663,16 @@ pub struct RemoteConfig {
     /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once — remote
     /// jobs aren't RAM-bound (gestalt's wave scheduler only governs LOCAL
     /// co-residency), so they run in their own separately-capped batch
-    /// instead of being serialized behind local waves. Default 4 is a
-    /// placeholder pending an operator call informed by real Azure/hosted
-    /// rate-limit tiers — unlike `max_tokens_per_execution` this is not yet
-    /// empirically tuned.
+    /// instead of being serialized behind local waves.
+    ///
+    /// **Default `1` (#1665 review CONSIDER 5), not empirically tuned.**
+    /// Every real call site now resolves this (fixing #2681, where they
+    /// hardcoded `remote_cap: 1` and ignored the accessor entirely); the
+    /// default was moved down from the old placeholder `4` to `1` in the
+    /// same change so wiring it is behavior-preserving — an operator who
+    /// never touches this stays fully serial, exactly as before. Raise it
+    /// via `config set remote.concurrent_cap <n>` once real hosted-
+    /// endpoint rate-limit tiers justify a higher value.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub concurrent_cap: Option<u32>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
@@ -1129,7 +1143,11 @@ impl DarkmuxConfig {
             }),
             remote: Some(RemoteConfig {
                 max_tokens_per_execution: Some(500_000),
-                concurrent_cap: Some(4),
+                // (#1665 review CONSIDER 5) Visible `1`, matching the
+                // resolved accessor default — see `RemoteConfig::
+                // concurrent_cap`'s own doc for why this moved down from
+                // the old placeholder `4`.
+                concurrent_cap: Some(1),
                 extras: Default::default(),
             }),
             mission: Some(MissionBoardConfig {
@@ -1318,14 +1336,17 @@ mod tests {
         assert_eq!(cfg.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
         // (#1230 Packet 1) The concurrent-dispatch remote cap, same
         // visible-default treatment as its token-allowance sibling.
-        assert_eq!(cfg.remote.as_ref().unwrap().concurrent_cap, Some(4));
+        // (#1665 review CONSIDER 5) `1`, not the old placeholder `4` —
+        // matches the resolved accessor default now that real call sites
+        // resolve it.
+        assert_eq!(cfg.remote.as_ref().unwrap().concurrent_cap, Some(1));
         // Lossless round-trip.
         let back: DarkmuxConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.redis.as_ref().unwrap().enabled, Some(false));
         assert_eq!(back.audit.as_ref().unwrap().dir.as_deref(), Some("~/.darkmux/audit"));
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
         assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
-        assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(4));
+        assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(1));
     }
 
     /// (#1475 packet 1) `role_profiles` is written by `init` as a visible empty

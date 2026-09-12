@@ -731,13 +731,25 @@ pub fn remote_max_tokens_per_execution() -> u64 {
 }
 /// (#1230 Packet 1) Max CONCURRENT remote dispatches
 /// `darkmux_crew::concurrent_dispatch::run_bounded` runs at once. Resolves
-/// `env(DARKMUX_REMOTE_CONCURRENT_CAP) > config.remote.concurrent_cap > 4`
-/// — mirrors `remote_max_tokens_per_execution`'s wiring exactly. A
-/// placeholder default (see `RemoteConfig::concurrent_cap`'s doc), not yet
-/// empirically tuned against real hosted-endpoint rate limits.
+/// `env(DARKMUX_REMOTE_CONCURRENT_CAP) > config.remote.concurrent_cap > 1`
+/// — mirrors `remote_max_tokens_per_execution`'s wiring exactly.
+///
+/// **Default is `1`, not `4` (#1665 review CONSIDER 5).** This accessor
+/// went unwired at every real call site for a while (#2681 found it: every
+/// production `run_step_graph` call hardcoded `remote_cap: 1` instead of
+/// resolving this function) — those call sites now resolve it, and the
+/// default was moved from the old placeholder `4` down to `1` in the SAME
+/// change so wiring it is behavior-preserving: an operator who never
+/// touches `remote.concurrent_cap`/`DARKMUX_REMOTE_CONCURRENT_CAP` gets
+/// today's serial behavior unchanged. Raising it to allow real concurrent
+/// remote dispatch is now an operator OPT-IN via `config set
+/// remote.concurrent_cap <n>`, not a silent default flip — a real
+/// concurrency increase on the main dispatch path deserves its own
+/// dogfood pass, per this repo's release-gate doctrine, not a side effect
+/// of wiring the knob.
 pub fn remote_concurrent_cap() -> u32 {
     let cfg = config().remote.as_ref().and_then(|r| r.concurrent_cap);
-    pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(4)).unwrap()
+    pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(1)).unwrap()
 }
 // ── Radio interpreter (#1698 Packet B2) ──
 /// The ROUTING seat's explicit profile override. Resolves
@@ -2892,20 +2904,24 @@ mod tests {
         }
     }
 
-    // ── remote_concurrent_cap (#1230 Packet 1): env > config > 4 ──
+    // ── remote_concurrent_cap (#1230 Packet 1): env > config > 1 ──
+    // (#1665 review CONSIDER 5) Default moved from the old placeholder `4`
+    // to `1` in the same change that wired the real call sites — see
+    // `remote_concurrent_cap`'s own doc for why that keeps today's
+    // (unwired) behavior unchanged for an operator who never sets this.
     #[serial_test::serial]
     #[test]
     fn remote_concurrent_cap_env_then_default() {
         let k = "DARKMUX_REMOTE_CONCURRENT_CAP";
         let prev = std::env::var(k).ok();
         unsafe { std::env::remove_var(k); }
-        // No env + the empty test config (#811) → the built-in placeholder 4.
-        assert_eq!(remote_concurrent_cap(), 4);
+        // No env + the empty test config (#811) → the built-in default 1.
+        assert_eq!(remote_concurrent_cap(), 1);
         unsafe { std::env::set_var(k, "8"); }
         assert_eq!(remote_concurrent_cap(), 8, "env tier wins live");
         // An unparseable env value falls through to the default, never panics.
         unsafe { std::env::set_var(k, "lots"); }
-        assert_eq!(remote_concurrent_cap(), 4);
+        assert_eq!(remote_concurrent_cap(), 1);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
@@ -3159,16 +3175,15 @@ mod tests {
     /// dedup.rs` and `coder_phase.rs` (#1352) use for a documented
     /// narrowing. Grow this list only with a linked issue, never to
     /// silence a failure without one.
-    const KNOWN_GAPS: &[(&str, &str)] = &[
-        // #2681: every real `run_step_graph`/`run_bounded` call site
-        // hardcodes `remote_cap: 1` instead of resolving this accessor —
-        // found BY this guard while it was being written. Left as a
-        // tracked gap rather than fixed in the same PR: flipping the
-        // real-world default from always-serial to up-to-4-concurrent
-        // remote dispatch is a behavioral change that deserves its own
-        // dogfood pass, not a side effect of an audit PR.
-        ("remote_concurrent_cap", "https://github.com/kstrat2001/darkmux/issues/2681"),
-    ];
+    // (#1665 review CONSIDER 5) `remote_concurrent_cap` (#2681) was here —
+    // found BY this guard while it was being written, then resolved in the
+    // same review pass: the real `run_step_graph` call sites now resolve
+    // it, and its default moved from the old placeholder `4` down to `1`
+    // in the same change, so wiring it is behavior-preserving (see
+    // `remote_concurrent_cap`'s own doc). No known gaps remain; keep this
+    // list empty rather than deleting it so the NEXT dead knob has an
+    // obvious place to land.
+    const KNOWN_GAPS: &[(&str, &str)] = &[];
 
     /// Every top-level (column-0) `pub fn <name>(` in `src`, in the same
     /// spirit as `dispatch_internal_tests.rs`'s `top_level_function_spans`
@@ -3187,14 +3202,28 @@ mod tests {
         out
     }
 
-    /// `text` with every full-line comment (`//`, `///`, `//!`) dropped —
-    /// so a doc comment merely NAMING an accessor (e.g. "resolved via
-    /// `config_access::log_level`") can never satisfy this guard the way
-    /// an actual call site does. Line-level, not token-level: matches
-    /// this codebase's own precedent (`liveness_conformance`'s
-    /// `body.contains(...)` textual checks) of accepting a known, narrow
-    /// gap (a trailing `// comment` on a real code line still counts)
-    /// rather than writing a full Rust tokenizer for a test.
+    /// `text` with every LINE-STYLE comment (`//`, `///`, `//!`) dropped —
+    /// so a doc comment merely NAMING an accessor at the START of its own
+    /// line (e.g. "resolved via `config_access::log_level`") can't satisfy
+    /// this guard the way an actual call site does. Line-level, not
+    /// token-level: matches this codebase's own precedent
+    /// (`liveness_conformance`'s `body.contains(...)` textual checks) of
+    /// accepting a known, narrow gap rather than writing a full Rust
+    /// tokenizer for a test.
+    ///
+    /// **Stated honestly (#1665 review CONSIDER 4), the gaps this does NOT
+    /// close** — none exploited by any accessor in this file today, which
+    /// is exactly why they're safe to name rather than fix:
+    /// a trailing `// comment` on a real code line still counts as code
+    /// (by design — see above); a block comment (`/* ... */`) is NOT
+    /// stripped at all, so `/* log_level( */` would satisfy the guard the
+    /// same as a real call; and this is a substring scan over TEXT, not a
+    /// parse of Rust semantics, so a string literal containing an
+    /// accessor's name (`"log_level("`) would satisfy it too. The guard
+    /// proves "no textual match anywhere else in the repo", which is
+    /// strong evidence of a real dead knob when it fails, but is not a
+    /// call-graph — read a passing run as "nothing obviously references
+    /// this", not as a formal proof of a real caller.
     fn strip_comment_lines(text: &str) -> String {
         text.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
     }
@@ -3203,6 +3232,14 @@ mod tests {
     /// deliberately walks the WHOLE workspace (`src/`, every `crates/*/`,
     /// `runtime/`), not just this crate, because a config value's real
     /// reader can live in any of them.
+    ///
+    /// **A physical directory walk, not a Cargo workspace query (#1665
+    /// review CONSIDER 4):** this also descends into any `.rs` file that
+    /// happens to sit under `repo_root` in a crate `Cargo.toml`'s
+    /// `[workspace].members` never lists — code the real `cargo build
+    /// --workspace` this repo actually ships never compiles. A reader
+    /// that lives ONLY in such a crate would still satisfy this guard,
+    /// even though it can never run. Not exploited by any accessor today.
     fn collect_rs_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(root) else { return };
         for entry in entries.flatten() {
@@ -3277,12 +3314,23 @@ mod tests {
 
         assert!(
             unread.is_empty(),
+            // (#1665 review CONSIDER 4) Stated as what this guard actually
+            // checks, not an overclaim about "any caller": a textual
+            // substring match for `name(`/`::name` anywhere else in this
+            // repository's `.rs` files, excluding this file's own
+            // top-level `//` comments. It is NOT a call graph — see
+            // `strip_comment_lines`/`collect_rs_files`'s own docs for the
+            // named (currently unexploited) gaps: a match in another
+            // file's OWN unit test still counts, a block comment
+            // (`/* ... */`) is never stripped, a string literal naming the
+            // accessor would count, and the walk isn't scoped to crates
+            // this workspace's `cargo build --workspace` actually compiles.
             "these config_access accessors (or their `_with_source`/alias \
-             siblings) have NO caller anywhere in the workspace outside a \
-             doc comment or their own unit test — a settable, typed config \
-             field that nothing reads is exactly the #1548/#1665 dead-knob \
-             shape. Either wire a real reader, or add a KNOWN_GAPS entry \
-             with a tracking issue: {unread:?}"
+             siblings) have NO textual match anywhere else in this repository's \
+             `.rs` files — a settable, typed config field with no apparent \
+             reader anywhere is exactly the #1548/#1665 dead-knob shape. \
+             Either wire a real reader, or add a KNOWN_GAPS entry with a \
+             tracking issue: {unread:?}"
         );
 
         // The KNOWN_GAPS list itself must not silently rot into "still
