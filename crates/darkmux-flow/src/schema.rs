@@ -79,6 +79,37 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.48.0";
 // Version history:
+//   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2694: `hook.failed`'s
+//           existing `payload.error` no longer carries a refused
+//           redirect's `Location` header verbatim. That header is
+//           remote-chosen text, and when it does not parse as a URL
+//           `try_post` fell back to its raw bytes; it is now sanitized,
+//           bounded and double-quoted at the boundary by
+//           `hooks::quote_and_escape_untrusted` (the same helper #2196's
+//           rejection reasons use), so the reason reads
+//           `redirect refused: 302 to "<target>"`. No key is added,
+//           removed or retyped — only the VALUE of a string field that
+//           has always carried free prose gets narrower, which is why
+//           this is not a bump. TWO DISTINCT FIELDS carry this text and
+//           their consumer sets are NOT the same one (stated separately
+//           because this entry exists to be re-read later):
+//             * the FLOW RECORD field `hook.failed.payload.error` — read
+//               by exactly two consumers, `flow tail`'s human arm (which
+//               never prints the payload) and the drain-counting sink
+//               (which never reads `error`);
+//             * the SIDECAR field `LastStatus.error` — read by
+//               `flow status` (human + `--json`), the daemon's
+//               `/flow-status` route, and `darkmux-doctor` (which reads
+//               summaries and sidecars, never flow records). The viewer
+//               reads neither: `grep -rn last_error ui/src` is zero hits.
+//           Not one consumer of EITHER field parses the string, so no
+//           predictor of its shape exists to break — which is the whole
+//           basis for the no-bump call. `flow status`'s HUMAN output
+//           does change for every redirect refusal (the target gains
+//           quotes, and a long one now renders as a bare `last error:`
+//           label plus its own indented block rather than inline), but
+//           that is a rendering surface, not a wire consumer, and the
+//           change is the point of the fix.
 //   1.48.0 (#2196): `hook.fired`'s payload gains an additive
 //           `receiver_rejected_reasons` key — the receiver's own
 //           `results[].error` text (bounded to the first 3, each

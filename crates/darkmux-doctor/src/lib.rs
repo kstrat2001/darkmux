@@ -7388,7 +7388,7 @@ mod tests {
         // wide (2-column) characters, and a realistic multi-word reason.
         let reasons =
             ["q".repeat(400), "漢".repeat(200), "payload field \"file\" must be a non-empty string".to_string()];
-        let min_width = darkmux_flow::hooks::REJECTION_REASON_MIN_TERMINAL_WIDTH;
+        let min_width = darkmux_flow::hooks::MIN_SUPPORTED_TERMINAL_WIDTH;
 
         for reason in reasons {
             let block = doctor_rejection_block(&reason);
