@@ -1268,6 +1268,56 @@ mod tests {
     }
 
     #[test]
+    fn nearest_model_keys_are_alphabetical_and_capped_at_three_2696() {
+        // #2696 (same shape as the free-phase unload sort): `nearest_model_keys`
+        // docs promise "alphabetical, capped at 3", enforced by `hits.sort()`
+        // + `hits.truncate(3)` — but `unknown_model_fast_fail_1276` above (the
+        // only prior fixture exercising this fn) has exactly ONE match, so
+        // neither the sort nor the truncate has ever been observable: a
+        // single-element Vec reads identically sorted or not, capped or not.
+        //
+        // Four catalog keys match "qwen3-4b" here, inserted in an order that
+        // is neither alphabetical nor host/insertion-preserving ("z", "m",
+        // "b", "a"), so: (1) leaving them unsorted would report
+        // ["qwen3-4b-z", "qwen3-4b-m", "qwen3-4b-b"] instead of the correct
+        // alphabetical-first-three, and (2) skipping the truncate would
+        // report all four instead of three.
+        let f = Facts {
+            catalog: Some(vec![
+                CatalogFact { model_key: "qwen3-4b-z".into(), size_bytes: Some(GB) },
+                CatalogFact { model_key: "qwen3-4b-m".into(), size_bytes: Some(GB) },
+                CatalogFact { model_key: "qwen3-4b-b".into(), size_bytes: Some(GB) },
+                CatalogFact { model_key: "qwen3-4b-a".into(), size_bytes: Some(GB) },
+                CatalogFact { model_key: "devstral".into(), size_bytes: Some(GB) },
+            ]),
+            ..Default::default()
+        };
+        let plan = plan_acquire(&[placement("qwen3-4b", 8_000)], &f, additive_auto(), &no_est());
+
+        let nearest = match plan.actions.as_slice() {
+            [PlannedAction { reason: Reason::UnknownModelKey { nearest }, .. }] => nearest.clone(),
+            other => panic!("expected exactly one UnknownModelKey Block: {other:?}"),
+        };
+
+        // Non-vacuity: four catalog entries genuinely match "qwen3-4b" (a
+        // fifth, "devstral", genuinely does not) — otherwise capping at
+        // three and sorting alphabetically would be indistinguishable from
+        // doing nothing.
+        assert_eq!(
+            nearest.len(),
+            3,
+            "four keys match; truncate(3) must drop exactly one: {nearest:?}"
+        );
+
+        assert_eq!(
+            nearest,
+            vec!["qwen3-4b-a".to_string(), "qwen3-4b-b".to_string(), "qwen3-4b-m".to_string()],
+            "nearest-match hints are alphabetical, capped at 3 — \"qwen3-4b-z\" is the correct \
+             drop, not an artifact of catalog insertion order: {nearest:?}"
+        );
+    }
+
+    #[test]
     fn catalog_unavailable_lenient() {
         // Facts.catalog = None means the existence check is SKIPPED, not
         // failed — the bounded Deadline port backstops execution instead.
@@ -2037,6 +2087,90 @@ mod tests {
                 reconcile_load_action("b", 32_000),
             ],
             "every free precedes every load"
+        );
+    }
+
+    #[test]
+    fn free_phase_unloads_sort_by_host_reported_index_2696() {
+        // #2696: `unloads.sort_by_key(|(idx, _)| *idx)` is a documented
+        // contract (module docs: "orders actions per the Plan ordering
+        // contract"; `EvictionOrder::HostReported`), not an implementation
+        // detail — the emitted order must match what an operator reads in
+        // `lms ps`, and reversing the comparator left the whole suite green
+        // because every existing fixture with 2+ unloads produced them all
+        // from the SAME arm (a single `for (idx, r) in
+        // facts.residents.iter().enumerate()` loop), whose insertion order
+        // already equals host order — the sort was a no-op every fixture
+        // happened to agree with.
+        //
+        // Here the two unloads come from DIFFERENT arms at DIFFERENT points
+        // in the function: the reconcile stale for "darkmux:b" (host idx 0)
+        // is committed into `unloads` LAST (via `reconcile_frees`, after
+        // pass 1 and the budget/pool arms), while the pass-1 unload of
+        // "darkmux:aaa" (host idx 1, no longer desired) is pushed FIRST.
+        // Insertion order is therefore [(1, aaa), (0, b)] — genuinely
+        // disagreeing with host order [(0, b), (1, aaa)] — so the sort has
+        // real work to do and a fixture composed only of same-arm unloads
+        // could never observe it. Also chosen so identifier "darkmux:aaa"
+        // sorts alphabetically BEFORE "darkmux:b", so "sort by identifier"
+        // is a distinguishable wrong answer too, not an accidental match.
+        //
+        // Composes with #2692's refuse-fast hoist: this plan carries no
+        // Block, so `blocks` is empty and assembly is `unloads(sorted) ++
+        // proceeding`, unaffected by the hoist.
+        let f = facts(vec![
+            resident("darkmux:b", "b", 4_096, None),     // host idx 0 — reconciled
+            resident("darkmux:aaa", "aaa", 4_096, None), // host idx 1 — no longer desired
+        ]);
+        let plan = plan_acquire(
+            &[placement("b", 32_000)],
+            &f,
+            opts(CallerIntent::OperatorExplicit, AcquireScope::Exclusive),
+            &no_est(),
+        );
+
+        // Non-vacuity: genuinely two unloads, targeting genuinely distinct
+        // residents — otherwise the order assertion below could hold
+        // vacuously against a fixture that produced one unload or none.
+        let unload_idents: Vec<&str> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match &a.action {
+                Action::Unload { target } => Some(target.identifier()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unload_idents.len(),
+            2,
+            "fixture must produce exactly two unloads to exercise the sort: {:?}",
+            plan.actions
+        );
+        assert_ne!(
+            unload_idents[0], unload_idents[1],
+            "the two unloads must target distinct residents at distinct host indices: {:?}",
+            plan.actions
+        );
+
+        assert_eq!(
+            plan.actions,
+            vec![
+                reconcile_unload_action("darkmux:b", 4_096),
+                PlannedAction {
+                    action: Action::Unload {
+                        target: OwnedTarget::claim("darkmux:aaa", None).unwrap(),
+                    },
+                    reason: Reason::NoLongerDesired,
+                    precondition: Precondition::ResidentPresent {
+                        identifier: "darkmux:aaa".into(),
+                        at_ctx: Some(4_096),
+                    },
+                },
+                reconcile_load_action("b", 32_000),
+            ],
+            "free-phase unloads sort by HOST-REPORTED resident index (0 before 1) \
+             regardless of which arm produced each or which placement it traces to: {:?}",
+            plan.actions
         );
     }
 
