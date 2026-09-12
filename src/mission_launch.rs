@@ -1531,7 +1531,13 @@ pub fn launch(
         &registry,
         &facts,
         &est,
-        1,
+        // (#1665 review CONSIDER 5, closes #2681) Was a hardcoded `1` —
+        // now resolves the operator's real setting. Behavior-preserving:
+        // `remote_concurrent_cap()`'s own default moved down to `1` in the
+        // same change, so an operator who never touches
+        // `remote.concurrent_cap`/`DARKMUX_REMOTE_CONCURRENT_CAP` sees no
+        // change at all.
+        darkmux_types::config_access::remote_concurrent_cap() as usize,
         &crew::concurrent_dispatch::lms_host_factory,
         // (#1641) The launcher knows its own `mission_id` — stamp it onto
         // every record this run's `run_step_graph` call produces that

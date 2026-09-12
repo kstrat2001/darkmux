@@ -4074,6 +4074,80 @@ fn check_daemon_reachable() -> Check {
     check_daemon_reachable_impl("127.0.0.1", 8765)
 }
 
+/// (#1665) Whether a raw HTTP response's body parses as JSON carrying a
+/// `darkmux_version` key — the one field `darkmux_serve::health` always
+/// emits. Best-effort on purpose: a malformed/oversized body just reads as
+/// "not darkmux" (`false`) rather than panicking the check.
+fn response_names_darkmux(response: &str) -> bool {
+    let Some(body_start) = response.find("\r\n\r\n") else { return false };
+    let body = &response[body_start + 4..];
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("darkmux_version").cloned())
+        .is_some()
+}
+
+/// (#1665 review CONSIDER 3) Byte offset just past the header/body
+/// separator (`\r\n\r\n`), or `None` when the headers haven't fully
+/// arrived in `data` yet.
+fn http_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Parse `Content-Length` out of a header block (case-insensitive header
+/// name, per HTTP/1.1 — real servers vary casing).
+fn http_content_length(headers: &str) -> Option<usize> {
+    headers
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+        .and_then(|(_, v)| v.trim().parse().ok())
+}
+
+/// (#1665 review CONSIDER 3) Read a full HTTP response off `stream`,
+/// looping across multiple TCP reads rather than trusting one 1 KiB read
+/// to have captured everything. A real server that flushes headers and
+/// writes the body moments later (two TCP segments, not one) used to be
+/// mistaken for a "200 with no darkmux identity" port squatter — the
+/// second read that would have carried the body never happened. Stops
+/// when: (a) the peer closes the connection (`Connection: close`, which
+/// this probe's request always sends, makes EOF the normal end-of-response
+/// signal), (b) the headers are in AND a `Content-Length` says the body is
+/// fully buffered, or (c) a total-size/deadline bound is hit — a
+/// misbehaving or hostile responder must not hang `darkmux doctor`
+/// indefinitely. Whatever arrived before any of those is what gets
+/// returned; a read timeout or error is not itself a failure here, since
+/// the per-read socket timeout set by the caller already guards against a
+/// truly silent peer.
+fn read_full_http_response(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+    const TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + TOTAL_BUDGET;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        if std::time::Instant::now() >= deadline || data.len() >= MAX_RESPONSE_BYTES {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break, // peer closed — the normal end for `Connection: close`
+            Ok(n) => {
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = http_header_end(&data) {
+                    let headers = String::from_utf8_lossy(&data[..header_end]);
+                    match http_content_length(&headers) {
+                        Some(len) if data.len() >= header_end + len => break,
+                        Some(_) => continue, // headers in, body still arriving
+                        None => continue,    // no Content-Length — wait for EOF/timeout
+                    }
+                }
+            }
+            Err(_) => break, // timeout or error — use whatever arrived so far
+        }
+    }
+    data
+}
+
 /// Core implementation that takes host/port so tests can inject mock servers.
 fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     let addr = format!("{}:{}", host, port);
@@ -4137,11 +4211,12 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     stream.write_all(request.as_bytes()).ok();
     stream.flush().ok(); // Ensure the request is sent
 
-    // Read response.
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).ok().unwrap_or(0);
-
-    let response = String::from_utf8_lossy(&buf[..n]);
+    // (#1665 review CONSIDER 3) Read the FULL response, not just whatever
+    // fit in one TCP segment — see `read_full_http_response`'s doc for the
+    // headers-then-body-later gap this closes.
+    let data = read_full_http_response(&mut stream);
+    let n = data.len();
+    let response = String::from_utf8_lossy(&data);
     if n == 0 {
         return Check {
             name: DAEMON_CHECK_NAME.into(),
@@ -4151,7 +4226,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
         };
     }
 
-    if response.starts_with("HTTP/1.1 200") {
+    if response.starts_with("HTTP/1.1 200") && response_names_darkmux(&response) {
         // Surface WHERE to open the viewer, not just that the daemon answers:
         // the loopback URL (this machine) + the tailnet URL (phone / other
         // tailnet device) when `tailscale serve` is proxying to this daemon.
@@ -4164,6 +4239,29 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
             status: Status::Pass,
             message,
             hint: None,
+        }
+    } else if response.starts_with("HTTP/1.1 200") {
+        // (#1665) A 200 alone is not identity: anything answering on this
+        // port with a 200 — a dev server, a stray `python -m http.server`,
+        // another operator's process that happened to grab 8765 — used to
+        // read as "the viewer is reachable" with zero verification that it
+        // was actually darkmux on the other end. `/health`'s body always
+        // carries `darkmux_version` (`darkmux_serve::health`); its absence
+        // means this is a port squatter, not the daemon. Describes what was
+        // observed, not a verdict about what's actually listening there.
+        Check {
+            name: DAEMON_CHECK_NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "something answered 200 at {addr}/health but the body doesn't look like \
+                 darkmux's — no `darkmux_version` field. Possibly another process holding \
+                 this port."
+            ),
+            hint: Some(
+                "run `darkmux serve` on a free port, or check what's already listening on \
+                 8765 (`lsof -i :8765`)"
+                    .into(),
+            ),
         }
     } else {
         // Port is open but not darkmux (or wrong endpoint).
@@ -10647,9 +10745,16 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
 
-                // Send HTTP 200 response
-                let response =
-                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                // Send HTTP 200 response with a body shaped like the real
+                // `/health` handler's (#1665 — a 200 with no
+                // `darkmux_version` field no longer counts as identity, see
+                // `daemon_reachable_check_warns_on_a_200_with_no_darkmux_identity`
+                // below).
+                let body = r#"{"darkmux_version":"9.9.9"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 let _ = stream.write_all(response.as_bytes());
             }
         });
@@ -10664,7 +10769,8 @@ mod tests {
         assert_eq!(
             check.status,
             Status::Pass,
-            "daemon reachable check should pass when health returns 200. Got message: {}",
+            "daemon reachable check should pass when health returns 200 with darkmux's own \
+             body shape. Got message: {}",
             check.message
         );
         // (viewer-url) Pass message now surfaces the loopback viewer URL; the
@@ -10677,6 +10783,114 @@ mod tests {
         );
 
         // Shutdown the server by dropping the listener (via a separate scope)
+        drop(server_handle);
+    }
+
+    /// (#1665) The "port squatter" gap named in the issue: `check_daemon_reachable_impl`
+    /// used to Pass on ANY 200 at `/health`, so a stray process holding
+    /// 8765 (a dev server, `python -m http.server`, another operator's
+    /// tool) read as "the darkmux viewer is reachable" with zero identity
+    /// verification. A 200 with a body that doesn't carry `darkmux_version`
+    /// must now Warn, naming the observation rather than asserting a
+    /// verdict about what's actually listening there.
+    #[test]
+    fn daemon_reachable_check_warns_on_a_200_with_no_darkmux_identity() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                // A generic 200 body a port squatter (an unrelated dev
+                // server, a stray static file server) would plausibly send —
+                // no `darkmux_version` field anywhere in it.
+                let body = "<html><body>hello</body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        let check = check_daemon_reachable_impl("127.0.0.1", port);
+
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a 200 with no darkmux identity must not read as the daemon being reachable: {check:?}"
+        );
+        assert!(check.message.contains("darkmux_version"), "{}", check.message);
+        assert!(
+            !check.message.contains("viewer http://"),
+            "must not hand out a viewer link for a socket that isn't confirmed to be darkmux: {}",
+            check.message
+        );
+
+        drop(server_handle);
+    }
+
+    /// (#1665 review CONSIDER 3) A real daemon whose headers and body
+    /// arrive in TWO separate TCP segments — a flush right after the
+    /// status line + headers, then the JSON body ~120ms later — must
+    /// still read as reachable. Before `read_full_http_response`, ONE 1
+    /// KiB read captured only the headers, so `response_names_darkmux`
+    /// (which looks for `darkmux_version` in the body) came back `false`
+    /// and this exact healthy daemon read as a "port squatter" warning.
+    #[test]
+    fn daemon_reachable_check_survives_a_response_split_across_two_tcp_segments() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind test server");
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+
+                let body = r#"{"darkmux_version":"9.9.9"}"#;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                // Segment 1: headers only, flushed immediately.
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.flush();
+                // Segment 2: the body, well after the first read a
+                // single-read probe would have already returned from.
+                thread::sleep(Duration::from_millis(120));
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        let check = check_daemon_reachable_impl("127.0.0.1", port);
+
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a real daemon split across two TCP segments must still read as reachable: {check:?}"
+        );
+        assert!(
+            check.message.contains(&format!("viewer http://127.0.0.1:{port}/")),
+            "{}",
+            check.message
+        );
+
         drop(server_handle);
     }
 

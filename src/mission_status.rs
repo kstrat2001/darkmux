@@ -762,8 +762,22 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
         // injected mid-command — unpasteable, which is the one thing the
         // #1569 rule exists to prevent. The prose now only explains the
         // CHOICE between them; the commands themselves are copyable lines.
+        //
+        // (#1665) The first suggestion used to be `mission status --json`,
+        // but `board_json`'s per-mission shape carries only status COUNTS
+        // (`total`/`complete`/`running`/…) — never phase ids or per-phase
+        // statuses. A suggestion promising phase detail that command can't
+        // deliver is the same class of overclaim this audit exists to
+        // catch. `mission debrief <id> --json` genuinely emits
+        // `phases[].{id,description,status,reason}` (`coder_phase::debrief`)
+        // for any mission regardless of status, so it's the command that
+        // actually answers "what's going on in each phase" before choosing
+        // abort vs finalize.
         suggest: vec![
-            "darkmux mission status --json   # inspect the phase details first".to_string(),
+            format!(
+                "darkmux mission debrief {id} --json   # inspect the phase details first",
+                id = m.id
+            ),
             format!(
                 "darkmux mission abort {id}   # …then this, to tear the stalled mission down",
                 id = m.id
@@ -2688,6 +2702,29 @@ mod tests {
                 "rationale must not embed a runnable command (it would wrap): {note}"
             );
         }
+    }
+
+    /// (#1665) The "inspect the phase details first" suggestion used to
+    /// name `mission status --json`, whose per-mission JSON (`board_json`)
+    /// carries only status COUNTS — never a phase id or per-phase status
+    /// (see `board_json_is_complete_regardless_of_what_a_human_board_would_
+    /// hide` below for that shape). An operator following the suggestion
+    /// verbatim got a command that could not deliver what it promised.
+    /// `mission debrief <id> --json` is the command that actually emits
+    /// `phases[].{id,status,reason}` — this pins the fix and guards against
+    /// a future edit reverting the pointer without noticing why.
+    #[test]
+    fn stale_active_phase_detail_suggestion_names_a_command_that_can_deliver_it() {
+        let mut m = mission("m9", MissionStatus::Active);
+        m.started_ts = Some(0);
+        let d = detect_drift(&m, &[], &BTreeMap::new(), 15 * 86_400, 14);
+        let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
+        let first_cmd = split_suggestion(&stale.suggest[0]).0;
+        assert_eq!(
+            first_cmd, "darkmux mission debrief m9 --json",
+            "the phase-detail suggestion must be a real per-phase read, not `mission status --json` \
+             (whose JSON carries only counts): got `{first_cmd}`"
+        );
     }
 
     #[test]

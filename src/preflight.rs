@@ -170,6 +170,7 @@ mod tests {
             source: None,
             battery_pct: None,
             low_power_mode: None,
+            low_power_mode_unreadable: false,
             thermal: state.map(|s| ThermalSample { state: s.into(), cpu_speed_limit_pct: 100 }),
             recent_thermal_emergency: None,
         }

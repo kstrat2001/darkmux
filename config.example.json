@@ -44,7 +44,7 @@
   },
   "remote": {
     "max_tokens_per_execution": 500000,
-    "concurrent_cap": 4
+    "concurrent_cap": 1
   },
   "mission": {
     "stale_active_days": 14
