@@ -429,16 +429,28 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
                     } else {
                         workdir.clone()
                     };
-                    // (#1210) Dialectic mode's per-seat exit code isn't wired
-                    // into infra classification yet — `SeatRecord`'s own
-                    // token accounting (below) is dialectic's existing infra
-                    // signal, and dialectic is the experimental debate mode,
-                    // not the `lab eval` default path this issue's live
-                    // failure (Gemini 429, agentic/diff/strict mode) hit.
-                    // Dropping the exit code here (vs. plumbing it into
-                    // `SeatRecord`) is a deliberate scope cut, not an
-                    // oversight — revisit if dialectic mode sees a live
-                    // quota failure of its own.
+                    // (#1210 — corrected, review-QA finding) Dialectic
+                    // mode's per-seat exit code isn't wired into infra
+                    // classification yet. `SeatRecord`'s own token
+                    // accounting (below) IS a real infra signal for the
+                    // 429/quota shape (a recovered envelope with literal
+                    // zero tokens) — but NOT for a crashed/killed seat: a
+                    // dead container writes no envelope, so
+                    // `dialectic::run_debate`'s `seat_record` closure
+                    // (`envelope_meta(stdout)`, no exit code in scope) sees
+                    // `model: None, total_tokens: None` — indistinguishable
+                    // from "nothing to report" — and a debate whose seats
+                    // all died folds to `total: None`, which is NOT the
+                    // `Some(0)` `is_infra_failure` requires. The predicate
+                    // stays false and the case scores as a genuine
+                    // capability failure instead of a rerun. This is a real
+                    // gap, left open on purpose: dialectic is the
+                    // experimental debate mode, not the `lab eval` default
+                    // path this issue's live failure (Gemini 429,
+                    // agentic/diff/strict mode) hit, so plumbing the exit
+                    // code through `SeatRecord` is deferred rather than
+                    // bundled into this fix — revisit if dialectic mode
+                    // sees a live crashed-container failure of its own.
                     dispatch_case(
                         prompt,
                         &format!("{}-{}", c.id, seat.label()),
@@ -467,6 +479,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             meta.push(EnvelopeMeta {
                 model: debate.prosecutor.model.clone(),
                 total_tokens: total,
+                infra_exit: false,
             });
             debates.push(debate);
             review
@@ -1242,6 +1255,17 @@ fn print_summary(scored: &[(&Case, CaseScore)], meta: &[EnvelopeMeta], opts: &Re
 pub(crate) struct EnvelopeMeta {
     pub model: Option<String>,
     pub total_tokens: Option<u64>,
+    /// (#1210 MUST-FIX-1) A CLASSIFICATION-ONLY signal: true when
+    /// [`envelope_meta_with_exit`] promoted this row to the infra reading
+    /// (no envelope recovered AND a non-zero exit code). This must never be
+    /// read as a measurement — `total_tokens` stays whatever was actually
+    /// parsed (`None` when nothing was), so a crashed/killed container that
+    /// may have served real tokens before dying never fabricates a `Some(0)`
+    /// in `total_tokens` (and, downstream, in the persisted
+    /// `ScoreRow::tokens_to_solution`). Same "`None`, not `Some(0)`: nothing
+    /// was measured, not 'zero was measured'" discipline
+    /// `runtime/src/main.rs` documents beside its own hardcoded-zero arms.
+    pub infra_exit: bool,
 }
 
 /// Parse the dispatch envelope (the last stdout line starting with `{` —
@@ -1273,6 +1297,7 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
     EnvelopeMeta {
         model: m.get("model").and_then(|s| s.as_str()).map(str::to_string),
         total_tokens: total,
+        infra_exit: false,
     }
 }
 
@@ -1290,22 +1315,32 @@ pub(crate) fn envelope_meta(stdout: &str) -> EnvelopeMeta {
 /// left stdout merely malformed-but-present; the exit code is what
 /// distinguishes them.
 ///
-/// Only promotes to the zero-token infra reading when BOTH are true:
-/// no envelope was recovered (`model` and `total_tokens` both `None`) AND
-/// the exit code is non-zero. An envelope WAS recovered — even a
-/// `"result":"error"` one with real capability content, however
-/// degenerate — is never overridden by exit status; a non-zero exit
-/// alongside a fully-parsed envelope is left alone (out of scope: no
-/// case in this bench exits non-zero *after* writing a real envelope,
-/// since the runtime's own `main()` returns `ExitCode::SUCCESS` on every
-/// path that produces one). A CLEAN exit (0) with no envelope recovered
-/// stays the pre-existing ambiguous case — conservatively NOT reclassified,
-/// same "positive evidence only" rule `is_infra_failure` already applies to
-/// an unknown token count.
+/// Only promotes to the infra reading when BOTH are true: no envelope was
+/// recovered (`model` and `total_tokens` both `None`) AND the exit code is
+/// non-zero. An envelope WAS recovered — even a `"result":"error"` one with
+/// real capability content, however degenerate — is never overridden by
+/// exit status; a non-zero exit alongside a fully-parsed envelope is left
+/// alone. That combination IS reachable, not out of scope: `runtime/src/
+/// main.rs`'s loop-error arm prints a (zeroed) envelope and then returns
+/// exit 1, and its escalation arm returns exit 1 *after* the success branch
+/// already printed a full envelope carrying real token counts. Both are
+/// deliberately left alone here — a recovered envelope is positive
+/// capability evidence the exit code doesn't get to overrule. A CLEAN exit
+/// (0) with no envelope recovered stays the pre-existing ambiguous case —
+/// conservatively NOT reclassified, same "positive evidence only" rule
+/// `is_infra_failure` already applies to an unknown token count.
+///
+/// (#1210 MUST-FIX-1) The promotion sets ONLY the classification signal
+/// (`infra_exit: true`); `total_tokens` stays `None`, never a fabricated
+/// `Some(0)` — a killed/crashed container may have served real tokens
+/// before dying, and this helper has no way to know how many. Zero is a
+/// MEASUREMENT (the runtime's own graceful-error envelope really does emit
+/// literal 0/0), and this path never measured anything, so it doesn't get
+/// to claim zero.
 pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeMeta {
     let m = envelope_meta(stdout);
     if exit_code != 0 && m.model.is_none() && m.total_tokens.is_none() {
-        return EnvelopeMeta { model: None, total_tokens: Some(0) };
+        return EnvelopeMeta { model: None, total_tokens: None, infra_exit: true };
     }
     m
 }
@@ -1329,13 +1364,18 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
 /// `build_json_envelope("error", ..., 0, 0, ...)` (`runtime/src/main.rs`) with
 /// literal zeros — so a quota-dead dispatch parses as `Some(0)`, never `None`.
 /// `None` only arises when stdout carried NO parseable envelope at all (a
-/// crash before envelope emission), which `dispatch_case` surfaces as a bench
-/// error rather than a scored row — the None-conservative arm is correct, not
-/// a coverage gap. (The 2026-07-05 junk rows themselves were operator-cleaned
-/// from the corpus, per #1210 — the runtime envelope contract above is the
-/// citable evidence.)
+/// crash before envelope emission), which used to leave `total_tokens` at
+/// `None` with no other signal to key off. [`envelope_meta_with_exit`] now
+/// carries that case as its own `infra_exit` flag instead of fabricating a
+/// `Some(0)` token count (#1210 MUST-FIX-1) — so this predicate treats
+/// EITHER positive-zero-tokens evidence OR the exit-promoted flag as infra;
+/// neither one touches `total_tokens`, which keeps recording the genuinely
+/// unknown case as `None`. (The 2026-07-05 junk rows themselves were
+/// operator-cleaned from the corpus, per #1210 — the runtime envelope
+/// contract above is the citable evidence.)
 pub(crate) fn is_infra_failure(s: &CaseScore, m: Option<&EnvelopeMeta>) -> bool {
-    s.degenerate && matches!(m.and_then(|m| m.total_tokens), Some(0))
+    s.degenerate
+        && (matches!(m.and_then(|m| m.total_tokens), Some(0)) || m.is_some_and(|m| m.infra_exit))
 }
 
 /// Build the run's score rows: one capability row per case, plus the
@@ -1380,17 +1420,27 @@ pub(crate) fn build_score_rows(
         // model — an INFRA failure (rerun), not a capability verdict. A
         // degenerate review that served tokens (the model RAN and emitted
         // unparseable output, #1050) stays a CAPABILITY failure.
-        let outcome = if is_infra(i, s) {
+        let infra = is_infra(i, s);
+        let outcome = if infra {
             Outcome::InfraFail
         } else if s.degenerate || !s.correct {
             Outcome::CapabilityFail
         } else {
             Outcome::Pass
         };
+        // (#1210 review-QA — cross-bench divergence) An infra row carries no
+        // pass/fail verdict on the model at all — a naive `count(value ==
+        // 1.0)` must not be polluted by it, same "aggregate rows and
+        // pass/fail rows use `NotApplicable`/`None` so a naive count isn't
+        // polluted" discipline `tool_bench.rs` already applies to its own
+        // per-trial rows. Previously this row always carried `Some(0.0/1.0)`
+        // even when infra, which was a real (if latent) divergence from
+        // `tool_bench`'s pattern for the identical `scores.json` schema.
+        let value = (!infra).then_some(if s.correct { 1.0 } else { 0.0 });
         let mut r = row(
             "case",
             outcome,
-            Some(if s.correct { 1.0 } else { 0.0 }),
+            value,
             serde_json::json!({ "case": c.id, "kind": c.label.kind, "score": s }),
         );
         r.tokens_to_solution = meta.get(i).and_then(|m| m.total_tokens);
