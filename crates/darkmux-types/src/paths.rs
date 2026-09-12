@@ -188,9 +188,49 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// (#2643) `resolve` reads `DARKMUX_HOME` FIRST, unconditionally,
+    /// BEFORE it ever looks at `scope` — so an ambient `DARKMUX_HOME` in
+    /// the shell running `cargo test` silently pre-empts every scope this
+    /// module exercises (`ForceProject`, `ForceUser`, and `Auto`'s own
+    /// cwd-vs-home branch), not just `resolve_honors_darkmux_home_override`,
+    /// which means to test the override itself. Reproduced directly:
+    /// `DARKMUX_HOME=/tmp/w24a-scratch-home cargo test -p darkmux-types
+    /// --lib paths::tests` failed `resolve_force_project_uses_cwd`,
+    /// `resolve_force_user_uses_home`, and
+    /// `resolve_auto_prefers_project_when_present` — each asserting a root
+    /// ending in `.darkmux` (the scratch path doesn't) or a `Scope` the
+    /// override silently swapped. Structural fix: clear `DARKMUX_HOME` for
+    /// the duration of any test that means to exercise the NON-override
+    /// resolution path, rather than assume the ambient shell already has
+    /// it unset. RAII (not raw save/clear/restore) so a panicking
+    /// assertion still restores the prior value.
+    struct ClearDarkmuxHomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl ClearDarkmuxHomeGuard {
+        fn new() -> Self {
+            let prev = env::var_os("DARKMUX_HOME");
+            unsafe { env::remove_var("DARKMUX_HOME") };
+            Self { prev }
+        }
+    }
+
+    impl Drop for ClearDarkmuxHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => env::set_var("DARKMUX_HOME", v),
+                    None => env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
     #[serial_test::serial]
     #[test]
     fn resolve_force_project_uses_cwd() {
+        let _clear_home = ClearDarkmuxHomeGuard::new();
         let tmp = TempDir::new().unwrap();
         let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
         let prev = env::current_dir().unwrap();
@@ -217,6 +257,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn resolve_force_user_uses_home() {
+        let _clear_home = ClearDarkmuxHomeGuard::new();
         let paths = resolve(ResolveScope::ForceUser);
         assert_eq!(paths.scope, Scope::User);
         assert!(paths.root.ends_with(".darkmux"));
@@ -225,6 +266,7 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn resolve_auto_prefers_project_when_present() {
+        let _clear_home = ClearDarkmuxHomeGuard::new();
         let tmp = TempDir::new().unwrap();
         let project_root = tmp.path().join(".darkmux");
         fs::create_dir_all(&project_root).unwrap();
@@ -248,6 +290,13 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn resolve_auto_falls_back_to_user_when_project_missing() {
+        // (#2643) Didn't hard-fail under an ambient `DARKMUX_HOME` in the
+        // repro run above (the override happens to also land on
+        // `Scope::User`), but that is a VACUOUS pass, not a real one — the
+        // assertion would still go green even if the actual fallback
+        // branch this test names were broken. Same guard as the three
+        // tests above, for the same reason.
+        let _clear_home = ClearDarkmuxHomeGuard::new();
         let tmp = TempDir::new().unwrap();
         // Crucially do NOT create .darkmux in tmp.
         let prev = env::current_dir().unwrap();
