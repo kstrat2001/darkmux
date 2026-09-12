@@ -275,6 +275,74 @@ impl Drop for IsolatedState {
 mod tests {
     use super::*;
 
+    /// [`InactivityBudget`]'s restore, asserted for all three shapes it
+    /// has to handle: displacing a value, displacing nothing, and the
+    /// `unset()` constructor.
+    ///
+    /// Added because the PR's own mutation gate caught this as a MISSED
+    /// mutant — `<impl Drop for InactivityBudget>::drop` replaced with
+    /// `()` and every test still green. That is precisely the #2698
+    /// finding this change exists to fix, reproduced in the new guard: an
+    /// unasserted restore is not a restore. A leaked budget pin is not
+    /// cosmetic either, since the value is read LIVE per access, so it
+    /// would silently become the threshold every later test in the process
+    /// measures its staleness fixtures against.
+    #[test]
+    #[serial_test::serial]
+    fn the_budget_guard_restores_what_it_displaced() {
+        const VAR: &str = "DARKMUX_INACTIVITY_TIMEOUT_SECONDS";
+        let ambient = std::env::var_os(VAR);
+
+        // Shape 1: it displaced a value.
+        // SAFETY: #[serial].
+        unsafe { std::env::set_var(VAR, "4242") };
+        {
+            let _b = InactivityBudget::seconds(600);
+            assert_eq!(std::env::var(VAR).as_deref(), Ok("600"), "the pin must take effect");
+        }
+        assert_eq!(
+            std::env::var(VAR).as_deref(),
+            Ok("4242"),
+            "the displaced value must come back"
+        );
+
+        // Shape 2: `unset()` over a value.
+        {
+            let _b = InactivityBudget::unset();
+            assert!(
+                std::env::var_os(VAR).is_none(),
+                "unset() must reach the built-in default tier by REMOVING the override"
+            );
+        }
+        assert_eq!(
+            std::env::var(VAR).as_deref(),
+            Ok("4242"),
+            "unset() must restore the value it removed"
+        );
+
+        // Shape 3: it displaced nothing — the variable must be REMOVED
+        // again, not left behind pinned at whatever this test chose.
+        // SAFETY: #[serial].
+        unsafe { std::env::remove_var(VAR) };
+        {
+            let _b = InactivityBudget::seconds(7);
+            assert_eq!(std::env::var(VAR).as_deref(), Ok("7"));
+        }
+        assert!(
+            std::env::var_os(VAR).is_none(),
+            "a variable that was UNSET must be unset again — a leaked budget pin becomes the \
+             threshold every later test in this process is measured against"
+        );
+
+        // SAFETY: #[serial].
+        unsafe {
+            match ambient {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
     /// The two lists must stay disjoint — a variable that is both pinned
     /// and cleared would have its restore entry pushed twice and its
     /// final value decided by list order, which is exactly the kind of
