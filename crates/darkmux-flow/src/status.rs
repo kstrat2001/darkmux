@@ -744,12 +744,22 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                     // failed, the disclosure-destroying shape #2686
                     // named.
                     //
-                    // (#2694 fix round) Not unreachable defense: no
-                    // in-process producer can reach it post-fix (an
+                    // (#2694 fix round 2, CONSIDER C — the corrected
+                    // reason; the first version of this note said an
+                    // older binary could have written such a value, and
+                    // that is FALSE.) No producer can reach this arm, at
+                    // this commit or any earlier one: post-fix an
                     // all-stripped `Location` still yields
-                    // `redirect refused: 302 to ""`), but the `.last`
-                    // sidecar is a FILE, and one written by an older
-                    // binary carries whatever that binary wrote. Held by
+                    // `redirect refused: 302 to ""`, and at the base
+                    // commit all five pre-fix producers prefix darkmux's
+                    // own prose, so none of them can sanitize to empty
+                    // either. The arm is reachable only from a `.last`
+                    // sidecar darkmux did not write — a hand-edit, a
+                    // third-party tool, a restored backup. That is still
+                    // reason to keep and test it, because the sidecar is
+                    // read LENIENTLY, exactly like every other registry
+                    // and config file in this project: what is on disk is
+                    // whatever is on disk. Held by
                     // `flow_status_still_discloses_a_last_error_that_sanitizes_to_nothing`.
                     0 => {
                         let _ = writeln!(out, "{LAST_ERROR_LABEL}(no printable text)");
@@ -1909,13 +1919,49 @@ mod hooks_status_tests {
         assert!(!format_status_human(&status).contains("last error"), "no terminal failure, no row");
     }
 
-    /// Every line `rendered` emits at column zero — a line that is
-    /// neither empty nor indented. These are the rows an operator reads
-    /// as darkmux's own structural voice (`FLUSH_LEFT_ROWS`), so the set
-    /// of them must depend ONLY on the status being described, never on
-    /// the untrusted text inside a value.
-    fn flush_left_lines(rendered: &str) -> Vec<String> {
-        rendered.lines().filter(|l| !l.is_empty() && !l.starts_with(' ')).map(str::to_string).collect()
+    /// (#2694 fix round 2, CONSIDER B) Every non-empty line `rendered`
+    /// emits OUTSIDE the `last error:` block — darkmux's whole structural
+    /// voice, not just the column-zero third of it. The first version of
+    /// this helper filtered `!l.starts_with(' ')`, which watched the
+    /// eight flush-left rows and left the two-space ones (`  schema:`,
+    /// `  composition:`, `  url:`, and the `  - {r}` bullets under
+    /// `Warnings:` / `Failures:`) outside the comparison entirely: a
+    /// fixture carrying `\n  composition:  Compromised` forged a row in
+    /// the genuine row's exact indentation with every guard green. That
+    /// is unreachable on shipped code — the sanitize pass collapses the
+    /// newline, so no extra line of ANY indentation is produced — but the
+    /// guard's stated virtue is holding for rows nobody has enumerated,
+    /// and comparing every line outside the block costs nothing.
+    ///
+    /// Everything here must be a function of the STATUS being described,
+    /// never of the bytes inside one of its values.
+    ///
+    /// One row genuinely varies between two renders of the SAME status:
+    /// `  outbox_dir:` names a fresh `TempDir` per fixture. Its VALUE is
+    /// normalized rather than the row being dropped, so an extra forged
+    /// `  outbox_dir:` line still changes the vector's length and fails.
+    /// (The widened comparison found this on its first run — the
+    /// column-zero-only version never saw the row at all.)
+    fn lines_outside_the_last_error_block(rendered: &str) -> Vec<String> {
+        const OUTBOX_DIR_LABEL: &str = "  outbox_dir:   ";
+        let indent = " ".repeat(crate::hooks::UNTRUSTED_TEXT_LINE_INDENT);
+        let mut out = Vec::new();
+        let mut in_block = false;
+        for line in rendered.lines() {
+            if line.starts_with("      last error:") {
+                in_block = true;
+            } else if in_block && !line.starts_with(&indent) {
+                in_block = false;
+            }
+            if !in_block && !line.is_empty() {
+                if line.starts_with(OUTBOX_DIR_LABEL) {
+                    out.push(format!("{OUTBOX_DIR_LABEL}<per-fixture tempdir>"));
+                } else {
+                    out.push(line.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// The lines `format_status_human` emits for the `last error:` block
@@ -1952,9 +1998,12 @@ mod hooks_status_tests {
     /// `white-space: pre` makes the wrap-based forgery unreachable.
     ///
     /// Asserted as a SET EQUALITY against a benign baseline rather than
-    /// as a vocabulary check, so it holds for a flush-left row nobody has
-    /// enumerated yet: the column-zero rows of a status render must be a
-    /// function of the status, not of the bytes inside one of its values.
+    /// as a vocabulary check, so it holds for a row nobody has
+    /// enumerated yet: EVERY line outside the `last error:` block must be
+    /// a function of the status, not of the bytes inside one of its
+    /// values. (#2694 fix round 2, CONSIDER B — the comparison covers
+    /// darkmux's two-space rows as well as its flush-left ones; the
+    /// payload set exercises both.)
     ///
     /// Red-proves by name: in `hooks::untrusted_display_lines`, drop the
     /// sanitize pass — `wrap_to_display_width(&truncate_reason(text), …)`
@@ -1962,26 +2011,39 @@ mod hooks_status_tests {
     /// this fails while every other test in the crate stays green.
     #[test]
     fn flow_status_last_error_cannot_forge_a_flush_left_row_with_a_raw_newline() {
-        let baseline = flush_left_lines(&render_with_last_error("benign"));
-        for payload in FLUSH_LEFT_ROWS {
+        // (#2694 fix round 2, CONSIDER B) darkmux's own indented rows,
+        // which the first version of this guard left outside the
+        // comparison. `  composition:` is the one the review forged.
+        const TWO_SPACE_ROWS: &[&str] =
+            &["  composition:  Compromised", "  schema:       0.0", "  - no drainer heartbeat for 9999s"];
+
+        let baseline = lines_outside_the_last_error_block(&render_with_last_error("benign"));
+        let mut exercised = 0usize;
+        for payload in FLUSH_LEFT_ROWS.iter().chain(TWO_SPACE_ROWS.iter()) {
             let err =
                 format!("transform `/x/a.jq` failed: jq: error at line 1:\n{payload}\n  - deliveries are healthy");
 
             // PRECONDITION — the fixture really does put the row text at
             // the start of a raw line, so a renderer that passed it
-            // through unsanitized would print it at column 0.
+            // through unsanitized would print it at that line's start.
             assert!(
                 err.lines().any(|l| l == *payload),
                 "the fixture must actually carry {payload:?} as a whole raw line, or this proves nothing: {err:?}"
             );
+            exercised += 1;
 
-            let got = flush_left_lines(&render_with_last_error(&err));
+            let got = lines_outside_the_last_error_block(&render_with_last_error(&err));
             assert_eq!(
                 got, baseline,
-                "the column-zero rows changed when {payload:?} was embedded in the last error — \
-                 remote text reached darkmux's own structural voice"
+                "the structural rows changed when {payload:?} was embedded in the last error — \
+                 remote text reached darkmux's own voice"
             );
         }
+        assert_eq!(
+            exercised,
+            FLUSH_LEFT_ROWS.len() + TWO_SPACE_ROWS.len(),
+            "every flush-left AND two-space row must be exercised"
+        );
     }
 
     /// (#2694 fix-round MUST FIX 2, the second half of the same guard)
@@ -2001,8 +2063,24 @@ mod hooks_status_tests {
         let err = format!("{REDIRECT_REASON_HEAD}{}", "z".repeat(60_000));
         let rendered = render_with_last_error(&err);
         let block = last_error_block_lines(&rendered);
+
+        // (#2694 fix round 2, CONSIDER A) PIN THE HELPER FIRST.
+        // `!block.is_empty()` is satisfied by anything PLAUSIBLE, so a
+        // `last_error_block_lines` that quietly stopped reading the real
+        // render — returning a stub, or losing the block to a changed
+        // label — would take this bound and the inline sweep vacuous
+        // TOGETHER, since both consume it. So: the block must start at
+        // the genuine label, and it must carry this fixture's OWN
+        // characters, which no stub can supply.
         assert!(
-            !block.is_empty() && block.len() <= 8,
+            block.first().is_some_and(|l| l.starts_with("      last error:")),
+            "the block must begin at the genuine label row: {block:?}"
+        );
+        let zs: usize = block.iter().map(|l| l.chars().filter(|c| *c == 'z').count()).sum();
+        assert!(zs >= 50, "the block must carry the fixture's own text, not a plausible stub: {block:?}");
+
+        assert!(
+            block.len() <= 8,
             "a single `last error:` row rendered {} lines; the raw-width bound holds it to a handful",
             block.len()
         );
@@ -2050,7 +2128,20 @@ mod hooks_status_tests {
             let err = "z".repeat(n);
             let rendered = render_with_last_error(&err);
             let block = last_error_block_lines(&rendered);
-            assert!(!block.is_empty(), "n={n}: the row must render at all: {rendered}");
+
+            // (#2694 fix round 2, CONSIDER A) Pin the helper against this
+            // fixture before measuring geometry with it — see
+            // `one_last_error_row_cannot_become_a_screenful`. Every `z`
+            // the fixture supplied must be present and accounted for, so
+            // a helper returning a plausible stub fails here rather than
+            // reporting a comfortable width for a line nobody rendered.
+            assert!(
+                block.first().is_some_and(|l| l.starts_with("      last error:")),
+                "n={n}: the block must begin at the genuine label row: {block:?}"
+            );
+            let zs: usize = block.iter().map(|l| l.chars().filter(|c| *c == 'z').count()).sum();
+            assert_eq!(zs, n, "n={n}: the block must carry every character the fixture supplied: {block:?}");
+
             if block.len() == 1 {
                 inline_seen += 1;
             }
