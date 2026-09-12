@@ -95,13 +95,27 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
     // *somewhere* on this card — but it is weaker cover than "exhaustive"
     // implies: the chip carries no qualifier naming what it counts (an
     // operator has to notice a local+cloud+unattributed gap and infer it),
-    // no chip on this card names unattributed RUNS specifically (the
-    // UNATTRIBUTED tile is a TOKEN count, a different unit), and `t.runs`
-    // itself under-counts in general — a dispatch whose completion carries
-    // no token totals and emits no telemetry contributes 0 to `runs` too.
-    // So this omission clears "describe, don't adjudicate" cleanly, but
-    // "record exhaustively, display selectively" only partially: the
-    // record this note leans on is real but incomplete, not a full ledger.
+    // and no chip on this card names unattributed RUNS specifically (the
+    // UNATTRIBUTED tile is a TOKEN count, a different unit). So this
+    // omission clears "describe, don't adjudicate" cleanly, but "record
+    // exhaustively, display selectively" only partially.
+    //
+    // (#2709) This used to carry a third reason — "`t.runs` itself
+    // under-counts in general: a dispatch whose completion carries no token
+    // totals and emits no telemetry contributes 0 to `runs` too". That is
+    // no longer true; a run key that closed with a `dispatch.complete` is
+    // counted whether or not the completion reported tokens (see
+    // `savings.ts`'s run loop and its EXTRA LOCAL RUN term).
+    //
+    // What this template still cannot say is that a dispatch is IN FLIGHT.
+    // An in-flight run is `unknownRuns` by construction until its own
+    // terminal lands, and `unknownRuns` never appears as a number here, so
+    // a window holding three finished local dispatches and one live hosted
+    // one renders "3 local dispatches" beside a cloud token tile. Both
+    // halves are true and describe different runs; this line has no room to
+    // say which. Pinned as a string in savings.test.ts ("an in-flight
+    // HOSTED run does not inherit an earlier mission's LOCAL verdict") so
+    // it stays visible rather than being rediscovered.
     //
     // Clamped at zero: a caller-supplied `TokensOffMeter` with
     // `unknownRuns` overcounting relative to `runs`/`cloudRuns` (this
