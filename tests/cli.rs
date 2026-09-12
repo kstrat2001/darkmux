@@ -111,10 +111,28 @@ fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
 /// enumerating the leaks (and re-enumerating them every time a new one is
 /// written). They point at the same tree, so a child sees one coherent
 /// root either way it resolves.
+///
+/// (#2682 fix-pass round 3, MUST FIX 1) And one `env_remove`, because
+/// `DARKMUX_CREW_DIR` OUTRANKS both of them. `crew::loader::
+/// user_state_root()` — the resolver behind every `missions/` and
+/// `phases/` read and write — asks `config_access::crew_dir_override()`
+/// first and only falls back to the `DARKMUX_HOME` tier when that
+/// override is absent, so a child spawned by this helper with
+/// `DARKMUX_CREW_DIR` merely INHERITED from the ambient environment reads
+/// and writes the operator's real board, whatever root the two vars above
+/// name. Measured at this head with a sentinel exported: `cargo test
+/// --test cli mission_status_` failed 4 of 8, because each test's fixture
+/// (written under its own `DARKMUX_HOME`) was invisible to the subprocess
+/// reading it back. Clearing it here restores the intended
+/// `DARKMUX_HOME`-tier resolution for every spawn at once; the handful of
+/// tests that genuinely exercise the override still set it explicitly
+/// afterward, and a later `.env` wins over this `.env_remove`.
 fn darkmux_std_cmd() -> std::process::Command {
     let (home, darkmux_home) = isolated_roots();
     let mut cmd = std::process::Command::new(darkmux_bin_path());
-    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
+    cmd.env("HOME", home)
+        .env("DARKMUX_HOME", darkmux_home)
+        .env_remove("DARKMUX_CREW_DIR");
     cmd
 }
 
@@ -7193,6 +7211,291 @@ fn mission_launch_prunes_disabled_steps_at_mint_and_reports_them() {
         .unwrap();
     let human_out = String::from_utf8_lossy(&human.stdout);
     assert!(human_out.contains("1 of 4 steps minted (3 left out by config)"), "got:\n{human_out}");
+}
+
+// ── (#2682 fix-pass MUST FIX 3) `running-phase-session-dead` end-to-end ────
+//
+// The unit tests inside `src/mission_status.rs` (`detect_drift`,
+// `running_phase_session_drift`) all hand-type the `local_status`/
+// `local_evidence` values `run()` is supposed to compute — none of them go
+// through `run()` itself, and `tests/cli.rs` had NO `mission status`
+// invocation that touched this rule at all. Mutation-proven per the review:
+// replacing `run()`'s own `local_dispatch_status.get(&m.id)` lookup with a
+// constant `(None, None)` left `cargo test -p darkmux --bin darkmux
+// mission_status::` at 93/93 green — nothing proved the CLI's own wiring
+// was connected to the rule the unit tests were exercising. These two tests
+// go through the REAL `darkmux mission status --json` subprocess.
+
+/// Writes a bare-minimum `mission.json` + one `phases/<id>.json` directly
+/// (no `mission launch`, no dispatch, no container — pure static JSON, so
+/// this never touches a model or the network). `started_ts` is a caller-
+/// supplied Unix-seconds value so each test can place it however far in
+/// the past its scenario needs.
+fn write_running_mission(home: &std::path::Path, mission_id: &str, phase_id: &str, started_ts: u64) {
+    let mission_dir = home.join("missions").join(mission_id);
+    fs::create_dir_all(mission_dir.join("phases")).unwrap();
+    fs::write(
+        mission_dir.join("mission.json"),
+        serde_json::json!({
+            "id": mission_id,
+            "description": "fix-pass e2e fixture",
+            "status": "active",
+            "phase_ids": [phase_id],
+            "created_ts": started_ts,
+            "started_ts": started_ts,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        mission_dir.join("phases").join(format!("{phase_id}.json")),
+        serde_json::json!({
+            "id": phase_id,
+            "mission_id": mission_id,
+            "description": "fix-pass e2e phase",
+            "status": "running",
+            "created_ts": started_ts,
+            "started_ts": started_ts,
+            "task_ids": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn mission_drift<'a>(board: &'a serde_json::Value, mission_id: &str) -> &'a serde_json::Value {
+    board["missions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no missions array in board: {board}"))
+        .iter()
+        .find(|m| m["id"] == mission_id)
+        .unwrap_or_else(|| panic!("mission {mission_id} not on the board: {board}"))
+}
+
+/// (#2682 fix-pass MUST FIX 1) Probe A: an Active mission whose Running
+/// phase has NEVER dispatched anything at all — no flow records exist for
+/// it — but `started_ts` is old enough that `mission_run_status_and_evidence`
+/// reads it `Abandoned` on the mission's own AGE
+/// (`DispatchSessionEvidence::NoAttributableSession`).
+///
+/// (round 2, MUST FIX 1) The board must stay SILENT here. That shape is the
+/// ordinary state of a mission parked at a sign-off gate, and the permanent
+/// state of every Active mission whose dispatches aged out of
+/// `RUNS_FLOW_SCAN_WINDOW_DAYS` — round 1 fired a drift on it (re-worded,
+/// but still firing), which removed the board's clean checkmark forever.
+///
+/// Deliberately NOT vacuous: it first proves `darkmux run list` really does
+/// read this fixture `abandoned`, so the assertion below is measuring a
+/// KNOWN disagreement the board declines to render, not an empty board.
+///
+/// (MUST FIX 2) `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` is pinned. The verdict
+/// is the mission's 25-minute age measured against `stale_after_ms()` —
+/// twice that knob — so without the pin an operator with the documented
+/// `7200` exported turns the budget into 4 hours and the fixture's own
+/// premise (that `run list` reads it `abandoned` at all) evaporates.
+#[test]
+fn mission_status_running_phase_with_no_dispatch_ever_stays_silent() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap(); // deliberately left empty
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_running_mission(home.path(), "never-dispatched-e2e", "p1", now - 25 * 60);
+
+    // 60s knob → a 120s staleness budget: 25 minutes is unambiguously past
+    // it, whatever the environment running this suite has exported.
+    let run_list = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["run", "list", "--json", "--all"])
+        .output()
+        .unwrap();
+    assert!(run_list.status.success(), "{}", String::from_utf8_lossy(&run_list.stderr));
+    let runs: serde_json::Value = serde_json::from_slice(&run_list.stdout).unwrap();
+    let row = runs["runs"]
+        .as_array()
+        .expect("run list --json always emits a runs array")
+        .iter()
+        .find(|r| r["id"] == "never-dispatched-e2e")
+        .unwrap_or_else(|| panic!("no run row for the fixture: {runs}"));
+    assert_eq!(
+        row["status"], "abandoned",
+        "fixture premise: `run list` must genuinely read this mission abandoned, or the board's \
+         silence below proves nothing: {row}"
+    );
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let m = mission_drift(&board, "never-dispatched-e2e");
+    let drifts = m["drift"].as_array().unwrap();
+    assert!(
+        !drifts.iter().any(|d| d["kind"] == "running-phase-session-dead"),
+        "a mission with no attributable dispatch session must not be flagged as one whose \
+         dispatch session died — this is the sign-off-gate false alarm round 2 removed: {m}"
+    );
+}
+
+/// (#2682 fix-pass MUST FIX 5) darkmux POSITIVELY recorded this mission's
+/// one dispatch session ENDING (a `session.end` crash/kill/timeout
+/// close-edge, attributed via the record's own `mission_id` field). The
+/// board must describe that as an observation, never as "no evidence of
+/// life", and it may still offer `mission abort`.
+#[test]
+fn mission_status_recorded_session_end_describes_an_observation_not_an_absence() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_running_mission(home.path(), "recorded-end-e2e", "p1", now - 25 * 60);
+
+    let day = darkmux_flow::day_utc_now();
+    fs::write(
+        flows.path().join(format!("{day}.jsonl")),
+        serde_json::json!({
+            "ts": "2024-01-01T09:00:00Z",
+            "action": "session.end",
+            "session_id": "e2e-crashed-session",
+            "mission_id": "recorded-end-e2e",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let m = mission_drift(&board, "recorded-end-e2e");
+    let drifts = m["drift"].as_array().unwrap();
+    let hit = drifts
+        .iter()
+        .find(|d| d["kind"] == "running-phase-session-dead")
+        .unwrap_or_else(|| panic!("no running-phase-session-dead drift for a recorded session.end: {m}"));
+    let detail = hit["detail"].as_str().unwrap().to_lowercase();
+    assert!(
+        detail.contains("recorded") && detail.contains("ending"),
+        "must describe the POSITIVE observation: {detail}"
+    );
+    assert!(
+        !detail.contains("no evidence of life"),
+        "a recorded end is a fact, not the same claim as silence: {detail}"
+    );
+    let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert!(
+        suggest.iter().any(|s| s.contains("mission abort")),
+        "a positively recorded end is a reasonable abort case: {suggest:?}"
+    );
+}
+
+/// (#2682 fix-pass round 2, CONSIDER) The third evidence variant,
+/// `StaleNoTerminal` — a session that really did start and never announced
+/// an ending, past the staleness budget. It had unit coverage only; the
+/// other two were pinned end-to-end. This is also the ONE variant that is
+/// genuinely the "SIGKILLed mission still reads clean" shape #2682 was
+/// filed over, so its end-to-end absence was the least comfortable of the
+/// three.
+///
+/// Doubles as the HUMAN-RENDER assertion (round 2's second CONSIDER):
+/// every other assertion in this family reads `--json`, and mutating
+/// `src/mission_status.rs`'s drift-render loop to print nothing left the
+/// whole suite green. The second half of this test runs the same fixture
+/// WITHOUT `--json` and requires the warning line and the copy-pasteable
+/// command to actually reach stdout.
+///
+/// (MUST FIX 2) Budget pinned like its siblings, though this one would
+/// survive without it: the verdict is an idle distance measured against
+/// `stale_after_ms()`, and the pin says so — the 2024 stamp below happens
+/// to be past any budget a person would set, which is luck, not a property
+/// the fixture states.
+#[test]
+fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_running_mission(home.path(), "stale-session-e2e", "p1", now - 25 * 60);
+
+    // A `dispatch start` bookend with NO terminal ever landing, stamped far
+    // enough back that it is stale under any budget — a fixed past stamp
+    // rather than arithmetic on `now`, so nothing here can land on the
+    // wrong side of a UTC midnight while the suite runs.
+    let day = darkmux_flow::day_utc_now();
+    fs::write(
+        flows.path().join(format!("{day}.jsonl")),
+        serde_json::json!({
+            "ts": "2024-01-01T09:00:00Z",
+            "action": "dispatch start",
+            "session_id": "e2e-stale-session",
+            "mission_id": "stale-session-e2e",
+            "handle": "coder",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let m = mission_drift(&board, "stale-session-e2e");
+    let drifts = m["drift"].as_array().unwrap();
+    let hit = drifts
+        .iter()
+        .find(|d| d["kind"] == "running-phase-session-dead")
+        .unwrap_or_else(|| panic!("no running-phase-session-dead drift for a started, never-terminated session: {m}"));
+    let detail = hit["detail"].as_str().unwrap().to_lowercase();
+    assert!(
+        detail.contains("no evidence of life") || detail.contains("no terminal record"),
+        "the one variant the fixed wording was always accurate for: {detail}"
+    );
+    let suggest: Vec<&str> = hit["suggest"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert!(
+        suggest.iter().any(|s| s.contains("mission abort")),
+        "a genuinely stale session is a real abort case: {suggest:?}"
+    );
+
+    // ── the human board, same fixture ──────────────────────────────────
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{}", String::from_utf8_lossy(&human.stderr));
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_out.contains("no terminal record seen"),
+        "the drift's own sentence must reach the human board, not just --json:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("darkmux mission abort stale-session-e2e"),
+        "the copy-pasteable reconcile command must reach the human board:\n{human_out}"
+    );
 }
 
 // ── (#2300) growth: a step's OUTPUT grows tasks into the graph ───────────

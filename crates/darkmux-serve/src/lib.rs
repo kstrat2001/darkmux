@@ -53,7 +53,10 @@ mod panel;
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
 mod runs;
-pub use runs::{build_runs, peer_mission_runs, AbandonReason, Run, RunKind, RunStatus};
+pub use runs::{
+    build_runs, local_dispatch_status, peer_mission_runs, AbandonReason, DispatchSessionEvidence,
+    Run, RunKind, RunStatus,
+};
 pub mod source_state;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
