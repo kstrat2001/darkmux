@@ -399,16 +399,16 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 /// existed. Four of those targets were spawning the real binary with
 /// nothing neutralized; two of them wrote `fleet.json` into a sentinel
 /// root, and one wrote a BLAKE3-chained `mission start` into the audit
-/// chain. A guard that can only see the file it was written in does not
-/// prevent a sixth copy; it guarantees the sixth copy goes somewhere it
-/// cannot look.
+/// chain. A guard that can only see the file it was written in cannot
+/// catch a sixth copy anywhere else; it guarantees the sixth copy goes
+/// somewhere it cannot look.
 ///
 /// Two assertions, because "fenced" and "isolated" are different claims:
 ///
 /// 1. Every spawn token outside a fenced block is an offender. A new test
 ///    file that spawns darkmux with no markers at all fails here, named by
 ///    file and line.
-/// 2. Every fenced block that CONTAINS a spawn token must also call
+/// 2. Every fenced block that CONTAINS a spawn token must also CALL
 ///    `neutralize_state_vars`. Without this, fencing a raw spawn would
 ///    silence the guard while changing nothing — the markers would become
 ///    a way to opt OUT of isolation rather than into it.
@@ -416,6 +416,37 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 /// The blocks are the trusted region, deliberately: each is short, fenced
 /// by two markers, and is where a reviewer looking for "how does this
 /// target isolate itself" already has to look.
+///
+/// # What this guard does NOT hold
+///
+/// (#2710 review round 1, MUST FIX 2) Stated plainly, because an
+/// overclaim here is what makes the next reviewer skip the check.
+///
+/// This is a TEXT SCAN. What it holds is narrower than "a sixth copy
+/// cannot be added quietly": **a sixth copy written in one of the four
+/// recognized textual forms in `SPAWN_TOKENS` cannot be added quietly.**
+/// Everything outside that set is invisible to it, and no amount of
+/// further token-matching closes the gap — each of these was demonstrated
+/// against this guard, not imagined:
+///
+/// * A fenced block that spawns darkmux RAW while calling the helper on an
+///   unrelated decoy `Command` passes both assertions. Guard green, target
+///   green, two files leaked. That is exactly the green-and-leaking shape
+///   this whole change argues the fix must be structural to prevent, and
+///   text matching cannot reach it.
+/// * `SPAWN_TOKENS` is an allowlist of SPELLINGS. A resolver named
+///   anything other than `darkmux_release_binary` is invisible, and both a
+///   path-built `Command::new(<pathbuf>)` and a PATH-resolved
+///   `Command::new("darkmux")` pass while leaking.
+/// * The `fenced_spawn_blocks >= 2` floor tolerates single-token drift:
+///   deleting the one token that caught four of the five original
+///   offenders leaves the guard green with a raw unfenced spawn present.
+/// * The walk stops at this crate's `tests/`. `crates/*/tests/`,
+///   `runtime/tests/` and `examples/` are out of scope — nothing there
+///   spawns darkmux today, and nothing prevents it tomorrow.
+///
+/// These four are filed as a follow-up rather than patched here, because
+/// the durable answer is a structural chokepoint, not a longer token list.
 #[test]
 fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
     // Split with `concat!` on purpose: written as one literal, these two
@@ -450,7 +481,23 @@ fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
         "darkmux_release_binary",
         ".env(\"DARKMUX_BIN\"",
     ];
-    const NEUTRALIZER: &str = "neutralize_state_vars";
+    // The CALL form, not the bare name — and split with `concat!` for the
+    // same reason the markers are: written as one literal, this very line
+    // would contain the token and satisfy the requirement for the block it
+    // sits in.
+    //
+    // (#2710 review round 1, MUST FIX 1) Both details are load-bearing,
+    // and both were wrong first. Matching the bare name meant the `use`
+    // IMPORT satisfied the rule, and in four of the five converted files
+    // that import sits INSIDE the fence — so each was one deleted line
+    // from silently regressing. Measured before this fix, deleting ONLY
+    // the call (1 line): `fleet_concurrent_add_no_lost_writes.rs:50` and
+    // `state_files_owner_only_mode.rs:52` each left the guard at EXIT=0
+    // while the target went EXIT=101 and leaked `fleet.json` + its lock
+    // into a sentinel. Separately, this const written as a plain literal
+    // was itself a code line carrying the bare name — the guard's own
+    // token declaration satisfying the guard's own assertion.
+    const NEUTRALIZER: &str = concat!("neutralize_state_vars", "(");
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let files = rust_sources_under_tests();
@@ -523,7 +570,15 @@ fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
                 continue;
             }
             fenced_spawn_blocks += 1;
-            if !body.iter().any(|l| is_code(l) && l.contains(NEUTRALIZER)) {
+            // A `use` line can never BE the call, only name it, so it is
+            // excluded explicitly as well as by the call-form token above.
+            // Belt and braces on purpose: the token shape is what actually
+            // held in the red-prove, and this makes the intent readable
+            // without having to reason about substrings.
+            let is_call = |l: &&str| {
+                is_code(l) && !l.trim_start().starts_with("use ") && l.contains(NEUTRALIZER)
+            };
+            if !body.iter().any(is_call) {
                 unisolated_blocks.push(format!("  {rel}:{}", begin + 1));
             }
         }
