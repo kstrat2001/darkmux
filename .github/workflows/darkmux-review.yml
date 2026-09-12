@@ -58,12 +58,24 @@ permissions:
 jobs:
   review:
     runs-on: [self-hosted, darkmux-review]
+    # (#2100) This number is duplicated as a literal `--timeout-minutes 90`
+    # in "Post the review" below (the `job` context exposes `job.status`,
+    # not the configured budget itself, so there is no single source to
+    # read it back from) — change BOTH together, or the disclosure posted
+    # on a real cancellation will name a stale minute count.
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ inputs.pr }}
       REPO: ${{ github.repository }}
     steps:
+      # (#2100) Wall-clock zero for this job — read back by the cancellation
+      # notice below so a job killed by its own `timeout-minutes` can name
+      # how long it actually ran, rather than just repeating the configured
+      # budget. Cheap and has no failure mode (`date +%s` cannot fail).
+      - name: Record job start time
+        run: echo "JOB_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout review tooling (trusted main — NOT the reviewed PR)
         uses: actions/checkout@v4
         with:
@@ -82,6 +94,65 @@ jobs:
         # (main). The reviewed PR's code is never checked out — only its diff
         # (and, inside the review dispatch, individual file contents via the
         # API) are read — so untrusted PR code never lands on the runner.
+
+      # (#2100 CONSIDER 5) Moved ABOVE the build step, deliberately: this
+      # fetch needs only `gh`, no built binary, so it no longer has to wait
+      # behind `cargo build --release --locked`. A cancel landing anywhere
+      # from job start through the old position of this step (checkout,
+      # self-test, build) used to be a COMPLETELY silent PR — `has_diff`
+      # was never set, so "Post the review" below (gated on it) never got a
+      # turn even under `always()`. Measured in the real cancelled run
+      # (30812863146): job start 12:15:52, diff step (at its old position,
+      # after the build) 12:20:13 — a 4.5-minute unprotected window,
+      # unbounded further if the build itself wedges. Moving this step here
+      # shrinks that window to "checkout + this step", with nothing
+      # variable-cost in between. It does not close the window to zero: a
+      # cancel during checkout, or during this step's own two `gh` calls,
+      # is still silent — see the module doc on
+      # `ci-review-cancellation-notice.py` and the runner-shutdown caveat
+      # below for what remains genuinely uncovered.
+      - name: Fetch PR diff + head SHA (API only — no PR checkout, no code execution)
+        id: diff
+        run: |
+          set -euo pipefail
+          # Defense-in-depth: the `pr` input is maintainer-supplied, but pin it to
+          # digits so only a valid PR number ever reaches the gh/API calls below.
+          case "$PR" in ''|*[!0-9]*) echo "pr input must be a number"; exit 1 ;; esac
+          mkdir -p "$RUNNER_TEMP/qa"
+          # The review dispatch (below) reads this FULL diff directly — it caps
+          # what it sends to each seat's model internally (the same 80KB model
+          # budget the old single-reviewer prompt used) while keeping the full
+          # diff on disk for anchor-line resolution when rendering the review.
+          gh pr diff "$PR" --repo "$REPO" > "$RUNNER_TEMP/qa/pr.diff"
+          if [ -s "$RUNNER_TEMP/qa/pr.diff" ]; then
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+          fi
+          HEAD_SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          # Whole-string bash match, NOT line-anchored grep: grep -Eq '^...$'
+          # matches per LINE, so a multiline value with one valid-looking line
+          # would slip through; [[ =~ ]] anchors against the entire value.
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha from gh pr view"; exit 1; }
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      # (#2100 MUST FIX 2) Deliberately placed AFTER the diff step above, not
+      # before it: this step's own job is to add confidence in the
+      # cancellation-disclosure path, and a self-hosted Mac with a broken or
+      # missing python3 must not be able to make the disclosure path WORSE
+      # than doing nothing. Before this fix, this step sat before the diff
+      # fetch — a runner failing here left `has_diff` unset, "Post the
+      # review" skipped outright by its own `if:` (even under `always()`),
+      # and the PR silent: a hard new prerequisite added to the one path
+      # whose whole purpose is never to be silent. Now, a broken interpreter
+      # here still lets `has_diff` be set by the step above, so "Post the
+      # review" still gets its turn; "Post the review" itself also
+      # tolerates a broken interpreter directly, via its own `|| NOTICE=""`
+      # guard (see the comment there) — this self-test is a fast/cheap
+      # early warning, not the thing standing between a broken interpreter
+      # and a silent PR.
+      - name: Self-test the review-cancellation notice script
+        run: python3 scripts/ci-review-cancellation-notice.py --self-test
 
       - name: Build the darkmux binary (trusted main checkout — #1359)
         run: |
@@ -117,31 +188,6 @@ jobs:
           cargo build --release --locked
           echo "DARKMUX_BIN=$PWD/target/release/darkmux" >> "$GITHUB_ENV"
           "$PWD/target/release/darkmux" --version
-
-      - name: Fetch PR diff + head SHA (API only — no PR checkout, no code execution)
-        id: diff
-        run: |
-          set -euo pipefail
-          # Defense-in-depth: the `pr` input is maintainer-supplied, but pin it to
-          # digits so only a valid PR number ever reaches the gh/API calls below.
-          case "$PR" in ''|*[!0-9]*) echo "pr input must be a number"; exit 1 ;; esac
-          mkdir -p "$RUNNER_TEMP/qa"
-          # The review dispatch (below) reads this FULL diff directly — it caps
-          # what it sends to each seat's model internally (the same 80KB model
-          # budget the old single-reviewer prompt used) while keeping the full
-          # diff on disk for anchor-line resolution when rendering the review.
-          gh pr diff "$PR" --repo "$REPO" > "$RUNNER_TEMP/qa/pr.diff"
-          if [ -s "$RUNNER_TEMP/qa/pr.diff" ]; then
-            echo "has_diff=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_diff=false" >> "$GITHUB_OUTPUT"
-          fi
-          HEAD_SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
-          # Whole-string bash match, NOT line-anchored grep: grep -Eq '^...$'
-          # matches per LINE, so a multiline value with one valid-looking line
-          # would slip through; [[ =~ ]] anchors against the entire value.
-          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha from gh pr view"; exit 1; }
-          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
 
       - name: Write PR intent (title + description — prompt assembly lives in the binary)
         if: steps.diff.outputs.has_diff == 'true'
@@ -218,11 +264,64 @@ jobs:
       # (#1583) The step name promised a summary fallback that did not exist
       # for the `review` mode: a 422 on the inline anchors killed the step
       # under `set -e` and discarded the whole run. The fallback is real now.
+      #
+      # (#2100) `if:` widened from a bare `has_diff` check (an IMPLICIT
+      # `success()` gate) to `always() && has_diff` — the exact shape #2550/
+      # #2623 fixed for the mutation gate's own "Report survivors" step, for
+      # the identical failure: a reporting step gated on an implicit
+      # `success()` never runs once the JOB itself (not just the dispatch
+      # step above) is marked `cancelled` by its own `timeout-minutes`. A
+      # large diff's review can legitimately run the whole 90-minute budget
+      # (the dispatch is still emitting telemetry, healthy, just slow, when
+      # GitHub cuts it) — that killed the dispatch process before it ever
+      # reached its own `deliver.github_review` step, so `rendered.json` was
+      # never written, and this step — ungated for cancellation — never got
+      # a turn to say so. The PR read as though no review had ever run.
+      # `always()` lets this step run in GitHub's post-cancellation grace
+      # window; `steps.diff.outputs.has_diff == 'true'` is kept alongside it
+      # because a job cancelled before even that fast, early step ran has
+      # nothing to disclose about a review either (see
+      # `scripts/ci-review-cancellation-notice.py`'s own module doc for the
+      # decision table this step now delegates to).
       - name: Post the review (inline comments, or summary fallback)
-        if: steps.diff.outputs.has_diff == 'true'
+        if: always() && steps.diff.outputs.has_diff == 'true'
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ ! -s "$RUNNER_TEMP/qa/rendered.json" ]; then
+            # (#2100) Ask the dedicated, self-tested script whether THIS is
+            # a cancellation-worth-disclosing case (its own module doc has
+            # the full decision table; see the self-test step above). It
+            # prints a disclosure when the job was cancelled, and prints
+            # nothing for every other reason `rendered.json` could be
+            # missing/empty (an ordinary crash, a non-cancelled failure) —
+            # the generic warning below still covers those, byte-for-byte
+            # the same as before this fix.
+            #
+            # `|| NOTICE=""` is load-bearing, the same convention
+            # `post_review_or_fallback`'s `HEAD_NOW=$(...) || HEAD_NOW=""`
+            # already uses below: under `set -e` a failing command
+            # substitution in a plain assignment kills the STEP outright,
+            # BEFORE either `gh pr comment` call below ever runs — so any
+            # non-zero exit from the interpreter (missing python3, a
+            # regression in the script itself) would silently skip straight
+            # past this whole disclosure branch, making the PR MORE silent
+            # than before this fix ever existed. The guard means a broken
+            # interpreter degrades to the generic "produced no output"
+            # warning below instead of aborting with nothing posted at all.
+            NOTICE=$(python3 scripts/ci-review-cancellation-notice.py \
+              --job-status "$JOB_STATUS" \
+              --rendered "$RUNNER_TEMP/qa/rendered.json" \
+              --timeout-minutes 90 \
+              --started-epoch "${JOB_STARTED_EPOCH:-}" \
+              --run-url "$RUN_URL") || NOTICE=""
+            if [ -n "$NOTICE" ]; then
+              gh pr comment "$PR" --repo "$REPO" --body "$NOTICE"
+              echo "::error::review dispatch was cancelled — no rendered payload"
+              exit 1
+            fi
             # The dispatch above never wrote a rendered payload at all (e.g. it
             # crashed before its own degraded-mode fallback could run). Same
             # "never read as a green check" contract as mode=degraded (#1113).
@@ -311,8 +410,33 @@ jobs:
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/fallback-final.md"
             fi
           }
-          MODE_RESULT=$(jq -r .mode "$RUNNER_TEMP/qa/rendered.json")
+          # (#2100 CONSIDER 3) The caller's own `[ ! -s rendered.json ]` gate
+          # above only screens out MISSING/EMPTY — a non-empty file that is
+          # not valid JSON (a truncated write, a killed process mid-flush)
+          # sails past it and reaches this `jq` unguarded. Under `set -e` a
+          # parse failure here would abort the STEP with no comment posted
+          # at all — the exact symptom #2100 exists to close, reopened one
+          # layer down. `|| MODE_RESULT="__unparseable__"` catches that;
+          # `.mode // "null"` (rather than bare `.mode`) makes a valid JSON
+          # object with no `mode` field land on the literal string "null",
+          # same as `jq -r .mode` already did, but explicitly rather than
+          # by accident of `-r`'s null-rendering — both cases get their own
+          # named arm below instead of falling through to the unrecognized-
+          # mode catch-all silently.
+          MODE_RESULT=$(jq -r '.mode // "null"' "$RUNNER_TEMP/qa/rendered.json" \
+            2>"$RUNNER_TEMP/qa/mode.err") || MODE_RESULT="__unparseable__"
           case "$MODE_RESULT" in
+            __unparseable__)
+              echo "::error::rendered.json exists but is not valid JSON"
+              sed -n '1,20p' "$RUNNER_TEMP/qa/mode.err" || true
+              gh pr comment "$PR" --repo "$REPO" --body \
+                ":warning: darkmux PR review produced an unparseable rendered payload — see workflow logs."
+              exit 1 ;;
+            null)
+              echo "::error::rendered.json parsed but has no mode field"
+              gh pr comment "$PR" --repo "$REPO" --body \
+                ":warning: darkmux PR review produced a rendered payload with no recognizable mode — see workflow logs."
+              exit 1 ;;
             review)
               # (#2431 round 2, MF-C) `.fallback_comment` — `DeliverOutcome`
               # never had a `.comment` field, so this used to print the
@@ -380,7 +504,15 @@ jobs:
               # never fall through to a silent post-and-pass — the same
               # "a produced-nothing review must never read as a green
               # check" doctrine the `degraded)` arm above states explicitly.
+              # (#2100 CONSIDER 3) This used to exit 1 with NO comment
+              # posted — a valid rendered payload with an unrecognized
+              # `mode` string was every bit as silent on the PR as the
+              # bugs this whole file exists to close, just from a
+              # different cause. Post the same disclosure shape the
+              # `null)`/`__unparseable__)` arms above use.
               echo "::error::unrecognized rendered mode: $MODE_RESULT"
+              gh pr comment "$PR" --repo "$REPO" --body \
+                ":warning: darkmux PR review produced a rendered payload with an unrecognized mode (\`$MODE_RESULT\`) — see workflow logs."
               exit 1 ;;
           esac
 
