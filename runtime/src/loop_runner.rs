@@ -11805,6 +11805,172 @@ mod tests {
         assert_eq!(outcome.turns, 1, "every hit is a continuation of the SAME logical turn");
     }
 
+    /// (#2633 fix-pass) The SECOND half of the budget block's ordering: it
+    /// must act BEFORE the remedy branches, not just after the degeneracy
+    /// escalation. The fixture above pins "after the gate"; nothing pinned
+    /// "before the remedy", and moving the whole block down past the
+    /// `degenerate && writing_thought` chain left the suite green.
+    ///
+    /// What the mutation costs, concretely: the remedy for a degenerate
+    /// THOUGHT is `turn.close_thought()`, and a closed thought changes what
+    /// `pending_answer()` hands over — `deliverable("")` emits the thought
+    /// region ONLY while the block is still open (see its doc). Run the
+    /// remedy first and the escalation below it hands the frontier the
+    /// answer region alone, with the entire thought this turn banked
+    /// silently dropped. That is #1221's discard-the-turn bug, re-entered
+    /// through the ordering rather than through the region machine.
+    ///
+    /// Reaching all three conditions on ONE call takes some care, because
+    /// `sent_generation_bound` and an open thought pull against each other:
+    /// an open thought makes `in_answer_region()` false, so the only way a
+    /// call carrying one is still generation-bound is
+    /// `dispatch_has_reasoned == false` at REQUEST time — and any call that
+    /// leaves an open thought sets that flag true for every call after it.
+    /// So the one reachable shape is exactly this: four generation-bound
+    /// calls that never reason at all, then a fifth whose content OPENS a
+    /// `<think>` it does not close and whose slice reads degenerate. The
+    /// fifth call's request was built while the flag was still false, so it
+    /// is generation-bound and draws the continuation that exhausts the
+    /// budget; its response is what makes `writing_thought()` true.
+    ///
+    /// The numbers: `max_tokens_per_call=200` / `generation_checkpoint_
+    /// interval=50` puts `max_generation_continuations` at
+    /// `max(200/50, 4) == 4`, so call 5 is the one that exhausts it, and
+    /// `tail_sample_tokens(50)` is 400 tokens.
+    ///
+    /// - Calls 1-4 return a 500-token block of DISTINCT tokens. One period
+    ///   (500) is deliberately WIDER than the judged tail (400) — the same
+    ///   property #2258's fixtures rely on — so the sampled tail is always a
+    ///   sub-period run of unique tokens, ratio 1.0, robustly CLEAN. Without
+    ///   that these four would escalate early through the ANSWER-region arm
+    ///   and the fixture would never reach the call it exists to test.
+    /// - Call 5 returns `<think>` + `"loop forever "` x300. Its tail is 400
+    ///   tokens of a period-2 sequence: 389 windows, 2 distinct, ratio
+    ///   ≈0.0051 — degenerate with a ~49x margin.
+    ///
+    /// The two mocks are told apart by counting `ZZBLOCK` (one per absorbed
+    /// block) in the outgoing prefill: 0-3 copies is a call in the first
+    /// group, 4 is the fifth call.
+    #[test]
+    #[serial_test::serial]
+    fn the_generation_budget_escalates_before_the_thought_is_closed() {
+        let plain_block: String = std::iter::once("ZZBLOCK ".to_string())
+            .chain((0..499).map(|i| format!("a{i} ")))
+            .collect();
+        let thought_block = format!("<think>\n{}", "loop forever ".repeat(300));
+
+        let server = crate::test_support::GuardedMockServer::start();
+        // Calls 1-4: plain content, never any reasoning, so every request is
+        // built with `dispatch_has_reasoned == false` and carries the
+        // generation bound.
+        let _plain = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req
+                    .body
+                    .as_ref()
+                    .map(|v| String::from_utf8_lossy(v).to_string())
+                    .unwrap_or_default();
+                b.matches("ZZBLOCK").count() <= 3
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some(&plain_block), None, "length", 100, 50));
+        });
+        // Call 5: opens a thought it never closes, degenerate inside.
+        let _thinking = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req
+                    .body
+                    .as_ref()
+                    .map(|v| String::from_utf8_lossy(v).to_string())
+                    .unwrap_or_default();
+                b.matches("ZZBLOCK").count() >= 4
+            });
+            then.status(200).json_body(chat_response_json(
+                Some(&thought_block),
+                None,
+                "length",
+                100,
+                50,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("budget-before-remedy").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("write forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(50), None, Some(200), None, Some(50),
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("budget exhaustion on a thought-carrying call is a clean escalation, not an Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(
+                EscalationReason::GenerationCheckpointBudgetExhausted
+            ),
+            "call 5 is the one that exhausts the 4-continuation budget, and its thought is \
+             still OPEN — so the budget, not the ANSWER-region degeneracy arm, is what \
+             stops this turn. Got {:?}",
+            outcome.terminal_reason
+        );
+
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let checkpoints: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .collect();
+        let fifth = checkpoints
+            .iter()
+            .find(|c| c["checkpoint"] == serde_json::json!(5))
+            .unwrap_or_else(|| panic!("expected a checkpoint 5 record, got {checkpoints:?}"));
+        assert_eq!(
+            fifth["verdict"],
+            serde_json::json!("conclude"),
+            "checkpoint 5's slice is a period-2 verbatim loop — if this reads `continue` the \
+             fixture has drifted off the shape under test (a clean slice never reaches the \
+             remedy branch this test guards). Got {fifth:?}"
+        );
+        assert_eq!(
+            fifth["bound"]["kind"],
+            serde_json::json!("generation_checkpoint_interval"),
+            "call 5 must still be GENERATION-bound — a reasoning bound here means \
+             `dispatch_has_reasoned` flipped before the request was built and the budget \
+             was never drawn. Got {fifth:?}"
+        );
+
+        // THE GUARD. Both regions must reach the frontier. `close_thought()`
+        // running before this escalation would drop the thought half — the
+        // marker below is the only thing that distinguishes the two
+        // orderings, because every other observable (terminal reason, record
+        // count, verdict, ratio, call count) is identical under both.
+        let delivered = outcome
+            .final_answer
+            .as_deref()
+            .expect("the escalation must hand over everything banked, not None");
+        assert!(
+            delivered.contains("loop forever"),
+            "(#2633 fix-pass) the THOUGHT this turn banked is missing from the deliverable. \
+             That is what acting on the budget AFTER the `degenerate && writing_thought` \
+             remedy costs: the remedy closes the thought, and a closed thought is excluded \
+             from `deliverable()`, so the frontier receives the answer region alone. \
+             Got {delivered:?}"
+        );
+        assert!(
+            delivered.contains("ZZBLOCK"),
+            "the four earlier calls' ANSWER region must survive too — this half held even \
+             under the wrong ordering, and it is here so a future change that trades one \
+             region for the other is caught in both directions. Got {delivered:?}"
+        );
+        assert_eq!(outcome.turns, 1, "every hit is a continuation of the SAME logical turn");
+    }
+
     /// (#2258) The INVERTED direction of the fixture above — a fix that
     /// simply swapped the hardcoded `reasoning_interval` for a hardcoded
     /// `generation_interval` (rather than reading back whichever bound
@@ -13036,7 +13202,6 @@ mod tests {
         let args = r#"{"path":123,"content":"x"}"#;
         assert_eq!(extract_edit_target_path(args), None);
     }
-
 }
 
 #[cfg(test)]

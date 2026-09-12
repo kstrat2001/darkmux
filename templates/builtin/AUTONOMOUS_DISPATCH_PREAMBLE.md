@@ -60,7 +60,13 @@ This dispatch is bounded along seven dimensions:
   are not told when this fires — it is silent, the same as the
   per-turn cap's checkpoints — but a turn that keeps re-hitting it
   without converging escalates via
-  `escalation_generation_checkpoint_budget_exhausted`.
+  `escalation_generation_checkpoint_budget_exhausted`. If what you
+  emit across those check-ins is REPEATING — the same block of text
+  written again and again — the dispatch stops on that instead, and
+  reports `escalation_intra_turn_stall_exhausted`. Either way the
+  work you have already written is handed on, so when you notice
+  yourself restating what you just wrote, stop and give your answer
+  from what you have rather than continuing.
 - **Cumulative completion-token cap** — sum of all completion tokens
   (content + reasoning) across every turn. Crossing terminates via
   `escalation_cumulative_tokens_exceeded`.

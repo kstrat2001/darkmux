@@ -344,6 +344,29 @@
             preamble.contains("escalation_generation_checkpoint_budget_exhausted"),
             "preamble must name the generation-checkpoint-budget escalation (#2171)"
         );
+        // (#2633) The generation check-in has TWO terminals now that the
+        // degeneracy gate judges the call that exhausts the budget, and the
+        // model has to be told about both IN THAT BULLET — the presence
+        // assertions around this one are satisfied by either name appearing
+        // anywhere in the file, so they cannot catch the drift where the
+        // bullet goes on teaching the budget terminal alone. At the shipped
+        // defaults a REPEATING generation-bound turn is the modal producer
+        // of the stall terminal, so a bullet naming only the budget one
+        // teaches a diagnosis that is wrong most of the time.
+        let check_in_bullet = preamble
+            .split("- **Per-call generation check-in**")
+            .nth(1)
+            .and_then(|rest| rest.split("\n- **").next())
+            .unwrap_or_else(|| {
+                panic!("preamble must carry a `Per-call generation check-in` bullet")
+            });
+        assert!(
+            check_in_bullet.contains("escalation_generation_checkpoint_budget_exhausted")
+                && check_in_bullet.contains("escalation_intra_turn_stall_exhausted"),
+            "the generation check-in bullet must name BOTH terminals it can reach — a turn \
+             that is merely not converging reports the budget one, a turn that is REPEATING \
+             reports the stall one (#2633). Got: {check_in_bullet:?}"
+        );
         assert!(
             preamble.contains("escalation_cumulative_tokens_exceeded"),
             "preamble must name the cumulative-tokens escalation"
