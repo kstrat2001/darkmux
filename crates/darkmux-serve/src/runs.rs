@@ -2815,6 +2815,21 @@ mod tests {
             }
             Self { prev }
         }
+        /// (round 3, CONSIDER 2) The other pin a test can need: the knob
+        /// CLEARED, so the resolved value is the built-in default rather
+        /// than whatever the environment exports. Under `cfg(test)`
+        /// `config_access::config()` returns `EMPTY_CONFIG` without ever
+        /// opening a file, so `env > config > default` collapses to
+        /// `env > default` here — clearing the env var is the only way to
+        /// reach the default tier, and a test asserting the SHIPPED value
+        /// has to reach it.
+        fn unset() -> Self {
+            let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+            unsafe {
+                std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+            }
+            Self { prev }
+        }
     }
     impl Drop for InactivityBudgetGuard {
         fn drop(&mut self) {
@@ -4162,11 +4177,48 @@ mod tests {
     /// The threshold is DERIVED from the runtime's own inactivity budget, not
     /// invented — so it moves with the operator's config instead of drifting
     /// away from it.
+    ///
+    /// (#2682 fix-pass round 3, CONSIDER 2) Rewritten, because the old
+    /// second assertion — `stale_after_ms() >= 600 * 2_000`, "never below
+    /// the shipped default" — asserted a FLOOR that no tier enforces.
+    /// `inactivity_timeout_seconds()` resolves `env >` default and clamps
+    /// nothing, so an operator (or a CI job, or a sibling test process)
+    /// with `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` exported anywhere below
+    /// `600` turned this test red. Measured across a
+    /// 1/5/30/300/3600/7200/86400/172800 sweep: red at 1, 5, 30 and 300.
+    /// The claim it was reaching for is really two separate claims, so
+    /// they are now made separately — the DERIVATION is swept across
+    /// several pinned budgets (which is the "moves with the config" half,
+    /// and is what one fixed value could never show), and the DEFAULT is
+    /// asserted with the knob explicitly CLEARED.
     #[test]
+    #[serial_test::serial]
     fn the_staleness_window_tracks_the_runtime_inactivity_budget() {
-        let budget = darkmux_types::config_access::inactivity_timeout_seconds();
-        assert_eq!(stale_after_ms(), budget * 2_000, "twice the watchdog budget, in ms");
-        assert!(stale_after_ms() >= 600 * 2_000, "and never below the shipped default");
+        // The derivation holds at every budget, not just at whichever one
+        // the environment happens to carry.
+        for secs in [1u64, 5, 30, 300, 600, 3600, 7200, 86_400, 172_800] {
+            let _budget = InactivityBudgetGuard::seconds(secs);
+            assert_eq!(
+                darkmux_types::config_access::inactivity_timeout_seconds(),
+                secs,
+                "the knob is the top tier and is read live"
+            );
+            assert_eq!(
+                stale_after_ms(),
+                secs * 2_000,
+                "twice the watchdog budget, in ms — at {secs}s"
+            );
+        }
+
+        // …and the SHIPPED default, reached the only way a test can reach
+        // it: with the env tier cleared.
+        let _default = InactivityBudgetGuard::unset();
+        assert_eq!(
+            darkmux_types::config_access::inactivity_timeout_seconds(),
+            600,
+            "the shipped default inactivity budget"
+        );
+        assert_eq!(stale_after_ms(), 600 * 2_000, "a 20-minute staleness window by default");
     }
 
     // ── earliest_by_start: pairs, not bare aggs (#1915) ──────────────────
@@ -6762,10 +6814,22 @@ mod tests {
         // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
         // same reason as the first of these, above.
         let _g = CrewGuard::new();
+        // (#2682 fix-pass round 3, CONSIDER 2) Budget pinned, and the
+        // comment below corrected. It used to claim "yesterday" sat
+        // "comfortably OUTSIDE the liveness budget" — which is false above
+        // a 12-hour knob, because `stale_after_ms()` is TWICE it: with
+        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=86400` the window is 48
+        // hours and yesterday is comfortably INSIDE. Measured red at
+        // 86400 and 172800 on a 1/5/30/300/3600/7200/86400/172800 sweep.
+        // A fixed distance stated as "comfortably outside" a threshold the
+        // environment owns is the clock rule's denominator half: pin the
+        // denominator, then the numerator's comfort is a real property.
+        let _budget = InactivityBudgetGuard::seconds(60);
         let flows = TempDir::new().unwrap();
-        // Yesterday: comfortably INSIDE the 14-day scan window, comfortably
+        // Yesterday: comfortably INSIDE the 14-day scan window, and — at
+        // the 120s liveness window the pin above fixes — comfortably
         // OUTSIDE the liveness budget. The two bounds answer different
-        // questions and this test pins the second one — `cutoff_date_string(1)`
+        // questions and this test pins the second one; `cutoff_date_string(1)`
         // is the same date arithmetic the window itself uses.
         let stale_ts = format!("{}T00:00:00Z", cutoff_date_string(1));
         let fleet = vec![peer_record("dispatch start", &stale_ts)];

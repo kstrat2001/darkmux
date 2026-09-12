@@ -111,10 +111,28 @@ fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
 /// enumerating the leaks (and re-enumerating them every time a new one is
 /// written). They point at the same tree, so a child sees one coherent
 /// root either way it resolves.
+///
+/// (#2682 fix-pass round 3, MUST FIX 1) And one `env_remove`, because
+/// `DARKMUX_CREW_DIR` OUTRANKS both of them. `crew::loader::
+/// user_state_root()` — the resolver behind every `missions/` and
+/// `phases/` read and write — asks `config_access::crew_dir_override()`
+/// first and only falls back to the `DARKMUX_HOME` tier when that
+/// override is absent, so a child spawned by this helper with
+/// `DARKMUX_CREW_DIR` merely INHERITED from the ambient environment reads
+/// and writes the operator's real board, whatever root the two vars above
+/// name. Measured at this head with a sentinel exported: `cargo test
+/// --test cli mission_status_` failed 4 of 8, because each test's fixture
+/// (written under its own `DARKMUX_HOME`) was invisible to the subprocess
+/// reading it back. Clearing it here restores the intended
+/// `DARKMUX_HOME`-tier resolution for every spawn at once; the handful of
+/// tests that genuinely exercise the override still set it explicitly
+/// afterward, and a later `.env` wins over this `.env_remove`.
 fn darkmux_std_cmd() -> std::process::Command {
     let (home, darkmux_home) = isolated_roots();
     let mut cmd = std::process::Command::new(darkmux_bin_path());
-    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
+    cmd.env("HOME", home)
+        .env("DARKMUX_HOME", darkmux_home)
+        .env_remove("DARKMUX_CREW_DIR");
     cmd
 }
 

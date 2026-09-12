@@ -871,9 +871,14 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// honest statement about darkmux's own ATTRIBUTION layer, not about the
 /// mission, so rendering it as mission drift blames the mission for a
 /// flow-emitter defect. It is dropped here rather than re-worded again.
-/// (The ambiguity case is still worth surfacing SOMEWHERE — `darkmux
-/// doctor` is the right home for a flow-attribution defect, not the
-/// mission board. Filed as #2691, deliberately not built here.)
+/// (Both shapes that reach this arm are still worth surfacing SOMEWHERE —
+/// `darkmux doctor` is the right home for a flow-attribution defect and
+/// for expired evidence alike, not the mission board. Filed as #2691,
+/// deliberately not built here. Round 3, CONSIDER 3: #2691 originally
+/// enumerated both the AMBIGUITY refusal and the aged-out/never-dispatched
+/// road but specified a check for only the first, leaving the second
+/// silent on the board and unfiled; it has been widened to cover both,
+/// including the one Active row named below that no other rule draws.)
 /// `RecordedEnd` and `StaleNoTerminal` are genuine dispatch observations
 /// and stay, which is what keeps the `kind` string
 /// (`running-phase-session-dead`) accurate for every arm that survives.
@@ -942,6 +947,29 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 ///     correctly shows `Paused`; genuinely a display disagreement, but
 ///     distinct in kind from the "Running phase, dead session" gap this
 ///     issue named, and not fixed here.
+///
+/// **One of those Active rows has NO other rule behind it (round 3,
+/// CONSIDER 1).** Most of the 13 are silent HERE and still drawn
+/// elsewhere — the day-scale `stale_active_drift` covers the aged
+/// zero-complete shapes, `done-not-finalized` covers the all-terminal
+/// ones. One is not covered by anything: an Active mission past
+/// `RUNS_FLOW_SCAN_WINDOW_DAYS` whose records aged out, holding a Running
+/// phase AND at least one Complete phase, draws no drift of any kind
+/// while `run list` reads it `abandoned`. `done-not-finalized` needs every
+/// phase terminal, `stale-active` is disqualified by `complete > 0`, and
+/// this rule declines `NoAttributableSession`. Round 1 fired there and
+/// `main` does not, so it is a NARROWING rather than a regression — named
+/// here because an enumerated count that doesn't say which row is
+/// uncovered reads as if all 13 are covered somewhere.
+///
+/// It is also the row the matrix below structurally CANNOT see: that
+/// sweep's phase axis yields at most one phase per mission
+/// (`ps.map(..).into_iter().collect()`), so Running-alongside-Complete
+/// never occurs in its 100 rows. A figure backed by a harness blind to a
+/// case is worth less than it looks, so the shape has its own test —
+/// `an_aged_active_mission_with_a_complete_phase_alongside_a_running_one_draws_nothing`
+/// — which asserts `run list` really does read it `abandoned` before
+/// asserting the board's silence.
 ///
 /// **Two counting subtleties, so a recount doesn't come out wrong.**
 ///   1. The naive sweep returns **58**, not 33. The extra 25 are the whole
@@ -2048,17 +2076,40 @@ mod tests {
     /// subsequent `#[serial]` test in the process would then read/write
     /// through a directory that no longer exists. Caller must hold
     /// `#[serial_test::serial]` — this guard does not itself serialize.
+    ///
+    /// (round 3, MUST FIX 1) It pins `DARKMUX_CREW_DIR` as well, to the
+    /// SAME tempdir, and that half is what actually contains the mission
+    /// writes. `DARKMUX_HOME` alone does not: every mission/phase write in
+    /// this module routes through `crew::loader::user_state_root()`, which
+    /// resolves `config_access::crew_dir_override()` FIRST and only falls
+    /// back to `resolve(ForceUser).root` (the `DARKMUX_HOME` tier) when
+    /// that override is absent. So an operator — or a CI job, or a sibling
+    /// agent session — with `DARKMUX_CREW_DIR` exported outranks the
+    /// scratch root this guard sets, and the fixtures land in the REAL
+    /// board. Measured at this head with a sentinel exported: `cargo test
+    /// --bin darkmux mission_status::` exited 0, 98 passed, and wrote 102
+    /// mission directories (100 `matrix-*`, `dispatch-crashed-2682`, `m1`)
+    /// permanently into the sentinel — a fully green suite mutating
+    /// operator state. Pinning BOTH tiers is the same shape
+    /// `darkmux-serve`'s `runs.rs::CrewGuard` already uses; pointing both
+    /// at one tempdir keeps the child's view coherent whichever tier a
+    /// given accessor resolves through.
     struct DarkmuxHomeGuard {
         tmp: tempfile::TempDir,
         prev: Option<String>,
+        prev_crew: Option<String>,
     }
     impl DarkmuxHomeGuard {
         fn new() -> Self {
             let tmp = tempfile::TempDir::new().unwrap();
             let prev = std::env::var("DARKMUX_HOME").ok();
+            let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
             // SAFETY: caller holds #[serial_test::serial].
-            unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
-            Self { tmp, prev }
+            unsafe {
+                std::env::set_var("DARKMUX_HOME", tmp.path());
+                std::env::set_var("DARKMUX_CREW_DIR", tmp.path());
+            }
+            Self { tmp, prev, prev_crew }
         }
         fn path(&self) -> &std::path::Path {
             self.tmp.path()
@@ -2071,6 +2122,10 @@ mod tests {
                 match &self.prev {
                     Some(v) => std::env::set_var("DARKMUX_HOME", v),
                     None => std::env::remove_var("DARKMUX_HOME"),
+                }
+                match &self.prev_crew {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
                 }
             }
         }
@@ -2105,6 +2160,65 @@ mod tests {
                 match &self.prev {
                     Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
                     None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+                }
+            }
+        }
+    }
+
+    /// (#2682 fix-pass round 3, MUST FIX 1) The guard's own contract,
+    /// asserted rather than documented. The leak this closes is SILENT —
+    /// with `DARKMUX_CREW_DIR` exported, the mission-writing tests in this
+    /// module wrote 102 mission directories into the operator's real board
+    /// and the suite still exited 0, 98 passed. Nothing in a green run
+    /// could have told anyone. So the pin gets a test that goes red when
+    /// it is removed, instead of a leak count only a reviewer running with
+    /// a sentinel directory would ever see.
+    ///
+    /// It asserts against `user_state_root()` — the resolver every
+    /// `missions/` write in this module actually routes through — not
+    /// against the env var, so it stays honest if the precedence between
+    /// the two tiers is ever rearranged.
+    #[test]
+    #[serial_test::serial]
+    fn the_home_guard_also_pins_the_crew_dir_that_outranks_it() {
+        const SENTINEL: &str = "/darkmux-round3-sentinel-must-not-be-used";
+        // SAFETY: #[serial]. Held to the end of the test so a panicking
+        // assertion below cannot leave the sentinel exported.
+        let _restore = unsafe {
+            let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+            std::env::set_var("DARKMUX_CREW_DIR", SENTINEL);
+            CrewDirRestore(prev)
+        };
+
+        let guard = DarkmuxHomeGuard::new();
+        let root = crew::loader::user_state_root();
+        assert_eq!(
+            root,
+            guard.path(),
+            "every missions/ write in this module resolves through user_state_root(), whose \
+             FIRST tier is crew_dir_override() — a DarkmuxHomeGuard that pins only DARKMUX_HOME \
+             leaves the fixtures landing in whatever board the environment names"
+        );
+        drop(guard);
+
+        // …and the displaced value comes back, so the guard is not itself a leak.
+        assert_eq!(
+            std::env::var("DARKMUX_CREW_DIR").ok().as_deref(),
+            Some(SENTINEL),
+            "the guard must restore the crew dir it displaced, the same way it restores DARKMUX_HOME"
+        );
+    }
+
+    /// Tiny RAII for the test above, so its own sentinel cannot outlive a
+    /// panicking assertion.
+    struct CrewDirRestore(Option<String>);
+    impl Drop for CrewDirRestore {
+        fn drop(&mut self) {
+            // SAFETY: the only holder is a #[serial_test::serial] test.
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                    None => std::env::remove_var("DARKMUX_CREW_DIR"),
                 }
             }
         }
@@ -3277,6 +3391,118 @@ mod tests {
         assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
     }
 
+    /// (#2682 fix-pass round 3, CONSIDER 1) The one Active shape the board
+    /// now draws NOTHING for, pinned deliberately — and pinned HERE rather
+    /// than in the matrix below, which structurally cannot see it: the
+    /// matrix builds its phase list with `ps.map(..).into_iter().collect()`,
+    /// so every row holds at most ONE phase and a mission holding a Running
+    /// phase AND a Complete one never occurs in those 100 rows.
+    ///
+    /// The shape: an Active mission older than `RUNS_FLOW_SCAN_WINDOW_DAYS`
+    /// whose dispatch records have aged out, holding a Running phase and at
+    /// least one Complete phase. Each of the three rules declines it for
+    /// its own reason —
+    ///   - `done-not-finalized` needs ALL phases terminal; the Running one
+    ///     is not,
+    ///   - `stale-active` is disqualified by `complete > 0`,
+    ///   - `running-phase-session-dead` is silent on
+    ///     `NoAttributableSession` (round 2's MUST FIX 1),
+    /// — and no rule is left. `darkmux run list` meanwhile reads the same
+    /// mission `abandoned`, which this test asserts FIRST so the silence
+    /// below is measured against a known disagreement rather than an empty
+    /// board.
+    ///
+    /// This is a NARROWING, not a regression: round 1 fired here, `main`
+    /// does not, and nothing shipped is lost. It is recorded because
+    /// `running_phase_session_drift`'s scope doc enumerates the 13 silent
+    /// Active rows without noting that this one has no other rule behind
+    /// it. The zero-complete twin is asserted alongside it to show the
+    /// day-scale rule really does cover that sibling — the difference
+    /// between the two arms is the whole finding.
+    #[test]
+    #[serial_test::serial]
+    fn an_aged_active_mission_with_a_complete_phase_alongside_a_running_one_draws_nothing() {
+        let _home = DarkmuxHomeGuard::new();
+        // 60s knob → a 120s staleness budget, so the age branch below fires
+        // whatever the environment running this suite has exported.
+        let _budget = InactivityBudgetGuard::seconds(60);
+
+        let now = now_unix();
+        // Deliberately empty: this shape's premise is that every dispatch
+        // record aged out of the scan window, so there is nothing to
+        // attribute a session to.
+        let flows = tempfile::TempDir::new().unwrap();
+
+        // `complete_phases = 0` then `= 1`, same mission shape otherwise.
+        for (id, complete_phases) in [("aged-zero-complete", 0usize), ("aged-with-complete", 1usize)]
+        {
+            let mut m = mission(id, MissionStatus::Active);
+            m.started_ts = Some(now.saturating_sub(30 * 86_400));
+            let mut phases = vec![phase(&format!("{id}-run"), id, PhaseStatus::Running)];
+            for n in 0..complete_phases {
+                phases.push(phase(&format!("{id}-done-{n}"), id, PhaseStatus::Complete));
+            }
+            m.phase_ids = phases.iter().map(|p| p.id.clone()).collect();
+            crew::lifecycle::save_mission(&m).unwrap();
+            for p in &phases {
+                crew::lifecycle::save_phase(p).unwrap();
+            }
+
+            // Not hand-typed: the SAME computation `darkmux run list`
+            // renders from, so the disagreement below is real.
+            let local = darkmux_serve::local_dispatch_status(
+                std::slice::from_ref(&m),
+                flows.path(),
+                &[],
+            );
+            let (status, evidence) = local
+                .get(id)
+                .copied()
+                .unwrap_or_else(|| panic!("no local_dispatch_status entry for {id}"));
+            assert_eq!(
+                status,
+                RunStatus::Abandoned,
+                "fixture premise: `run list` must genuinely read {id} abandoned, or the \
+                 silence below proves nothing"
+            );
+            assert_eq!(
+                evidence,
+                Some(DispatchSessionEvidence::NoAttributableSession),
+                "fixture premise: the aged-out shape is the no-attributable-session road"
+            );
+
+            let phase_refs: Vec<&Phase> = phases.iter().collect();
+            let kinds: Vec<&str> = detect_drift(
+                &m,
+                &phase_refs,
+                &BTreeMap::new(),
+                Some(status),
+                evidence,
+                now,
+                14,
+            )
+            .iter()
+            .map(|d| d.kind)
+            .collect();
+
+            if complete_phases == 0 {
+                assert_eq!(
+                    kinds,
+                    vec!["stale-active"],
+                    "the day-scale rule covers the zero-complete sibling — if this arm ever \
+                     goes empty too, the narrowing below stopped being narrow"
+                );
+            } else {
+                assert!(
+                    kinds.is_empty(),
+                    "documented as UNCOVERED in running_phase_session_drift's scope doc — if a \
+                     rule starts firing here, update that doc rather than this assertion: \
+                     {kinds:?}"
+                );
+            }
+        }
+    }
+
     // ─── the board-vs-`run list` disagreement matrix (#2682 round 2) ───
 
     /// The five flow-record shapes the matrix below sweeps, one per row of
@@ -4258,6 +4484,15 @@ mod tests {
         // "A live peer" — the issue's own contrast case against "rostered
         // but silent" below. No terminal record, but the session is
         // recent enough to read as live.
+        //
+        // (#2682 fix-pass round 3, CONSIDER 2) "Recent enough" is measured
+        // against `stale_after_ms()`, so the environment owned it: with
+        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=1` the window is 2 seconds
+        // and a 5-second-old record reads Abandoned. Marginal — it was the
+        // only value in a 1/5/30/300/3600/7200/86400/172800 sweep that
+        // turned it red — but marginal is still environment-owned, and the
+        // pin costs one line.
+        let _budget = InactivityBudgetGuard::seconds(600);
         with_isolated_darkmux_home(|| {
             let flows = tempfile::tempdir().unwrap();
             let now = now_unix();
