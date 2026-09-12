@@ -123,6 +123,17 @@ import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../l
  *       `dispatch.complete` is now a run. Measured on the committed
  *       two-day corpus: 50 run keys carry a completion while `runs`
  *       reported 40.
+ *
+ *       SIZE OF THAT, stated so nobody expects the wrong thing on live
+ *       data: 40 -> 52 measures ids recorded BEFORE #1918, which is
+ *       already on main. `session_id::scope_to_run` composes the run id
+ *       into every `task-`/`step-`-prefixed session id AT THE LAUNCHER, so
+ *       post-#1918 ids are already run-unique. Replaying that transform
+ *       over the same corpus: base 50 -> branch 52, a delta of +2, not
+ *       +12. On the 24h window the viewer actually loads the number does
+ *       not move at all (19 -> 19). Eleven of the twelve is a
+ *       retrospective correction for archived records; every token field
+ *       is identical either way. Pinned in savings.test.ts.
  *   (b) `cloudRuns` was not monotonic — measured `[0,0,1,1,0]` across an
  *       arrival sequence, resting on "1 local dispatch" beside a 100%-cloud
  *       token tile. A hosted terminal that reported no usage never entered
@@ -137,19 +148,57 @@ import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../l
  *       entirely. The guard is run-scoped now, so it only ever skips the
  *       run it is actually about.
  *
- * What this pass does NOT close is #2690's TOKEN half, and that is a
- * measurement rather than a shrug: sibling seats fanned out within one task
- * share the session id AND the mission id by construction, and NOTHING on a
- * `telemetry.tokens` record names the seat it came from. `payload.step_id`
- * is stamped only by the container path's `stamp_step_id`
- * (`crates/darkmux-crew/src/dispatch_internal.rs`) and only when the
- * dispatch is a graph step; `handle` on such a record is the ROLE id
- * (`build_telemetry_record`, `crates/darkmux-crew/src/dispatch.rs:1179`);
- * `work_id` is `None` on every crew record builder. Measured across all
- * four committed corpora: ZERO of 774 `telemetry.tokens` records carry a
- * `payload.step_id`. There is no third coordinate to key on, so the token
- * split's cloud-over-local precedence for a mixed key stays exactly as
- * #2701 left it, and #2690's three token shapes stay open.
+ * What this pass does NOT reach is #2690's TOKEN half. Sibling seats fanned
+ * out within one task share the session id AND the mission id by
+ * construction, so `runKey` is identical for them and the cloud-over-local
+ * precedence on the split below is unchanged. FOUR candidate seat
+ * coordinates were measured on the committed corpora before settling that,
+ * because "no coordinate exists" is a much stronger claim than any one of
+ * them supports:
+ *
+ *   `payload.step_id` — stamped only by the container path's
+ *   `stamp_step_id` (`crates/darkmux-crew/src/dispatch_internal.rs`) and
+ *   only for a graph step. ZERO of the 774 `telemetry.tokens` records
+ *   across all four corpora carry one.
+ *
+ *   `work_id` — `None` on every crew record builder.
+ *
+ *   `record.model` — present on 774 of 774, but it is not a SEAT identity:
+ *   a probe fan-out is k draws on ONE model. Measured: ZERO run keys whose
+ *   telemetry spans more than one model, so it separates nothing; and 3
+ *   telemetry models match no completion model under their own key, so it
+ *   would orphan.
+ *
+ *   `handle` — NOT uniformly the role id, which an earlier revision of this
+ *   comment claimed. The map-item emitter passes `&step.id` as the role_id
+ *   argument (`builtins.rs`, beside `map_item_token_payload`), so a map
+ *   item's telemetry carries a STEP handle while the container path's
+ *   carries a ROLE handle. Measured anyway, and it fails harder than the
+ *   others: ZERO keys whose telemetry spans more than one handle, and 163
+ *   of the 364 two-day telemetry records (45%) carry a handle matching no
+ *   bookend handle under their own key — the review pipeline's own
+ *   `telemetry.tokens` emitter uses `review` while its bookends use the
+ *   seat names. Keying on it would move 45% of the corpus's telemetry into
+ *   `unknown`, including the 144,638-token Azure run, which is the one
+ *   direction this function may never take.
+ *
+ * The honest remaining candidate, named so the next reader does not
+ * re-derive it: `DispatchMapStepKind::item_record`'s `payload.remote` is a
+ * literal per-seat hosted-or-local verdict, already emitted, for exactly the
+ * map fan-out population #2690 is about — the item record and that item's
+ * `telemetry.tokens` record are pushed from the SAME `MapItemResult` in the
+ * same loop iteration. Measured: 180 of the 364 two-day telemetry records
+ * pair 1:1 with one on `(session_id, ts, total_tokens)`, zero ambiguous, 88
+ * of them remote. Two reasons it is not consumed here. It covers half the
+ * population (the container and review paths emit no item record), and the
+ * join available today is a three-field heuristic on a SECOND-precision
+ * timestamp whose collision case — k identical draws of one prompt closing
+ * in the same second — is the normal shape of a probe stage, not a remote
+ * one. The clean version is a producer change (carry the item's own
+ * `remote`/`index` into `map_item_token_payload`, a flow-schema minor bump)
+ * and belongs with a live dispatch to verify it, not in a viewer lens.
+ * Nothing committed exercises any of it: ZERO run keys in either corpus
+ * hold both a hosted and an endpoint-less completion.
  *
  * Producer note, still true and still load-bearing: `endpoint` is stamped
  * from one `endpoint_label` onto start/error/complete alike by
@@ -660,6 +709,39 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // id had telemetry: measured, 9,999 hosted tokens absent from `total`
   // entirely — under-reported, not misattributed, which is what made it
   // easy to miss.
+  //
+  // (#2709) THE INVARIANT THAT GUARD NOW DEPENDS ON, named because it is
+  // load-bearing for the headline number and was not before:
+  //
+  //   **A dispatch's `telemetry.tokens` records and that same dispatch's
+  //   `dispatch.complete` must carry the SAME `mission_id`.**
+  //
+  // Keyed on the bare session id the guard was immune to this by
+  // construction — a session id is a session id on every record of a
+  // dispatch. Keyed by run, a producer that stamps a mission id on the
+  // telemetry but not on the completion (or a different one) puts the two
+  // under different keys, `sess.has(k)` stops firing for the completion's
+  // key, and its totals are added ON TOP of the telemetry that already
+  // counted them. Measured cost of that skew: 4,000 tokens counted twice on
+  // the ordinary shape, and GAP C's 9,999 becoming 19,998.
+  //
+  // Checked, not assumed. All three live `telemetry.tokens` producers take
+  // `mission_id` from the same dispatch-scoped value that the terminal
+  // bookend takes it from — the container tailer's `self.mission_id`
+  // (`dispatch_internal.rs`, used by `emit` and `emit_telemetry` alike),
+  // `dispatch_remote`, and the map-item emitter (which passes `None` for
+  // BOTH, so both land under the same empty mission). And on the corpora:
+  // ZERO sessions where a telemetry mission id matches no completion
+  // mission id of the same session, in either the two-day corpus or the
+  // demo replay.
+  //
+  // No conformance test expresses it, because it is a cross-producer
+  // alignment and the subsystem tests exercise each producer alone — the
+  // class of contract the repo's own registry says unit tests structurally
+  // cannot catch. #1918's comment records that its producer inventory had
+  // to be widened twice, so a fourth emitter arriving without this property
+  // is the realistic failure. If one does, `darkmux doctor` and a
+  // double-counted `total` are where it will surface.
   //
   // Classification of a bookend's tokens is PER-COMPLETION (#2635), not
   // per-key: each `dcTok` payload IS the `dispatch.complete` record that

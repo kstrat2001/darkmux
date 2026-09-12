@@ -1977,6 +1977,96 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     // Neither reported a token count, so no tile moves.
     expect(t.total).toBe(0);
   });
+
+  /**
+   * (round-2 review MUST FIX) THE MIXED-CLASS PAIR — a token-BEARING bookend
+   * of one class beside a token-LESS terminal of the OTHER, under one run key.
+   *
+   * This is the only shape in which the two EXTRA terms' `!saw*Bookend`
+   * conjuncts do any work, and it was absent from the file. Every test that
+   * paired a hosted and a local terminal under one key used TWO token-less
+   * completions, so `bookends` was empty and the terms' behavior was
+   * indistinguishable from "fire when there are no bookends". The hosted half
+   * happened to be covered by the usage-omitting fixtures above; the local
+   * half — the one this change is about — was not.
+   *
+   * Two mutations survived the whole 194-test fleet selection before these
+   * two tests existed, each reverting `runs` to the pre-#2709 answer with the
+   * suite green:
+   *
+   *   A  `if (localKeys.has(k) && !sawLocalBookend && bookends.length === 0)`
+   *   B  setting `sawLocalBookend = true` in the CLOUD arm of the bookend loop
+   *
+   * Both are red now, and their hosted mirrors (the same two mutations on
+   * `cloudTerminalKeys` / `sawCloudBookend`) stay red as they already were.
+   */
+  it("TERM (mixed): a token-BEARING hosted completion beside a token-LESS local terminal counts one of each", () => {
+    const sid = "task:mixed-hosted-bearing";
+    const data: FlowRecord[] = [
+      // The hosted seat: reported usage, so it enters `dcTok`.
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: 5000 } }),
+      // A local `dispatch.map` step's own summary bookend under the same key —
+      // the real producer shape, carrying no endpoint and no token field.
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", handle: "map-local", payload: { step_id: "map-1", kind: "dispatch.map", runtime: "scheduler", result_class: "ok", items_in: 3, ok_count: 3, failed_count: 0 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
+    expect(t.total).toBe(5000);
+    expect(t.cloud).toBe(5000);
+    expect(t.local).toBe(0);
+
+    // THE HERO LINE, pinned as a string rather than described — ACCEPTED, not
+    // fixed, and the distinction matters because it LOOKS like the K2
+    // contradiction pinned a few hundred lines above ("2 local dispatches"
+    // beside LOCAL TOKENS 0).
+    //
+    // K2 is an ATTRIBUTION error: local seats produced real local tokens and
+    // the split credited them to cloud because a `telemetry.tokens` record
+    // names no seat. Here there is nothing to attribute — a LOCAL
+    // `dispatch.map` step's aggregate bookend reports no token total at all
+    // (`stamp_remote_classification` runs only `if endpoint_label.is_some()`,
+    // `crates/darkmux-crew/src/step_kinds/builtins.rs`), so the record
+    // contains zero local tokens to place anywhere. The DISPATCHES line and
+    // the LOCAL TOKENS tile disagree because the PRODUCER emits one and not
+    // the other, not because this function guessed.
+    //
+    // Fixing it here is not available: the two alternatives are to stop
+    // counting the local run (which is the #2709 defect, restored) or to
+    // fabricate a token count (which this function must never do). The real
+    // fix is producer-side — a local map-step aggregate reporting its own
+    // token total — and it is named in savings.ts's module doc. Until then
+    // this under-reports LOCAL tokens, which is the direction this function
+    // is allowed to err in; it never credits hosted spend as local.
+    //
+    // When this assertion starts failing, that decision has changed — update
+    // it deliberately, don't delete it.
+    expect(hybridNote(data, t).text).toBe("1 dispatch local + 1 via cloud. The hybrid loop is humming, keep it up.");
+  });
+
+  /** The mirror, so the two halves of the pair are visibly symmetric rather
+   * than one being covered by accident: a token-BEARING local completion
+   * beside a token-LESS hosted terminal (the usage-omitting
+   * `single_shot.rs:51` shape). Kills the same two mutations applied to
+   * `cloudTerminalKeys` / `sawCloudBookend`. */
+  it("TERM (mixed, mirror): a token-BEARING local completion beside a token-LESS hosted terminal counts one of each", () => {
+    const sid = "task:mixed-local-bearing";
+    const t = tokensOffMeter([
+      rec({ ts: "2026-08-08T00:00:01Z", session_id: sid, action: "dispatch complete", handle: "coder-local", payload: { total_tokens: 5000 } }),
+      rec({ ts: "2026-08-08T00:00:02Z", session_id: sid, action: "dispatch complete", handle: "judge-hosted", payload: { endpoint: AZURE, total_tokens: null } }),
+    ]);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
+    // The local seat's own self-describing payload is the only token count
+    // in the record, and it reads local.
+    expect(t.total).toBe(5000);
+    expect(t.local).toBe(5000);
+    expect(t.cloud).toBe(0);
+  });
 });
 
 /**
@@ -1995,20 +2085,156 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     JSON.parse(readFileSync(path.join(REPO_ROOT, `tests/parity/corpus/${name}.json`), "utf8")) as FlowRecord[];
   const corpus = [...day("flow-yesterday"), ...day("flow-today")];
 
-  it("cloudRuns never decreases across every playhead of the committed two-day corpus", () => {
+  /**
+   * ONE scrub, every field, every playhead. An earlier revision of this
+   * block asserted the token totals at END OF FILE only — the exact
+   * terminal-snapshot shape that let this defect class survive four pull
+   * requests, sitting inside a describe block named for a playhead scrub.
+   * The claim is now encoded where it is made.
+   *
+   * `unknown` is deliberately NOT asserted monotone: an in-flight run's
+   * tokens sit there until its own terminal lands and then move to local or
+   * cloud, so it legitimately falls. Measured on this corpus: 27 of 2,073
+   * positions. The other three never fall.
+   */
+  it("every token field and the cloud run count behave across all 2,073 playheads", () => {
     const heads = [...new Set(corpus.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n)))].sort((a, b) => a - b);
-    expect(heads.length).toBeGreaterThan(2000);
-    let prev = 0;
+    expect(heads.length).toBe(2073);
+    let prevCloudRuns = 0, prevTotal = 0, prevCloud = 0, prevLocal = 0;
+    let unknownDips = 0;
+    let last = tokensOffMeter([]);
     for (const h of heads) {
-      const cr = tokensOffMeter(corpus.filter((r) => T(r.ts) <= h)).cloudRuns;
-      expect(cr).toBeGreaterThanOrEqual(prev);
-      prev = cr;
+      const t = tokensOffMeter(corpus.filter((r) => T(r.ts) <= h));
+      // A cloud dispatch that lands never un-lands. This is #2709 symptom
+      // (b) in its real-data form.
+      expect(t.cloudRuns).toBeGreaterThanOrEqual(prevCloudRuns);
+      // No token ever LEAVES the cloud tile, and none ever leaves `total`
+      // or `local` either — #2709 symptom (c) was a whole run's tokens
+      // dropping out of `total`, which this would have caught at the
+      // playhead it happened rather than at end of file.
+      expect(t.total).toBeGreaterThanOrEqual(prevTotal);
+      expect(t.cloud).toBeGreaterThanOrEqual(prevCloud);
+      expect(t.local).toBeGreaterThanOrEqual(prevLocal);
+      // `local` is the remainder, never a residual that absorbs the
+      // unproven, and the two proven buckets never exceed the whole.
+      expect(t.local).toBe(t.total - t.cloud - t.unknown);
+      expect(t.cloud + t.unknown).toBeLessThanOrEqual(t.total);
+      if (t.unknown < last.unknown) unknownDips++;
+      prevCloudRuns = t.cloudRuns; prevTotal = t.total; prevCloud = t.cloud; prevLocal = t.local;
+      last = t;
     }
-    expect(prev).toBe(3);
+    expect(unknownDips).toBe(27);
+    // And the terminal values, asserted at the end of the SAME loop rather
+    // than in a test of their own. These are byte-identical to the
+    // pre-#2709 shape — measured at every playhead of every committed
+    // corpus, maxCloudGain and maxCloudLoss both 0.
+    expect(last.total).toBe(999248);
+    expect(last.cloud).toBe(396926);
+    expect(last.local).toBe(600113);
+    expect(last.unknown).toBe(2209);
+    expect(last.cloudRuns).toBe(3);
+  });
+
+  /**
+   * (round-2 review restatement) The 40 -> 52 number measures data recorded
+   * BEFORE #1918, which is already on main. `session_id::scope_to_run`
+   * composes the run id into every `task-`/`step-`-prefixed session id at
+   * the launcher, so post-#1918 ids are already run-unique and most of the
+   * recurrence this change corrects cannot occur in new records. Replaying
+   * that transform over this same corpus:
+   *
+   *   as recorded (pre-#1918)   base 40  ->  branch 52   (+12)
+   *   scoped      (post-#1918)  base 50  ->  branch 52   (+2)
+   *   the 24h window the viewer loads   19  ->  19        (0)
+   *
+   * Eleven of the twelve is a retrospective correction for archived data.
+   * Every token field is identical in all three. This test pins both ends of
+   * that so the framing cannot drift back to "a 30% jump in the headline
+   * number", which will not happen on current records.
+   */
+  it("the run-count delta is +12 on pre-#1918 ids and +2 once #1918's scoping is replayed", () => {
+    const scopeToRun = (sid: string, runId: string) =>
+      (sid.startsWith("task-") || sid.startsWith("step-")) && !sid.includes(runId) ? `${sid}-${runId}` : sid;
+    const scoped = corpus.map((r) =>
+      r.session_id && r.mission_id ? { ...r, session_id: scopeToRun(r.session_id, r.mission_id) } : r,
+    );
+    const asRecorded = tokensOffMeter(corpus);
+    const asScoped = tokensOffMeter(scoped);
+    expect(asRecorded.runs).toBe(52);
+    expect(asScoped.runs).toBe(52);
+    // The BASE's own numbers (40 and 50) cannot be asserted from here
+    // without importing the pre-#2709 implementation; what this pins is the
+    // half that belongs to this branch — that scoping the ids changes
+    // nothing about what it reports, which is the claim "#1918 and #2709
+    // agree about what a run is".
+    expect(asScoped.cloudRuns).toBe(asRecorded.cloudRuns);
+    expect(asScoped.unknownRuns).toBe(asRecorded.unknownRuns);
+    expect(asScoped.total).toBe(asRecorded.total);
+    expect(asScoped.cloud).toBe(asRecorded.cloud);
+    expect(asScoped.local).toBe(asRecorded.local);
+    expect(asScoped.unknown).toBe(asRecorded.unknown);
+  });
+
+  /**
+   * (round-2 review) THE CROSS-PRODUCER INVARIANT the run-scoped
+   * double-count guard now depends on, made falsifiable.
+   *
+   * `savings.ts`'s `countTokens` is `!sess.has(k)` where `k` is a RUN key.
+   * Keyed on the bare session id the guard was immune by construction. Keyed
+   * by run it needs a dispatch's `telemetry.tokens` records and that same
+   * dispatch's `dispatch.complete` to carry the SAME `mission_id`, or the
+   * two land under different keys and the completion's totals are added on
+   * top of telemetry that already counted them.
+   *
+   * Half of this test asserts the corpus conforms; half pins what a
+   * violation would COST, so the invariant is a number and not a worry. The
+   * skewed expectations are deliberately the WRONG answer — if a future
+   * change hardens the guard, update them, don't delete them.
+   */
+  it("a dispatch's telemetry and its own completion carry the same mission id — corpus conforms, and the cost if one did not", () => {
+    // Conformance, on real data.
+    const telMissions = new Map<string, Set<string>>();
+    const compMissions = new Map<string, Set<string>>();
+    for (const r of corpus) {
+      if (!r.session_id) continue;
+      const bucket = r.category === "telemetry" && r.source === "tokens" ? telMissions
+        : isDispatchComplete(r.action ?? "") ? compMissions : null;
+      if (!bucket) continue;
+      if (!bucket.has(r.session_id)) bucket.set(r.session_id, new Set());
+      bucket.get(r.session_id)!.add(r.mission_id ?? "<none>");
+    }
+    let skewed = 0;
+    for (const [sid, tm] of telMissions) {
+      const cm = compMissions.get(sid);
+      if (!cm) continue;
+      for (const m of tm) if (!cm.has(m)) { skewed++; break; }
+    }
+    expect(skewed).toBe(0);
+
+    // The cost, measured. One ordinary local dispatch, its telemetry and its
+    // completion reporting the same 4,000 tokens.
+    const SID = "task-skew";
+    const tel = (m: string | undefined, total: number, ts: string): FlowRecord =>
+      rec({ ts, session_id: SID, ...(m ? { mission_id: m } : {}), category: "telemetry", source: "tokens",
+            payload: { turn_seq: 1, prompt_tokens: total, completion_tokens: 0, total_tokens: total } });
+    const comp = (m: string | undefined, total: number, ts: string): FlowRecord =>
+      rec({ ts, session_id: SID, ...(m ? { mission_id: m } : {}), action: "dispatch complete", payload: { total_tokens: total } });
+
+    const aligned = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp("m1", 4000, "2026-08-08T00:00:02Z")]);
+    expect(aligned.total).toBe(4000);
+    expect(aligned.local).toBe(4000);
+    expect(aligned.runs).toBe(1);
+
+    // Same dispatch, mission id present on the telemetry and absent from the
+    // completion. The 4,000 is counted twice and shows as a second run.
+    const skew = tokensOffMeter([tel("m1", 4000, "2026-08-08T00:00:01Z"), comp(undefined, 4000, "2026-08-08T00:00:02Z")]);
+    expect(skew.total).toBe(8000);
+    expect(skew.unknown).toBe(4000);
+    expect(skew.runs).toBe(2);
   });
 
   it("every run key that closed with a dispatch.complete is counted", () => {
-    const key = (r: FlowRecord) => `${r.session_id} ${r.mission_id || ""}`;
+    const key = (r: FlowRecord) => `${r.session_id}\u0000${r.mission_id || ""}`;
     const closed = new Set(corpus.filter((r) => isDispatchComplete(r.action ?? "") && r.session_id).map(key));
     // 50 keys closed; `runs` reported 40 before #2709. The two extra runs
     // are one key holding two token-bearing sibling bookends, plus one
@@ -2018,18 +2244,29 @@ describe("tokensOffMeter — corpus playhead scrub (#2709)", () => {
     expect(t.runs).toBe(52);
     expect(t.unknownRuns).toBe(1);
     expect(t.cloudRuns).toBe(3);
-  });
-
-  it("no token moves onto the cloud tile that the pre-#2709 shape did not already put there", () => {
-    // The token tiles are untouched by this change on real data: `total`,
-    // `cloud`, `local` and `unknown` are identical at every playhead of
-    // every committed corpus (measured), so the terminal values are pinned
-    // here as the cheap standing check.
-    const t = tokensOffMeter(corpus);
-    expect(t.total).toBe(999248);
-    expect(t.cloud).toBe(396926);
-    expect(t.local).toBe(600113);
-    expect(t.unknown).toBe(2209);
+    // (round-2 review note) Which keys the EXTRA LOCAL RUN term actually
+    // adds, counted rather than described: a key whose only local evidence
+    // is a token-LESS completion. Twelve of the sixteen are `dispatch.map`
+    // step AGGREGATES that fanned out to 3, 8 or 21 real seat calls each.
+    // So "every key that closed is a run" counts dispatches at the STEP
+    // grain, not model calls — for those keys one run stands for many
+    // calls. Base counted the HOSTED ones on exactly those terms already;
+    // this change makes the local ones visible on the same terms.
+    const tokenLessLocalKeys = new Set(
+      corpus
+        .filter((r) => {
+          if (!r.session_id || !isDispatchComplete(r.action ?? "")) return false;
+          const p = (r.payload ?? {}) as Record<string, unknown>;
+          if (p.endpoint) return false;
+          return !(p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens);
+        })
+        .map(key),
+    );
+    expect(tokenLessLocalKeys.size).toBe(16);
+    const mapAggregates = [...tokenLessLocalKeys].filter((k) =>
+      corpus.some((r) => key(r) === k && ((r.payload ?? {}) as Record<string, unknown>).kind === "dispatch.map"),
+    );
+    expect(mapAggregates.length).toBe(12);
   });
 });
 
