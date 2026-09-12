@@ -1897,9 +1897,11 @@ const MAX_REJECTION_REASONS: usize = 3;
 /// non-whitespace blank-rendering characters ([`is_stripped_for_display`]),
 /// not this width bound — see those functions' docs. The FLUSH-LEFT rows
 /// are closed separately, at the render site, by
-/// [`format_rejection_reasons_as_indented_lines`] (#2196 fix-round 3,
-/// MUST FIX G); no sanitizer can close those, because what makes them
-/// forgeable is the row's wrap point, which the sanitizer cannot see. The
+/// [`rejection_reason_display_lines`] and its wrappers (#2196 fix-rounds
+/// 3 and 4, MUST FIX G — `flow status`, then `doctor` and the delivery
+/// stderr warning); no sanitizer can close those, because what makes
+/// them forgeable is the row's wrap point, which the sanitizer cannot
+/// see. The
 /// bound below exists to cap payload size and keep a report from an
 /// actively hostile receiver bounded, not to defeat forgery.
 ///
@@ -1909,7 +1911,7 @@ const MAX_REJECTION_REASONS: usize = 3;
 /// bounding an actively hostile receiver's payload. [`REJECTION_REASON_TAIL_RESERVE`]
 /// documents how the budget splits between a head and a tail when a
 /// reason IS long enough to need cutting.
-pub(crate) const MAX_REJECTION_REASON_DISPLAY_WIDTH: usize = 120;
+pub const MAX_REJECTION_REASON_DISPLAY_WIDTH: usize = 120;
 
 /// The two literal `"` characters [`format_rejection_reasons_for_display`]
 /// always wraps a reason in, reserved out of [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]
@@ -2140,9 +2142,16 @@ fn is_stripped_for_display(c: char) -> bool {
 /// [`is_stripped_for_display`] names — see that function's doc for the
 /// category-level check plus the two small closed exceptions Unicode's
 /// category system can't express. The result is also passed through
-/// [`collapse_whitespace_and_trim`], which is what actually defeats the
-/// exact-vocabulary row forgery — see [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s
-/// doc.
+/// [`collapse_whitespace_and_trim`], which defeats the exact-vocabulary
+/// forgery of an INDENTED row — and only that. (#2196 fix-round 4) An
+/// earlier revision of this line said it "actually defeats the
+/// exact-vocabulary row forgery", full stop, which was the same
+/// overstatement the whole premise rested on: all three surfaces that
+/// render this text have FLUSH-LEFT rows the whitespace collapse cannot
+/// protect (`flow status` has eight, `doctor` three, and every one of
+/// this module's sixteen stderr rows). Those are closed at their render
+/// sites instead, by [`rejection_reason_display_lines`] and its two
+/// wrappers — see [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s doc.
 fn sanitize_reason_text(s: &str) -> String {
     let filtered: String = s.chars().filter(|c| !is_stripped_for_display(*c)).collect();
     strip_leading_zero_width(&collapse_whitespace_and_trim(&filtered))
@@ -2254,6 +2263,16 @@ fn collapse_whitespace_and_trim(s: &str) -> String {
 /// list for why that matters here.
 fn display_width(c: char) -> usize {
     unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Rendered column width of a whole string (see [`display_width`]).
+///
+/// Exported so a consumer in another crate can assert the geometry of a
+/// row it prints WITHOUT taking its own `unicode-width` dependency — the
+/// width question has exactly one answer in this workspace, and a second
+/// dependency edge would be a second place for it to drift.
+pub fn display_columns(s: &str) -> usize {
+    s.chars().map(display_width).sum()
 }
 
 /// Truncate already-SANITIZED text `s` to at most `budget` rendered
@@ -2471,7 +2490,7 @@ pub fn format_rejection_reasons_for_display(reasons: &[String]) -> String {
 /// narrowest width anyone actually reviews `flow status` at; a terminal
 /// narrower than that wraps darkmux's own rows too, so the forged row
 /// stops being distinguishable from ordinary damage.
-pub(crate) const REJECTION_REASON_MIN_TERMINAL_WIDTH: usize = 60;
+pub const REJECTION_REASON_MIN_TERMINAL_WIDTH: usize = 60;
 
 /// (#2196 fix-round 3, MUST FIX G) Columns of indent every line
 /// [`format_rejection_reasons_as_indented_lines`] emits carries. Deeper
@@ -2519,16 +2538,52 @@ pub(crate) const REJECTION_REASON_LINE_INDENT: usize = 8;
 /// reason stays readable while an adversarial one is still bounded.
 pub fn format_rejection_reasons_as_indented_lines(reasons: &[String]) -> Vec<String> {
     let indent = " ".repeat(REJECTION_REASON_LINE_INDENT);
-    // The `- 1` keeps a full line one column SHORT of the narrowest
-    // supported width: terminals disagree about whether a line that
-    // exactly fills the last column wraps immediately or defers, and the
-    // guarantee should not depend on which behavior the operator's
-    // terminal picked.
-    let content_budget = REJECTION_REASON_MIN_TERMINAL_WIDTH - REJECTION_REASON_LINE_INDENT - 1;
-    wrap_to_display_width(&format_rejection_reasons_for_display(reasons), content_budget)
+    rejection_reason_display_lines(reasons, REJECTION_REASON_LINE_INDENT)
         .into_iter()
         .map(|line| format!("{indent}{line}"))
         .collect()
+}
+
+/// (#2196 fix-round 4) Columns of prefix `darkmux doctor` puts in front
+/// of a hint line — `"        \u{2192} "`, eight spaces plus the arrow plus a
+/// space, matching `render_check_block`'s own `HINT_HEAD`. A hint
+/// CONTINUATION is padded to the same width, so every line of a hint is
+/// indented by exactly this much.
+pub const REJECTION_REASON_HINT_INDENT: usize = 10;
+
+/// Never wrap receiver text below this many columns, however deep the
+/// caller's prefix. A budget near zero would emit one character per line
+/// — technically bounded, useless to read — so a caller whose prefix
+/// leaves no room gets a line that is wider than the minimum terminal
+/// width instead of a column of confetti. No caller in this workspace is
+/// anywhere near it (the deepest prefix is doctor's 10), and a future one
+/// that is has a layout problem this function cannot fix for it.
+const REJECTION_REASON_MIN_CONTENT_BUDGET: usize = 20;
+
+/// (#2196 fix-round 4) The receiver's rejection reasons, rendered and
+/// wrapped to lines that fit UNDER [`REJECTION_REASON_MIN_TERMINAL_WIDTH`]
+/// once the caller's own `prefix_columns` of indentation go in front of
+/// them. Returned WITHOUT that prefix, because the two consumers attach
+/// it differently: `flow status` prepends spaces itself
+/// ([`format_rejection_reasons_as_indented_lines`]), while `doctor` hands
+/// the lines to its own hint renderer, which supplies `"        \u{2192} "`
+/// for the first and ten spaces for the rest.
+///
+/// Taking the prefix as a parameter is what makes the guarantee travel.
+/// The budget is a property of the FINISHED line, not of this function,
+/// so a helper that hard-coded one indent would silently over-run for any
+/// caller that indents deeper — and the whole defense is that no printed
+/// line reaches the minimum terminal width.
+///
+/// The `+ 1` keeps a full line one column SHORT of that width: terminals
+/// disagree about whether a line that exactly fills the last column wraps
+/// immediately or defers, and the guarantee should not depend on which
+/// behavior the operator's terminal happens to have.
+pub fn rejection_reason_display_lines(reasons: &[String], prefix_columns: usize) -> Vec<String> {
+    let content_budget = REJECTION_REASON_MIN_TERMINAL_WIDTH
+        .saturating_sub(prefix_columns + 1)
+        .max(REJECTION_REASON_MIN_CONTENT_BUDGET);
+    wrap_to_display_width(&format_rejection_reasons_for_display(reasons), content_budget)
 }
 
 /// Greedy word wrap of `s` to at most `budget` rendered columns per line
@@ -2569,6 +2624,41 @@ fn wrap_to_display_width(s: &str, budget: usize) -> Vec<String> {
     if !cur.is_empty() {
         lines.push(cur);
     }
+    lines
+}
+
+/// (#2196 fix-round 4, MUST FIX G at the stderr surface) The lines the
+/// delivery path writes to stderr when a receiver accepts the request but
+/// reports rejecting records inside it.
+///
+/// A `Vec` of whole lines rather than one interpolated string, for the
+/// same reason `flow status` stopped rendering the reason inline: the
+/// reason used to sit in the middle of a single line that no code
+/// bounded, so the terminal wrapped it and the continuation began at
+/// column 0.
+///
+/// This surface's row inventory is the shortest of the three, and it
+/// makes the fix stronger here than anywhere else: **every** line this
+/// module writes to stderr is flush-left and begins with the literal
+/// `flow::HookSink: ` — 16 sites, ZERO indented ones. So an indented line
+/// cannot be mistaken for a darkmux row no matter what it says, and the
+/// defense needs no vocabulary list at all. It also needed the fix most:
+/// unlike `doctor`, nothing here caps the line's width, so the inline
+/// form wrapped on EVERY terminal rather than only on one narrower than
+/// the renderer assumed.
+///
+/// Split out as a pure function so the geometry is testable without
+/// capturing a process's stderr — the behavior under test is the shape of
+/// the lines, not the IO.
+fn receiver_rejection_stderr_lines(url: &str, n: u64, total: u64, reasons: &[String]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "flow::HookSink: receiver at {url} accepted the request but rejected {n} record(s) inside it \
+         ({total} so far) — see hook.fired.receiver_rejected"
+    )];
+    // Empty in, nothing out: `format_rejection_reasons_as_indented_lines`
+    // yields no lines for no reasons, so a rejection the receiver gave no
+    // reason for prints exactly the one header line it always did.
+    lines.extend(format_rejection_reasons_as_indented_lines(reasons));
     lines
 }
 
@@ -3477,20 +3567,20 @@ fn drainer_loop(
                     if let Some(n) = rejected_for_status {
                         let total =
                             add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
-                        let reasons_note = if reasons_for_status.is_empty() {
-                            String::new()
-                        } else {
-                            // (#2196 fix-round MUST FIX 1) Quoted +
-                            // re-sanitized via `format_rejection_reasons_for_display`
-                            // — this string reaches a real terminal via
-                            // `eprintln!`, the same surface `flow status`
-                            // and `doctor` render to.
-                            format!(" — {}", format_rejection_reasons_for_display(&reasons_for_status))
-                        };
-                        eprintln!(
-                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it ({total} so far){reasons_note} — see hook.fired.receiver_rejected",
-                            rt.rule.url
-                        );
+                        // (#2196 fix-round MUST FIX 1) Quoted +
+                        // re-sanitized; (#2196 fix-round 4, MUST FIX G)
+                        // and on its own INDENTED line(s) rather than
+                        // inline, because this string reaches a real
+                        // terminal, the same as `flow status` and
+                        // `doctor` — see `receiver_rejection_stderr_lines`.
+                        for line in receiver_rejection_stderr_lines(
+                            &rt.rule.url,
+                            n,
+                            total,
+                            &reasons_for_status,
+                        ) {
+                            eprintln!("{line}");
+                        }
                     }
                     emit_hook_record_with(
                         report_sink.as_ref(),
@@ -7588,6 +7678,161 @@ mod tests {
         let decomposed = "cafe\u{0301} is not a valid value";
         let rendered = format_rejection_reasons_for_display(&[decomposed.to_string()]);
         assert_eq!(rendered, format!("\"{decomposed}\""), "{rendered:?}");
+    }
+
+    /// (#2196 fix-round 4) Every line this module writes to stderr,
+    /// enumerated: **16 `eprintln!` sites, all FLUSH LEFT, every one
+    /// beginning with the literal `flow::HookSink: `, and ZERO indented
+    /// ones.** That inventory is what makes this surface's defense the
+    /// simplest of the three — an indented line cannot be mistaken for a
+    /// darkmux row whatever it says, so no vocabulary list is needed.
+    ///
+    /// The `{}`-bearing prefixes, verbatim, as the forgery payloads.
+    const STDERR_ROWS: &[&str] = &[
+        "flow::HookSink: receiver at ",
+        "flow::HookSink: failed to persist ",
+        "flow::HookSink: failed to write last-status ",
+        "flow::HookSink: failed to write cursor-write status ",
+        "flow::HookSink: failed to quarantine invalid outbox line into ",
+        "flow::HookSink: failed to open quarantine file ",
+        "flow::HookSink: outbox compaction failed for ",
+        "flow::HookSink: try_post refusing to send — URL failed re-validation: ",
+        "flow::HookSink: rule #0 failed to persist delivery cursor to ",
+        "flow::HookSink: failed to emit hook.dry_run: ",
+        "flow::HookSink: failed to emit hook.failed (dropped-append warning): ",
+        "flow::HookSink: failed to emit hook.failed (busy warning): ",
+        "flow::HookSink: file-transport write to ",
+        "flow::HookSink: failed to check/fix trailing newline on ",
+        "flow::HookSink: rule #0 disabled — its `transform` failed to load; the rest of the sink still works: ",
+        "flow::HookSink: rule #0 outbox append failed: ",
+    ];
+
+    /// Simulate a terminal `width` columns wide wrapping `lines`, and
+    /// return every VISUAL line that is a CONTINUATION.
+    fn stderr_wrapped_continuations(lines: &[String], width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in lines {
+            let chars: Vec<char> = line.chars().collect();
+            let mut start = width;
+            while start < chars.len() {
+                out.push(chars[start..].iter().take(width).collect::<String>());
+                start += width;
+            }
+        }
+        out
+    }
+
+    /// (#2196 fix-round 4, MUST FIX G at the stderr surface) The delivery
+    /// warning used to carry the receiver's reason INLINE in one long
+    /// line that nothing bounded — no `output_width()` cap, no wrap of
+    /// its own — so it wrapped on EVERY terminal, not merely one narrower
+    /// than a renderer assumed, and the continuation began at column 0
+    /// where all 16 of this module's stderr rows live.
+    ///
+    /// SELF-PROVING, the same shape as the `flow status` and `doctor`
+    /// tests: for each row and width it first SEARCHES for a filler that
+    /// makes the forgery genuinely land at column 0 in the INLINE form,
+    /// asserts at least one exists, then asserts the shipped builder
+    /// produces no such continuation at any width.
+    ///
+    /// Red-proves by name: replace `receiver_rejection_stderr_lines`'s
+    /// body with the pre-fix single interpolated line and the post-fix
+    /// assertion fails on every pair the precondition found.
+    #[test]
+    fn stderr_rejection_warning_cannot_forge_a_flow_hooksink_row() {
+        let widths = [60usize, 72, 80, 100, 120];
+        let url = "http://127.0.0.1:8790/events";
+        let mut proven: Vec<(String, usize, usize)> = Vec::new();
+
+        // The pre-fix shape, reconstructed from the shipped header so it
+        // stays correct as the surrounding wording evolves.
+        let inline = |reason: &String| -> Vec<String> {
+            let header = receiver_rejection_stderr_lines(url, 1, 1, &[]).remove(0);
+            vec![format!("{header} — {}", format_rejection_reasons_for_display(std::slice::from_ref(reason)))]
+        };
+
+        for row in STDERR_ROWS {
+            // Matched on the TRIMMED prefix: `collapse_whitespace_and_trim`
+            // strips a reason's trailing space, so a payload ending in one
+            // never survives verbatim. Trimming here keeps the forgery
+            // honest — the row is still recognizable without its trailing
+            // space, and demanding the space would have made every pair
+            // look unforgeable for a reason that has nothing to do with
+            // the defense.
+            let row = row.trim_end();
+            for width in widths {
+                let max_filler = MAX_REJECTION_REASON_DISPLAY_WIDTH.saturating_sub(row.chars().count() + 3);
+                for filler in 0..=max_filler {
+                    let reason = format!("{} {row}", "z".repeat(filler));
+                    if stderr_wrapped_continuations(&inline(&reason), width).iter().any(|c| c.starts_with(row)) {
+                        proven.push((row.to_string(), width, filler));
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !proven.is_empty(),
+            "the precondition found no forgeable (row, width, filler) at all — this test would prove nothing"
+        );
+        println!("stderr inline forgeries proven (row, terminal width, filler): {} pairs", proven.len());
+
+        for (row, _width, filler) in &proven {
+            let reason = format!("{} {row}", "z".repeat(*filler));
+            let lines = receiver_rejection_stderr_lines(url, 1, 1, std::slice::from_ref(&reason));
+            for w in widths {
+                for continuation in stderr_wrapped_continuations(&lines, w) {
+                    for candidate in STDERR_ROWS {
+                        assert!(
+                            !continuation.starts_with(candidate.trim_end()),
+                            "width {w}: a wrapped continuation forges the stderr row {candidate:?} \
+                             (row {row:?}, filler {filler}): {continuation:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// (#2196 fix-round 4, the mechanism asserted independently of any
+    /// forged vocabulary) Every stderr line carrying receiver text is
+    /// indented and strictly under the narrowest supported terminal
+    /// width; the HEADER line, which is darkmux's own words only, is the
+    /// inverted case — it stays flush-left, as all 16 rows here do.
+    ///
+    /// Red-proves by name: revert `receiver_rejection_stderr_lines` to
+    /// the single interpolated line and the indent assertion fails.
+    #[test]
+    fn every_stderr_reason_line_is_indented_and_narrower_than_the_supported_width() {
+        let url = "http://127.0.0.1:8790/events";
+        for reason in [
+            "q".repeat(400),
+            "漢".repeat(200),
+            "payload field \"file\" must be a non-empty string".to_string(),
+        ] {
+            let lines = receiver_rejection_stderr_lines(url, 1, 1, std::slice::from_ref(&reason));
+            assert!(
+                lines[0].starts_with("flow::HookSink: receiver at "),
+                "the header must stay flush-left and keep its row vocabulary: {:?}",
+                lines[0]
+            );
+            assert!(lines.len() > 1, "the reason must actually produce its own line(s): {lines:?}");
+            for line in &lines[1..] {
+                assert!(line.starts_with("        "), "stderr reason line is not indented: {line:?}");
+                let w = display_columns(line);
+                assert!(
+                    w < REJECTION_REASON_MIN_TERMINAL_WIDTH,
+                    "stderr reason line is {w} columns, must stay under {}: {line:?}",
+                    REJECTION_REASON_MIN_TERMINAL_WIDTH
+                );
+            }
+        }
+
+        // Inverted case: no reasons means no extra lines at all, so a
+        // rejection the receiver gave no reason for still prints exactly
+        // the one warning line it always did.
+        assert_eq!(receiver_rejection_stderr_lines(url, 1, 1, &[]).len(), 1);
     }
 
     /// (#2196 fix-round MUST FIX 3) A receiver answering `"rejected": 0`

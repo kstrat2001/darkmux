@@ -2116,6 +2116,12 @@ fn build_hooks_check(
 
     for s in &summaries {
         let mut flags = Vec::new();
+        // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
+        // receiver's own reason text NEVER joins `message`. It rides
+        // these pre-bounded hint lines instead — see the `receiver_rejected_total`
+        // block below for why, and `darkmux_flow::hooks::rejection_reason_display_lines`
+        // for the budget.
+        let mut reason_hint_lines: Vec<String> = Vec::new();
         let mut rule_status = Status::Pass;
         if s.is_empty_match {
             flags.push("EMPTY MATCH — matches nothing".to_string());
@@ -2200,21 +2206,46 @@ fn build_hooks_check(
         // Describing only, per this project's stance: names the count and
         // the actor, never characterizes the receiver as misconfigured.
         if s.receiver_rejected_total > 0 {
+            // (#2196) The receiver's own stated reason(s) for that last
+            // rejection, when its body carried any — the count alone
+            // tells an operator SOMETHING was thrown away, never WHY, so
+            // this is what saves a replay against a scratch receiver or a
+            // trip through the receiver's own log to find out.
+            //
+            // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
+            // reason text is deliberately NOT interpolated into
+            // `message`, which is where it lived through fix-round 3.
+            // Two independent reasons, both structural:
+            //
+            //  * `message` is word-wrapped by `render_check_block` to
+            //    `output_width()` and its CONTINUATIONS are indented —
+            //    but `output_width()` reads `COLUMNS`, and `COLUMNS` is
+            //    not exported to child processes by zsh or bash
+            //    (measured). So doctor renders at its 100-column DEFAULT
+            //    however wide the operator's terminal really is, the
+            //    terminal re-wraps every line past its own width, and the
+            //    continuation lands at column 0 — where doctor's three
+            //    flush-left rows live (the `darkmux doctor — N checks`
+            //    header, the `●` verdict banner, and the summary). Proven
+            //    against the real renderer: a receiver could put
+            //    `● ok — every check passed` at column 0 of a 60-column
+            //    terminal, under a genuine `broken` banner.
+            //  * `verdict_banner_at` quotes the worst check's whole
+            //    `message` onto a FLUSH-LEFT line of its own. Anything in
+            //    `message` is one status away from being printed at
+            //    column 0 with no indent at all.
+            //
+            // The hint path has neither problem: every hint line is
+            // printed behind `"        → "` or ten spaces, and the lines
+            // below are pre-bounded so the finished row stays under the
+            // narrowest supported terminal width.
             let last_clause = match s.last_receiver_rejected {
-                // (#2196) The receiver's own stated reason(s) for that
-                // last rejection, when its body carried any — the count
-                // alone tells an operator SOMETHING was thrown away,
-                // never WHY, so this is what saves a replay against a
-                // scratch receiver or a trip through the receiver's own
-                // log to find out.
-                // (#2196 fix-round MUST FIX 1) Quoted + re-sanitized —
-                // see `darkmux_flow::hooks::format_rejection_reasons_for_display`'s
-                // doc for why this isn't a bare `.join("; ")`.
                 Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
-                    format!(
-                        "; {n} on the last delivery ({})",
-                        darkmux_flow::hooks::format_rejection_reasons_for_display(&s.last_receiver_rejected_reasons)
-                    )
+                    reason_hint_lines = darkmux_flow::hooks::rejection_reason_display_lines(
+                        &s.last_receiver_rejected_reasons,
+                        darkmux_flow::hooks::REJECTION_REASON_HINT_INDENT,
+                    );
+                    format!("; {n} on the last delivery — the receiver's reason(s) below")
                 }
                 Some(n) => format!("; {n} on the last delivery"),
                 None => String::new(),
@@ -2315,10 +2346,30 @@ fn build_hooks_check(
             name: format!("hooks.rule.{}", s.index),
             status: rule_status,
             message,
-            hint: if flags.is_empty() {
-                None
-            } else {
-                Some("Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).".into())
+            hint: {
+                // (#2196 fix-round 4) The receiver's quoted reason(s)
+                // ride here as their own lines, ahead of the config
+                // remedy — they are EVIDENCE, and an operator reading a
+                // rejection wants the receiver's words before any advice
+                // about the local config. Each line is already bounded so
+                // that doctor's hint prefix plus the line stays under the
+                // narrowest supported terminal width; doctor's own
+                // `wrap_hanging` only ever narrows a line further, so the
+                // bound survives whatever `output_width()` resolves to.
+                let mut hint_lines: Vec<String> = Vec::new();
+                if !reason_hint_lines.is_empty() {
+                    hint_lines.push("the receiver's stated reason(s) for the last rejection:".into());
+                    hint_lines.extend(reason_hint_lines.iter().cloned());
+                }
+                if !flags.is_empty() {
+                    hint_lines
+                        .push("Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).".into());
+                }
+                if hint_lines.is_empty() {
+                    None
+                } else {
+                    Some(hint_lines.join("\n"))
+                }
             },
         });
     }
@@ -7029,6 +7080,241 @@ mod tests {
         );
     }
 
+    /// (#2196 fix-round 4) Every line `print_report` emits FLUSH LEFT
+    /// (column 0). Derived by enumerating every `println!` in that
+    /// function plus the two it delegates to (`render_check_block`,
+    /// `verdict_banner_at`); there are exactly THREE shapes, against
+    /// four indented ones.
+    ///
+    /// | Row | Column |
+    /// |---|---|
+    /// | `darkmux doctor — {n} checks` (header) | 0 |
+    /// | `● ok …` / `● needs attention — …` / `● broken — …` (verdict banner) | 0 |
+    /// | `all {n} checks passed…` / `{n} pass, {m} warn — workable but worth a look` / `{n} pass, {m} warn, {k} fail — fix failures before running darkmux end-to-end` (summary) | 0 |
+    /// | `  {marker} {name:<22} {message}` (check first line) | 2 |
+    /// | message continuation | `head` (>= 27) |
+    /// | `        → {hint}` (hint first line) | 8 |
+    /// | hint continuation | 10 |
+    ///
+    /// The verdict banner and the summary are the two that matter: the
+    /// banner is the FIRST line an operator reads and the summary is the
+    /// LAST, and between them they are the whole verdict. A forged
+    /// `"33 pass, 2 warn — workable but worth a look"` under a genuine
+    /// `broken` banner is a receiver telling the operator the machine is
+    /// fine.
+    const DOCTOR_FLUSH_LEFT_ROWS: &[&str] =
+        &["darkmux doctor —", "● ok", "● needs attention —", "● broken —", "all ", " pass, "];
+
+    /// The forgery payloads: the verbatim vocabulary of doctor's three
+    /// flush-left row shapes, each sized to a plausible whole row.
+    const DOCTOR_FORGERY_PAYLOADS: &[&str] = &[
+        "33 pass, 2 warn — workable but worth a look",
+        "● needs attention — everything looks fine here",
+        "● ok — every check passed",
+        "darkmux doctor — 35 checks",
+        "all 35 checks passed",
+    ];
+
+    /// Simulate a terminal `width` columns wide wrapping `lines`, and
+    /// return every VISUAL line that is a CONTINUATION — the only lines
+    /// receiver text can reach column 0 through.
+    fn doctor_wrapped_continuations(lines: &[String], width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in lines {
+            let visible = strip_ansi(line);
+            let chars: Vec<char> = visible.chars().collect();
+            let mut start = width;
+            while start < chars.len() {
+                out.push(chars[start..].iter().take(width).collect::<String>());
+                start += width;
+            }
+        }
+        out
+    }
+
+    /// Render `hooks.rule.0`'s check block for a receiver rejection whose
+    /// reason is `reason`, at doctor's REAL default render width.
+    ///
+    /// 100 is not an arbitrary fixture choice: `output_width()` reads
+    /// `COLUMNS`, and **`COLUMNS` is not exported to child processes** by
+    /// either zsh or bash on this machine (measured —
+    /// `zsh -i -c 'printenv COLUMNS'` exits 1, as do the bash form and
+    /// this process's own environment). So `darkmux doctor` run from an
+    /// ordinary shell falls through to the 100-column default however
+    /// wide the operator's terminal actually is, which is exactly the
+    /// mismatch the forgery needs: on an 80-column terminal doctor emits
+    /// lines up to 100 columns and the terminal wraps them.
+    fn doctor_rejection_check(reason: &str) -> Check {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (rule_cfg, key) = rejection_fixture_rule();
+        let rules = vec![rule_cfg];
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            serde_json::json!({
+                "ts": "2026-01-01T00:00:00Z",
+                "ok": true,
+                "last_receiver_rejected": 1,
+                "last_receiver_rejected_reasons": [reason],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        checks.into_iter().find(|c| c.name == "hooks.rule.0").unwrap()
+    }
+
+    fn doctor_rejection_block(reason: &str) -> Vec<String> {
+        render_check_block(&doctor_rejection_check(reason), 100)
+    }
+
+    /// The pre-fix INLINE rendering, reconstructed against the REAL rule
+    /// message rather than a synthetic stand-in.
+    ///
+    /// Reconstructed rather than hard-coded on purpose: a hand-copied
+    /// replica of the old message would drift the moment the surrounding
+    /// text changed, and the filler search would then be tuning against a
+    /// line the renderer never produced — the precondition would still
+    /// "pass" while proving nothing about the real surface. Taking the
+    /// live check and putting the quoted reason back into its `message`
+    /// reproduces the pre-fix geometry and stays correct as the message
+    /// around it evolves.
+    fn doctor_inline_block(reason: &str) -> Vec<String> {
+        let live = doctor_rejection_check(reason);
+        let quoted =
+            darkmux_flow::hooks::format_rejection_reasons_for_display(std::slice::from_ref(&reason.to_string()));
+        render_check_block(
+            &Check { message: format!("{} ({quoted})", live.message), ..live },
+            100,
+        )
+    }
+
+    /// (#2196 fix-round 4) `doctor` is the surface an operator reads to
+    /// decide whether the system is HEALTHY, which makes a forged row
+    /// here worth more to an attacker than any row in `flow status`.
+    ///
+    /// SELF-PROVING, the same shape as
+    /// `flow_status_reason_cannot_forge_a_flush_left_row`: it first
+    /// SEARCHES for a (payload, width, filler) combination that makes the
+    /// forgery genuinely land at column 0 in the INLINE form, asserts at
+    /// least one exists — then asserts the SHIPPED renderer produces no
+    /// such continuation for any of them.
+    ///
+    /// The search is what makes the precondition honest. Doctor's layout
+    /// is `"  {marker} {name:<22} {message}"` word-wrapped at 100, so the
+    /// column a payload lands on is not something a fixture can assume;
+    /// it has to be found. A fixture that guessed wrong would pass while
+    /// proving nothing — the exact failure this PR already made once in
+    /// `status.rs`.
+    ///
+    /// Not every pair is forgeable, and the reason is structural: doctor
+    /// caps its OWN lines at `output_width()`, so the continuation window
+    /// a terminal `w` columns wide exposes is only `output_width() - w`
+    /// columns. At the measured default of 100 that is 40 columns on a
+    /// 60-column terminal and 20 on an 80-column one — too narrow for the
+    /// 43-column summary row, wide enough for a verdict banner. The
+    /// search records which pairs are real rather than assuming a grid.
+    ///
+    /// Red-proves by name: put the quoted reason back into the rule
+    /// check's `message` (the `last_clause` that carried
+    /// `format_rejection_reasons_for_display` before this fix) and the
+    /// post-fix assertion fails on every pair the precondition found.
+    #[test]
+    fn doctor_reason_cannot_forge_a_flush_left_row() {
+        let widths = [60usize, 72, 80, 100, 120];
+        let mut proven: Vec<(String, usize, usize)> = Vec::new();
+
+        for payload in DOCTOR_FORGERY_PAYLOADS {
+            for width in widths {
+                // The sanitizer bounds a reason to 118 columns, so a
+                // filler past that destroys the payload rather than
+                // placing it — search only the range that can actually
+                // carry a whole payload.
+                let max_filler =
+                    darkmux_flow::hooks::MAX_REJECTION_REASON_DISPLAY_WIDTH.saturating_sub(payload.chars().count() + 3);
+                for filler in 0..=max_filler {
+                    let reason = format!("{} {payload}", "z".repeat(filler));
+                    if doctor_wrapped_continuations(&doctor_inline_block(&reason), width)
+                        .iter()
+                        .any(|c| c.starts_with(payload))
+                    {
+                        proven.push(((*payload).to_string(), width, filler));
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !proven.is_empty(),
+            "the precondition found no forgeable (payload, width, filler) at all — this test would prove nothing"
+        );
+        println!("doctor inline forgeries proven (payload, terminal width, filler): {proven:#?}");
+
+        // Every combination the precondition PROVED must now be closed by
+        // the shipped renderer — and not merely for its own payload: no
+        // continuation may begin with ANY of doctor's flush-left rows.
+        for (payload, _width, filler) in &proven {
+            let reason = format!("{} {payload}", "z".repeat(*filler));
+            let block = doctor_rejection_block(&reason);
+            for w in widths {
+                for continuation in doctor_wrapped_continuations(&block, w) {
+                    for row in DOCTOR_FLUSH_LEFT_ROWS {
+                        assert!(
+                            !continuation.starts_with(row),
+                            "width {w}: a wrapped continuation forges doctor's flush-left row {row:?} \
+                             (payload {payload:?}, filler {filler}): {continuation:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// (#2196 fix-round 4, the mechanism asserted independently of any
+    /// forged vocabulary) Every line doctor emits that carries
+    /// receiver-controlled text must be BOTH indented and strictly
+    /// narrower than the narrowest supported terminal width — so a row a
+    /// future revision adds is closed by construction rather than by
+    /// matching a string.
+    ///
+    /// Red-proves by name: put the reason back in `message` and the
+    /// indent assertion fails (doctor's first check line starts at column
+    /// 2 with the marker, not at the reason's indent); widen
+    /// `REJECTION_REASON_HINT_CONTENT_BUDGET` past 49 and the
+    /// strict-inequality assertion fails at 60 columns.
+    #[test]
+    fn every_doctor_reason_line_is_indented_and_narrower_than_the_supported_width() {
+        // Three shapes at once: an unbroken run with no wrap opportunity,
+        // wide (2-column) characters, and a realistic multi-word reason.
+        let reasons =
+            ["q".repeat(400), "漢".repeat(200), "payload field \"file\" must be a non-empty string".to_string()];
+        let min_width = darkmux_flow::hooks::REJECTION_REASON_MIN_TERMINAL_WIDTH;
+
+        for reason in reasons {
+            let block = doctor_rejection_block(&reason);
+            let mut reason_lines = 0usize;
+            for line in &block {
+                let visible = strip_ansi(line);
+                // The reason lines are exactly the ones carrying a quote —
+                // `format_rejection_reasons_for_display` always quotes, and
+                // no other row in this block emits one.
+                if !visible.contains('"') {
+                    continue;
+                }
+                reason_lines += 1;
+                assert!(
+                    visible.starts_with("        "),
+                    "doctor reason line is not indented: {visible:?}"
+                );
+                let w = darkmux_flow::hooks::display_columns(&visible);
+                assert!(w < min_width, "doctor reason line is {w} columns, must stay under {min_width}: {visible:?}");
+            }
+            assert!(reason_lines > 0, "the fixture must actually produce reason lines: {block:?}");
+        }
+    }
+
     /// One `HookRule` plus its `rule_key`, for the receiver-rejection
     /// fixtures below — all three stage sidecar files by hand under a
     /// tempdir standing in for the outbox dir.
@@ -7105,10 +7391,38 @@ mod tests {
         // internal `"` backslash-escaped, and — since 47 columns is well
         // under the fix-round-2 budget of 118 — surviving WHOLE rather
         // than losing the word "string" to the old 40-column cap.
+        //
+        // (#2196 fix-round 4, MUST FIX G at the doctor surface) The
+        // reason moved OUT of `message` and into the HINT. `message` is
+        // word-wrapped to `output_width()` and re-quoted whole by the
+        // flush-left verdict banner, both of which put receiver text at
+        // column 0; the hint path is indented on every line. The
+        // DISCLOSURE is unchanged — same text, same quoting, same
+        // escaping — so both halves are asserted: the count still names
+        // the rejection on `message`, and the receiver's words are still
+        // present, now on the hint.
         assert!(
-            rule.message.contains("\"payload field \\\"file\\\" must be a non-empty string\""),
-            "the receiver's own reason must be named, not just the count: {}",
+            rule.message.contains("1 on the last delivery"),
+            "the count must still ride the message: {}",
             rule.message
+        );
+        assert!(
+            !rule.message.contains("payload field"),
+            "receiver text must NOT ride the message any more: {}",
+            rule.message
+        );
+        let hint = rule.hint.as_deref().unwrap_or_default();
+        // Rejoined before matching: the hint carries the reason as its
+        // own WRAPPED lines (bounded so doctor's hint prefix plus the
+        // line stays under the narrowest supported terminal width), so
+        // the text is complete but not contiguous. Asserting on the
+        // rejoined form proves the disclosure survived the move whole —
+        // asserting on a raw substring would only prove where the wrap
+        // happened to fall.
+        let rejoined = hint.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            rejoined.contains("\"payload field \\\"file\\\" must be a non-empty string\""),
+            "the receiver's own reason must still be named, quoted and escaped: {hint}"
         );
     }
 
