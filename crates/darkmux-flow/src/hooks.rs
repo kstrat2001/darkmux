@@ -640,6 +640,17 @@ struct LastStatus {
     /// written before this field existed, defaults to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_receiver_rejected: Option<u64>,
+    /// (#2196) The receiver's own `results[].error` text for the LAST
+    /// successful delivery's rejected record(s) — CONTEXT alongside
+    /// `last_receiver_rejected`, same last-value shape and same erasure
+    /// caveat (a later clean delivery truncate-replaces this sidecar, so
+    /// this is never what a check keys on; see `receiver_rejected_total`
+    /// for the cumulative count doctor/`flow status` use). Empty when the
+    /// last delivery was clean, or when it was rejected but the receiver's
+    /// body carried no `results` detail. Lenient-on-read: absent in a
+    /// sidecar written before this field existed, defaults to empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    last_receiver_rejected_reasons: Vec<String>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -710,15 +721,23 @@ fn write_status_sidecar_locked(path: &Path, json: &[u8]) -> Result<()> {
 /// report (a give-up, a redirect refusal, or a quarantine never got a
 /// 2xx response body to read one from).
 fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
-    write_last_status_full(rt, ok, error, None)
+    write_last_status_full(rt, ok, error, None, Vec::new())
 }
 
 /// (#2273) Full form of [`write_last_status`] — takes the receiver's
 /// per-record rejection count from the delivery this call reports on, so
 /// it survives into the `.last` sidecar for a later `darkmux doctor` run
 /// to surface, not just the `hook.fired` flow record the delivery already
-/// emitted.
-fn write_last_status_full(rt: &RuleRuntime, ok: bool, error: Option<&str>, last_receiver_rejected: Option<u64>) {
+/// emitted. `last_receiver_rejected_reasons` (#2196) is that same
+/// delivery's `results[].error` text, empty when `last_receiver_rejected`
+/// is `None` or the receiver's body carried no per-record detail.
+fn write_last_status_full(
+    rt: &RuleRuntime,
+    ok: bool,
+    error: Option<&str>,
+    last_receiver_rejected: Option<u64>,
+    last_receiver_rejected_reasons: Vec<String>,
+) {
     let status = LastStatus {
         ts: schema::ts_utc_now(),
         ok,
@@ -726,6 +745,7 @@ fn write_last_status_full(rt: &RuleRuntime, ok: bool, error: Option<&str>, last_
         cursor_write_failures: rt.cursor_write_failures.load(Ordering::Acquire),
         stalled: rt.stalled.load(Ordering::Acquire),
         last_receiver_rejected,
+        last_receiver_rejected_reasons,
     };
     if let Ok(json) = serde_json::to_string(&status) {
         // (#2453) Locked on the sidecar's own path — see
@@ -783,6 +803,7 @@ fn write_cursor_write_status(path: &Path, cursor_write_failures: u64, stalled: b
             cursor_write_failures: 0,
             stalled: false,
             last_receiver_rejected: None,
+            last_receiver_rejected_reasons: Vec::new(),
         });
         // (#2453 red-prove seam) Widens the read-to-write window on
         // demand for the concurrency test — see
@@ -1090,6 +1111,12 @@ pub struct HookRuleSummary {
     /// 400 rejections followed by one clean accept reads `None` here.
     /// `receiver_rejected_total` is the durable count.
     pub last_receiver_rejected: Option<u64>,
+    /// (#2196) The receiver's own `results[].error` text for
+    /// `last_receiver_rejected`'s rejected record(s) — same LAST-value,
+    /// self-erasing shape and the same caveat (never the signal a check
+    /// keys on). Empty when the last delivery was clean, or was rejected
+    /// but the receiver's body carried no per-record detail to name.
+    pub last_receiver_rejected_reasons: Vec<String>,
     /// (#2273 fix-round finding 1) CUMULATIVE count of records this
     /// rule's receiver reported rejecting, across every delivery and
     /// every process — read from the persisted `<key>.rejected` counter
@@ -1226,6 +1253,10 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 last_drainer_heartbeat,
                 quarantined_lines,
                 last_receiver_rejected: last.as_ref().and_then(|s| s.last_receiver_rejected),
+                last_receiver_rejected_reasons: last
+                    .as_ref()
+                    .map(|s| s.last_receiver_rejected_reasons.clone())
+                    .unwrap_or_default(),
                 receiver_rejected_total,
                 key,
                 is_file,
@@ -1640,7 +1671,14 @@ enum DeliveryOutcome {
     /// rejections is still CONSUMED (at-least-once, the line advances) but
     /// the count rides on `hook.fired` so it is never silent (#1959 live
     /// loop: every finding was refused inside a 200 and nothing said so).
-    Success { receiver_rejected: Option<u64> },
+    /// `receiver_rejected_reasons` is the same body's `results[].error`
+    /// text for entries the receiver marked `ok: false` (#2196 — the
+    /// count alone told an operator SOMETHING was thrown away, never
+    /// WHY, so finding out required replaying against a scratch receiver
+    /// or reading the receiver's own log). Bounded and lenient-on-read:
+    /// see [`extract_rejection_reasons`]. Empty when the body carries no
+    /// `results` array, or none of its entries are marked rejected.
+    Success { receiver_rejected: Option<u64>, receiver_rejected_reasons: Vec<String> },
     ClientError,
     /// (#2093 merge-gate finding 2) A 3xx response — the receiver telling
     /// us to go elsewhere, which we refuse rather than follow. Treated as
@@ -1827,6 +1865,61 @@ fn build_delivery_headers(
     }
 }
 
+/// (#2196) Cap on how many receiver-reported per-record rejection reason
+/// strings ride the `hook.fired` payload / `.last` sidecar / `doctor` /
+/// `flow status` surfaces. The receiver's `results[]` array is untrusted
+/// input from outside the process; an observability surface must not
+/// become a vector for an unbounded string dump from a receiver that
+/// (deliberately or not) rejects everything with a huge error body.
+const MAX_REJECTION_REASONS: usize = 3;
+
+/// Each individual reason string is truncated to this many bytes (on a
+/// UTF-8 char boundary) before it rides anywhere durable — see
+/// [`MAX_REJECTION_REASONS`]'s doc for why a bound exists at all.
+const MAX_REJECTION_REASON_LEN: usize = 200;
+
+/// Truncate `s` to at most [`MAX_REJECTION_REASON_LEN`] bytes, walking
+/// back to the nearest UTF-8 char boundary so a truncated multi-byte
+/// character never panics or produces invalid UTF-8. Appends `…` when
+/// truncation actually happened.
+fn truncate_reason(s: &str) -> String {
+    if s.len() <= MAX_REJECTION_REASON_LEN {
+        return s.to_string();
+    }
+    let mut end = MAX_REJECTION_REASON_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Extract up to [`MAX_REJECTION_REASONS`] per-record rejection reason
+/// strings from a receiver's 2xx JSON response body (#2196). The local
+/// tracker's contract shape is `results: [{"ok": false, "error": "..."}]`
+/// alongside the record's own `rejected` count; this pulls the `error`
+/// text from every entry explicitly marked `"ok": false`.
+///
+/// Lenient-on-read, deliberately: a `results` entry missing `ok`/`error`,
+/// an `error` that isn't a string, a non-array `results`, or no `results`
+/// key at all all yield no reasons for that entry rather than an error —
+/// darkmux describes what the receiver told it and never invents detail
+/// the receiver didn't provide (this project's "describes, never
+/// adjudicates" stance applies to absence of data too).
+fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
+    body.get("results")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("ok").and_then(serde_json::Value::as_bool) == Some(false))
+                .filter_map(|e| e.get("error").and_then(serde_json::Value::as_str))
+                .take(MAX_REJECTION_REASONS)
+                .map(truncate_reason)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome {
     // (#2093 merge-gate finding 1, belt-and-braces) Re-validate at POST
     // time — the URL was already validated at `resolve_rules` /
@@ -1894,10 +1987,16 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
                 // body is JSON that carries one.
                 let mut buf = String::new();
                 let _ = std::io::Read::take(resp.into_reader(), 65_536).read_to_string(&mut buf);
-                let receiver_rejected = serde_json::from_str::<serde_json::Value>(&buf)
-                    .ok()
-                    .and_then(|v| v.get("rejected").and_then(serde_json::Value::as_u64));
-                DeliveryOutcome::Success { receiver_rejected }
+                let parsed_body = serde_json::from_str::<serde_json::Value>(&buf).ok();
+                let receiver_rejected =
+                    parsed_body.as_ref().and_then(|v| v.get("rejected").and_then(serde_json::Value::as_u64));
+                // (#2196) A body that isn't JSON at all, or is JSON with
+                // no `results` array, yields no reasons — darkmux
+                // describes what the receiver told it, never invents
+                // detail the receiver didn't provide.
+                let receiver_rejected_reasons =
+                    parsed_body.as_ref().map(extract_rejection_reasons).unwrap_or_default();
+                DeliveryOutcome::Success { receiver_rejected, receiver_rejected_reasons }
             }
         }
         Err(ureq::Error::Status(code, _resp)) if is_retryable_client_status(code) => DeliveryOutcome::RetryableFailure,
@@ -2218,7 +2317,7 @@ fn emit_hook_record(
     error: Option<&str>,
     delivery_id: &str,
 ) {
-    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None, delivery_id)
+    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None, &[], delivery_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2230,6 +2329,7 @@ fn emit_hook_record_with(
     attempt: u32,
     error: Option<&str>,
     receiver_rejected: Option<u64>,
+    receiver_rejected_reasons: &[String],
     delivery_id: &str,
 ) {
     let rule = &rt.rule;
@@ -2272,6 +2372,15 @@ fn emit_hook_record_with(
     let rejected_count = receiver_rejected.filter(|n| *n > 0);
     if let Some(n) = rejected_count {
         payload["receiver_rejected"] = serde_json::Value::from(n);
+    }
+    // (#2196) The receiver's own `results[].error` text — WHY, not just
+    // how many. Rides alongside `receiver_rejected` only (never on a
+    // clean delivery, and never invented when the receiver's body
+    // carried no such detail); an empty array is never emitted so an
+    // older reader that doesn't know this key sees no difference from
+    // before.
+    if !receiver_rejected_reasons.is_empty() {
+        payload["receiver_rejected_reasons"] = serde_json::Value::from(receiver_rejected_reasons.to_vec());
     }
 
     let action = if success { "hook.fired" } else { "hook.failed" };
@@ -2683,7 +2792,7 @@ fn drainer_loop(
                 continue;
             }
             match try_post(&rt.rule.url, &body, &headers) {
-                DeliveryOutcome::Success { receiver_rejected } => {
+                DeliveryOutcome::Success { receiver_rejected, receiver_rejected_reasons } => {
                     let attempt = {
                         let mut c = rt.attempt_count.lock().unwrap();
                         *c += 1;
@@ -2701,17 +2810,42 @@ fn drainer_loop(
                     // ACCUMULATES and is never reset — that one is what
                     // doctor / `flow status` key on, so one clean
                     // delivery seconds later cannot erase the signal.
+                    //
+                    // (#2196) `reasons_for_status` rides the SAME gate as
+                    // the count (`rejected_for_status`) rather than an
+                    // independent one keyed on `receiver_rejected_reasons`
+                    // being non-empty — a receiver's `results[]` entries
+                    // without a top-level `rejected` count is not a shape
+                    // this contract defines, so reasons are only surfaced
+                    // as context for a rejection the count already named.
                     let rejected_for_status = receiver_rejected.filter(|n| *n > 0);
-                    write_last_status_full(rt, true, None, rejected_for_status);
+                    let reasons_for_status: Vec<String> =
+                        if rejected_for_status.is_some() { receiver_rejected_reasons } else { Vec::new() };
+                    write_last_status_full(rt, true, None, rejected_for_status, reasons_for_status.clone());
                     if let Some(n) = rejected_for_status {
                         let total =
                             add_receiver_rejected(&rt.rule.outbox_path, &rt.rule.receiver_rejected_path, n);
+                        let reasons_note = if reasons_for_status.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", reasons_for_status.join("; "))
+                        };
                         eprintln!(
-                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it ({total} so far) — see hook.fired.receiver_rejected",
+                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it ({total} so far){reasons_note} — see hook.fired.receiver_rejected",
                             rt.rule.url
                         );
                     }
-                    emit_hook_record_with(report_sink.as_ref(), true, rt, &line, attempt, None, receiver_rejected, &delivery_id);
+                    emit_hook_record_with(
+                        report_sink.as_ref(),
+                        true,
+                        rt,
+                        &line,
+                        attempt,
+                        None,
+                        receiver_rejected,
+                        &reasons_for_status,
+                        &delivery_id,
+                    );
                 }
                 DeliveryOutcome::ClientError => {
                     let attempt = {
@@ -6046,6 +6180,241 @@ mod tests {
              that, seconds after the loss: {summary:?}"
         );
         drop(sink);
+    }
+
+    // ─── (#2196) the receiver's own rejection REASON, not just the count ──
+
+    /// (#2196) One of many: a receiver's `results[]` can carry both
+    /// accepted and rejected entries in the same 2xx response. The
+    /// rejected entry's `error` text must ride the `hook.fired` payload,
+    /// the `.last` sidecar, and the summary `doctor`/`flow status` read —
+    /// so an operator learns WHY, not just that something was thrown
+    /// away.
+    #[test]
+    fn hook_fired_surfaces_the_receivers_rejection_reason_alongside_the_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"accepted":2,"rejected":1,"results":[{"ok":true},{"ok":true},{"ok":false,"error":"payload field \"file\" must be a non-empty string"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let reasons: Vec<String> = fired
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("receiver_rejected_reasons"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            reasons,
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            "{fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "warn", "{fired:?}");
+
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
+        assert_eq!(
+            last.last_receiver_rejected_reasons,
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            "{last:?}"
+        );
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(
+            summary.last_receiver_rejected_reasons,
+            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            "{summary:?}"
+        );
+        drop(sink);
+    }
+
+    /// (#2196 boundary) Every record in the delivery rejected — the
+    /// `results` array has no `ok: true` entries at all. Every reason
+    /// (up to the bound) must still surface, not just the first.
+    #[test]
+    fn hook_fired_surfaces_every_reason_when_the_whole_delivery_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"accepted":0,"rejected":2,"results":[{"ok":false,"error":"reason A"},{"ok":false,"error":"reason B"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(
+                || read_last_status(&last_path).is_some_and(|s| s.last_receiver_rejected == Some(2)),
+                Duration::from_secs(5)
+            ),
+            "the fully-rejected delivery must land"
+        );
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(
+            last.last_receiver_rejected_reasons,
+            vec!["reason A".to_string(), "reason B".to_string()],
+            "{last:?}"
+        );
+        drop(sink);
+    }
+
+    /// (#2196 boundary) A 2xx body the sink cannot parse as JSON at all —
+    /// no `rejected` count, no reasons, and the delivery must still read
+    /// as an ordinary clean accept (Info level, nothing persisted). The
+    /// sink must never crash on garbage in a 2xx body, and must never
+    /// invent a rejection where the receiver never claimed one.
+    #[test]
+    fn hook_fired_stays_clean_when_a_2xx_body_is_not_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body("not valid json at all {{{");
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "an unparseable body must never be read as a rejection: {fired:?}"
+        );
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            "no reasons can exist without a parseable body: {fired:?}"
+        );
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        assert!(summary.last_receiver_rejected_reasons.is_empty(), "{summary:?}");
+        let _ = key;
+        drop(sink);
+    }
+
+    /// (#2196 boundary) A receiver that answers 2xx with a body carrying
+    /// no per-record detail whatsoever (no `rejected`, no `results`) —
+    /// darkmux has nothing to disclose, so nothing is disclosed. Distinct
+    /// from the unparseable-body case above: this body IS valid JSON,
+    /// just not the rejection-reporting contract.
+    #[test]
+    fn hook_fired_stays_clean_when_a_2xx_body_carries_no_per_record_detail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(r#"{"ok":true}"#);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
+            "the clean delivery must land"
+        );
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        assert!(last.last_receiver_rejected_reasons.is_empty(), "{last:?}");
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196) Unit-level pin on the extraction + bounding helpers, so the
+    /// cap and the truncation are each independently provable without a
+    /// live receiver round-trip.
+    #[test]
+    fn extract_rejection_reasons_is_bounded_and_truncates_long_entries() {
+        let long = "x".repeat(500);
+        let body = serde_json::json!({
+            "rejected": 5,
+            "results": [
+                {"ok": false, "error": "r1"},
+                {"ok": true},
+                {"ok": false, "error": "r2"},
+                {"ok": false, "error": &long},
+                {"ok": false, "error": "r4 — never reached, the cap is 3"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons.len(), MAX_REJECTION_REASONS, "{reasons:?}");
+        assert_eq!(reasons[0], "r1");
+        assert_eq!(reasons[1], "r2");
+        assert_eq!(reasons[2].chars().count(), MAX_REJECTION_REASON_LEN + 1, "must truncate + ellipsis: {reasons:?}");
+        assert!(reasons[2].ends_with('…'), "{reasons:?}");
     }
 
     // ─── (#2183) jq transforms + Keychain headers + the `file` transport ──

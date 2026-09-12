@@ -2201,6 +2201,15 @@ fn build_hooks_check(
         // the actor, never characterizes the receiver as misconfigured.
         if s.receiver_rejected_total > 0 {
             let last_clause = match s.last_receiver_rejected {
+                // (#2196) The receiver's own stated reason(s) for that
+                // last rejection, when its body carried any — the count
+                // alone tells an operator SOMETHING was thrown away,
+                // never WHY, so this is what saves a replay against a
+                // scratch receiver or a trip through the receiver's own
+                // log to find out.
+                Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
+                    format!("; {n} on the last delivery ({})", s.last_receiver_rejected_reasons.join("; "))
+                }
                 Some(n) => format!("; {n} on the last delivery"),
                 None => String::new(),
             };
@@ -7060,6 +7069,54 @@ mod tests {
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
         assert!(rule.message.contains("3 record(s) reported rejected by the receiver"), "{}", rule.message);
         assert!(rule.message.contains("3 on the last delivery"), "{}", rule.message);
+    }
+
+    /// (#2196) When the `.last` sidecar also carries the receiver's own
+    /// stated reason(s) for the rejection, `doctor` must name them next
+    /// to the count — the count alone tells an operator SOMETHING was
+    /// thrown away, never WHY.
+    #[test]
+    fn hooks_check_names_the_receivers_last_rejection_reason_when_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (rule_cfg, key) = rejection_fixture_rule();
+        let rules = vec![rule_cfg];
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":1,"last_receiver_rejected_reasons":["payload field \"file\" must be a non-empty string"]}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
+        assert!(
+            rule.message.contains("payload field \"file\" must be a non-empty string"),
+            "the receiver's own reason must be named, not just the count: {}",
+            rule.message
+        );
+    }
+
+    /// (#2196 inverted case) A rejection with no reason on record (the
+    /// receiver's body carried a count but no `results` detail) must not
+    /// print an empty or garbled reason clause — the plain count-only
+    /// message from before this fix.
+    #[test]
+    fn hooks_check_omits_the_reason_clause_when_none_was_recorded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (rule_cfg, key) = rejection_fixture_rule();
+        let rules = vec![rule_cfg];
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":3}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "3").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.message.matches("3 on the last delivery").count(), 1, "{}", rule.message);
+        assert!(!rule.message.contains("()"), "no empty parens when there's no reason: {}", rule.message);
     }
 
     /// (#2273 fix-round finding 1) The BLOCKER: `last_receiver_rejected`

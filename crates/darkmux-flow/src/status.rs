@@ -685,6 +685,18 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                     "      rejected by receiver: {} (request accepted, content rejected — consumed, not retried)",
                     r.receiver_rejected_total
                 );
+                // (#2196) The receiver's own stated reason(s) for its
+                // MOST RECENT rejection — context alongside the
+                // cumulative count above, not a substitute for it (the
+                // reason is last-value and self-erases on a later clean
+                // delivery, same as `last_receiver_rejected`).
+                if !r.last_receiver_rejected_reasons.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "      last rejection reason(s): {}",
+                        r.last_receiver_rejected_reasons.join("; ")
+                    );
+                }
             }
             if r.stalled {
                 let _ = writeln!(
@@ -748,6 +760,17 @@ pub struct HookRuleStatus {
     /// written by an older binary still deserializes.
     #[serde(default)]
     pub receiver_rejected_total: u64,
+    /// (#2196) The receiver's own stated reason(s) for its MOST RECENT
+    /// rejection — `results[].error` text from the last delivery the
+    /// receiver reported rejecting. Context alongside
+    /// `receiver_rejected_total`, not a replacement: this is a LAST-value
+    /// field that a later clean delivery erases, same caveat as
+    /// `hooks::HookRuleSummary::last_receiver_rejected`. Empty when
+    /// there's no current rejection, or the receiver's body carried no
+    /// per-record detail. Additive; `#[serde(default)]` so a consumer
+    /// holding a document written by an older binary still deserializes.
+    #[serde(default)]
+    pub last_receiver_rejected_reasons: Vec<String>,
 }
 
 /// The flow-record hook sink's status — folded into `FlowStatus` (#1959;
@@ -796,6 +819,7 @@ pub fn build_hooks_status(
                 last_drainer_heartbeat: s.last_drainer_heartbeat,
                 quarantined_lines: s.quarantined_lines,
                 receiver_rejected_total: s.receiver_rejected_total,
+                last_receiver_rejected_reasons: s.last_receiver_rejected_reasons,
             })
             .collect(),
     }
@@ -1062,6 +1086,58 @@ mod hooks_status_tests {
         assert!(rendered.contains("rejected by receiver: 7"), "{rendered}");
     }
 
+    /// (#2196) `flow status` is the natural verb for "did my hook
+    /// deliver?" — the receiver's own stated reason for its last
+    /// rejection must ride alongside the count, both in `--json` and the
+    /// human renderer, so an operator doesn't have to correlate against
+    /// the receiver's own log to learn WHY.
+    #[test]
+    fn flow_status_surfaces_the_receivers_last_rejection_reason() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = crate::hooks::rule_key(&m, &url);
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true,"last_receiver_rejected":1,"last_receiver_rejected_reasons":["rule must be a string"]}"#,
+        )
+        .unwrap();
+
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        assert_eq!(hooks.rules[0].last_receiver_rejected_reasons, vec!["rule must be a string".to_string()]);
+        let json = serde_json::to_value(&hooks).unwrap();
+        assert_eq!(json["rules"][0]["last_receiver_rejected_reasons"], serde_json::json!(["rule must be a string"]));
+
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+        assert!(rendered.contains("last rejection reason(s): rule must be a string"), "{rendered}");
+    }
+
     /// (#2273 fix-round finding 3, inverted case) A rule that has never
     /// seen a rejection prints no rejection line at all — so a renderer
     /// that unconditionally emitted the row could not pass the test above
@@ -1098,5 +1174,6 @@ mod hooks_status_tests {
         };
         let rendered = format_status_human(&status);
         assert!(!rendered.contains("rejected by receiver"), "{rendered}");
+        assert!(!rendered.contains("last rejection reason"), "{rendered}");
     }
 }
