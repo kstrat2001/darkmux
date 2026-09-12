@@ -32,11 +32,18 @@ its own preceding step — is cancelled).
 That step's existing `[ ! -s rendered.json ]` branch already disclosed a
 dispatch that "crashed before its own degraded-mode fallback could run"
 with a generic warning. This script gives that SAME branch a second,
-MORE SPECIFIC message for the job-timeout case, naming the cause and the
-elapsed wall clock — the number that decides whether `timeout-minutes`
-needs raising, made visible on the PR instead of inferred from workflow
-logs nobody opens (#2100's own "concurrent-build tax... visible instead of
-inferred").
+MORE SPECIFIC message for a CANCELLED job, naming the elapsed wall clock —
+the number that decides whether `timeout-minutes` needs raising, made
+visible on the PR instead of inferred from workflow logs nobody opens
+(#2100's own "concurrent-build tax... visible instead of inferred").
+
+A cancelled job is NOT always a timed-out job, though: `darkmux-review.yml`
+sets `cancel-in-progress: true`, so re-dispatching a review on the same PR
+cancels whatever run is already in flight — a real, common cause distinct
+from the 90-minute budget expiring. This script's message names which one
+it thinks happened (by comparing elapsed time to the configured budget,
+within `GRACE_MINUTES` of tolerance) rather than always asserting "timed
+out"; see `GRACE_MINUTES`'s own comment for the run-history proof.
 
 ## Partial findings are never discarded
 
@@ -53,6 +60,16 @@ partial review is not a failed review — this script is careful to never
 override real, even incomplete, content with the "nothing produced"
 notice; see the "PARTIAL FINDINGS SURVIVE" self-test cases below.
 
+Honestly stated: those self-test cases prove the invariant against
+`compute_notice` DIRECTLY, in isolation — they are not proof the real
+caller ever hands this function a corrupt or no-mode `rendered_path`. The
+bash caller's own `[ ! -s rendered.json ]` gate only ever gets this script
+a MISSING or EMPTY path (both handled below); a non-empty-but-corrupt or
+no-mode payload passes that gate and reaches the caller's own `jq`-based
+mode dispatch instead, which is a separate code path this script cannot
+see and does not protect (#2100 CONSIDER 3 hardened that path directly, in
+the workflow file, rather than here).
+
 ## Never a verdict
 
 The disclosed line states what ran, what did not, and why — never a
@@ -68,6 +85,24 @@ import sys
 from pathlib import Path
 
 CANCELLED_STATUS = "cancelled"
+
+# (#2100 MUST FIX 1) How close `elapsed` has to sit to the configured job
+# budget before this script asserts "this was a timeout" rather than "this
+# was cancelled for some other reason". Proven from this workflow's OWN run
+# history, not theory: `cancel-in-progress: true` in the concurrency group
+# above `jobs.review` means re-dispatching a review on the same PR cancels
+# whatever run is already in flight. Of the six cancelled runs this workflow
+# has ever had, four ran the full ~90-minute budget and TWO were short
+# supersede-cancels — run 30812863146 (PR 1617) was cancelled after 18
+# minutes when run 30814081434 was queued for the same PR. A third of the
+# sample. Asserting "this is a timed-out run" against an 18-minute (or a
+# 2-minute, or a 0-second) elapsed time is simply false, and false in the
+# specific way that misleads a maintainer re-dispatching a fix: it reads as
+# "raise the timeout" when the real story is "a newer run superseded this
+# one, which is working as designed". Named rather than inlined so the
+# self-test cases below can assert against the same threshold this function
+# uses.
+GRACE_MINUTES = 10
 
 
 def rendered_has_content(rendered_path: str) -> bool:
@@ -138,16 +173,43 @@ def compute_notice(
         return ""
 
     minutes = elapsed_minutes(started_epoch, now_epoch)
-    if minutes is not None:
-        elapsed_text = f"after {minutes} minute(s)"
+    try:
+        budget = int(timeout_minutes)
+    except (TypeError, ValueError):
+        budget = None
+
+    # (#2100 MUST FIX 1) Three distinct causes, three distinct claims — never
+    # collapse "cancelled" into "timed out" just because a job timeout is
+    # the ONE cancellation cause this workflow can name a budget for. See
+    # `GRACE_MINUTES` above for why the threshold exists at all. Either
+    # bound missing/unparseable means the comparison itself can't be made —
+    # that's the UNKNOWN case, never a guess in either direction.
+    if minutes is None or budget is None:
+        cause = (
+            f"was cancelled (job `timeout-minutes: {timeout_minutes}`) — the "
+            "elapsed run time could not be determined, so whether this was a "
+            "timeout, a superseding re-dispatch, or a manual cancel is unknown."
+        )
+    elif minutes >= budget - GRACE_MINUTES:
+        cause = (
+            f"ran {minutes} minute(s) before being cancelled — at or near its "
+            f"`timeout-minutes: {timeout_minutes}` job budget, most likely its own "
+            "timeout (though a manual cancel this close to the budget can also "
+            "cause this)."
+        )
     else:
-        elapsed_text = f"by its {timeout_minutes}-minute job timeout"
+        cause = (
+            f"was cancelled after only {minutes} minute(s) — well short of its "
+            f"`timeout-minutes: {timeout_minutes}` job budget, so this is NOT a "
+            "timeout. Most likely a newer dispatch on this PR superseded it "
+            "(this workflow cancels an in-progress run for the same PR), or "
+            "someone cancelled it manually."
+        )
+
     lines = [
-        f":no_entry: darkmux self-review was cancelled {elapsed_text} "
-        f"(job `timeout-minutes: {timeout_minutes}`) — the review never "
-        "finished, so no automated review was produced. This is a timed-out "
-        "run, not a clean pass and not a declined review; treat it as "
-        "needing manual review.",
+        f":no_entry: darkmux self-review {cause} The review never finished, "
+        "so no automated review was produced; treat it as needing manual "
+        "review.",
     ]
     if run_url:
         lines.append(f"See the run for details: {run_url}")
@@ -181,7 +243,8 @@ SELF_TEST_CASES = [
         "expect_empty": True,
     },
     {
-        "name": "cancelled with no rendered.json at all: the loud, distinct notice",
+        "name": "cancelled AT its budget (elapsed within GRACE_MINUTES of timeout): "
+        "the loud, distinct TIMEOUT notice",
         "job_status": "cancelled",
         "rendered": None,
         "timeout_minutes": 90,
@@ -190,11 +253,53 @@ SELF_TEST_CASES = [
         "run_url": "https://github.com/kstrat2001/darkmux/actions/runs/123",
         "expect_contains": [
             "cancelled",
-            "after 91 minute(s)",
+            "91 minute(s)",
+            "most likely its own",
             "timeout-minutes: 90",
             "no automated review was produced",
             "https://github.com/kstrat2001/darkmux/actions/runs/123",
         ],
+        "expect_not_contains": ["NOT a timeout"],
+    },
+    {
+        "name": "cancelled WELL SHORT of its budget (18-minute PR-1617 shape, run "
+        "30812863146): must NOT claim a timeout — a supersede-cancel, per "
+        "GRACE_MINUTES's own run-history proof",
+        "job_status": "cancelled",
+        "rendered": None,
+        "timeout_minutes": 90,
+        "started_epoch": 0.0,
+        "now_epoch": 18 * 60.0,
+        "expect_contains": [
+            "cancelled",
+            "18 minute(s)",
+            "NOT a timeout",
+            "superseded",
+            "no automated review was produced",
+        ],
+        "expect_not_contains": ["most likely its own"],
+    },
+    {
+        "name": "cancelled with a TWO-MINUTE elapsed epoch — the exact reviewer "
+        "repro: must not read as a timed-out run",
+        "job_status": "cancelled",
+        "rendered": None,
+        "timeout_minutes": 90,
+        "started_epoch": 0.0,
+        "now_epoch": 2 * 60.0,
+        "expect_contains": ["2 minute(s)", "NOT a timeout"],
+        "expect_not_contains": ["this is a timed-out run", "most likely its own"],
+    },
+    {
+        "name": "cancelled with a ZERO-SECOND elapsed epoch — must not read as a "
+        "timed-out run either",
+        "job_status": "cancelled",
+        "rendered": None,
+        "timeout_minutes": 90,
+        "started_epoch": 0.0,
+        "now_epoch": 0.0,
+        "expect_contains": ["0 minute(s)", "NOT a timeout"],
+        "expect_not_contains": ["most likely its own"],
     },
     {
         "name": "cancelled with an EMPTY rendered.json file — same as no file at all",
@@ -243,24 +348,40 @@ SELF_TEST_CASES = [
         "expect_empty": True,
     },
     {
-        "name": "no elapsed-time inputs available — the message still names the "
-        "configured timeout instead of a computed elapsed time",
+        "name": "no elapsed-time inputs available — the message says the cause is "
+        "UNKNOWN rather than guessing either way",
         "job_status": "cancelled",
         "rendered": None,
         "timeout_minutes": 90,
         "started_epoch": None,
         "now_epoch": None,
-        "expect_contains": ["by its 90-minute job timeout", "no automated review was produced"],
-        "expect_not_contains": ["after "],
+        "expect_contains": [
+            "timeout-minutes: 90",
+            "elapsed run time could not be determined",
+            "no automated review was produced",
+        ],
+        "expect_not_contains": ["most likely its own", "NOT a timeout"],
     },
     {
-        "name": "malformed elapsed-time inputs degrade gracefully, never raise",
+        "name": "malformed elapsed-time inputs degrade gracefully, never raise, and "
+        "still say UNKNOWN rather than guessing",
         "job_status": "cancelled",
         "rendered": None,
         "timeout_minutes": 90,
         "started_epoch": "not-a-number",
         "now_epoch": "also-not-a-number",
-        "expect_contains": ["by its 90-minute job timeout"],
+        "expect_contains": ["elapsed run time could not be determined"],
+    },
+    {
+        "name": "malformed timeout_minutes degrades gracefully (budget unparseable) — "
+        "even with a real elapsed time, cause is UNKNOWN rather than guessed",
+        "job_status": "cancelled",
+        "rendered": None,
+        "timeout_minutes": "ninety",
+        "started_epoch": 0.0,
+        "now_epoch": 30 * 60.0,
+        "expect_contains": ["elapsed run time could not be determined"],
+        "expect_not_contains": ["most likely its own", "NOT a timeout"],
     },
     {
         "name": "no run URL supplied — the message still renders without a link line",
