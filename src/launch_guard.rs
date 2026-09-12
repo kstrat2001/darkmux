@@ -338,7 +338,28 @@ mod tests {
         assert_eq!(*abort_calls.borrow(), 0, "a disarmed guard must never invoke the abort writer on Drop");
     }
 
+    /// (#2671 follow-up) Must be `#[serial_test::serial]` — this is the ONE
+    /// other place in this module that drops a `LaunchFinalizeGuard` while
+    /// still ARMED, and `Drop`'s fallback path unconditionally calls
+    /// `darkmux_types::child_registry::kill_all(SIGKILL)` (see the `Drop`
+    /// impl above), which reaches every pid CURRENTLY registered in that
+    /// process-wide registry — not just pids this test itself registered
+    /// (it registers none). Left unmarked, this test could run on a
+    /// different thread at the exact moment
+    /// `an_unjoined_worker_thread_would_let_drop_kill_a_live_child_the_
+    /// shape_scheduler_rs_avoids` (below) has registered its real `sleep
+    /// 30` child but not yet reached its own 150ms liveness check —
+    /// `kill_all` would SIGKILL that child out from under it, the
+    /// detached waiter thread would reap it, and the liveness check would
+    /// read `ESRCH` well before the guard under test ever got a chance to
+    /// drop. Reproduced directly: forcing this test to land inside that
+    /// window (a temporary artificial delay, removed after) made the other
+    /// test fail with the EXACT assertion and line CI reported — "the
+    /// child must have been genuinely alive/working before Drop" — proving
+    /// this was the real, mechanical cause of the reported flake, not a
+    /// timing margin on the other test's own 150ms wait.
     #[test]
+    #[serial_test::serial] // `child_registry` is process-wide — see doc above
     fn drop_without_close_invokes_the_abort_writer_exactly_once() {
         let abort_calls = RefCell::new(0u32);
         {
