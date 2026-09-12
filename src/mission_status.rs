@@ -581,6 +581,10 @@ fn print_peer_missions(peer: &[Run], now: u64, width: Option<usize>) {
 ///   - (#1230 Packet 5) an ACTIVE mission with ZERO complete phases whose
 ///     `started_ts` is older than `stale_days` — the `doom-loop-m4` case
 ///     (0/4 phases for ~20 days, no drift surfaced by either check above).
+///   - (#2682) an ACTIVE mission with a Running phase whose OWN dispatch
+///     session shows no evidence of life, by the same staleness rule
+///     `darkmux run list` already applies to this exact mission on this
+///     exact machine — see [`running_phase_session_drift`]'s own doc.
 ///
 /// (#2406) The former third bullet here — a PLANNED phase with an
 /// earlier-in-mission-order Abandoned phase, flagged "can never run" — was
@@ -594,10 +598,20 @@ fn print_peer_missions(peer: &[Run], now: u64, width: Option<usize>) {
 /// with an open phase is no longer a reachable state to detect. (Its `phase
 /// complete`/`phase abandon` reconcile hints went with the retired `phase`
 /// family; the surviving hints point at `mission finalize` / `mission abort`.)
+///
+/// `local_status` (#2682) is this mission's own [`RunStatus`] as
+/// `darkmux_serve::build_runs` computed it — `None` only when the caller
+/// could not classify this mission at all. Passed in rather than re-derived
+/// here for the same IO-free-and-testable reason `now`/`stale_days` already
+/// are, and — more importantly — because re-deriving `session_is_live`
+/// against this module's own flow read would be a SECOND, independently
+/// written liveness rule that could quietly drift from the one `darkmux run
+/// list`/the viewer already ship (see `run()`'s call site doc).
 fn detect_drift(
     m: &Mission,
     phases: &[&Phase],
     live_steps: &BTreeMap<String, Vec<String>>,
+    local_status: Option<RunStatus>,
     now: u64,
     stale_days: u64,
 ) -> Vec<Drift> {
@@ -619,6 +633,10 @@ fn detect_drift(
     }
 
     if let Some(d) = stale_active_drift(m, complete, now, stale_days) {
+        out.push(d);
+    }
+
+    if let Some(d) = running_phase_session_drift(m, phases, local_status) {
         out.push(d);
     }
 
@@ -790,6 +808,80 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
     })
 }
 
+/// (#2682) An ACTIVE mission with a `Running` phase whose OWN dispatch
+/// session shows no evidence of life — the "SIGKILLed mission still reads
+/// clean" gap between this board and `darkmux run list`.
+///
+/// `darkmux_serve::build_runs` → `mission_to_run` → `mission_run_status`
+/// already applies `session_is_live` (the SAME staleness budget
+/// `darkmux run list` and the viewer's missions lens judge every dispatch
+/// by) to this exact mission's own flow records, on this exact machine.
+/// `local_status` is that computed [`RunStatus`], handed to this function
+/// rather than re-derived here — see `detect_drift`'s own doc for why a
+/// second, independently-written liveness rule is exactly the drift this
+/// issue is about closing, not reopening one level down.
+///
+/// Fires ONLY when:
+///   - `m.status == MissionStatus::Active` — a `Paused` mission is
+///     deliberately idle, and `mission_run_status` never applies the
+///     staleness gate to one (see that function's own doc); a Paused
+///     mission's `local_status` can therefore never read `Abandoned` here,
+///     so this rule already stays quiet for it without a separate check.
+///   - at least one phase reads `Running` — a mission with no Running phase
+///     has nothing this rule is about.
+///   - `local_status == Some(RunStatus::Abandoned)` — the SAME "no evidence
+///     of life" verdict `darkmux run list` renders for this mission today.
+///     `RunStatus::Error`/`Unparseable`/etc. are real terminal signals of
+///     their own and are left to whatever surfaces those, not folded into
+///     this rule.
+///
+/// Describes, never adjudicates — matching the posture `peer_status_word`'s
+/// own doc states: the wording says what was OBSERVED (no terminal record
+/// seen) and never claims the mission crashed, failed, or should be torn
+/// down. The suggested commands are reconcile OPTIONS, not a verdict — the
+/// same "debrief first, then choose" shape `stale_active_drift` already
+/// uses above.
+fn running_phase_session_drift(
+    m: &Mission,
+    phases: &[&Phase],
+    local_status: Option<RunStatus>,
+) -> Option<Drift> {
+    if m.status != MissionStatus::Active {
+        return None;
+    }
+    if local_status != Some(RunStatus::Abandoned) {
+        return None;
+    }
+    let running: Vec<&str> =
+        phases.iter().filter(|p| p.status == PhaseStatus::Running).map(|p| p.id.as_str()).collect();
+    if running.is_empty() {
+        return None;
+    }
+    Some(Drift {
+        kind: "running-phase-session-dead",
+        detail: format!(
+            "phase(s) {} read Running, but this mission's dispatch session shows no evidence of \
+             life — no terminal record seen (the same staleness rule `darkmux run list` reports \
+             this mission Abandoned under)",
+            running.join(", ")
+        ),
+        suggest: vec![
+            format!(
+                "darkmux run list --json   # cross-check this machine's own dispatch-session read for {id}",
+                id = m.id
+            ),
+            format!(
+                "darkmux mission debrief {id} --json   # inspect what actually happened",
+                id = m.id
+            ),
+            format!(
+                "darkmux mission abort {id}   # …if the work is in fact dead",
+                id = m.id
+            ),
+        ],
+    })
+}
+
 // RETIRED (#2406). `unreachable_phase_drifts` used to flag any Planned
 // phase sitting after an Abandoned one, on the theory that phases gate
 // strictly linearly by `Mission.phase_ids` order — and it suggested a
@@ -853,6 +945,49 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         by_mission.entry(s.mission_id.as_str()).or_default().push(s);
     }
 
+    // (#1711) Fetched BEFORE the per-mission view loop below (moved up from
+    // its original position after that loop — see the "known_mission_ids"
+    // paragraph there for why the ORIGINAL #1711 design deliberately never
+    // re-loaded Mission/Phase JSON here, and `local_run_status`'s own doc
+    // just below for why #2682 now pays that cost anyway): missions this
+    // machine can SEE via the shared flow stream but does not OWN.
+    // `fleet_records_for_runs()` degrades to an empty vec + `SourceState::Off`
+    // on a standalone install with no `DARKMUX_REDIS_URL`, so this costs
+    // nothing there. See [`peer_mission_runs`]'s doc for why THAT call reuses
+    // #1705's narrow aggregation rather than re-deriving it.
+    let known_mission_ids: std::collections::HashSet<String> =
+        missions.iter().map(|m| m.id.clone()).collect();
+    let flows_dir = config_access::flows_dir();
+    let fleet = darkmux_serve::fleet_records_for_runs();
+
+    // (#2682) This mission's OWN dispatch-session status, exactly as
+    // `darkmux run list`/the viewer's missions lens already compute it
+    // (`darkmux_serve::build_runs` → `mission_to_run` → `mission_run_status`,
+    // which applies `session_is_live` against this machine's own flow
+    // records). Consumed by `detect_drift` below so this board and `run list`
+    // read the SAME value for the same mission by construction, rather than
+    // two independently-derived opinions that usually — but not always —
+    // agree.
+    //
+    // **The cost this reopens, on purpose.** The #1711 comment above this
+    // one exists precisely because calling the FULL `darkmux_serve::build_runs`
+    // reloads `Mission`/`Phase` JSON this function already has in hand AND
+    // rebuilds a `Run` for every local mission — measured as this command's
+    // dominant cost when #1711 was calling it ONLY to fish the peer rows out
+    // (and throwing the local rebuild away unused). This time the local
+    // rebuild IS the thing being used — there is no narrower `pub` entry
+    // point into `session_is_live`'s machinery than `build_runs` itself (see
+    // this PR's own description for the alternative considered and why it
+    // was not taken) — so the second Mission/Phase load is accepted rather
+    // than optimized away. `lab_dir: None` at least skips the lab-run scan
+    // half of `build_runs`, which this board never renders.
+    let local_run_status: std::collections::HashMap<String, RunStatus> =
+        darkmux_serve::build_runs(&flows_dir, None, &fleet.records)
+            .into_iter()
+            .filter(|r| known_mission_ids.contains(&r.id))
+            .map(|r| (r.id, r.status))
+            .collect();
+
     let mut views: Vec<MissionView> = missions
         .iter()
         .map(|m| {
@@ -878,7 +1013,14 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
                 running: ss.iter().filter(|s| s.status == PhaseStatus::Running).count(),
                 planned: ss.iter().filter(|s| s.status == PhaseStatus::Planned).count(),
                 abandoned: ss.iter().filter(|s| s.status == PhaseStatus::Abandoned).count(),
-                drifts: detect_drift(m, &ss, &live_steps_for(m, &ss), now, stale_days),
+                drifts: detect_drift(
+                    m,
+                    &ss,
+                    &live_steps_for(m, &ss),
+                    local_run_status.get(&m.id).copied(),
+                    now,
+                    stale_days,
+                ),
                 graph: crew::lifecycle::load_graph_report(&m.id).ok().flatten(),
                 m,
             }
@@ -886,23 +1028,6 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
         .collect();
     views.sort_by(board_order);
 
-    // (#1711) Peer half of the board: missions this machine can SEE via the
-    // shared flow stream but does not OWN. Fetched unconditionally (both the
-    // `--json` and human paths need it) — `fleet_records_for_runs()`
-    // degrades to an empty vec + `SourceState::Off` on a standalone install
-    // with no `DARKMUX_REDIS_URL`, so this costs nothing there. See
-    // [`peer_mission_runs`]'s doc for why this reuses #1705's aggregation
-    // rather than re-deriving it.
-    //
-    // `known_mission_ids` is passed to `peer_mission_runs` so it never
-    // re-loads `Mission`/`Phase` JSON this function already has in hand
-    // (#1711 review finding — the earlier version called the full
-    // `darkmux_serve::build_runs`, which reloads that JSON AND rebuilds a
-    // `Run` for every local mission, neither of which this board uses).
-    let known_mission_ids: std::collections::HashSet<String> =
-        missions.iter().map(|m| m.id.clone()).collect();
-    let flows_dir = config_access::flows_dir();
-    let fleet = darkmux_serve::fleet_records_for_runs();
     let peer = peer_mission_runs(&flows_dir, &fleet.records, &known_mission_ids);
     let fleet_complete = matches!(fleet.state, SourceState::Ok | SourceState::Off);
 
@@ -2617,21 +2742,21 @@ mod tests {
         let m = mission("m1", MissionStatus::Finalized);
         let running = phase("s1", "m1", PhaseStatus::Running);
         let planned = phase("s2", "m1", PhaseStatus::Planned);
-        assert!(detect_drift(&m, &[&running, &planned], &BTreeMap::new(), 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&running, &planned], &BTreeMap::new(), None, 0, 14).is_empty());
     }
 
     #[test]
     fn finalized_mission_all_terminal_is_clean() {
         let m = mission("m1", MissionStatus::Finalized);
         let s = phase("s1", "m1", PhaseStatus::Complete);
-        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), None, 0, 14).is_empty());
     }
 
     #[test]
     fn active_mission_all_terminal_suggests_finalize() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Complete);
-        let d = detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, 0, 14);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "done-not-finalized");
         assert!(d[0].suggest[0].contains("mission finalize m1"));
@@ -2642,7 +2767,7 @@ mod tests {
         // Work in flight is normal, not drift.
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Running);
-        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), None, 0, 14).is_empty());
     }
 
     #[test]
@@ -2650,13 +2775,13 @@ mod tests {
         // All terminal but nothing COMPLETE → not "done", don't nag to close.
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Abandoned);
-        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), 0, 14).is_empty());
+        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), None, 0, 14).is_empty());
     }
 
     #[test]
     fn mission_with_no_phases_is_clean() {
         let m = mission("m1", MissionStatus::Active);
-        assert!(detect_drift(&m, &[], &BTreeMap::new(), 0, 14).is_empty());
+        assert!(detect_drift(&m, &[], &BTreeMap::new(), None, 0, 14).is_empty());
     }
 
     // ─── stale-active (#1230 Packet 5) ─────────────────────────────────
@@ -2667,7 +2792,7 @@ mod tests {
         m.started_ts = Some(0);
         // No phases at all — zero complete either way.
         let now = 15 * 86_400; // 15 days later
-        let d = detect_drift(&m, &[], &BTreeMap::new(), now, 14);
+        let d = detect_drift(&m, &[], &BTreeMap::new(), None, now, 14);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].kind, "stale-active");
         assert!(d[0].detail.contains("15 day"));
@@ -2683,7 +2808,7 @@ mod tests {
     fn stale_active_actionable_commands_are_each_their_own_suggestion() {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
-        let d = detect_drift(&m, &[], &BTreeMap::new(), 15 * 86_400, 14);
+        let d = detect_drift(&m, &[], &BTreeMap::new(), None, 15 * 86_400, 14);
         let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
 
         for want in ["darkmux mission abort m1", "darkmux mission finalize m1"] {
@@ -2717,7 +2842,7 @@ mod tests {
     fn stale_active_phase_detail_suggestion_names_a_command_that_can_deliver_it() {
         let mut m = mission("m9", MissionStatus::Active);
         m.started_ts = Some(0);
-        let d = detect_drift(&m, &[], &BTreeMap::new(), 15 * 86_400, 14);
+        let d = detect_drift(&m, &[], &BTreeMap::new(), None, 15 * 86_400, 14);
         let stale = d.iter().find(|dr| dr.kind == "stale-active").expect("stale-active drift");
         let first_cmd = split_suggestion(&stale.suggest[0]).0;
         assert_eq!(
@@ -2732,7 +2857,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
         let now = 5 * 86_400; // only 5 days in — under the 14-day default
-        assert!(detect_drift(&m, &[], &BTreeMap::new(), now, 14).is_empty());
+        assert!(detect_drift(&m, &[], &BTreeMap::new(), None, now, 14).is_empty());
     }
 
     #[test]
@@ -2741,7 +2866,7 @@ mod tests {
         // staleness, fails closed rather than flagging.
         let m = mission("m1", MissionStatus::Active);
         assert!(m.started_ts.is_none());
-        assert!(detect_drift(&m, &[], &BTreeMap::new(), 999 * 86_400, 14).is_empty());
+        assert!(detect_drift(&m, &[], &BTreeMap::new(), None, 999 * 86_400, 14).is_empty());
     }
 
     #[test]
@@ -2751,10 +2876,188 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.started_ts = Some(0);
         let s = phase("s1", "m1", PhaseStatus::Complete);
-        let d = detect_drift(&m, &[&s], &BTreeMap::new(), 30 * 86_400, 14);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, 30 * 86_400, 14);
         // `done-not-finalized` fires (all terminal + complete>0), but NOT
         // `stale-active`.
         assert!(!d.iter().any(|dr| dr.kind == "stale-active"));
+    }
+
+    // ─── running-phase-session-dead (#2682) ────────────────────────────
+
+    #[test]
+    fn running_phase_session_drift_fires_when_local_status_is_abandoned() {
+        let m = mission("m1", MissionStatus::Active);
+        let s = phase("p1", "m1", PhaseStatus::Running);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), 0, 14);
+        let kinds: Vec<&str> = d.iter().map(|x| x.kind).collect();
+        let hit = d
+            .iter()
+            .find(|dr| dr.kind == "running-phase-session-dead")
+            .unwrap_or_else(|| panic!("no running-phase-session-dead drift: {kinds:?}"));
+        assert!(hit.detail.contains("p1"), "{}", hit.detail);
+        // Describes, never adjudicates (#2682's own doctrine, matching
+        // `peer_status_word`'s posture) — must say what was OBSERVED, never
+        // assert the mission crashed/failed/should be torn down.
+        assert!(
+            hit.detail.contains("no evidence of life") || hit.detail.contains("no terminal record")
+        );
+        assert!(
+            !hit.detail.to_lowercase().contains("crash")
+                && !hit.detail.to_lowercase().contains("failed"),
+            "must describe, not adjudicate: {}",
+            hit.detail
+        );
+    }
+
+    /// Invariant 2 (issue #2682): a Running phase whose session IS live must
+    /// stay clean — no new false positive from this rule.
+    #[test]
+    fn running_phase_session_drift_stays_clean_when_session_is_live() {
+        let m = mission("m1", MissionStatus::Active);
+        let s = phase("p1", "m1", PhaseStatus::Running);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Running), 0, 14);
+        assert!(
+            !d.iter().any(|dr| dr.kind == "running-phase-session-dead"),
+            "a live session must never fire this drift: {d:?}"
+        );
+    }
+
+    /// `local_status: None` (the caller could not classify the mission at
+    /// all) must never be treated as "dead" — no evidence either way stays
+    /// quiet rather than guessing.
+    #[test]
+    fn running_phase_session_drift_stays_clean_when_status_is_unknown() {
+        let m = mission("m1", MissionStatus::Active);
+        let s = phase("p1", "m1", PhaseStatus::Running);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, 0, 14);
+        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+    }
+
+    /// `mission_run_status` never applies the staleness gate to a `Paused`
+    /// mission (it is deliberately idle, not silent) — so its `local_status`
+    /// can never actually read `Abandoned` in production. This pins THIS
+    /// function's OWN guard directly, independent of that upstream fact, the
+    /// same defense-in-depth `detect_drift`'s other rules already get.
+    #[test]
+    fn running_phase_session_drift_stays_clean_for_a_paused_mission() {
+        let m = mission("m1", MissionStatus::Paused);
+        let s = phase("p1", "m1", PhaseStatus::Running);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), 0, 14);
+        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+    }
+
+    #[test]
+    fn running_phase_session_drift_stays_clean_with_no_running_phase() {
+        let m = mission("m1", MissionStatus::Active);
+        let s = phase("p1", "m1", PhaseStatus::Planned);
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), 0, 14);
+        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+    }
+
+    /// (#2682) The invariant the issue exists to close, pinned directly
+    /// against the REAL wiring rather than two independently hand-typed
+    /// expectations: build a mission whose dispatch session crashed
+    /// (bookend `dispatch start` with no terminal, its own last activity far
+    /// past the staleness budget), and feed `darkmux_serve::build_runs`'s
+    /// OWN computed status for that mission straight into `detect_drift`.
+    /// If a future change ever made these two disagree, this test — which
+    /// never hand-types `RunStatus::Abandoned` as the middle value, only as
+    /// the final assertion on what `build_runs` itself produced — would
+    /// need `build_runs`'s real output to already be wrong before this test
+    /// could pass, which is a stronger guarantee than two separately-written
+    /// tests that merely happen to agree today.
+    #[test]
+    #[serial_test::serial]
+    fn cli_board_and_run_list_agree_on_a_crashed_local_mission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+
+        let mut m = mission("dispatch-crashed-2682", MissionStatus::Active);
+        m.phase_ids = vec!["p-crash".to_string()];
+        // Far enough in the past that it is stale under ANY reasonable
+        // inactivity budget, without pinning this test to a literal "now" —
+        // matching darkmux-serve's own precedent for this exact scenario
+        // (`build_runs_crashed_active_mission_reports_abandoned_not_eternal_running`).
+        m.started_ts = Some(1_700_000_000);
+        crew::lifecycle::save_mission(&m).unwrap();
+        let mut running_phase = phase("p-crash", "dispatch-crashed-2682", PhaseStatus::Running);
+        running_phase.task_ids = vec!["t-crash".to_string()];
+        crew::lifecycle::save_phase(&running_phase).unwrap();
+        let task = crew::types::Task {
+            run_on: crew::types::default_run_on(),
+            id: "t-crash".to_string(),
+            phase_id: "p-crash".to_string(),
+            description: "d".to_string(),
+            display_name: None,
+            step_ids: vec!["s-crash".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: Some("coder".to_string()),
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        crew::lifecycle::save_task("dispatch-crashed-2682", &task).unwrap();
+        let step = crew::types::Step {
+            id: "s-crash".to_string(),
+            task_id: "t-crash".to_string(),
+            gate: None,
+            kind: "dispatch.internal".to_string(),
+            status: crew::types::NodeStatus::Running,
+            config: serde_json::json!({ "session_id": "crew-dispatch-coder-2682" }),
+            started_ts: Some(1_700_000_000),
+            completed_ts: None,
+            output: None,
+        };
+        crew::lifecycle::save_step("dispatch-crashed-2682", "p-crash", &step).unwrap();
+
+        let flows_dir = tmp.path().join("flows");
+        std::fs::create_dir_all(&flows_dir).unwrap();
+        let day = darkmux_flow::day_utc_now();
+        let mut f = std::fs::File::create(flows_dir.join(format!("{day}.jsonl"))).unwrap();
+        use std::io::Write as _;
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "ts": "2024-01-01T09:00:00Z",
+                "action": "dispatch start",
+                "session_id": "crew-dispatch-coder-2682",
+                "handle": "coder",
+            })
+        )
+        .unwrap();
+        drop(f);
+
+        let runs = darkmux_serve::build_runs(&flows_dir, None, &[]);
+        let run = runs
+            .iter()
+            .find(|r| r.id == "dispatch-crashed-2682")
+            .unwrap_or_else(|| panic!("no Run for the crashed mission: {runs:?}"));
+
+        // What `darkmux run list` reports for this exact mission today.
+        assert_eq!(
+            run.status,
+            RunStatus::Abandoned,
+            "fixture must actually reproduce the crashed-session shape: {run:?}"
+        );
+
+        // What the board's OWN drift check does when handed that SAME value.
+        let d = detect_drift(&m, &[&running_phase], &BTreeMap::new(), Some(run.status), 0, 14);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+
+        assert!(
+            d.iter().any(|dr| dr.kind == "running-phase-session-dead"),
+            "`darkmux run list` reads this mission Abandoned but the board stayed clean: {d:?}"
+        );
     }
 
     // ─── step-level drift (#2310 fix-loop C4 / S4-C4) ──────────────────
@@ -2773,7 +3076,7 @@ mod tests {
             vec!["s-dep".to_string(), "s-chain".to_string()],
         )]);
 
-        let d = detect_drift(&m, &[&done], &live, 0, 14);
+        let d = detect_drift(&m, &[&done], &live, None, 0, 14);
         let hit = d
             .iter()
             .find(|dr| dr.kind == "phase-terminal-live-step")
@@ -2792,7 +3095,7 @@ mod tests {
         m.phase_ids = vec!["p1".to_string()];
         let live = BTreeMap::from([("p1".to_string(), vec!["s-1".to_string()])]);
 
-        let d = detect_drift(&m, &[&open], &live, 0, 14);
+        let d = detect_drift(&m, &[&open], &live, None, 0, 14);
         assert!(
             d.iter().any(|dr| dr.kind == "mission-terminal-live-step" && dr.detail.contains("s-1")),
             "{:?}",
@@ -2811,7 +3114,7 @@ mod tests {
         m.phase_ids = vec!["p1".to_string()];
         let live = BTreeMap::from([("p1".to_string(), vec!["s-1".to_string()])]);
 
-        let d = detect_drift(&m, &[&open], &live, 0, 14);
+        let d = detect_drift(&m, &[&open], &live, None, 0, 14);
         assert!(
             !d.iter().any(|dr| dr.kind.ends_with("live-step")),
             "{:?}",
@@ -2839,7 +3142,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = vec!["dead".to_string(), "blocked".to_string()];
 
-        let d = detect_drift(&m, &[&dead, &blocked], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&dead, &blocked], &BTreeMap::new(), None, 0, 14);
         assert!(
             !d.iter().any(|dr| dr.kind == "unreachable-phase"),
             "the phase-order rule is retired (#2406): {d:?}"
@@ -2856,7 +3159,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = ["dead", "blocked-a", "blocked-b"].map(String::from).to_vec();
 
-        let d = detect_drift(&m, &[&dead, &a, &b], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&dead, &a, &b], &BTreeMap::new(), None, 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
     }
 
@@ -2870,7 +3173,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = ["healthy", "dead", "blocked"].map(String::from).to_vec();
 
-        let d = detect_drift(&m, &[&healthy, &dead, &blocked], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&healthy, &dead, &blocked], &BTreeMap::new(), None, 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
     }
 
@@ -2884,7 +3187,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = ["dead", "in-flight", "blocked"].map(String::from).to_vec();
 
-        let d = detect_drift(&m, &[&dead, &running, &blocked], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&dead, &running, &blocked], &BTreeMap::new(), None, 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"), "{d:?}");
     }
 
@@ -2895,7 +3198,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = vec!["done".to_string(), "next".to_string()];
 
-        let d = detect_drift(&m, &[&done, &next], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&done, &next], &BTreeMap::new(), None, 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
@@ -2908,7 +3211,7 @@ mod tests {
         let mut m = mission("m1", MissionStatus::Active);
         m.phase_ids = vec!["dead".to_string(), "done".to_string()];
 
-        let d = detect_drift(&m, &[&dead, &done], &BTreeMap::new(), 0, 14);
+        let d = detect_drift(&m, &[&dead, &done], &BTreeMap::new(), None, 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "unreachable-phase"));
     }
 
@@ -2955,7 +3258,7 @@ mod tests {
             vec![&runtime_capture, &file_match, &sovereignty_verbs, &validate_cure];
 
         let now = now_unix(); // real elapsed time since the real started_ts
-        let d = detect_drift(&m, &phases, &BTreeMap::new(), now, 14);
+        let d = detect_drift(&m, &phases, &BTreeMap::new(), None, now, 14);
 
         assert!(
             d.iter().any(|dr| dr.kind == "stale-active"),
@@ -2988,7 +3291,7 @@ mod tests {
         m.phase_ids = vec!["review".to_string(), "deliver".to_string()];
         m.started_ts = Some(1_788_656_497);
 
-        let d = detect_drift(&m, &[&review, &deliver], &BTreeMap::new(), 1_788_657_100, 14);
+        let d = detect_drift(&m, &[&review, &deliver], &BTreeMap::new(), None, 1_788_657_100, 14);
 
         assert!(
             !d.iter().any(|dr| dr.kind == "unreachable-phase"),
