@@ -79,12 +79,20 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.48.0";
 // Version history:
-//   1.48.0 (#2196): `hook.fired`/`hook.failed`'s payload gains an
-//           additive `receiver_rejected_reasons` key — the receiver's
-//           own `results[].error` text (bounded to the first 3, each
-//           truncated to 200 bytes) for the record(s) it reported
-//           rejecting inside an otherwise-2xx response, riding alongside
-//           the existing `receiver_rejected` count. MINOR, following this
+//   1.48.0 (#2196): `hook.fired`'s payload gains an additive
+//           `receiver_rejected_reasons` key — the receiver's own
+//           `results[].error` text (bounded to the first 3, each
+//           truncated to `MAX_REJECTION_REASON_DISPLAY_WIDTH` rendered
+//           columns, sanitized against control/bidi/invisible characters
+//           and with whitespace runs collapsed — see `hooks.rs`'s
+//           `truncate_reason`/`sanitize_reason_text` docs, hardened in
+//           the #2196 fix-round) for the record(s) it reported rejecting
+//           inside an otherwise-2xx response, riding alongside the
+//           existing `receiver_rejected` count. `hook.failed` never
+//           carries this key — `emit_hook_record` (the give-up path)
+//           always passes an empty reasons slice; only the
+//           `DeliveryOutcome::Success` arm (which always emits
+//           `hook.fired`) supplies reasons. MINOR, following this
 //           history's own repeated precedent (1.21.0, 1.25.0, 1.29.0,
 //           1.32.0, 1.33.0, 1.36.0, among others): a new optional payload
 //           key on an existing action is additive, and "only producers

@@ -3130,21 +3130,25 @@ mod tests {
         //           hub brew/stable) would otherwise report no skew while
         //           two shapes were live. See `schema.rs`'s own history
         //           entry for the full explanation.
-        //   1.48.0 (#2196): `hook.fired`/`hook.failed`'s payload gains an
-        //           additive `receiver_rejected_reasons` key — the
-        //           receiver's own `results[].error` text (bounded to the
-        //           first 3, truncated to 200 bytes each) for record(s)
-        //           it reported rejecting inside an otherwise-2xx
-        //           response, alongside the existing `receiver_rejected`
-        //           count. Minor, same "new optional payload key on an
-        //           existing action" bar this history has applied
-        //           repeatedly (1.21.0, 1.25.0, 1.29.0, 1.32.0, 1.33.0,
-        //           1.36.0). See `schema.rs`'s own history entry for the
-        //           full explanation, including why the sidecar/status
-        //           fields this same fix adds
-        //           (`last_receiver_rejected_reasons` on `.last` and on
-        //           `HookRuleStatus`) are NOT part of this constant's
-        //           scope.
+        //   1.48.0 (#2196): `hook.fired`'s payload gains an additive
+        //           `receiver_rejected_reasons` key — the receiver's own
+        //           `results[].error` text (bounded to the first 3,
+        //           truncated + sanitized per `hooks.rs`'s
+        //           `truncate_reason`, hardened in the #2196 fix-round)
+        //           for record(s) it reported rejecting inside an
+        //           otherwise-2xx response, alongside the existing
+        //           `receiver_rejected` count. `hook.failed` never
+        //           carries this key — only the `DeliveryOutcome::Success`
+        //           arm (always `hook.fired`) supplies reasons; the
+        //           give-up path always passes an empty slice. Minor,
+        //           same "new optional payload key on an existing
+        //           action" bar this history has applied repeatedly
+        //           (1.21.0, 1.25.0, 1.29.0, 1.32.0, 1.33.0, 1.36.0). See
+        //           `schema.rs`'s own history entry for the full
+        //           explanation, including why the sidecar/status fields
+        //           this same fix adds (`last_receiver_rejected_reasons`
+        //           on `.last` and on `HookRuleStatus`) are NOT part of
+        //           this constant's scope.
         assert_eq!(FLOW_SCHEMA_VERSION, "1.48.0");
     }
 

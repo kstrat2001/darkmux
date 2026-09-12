@@ -1873,10 +1873,69 @@ fn build_delivery_headers(
 /// (deliberately or not) rejects everything with a huge error body.
 const MAX_REJECTION_REASONS: usize = 3;
 
-/// Each individual reason string is truncated to this many bytes (on a
-/// UTF-8 char boundary) before it rides anywhere durable — see
-/// [`MAX_REJECTION_REASONS`]'s doc for why a bound exists at all.
-const MAX_REJECTION_REASON_LEN: usize = 200;
+/// (#2196 fix-round MUST FIX 1) Each individual reason string is
+/// truncated to at most this many rendered COLUMNS (see [`display_width`]
+/// — not bytes, not `char`s) before it rides anywhere durable. A byte
+/// bound doesn't protect the one surface this text is actually dangerous
+/// on: a fixed-column human report. `flow status`'s widest per-rule
+/// label, `"      last rejection reason(s): "`
+/// (`status.rs::format_status_human`), is 32 columns; a receiver padding
+/// its reason to reach the wrap boundary of even a conservative 80-column
+/// terminal controls everything from that column onward, including the
+/// first character of the WRAPPED CONTINUATION ROW — which a plain byte
+/// cap (the previous 200-byte bound) does nothing to prevent (a 90-byte
+/// all-printable reason reaches column 122, well past any real
+/// terminal's fold point).
+///
+/// The budget: assume an 80-column floor (the POSIX default, and a
+/// reasonable "narrowest terminal an operator plausibly runs `flow
+/// status`/`doctor` in"), subtract the widest known inline-label prefix
+/// (32) and the two quote-mark columns [`format_rejection_reasons_for_display`]
+/// adds, then round down for margin. This bound is defense in depth, not
+/// the whole defense — on a terminal narrower than 80 columns a long
+/// enough reason can still wrap. What actually closes the exact-vocabulary
+/// forgery (a receiver reproducing darkmux's own `"      cursor-write
+/// failures: 0 (recovered)"`-shaped rows) is
+/// [`collapse_whitespace_and_trim`]: darkmux's own rows always indent with
+/// a RUN of spaces, and a run collapses to one, so no receiver-controlled
+/// text can ever reproduce that indentation regardless of where a wrap
+/// lands.
+const MAX_REJECTION_REASON_DISPLAY_WIDTH: usize = 40;
+
+/// (#2196 fix-round MUST FIX 1) Bidi control / directional-isolate
+/// characters — the Trojan Source class (CVE-2021-42574: RLO/LRO/isolates
+/// reorder how text VISUALLY renders without touching its logical byte
+/// order). Unicode category `Cf` (format), not `Cc` — `char::is_control()`
+/// does not catch these.
+fn is_bidi_control_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200E}' | '\u{200F}' // LRM, RLM
+        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+    )
+}
+
+/// (#2196 fix-round MUST FIX 1) Invisible / zero-width characters that can
+/// hide arbitrary payload inside otherwise-printable text (ZWSP, ZWNJ,
+/// ZWJ, the BOM/ZWNBSP, and soft hyphen). Also `Cf`, not `Cc`.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
+        | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
+        | '\u{00AD}' // SOFT HYPHEN
+    )
+}
+
+/// (#2196 fix-round MUST FIX 1) Unicode line/paragraph separators —
+/// category `Zl`/`Zp`, not `Cc` — that some terminals and renderers treat
+/// as a line break exactly like `\n`/`\r`. Left in, these are the same
+/// row-forgery primitive `\n` is, wearing a category `char::is_control()`
+/// doesn't check.
+fn is_unicode_line_break(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
 
 /// Strip control characters (the Unicode `Cc` category — C0 controls
 /// including `\n`/`\r`, ESC, and DEL, plus the C1 range) from a
@@ -1897,29 +1956,138 @@ const MAX_REJECTION_REASON_LEN: usize = 200;
 /// prose an operator reads, not a wire-protocol value like a header), so
 /// this deliberately doesn't reuse `sanitize_header_value`'s ASCII-only
 /// allowlist.
+///
+/// (#2196 fix-round MUST FIX 1) `char::is_control()` alone only catches
+/// category `Cc` — it lets through the Trojan Source bidi-reordering set,
+/// invisible/zero-width characters, and the Unicode line/paragraph
+/// separators, all of which are the SAME class of terminal-corruption
+/// primitive as a raw control character and are filtered here too (see
+/// [`is_bidi_control_char`]/[`is_invisible_format_char`]/
+/// [`is_unicode_line_break`]'s docs). The result is also passed through
+/// [`collapse_whitespace_and_trim`], which is what actually defeats the
+/// exact-vocabulary row forgery — see [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s
+/// doc.
 fn sanitize_reason_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    let filtered: String = s
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !is_bidi_control_char(*c)
+                && !is_invisible_format_char(*c)
+                && !is_unicode_line_break(*c)
+        })
+        .collect();
+    collapse_whitespace_and_trim(&filtered)
+}
+
+/// (#2196 fix-round MUST FIX 1 + MUST FIX 5) Collapse any run of Unicode
+/// whitespace (regular space, NBSP, and every other `char::is_whitespace()`
+/// code point — not just ASCII space) down to a single ASCII space, then
+/// trim the ends.
+///
+/// This is the fix for the forged-row primitive, not just cosmetic
+/// tidying: every darkmux-owned row in `flow status`'s per-rule block
+/// (`status.rs`, e.g. `"      cursor-write failures: {} (recovered)"`,
+/// `"      STALLED: ..."`, `"      last drainer heartbeat: ..."`) indents
+/// with a RUN of six literal spaces. A receiver forging one of those rows
+/// needs that exact run to land at column 0 of a wrapped continuation
+/// line. Collapsing every whitespace run to one character means no
+/// receiver-supplied text can ever contain six (or two, or any run
+/// length ≥ 2) consecutive spaces after sanitization — the forged row
+/// literally cannot be constructed, independent of terminal width, wrap
+/// point, or the length bound above.
+///
+/// Trimming also closes MUST FIX 5 for free: a reason that is empty, or
+/// made of nothing but control/whitespace characters the filter above
+/// just stripped, becomes `""` here, which [`extract_rejection_reasons`]
+/// then drops entirely rather than let an empty-parens
+/// `"... on the last delivery ()"` line ship.
+fn collapse_whitespace_and_trim(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// (#2196 fix-round MUST FIX 1) Approximate rendered column width of `c`
+/// on a typical terminal: East-Asian wide/fullwidth scripts occupy two
+/// columns, everything else occupies one. Not a full Unicode
+/// `East_Asian_Width` implementation — no `unicode-width`-class crate is
+/// in this dependency set (see this crate's small, deliberate dep list),
+/// and this is close enough for a length BOUND, not a pixel-exact layout
+/// engine. The ranges below cover the common wide scripts (CJK
+/// ideographs, Hangul syllables, Hiragana/Katakana, CJK compatibility,
+/// fullwidth forms) that the previous byte-only bound completely missed:
+/// 200 bytes is 67 CJK characters, roughly 134 display columns — nearly
+/// double what the byte count suggests. Underestimating a rare wide
+/// codepoint outside these ranges costs a couple of stray columns, not a
+/// forged row; [`collapse_whitespace_and_trim`] is what actually closes
+/// the exact-vocabulary forgery regardless of how this function scores
+/// any given character.
+fn display_width(c: char) -> usize {
+    let cp = c as u32;
+    let wide = matches!(
+        cp,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0x303E // CJK radicals, Kangxi, CJK symbols/punctuation
+        | 0x3041..=0x33FF // Hiragana, Katakana, CJK compatibility
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xA000..=0xA4CF // Yi syllables/radicals
+        | 0xAC00..=0xD7A3 // Hangul syllables
+        | 0xF900..=0xFAFF // CJK compatibility ideographs
+        | 0xFF00..=0xFF60 // Fullwidth forms
+        | 0xFFE0..=0xFFE6 // Fullwidth signs
+        | 0x20000..=0x3FFFD // CJK extension B and beyond (supplementary plane)
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
 }
 
 /// Sanitize `s` (see [`sanitize_reason_text`]) and then truncate the
-/// SANITIZED string to at most [`MAX_REJECTION_REASON_LEN`] bytes,
-/// walking back to the nearest UTF-8 char boundary so a truncated
-/// multi-byte character never panics or produces invalid UTF-8. Appends
-/// `…` when truncation actually happened. Sanitizing before truncating
-/// (not after) matters for two reasons: the byte bound is a promise
-/// about what actually rides downstream, and filtering after truncation
-/// could still cut a multi-byte sequence at the wrong point relative to
-/// the removed bytes.
+/// SANITIZED string to at most [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]
+/// rendered columns (see [`display_width`]), appending `…` when
+/// truncation actually happened. Walks `char_indices` — every candidate
+/// cut point is therefore already a UTF-8 char boundary BY CONSTRUCTION,
+/// eliminating the panic class a raw byte-offset slice invites (#2196
+/// fix-round MUST FIX 2: a naive `&s[..N]` on a byte offset that lands
+/// mid-character panics with "byte index N is not a char boundary" —
+/// reachable with a 204-byte reason ending in a multi-byte character
+/// under the OLD 200-byte bound, and just as reachable under a column
+/// bound with a naive implementation). Sanitizing before truncating (not
+/// after) matters for two reasons: the bound is a promise about what
+/// actually rides downstream, and filtering after truncation could still
+/// cut a multi-byte sequence at the wrong point relative to the removed
+/// characters.
 fn truncate_reason(s: &str) -> String {
     let s = sanitize_reason_text(s);
-    if s.len() <= MAX_REJECTION_REASON_LEN {
-        return s;
+    let mut width = 0usize;
+    let mut cut_at = None;
+    for (idx, c) in s.char_indices() {
+        let w = display_width(c);
+        if width + w > MAX_REJECTION_REASON_DISPLAY_WIDTH {
+            cut_at = Some(idx);
+            break;
+        }
+        width += w;
     }
-    let mut end = MAX_REJECTION_REASON_LEN;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    match cut_at {
+        Some(idx) => format!("{}…", &s[..idx]),
+        None => s,
     }
-    format!("{}…", &s[..end])
 }
 
 /// Extract up to [`MAX_REJECTION_REASONS`] per-record rejection reason
@@ -1934,6 +2102,15 @@ fn truncate_reason(s: &str) -> String {
 /// darkmux describes what the receiver told it and never invents detail
 /// the receiver didn't provide (this project's "describes, never
 /// adjudicates" stance applies to absence of data too).
+///
+/// (#2196 fix-round MUST FIX 5) A reason that sanitizes to empty (an
+/// empty string, or one made of nothing but control/whitespace
+/// characters `truncate_reason` just stripped) is dropped here rather
+/// than kept as `""` — an empty-string "reason" is not a reason; letting
+/// it through produced `"... on the last delivery ()"` in `doctor` and a
+/// bare, contentless `"last rejection reason(s): "` in `flow status`,
+/// leaving the operator unable to tell whether the receiver gave no
+/// reason at all or darkmux lost one it was given.
 fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
     body.get("results")
         .and_then(serde_json::Value::as_array)
@@ -1944,9 +2121,44 @@ fn extract_rejection_reasons(body: &serde_json::Value) -> Vec<String> {
                 .filter_map(|e| e.get("error").and_then(serde_json::Value::as_str))
                 .take(MAX_REJECTION_REASONS)
                 .map(truncate_reason)
+                .filter(|s| !s.is_empty())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// (#2196 fix-round MUST FIX 1 + CONSIDER) Render receiver-supplied
+/// rejection reason(s) for a human-facing terminal surface (`flow
+/// status`, `darkmux doctor`, and the delivery `eprintln!` at the
+/// `DeliveryOutcome::Success` call site) — each reason double-quoted and
+/// semicolon-joined, and re-sanitized/re-bounded via [`truncate_reason`]
+/// rather than trusting the caller already did.
+///
+/// Two independent reasons this exists as its own function instead of a
+/// bare `.join("; ")` at each call site:
+///
+/// - **Attribution.** Quoting makes the text unambiguously the
+///   RECEIVER'S words, never darkmux's own voice — a reader scanning for
+///   a closing quote mark can tell where receiver-controlled text ends,
+///   which a bare inline string cannot offer. Internal `"` and `\` are
+///   backslash-escaped (the familiar quoted-string convention) so a
+///   reason that itself contains a literal `"` can never look like the
+///   closing quote and spill unquoted text onto the row.
+/// - **Defense in depth.** Sanitization today lives only at the
+///   producer (`truncate_reason`, called from `extract_rejection_reasons`
+///   at write time). A `.last` sidecar already on disk from before this
+///   fix (this fix's own first commit wrote reasons unsanitized), or any
+///   future producer that forgets to call `truncate_reason`, would
+///   otherwise render raw. Calling `truncate_reason` again here is one
+///   call and closes that window — sanitization and the display-width
+///   bound are both idempotent, so re-applying them to already-clean
+///   text is a no-op.
+pub fn format_rejection_reasons_for_display(reasons: &[String]) -> String {
+    reasons
+        .iter()
+        .map(|r| format!("\"{}\"", truncate_reason(r).replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome {
@@ -2857,7 +3069,12 @@ fn drainer_loop(
                         let reasons_note = if reasons_for_status.is_empty() {
                             String::new()
                         } else {
-                            format!(" — {}", reasons_for_status.join("; "))
+                            // (#2196 fix-round MUST FIX 1) Quoted +
+                            // re-sanitized via `format_rejection_reasons_for_display`
+                            // — this string reaches a real terminal via
+                            // `eprintln!`, the same surface `flow status`
+                            // and `doctor` render to.
+                            format!(" — {}", format_rejection_reasons_for_display(&reasons_for_status))
                         };
                         eprintln!(
                             "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it ({total} so far){reasons_note} — see hook.fired.receiver_rejected",
@@ -6262,9 +6479,16 @@ mod tests {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
+        // (#2196 fix-round MUST FIX 1) The receiver's raw text is 47
+        // display columns; `truncate_reason` bounds it to
+        // `MAX_REJECTION_REASON_DISPLAY_WIDTH` (40) at write time, so the
+        // stored value carries the ellipsis already — the render layer
+        // (`format_rejection_reasons_for_display`) additionally quotes
+        // and escapes it, but that's a display concern, not a storage
+        // one; these assertions check what's actually stored.
         assert_eq!(
             reasons,
-            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            vec!["payload field \"file\" must be a non-empty…".to_string()],
             "{fired:?}"
         );
         assert_eq!(level_wire(fired.level), "warn", "{fired:?}");
@@ -6274,14 +6498,14 @@ mod tests {
         let last = read_last_status(&last_status_path(tmp.path(), &key)).expect("`.last` sidecar must exist");
         assert_eq!(
             last.last_receiver_rejected_reasons,
-            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            vec!["payload field \"file\" must be a non-empty…".to_string()],
             "{last:?}"
         );
 
         let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
         assert_eq!(
             summary.last_receiver_rejected_reasons,
-            vec!["payload field \"file\" must be a non-empty string".to_string()],
+            vec!["payload field \"file\" must be a non-empty…".to_string()],
             "{summary:?}"
         );
         drop(sink);
@@ -6514,21 +6738,33 @@ mod tests {
 
     /// (#2196 fix-round MUST FIX 1) `truncate_reason` (the single choke
     /// point every `results[].error` string passes through — see
-    /// `extract_rejection_reasons`) must strip control characters BEFORE
-    /// a receiver's text reaches `flow status`, `darkmux doctor`, or the
-    /// `eprintln!` at the `DeliveryOutcome::Success` call site — all of
-    /// which render the string directly to a real terminal. Three probes,
-    /// each a distinct terminal-corruption primitive a raw receiver
-    /// string could otherwise carry: an embedded newline that would forge
-    /// extra status-line rows, a carriage return that would overwrite the
-    /// visible line, and a raw ANSI escape (here, a screen-clear plus a
-    /// color code) that would execute on whatever terminal is watching.
+    /// `extract_rejection_reasons`) must strip every terminal-corruption
+    /// primitive BEFORE a receiver's text reaches `flow status`,
+    /// `darkmux doctor`, or the `eprintln!` at the `DeliveryOutcome::Success`
+    /// call site — all of which render the string directly to a real
+    /// terminal — AND collapse whitespace runs, which is what actually
+    /// defeats the exact-vocabulary row forgery (see
+    /// [`MAX_REJECTION_REASON_DISPLAY_WIDTH`]'s doc).
+    ///
+    /// This REPLACES the PR's original version of this test, which
+    /// asserted the OLD, defective behavior verbatim: it expected the
+    /// newline-forgery input's six-space indentation to survive fully
+    /// intact (`"ok      stalled: ..."`) — exactly the primitive the
+    /// terminal-wrap row forgery in MUST FIX 1 depends on. That
+    /// assertion encoded the defect as expected behavior; it's gone now,
+    /// and whitespace runs collapse to one space.
     #[test]
-    fn truncate_reason_strips_control_characters_before_bounding() {
+    fn truncate_reason_strips_forgery_primitives_and_collapses_whitespace() {
+        // (Collapsed-then-truncated: the collapsed string is 63 columns,
+        // over the 40-column cap, so the stored value also carries an
+        // ellipsis — the whitespace-collapse property below is what this
+        // probe is pinning, not the exact surviving prefix.)
         let newline_forgery = "ok\n      stalled: no drainer heartbeat for 9999s\n      quarantined lines: 0";
         let out = truncate_reason(newline_forgery);
         assert!(!out.contains('\n'), "{out:?}");
-        assert_eq!(out, "ok      stalled: no drainer heartbeat for 9999s      quarantined lines: 0");
+        assert!(!out.contains("  "), "no run of 2+ spaces may survive sanitization: {out:?}");
+        assert!(out.starts_with("ok stalled: no drainer heartbeat"), "{out:?}");
+        assert!(out.ends_with('…'), "{out:?}");
 
         let ansi = "\x1b[2J\x1b[31mFATAL: darkmux is corrupt\x1b[0m";
         let out = truncate_reason(ansi);
@@ -6541,9 +6777,211 @@ mod tests {
         assert_eq!(out, "realFAKE");
 
         // Printable non-ASCII text (this is prose, not a header value)
-        // must survive — the filter targets control characters, not
-        // anything outside plain ASCII.
+        // must survive — the filter targets control/forgery characters,
+        // not anything outside plain ASCII.
         assert_eq!(truncate_reason("café \u{2014} rejected"), "café \u{2014} rejected");
+
+        // (#2196 fix-round MUST FIX 1) Trojan Source class (CVE-2021-42574):
+        // RLO reorders the VISUAL rendering of everything after it
+        // without touching logical byte order — this exact payload would
+        // otherwise display as an approval-reading string.
+        let rlo = "delivered OK \u{202e})deppord( deriuqer dleif";
+        let out = truncate_reason(rlo);
+        assert!(!out.contains('\u{202e}'), "{out:?}");
+
+        // Directional isolates + RLM — the rest of the Trojan Source set.
+        for c in ['\u{2066}', '\u{2067}', '\u{2069}', '\u{200f}'] {
+            let poisoned = format!("ok{c}text");
+            assert!(!truncate_reason(&poisoned).contains(c), "{c:?} must be stripped");
+        }
+
+        // Invisible / zero-width characters.
+        for c in ['\u{200b}', '\u{feff}', '\u{00ad}'] {
+            let poisoned = format!("ok{c}text");
+            assert!(!truncate_reason(&poisoned).contains(c), "{c:?} must be stripped");
+        }
+
+        // Unicode line/paragraph separators — the same row-forgery
+        // primitive as `\n`, wearing a category `is_control()` misses.
+        for c in ['\u{2028}', '\u{2029}'] {
+            let poisoned = format!("ok{c}      stalled: fake");
+            let out = truncate_reason(&poisoned);
+            assert!(!out.contains(c), "{c:?} must be stripped: {out:?}");
+            assert!(!out.contains("  "), "whitespace run must still collapse: {out:?}");
+        }
+    }
+
+    /// (#2196 fix-round MUST FIX 1, forgery pin — short case) A reason
+    /// SHORT ENOUGH to survive `truncate_reason`'s width cap WHOLE (no
+    /// ellipsis) must still have an embedded darkmux-row-shaped
+    /// indentation collapsed — proving the fix isn't merely "the width
+    /// cap cuts off anything long enough to reach a wrap point", which
+    /// would leave a reason deliberately engineered to fit inside the
+    /// cap free to forge a row. `"      cursor-write failures: 0
+    /// (recovered)"` alone is 43 columns — already longer than the
+    /// entire cap — so a forgery attempt reproducing that exact row
+    /// verbatim can never survive truncation at all; this is the
+    /// complementary case where the forged text is short enough that
+    /// truncation isn't what saves it.
+    #[test]
+    fn truncate_reason_collapses_a_forged_row_prefix_even_when_it_fits_whole() {
+        let short_forgery = "x      cursor-write failures: 0";
+        let out = truncate_reason(short_forgery);
+        assert!(!out.ends_with('…'), "must survive whole, not truncated: {out:?}");
+        assert!(!out.contains("  "), "the forged indentation must collapse: {out:?}");
+        assert_eq!(out, "x cursor-write failures: 0");
+    }
+
+    /// (#2196 fix-round MUST FIX 2) `truncate_reason` walks `char_indices`
+    /// so every cut point is a UTF-8 char boundary BY CONSTRUCTION — this
+    /// pins that against exactly the inputs a naive byte-offset slice
+    /// panics on: a multi-byte character straddling the cut point, and an
+    /// all-wide-CJK reason where raw byte length wildly understates
+    /// rendered column width (200 bytes is 67 CJK characters, ~134
+    /// display columns — see [`display_width`]'s doc). Red-proved:
+    /// reverting `truncate_reason` to a raw byte-offset slice on
+    /// `MAX_REJECTION_REASON_DISPLAY_WIDTH` bytes (the shape the
+    /// ORIGINAL `hooks.rs:1918-1921` walk was protecting against) panics
+    /// on both inputs below with "byte index N is not a char boundary".
+    #[test]
+    fn truncate_reason_never_panics_on_a_multibyte_char_straddling_the_cut() {
+        // 39 ASCII columns, then one 3-byte character (総, U+7DCF) whose
+        // 2-column display width pushes the running total from 39 to 41
+        // — over the 40-column cap ON that multi-byte character, the
+        // exact straddle shape a naive byte-offset slice panics on.
+        let straddle = format!("{}\u{7dcf}", "a".repeat(39));
+        let out = truncate_reason(&straddle);
+        assert!(out.is_char_boundary(out.len()), "{out:?}");
+        assert!(out.ends_with('…'), "{out:?}");
+
+        // All-wide CJK: every character is 2 display columns, so the
+        // 40-column cap truncates after exactly 20 characters — 201
+        // bytes total, nowhere near an ASCII byte boundary by luck.
+        let all_cjk = "一".repeat(67); // 201 bytes, 67 chars, 134 display columns
+        let out = truncate_reason(&all_cjk);
+        assert!(out.is_char_boundary(out.len()), "{out:?}");
+        assert_eq!(out.chars().filter(|c| *c != '…').count(), 20, "{out:?}");
+        assert!(out.ends_with('…'), "{out:?}");
+    }
+
+    /// (#2196 fix-round MUST FIX 3) A receiver answering `"rejected": 0`
+    /// EXPLICITLY (as opposed to omitting the key entirely, which
+    /// `hook_fired_stays_clean_when_results_reject_without_a_top_level_rejected_count`
+    /// above covers) must be treated the same as "no count to disclose".
+    /// `receiver_rejected.filter(|n| *n > 0)` at the
+    /// `DeliveryOutcome::Success` call site already does this correctly
+    /// — this test is what was missing, not a code change. Red-proved:
+    /// deleting that `.filter(|n| *n > 0)` reaches the identical failure
+    /// shape this PR wrote the sibling test above for: `hook.fired` at
+    /// Info carrying a reason with a zero count, plus the stderr line
+    /// `"rejected 0 record(s) inside it (0 so far)"`.
+    #[test]
+    fn hook_fired_stays_clean_when_top_level_rejected_is_explicitly_zero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_response_body(
+            r#"{"ok":true,"rejected":0,"results":[{"ok":false,"error":"ZERO-COUNT-LEAK"}]}"#,
+        );
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, &receiver.url("/events"));
+        let last_path = last_status_path(tmp.path(), &key);
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(
+            wait_until(|| read_last_status(&last_path).is_some(), Duration::from_secs(3)),
+            "the delivery must land"
+        );
+        assert!(
+            wait_until(
+                || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+                Duration::from_secs(3)
+            ),
+            "hook.fired must land"
+        );
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).is_none(),
+            "rejected: 0 is not a count to disclose: {fired:?}"
+        );
+        assert!(
+            fired.payload.as_ref().and_then(|p| p.get("receiver_rejected_reasons")).is_none(),
+            "a reason must never ride when the receiver's own count was zero: {fired:?}"
+        );
+        assert_eq!(level_wire(fired.level), "info", "{fired:?}");
+
+        let last = read_last_status(&last_path).unwrap();
+        assert_eq!(last.last_receiver_rejected, None, "{last:?}");
+        assert!(last.last_receiver_rejected_reasons.is_empty(), "{last:?}");
+
+        let summary = summarize_configured_rules(&rules, tmp.path()).remove(0);
+        assert_eq!(summary.receiver_rejected_total, 0, "{summary:?}");
+        drop(sink);
+    }
+
+    /// (#2196 fix-round MUST FIX 4) `extract_rejection_reasons` filters
+    /// on `"ok": false` explicitly — an entry marked `"ok": true` must
+    /// never contribute its `error` text, even when one happens to carry
+    /// one. Every existing fixture's `ok: true` entries carry no `error`
+    /// key at all, so `filter_map` swallows them for a reason unrelated
+    /// to the `ok` filter — this is the case that actually exercises it.
+    /// Red-proved: deleting
+    /// `.filter(|e| e.get("ok").and_then(as_bool) == Some(false))`
+    /// reports BOTH strings below instead of just the real one.
+    #[test]
+    fn extract_rejection_reasons_never_reports_an_accepted_records_text() {
+        let body = serde_json::json!({
+            "rejected": 1,
+            "results": [
+                {"ok": true, "error": "LEAKED-FROM-AN-ACCEPTED-RECORD"},
+                {"ok": false, "error": "the real rejection"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons, vec!["the real rejection".to_string()], "{reasons:?}");
+    }
+
+    /// (#2196 fix-round MUST FIX 5) A reason that sanitizes to empty — an
+    /// empty string, or one made of nothing but control/bidi/whitespace
+    /// characters `truncate_reason` strips — must never appear in the
+    /// returned vector as `""`. Letting it through produced `"... on the
+    /// last delivery ()"` in `doctor` and a bare, contentless "last
+    /// rejection reason(s): " line in `flow status`, leaving an operator
+    /// unable to tell whether the receiver gave no reason at all or
+    /// darkmux lost one it was given.
+    #[test]
+    fn extract_rejection_reasons_drops_reasons_that_sanitize_to_empty() {
+        let body = serde_json::json!({
+            "rejected": 2,
+            "results": [
+                {"ok": false, "error": ""},
+                {"ok": false, "error": "\u{0}\u{1}\u{202e}"},
+                {"ok": false, "error": "real reason"},
+            ]
+        });
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons, vec!["real reason".to_string()], "{reasons:?}");
     }
 
     /// (#2196 fix-round MUST FIX 1, end-to-end) The unit test above pins
@@ -6633,7 +7071,11 @@ mod tests {
         assert_eq!(reasons.len(), MAX_REJECTION_REASONS, "{reasons:?}");
         assert_eq!(reasons[0], "r1");
         assert_eq!(reasons[1], "r2");
-        assert_eq!(reasons[2].chars().count(), MAX_REJECTION_REASON_LEN + 1, "must truncate + ellipsis: {reasons:?}");
+        assert_eq!(
+            reasons[2].chars().count(),
+            MAX_REJECTION_REASON_DISPLAY_WIDTH + 1,
+            "must truncate + ellipsis: {reasons:?}"
+        );
         assert!(reasons[2].ends_with('…'), "{reasons:?}");
     }
 

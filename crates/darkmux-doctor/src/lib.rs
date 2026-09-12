@@ -2207,8 +2207,14 @@ fn build_hooks_check(
                 // never WHY, so this is what saves a replay against a
                 // scratch receiver or a trip through the receiver's own
                 // log to find out.
+                // (#2196 fix-round MUST FIX 1) Quoted + re-sanitized —
+                // see `darkmux_flow::hooks::format_rejection_reasons_for_display`'s
+                // doc for why this isn't a bare `.join("; ")`.
                 Some(n) if !s.last_receiver_rejected_reasons.is_empty() => {
-                    format!("; {n} on the last delivery ({})", s.last_receiver_rejected_reasons.join("; "))
+                    format!(
+                        "; {n} on the last delivery ({})",
+                        darkmux_flow::hooks::format_rejection_reasons_for_display(&s.last_receiver_rejected_reasons)
+                    )
                 }
                 Some(n) => format!("; {n} on the last delivery"),
                 None => String::new(),
@@ -7090,8 +7096,16 @@ mod tests {
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path(), &std::collections::HashSet::new());
         let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
         assert_eq!(rule.status, Status::Warn, "{}", rule.message);
+        // (#2196 fix-round MUST FIX 1) The fixture's 47-column raw text
+        // is written straight into the `.last` sidecar, bypassing the
+        // producer's own `truncate_reason` call — this proves the
+        // render-time re-sanitization/re-bounding
+        // (`darkmux_flow::hooks::format_rejection_reasons_for_display`)
+        // ALSO applies at read time: the rendered text is bounded to 40
+        // columns (+ellipsis) and quoted, with the reason's OWN internal
+        // `"` backslash-escaped.
         assert!(
-            rule.message.contains("payload field \"file\" must be a non-empty string"),
+            rule.message.contains("\"payload field \\\"file\\\" must be a non-empty…\""),
             "the receiver's own reason must be named, not just the count: {}",
             rule.message
         );

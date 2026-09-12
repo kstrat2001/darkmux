@@ -691,10 +691,13 @@ pub fn format_status_human(status: &FlowStatus) -> String {
                 // reason is last-value and self-erases on a later clean
                 // delivery, same as `last_receiver_rejected`).
                 if !r.last_receiver_rejected_reasons.is_empty() {
+                    // (#2196 fix-round MUST FIX 1) Quoted + re-sanitized —
+                    // see `hooks::format_rejection_reasons_for_display`'s
+                    // doc for why this isn't a bare `.join("; ")`.
                     let _ = writeln!(
                         out,
                         "      last rejection reason(s): {}",
-                        r.last_receiver_rejected_reasons.join("; ")
+                        crate::hooks::format_rejection_reasons_for_display(&r.last_receiver_rejected_reasons)
                     );
                 }
             }
@@ -1135,7 +1138,189 @@ mod hooks_status_tests {
             hooks,
         };
         let rendered = format_status_human(&status);
-        assert!(rendered.contains("last rejection reason(s): rule must be a string"), "{rendered}");
+        assert!(rendered.contains("last rejection reason(s): \"rule must be a string\""), "{rendered}");
+    }
+
+    /// (#2196 fix-round MUST FIX 6) The reason ROW's own gate
+    /// (`!r.last_receiver_rejected_reasons.is_empty()`) has no direct
+    /// test — the existing inverted case above uses
+    /// `receiver_rejected_total == 0`, so the OUTER `if
+    /// r.receiver_rejected_total > 0` block is skipped entirely and the
+    /// inner gate this test targets is never reached; its assertion
+    /// proves nothing about the guard beside it. This is the common case
+    /// by the PR's own description: rejections on record
+    /// (`receiver_rejected_total > 0`) with the reason self-erased by a
+    /// later clean delivery (`last_receiver_rejected_reasons` empty) —
+    /// `doctor` already has a fixture for exactly this shape
+    /// (`hooks_check_still_warns_after_a_later_clean_delivery_erased_the_last_value`);
+    /// `flow status` did not.
+    #[test]
+    fn flow_status_omits_the_reason_row_when_the_count_is_nonzero_but_the_reason_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = crate::hooks::rule_key(&m, &url);
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "400").unwrap();
+        // What one clean delivery leaves behind after 400 rejected ones —
+        // `last_receiver_rejected`/`last_receiver_rejected_reasons` both
+        // absent, same fixture shape doctor already pins.
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            r#"{"ts":"2026-01-01T00:00:00Z","ok":true}"#,
+        )
+        .unwrap();
+
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        assert_eq!(hooks.rules[0].receiver_rejected_total, 400);
+        assert!(hooks.rules[0].last_receiver_rejected_reasons.is_empty());
+
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+        assert!(rendered.contains("rejected by receiver: 400"), "{rendered}");
+        assert!(!rendered.contains("last rejection reason"), "{rendered}");
+    }
+
+    /// (#2196 fix-round MUST FIX 1, forgery pin) Before this fix, a
+    /// receiver could pad a rejection reason so that a real terminal
+    /// wrapping the `"      last rejection reason(s): "` row (32 columns)
+    /// at 80 columns landed a SIX-SPACE-INDENTED continuation row
+    /// character-for-character identical to darkmux's own
+    /// `"      cursor-write failures: N (recovered)"` row format — a
+    /// receiver-controlled row indistinguishable from real darkmux
+    /// output, sitting directly under the genuine count.
+    ///
+    /// The fixture writes that exact forged reason straight into the
+    /// `.last` sidecar (bypassing `extract_rejection_reasons`/
+    /// `truncate_reason` entirely — simulating either a sidecar written
+    /// before this fix, or a future producer that forgets to sanitize),
+    /// so this also proves the CONSIDER item: `format_status_human`
+    /// re-sanitizes at render via
+    /// `hooks::format_rejection_reasons_for_display`, not just at the
+    /// producer.
+    ///
+    /// The forged reason is exactly 40 display columns — right AT the
+    /// display-width cap, not over it — deliberately, so it survives
+    /// truncation WHOLE (no ellipsis eats it). A longer padded reason
+    /// (the review's own PoC shape, ~90 bytes) would ALSO be defeated,
+    /// but only because the width bound truncates it away before the
+    /// forged vocabulary is ever reached — that would prove the width
+    /// bound works without ever exercising
+    /// [`crate::hooks::collapse_whitespace_and_trim`] at all. This exact
+    /// size is what makes the test red-provable against a whitespace-
+    /// collapse regression specifically.
+    ///
+    /// Every genuine row in this per-rule block indents with a RUN of
+    /// spaces (never one) — `collapse_whitespace_and_trim` guarantees no
+    /// receiver text can reproduce that run, so no simulated wrap of the
+    /// rendered output, at any column width, can ever produce a
+    /// continuation line starting with darkmux's own multi-space
+    /// indentation.
+    #[test]
+    fn flow_status_reason_forgery_cannot_reproduce_darkmuxs_own_row_indentation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events".to_string();
+        let rules = vec![HookRule {
+            r#match: Some(m.clone()),
+            http: Some(url.clone()),
+            signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
+            extras: Default::default(),
+        }];
+        let key = crate::hooks::rule_key(&m, &url);
+        // Filler (10 cols) + darkmux's OWN row text, six-space-indented
+        // (30 cols) = exactly 40 — the display-width cap — so this
+        // survives `truncate_reason` WHOLE, unlike a longer padded
+        // attempt that the cap alone would already defeat.
+        let forged_reason = "1234567890      cursor-write failures: 0";
+        assert_eq!(forged_reason.chars().count(), 40, "fixture must sit exactly at the cap");
+        std::fs::write(tmp.path().join(format!("{key}.rejected")), "1").unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{key}.last")),
+            serde_json::json!({
+                "ts": "2026-01-01T00:00:00Z",
+                "ok": true,
+                "last_receiver_rejected": 1,
+                "last_receiver_rejected_reasons": [forged_reason],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+
+        // The rendered reason must never contain the forged run of
+        // spaces — the property that makes the forgery impossible
+        // regardless of where any wrap lands.
+        assert!(!rendered.contains("1234567890      cursor-write"), "{rendered}");
+        assert!(!rendered.contains("      cursor-write"), "no 6-space-indented forgery may survive: {rendered}");
+
+        // Simulate wrapping every line at a range of plausible terminal
+        // widths and assert no continuation row can ever begin with
+        // darkmux's own row vocabulary (two or more leading spaces is
+        // darkmux's own indent; a wrapped row starting with it would be
+        // the forgery).
+        for width in [40usize, 60, 80, 100, 120] {
+            for line in rendered.lines() {
+                let chars: Vec<char> = line.chars().collect();
+                for chunk_start in (width..chars.len()).step_by(width) {
+                    let continuation: String = chars[chunk_start..].iter().take(width).collect();
+                    assert!(
+                        !continuation.starts_with("  "),
+                        "wrapped continuation row at width {width} begins with darkmux's own \
+                         multi-space indent — forgery survived: {continuation:?} (full line: {line:?})"
+                    );
+                    assert!(
+                        !continuation.starts_with("cursor-write failures"),
+                        "wrapped continuation row at width {width} reproduces darkmux's own row \
+                         vocabulary: {continuation:?} (full line: {line:?})"
+                    );
+                }
+            }
+        }
     }
 
     /// (#2273 fix-round finding 3, inverted case) A rule that has never
