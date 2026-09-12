@@ -1892,12 +1892,16 @@ const MAX_REJECTION_REASONS: usize = 3;
 /// discarded and never why — a 40-column cap recreates most of that gap.
 /// The 40-column number was also buying little: at 40 columns the full
 /// row (label + quotes + reason) is 75 columns and doesn't even wrap an
-/// 80-column terminal, and what actually closes the exact-vocabulary row
-/// forgery is [`collapse_whitespace_and_trim`] plus stripping the
+/// 80-column terminal, and what closes the exact-vocabulary forgery of an
+/// INDENTED row is [`collapse_whitespace_and_trim`] plus stripping the
 /// non-whitespace blank-rendering characters ([`is_stripped_for_display`]),
-/// not this width bound — see those functions' docs. The bound below
-/// exists to cap payload size and keep a report from an actively hostile
-/// receiver bounded, not to defeat forgery.
+/// not this width bound — see those functions' docs. The FLUSH-LEFT rows
+/// are closed separately, at the render site, by
+/// [`format_rejection_reasons_as_indented_lines`] (#2196 fix-round 3,
+/// MUST FIX G); no sanitizer can close those, because what makes them
+/// forgeable is the row's wrap point, which the sanitizer cannot see. The
+/// bound below exists to cap payload size and keep a report from an
+/// actively hostile receiver bounded, not to defeat forgery.
 ///
 /// 120 is chosen as the upper end of "roughly 100-120": generous enough
 /// that realistic receiver validation messages (measured: 47, 83, 108
@@ -1932,6 +1936,43 @@ pub(crate) const REJECTION_REASON_RAW_BUDGET: usize = MAX_REJECTION_REASON_DISPL
 /// short trailing clause like the example above (19 columns) with a
 /// little headroom.
 pub(crate) const REJECTION_REASON_TAIL_RESERVE: usize = 24;
+
+/// (#2196 fix-round 3, MUST FIX F) How many `char`s [`bound_reason_width`]
+/// allows per column of its width budget — the LENGTH ceiling that rides
+/// alongside the COLUMN ceiling.
+///
+/// This exists because fix-round 3 turned the width bound into a
+/// width-ONLY bound and, in doing so, removed the last thing bounding
+/// LENGTH. `unicode-width` is correct that a combining mark occupies ZERO
+/// rendered columns, so under a pure column budget a combining mark costs
+/// nothing: `bound_reason_width`'s head loop never trips on one, and
+/// nothing else in the pipeline caps characters or bytes. Measured on the
+/// real path (the receiver body is read through a 64 KiB `Read::take`, so
+/// this is reachable, not theoretical): a single 2xx response of ~60 KB
+/// put 20,000 combining marks — 40,000 bytes, nominal rendered width 0 —
+/// into the `.last` sidecar, the `hook.fired` payload (which flows on to
+/// the daily JSONL, the audit sink, and Redis `XADD`), the delivery
+/// `eprintln!`, and both `flow status` and `doctor`. Twenty thousand
+/// marks stacked on one cell is also a terminal-corruption primitive in
+/// its own right, not merely volume.
+///
+/// The two earlier rounds bounded length only by accident: round 1 had a
+/// flat 200-BYTE cap, and round 2's hand-rolled width function scored a
+/// combining mark as 1 column, so its column budget doubled as a rough
+/// character cap. Round 3's correct width function removed both. This
+/// constant restores the ceiling EXPLICITLY, as a second budget the head
+/// and tail loops honor alongside the column budget, so it cannot be lost
+/// again by a width-function change.
+///
+/// 4 chars/column is deliberately generous rather than tight: legitimate
+/// text really does spend several `char`s per rendered column — a
+/// decomposed `é` is 2 chars for 1 column, a Devanagari or Thai cluster
+/// can stack several combining marks on one, and a regional-indicator
+/// flag pair is 2 chars for 2 columns. At [`REJECTION_REASON_RAW_BUDGET`]
+/// that is 472 chars — no realistic reason comes close (the longest
+/// measured real one is 108 columns / 108 chars), while the hostile
+/// 20,000-char case above is cut by a factor of 42.
+pub(crate) const REJECTION_REASON_CHARS_PER_COLUMN: usize = 4;
 
 /// (#2196 fix-round 2, MUST FIX A) Is `c` in a Unicode GENERAL CATEGORY
 /// that has no business appearing in a human-facing terminal report,
@@ -1968,7 +2009,15 @@ pub(crate) const REJECTION_REASON_TAIL_RESERVE: usize = 24;
 ///   `char` type structurally excludes surrogate code points), kept here
 ///   only so this function reads as a complete category audit.
 /// - `Cn` (Unassigned) — no character is assigned here yet; a receiver
-///   naming one is sending noise at best.
+///   naming one is sending noise at best. (#2196 fix-round 3, CONSIDER)
+///   This one arm is UCD-VERSION-COUPLED, and knowingly so: both crates
+///   ship Unicode 16.0 tables, so a code point assigned in Unicode 17 or
+///   later reads as `Cn` here and is silently deleted from an otherwise
+///   legitimate reason. The direction is fail-safe (drop, never render
+///   the unknown), and the blast radius is narrow — a message in a newly
+///   encoded script loses those characters with no diagnostic. A crate
+///   version bump picks up each new UCD edition; there is nothing to fix
+///   in this function.
 /// - `Zl`/`Zp` (Line/Paragraph Separator) — U+2028/U+2029, the same
 ///   row-forgery primitive as `\n` wearing a category `\n`'s own check
 ///   doesn't cover.
@@ -2015,6 +2064,23 @@ fn is_denylisted_category(c: char) -> bool {
 ///   of the braille block; category `So` (Symbol) like every other
 ///   braille cell, but this one specific pattern is, by definition, the
 ///   blank one.
+///
+/// (#2196 fix-round 3, CONSIDER — investigated, NOT adopted) Four of the
+/// five above (`U+115F`, `U+1160`, `U+3164`, `U+FFA0`) carry Unicode's
+/// `Default_Ignorable_Code_Point` property, so filtering on that property
+/// would subsume four fifths of this hand-maintained list and close the
+/// remaining zero-width `Mn` survivors for free, leaving `U+2800` — a
+/// real glyph that merely happens to render blank — as a one-character
+/// exception. That is the better shape and it is worth revisiting.
+/// **`unicode-general-category` 1.1.0 does not expose the property**
+/// (verified: a case-insensitive grep for `default.?ignorable` across the
+/// whole vendored crate returns nothing; its public surface is
+/// `get_general_category` and the `GeneralCategory` enum, nothing else),
+/// and neither does `unicode-width`. Hand-rolling the property's ~30
+/// ranges here would be a SIXTH hand-maintained list — the exact thing
+/// fix-round 2 inverted this module away from — so the five-element list
+/// stands until a crate that ships the real property table is worth
+/// adding as a third dependency.
 fn is_blank_glyph_exception(c: char) -> bool {
     matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}')
 }
@@ -2079,7 +2145,31 @@ fn is_stripped_for_display(c: char) -> bool {
 /// doc.
 fn sanitize_reason_text(s: &str) -> String {
     let filtered: String = s.chars().filter(|c| !is_stripped_for_display(*c)).collect();
-    collapse_whitespace_and_trim(&filtered)
+    strip_leading_zero_width(&collapse_whitespace_and_trim(&filtered))
+}
+
+/// (#2196 fix-round 3, CONSIDER) Drop any LEADING zero-column characters
+/// left after [`collapse_whitespace_and_trim`].
+///
+/// That function trims WHITESPACE, and a combining mark is not
+/// whitespace, so a reason beginning with one survives to the front of
+/// the string — where [`format_rejection_reasons_for_display`] then puts
+/// darkmux's own opening `"` immediately before it. A combining mark
+/// applies to the character that PRECEDES it, so a reason starting with
+/// U+0336 COMBINING LONG STROKE OVERLAY or U+20DD COMBINING ENCLOSING
+/// CIRCLE renders the quote itself struck through or circled. That quote
+/// is the single character carrying the attribution — the mark that tells
+/// a reader "everything after this is the receiver's words, not
+/// darkmux's" — so receiver-controlled text must not be able to deface
+/// it. The marks are kept everywhere else in the string, where they are
+/// ordinary prose (`café` decomposed is `e` + U+0301).
+///
+/// Zero-COLUMN rather than a category test on purpose: it is exactly the
+/// characters that cost no cell of their own — and therefore land on the
+/// preceding one — that can reach the quote. An empty result is fine;
+/// [`extract_rejection_reasons`] drops an empty reason.
+fn strip_leading_zero_width(s: &str) -> String {
+    s.trim_start_matches(|c| display_width(c) == 0).to_string()
 }
 
 /// (#2196 fix-round MUST FIX 1 + MUST FIX 5) Collapse any run of Unicode
@@ -2087,17 +2177,30 @@ fn sanitize_reason_text(s: &str) -> String {
 /// code point — not just ASCII space) down to a single ASCII space, then
 /// trim the ends.
 ///
-/// This is the fix for the forged-row primitive, not just cosmetic
-/// tidying: every darkmux-owned row in `flow status`'s per-rule block
-/// (`status.rs`, e.g. `"      cursor-write failures: {} (recovered)"`,
+/// This is part of the fix for the forged-row primitive, not just
+/// cosmetic tidying: every darkmux-owned row in `flow status`'s per-rule
+/// block (`status.rs`, e.g. `"      cursor-write failures: {} (recovered)"`,
 /// `"      STALLED: ..."`, `"      last drainer heartbeat: ..."`) indents
 /// with a RUN of six literal spaces. A receiver forging one of those rows
 /// needs that exact run to land at column 0 of a wrapped continuation
 /// line. Collapsing every whitespace run to one character means no
 /// receiver-supplied text can ever contain six (or two, or any run
-/// length ≥ 2) consecutive spaces after sanitization — the forged row
-/// literally cannot be constructed, independent of terminal width, wrap
-/// point, or the length bound above.
+/// length ≥ 2) consecutive spaces after sanitization — an INDENTED row
+/// cannot be constructed, independent of terminal width, wrap point, or
+/// the length bound above.
+///
+/// (#2196 fix-round 3, MUST FIX G) That is the whole of what this
+/// function buys, and an earlier revision of this doc overstated it as
+/// the whole defense. It covers the INDENTED rows only. Eight rows in
+/// `format_status_human` render FLUSH LEFT — the `flow status — {state}`
+/// header, `Hooks`, `Disk`, `Redis`, `Schema`, `Warnings:`, `Failures:`,
+/// and `Redis: not configured (set DARKMUX_REDIS_URL to enable)` — and
+/// none of them needs leading whitespace to look genuine, so collapsing
+/// whitespace runs does nothing for them at all. Those are closed at the
+/// render site instead, by
+/// [`format_rejection_reasons_as_indented_lines`], which takes the
+/// wrapping away from the terminal so no continuation line exists to
+/// carry receiver text to column 0.
 ///
 /// Trimming also closes MUST FIX 5 for free: a reason that is empty, or
 /// made of nothing but control/whitespace characters the filter above
@@ -2154,7 +2257,14 @@ fn display_width(c: char) -> usize {
 }
 
 /// Truncate already-SANITIZED text `s` to at most `budget` rendered
-/// columns (see [`display_width`]), preserving both a HEAD and a short
+/// columns (see [`display_width`]) AND at most
+/// `budget * `[`REJECTION_REASON_CHARS_PER_COLUMN`] characters
+/// (#2196 fix-round 3, MUST FIX F — a column budget alone bounds nothing
+/// a receiver cares about, because a combining mark is correctly scored
+/// at ZERO columns; see that constant's doc for the measured 60 KB /
+/// 20,000-character payload that reached five surfaces on a row of
+/// nominal width 10). Both ceilings are enforced on the same walk, and
+/// either one alone triggers a cut, preserving both a HEAD and a short
 /// TAIL separated by a single `…` when a cut is needed, rather than
 /// chopping the tail off outright (#2196 fix-round 2, MUST FIX C). For a
 /// validation-style reason (`"...severity must be one of low, medium,
@@ -2172,8 +2282,13 @@ fn display_width(c: char) -> usize {
 /// FIX 2: a naive `&s[..N]` on a byte offset that lands mid-character
 /// panics with "byte index N is not a char boundary").
 fn bound_reason_width(s: &str, budget: usize) -> String {
+    // (#2196 fix-round 3, MUST FIX F) Both budgets are enforced: columns
+    // AND characters. A width-only bound does not bound anything a
+    // receiver cares about — see [`REJECTION_REASON_CHARS_PER_COLUMN`].
+    let char_budget = budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
     let total_width: usize = s.chars().map(display_width).sum();
-    if total_width <= budget {
+    let total_chars = s.chars().count();
+    if total_width <= budget && total_chars <= char_budget {
         return s.to_string();
     }
     let ellipsis_width = display_width('…');
@@ -2185,12 +2300,14 @@ fn bound_reason_width(s: &str, budget: usize) -> String {
     }
     let tail_budget = REJECTION_REASON_TAIL_RESERVE.min((budget - ellipsis_width) / 2);
     let head_budget = budget - ellipsis_width - tail_budget;
+    let head_char_budget = head_budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
+    let tail_char_budget = tail_budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
 
     let mut head_end = s.len();
     let mut w = 0usize;
-    for (idx, c) in s.char_indices() {
+    for (n, (idx, c)) in s.char_indices().enumerate() {
         let cw = display_width(c);
-        if w + cw > head_budget {
+        if w + cw > head_budget || n + 1 > head_char_budget {
             head_end = idx;
             break;
         }
@@ -2199,9 +2316,9 @@ fn bound_reason_width(s: &str, budget: usize) -> String {
 
     let mut tail_start = s.len();
     let mut w = 0usize;
-    for (idx, c) in s.char_indices().rev() {
+    for (n, (idx, c)) in s.char_indices().rev().enumerate() {
         let cw = display_width(c);
-        if w + cw > tail_budget {
+        if w + cw > tail_budget || n + 1 > tail_char_budget {
             break;
         }
         w += cw;
@@ -2209,10 +2326,23 @@ fn bound_reason_width(s: &str, budget: usize) -> String {
     }
 
     if tail_start <= head_end {
-        // The head and tail windows would overlap — total_width > budget
-        // already rules this out given head_budget + tail_budget <=
-        // budget - ellipsis_width, but stay safe rather than panic on a
-        // future constant change.
+        // The head and tail windows would overlap — a defensive floor,
+        // not a live branch. (#2196 fix-round 3) The character ceiling
+        // added above does NOT make it live, which is worth writing down
+        // because it looks like it should: a first pass at this claimed
+        // zero-width text would let the windows meet, and the test
+        // written to pin that disproved it. Both arms are closed at the
+        // shipped constants (head 93 cols / 372 chars, tail 24 cols / 96
+        // chars, budget 118 cols / 472 chars):
+        //   * Overlap implies `total_chars <= 372 + 96 = 468`, but a
+        //     CHARACTER-triggered cut needs `total_chars > 472`. 468 < 472.
+        //   * Overlap also implies the two windows cover the whole string
+        //     (counting the overlap twice), so `total_width <= 93 + 24 =
+        //     117`, but a WIDTH-triggered cut needs `total_width > 118`.
+        // No input can satisfy either, so no test is written against this
+        // arm — a test that cannot fail is worse than none. Kept anyway
+        // so a future constant change degrades to a correct head-only cut
+        // instead of re-emitting the overlap region twice.
         format!("{}…", &s[..head_end])
     } else {
         format!("{}…{}", &s[..head_end], &s[tail_start..])
@@ -2329,6 +2459,117 @@ pub fn format_rejection_reasons_for_display(reasons: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// (#2196 fix-round 3, MUST FIX G) The narrowest terminal width the
+/// rejection-reason rows are guaranteed against — no line
+/// [`format_rejection_reasons_as_indented_lines`] emits ever reaches this
+/// column, so no terminal at least this wide has anything to wrap.
+///
+/// A "narrowest supported width" has to be a NUMBER somewhere, because
+/// the guarantee is only as good as the assumption it names. 60 is the
+/// narrowest width anyone actually reviews `flow status` at; a terminal
+/// narrower than that wraps darkmux's own rows too, so the forged row
+/// stops being distinguishable from ordinary damage.
+pub(crate) const REJECTION_REASON_MIN_TERMINAL_WIDTH: usize = 60;
+
+/// (#2196 fix-round 3, MUST FIX G) Columns of indent every line
+/// [`format_rejection_reasons_as_indented_lines`] emits carries. Deeper
+/// than the six-space indent of the per-rule block it sits inside, so a
+/// reason line reads as subordinate to the `last rejection reason(s):`
+/// label above it.
+pub(crate) const REJECTION_REASON_LINE_INDENT: usize = 8;
+
+/// (#2196 fix-round 3, MUST FIX G) Render receiver-supplied rejection
+/// reasons as a list of COMPLETE, ALREADY-INDENTED output lines, none of
+/// which can reach column [`REJECTION_REASON_MIN_TERMINAL_WIDTH`].
+///
+/// This exists because the anti-forgery premise the earlier rounds relied
+/// on is FALSE, and was stated as an absolute. That premise: "every
+/// darkmux status row indents with a run of spaces, and
+/// [`collapse_whitespace_and_trim`] guarantees receiver text can never
+/// contain such a run, so a wrapped continuation line can never be
+/// mistaken for a darkmux row." Enumerating every `writeln!` in
+/// `status::format_status_human` shows twenty indented rows and EIGHT
+/// FLUSH-LEFT ones: the `flow status — {state}` header, `Hooks`, `Disk`,
+/// `Redis`, `Schema`, `Warnings:`, `Failures:`, and `Redis: not
+/// configured (set DARKMUX_REDIS_URL to enable)`. None of the eight needs
+/// leading whitespace to be plausible, so the whitespace collapse offers
+/// them ZERO protection — proven with 46 filler characters, one space,
+/// and the verbatim row text: no whitespace run, no blank glyph, no
+/// escape expansion, 100 columns against a 118-column budget, surviving
+/// truncation whole, landing at column 0 of the wrapped continuation with
+/// the genuine identical row four lines above. `Warnings:` and
+/// `Failures:` are the two that matter — they change how an operator
+/// reads everything printed below them.
+///
+/// The fix is at the RENDER site, not in the sanitizer, because the
+/// sanitizer cannot see the thing that makes the attack work: the row's
+/// own wrap point. darkmux takes the wrapping back from the terminal —
+/// every line is emitted whole, pre-indented, and short enough that no
+/// terminal at the supported width has a continuation to produce. With no
+/// continuation line, there is no column-0 receiver text, and the
+/// forgery is unreachable by construction rather than by vocabulary —
+/// which also means it holds for the flush-left rows the collapse never
+/// covered, and for any row a future revision adds.
+///
+/// Wrapping prefers a space boundary and falls back to a hard character
+/// split for a single token wider than the budget (a hostile receiver's
+/// unbroken run, or a legitimate long identifier), so a real multi-word
+/// reason stays readable while an adversarial one is still bounded.
+pub fn format_rejection_reasons_as_indented_lines(reasons: &[String]) -> Vec<String> {
+    let indent = " ".repeat(REJECTION_REASON_LINE_INDENT);
+    // The `- 1` keeps a full line one column SHORT of the narrowest
+    // supported width: terminals disagree about whether a line that
+    // exactly fills the last column wraps immediately or defers, and the
+    // guarantee should not depend on which behavior the operator's
+    // terminal picked.
+    let content_budget = REJECTION_REASON_MIN_TERMINAL_WIDTH - REJECTION_REASON_LINE_INDENT - 1;
+    wrap_to_display_width(&format_rejection_reasons_for_display(reasons), content_budget)
+        .into_iter()
+        .map(|line| format!("{indent}{line}"))
+        .collect()
+}
+
+/// Greedy word wrap of `s` to at most `budget` rendered columns per line
+/// (see [`display_width`]), hard-splitting any single token wider than
+/// `budget`. Input is expected to be already sanitized, so the only
+/// whitespace it can contain is the single ASCII spaces
+/// [`collapse_whitespace_and_trim`] leaves behind plus the `"; "` joiner
+/// [`format_rejection_reasons_for_display`] adds.
+fn wrap_to_display_width(s: &str, budget: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in s.split(' ') {
+        let word_w: usize = word.chars().map(display_width).sum();
+        if !cur.is_empty() && cur_w + 1 + word_w > budget {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if word_w <= budget {
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += word_w;
+        } else {
+            for c in word.chars() {
+                let cw = display_width(c);
+                if cur_w + cw > budget && !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(c);
+                cur_w += cw;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome {
@@ -7209,6 +7450,144 @@ mod tests {
             "escaping must never grow the rendered reason past the total budget: {real_width} > \
              {MAX_REJECTION_REASON_DISPLAY_WIDTH} in {rendered:?}"
         );
+    }
+
+    /// (#2196 fix-round 3, MUST FIX F) The width bound must bound LENGTH
+    /// as well as COLUMNS.
+    ///
+    /// Fix-round 3 swapped the hand-rolled width function for
+    /// `unicode-width`, which is CORRECT that a combining mark occupies
+    /// zero rendered columns — and in doing so removed the only thing
+    /// bounding length anywhere in this pipeline. Round 1 had a flat
+    /// 200-BYTE cap; round 2's hand-rolled function scored a combining
+    /// mark as 1 column, so its column budget doubled as a rough
+    /// character cap at ~40. Round 3 had neither: zero-width characters
+    /// cost nothing against the budget, so the head loop's
+    /// `w + cw > head_budget` never tripped on them, and nothing else
+    /// capped characters or bytes. Measured on the round-3 code:
+    ///
+    /// ```text
+    /// pure combining : in_chars=20000 out_chars=20000 out_bytes=40000 out_width=0
+    /// mixed          : out_chars=20008 out_bytes=40008 out_width=8
+    /// ```
+    ///
+    /// Reachable, not extrapolated: the response body is read through a
+    /// 64 KiB `Read::take`, so ONE 2xx response under that cap carries
+    /// the whole payload into the `.last` sidecar, the `hook.fired`
+    /// record (and from there the daily JSONL, the audit sink, and Redis
+    /// `XADD MAXLEN ~10000`), the delivery `eprintln!`, and both
+    /// `flow status` and `doctor` — on a row of nominal width 10. Twenty
+    /// thousand marks stacked on one cell is also a terminal-corruption
+    /// primitive, not merely volume.
+    ///
+    /// Red-proves by name: delete `|| n + 1 > head_char_budget` from
+    /// `bound_reason_width`'s head loop, or drop the
+    /// `&& total_chars <= char_budget` term from its early return, and
+    /// the character assertions below fail. The trailing positive control
+    /// keeps the ceiling from being "passed" by a bound that eats real
+    /// reasons.
+    #[test]
+    fn rejection_reason_bounds_length_not_only_rendered_width() {
+        let char_ceiling = REJECTION_REASON_RAW_BUDGET * REJECTION_REASON_CHARS_PER_COLUMN;
+
+        // The exact shape the finding measured: 20,000 U+0301 COMBINING
+        // ACUTE ACCENT, each 2 bytes on the wire and 0 rendered columns,
+        // with a leading real word so `strip_leading_zero_width` (the
+        // separate CONSIDER fix) cannot be what closes this — the
+        // character ceiling has to.
+        let mixed = format!("rejected{}", "\u{0301}".repeat(20_000));
+        let body = serde_json::json!({
+            "rejected": 1,
+            "results": [{"ok": false, "error": &mixed}],
+        });
+        // Honesty check on the "reachable through the real 64 KiB body
+        // cap" claim: this is ONE response that fits under it.
+        assert!(
+            body.to_string().len() < 64 * 1024,
+            "the proof body must fit the real 64 KiB read cap to be reachable: {} bytes",
+            body.to_string().len()
+        );
+
+        let reasons = extract_rejection_reasons(&body);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        let out = &reasons[0];
+        let out_chars = out.chars().count();
+        assert!(
+            out_chars <= char_ceiling,
+            "{out_chars} chars survived a {char_ceiling}-char ceiling (in: {} chars)",
+            mixed.chars().count()
+        );
+        // Bytes follow from chars, but assert them too — the finding was
+        // reported in bytes, and `char`s alone would let a
+        // 4-byte-per-char payload back in at 4x this size.
+        assert!(out.len() <= char_ceiling * 4, "{} bytes survived (ceiling {} bytes)", out.len(), char_ceiling * 4);
+
+        // And the ceiling must hold through the RENDER path, which
+        // bounds a second time after escaping.
+        let rendered = format_rejection_reasons_for_display(&reasons);
+        assert!(
+            rendered.chars().count() <= char_ceiling + REJECTION_REASON_QUOTE_OVERHEAD,
+            "rendered row is {} chars",
+            rendered.chars().count()
+        );
+
+        // The all-combining variant the finding also measured
+        // (`in_chars=20000 out_chars=20000`) is now dropped OUTRIGHT
+        // rather than merely bounded: every character is zero-width, so
+        // `strip_leading_zero_width` empties it and
+        // `extract_rejection_reasons`'s empty filter discards it. Pinned
+        // so a later change that stops dropping it has to re-argue the
+        // ceiling for that shape too.
+        let pure: String = "\u{0301}".repeat(20_000);
+        let dropped = extract_rejection_reasons(&serde_json::json!({
+            "rejected": 1,
+            "results": [{"ok": false, "error": pure}],
+        }));
+        assert!(dropped.is_empty(), "an all-zero-width reason is not a reason: {dropped:?}");
+
+        // Positive control: the ceiling must not be reachable by any
+        // realistic reason, or a "passing" test here would just mean the
+        // bound eats real disclosure.
+        let realistic = "payload field \"file\" must be a non-empty string";
+        let kept = extract_rejection_reasons(&serde_json::json!({
+            "rejected": 1,
+            "results": [{"ok": false, "error": realistic}],
+        }));
+        assert_eq!(kept, vec![realistic.to_string()], "a realistic reason must survive whole: {kept:?}");
+    }
+
+    /// (#2196 fix-round 3, CONSIDER) A reason beginning with a
+    /// zero-width combining mark lands that mark on darkmux's OWN opening
+    /// quote — the single character carrying the attribution that
+    /// everything after it is the receiver's words. `collapse_whitespace_and_trim`
+    /// trims whitespace, and a combining mark is not whitespace, so it
+    /// survived to the front of the string and rendered the quote struck
+    /// through (U+0336 COMBINING LONG STROKE OVERLAY) or circled (U+20DD
+    /// COMBINING ENCLOSING CIRCLE).
+    ///
+    /// Red-proves by name: delete `strip_leading_zero_width`'s call in
+    /// `sanitize_reason_text` and the first assertion fails — the
+    /// rendered row's second character is the mark, not `r`. The
+    /// interior-mark case is the inverted control: legitimate decomposed
+    /// prose (`café` as `e` + U+0301) must be untouched.
+    #[test]
+    fn a_leading_zero_width_mark_never_lands_on_the_attribution_quote() {
+        for mark in ['\u{0336}', '\u{20DD}', '\u{0301}'] {
+            let reason = format!("{mark}rule must be a string");
+            let rendered = format_rejection_reasons_for_display(&[reason]);
+            assert_eq!(
+                rendered, "\"rule must be a string\"",
+                "U+{:04X} must not survive in front of the opening quote: {rendered:?}",
+                mark as u32
+            );
+        }
+
+        // Inverted case: the same mark INSIDE the text is ordinary prose
+        // and must survive — this is what stops the fix from being
+        // "strip all combining marks".
+        let decomposed = "cafe\u{0301} is not a valid value";
+        let rendered = format_rejection_reasons_for_display(&[decomposed.to_string()]);
+        assert_eq!(rendered, format!("\"{decomposed}\""), "{rendered:?}");
     }
 
     /// (#2196 fix-round MUST FIX 3) A receiver answering `"rejected": 0`
