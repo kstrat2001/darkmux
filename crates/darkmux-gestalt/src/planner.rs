@@ -2224,6 +2224,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refusals_keep_desired_input_order() {
+        // (#2674) The hoist reorders refusals AGAINST mutations and must
+        // not reorder them against EACH OTHER. `Vec::partition` is stable,
+        // so this holds structurally — pinned here because the consequence
+        // is not cosmetic: `execute_plan` reports the FIRST refusal in
+        // action order, and `ensure_wave_loaded` holds-and-retries only on
+        // `ClaimedResidentInsufficientCtx { clearable: true }`. Report the
+        // wrong one of a mixed pair and the wave either burns its whole
+        // three-attempt hold on a same-plan collision that can never clear
+        // (#2672 CONSIDER 3), or skips the hold that would have let a
+        // finishing sibling free its model.
+        //
+        // Mutation this pins: `blocks.reverse()` before assembly.
+        let plan = plan_acquire(
+            &[
+                placement("shared", 8_000),
+                placement("shared", 68_000),
+                placement("pinned", 68_000),
+            ],
+            &facts(vec![
+                resident("darkmux:shared", "shared", 4_096, None),
+                resident("darkmux:pinned", "pinned", 4_096, None),
+            ]),
+            opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:pinned"]),
+            &no_est(),
+        );
+
+        let refusals: Vec<&Reason> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a.action, Action::Block { .. }))
+            .map(|a| &a.reason)
+            .collect();
+        // Non-vacuity: two refusals, and they genuinely DIFFER in the field
+        // the caller's retry decision reads — otherwise the ordering
+        // assertion below could not distinguish anything.
+        assert_eq!(refusals.len(), 2, "two placements refuse: {:?}", plan.actions);
+        assert!(
+            matches!(refusals[0], Reason::ClaimedResidentInsufficientCtx { clearable: false, .. })
+                && matches!(
+                    refusals[1],
+                    Reason::ClaimedResidentInsufficientCtx { clearable: true, .. }
+                ),
+            "the fixture carries one of each `clearable`: {refusals:?}"
+        );
+
+        assert_eq!(
+            plan.actions[0].reason,
+            Reason::ClaimedResidentInsufficientCtx {
+                identifier: "darkmux:shared".into(),
+                resident_ctx: 4_096,
+                min_ctx: 68_000,
+                clearable: false,
+            },
+            "the plan LEADS with the refusal earliest in desired-input order — placement 1's \
+             same-plan collision, not placement 2's externally-claimed resident: {:?}",
+            plan.actions
+        );
+    }
+
     /// Fixture battery whose every row REFUSES — one per reachable `Block`
     /// reason, each paired with an earlier placement that (pre-#2674)
     /// committed a mutation ahead of the refusal.
@@ -2268,6 +2329,37 @@ mod tests {
                     &no_est(),
                 ),
                 "same-plan collision Block",
+            ),
+            (
+                // MIXED `clearable` — the row that makes the refusals'
+                // relative order decision-bearing rather than cosmetic.
+                // Placement 0 reconciles the shared stale; placement 1
+                // collides with it in this SAME plan (`clearable: false`,
+                // never resolvable by waiting); placement 2 hits a resident
+                // claimed by an EXTERNAL pin (`clearable: true`, which a
+                // finishing sibling can clear).
+                //
+                // `ensure_wave_loaded` gates its bounded retry-hold on the
+                // `clearable` of the refusal its executor reports — the
+                // FIRST in action order — so which of these two leads
+                // decides whether a wave burns three attempts on a
+                // deterministic failure (#2672 CONSIDER 3) or skips a hold
+                // that would have succeeded. See
+                // `refusals_keep_desired_input_order` below.
+                plan_acquire(
+                    &[
+                        placement("shared", 8_000),
+                        placement("shared", 68_000),
+                        placement("pinned", 68_000),
+                    ],
+                    &facts(vec![
+                        resident("darkmux:shared", "shared", 4_096, None),
+                        resident("darkmux:pinned", "pinned", 4_096, None),
+                    ]),
+                    opts_pinned(CallerIntent::Auto, AcquireScope::Additive, &["darkmux:pinned"]),
+                    &no_est(),
+                ),
+                "same-plan collision + externally-claimed Block (mixed clearable)",
             ),
             (
                 // An earlier fresh load ahead of an unknown-model-key Block.

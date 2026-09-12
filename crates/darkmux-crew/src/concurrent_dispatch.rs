@@ -495,6 +495,30 @@ enum PlanExecOutcome {
 /// for any plan `plan_acquire` produces; it stays so this function is total
 /// over an arbitrary action list instead of panicking on one.
 ///
+/// Two consequences of deciding refusals first, named rather than left to be
+/// rediscovered:
+///
+/// - **A refusing wave no longer cleans up its Exclusive pass-1 orphans.**
+///   Pre-#2674 a refused plan still ran its free phase, so an undesired
+///   `darkmux:*` resident left residency even on a wave that then failed;
+///   now nothing commits and that RAM stays held. This is the trade #2674
+///   makes deliberately — a predictable pre-plan state beats a half-state
+///   nothing describes — and it self-heals in the common case, because
+///   [`run_local_waves`] moves on to the next wave whose own pass-1 evicts
+///   the orphan. A single-wave schedule that refuses (or `dispatch_
+///   reconciled`) is where it does not: the orphan survives until some later
+///   command plans over it, or `darkmux machine eject` clears it.
+/// - **A genuine host fault co-occurring with a refusal is not surfaced.**
+///   Pre-#2674 a plan whose free phase would have failed AND that carried a
+///   later `Block` returned `HostFailed`, so a wedged host reached the
+///   operator; now the refusal is reported and the host is never called
+///   (pinned by `execute_plan_reports_the_refusal_even_when_a_host_call_
+///   would_also_have_failed_2674`). Probing a host on a plan already decided
+///   to refuse is the mutation this gate exists to prevent, and the wave
+///   fails loudly either way — but for a `clearable: false` refusal, which
+///   never retries, the real fault stays invisible until some later command
+///   touches the host.
+///
 /// # What is deliberately NOT done: rollback
 ///
 /// A genuine host-call failure (`HostFailed`) mid-plan still leaves the
@@ -511,9 +535,23 @@ enum PlanExecOutcome {
 /// ACTUALLY succeeded, appended in execution order. Only `darkmux:*`
 /// instances are named: the namespace convention is absolute for model
 /// lifecycle, so darkmux reports what it did to its OWN residents and never
-/// claims anything about user state. (A placement under an explicit
-/// non-namespaced alias is therefore omitted — the same alias asymmetry
-/// `plan_release` already documents.)
+/// claims anything about user state.
+///
+/// **Stated plainly, because it is a real gap and not a rounding error: a
+/// mutation to a placement loaded under an explicit NON-NAMESPACED alias
+/// goes unreported.** An alias is darkmux's own load (`OwnedTarget::claim`
+/// accepts it precisely because this call is what put it there, and a
+/// reconcile can therefore evict it), but it is not a `darkmux:*` instance
+/// in `lms ps`, and the note refuses to claim anything outside that
+/// namespace. So an operator using the namespace opt-out is exactly the
+/// operator who WILL meet the drift at the next `lms ps` — the outcome
+/// direction 3 exists to prevent — with an error that says nothing changed.
+/// Widening the note to cover aliases means the message can no longer close
+/// on "darkmux-owned residents only", which is the clause that makes it safe
+/// against a reader who cannot tell an alias from user state; that trade is
+/// deliberately not taken here. Same alias asymmetry `plan_release` already
+/// documents, pinned by
+/// `execute_plan_records_only_darkmux_namespaced_mutations_2674`.
 fn execute_plan(
     plan: &Plan,
     host: &mut dyn ModelHost,
@@ -1532,6 +1570,426 @@ mod tests {
         assert_eq!(partial_execution_note(&[]), "");
     }
 
+    #[test]
+    fn execute_plan_records_only_darkmux_namespaced_mutations_2674() {
+        // The namespace guards on BOTH `committed.push` sites, red-proved
+        // by an action list where a NON-namespaced identifier would reach
+        // the note if either guard were dropped.
+        //
+        // `ensure_wave_loaded_reports_what_a_failed_attempt_actually_
+        // changed_2674` below asserts a FOREIGN resident stays out of the
+        // message, but Exclusive pass-1 never targets a foreign resident,
+        // so no action naming it is ever produced and that assertion holds
+        // with or without the guards. The identifiers that CAN legitimately
+        // appear in a mutating action while not being `darkmux:*` are this
+        // call's own explicit aliases (`OwnedTarget::claim`'s documented
+        // namespace opt-out, and `Action::Load`'s free-form `identifier`),
+        // so those are what this fixture mutates.
+        //
+        // A future edit dropping either guard would put a non-namespaced
+        // identifier into a message whose own closing clause says
+        // darkmux-owned residents only — the namespace convention is
+        // ABSOLUTE for model lifecycle (#1274), so what darkmux claims to
+        // have done must be scoped the same way as what it may do.
+        let plan = Plan {
+            actions: vec![
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Unload {
+                        target: darkmux_gestalt::OwnedTarget::claim("my-alias", Some("my-alias"))
+                            .expect("an explicit alias is this call's own load"),
+                    },
+                    reason: Reason::NoLongerDesired,
+                    precondition: darkmux_gestalt::Precondition::ResidentPresent {
+                        identifier: "my-alias".into(),
+                        at_ctx: Some(8_000),
+                    },
+                },
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Unload { target: owned("darkmux:orphan") },
+                    reason: Reason::NoLongerDesired,
+                    precondition: darkmux_gestalt::Precondition::ResidentPresent {
+                        identifier: "darkmux:orphan".into(),
+                        at_ctx: Some(8_000),
+                    },
+                },
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Load {
+                        model_key: "aliased".into(),
+                        identifier: "another-alias".into(),
+                        min_ctx: 8_000,
+                    },
+                    reason: Reason::NoResident,
+                    precondition: darkmux_gestalt::Precondition::NoResidentForModelKey {
+                        model_key: "aliased".into(),
+                    },
+                },
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Load {
+                        model_key: "fresh".into(),
+                        identifier: "darkmux:fresh".into(),
+                        min_ctx: 8_000,
+                    },
+                    reason: Reason::NoResident,
+                    precondition: darkmux_gestalt::Precondition::NoResidentForModelKey {
+                        model_key: "fresh".into(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let mut host = MockHost::new()
+            .resident("my-alias", "aliased", 8_000, Some(1_000))
+            .resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
+        let mut committed = Vec::new();
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed);
+
+        assert!(matches!(outcome, PlanExecOutcome::Loaded), "every action succeeds");
+        // Non-vacuity: all four mutations genuinely reached the host, so
+        // the two that are absent from `committed` below were FILTERED,
+        // not skipped.
+        assert_eq!(host.ops.len(), 4, "all four mutations dispatched: {:?}", host.ops);
+        assert_eq!(
+            committed,
+            vec![
+                "unloaded \"darkmux:orphan\"".to_string(),
+                "loaded \"darkmux:fresh\" at 8000 context".to_string(),
+            ],
+            "only darkmux-NAMESPACED mutations are recorded — an explicit alias is darkmux's \
+             own load but is not a `darkmux:*` instance, and the note claims only the \
+             namespaced subset (#1274): {committed:?}"
+        );
+        let note = partial_execution_note(&committed);
+        assert!(
+            !note.contains("my-alias") && !note.contains("another-alias"),
+            "no non-namespaced identifier may reach the operator-facing note: {note}"
+        );
+        assert!(
+            note.contains("darkmux:orphan") && note.contains("darkmux:fresh"),
+            "the namespaced ones do: {note}"
+        );
+    }
+
+    #[test]
+    fn execute_plan_reports_the_first_refusal_in_action_order_2674() {
+        // The claim the whole "the retry decision is unchanged" argument
+        // rests on. `ensure_wave_loaded`'s Blocked arm holds-and-retries
+        // ONLY on `ClaimedResidentInsufficientCtx { clearable: true }`, so
+        // WHICH refusal this gate reports decides whether a wave burns its
+        // three-attempt hold on a deterministic same-plan collision
+        // (#2672's CONSIDER 3 finding) or skips the hold that would have
+        // let a finishing sibling free its model. "First in action order"
+        // is exactly what the pre-#2674 in-order loop surfaced, which is
+        // why the reported refusal is byte-identical across the change.
+        //
+        // Mutation this pins: `.iter().find_map` → `.iter().rev().find_map`.
+        let plan = Plan {
+            actions: vec![
+                claimed_block("first", "darkmux:first"),
+                // A mutation BETWEEN the two refusals — the pre-hoist order
+                // a non-`plan_acquire` producer could still hand us, and
+                // the reason this gate exists independently of the
+                // planner's own hoist.
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Unload { target: owned("darkmux:orphan") },
+                    reason: Reason::NoLongerDesired,
+                    precondition: darkmux_gestalt::Precondition::ResidentPresent {
+                        identifier: "darkmux:orphan".into(),
+                        at_ctx: Some(8_000),
+                    },
+                },
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Block {
+                        model_key: "second".into(),
+                        resident_identifier: Some("darkmux:second".into()),
+                    },
+                    reason: Reason::ClaimedResidentInsufficientCtx {
+                        identifier: "darkmux:second".into(),
+                        resident_ctx: 32_000,
+                        min_ctx: 68_000,
+                        // The OTHER `clearable`, so reporting the wrong
+                        // refusal changes the caller's retry decision and
+                        // not merely its wording.
+                        clearable: false,
+                    },
+                    precondition: darkmux_gestalt::Precondition::None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut host = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000));
+        let mut committed = Vec::new();
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed);
+
+        match outcome {
+            PlanExecOutcome::Blocked { model_key, reason } => {
+                assert_eq!(model_key, "first", "the FIRST refusal in action order is reported");
+                assert!(
+                    matches!(
+                        reason,
+                        Reason::ClaimedResidentInsufficientCtx { clearable: true, .. }
+                    ),
+                    "with the first refusal's own reason — the field `ensure_wave_loaded` \
+                     gates its bounded retry-hold on: {reason:?}"
+                );
+            }
+            _ => panic!("the plan refuses"),
+        }
+        assert!(host.ops.is_empty(), "and nothing mutated: {:?}", host.ops);
+    }
+
+    #[test]
+    fn execute_plan_reports_the_refusal_even_when_a_host_call_would_also_have_failed_2674() {
+        // The DECIDED consequence of refuse-fast, pinned so it is a
+        // contract rather than an accident: when a plan carries BOTH a
+        // would-fail host call and a refusal, the refusal is what the
+        // operator sees and the host is never asked. Pre-#2674 the in-order
+        // loop reached the failing unload first and returned `HostFailed`,
+        // so a wedged host surfaced even alongside a Block.
+        //
+        // This is the right trade and not a gap to close: probing the host
+        // on a plan already decided to refuse is exactly the mutation
+        // refuse-fast exists to prevent, the wave fails loudly either way,
+        // and the next attempt/wave re-plans from fresh facts and meets the
+        // host error then. It IS narrower than "nothing about the genuine
+        // host-error path changes": a `clearable: false` refusal never
+        // retries, so a co-occurring host fault stays unsurfaced until some
+        // later command touches the host.
+        let plan = Plan {
+            actions: vec![
+                darkmux_gestalt::PlannedAction {
+                    action: Action::Unload { target: owned("darkmux:orphan") },
+                    reason: Reason::NoLongerDesired,
+                    precondition: darkmux_gestalt::Precondition::ResidentPresent {
+                        identifier: "darkmux:orphan".into(),
+                        at_ctx: Some(8_000),
+                    },
+                },
+                claimed_block("m", "darkmux:m"),
+            ],
+            ..Default::default()
+        };
+        let mut host = MockHost::new()
+            .resident("darkmux:orphan", "orphan", 8_000, Some(1_000))
+            .resident("darkmux:m", "m", 32_000, Some(1_000));
+        host.fail_next_unload = Some(HostError::CommandFailed { detail: "lms is wedged".into() });
+        let mut committed = Vec::new();
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut committed);
+
+        assert!(
+            matches!(outcome, PlanExecOutcome::Blocked { .. }),
+            "the refusal wins over a host call that would also have failed"
+        );
+        assert!(
+            host.ops.is_empty(),
+            "the failing host call is never attempted — which is the point: {:?}",
+            host.ops
+        );
+    }
+
+    /// A [`ModelHost`] whose view of residency can CHANGE between calls and
+    /// whose loads fail every time — the two things `MockHost` cannot do
+    /// (its `fail_next_load` drains on first use, and its residency only
+    /// moves through its own load/unload).
+    ///
+    /// Both are needed to exercise `ensure_wave_loaded` ACROSS attempts,
+    /// which is where `committed` accumulates: a real retry re-reads `lms
+    /// ps` and a concurrent sibling's load can land in between.
+    struct ScriptedHost {
+        inner: MockHost,
+        /// Residency to install before the Nth `list_resident` (index =
+        /// call number). Calls past the end leave residency alone, so the
+        /// last entry effectively repeats.
+        scripted: Vec<Vec<ResidentFact>>,
+        list_calls: usize,
+        /// Returned from EVERY `load` when set (the op is still recorded —
+        /// the attempt happened).
+        always_fail_load: Option<HostError>,
+    }
+
+    impl ScriptedHost {
+        fn new(scripted: Vec<Vec<ResidentFact>>, always_fail_load: Option<HostError>) -> Self {
+            Self { inner: MockHost::new(), scripted, list_calls: 0, always_fail_load }
+        }
+    }
+
+    impl ModelHost for ScriptedHost {
+        fn list_resident(&mut self) -> Result<Vec<ResidentFact>, HostError> {
+            if let Some(next) = self.scripted.get(self.list_calls) {
+                self.inner.residents = next.clone();
+            }
+            self.list_calls += 1;
+            self.inner.list_resident()
+        }
+
+        fn list_catalog(&mut self) -> Result<Vec<darkmux_gestalt::CatalogFact>, HostError> {
+            self.inner.list_catalog()
+        }
+
+        fn load(
+            &mut self,
+            model_key: &str,
+            identifier: &str,
+            min_ctx: u32,
+            deadline: Deadline,
+        ) -> Result<darkmux_gestalt::LoadReport, HostError> {
+            if let Some(err) = self.always_fail_load.clone() {
+                self.inner.ops.push(darkmux_gestalt::mock::HostOp::Load {
+                    model_key: model_key.to_string(),
+                    identifier: identifier.to_string(),
+                    min_ctx,
+                });
+                return Err(err);
+            }
+            self.inner.load(model_key, identifier, min_ctx, deadline)
+        }
+
+        fn unload(
+            &mut self,
+            target: &darkmux_gestalt::OwnedTarget,
+            deadline: Deadline,
+        ) -> Result<(), HostError> {
+            self.inner.unload(target, deadline)
+        }
+    }
+
+    fn resident_fact(identifier: &str, model_key: &str, ctx: u64) -> ResidentFact {
+        ResidentFact {
+            identifier: identifier.to_string(),
+            model_key: model_key.to_string(),
+            ctx,
+            est_bytes: Some(1_000),
+        }
+    }
+
+    /// (#2674, direction 3) `committed` accumulates ACROSS attempts, and
+    /// the pinned-holder `HostFailed` bail reports it.
+    ///
+    /// Attempt 1 gets partway through — a pass-1 unload and a reconcile's
+    /// unload both commit — before the reload hits a live host error; a pin
+    /// exists, so the wave holds and retries. Later attempts plan from
+    /// residency that attempt 1 already changed and therefore commit
+    /// nothing new. If `committed` were scoped to one attempt, the operator
+    /// would be told the wave failed and NOT that two models left residency.
+    ///
+    /// Mutations this pins: hoisting `let mut committed` INSIDE the retry
+    /// loop, and dropping `partial_execution_note` from the pinned-holder
+    /// `HostFailed` bail.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_reports_an_earlier_attempts_commits_on_a_host_failure_2674() {
+        let _env = LeaseTestEnv::new();
+
+        // A live sibling pinning an unrelated model: the only thing this
+        // needs is a NON-EMPTY pinned set, which is what routes the host
+        // failure to the hold-and-retry arm rather than failing on the
+        // first attempt.
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:sibling".to_string()]).expect("sibling writes its lease");
+        sibling_guard
+            .mark_loaded(&["darkmux:sibling".to_string()])
+            .expect("the sibling is genuinely mid-generation");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = ScriptedHost::new(
+            vec![vec![
+                resident_fact("darkmux:orphan", "orphan", 8_000),
+                resident_fact("darkmux:m", "m", 32_000),
+            ]],
+            Some(HostError::InsufficientResources { detail: "not enough RAM".into() }),
+        );
+        let wave = vec![placement("m", 68_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+            .expect_err("every reload attempt fails");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blocked by (a) concurrent live darkmux command"),
+            "a pin explains the shortfall, so this is the hold-and-retry bail: {msg}"
+        );
+        assert!(
+            msg.contains("already changed darkmux-owned residency"),
+            "the pinned-holder bail carries the partial-execution note too — it is not the \
+             uncovered call site it was (#2674): {msg}"
+        );
+        assert!(
+            msg.contains("unloaded \"darkmux:orphan\"") && msg.contains("unloaded \"darkmux:m\""),
+            "and names BOTH mutations attempt 1 committed, even though the attempt that \
+             finally gave up committed nothing itself: {msg}"
+        );
+
+        drop(sibling_guard);
+        drop(own_guard);
+    }
+
+    /// (#2674, direction 3) The same cross-attempt accumulation, reported
+    /// from the `Blocked` bail — the retries-exhausted case #2674 names as
+    /// the surviving exposure, and the one call site a `Blocked` outcome
+    /// can reach.
+    ///
+    /// Attempt 1 commits a pass-1 unload and then its fresh load hits a
+    /// live host error; a pin exists, so the wave holds. By attempt 2 the
+    /// pinning sibling's own load has LANDED, so the same identifier is now
+    /// a claimed resident at too small a context and the wave refuses —
+    /// refuse-fast means attempt 2 commits nothing, but attempt 1's unload
+    /// already happened and the final error must still say so.
+    ///
+    /// Mutations this pins: hoisting `let mut committed` INSIDE the retry
+    /// loop, and dropping `partial_execution_note` from the `Blocked` bail.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_wave_loaded_reports_an_earlier_attempts_commits_when_a_later_attempt_blocks_2674() {
+        let _env = LeaseTestEnv::new();
+
+        let sibling_guard = residency_lease::LeaseGuard::acquire();
+        sibling_guard.write(&["darkmux:m".to_string()]).expect("sibling writes its lease");
+        sibling_guard
+            .mark_loaded(&["darkmux:m".to_string()])
+            .expect("the sibling is genuinely mid-generation, not merely acquiring");
+
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let mut host = ScriptedHost::new(
+            vec![
+                // Attempt 1: the sibling has claimed "darkmux:m" but its
+                // load has not landed yet, so nothing shares this model key
+                // and the wave plans a fresh load — after Exclusive pass-1
+                // evicts the undesired orphan.
+                vec![resident_fact("darkmux:orphan", "orphan", 8_000)],
+                // Attempt 2 onward: the sibling's load landed, at a context
+                // too small for this placement. Now it is a CLAIMED
+                // resident and the wave refuses instead of reconciling it.
+                vec![resident_fact("darkmux:m", "m", 32_000)],
+            ],
+            Some(HostError::InsufficientResources { detail: "not enough RAM".into() }),
+        );
+        let wave = vec![placement("m", 68_000)];
+
+        let own_guard = residency_lease::LeaseGuard::acquire();
+        let err = ensure_wave_loaded(&wave, &est, &mut host, &own_guard)
+            .expect_err("the claimed resident blocks this wave");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot load \"m\" for this wave"),
+            "this is the Blocked bail, not the HostFailed one: {msg}"
+        );
+        assert!(
+            msg.contains("already claimed"),
+            "the refusal reason is still what leads the error: {msg}"
+        );
+        assert!(
+            msg.contains("already changed darkmux-owned residency")
+                && msg.contains("unloaded \"darkmux:orphan\""),
+            "and an EARLIER attempt's committed unload is still reported on a Blocked exit — \
+             refuse-fast makes the refusing attempt commit nothing, which is exactly why the \
+             accumulation cannot be scoped to one attempt (#2674): {msg}"
+        );
+
+        drop(sibling_guard);
+        drop(own_guard);
+    }
+
     /// END-TO-END shape A (#2674): an Exclusive pass-1 unload of a
     /// darkmux-owned orphan folded in AHEAD of a later placement's
     /// `ClaimedResidentInsufficientCtx` Block. The whole real path —
@@ -1661,6 +2119,11 @@ mod tests {
              operator to meet the drift at the next `lms ps` (#2674): {msg}"
         );
         assert!(msg.contains("unloaded \"darkmux:m\""), "the note names the instance: {msg}");
+        // End-to-end backstop only, NOT the namespace guards' coverage: a
+        // foreign resident is never an Exclusive pass-1 target, so no
+        // action naming it is produced and this holds with or without the
+        // guards. `execute_plan_records_only_darkmux_namespaced_mutations_
+        // 2674` above is what red-proves them.
         assert!(
             !msg.contains("someones-own-model"),
             "the note names ONLY darkmux-owned instances — user state is never darkmux's to \
