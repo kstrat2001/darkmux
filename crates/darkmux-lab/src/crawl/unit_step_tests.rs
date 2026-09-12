@@ -474,6 +474,34 @@ fn config_timeout_seconds_garbage_value_is_refused_by_name() {
     assert!(msg.contains("soon"), "the offending value is named: {msg}");
 }
 
+/// (#2595 review round 2, CONSIDER 6) An unresolved `{{template}}` in a
+/// hand-authored `grow.config`'s `timeout_seconds` (e.g.
+/// `"timeout_seconds": "{{unit_timeout}}"`, launched with no `unit_timeout`
+/// param) renders as `""`, not as a missing key. Before this fix that
+/// reached the general parse below and was REFUSED by name (`must be a
+/// positive integer, got ""`), even though the sibling `plan`/`unit`
+/// fields (`str_field`) and `intent_file` already treat the identical `""`
+/// shape as absent. An unresolved template must read as absent here too.
+#[test]
+fn config_timeout_seconds_unresolved_empty_template_reads_as_absent() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "timeout_seconds": ""
+    }));
+    let cfg = UnitStepConfig::from_step(&step).expect("an empty-string timeout_seconds must not be refused");
+    assert_eq!(cfg.timeout_seconds, None, "an unresolved template must read as absent, not as an error");
+}
+
+/// Same as above for a whitespace-only render — matches `str_field`'s own
+/// `.trim().is_empty()` filter exactly.
+#[test]
+fn config_timeout_seconds_whitespace_only_template_reads_as_absent() {
+    let step = unit_step(serde_json::json!({
+        "plan": "/nonexistent/plan.json", "unit": "u-0001", "rule": "r", "timeout_seconds": "   "
+    }));
+    let cfg = UnitStepConfig::from_step(&step).expect("a whitespace-only timeout_seconds must not be refused");
+    assert_eq!(cfg.timeout_seconds, None);
+}
+
 /// (#2454) The thermal breaker's between-units gate: a `STOP` file present
 /// at the mission-relative path `thermal_governor::
 /// stop_file_path_from_record_context` derives (`<darkmux root>/crawl/

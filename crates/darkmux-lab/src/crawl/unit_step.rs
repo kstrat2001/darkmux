@@ -891,6 +891,18 @@ impl UnitStepConfig {
         let timeout_seconds = match step.config.get("timeout_seconds") {
             None => None,
             Some(serde_json::Value::Null) => None,
+            // (#2595 review round 2, CONSIDER 6) An unresolved
+            // `{{template}}` (e.g. `"timeout_seconds": "{{unit_timeout}}"`
+            // in a hand-authored `grow.config`, launched without that
+            // param) renders as `""`, not as a missing key — and must read
+            // as ABSENT, matching `str_field`'s and `intent_file`'s own
+            // trim-and-filter convention three lines above/below this one
+            // for the identical shape. Before this, the sibling fields
+            // treated `""` as absent while this one fell through to the
+            // general parse below and errored by name (`must be a positive
+            // integer, got ""`) — a needless refusal for a param the
+            // config author simply didn't supply.
+            Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
             Some(v) => {
                 let n = v
                     .as_u64()

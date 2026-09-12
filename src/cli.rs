@@ -814,16 +814,34 @@ pub(crate) enum MissionCmd {
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
         /// Per-dispatch timeout (seconds), for a config whose graph
-        /// executes a dispatch. The default when omitted is `600` for
-        /// every config — coder-phase, `crawl` (per-unit dispatch
-        /// timeout), and `review` alike. `review` no longer gets its own
-        /// 3600s default: before the funnel deletion (#2310 P4d) the
-        /// retired `pr-review run`'s dedicated launcher resolved `None` ->
-        /// 3600 so a long judge pass wouldn't time out (#1284 Packet 4b
-        /// review gate, must-fix 1); `review` now runs the same generic
-        /// path as every other config and gets the same 600s default. A
-        /// review whose seats need longer than that should pass
-        /// `--timeout` explicitly.
+        /// executes a dispatch. For coder-phase, the default when omitted
+        /// is `600` (`mission run`'s own default), stamped onto the coder
+        /// step unconditionally — that field bounds only the tool-less
+        /// single-call paths a container-agentic coder dispatch never
+        /// takes, so collapsing an omitted flag to `600` there is always
+        /// safe. (#2595 review round 2) For `crawl`/`review`'s per-unit
+        /// dispatch timeout, OMITTING this flag is different: it is NOT
+        /// the same as `--timeout 600`. It stamps nothing onto a grown
+        /// unit's config, so the operator's own standing
+        /// `config.runtime.inactivity_timeout_seconds` /
+        /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` / built-in-600 resolution
+        /// governs each unit instead — never a hardcoded 600 silently
+        /// overriding a configured budget. Passing this flag EXPLICITLY
+        /// for `crawl`/`review` wins OUTRIGHT: it overwrites every unit's
+        /// `timeout_seconds` unconditionally, even one a hand-authored
+        /// per-rule override in the mission config's own
+        /// `grow.config`/`config` already declared — the same "CLI wins
+        /// outright, never merely fills a gap" rule the container-agentic
+        /// dispatch path already applies to this exact flag one layer
+        /// down (`dispatch_internal::effective_inactivity_timeout_seconds`).
+        /// `review` no longer gets its own 3600s default: before the
+        /// funnel deletion (#2310 P4d) the retired `pr-review run`'s
+        /// dedicated launcher resolved `None` -> 3600 so a long judge pass
+        /// wouldn't time out (#1284 Packet 4b review gate, must-fix 1);
+        /// `review` now runs the same generic path as every other config.
+        /// A review whose seats need longer than the standing default
+        /// should pass `--timeout` explicitly, or raise
+        /// `config.runtime.inactivity_timeout_seconds`.
         #[arg(long)]
         timeout: Option<u32>,
         /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
