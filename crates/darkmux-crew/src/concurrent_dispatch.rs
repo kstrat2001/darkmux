@@ -1667,6 +1667,33 @@ mod tests {
             note.contains("darkmux:orphan") && note.contains("darkmux:fresh"),
             "the namespaced ones do: {note}"
         );
+        // The closing safety clause, pinned because it is LOAD-BEARING for
+        // the decision above it. `execute_plan`'s doc refuses to widen this
+        // note to cover aliased placements on the grounds that doing so
+        // costs the message its "darkmux-owned residents only" close — the
+        // clause that keeps it honest for a reader of `lms ps` who cannot
+        // tell darkmux's own aliased load from user state. A justification
+        // that load-bearing must not be deletable with the suite green, and
+        // without this the whole format string could be reduced to a bare
+        // list and every other assertion here would still pass.
+        //
+        // The read-only pointer rides the same assertion: "darkmux
+        // describes, never adjudicates" (#44) is what makes it safe for
+        // darkmux to report a mutation at all, and `darkmux machine status`
+        // is the verb that keeps the operator's next move a LOOK rather
+        // than a repair the note told them to make.
+        assert!(
+            note.contains("darkmux-owned residents only")
+                && note.contains("user-loaded models were never touched"),
+            "the note must close on the clause that scopes its claim to the darkmux \
+             namespace — the stated reason an aliased placement's mutation is documented \
+             rather than reported (#1274, #2674): {note}"
+        );
+        assert!(
+            note.contains("`darkmux machine status`"),
+            "and must point at the READ-ONLY verb rather than prescribing a repair \
+             (operator sovereignty, #44): {note}"
+        );
     }
 
     #[test]
