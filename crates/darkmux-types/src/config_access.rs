@@ -959,9 +959,21 @@ pub fn strict_selection() -> bool {
     config().runtime.as_ref().and_then(|r| r.strict_selection).unwrap_or(false)
 }
 /// (#1311) Diagnostic verbosity. `env(DARKMUX_LOG)` (lower-cased) >
-/// `config.runtime.log_level` > `"info"`. `"info"` = the informative
-/// dispatch-liveness phase markers; `"debug"` additionally turns on per-call
-/// detail (hosted call host/model/tokens/wall_ms). NEVER a secret at any level.
+/// `config.runtime.log_level` > `"info"`. NEVER a secret at any level.
+///
+/// **Scope, stated honestly (#1665 audit):** the ONLY reader anywhere in
+/// this tree is [`debug_logging`] just below, and its ONLY caller is the
+/// tool-less remote `single_shot` dispatch path
+/// (`darkmux_crew::single_shot`). Every value besides `"debug"` (an
+/// `"info"` tier, or anything else an operator sets) has zero effect
+/// anywhere — there is no `"info"`-specific behavior to turn on, just the
+/// absence of `"debug"`'s. And the internal-runtime Docker container path
+/// — the path `dispatch`/`mission launch`/`lab run` actually route through
+/// — never reads this field at all, so `config set runtime.log_level
+/// debug` has no effect on a real container dispatch. `config set` still
+/// accepts it (a real, typed field — nothing here overflows to `extras`),
+/// but "settable" should not be read as "affects every dispatch path"; it
+/// affects exactly the one narrow path described above.
 pub fn log_level() -> String {
     if let Some(s) = env_str("DARKMUX_LOG") {
         return s.to_ascii_lowercase();
@@ -975,6 +987,10 @@ pub fn log_level() -> String {
 }
 
 /// (#1311) Whether per-call debug logging is on (`log_level() == "debug"`).
+/// See [`log_level`]'s doc for this accessor's real (narrow) scope: today
+/// this is called from exactly one place, `darkmux_crew::single_shot`'s
+/// tool-less remote dispatch path — never from the internal-runtime
+/// container path most real dispatches actually run through.
 pub fn debug_logging() -> bool {
     log_level() == "debug"
 }
@@ -3110,5 +3126,180 @@ mod tests {
             tmp.path().join("cache"),
             "must scope under DARKMUX_HOME, not the real user home"
         );
+    }
+
+    // ─── settable ⇒ read (#1665, "the missing third leg") ──────────────
+    //
+    // `config_cmd.rs` already closes settable⇔typed-field in both
+    // directions (`every_with_defaults_key_is_settable` /
+    // `every_keys_entry_resolves_to_a_typed_field`). Neither asks whether
+    // a settable, typed field is actually CONSULTED by anything.
+    // `feedback_injection` sat in exactly that gap before #1548: a real
+    // accessor here, a real typed field, a config key that round-tripped
+    // through `config set`/`config get` cleanly — and zero callers
+    // anywhere in the tree. This guard would have caught it before it
+    // shipped, and exists so the next one doesn't need a fable audit to
+    // surface it.
+
+    /// A settable value whose ONLY reader is a differently-named derived
+    /// function (so the `_with_source`-suffix grouping below can't find
+    /// it on its own). Add an entry here — never silently widen the
+    /// suffix rule — when a value is read exclusively through a helper
+    /// whose name doesn't share the base's prefix.
+    const DERIVED_READER_ALIASES: &[(&str, &str)] = &[
+        // `log_level()`'s only reader is `debug_logging()` — see both
+        // accessors' own doc comments for the honest (narrow) scope this
+        // implies.
+        ("log_level", "debug_logging"),
+    ];
+
+    /// Accessors this guard KNOWS are currently unread outside their own
+    /// unit test, each with a tracking issue — named in place rather than
+    /// silently excluded, the same discipline `step_kinds/patterns/
+    /// dedup.rs` and `coder_phase.rs` (#1352) use for a documented
+    /// narrowing. Grow this list only with a linked issue, never to
+    /// silence a failure without one.
+    const KNOWN_GAPS: &[(&str, &str)] = &[
+        // #2681: every real `run_step_graph`/`run_bounded` call site
+        // hardcodes `remote_cap: 1` instead of resolving this accessor —
+        // found BY this guard while it was being written. Left as a
+        // tracked gap rather than fixed in the same PR: flipping the
+        // real-world default from always-serial to up-to-4-concurrent
+        // remote dispatch is a behavioral change that deserves its own
+        // dogfood pass, not a side effect of an audit PR.
+        ("remote_concurrent_cap", "https://github.com/kstrat2001/darkmux/issues/2681"),
+    ];
+
+    /// Every top-level (column-0) `pub fn <name>(` in `src`, in the same
+    /// spirit as `dispatch_internal_tests.rs`'s `top_level_function_spans`
+    /// — a plain line scan, not a real parser, because the input is this
+    /// crate's own well-formatted source, not arbitrary Rust.
+    fn top_level_pub_fn_names(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix("pub fn ") else { continue };
+            let name: String =
+                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// `text` with every full-line comment (`//`, `///`, `//!`) dropped —
+    /// so a doc comment merely NAMING an accessor (e.g. "resolved via
+    /// `config_access::log_level`") can never satisfy this guard the way
+    /// an actual call site does. Line-level, not token-level: matches
+    /// this codebase's own precedent (`liveness_conformance`'s
+    /// `body.contains(...)` textual checks) of accepting a known, narrow
+    /// gap (a trailing `// comment` on a real code line still counts)
+    /// rather than writing a full Rust tokenizer for a test.
+    fn strip_comment_lines(text: &str) -> String {
+        text.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Every `.rs` file under `root`, skipping VCS/build/vendor dirs —
+    /// deliberately walks the WHOLE workspace (`src/`, every `crates/*/`,
+    /// `runtime/`), not just this crate, because a config value's real
+    /// reader can live in any of them.
+    fn collect_rs_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if matches!(name, "target" | ".git" | "node_modules" | "ui" | ".darkmux") {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn every_config_value_is_read_by_something_outside_this_file() {
+        let this_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config_access.rs");
+        let this_src = std::fs::read_to_string(&this_file)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", this_file.display()));
+        let names = top_level_pub_fn_names(&this_src);
+        assert!(
+            names.len() > 50,
+            "sanity: found only {} pub fns in config_access.rs — the line \
+             scanner is almost certainly broken, not this file suddenly tiny",
+            names.len()
+        );
+
+        // Repo root: crates/darkmux-types/../..
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root must resolve");
+        let mut rs_files = Vec::new();
+        collect_rs_files(&repo_root, &mut rs_files);
+        let this_file_canon = this_file.canonicalize().expect("this file must resolve");
+        let corpus: Vec<String> = rs_files
+            .into_iter()
+            .filter(|p| p.canonicalize().map(|c| c != this_file_canon).unwrap_or(true))
+            .filter_map(|p| std::fs::read_to_string(&p).ok())
+            .map(|text| strip_comment_lines(&text))
+            .collect();
+        assert!(corpus.len() > 20, "sanity: found only {} other .rs files — the workspace walk is broken", corpus.len());
+
+        let is_read_as_code = |name: &str| -> bool {
+            let call = format!("{name}(");
+            let path_ref = format!("::{name}");
+            corpus.iter().any(|text| text.contains(&call) || text.contains(&path_ref))
+        };
+
+        // Group `_with_source` twins under their shared base, so a value
+        // read only through its provenance-carrying sibling still counts.
+        let base_name = |n: &str| n.strip_suffix("_with_source").unwrap_or(n).to_string();
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for n in &names {
+            groups.entry(base_name(n)).or_default().push(n.clone());
+        }
+        for (base, alias) in DERIVED_READER_ALIASES {
+            groups.entry(base.to_string()).or_default().push(alias.to_string());
+        }
+
+        let mut unread = Vec::new();
+        for (base, variants) in &groups {
+            if KNOWN_GAPS.iter().any(|(k, _)| k == base) {
+                continue;
+            }
+            if !variants.iter().any(|v| is_read_as_code(v)) {
+                unread.push(base.clone());
+            }
+        }
+
+        assert!(
+            unread.is_empty(),
+            "these config_access accessors (or their `_with_source`/alias \
+             siblings) have NO caller anywhere in the workspace outside a \
+             doc comment or their own unit test — a settable, typed config \
+             field that nothing reads is exactly the #1548/#1665 dead-knob \
+             shape. Either wire a real reader, or add a KNOWN_GAPS entry \
+             with a tracking issue: {unread:?}"
+        );
+
+        // The KNOWN_GAPS list itself must not silently rot into "still
+        // unread, nobody's tracking it": every entry named there must
+        // ACTUALLY be unread today. A gap that gets wired up (like
+        // `feedback_injection` was, by #1548) must have its allowance
+        // removed in the same PR, or this test would stop testing
+        // anything for that key ever again.
+        for (base, issue) in KNOWN_GAPS {
+            let variants = groups.get(*base).unwrap_or_else(|| {
+                panic!("KNOWN_GAPS names `{base}` but no such accessor exists in config_access.rs any more — remove the entry (tracked at {issue})")
+            });
+            assert!(
+                !variants.iter().any(|v| is_read_as_code(v)),
+                "KNOWN_GAPS claims `{base}` is unread (tracked at {issue}), but it now has a \
+                 real caller — remove it from KNOWN_GAPS so this guard covers it again"
+            );
+        }
     }
 }
