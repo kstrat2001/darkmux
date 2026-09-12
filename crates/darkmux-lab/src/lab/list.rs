@@ -143,6 +143,57 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// (#2643) `list_runs` reads its scan root through `config_access::
+    /// lab_dir()`, which resolves through `paths::resolve(Auto)` — and
+    /// `DARKMUX_HOME`, when set, wins over a project-local `./.darkmux`
+    /// UNCONDITIONALLY (see `paths::resolve`'s own doc comment; this is
+    /// deliberate production behavior, not a bug). The three tests below
+    /// used to only `set_current_dir` to a tempdir holding a `.darkmux/`
+    /// and rely on the project-local fallback being chosen — which is only
+    /// true when `DARKMUX_HOME` happens to be unset in the shell running
+    /// `cargo test`. An operator (or CI) with `DARKMUX_HOME` exported
+    /// ambiently made `list_runs` scan `<DARKMUX_HOME>/runs` instead of the
+    /// fixture's tempdir, silently returning empty — reproduced directly:
+    /// `DARKMUX_HOME=/tmp/w24a-scratch-home cargo test -p darkmux-lab --lib
+    /// lab::list::tests` failed all three with the exact index-out-of-bounds
+    /// / length-0 / missing-"good" panics this comment now guards against.
+    ///
+    /// The structural fix (per this project's own doctrine: prefer a fix
+    /// that removes the hazard over one more test-local guard) is to stop
+    /// depending on cwd-relative project-local discovery at all and instead
+    /// set `DARKMUX_HOME` explicitly to the SAME root the fixture writes
+    /// under — exactly what every real caller (and this task's own
+    /// constraints) already does. That makes resolution agree with the
+    /// fixture regardless of what the ambient shell exports, and drops the
+    /// `set_current_dir` dance (one fewer piece of process-wide state these
+    /// tests have to serialize against). RAII (not a raw save/set/restore)
+    /// so a panicking assertion still restores the prior value — mirrors
+    /// `lab::run::tests::HomeGuard` (same shape, this module's own copy per
+    /// this codebase's established per-module-guard convention; see e.g.
+    /// `lab/run.rs`, `lab/inspect.rs`, `crawl/plan_step.rs`).
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var_os("DARKMUX_HOME");
+            unsafe { std::env::set_var("DARKMUX_HOME", dir) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
     fn write_run(runs_dir: &std::path::Path, run_id: &str, workload: &str, dur: u64, ok: bool) {
         let dir = runs_dir.join(run_id);
         fs::create_dir_all(&dir).unwrap();
@@ -161,13 +212,14 @@ mod tests {
     #[test]
     fn list_empty_when_no_runs_dir() {
         let tmp = TempDir::new().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        // (#2643) Same HomeGuard isolation as the tests below — an empty
+        // tempdir with no `runs/` under it, rather than cwd + the ambient
+        // project/user fallback, so this asserts what its name claims
+        // regardless of what `DARKMUX_HOME` happens to be in the shell
+        // running `cargo test`.
+        let _home = HomeGuard::set(tmp.path());
         let result = list_runs(None).unwrap();
-        std::env::set_current_dir(prev).unwrap();
-        // Result depends on whether ~/.darkmux/runs/ exists, so we can't strictly
-        // assert empty — but the call should succeed without error.
-        let _ = result;
+        assert!(result.is_empty(), "no runs/ dir under an isolated DARKMUX_HOME must list empty");
     }
 
     #[serial_test::serial]
@@ -185,10 +237,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         write_run(&runs_dir, "run-new", "wl-c", 300_000, false);
 
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _home = HomeGuard::set(&darkmux);
         let summaries = list_runs(None).unwrap();
-        std::env::set_current_dir(prev).unwrap();
 
         // Newest first
         assert_eq!(summaries[0].run_id, "run-new");
@@ -203,16 +253,15 @@ mod tests {
     #[test]
     fn list_respects_limit() {
         let tmp = TempDir::new().unwrap();
-        let runs_dir = tmp.path().join(".darkmux/runs");
+        let darkmux = tmp.path().join(".darkmux");
+        let runs_dir = darkmux.join("runs");
         fs::create_dir_all(&runs_dir).unwrap();
         for i in 0..7 {
             write_run(&runs_dir, &format!("run-{i}"), "wl", 1000, true);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _home = HomeGuard::set(&darkmux);
         let summaries = list_runs(Some(3)).unwrap();
-        std::env::set_current_dir(prev).unwrap();
         assert_eq!(summaries.len(), 3);
         // Most-recent: run-6, run-5, run-4
         assert_eq!(summaries[0].run_id, "run-6");
@@ -223,17 +272,16 @@ mod tests {
     #[test]
     fn list_skips_dirs_without_manifest() {
         let tmp = TempDir::new().unwrap();
-        let runs_dir = tmp.path().join(".darkmux/runs");
+        let darkmux = tmp.path().join(".darkmux");
+        let runs_dir = darkmux.join("runs");
         fs::create_dir_all(&runs_dir).unwrap();
         write_run(&runs_dir, "good", "wl", 1000, true);
         // Bad dir: no manifest.json
         fs::create_dir_all(runs_dir.join("bad")).unwrap();
         fs::write(runs_dir.join("bad/notes.txt"), "no manifest here").unwrap();
 
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let _home = HomeGuard::set(&darkmux);
         let summaries = list_runs(None).unwrap();
-        std::env::set_current_dir(prev).unwrap();
         let names: Vec<&str> = summaries.iter().map(|r| r.run_id.as_str()).collect();
         assert!(names.contains(&"good"));
         assert!(!names.contains(&"bad"));

@@ -4404,7 +4404,10 @@ fn spawn_guarded_watchdog(
     // this point and the caller's return.
     let guard = StopFlagGuard(Arc::clone(watchdog_abandoned));
     let abandoned = Arc::clone(watchdog_abandoned);
-    let handle = thread::spawn(move || {
+    // (#2643) Named via `spawn_detached_named` — see its doc comment — so an
+    // env read inside `run_watchdog` attributes back to the spawning
+    // thread's name instead of logging `<unnamed>`.
+    let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
         run_watchdog(
             container_name,
             inactivity_deadline,
@@ -7225,7 +7228,8 @@ fn spawn_guarded_tailer(
     // this point and the caller's return.
     let guard = StopFlagGuard(Arc::clone(stop_flag));
     let stop = Arc::clone(stop_flag);
-    let handle = thread::spawn(move || {
+    // (#2643) Named via `spawn_detached_named` — see its doc comment.
+    let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
         run_tailer(
             out_dir,
             session_id,
@@ -7751,7 +7755,8 @@ fn spawn_guarded_sampler(
 ) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
-    let handle = thread::spawn(move || {
+    // (#2643) Named via `spawn_detached_named` — see its doc comment.
+    let handle = crate::concurrent_dispatch::spawn_detached_named(move || {
         run_telemetry_sampler(
             stop,
             role_id,

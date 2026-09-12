@@ -2812,6 +2812,37 @@ impl HookSink {
     /// `hook.fired`/`hook.failed` records land — see the module doc for why
     /// it's a snapshot of the OTHER sinks, not this one.
     pub fn new(rules: &[HookRule], outbox_dir: PathBuf, report_sink: Arc<dyn FlowSink>) -> Result<Self> {
+        Self::new_with_max_outbox_mb_override(rules, outbox_dir, report_sink, None)
+    }
+
+    /// (#2643) Test-only: inject the outbox size cap directly instead of
+    /// through `DARKMUX_HOOKS_MAX_OUTBOX_MB`. The two capping tests below
+    /// used to mutate that env var — a process-global config knob EVERY
+    /// `HookSink::new` call in this file's whole test suite reads once at
+    /// construction, regardless of which test constructed it — which
+    /// raced every other concurrently-running test in this file that
+    /// builds a sink. Unlike the rule-index collision `hook_signing_secret`
+    /// had (fixed by giving the signing test its own index), there is no
+    /// spare dimension to move THIS collision off of: it's one scalar
+    /// knob, read the same way by every construction. So the two tests
+    /// that need a non-default cap now call this instead of mutating
+    /// global state at all — nothing races because nothing is mutated.
+    #[cfg(test)]
+    fn new_for_test_with_max_outbox_mb(
+        rules: &[HookRule],
+        outbox_dir: PathBuf,
+        report_sink: Arc<dyn FlowSink>,
+        max_outbox_mb: u64,
+    ) -> Result<Self> {
+        Self::new_with_max_outbox_mb_override(rules, outbox_dir, report_sink, Some(max_outbox_mb))
+    }
+
+    fn new_with_max_outbox_mb_override(
+        rules: &[HookRule],
+        outbox_dir: PathBuf,
+        report_sink: Arc<dyn FlowSink>,
+        max_outbox_mb_override: Option<u64>,
+    ) -> Result<Self> {
         // (#2183) Resolved rule-by-rule (not the batch `resolve_rules`)
         // so a `transform` that fails to load can be isolated to THAT
         // rule alone — "a missing or unparseable adapter is a load-time
@@ -2885,8 +2916,13 @@ impl HookSink {
         // (#2093 merge-gate finding 5) Read live, once, at construction —
         // matches every other config accessor's "env wins live" contract
         // at the one point this sink consults it; a running sink doesn't
-        // re-poll config on every write.
-        let max_outbox_mb = darkmux_types::config_access::hooks_max_outbox_mb();
+        // re-poll config on every write. (#2643) `max_outbox_mb_override`
+        // — test-only, see `new_for_test_with_max_outbox_mb` above — wins
+        // when present, so a test can pin a cap without mutating the
+        // process-global env var every OTHER concurrently-running test's
+        // own `HookSink::new` call would also observe.
+        let max_outbox_mb =
+            max_outbox_mb_override.unwrap_or_else(darkmux_types::config_access::hooks_max_outbox_mb);
 
         let thread_rules = rule_runtimes.clone();
         let thread_stop = stop.clone();
@@ -3827,17 +3863,21 @@ mod tests {
     // ─── (#2135 option 2) delivery contract headers + signing ──────────
 
     #[test]
-    // (#2135 option 2) Shares rule-index 0 with the signing test below,
-    // which mutates `DARKMUX_HOOK_SECRET_0` — serialized against it (same
-    // default `serial_test` group) so the two can't race on that env var.
-    #[serial_test::serial]
+    // (#2135 option 2 / #2643) Used to share rule-index 0 with the signing
+    // test below and need `#[serial_test::serial]` against it for exactly
+    // that reason, plus a defensive env-var clear of its own at the top of
+    // the fn body. #2643 moved the signing test's signed rule to index 2
+    // (see that test's own doc comment) so nothing in this file mutates
+    // rule-index 0's signing-secret env key any more — the annotation AND
+    // the defensive clear are both gone, not because either was wrong
+    // when written, but because a defensive clear is itself a mutation as
+    // far as `scripts/env-audit-report.py`'s text-scan half is concerned
+    // (it matches any `remove_var(`/`set_var(` call on a `DARKMUX_`
+    // literal, deliberately not distinguishing "defensive" from
+    // "load-bearing" — see that script's own module doc for why), and
+    // keeping it would have kept every single-rule test in this file
+    // flagged as racing a mutation nothing else here still makes.
     fn delivery_carries_the_contract_headers_and_no_signature_when_unsigned() {
-        // Defensive: a prior test's env mutation must never leak in — this
-        // rule is also index 0, and the env override wins regardless of
-        // whether THIS rule names a keychain item.
-        unsafe {
-            std::env::remove_var("DARKMUX_HOOK_SECRET_0");
-        }
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
@@ -3871,26 +3911,78 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // mutates DARKMUX_HOOK_SECRET_0
+    // (#2643) Deliberately does NOT need `#[serial_test::serial]` any more.
+    // It used to occupy rule-index 0 and mutate `DARKMUX_HOOK_SECRET_0` —
+    // the SAME env key every other single-rule test in this file also
+    // reads (`resolve_one_rule` calls `hook_signing_secret(index, ..)` for
+    // every configured rule at construction time, regardless of whether
+    // that rule ever matches an event), which raced roughly 30 other
+    // unguarded tests in this module. Reproduced directly: with a
+    // temporary 400ms sleep widening the window after `set_var` and the
+    // sibling `..._when_unsigned` test's `#[serial]` removed, both landed
+    // in the same window in 5/5 runs and the unsigned test failed with
+    // exactly the predicted shape — its own unsigned rule (also index 0)
+    // picked up THIS test's leaked "top-secret-key" and grew a spurious
+    // `x-darkmux-signature` header. Restored immediately after capturing
+    // that failure (see the PR body for the exact repro).
+    //
+    // The structural fix, rather than adding `#[serial]` to ~30 readers
+    // (which would serialize a meaningful slice of this file's suite for
+    // no reason those tests care about signing at all): give THIS test's
+    // signed rule an index nothing else in the file's non-`#[ignore]`d
+    // tests ever occupies. Index 1 alone wasn't enough — a re-run of the
+    // env-audit sweep after that first attempt caught
+    // `resolve_rules_paths_are_stable_across_reordering` below, which
+    // builds its OWN 2-rule fixtures and reads both index 0 AND index 1
+    // (it swaps a 2-rule vec's order, so both positions get resolved in
+    // one run or the other). Two leading decoy rules that can never match
+    // push the real, signed rule to index 2 instead, so the env key this
+    // test mutates is `DARKMUX_HOOK_SECRET_2` — checked against every
+    // OTHER rules-vec literal in this file (including that reordering
+    // test and the one `#[ignore]`d 3-rule cost-check, which the default
+    // suite never runs) before picking it.
     fn delivery_carries_a_signature_the_receiver_can_recompute_when_signed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
-        let rules = vec![HookRule {
-            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some(receiver.url("/events")),
-            signing_secret_keychain_item: Some("darkmux-hook-test-0".to_string()),
+        let decoy = |path: &str| HookRule {
+            r#match: Some(HookMatch {
+                action: Some("darkmux-2643-decoy-never-matches".to_string()),
+                ..Default::default()
+            }),
+            http: Some(receiver.url(path)),
+            signing_secret_keychain_item: None,
             file: None,
             transform: None,
             headers: None,
             attribution_headers: None,
             extras: Default::default(),
-        }];
-        let prev = std::env::var("DARKMUX_HOOK_SECRET_0").ok();
+        };
+        let rules = vec![
+            // Decoys at index 0 and 1 — each resolves cleanly (a valid
+            // destination is required) but can never match the
+            // "crawl.finding" record this test writes, so neither ever
+            // delivers or competes with the real assertions below. Exist
+            // ONLY to push the signed rule off the two shared env keys
+            // other tests in this file do read.
+            decoy("/decoy-never-fires-0"),
+            decoy("/decoy-never-fires-1"),
+            HookRule {
+                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                http: Some(receiver.url("/events")),
+                signing_secret_keychain_item: Some("darkmux-hook-test-2".to_string()),
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
+                extras: Default::default(),
+            },
+        ];
+        let prev = std::env::var("DARKMUX_HOOK_SECRET_2").ok();
         // The env override wins over the Keychain item on every platform
         // (see `crate::hook_signing_secret`'s doc) — the portable path a
         // sandboxed test can actually exercise without a real Keychain.
         unsafe {
-            std::env::set_var("DARKMUX_HOOK_SECRET_0", "top-secret-key");
+            std::env::set_var("DARKMUX_HOOK_SECRET_2", "top-secret-key");
         }
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
         let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
@@ -3912,8 +4004,8 @@ mod tests {
         drop(sink);
         unsafe {
             match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOOK_SECRET_0", v),
-                None => std::env::remove_var("DARKMUX_HOOK_SECRET_0"),
+                Some(v) => std::env::set_var("DARKMUX_HOOK_SECRET_2", v),
+                None => std::env::remove_var("DARKMUX_HOOK_SECRET_2"),
             }
         }
     }
@@ -4815,7 +4907,12 @@ mod tests {
     /// survive across separate `HookSink` instances (simulating separate
     /// processes sharing the same outbox directory).
     #[test]
-    #[serial_test::serial] // mutates the process-global DARKMUX_HOOKS_MAX_OUTBOX_MB env var
+    // (#2643) Used to mutate the process-global `DARKMUX_HOOKS_MAX_OUTBOX_MB`
+    // env var (and need `#[serial_test::serial]` against every other test
+    // in this file that constructs a `HookSink`, since construction reads
+    // that SAME knob unconditionally). Now injects the cap directly via
+    // `new_for_test_with_max_outbox_mb` — nothing races because nothing
+    // mutates shared state.
     fn dropped_appends_counter_accumulates_across_separate_hook_sink_instances() {
         let tmp = tempfile::TempDir::new().unwrap();
         // A black-hole target: bound but never accepted, so nothing is
@@ -4833,16 +4930,11 @@ mod tests {
             extras: Default::default(),
         }];
 
-        let prev = std::env::var("DARKMUX_HOOKS_MAX_OUTBOX_MB").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", "1");
-        }
-
         // "Process 1": push the outbox over the 1 MiB cap, then drop one
         // append of its own.
         {
             let report: Arc<dyn FlowSink> = Arc::new(NullSink);
-            let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+            let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
             let mut big = record("work.big");
             big.reasoning = Some("x".repeat(2 * 1024 * 1024));
             sink.write(&big).unwrap();
@@ -4855,7 +4947,7 @@ mod tests {
         // against the SAME already-over-cap outbox.
         {
             let report: Arc<dyn FlowSink> = Arc::new(NullSink);
-            let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+            let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
             sink.write(&record("work.drop.2")).unwrap();
         }
         let after_2 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
@@ -4863,17 +4955,10 @@ mod tests {
         // "Process 3": same again.
         {
             let report: Arc<dyn FlowSink> = Arc::new(NullSink);
-            let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+            let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
             sink.write(&record("work.drop.3")).unwrap();
         }
         let after_3 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", v),
-                None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
-            }
-        }
 
         assert_eq!(after_1, 1, "process 1's own drop");
         assert_eq!(after_2, 2, "process 2 must ADD to process 1's count, not clobber it back to 1");
@@ -5052,8 +5137,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // (fix-round) mutates the process-global DARKMUX_HOOKS_MAX_OUTBOX_MB env var —
-    // races `dropped_appends_counter_accumulates_across_separate_hook_sink_instances` without this
+    // (#2643) Used to mutate the process-global `DARKMUX_HOOKS_MAX_OUTBOX_MB`
+    // env var and race
+    // `dropped_appends_counter_accumulates_across_separate_hook_sink_instances`
+    // (and every other `HookSink::new` in this file) without `#[serial]`.
+    // Now injects the cap directly via `new_for_test_with_max_outbox_mb` —
+    // see that constructor's doc comment.
     fn hook_write_drops_appends_past_the_cap_and_counts_them() {
         let tmp = tempfile::TempDir::new().unwrap();
         // A "black hole" target: bound but never accepted, so nothing is
@@ -5072,21 +5161,8 @@ mod tests {
             extras: Default::default(),
         }];
 
-        let prev = std::env::var("DARKMUX_HOOKS_MAX_OUTBOX_MB").ok();
-        // `HookSink::new` reads the cap ONCE, live, at construction —
-        // matches `config_access`'s general "env read live per access"
-        // rule, applied at the one place this sink reads it.
-        unsafe {
-            std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", "1");
-        }
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
-        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", v),
-                None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
-            }
-        }
+        let sink = HookSink::new_for_test_with_max_outbox_mb(&rules, tmp.path().to_path_buf(), report, 1).unwrap();
 
         // The cap check reads CURRENT undelivered bytes BEFORE this
         // write, so the first write that itself pushes the outbox over
@@ -6213,6 +6289,14 @@ mod tests {
     }
 
     #[test]
+    // (#2643) `orphan_backlog_stalls_the_rule_and_warns_instead_of_going_
+    // silent` below mutates `DARKMUX_HOOKS_JQ_TIMEOUT_MS` — reproduced
+    // directly: this test failed (`left: 100, right: 5_000`) when the two
+    // landed in the same window under the default parallel test harness.
+    // Genuinely nothing to restructure here (it asserts the DEFAULT, so
+    // there's no override to inject in place of the env mutation the way
+    // the outbox-cap tests got); `#[serial]` is the right, cheap fix.
+    #[serial_test::serial]
     fn wall_clock_and_output_caps_are_wired_from_config_defaults() {
         // The knobs themselves (`apply_transform`'s enforcement) are
         // exhaustively covered in `hook_transform`'s own tests; this just

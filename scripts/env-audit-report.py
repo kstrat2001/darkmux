@@ -95,19 +95,26 @@ helper this script doesn't recognize (some indirection beyond the plain
    other half of fix 2 — a reader should never have to infer coverage from
    an absence of findings.
 
-**Scope, stated plainly:** this script sweeps `darkmux-types` +
-`darkmux-crew` only (`SRC_DIRS` below). `darkmux-flow`, `darkmux-lab`,
+**Scope, stated plainly (as of #2643):** this script sweeps `darkmux-types` +
+`darkmux-crew` + `darkmux-flow` + `darkmux-lab` (`SRC_DIRS` below).
 `darkmux-serve`, `darkmux-doctor`, `darkmux-fleet`, top-level `src/`, and the
 `runtime/` crate (a separate Docker-image binary, not linked into this
 workspace, so this instrumentation cannot reach it at all) are UNSWEPT —
 narrowing `SRC_DIRS` to run this script against one of them is possible (see
 fix 2's proof above) but not done as part of the default invocation, and
 leaving them unswept is a scope decision, not a claim that they're clean.
+`darkmux-flow` and `darkmux-lab` were spot-checked by hand for this pass
+(grepped for `std::env::var`/`var_os` production call sites outside
+`config_access`, cross-referenced against test annotations) rather than
+found to need their own new `env_audit` chokepoint gauntlet — see #2643's
+PR body for what each spot-check found.
 
 ## Usage
 
     DARKMUX_ENV_AUDIT_LOG=/tmp/env-audit.log cargo test -p darkmux-types --lib
     DARKMUX_ENV_AUDIT_LOG=/tmp/env-audit.log cargo test -p darkmux-crew --lib
+    DARKMUX_ENV_AUDIT_LOG=/tmp/env-audit.log cargo test -p darkmux-flow --lib
+    DARKMUX_ENV_AUDIT_LOG=/tmp/env-audit.log cargo test -p darkmux-lab --lib
     python3 scripts/env-audit-report.py /tmp/env-audit.log
 
 Run it after adding a new test that touches `DARKMUX_*`-derived state, or
@@ -150,6 +157,23 @@ CRATE_DIRS: dict[str, list[Path]] = {
     "darkmux-crew": [
         REPO_ROOT / "crates/darkmux-crew/src",
         REPO_ROOT / "crates/darkmux-crew/tests",
+    ],
+    # (#2643) The two crates #2632's original sweep left unswept, closed here.
+    # Neither adds its own `env_audit` chokepoint gauntlet the way
+    # darkmux-crew did — darkmux-lab reaches every DARKMUX_* value it needs
+    # through darkmux-types' already-instrumented `config_access` resolvers,
+    # and darkmux-flow's three resolvers that bypass `config_access` by
+    # construction (secrets: `redis_url`, `serve_token`,
+    # `hook_signing_secret`) were wired directly into `env_audit::
+    # audit_env_read` in this same pass (see `crates/darkmux-flow/src/lib.rs`).
+    # Adding both here is what lets `is_serial()` actually locate their tests'
+    # `fn`s instead of falling into UNVERIFIABLE (NO-SOURCE-MATCH) by omission
+    # — see fix 2's module-doc proof above for what that misattribution looks
+    # like left unfixed.
+    "darkmux-flow": [REPO_ROOT / "crates/darkmux-flow/src"],
+    "darkmux-lab": [
+        REPO_ROOT / "crates/darkmux-lab/src",
+        REPO_ROOT / "crates/darkmux-lab/tests",
     ],
 }
 SRC_DIRS = [d for dirs in CRATE_DIRS.values() for d in dirs]

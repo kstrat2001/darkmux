@@ -148,6 +148,37 @@ where
         .expect("darkmux: failed to spawn scoped worker thread")
 }
 
+/// (#2643) The DETACHED-thread sibling of [`spawn_scoped_named`] above, for
+/// the three production `thread::spawn` calls in `dispatch_internal.rs`
+/// (the tailer, the inactivity watchdog, the thermal sampler) that have no
+/// `thread::scope` to spawn into — each outlives the function that spawned
+/// it, tracked instead via its own `JoinHandle` + `StopFlagGuard`. Bare
+/// `thread::spawn` leaves these unnamed, which is exactly the
+/// unattributable-env-read gap `env_audit.rs`'s "Known gaps" section named:
+/// a read inside `run_watchdog`/`run_tailer`/`run_telemetry_sampler` logged
+/// as `<unnamed>` rather than attributing back to the dispatch (and,
+/// transitively, the test) that spawned it. Same fix shape as the scoped
+/// version — inherit the current thread's name at spawn time via
+/// `Builder::name` — `std::thread::spawn`'s only difference from
+/// `Builder::new().spawn(f).expect(..)` is that the latter returns a
+/// `Result` instead of panicking internally on OS spawn failure, so
+/// `.expect` here preserves `thread::spawn`'s original panic-on-failure
+/// behavior rather than silently swallowing it.
+pub(crate) fn spawn_detached_named<F, T>(f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("darkmux-worker")
+        .to_string();
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(f)
+        .expect("darkmux: failed to spawn worker thread")
+}
+
 /// One job queued for [`run_bounded`]. `index` is the CALLER's own
 /// bookkeeping key (e.g. a future Step id's position) — results come back
 /// tagged with it rather than assuming the job list itself is

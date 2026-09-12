@@ -646,6 +646,12 @@ fn assemble_redis_url(host: &str, port: u16, db: Option<u8>, password: Option<&s
 /// the redacting `Display`; `expose_for_probe()` (deliberately verbose, visible
 /// in review) is the sole raw-bytes path, for `redis::Client::open`.
 pub fn redis_url() -> Option<RawRedisUrl> {
+    // (#2643) A resolution chokepoint that bypasses `config_access::env_str`
+    // by construction (a secret; see the module-level carve-out doc) — wire
+    // it into the same `env_audit` sink directly so the env-audit sweep can
+    // see readers of `DARKMUX_REDIS_URL` that reach it through here.
+    #[cfg(any(test, feature = "test-support"))]
+    darkmux_types::env_audit::audit_env_read("DARKMUX_REDIS_URL");
     // Tier 1 — env URL verbatim (password inline; redacted on Display).
     if let Some(url) = std::env::var("DARKMUX_REDIS_URL")
         .ok()
@@ -744,6 +750,9 @@ fn keychain_serve_token() -> Option<String> {
 /// config flag alone never activates auth (a gate-on-but-no-token state would
 /// otherwise 401 every request with no way to pass). (#881)
 pub fn serve_token() -> Option<RawServeToken> {
+    // (#2643) Same chokepoint-wiring reasoning as `redis_url` above.
+    #[cfg(any(test, feature = "test-support"))]
+    darkmux_types::env_audit::audit_env_read("DARKMUX_SERVE_TOKEN");
     // Tier 1 — env token verbatim.
     if let Some(tok) = std::env::var("DARKMUX_SERVE_TOKEN")
         .ok()
@@ -823,6 +832,11 @@ fn keychain_hook_secret(_item: &str) -> Option<String> {
 ///   3. else `None` — this rule's deliveries go out unsigned.
 pub fn hook_signing_secret(rule_index: usize, keychain_item: Option<&str>) -> Option<RawHookSecret> {
     let env_key = format!("DARKMUX_HOOK_SECRET_{rule_index}");
+    // (#2643) Same chokepoint-wiring reasoning as `redis_url`/`serve_token`
+    // above — `env_key` always starts with `DARKMUX_`, so `audit_env_read`'s
+    // own prefix gate accepts it unmodified.
+    #[cfg(any(test, feature = "test-support"))]
+    darkmux_types::env_audit::audit_env_read(&env_key);
     if let Some(tok) = std::env::var(&env_key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         return Some(RawHookSecret::new(tok));
     }
