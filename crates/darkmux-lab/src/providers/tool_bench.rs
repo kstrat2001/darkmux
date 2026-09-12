@@ -1323,6 +1323,27 @@ impl WorkloadProvider for ToolBenchProvider {
             verify: Some(VerifyOutcome {
                 // The bench "passes" when the MEASUREMENT is valid (no infra
                 // failures) — model quality lives in the rows, not here.
+                //
+                // (#2685) This gate now moves in BOTH directions, and the
+                // unfavorable one is operator-visible: a zero-token dispatch
+                // at a clean exit used to score as a capability zero, which
+                // left `infra` at 0 and reported a clean measurement; it is
+                // now an infra row, so `passed` goes FALSE on a bench run
+                // that previously reported success. The honest reading — one
+                // dead seat really does invalidate the measurement — but it
+                // is a change in the unfavorable direction, so name where it
+                // actually lands.
+                //
+                // It reaches `RunOutcome::verify_passed` (`lab/run.rs`),
+                // NOT `RunOutcome::ok` — this provider sets `RunResult.ok`
+                // unconditionally true, and `lab_cli`'s `lab run` exit
+                // status reads `o.ok`, so `darkmux lab run tool-bench` does
+                // NOT start exiting non-zero. The consumers that DO change:
+                // `lab characterize` prints its "verify check failed"
+                // verdict instead of the clean one, `lab tune` counts the
+                // run among its verify failures, and `lab loop` folds
+                // `verify_passed` into `analyze_run`'s verdict (and that
+                // verdict does gate an exit code).
                 passed: infra == 0,
                 details: format!(
                     "{passes}/{} trials passed · {infra} infra-fail · scores → {}",
@@ -1433,8 +1454,22 @@ fn extract_reply(stdout: &str) -> String {
 }
 
 /// Dispatch one task via the internal runtime. Same shape as the coding-task
-/// provider's helper; `timeout` is the bench's per-task inactivity cap (a
-/// stuck dispatch is an infra row + rerun, never a capability zero).
+/// provider's helper; `timeout` is the bench's per-task inactivity cap.
+///
+/// (#2685) What a stuck dispatch SCORES as now depends on how it ended, so
+/// the old blanket gloss here — "a stuck dispatch is an infra row + rerun,
+/// never a capability zero" — no longer describes this code:
+/// - The host watchdog HARD-KILLS the container at 100% of the cap. Nothing
+///   parseable reaches stdout (no envelope at all, or a truncated one), the
+///   exit is non-zero, and `scores::is_infra_failure` reads that as positive
+///   evidence the dispatch died → an infra row + rerun, as before. That arm
+///   is deliberately UNGATED: a nonce scraped out of the wreckage does not
+///   turn a kill into a pass.
+/// - A dispatch that took the runtime's 75% soft nudge and WRAPPED UP prints
+///   a complete envelope with real token counts. The model ran, so whatever
+///   it produced is capability evidence and is scored on merit — including
+///   as a capability ZERO when it emitted no `ANSWER:`/`BLOCKED:` verdict.
+///   The exit code alone no longer erases that.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_task(
     role_id: &str,
@@ -1920,7 +1955,7 @@ not json — tolerated
     /// answers. Now: one rule, and the model's work counts.
     ///
     /// `review_bench`'s half of this parity is asserted in
-    /// `build_rows_and_build_score_rows_agree_on_nonzero_exit_with_a_real_envelope`
+    /// `build_rows_and_build_score_rows_agree_on_a_recovered_envelope_and_on_a_dead_container`
     /// below, against the OTHER bench's real code path.
     #[test]
     fn score_task_keeps_a_real_envelope_at_a_nonzero_exit_as_capability() {
@@ -1938,14 +1973,25 @@ not json — tolerated
         assert!(sc.passed, "the model did the work; the exit code does not erase it");
     }
 
-    /// (#2685) The eligibility gate itself: a trial that DID answer is
-    /// never reclassified as infra, whatever the envelope says. This is
+    /// (#2685) The eligibility gate itself, and its ONE arm. A trial that
+    /// answered out of a RECOVERED envelope is never reclassified as infra:
+    /// the reply came out of that envelope's own `final_assistant` field, so
+    /// an `ANSWER:` verdict in it is trustworthy evidence the model ran, and
+    /// it outranks a token count that may be a metrics quirk. This is
     /// `review_bench`'s `!is_infra_failure(&ran_fine, Some(&zero))` arm
-    /// expressed through `tool_bench`'s own signal — the reply carried an
-    /// `ANSWER:` verdict, so there is positive evidence the model ran and
-    /// the trial gets scored on merit rather than thrown out as a rerun.
+    /// expressed through `tool_bench`'s own signal.
+    ///
+    /// (#2685 frontier-QA) The hard-infra shape goes the OTHER way, and the
+    /// second half below pins it. `infra_exit` means NO envelope parsed at
+    /// all, so there was no well-formed field to read a verdict out of —
+    /// whatever `extract_answer` found was scraped from the same unparseable
+    /// stdout. Letting that scrape veto the positive evidence that the
+    /// container died scored a watchdog kill as `Pass` at `value: 1.0`,
+    /// inside `pass_rate`'s numerator AND denominator: a kill FLATTERING the
+    /// model, worse than the exit-code-alone rule this bench carried before
+    /// #2685. See `scores::is_infra_failure`'s doc for the asymmetry.
     #[test]
-    fn score_task_never_reclassifies_a_trial_that_answered() {
+    fn score_task_never_reclassifies_a_trial_that_answered_from_a_real_envelope() {
         let t = nonce_task();
         let exp = expected_nonce(&t);
         let zero_tokens = envelope_meta_with_exit(
@@ -1955,10 +2001,13 @@ not json — tolerated
         let sc = score_task(&t, &zero_tokens, &format!("ANSWER: {exp}"), &TrajStats::default());
         assert!(!sc.infra_fail, "an answered trial is capability evidence, not a rerun");
         assert!(sc.passed);
-        // Same for the hard-infra envelope shape.
+        // The hard-infra shape: a scrape off a corpse never overrules it.
         let sc = score_task(&t, &dead(), &format!("ANSWER: {exp}"), &TrajStats::default());
-        assert!(!sc.infra_fail, "a parseable answer outranks the exit-promoted flag too");
-        assert!(sc.passed);
+        assert!(
+            sc.infra_fail,
+            "a dead container stays a rerun whatever was scraped out of its unparseable stdout"
+        );
+        assert!(!sc.passed, "a watchdog kill must never be counted as a pass for the model");
     }
 
     /// (#2685) The other half of the alignment: a QUOTA-dead dispatch that
@@ -2002,21 +2051,32 @@ not json — tolerated
     /// (#2685) The divergence this issue names, pinned against BOTH real
     /// row builders rather than one plus an assumption about the other.
     ///
-    /// The event: a NON-ZERO exit alongside a recovered envelope carrying
-    /// real token counts — the runtime's escalation arm, which prints a
-    /// full success envelope and then returns exit 1. Two benches write the
-    /// identical `ScoreRow` schema into the identical `scores.json`, and a
-    /// reader is invited to compare their rows; before this fix the same
-    /// event was `InfraFail` in `tool_bench` (exit-code-alone) and
-    /// `CapabilityFail`/`Pass` in `review_bench` (envelope-plus-exit), with
-    /// nothing on either row saying which rule had run.
+    /// **Event 1 — a recovered envelope at a non-zero exit.** The runtime's
+    /// escalation arm prints a full success envelope with real token counts
+    /// and then returns exit 1. Two benches write the identical `ScoreRow`
+    /// schema into the identical `scores.json`, and a reader is invited to
+    /// compare their rows; before this fix the same event was `InfraFail` in
+    /// `tool_bench` (exit-code-alone) and `CapabilityFail`/`Pass` in
+    /// `review_bench` (envelope-plus-exit), with nothing on either row
+    /// saying which rule had run. Correct answer: NOT infra, both sides.
     ///
-    /// Both halves below go through the production path — `build_rows` and
+    /// **Event 2 — a dead container.** A hard kill, a truncated envelope,
+    /// nothing parseable on stdout. Correct answer: INFRA, both sides.
+    ///
+    /// (#2685 frontier-QA) The second event is why this is a keystone and
+    /// not decoration. With event 1 alone every mutant that UNDER-classifies
+    /// satisfied the test, because event 1's correct answer is "not infra"
+    /// on both sides — measured, both `is_infra = |_, _| false` (review
+    /// side) and `infra_fail = false` (tool side) left this test at EXIT=0.
+    /// A parity keystone needs a case whose correct answer IS infra or it
+    /// pins only half the parity. The two events together kill both.
+    ///
+    /// Every half goes through the production path — `build_rows` and
     /// `build_score_rows` — not through the shared predicate directly, so a
     /// future bench that stops CALLING the shared rule fails here even
     /// though `scores::is_infra_failure`'s own tests stay green.
     #[test]
-    fn build_rows_and_build_score_rows_agree_on_nonzero_exit_with_a_real_envelope() {
+    fn build_rows_and_build_score_rows_agree_on_a_recovered_envelope_and_on_a_dead_container() {
         use crate::lab::review_bench::{build_score_rows, Case, CaseScore, Label};
         use crate::lab::scores::{ArtifactKey, Outcome, INFRA_CLASSIFIER};
 
@@ -2036,6 +2096,7 @@ not json — tolerated
         // rule turned it into infra and dropped it out of the denominator.
         let tasks = generate_tasks(9, &[2]);
         let task = tasks.iter().find(|t| t.axis == "selection:read").unwrap();
+        let exp = expected_nonce(task);
         let tb_score = score_task(task, &escalated, "ANSWER: DMX-ZZZZ9999", &TrajStats::default());
         let tb_rows = build_rows(&[trial(task, 0, tb_score)], 1, &artifact);
         let tb_case = tb_rows.iter().find(|r| r.axis == task.axis).unwrap();
@@ -2077,6 +2138,70 @@ not json — tolerated
         // whether its outcome is commensurable with its neighbor's.
         assert_eq!(tb_case.infra_classifier.as_deref(), Some(INFRA_CLASSIFIER));
         assert_eq!(rb_case.infra_classifier.as_deref(), Some(INFRA_CLASSIFIER));
+
+        // ── the second event: a DEAD container ──
+        //
+        // The event above is correctly "not infra" on BOTH sides, so on its
+        // own it pins only half the parity: every mutant that UNDER-
+        // classifies (`is_infra = |_, _| false` on the review side,
+        // `infra_fail = false` on the tool side) satisfies it. A keystone
+        // needs a case whose correct answer IS infra, driven through the
+        // same two builders. Measured, frontier-QA on this PR: with only the
+        // event above, both of those mutants left this test at EXIT=0.
+        //
+        // The shape: the host watchdog hard-kills the container, so the
+        // envelope — one `println!` embedding `final_assistant`, routinely
+        // far past `PIPE_BUF` — lands truncated. Nothing parses as JSON, the
+        // exit is non-zero, and `envelope_meta_with_exit` promotes it on
+        // POSITIVE evidence the dispatch died.
+        //
+        // Both benches then scrape a usable-looking signal out of that same
+        // unparseable stdout — `tool_bench`'s `extract_reply` falls back to
+        // the raw line and `extract_answer` accepts a lone nonce anywhere in
+        // it; `review_bench`'s freeform parser marks any non-empty text
+        // `parsed`, so `degenerate` is false. Neither scraped signal may
+        // overrule the positive infra evidence: a watchdog kill must never
+        // flatter the model with a `Pass` inside the pass-rate numerator.
+        let killed =
+            format!(r#"{{"result":"stop","final_assistant":"Found it.\nANSWER: {exp}\n","metri"#);
+        let killed_meta = envelope_meta_with_exit(&killed, 137);
+        assert!(killed_meta.infra_exit, "no envelope + non-zero exit = positive infra evidence");
+        assert_eq!(killed_meta.total_tokens, None, "nothing was measured, so nothing is claimed");
+
+        // tool_bench, through its PRODUCTION reply path — the truncated line
+        // is exactly what `run()` hands `score_task`, not a hand-written
+        // reply that assumes the scrape happens.
+        let killed_reply = extract_reply(&killed);
+        assert!(
+            killed_reply.contains(&exp),
+            "the scrape really does recover the planted nonce — the reachable shape, not a strawman"
+        );
+        let tb_dead = score_task(task, &killed_meta, &killed_reply, &TrajStats::default());
+        let tb_dead_rows = build_rows(&[trial(task, 0, tb_dead)], 1, &artifact);
+        let tb_dead_case = tb_dead_rows.iter().find(|r| r.axis == task.axis).unwrap();
+
+        // review_bench, with its own scraped signal: the freeform review
+        // "parsed", so its eligibility bool claims usable output for the
+        // very same dead container.
+        let rb_dead_scored: Vec<(&Case, CaseScore)> =
+            vec![(&case, CaseScore { degenerate: false, ..Default::default() })];
+        let rb_dead_rows =
+            build_score_rows(&rb_dead_scored, std::slice::from_ref(&killed_meta), &artifact);
+        let rb_dead_case = rb_dead_rows.iter().find(|r| r.axis == "case").unwrap();
+
+        assert_eq!(
+            tb_dead_case.outcome, rb_dead_case.outcome,
+            "a dead container must classify the same in both benches writing this schema"
+        );
+        assert_eq!(
+            tb_dead_case.outcome,
+            Outcome::InfraFail,
+            "a hard-killed container is a rerun, never a capability verdict — and never a Pass"
+        );
+        assert_eq!(tb_dead_case.value, None, "an infra row carries no verdict on the model");
+        assert_eq!(rb_dead_case.value, None);
+        assert_eq!(tb_dead_case.infra_classifier.as_deref(), Some(INFRA_CLASSIFIER));
+        assert_eq!(rb_dead_case.infra_classifier.as_deref(), Some(INFRA_CLASSIFIER));
     }
 
     #[test]

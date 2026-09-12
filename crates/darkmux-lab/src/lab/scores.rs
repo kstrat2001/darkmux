@@ -47,11 +47,22 @@ pub const SCORES_SCHEMA_VERSION: &str = "1.1.0";
 /// bench wrote the row.
 ///
 /// Bump the suffix whenever [`is_infra_failure`]'s SEMANTICS change (not for
-/// a refactor that preserves them). Rows carrying `None` predate #2685, when
-/// each bench re-derived its own predicate against this one schema —
-/// `review-bench` used this rule and `tool-bench` used exit-code-alone, so
-/// their `infra_fail` rows were not commensurable even though they share a
-/// schema. `/1` means: both benches ran the rule below.
+/// a refactor that preserves them). `/1` means: both benches ran the rule
+/// below.
+///
+/// **What an ABSENT value does and does not tell a reader.** `None` means
+/// only "written before #2685" — it does NOT say which of the two divergent
+/// pre-#2685 rules produced the row, because neither bench stamped anything.
+/// A pre-#2685 `review-bench` row was classified by this very rule; a
+/// pre-#2685 `tool-bench` row was classified by exit-code-alone; both carry
+/// `None`. Telling them apart still requires the fallback this field exists
+/// to remove — read `bench`, then know the repo history. A distinct retro
+/// value cannot fix that: the rows are already on disk unstamped, and
+/// rewriting them would be inventing provenance. So the honest reading of
+/// `None` is "provenance unknown, and possibly incommensurable with its
+/// neighbor" — which is strictly better than the pre-#2685 state (where a
+/// reader had no reason to suspect incommensurability at all), and strictly
+/// worse than a stamped row.
 pub const INFRA_CLASSIFIER: &str = "envelope-exit/1";
 
 /// Which score family a row belongs to — the load-bearing split (#1197).
@@ -268,8 +279,9 @@ pub struct ScoreRow {
     /// [`INFRA_CLASSIFIER`]. `scores.json` is a COMPARISON artifact: rows
     /// from different benches sit in one schema and are read as
     /// commensurable, so the classifier has to be on the row rather than
-    /// inferred from `bench`. `None` on rows written before the benches
-    /// converged (they were not commensurable, and nothing said so).
+    /// inferred from `bench`. `None` = written before the benches converged;
+    /// it does NOT distinguish the two pre-#2685 rules from each other (see
+    /// [`INFRA_CLASSIFIER`]'s doc) — only "provenance unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub infra_classifier: Option<String>,
 }
@@ -470,14 +482,46 @@ pub(crate) fn envelope_meta_with_exit(stdout: &str, exit_code: i32) -> EnvelopeM
 /// usable output" signal, so the one predicate serves both benches without
 /// either bench's score type leaking in here: `review_bench` passes
 /// `CaseScore::degenerate` (the review did not parse) and `tool_bench`
-/// passes "the reply carried no `ANSWER:`/`BLOCKED:` verdict". Its role is
-/// unchanged from the `&CaseScore` form: it gates ELIGIBILITY for the infra
-/// reading. A trial that DID produce parseable output is positive
-/// capability evidence and is never reclassified, whatever the envelope or
-/// the exit code say.
+/// passes "the reply carried no `ANSWER:`/`BLOCKED:` verdict".
+///
+/// (#2685 frontier-QA) That eligibility gate applies to the ZERO-TOKEN arm
+/// ONLY, and the two arms are asymmetric on purpose because their evidence
+/// comes from different places:
+///
+/// - **`Some(0)` tokens** means an envelope PARSED and reported literal
+///   zeros. The reply text the caller judged came out of that same
+///   well-formed envelope's own `final_assistant` field, so a parseable
+///   verdict in it is trustworthy positive evidence the model ran, and it
+///   rightly outranks a token count that may be a metrics quirk. Eligibility
+///   gates this arm.
+/// - **`infra_exit`** means NO envelope was recovered at all AND the
+///   container exited non-zero — [`envelope_meta_with_exit`]'s positive
+///   evidence that the dispatch DIED. There is no well-formed field to have
+///   read a verdict out of: whatever the caller judged was SCRAPED from the
+///   same unparseable stdout (`tool_bench`'s `extract_reply` falls back to
+///   the raw line and its `extract_answer` accepts a lone nonce anywhere in
+///   it; `review_bench`'s freeform parser marks any non-empty text
+///   `parsed`). A scrape off a corpse cannot overrule the evidence that it
+///   IS a corpse, so this arm is NOT gated.
+///
+/// Gating both arms is what let a hard-killed container — a truncated
+/// envelope, a lone nonce recovered out of the wreckage — score `Pass` at
+/// `value: 1.0` inside `pass_rate`'s numerator AND denominator, i.e. a
+/// watchdog kill FLATTERING the model. That is the worst direction this
+/// codebase's #1113/#1210 lineage exists to prevent, and it is worse than
+/// the exit-code-alone rule `tool_bench` carried before #2685, which at
+/// least classified the kill as infra. The conservative reading is the
+/// correct one here: an infra row is a RERUN, so a dead dispatch is never
+/// scored for or against the model.
 pub(crate) fn is_infra_failure(produced_no_usable_output: bool, m: Option<&EnvelopeMeta>) -> bool {
-    produced_no_usable_output
-        && (matches!(m.and_then(|m| m.total_tokens), Some(0)) || m.is_some_and(|m| m.infra_exit))
+    let Some(m) = m else { return false };
+    // Positive evidence the dispatch died. Ungated by design — see above.
+    if m.infra_exit {
+        return true;
+    }
+    // The recovered-envelope-with-literal-zeros shape (#1210): gated on the
+    // caller's own "this trial produced no usable output" signal.
+    produced_no_usable_output && matches!(m.total_tokens, Some(0))
 }
 
 #[cfg(test)]
@@ -751,6 +795,12 @@ mod tests {
     /// envelope always emits numeric token fields on its own success/error
     /// paths (see the fn doc), so `None` means "no parseable envelope" —
     /// kept capability-side deliberately, never guessed into infra.
+    ///
+    /// (#2685 frontier-QA) Also pins the ASYMMETRY between the two arms:
+    /// the eligibility bool gates the zero-token arm and NOT the
+    /// `infra_exit` arm. Red-proves against re-collapsing the predicate to
+    /// one conjunct over both, which let a scrape off a dead container's
+    /// unparseable stdout overrule positive evidence the container died.
     #[test]
     fn is_infra_failure_requires_degenerate_and_positive_zero_token_evidence() {
         // (#2685) The caller's own "produced no usable output" signal,
@@ -773,7 +823,15 @@ mod tests {
         // like positive-zero-token evidence, WITHOUT the token count itself
         // ever being fabricated as `Some(0)`.
         assert!(is_infra_failure(degen, Some(&exit_promoted)), "infra_exit flag alone = infra");
-        assert!(!is_infra_failure(ran_fine, Some(&exit_promoted)), "non-degenerate never reclassifies");
+        // (#2685 frontier-QA) …and the eligibility bool does NOT gate this
+        // arm. `infra_exit` means no envelope parsed at all, so the caller's
+        // "usable output" signal was scraped from that same unparseable
+        // stdout — a scrape off a corpse cannot outrank the evidence that it
+        // is a corpse. Gating this arm scored a watchdog kill as a `Pass`.
+        assert!(
+            is_infra_failure(ran_fine, Some(&exit_promoted)),
+            "a dead container stays infra even when the caller scraped a verdict out of its wreckage"
+        );
     }
 
 
