@@ -3325,6 +3325,34 @@
                 "expected XADD'd record to surface as SSE event; got: {got:?}"
             );
         }
+
+        // ─── #1466 gate MUST FIX 4: `mission_graph_json_handler` proxying
+        // a live peer's graph end-to-end — RELOCATED, not deleted ───────
+        //
+        // This in-process test used to live here (`mission_graph_json_
+        // handler_proxies_a_live_peers_graph`), gated on the SAME
+        // `redis_server_available()` this file's other Redis-needing
+        // tests use. That guard is exactly the problem: the only workflow
+        // job that runs this crate's tests is `build-test-lint` (macOS,
+        // `cargo test --workspace`), and that job installs no redis-server
+        // — so on every CI run since this test landed, it reported `ok`
+        // without ever executing a single assertion (the same defect
+        // class `ci.yml`'s own header memorializes for the `fleet-e2e`
+        // job, #1662, and the same SHAPE as #975 — a broken path riding
+        // four releases of green CI because nothing ever ran the real
+        // thing).
+        //
+        // Moved to `tests/e2e_mission_graph_peer_proxy.rs` — a binary
+        // under `tests/e2e_*.rs`, which the `fleet-e2e` job (ubuntu-latest,
+        // apt-installed redis, `DARKMUX_E2E_REQUIRED=1`) runs with the
+        // skip converted into a HARD FAILURE. `peer_graph`'s own unit
+        // tests (`crates/darkmux-serve/src/peer_graph.rs`) still
+        // exhaustively cover the decision logic with no Redis needed; the
+        // e2e binary is the ONE proof that the real, non-injected
+        // production wiring — two real daemon PROCESSES, real Redis, a
+        // real roster file, a real loopback HTTP call between them —
+        // actually composes end to end, at a gate that cannot silently
+        // skip.
     }
 
     // ─── #1387: worktree-summary endpoint tests (shared session-resolution

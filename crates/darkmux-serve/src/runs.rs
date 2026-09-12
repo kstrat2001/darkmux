@@ -499,6 +499,46 @@ pub fn peer_mission_runs(
     peer_runs_from_index(&flow_missions, known_mission_ids, &flow_index, now_ms).0
 }
 
+/// (#1466) The owning machine for ONE mission id, or `None` when no flow
+/// record anywhere (fleet stream or local day-files) names one. The same
+/// attribution [`build_flow_mission_index`] computes for the whole
+/// catalog, narrowed to a single id — for `peer_graph`'s "who do I ask
+/// for this mission's graph" lookup, which only ever wants one answer and
+/// has no reason to duplicate the fold that already exists here (same
+/// "one implementation, multiple narrow entry points" precedent
+/// [`peer_mission_runs`] itself follows, see that function's own doc).
+///
+/// Deliberately answers for ANY mission id, including a LOCAL one (no
+/// `known_mission_ids` filter) — `peer_graph::try_peer_graph` only calls
+/// this after its own local disk lookup already came back empty.
+///
+/// **This does NOT mean a non-`None` result is never this machine's own**
+/// (an earlier revision of this doc claimed exactly that, and it was
+/// false — #1466 gate MUST FIX 1). A flow record can name THIS machine as
+/// `machine_id` for a mission that is no longer on THIS machine's disk —
+/// cleared, pruned, or a `DARKMUX_HOME` mismatch between the process that
+/// ran it and the daemon reading it now, i.e. exactly the state this
+/// attribution-based lookup exists to recover from. darkmux's own docs
+/// (`docs/guide/always-on-hub.html`, `skills/darkmux-add-machine/SKILL.md`)
+/// tell every operator to register this machine in its own roster at
+/// `127.0.0.1:8765`, and a machine always beats its own presence — so
+/// without a separate guard, that self-attributed case would classify as
+/// a live, dialable peer and the daemon would fetch its own route,
+/// recursing. `peer_graph::try_peer_graph` is the caller that owns
+/// guarding against this (comparing the returned machine against
+/// `darkmux_flow::resolve_machine_id()` before ever treating it as a
+/// peer) — this function stays a pure attribution lookup and makes no
+/// promise about who the answer names.
+pub(crate) fn mission_owner_machine(
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+    mission_id: &str,
+) -> Option<String> {
+    build_flow_mission_index(flows_dir, fleet)
+        .get(mission_id)
+        .and_then(|agg| agg.machine.clone())
+}
+
 /// Per-`mission_id` rollup over the merged record stream (#1705) — the
 /// substrate for missions this daemon can SEE but does not OWN.
 ///
