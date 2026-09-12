@@ -316,6 +316,149 @@ describe("tokensOffMeter", () => {
     expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
   });
 
+  // (#2659) The issue's own reproduction shape: a single session id closes
+  // with TWO real `dispatch.complete` bookends (a deterministic
+  // `mission_run` session id reused across a re-launch, per #1856 — same
+  // population, different code path: #1856 fixed the TURN sort within a
+  // session, this fixes the RUN count across sessions). Before this fix
+  // `runs` was `sess.size` — one per distinct KEY — so this session
+  // undercounted to 1 no matter how many real dispatches closed under it.
+  it("(#2659) a session id spanning two dispatches counts as TWO runs, not one — sess.size undercounted this", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "spanning2", action: "dispatch.start", handle: "coder" }),
+      tokenRec("spanning2", 1, 100, 10, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "spanning2", action: "dispatch.complete", payload: { total_tokens: 110 } }),
+
+      // The re-launch: same session id, second dispatch, own bookend.
+      rec({ session_id: "spanning2", action: "dispatch.start", handle: "coder" }),
+      tokenRec("spanning2", 1, 200, 20, "2026-08-08T00:05:00Z"),
+      rec({ session_id: "spanning2", action: "dispatch.complete", payload: { total_tokens: 220 } }),
+    ];
+    const t = tokensOffMeter(data);
+    // Two real completions under one session id — this is what the fix is
+    // for. The pre-fix behavior was `t.runs === 1` here.
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
+    // Total tokens are unaffected — this bug was never a token-counting
+    // bug, only a run-COUNT bug.
+    expect(t.total).toBe(330);
+  });
+
+  // (#2659, inverted) The over-counting failure mode named in the issue: a
+  // run that genuinely IS one dispatch (one session id, ONE
+  // `dispatch.complete` bookend) must still count as one, even though the
+  // fix now looks past `sess.size` to bookend count. A fix that counted
+  // every telemetry turn or every start+complete pair as a separate run
+  // would fail this the same way undercounting failed the test above.
+  it("(#2659, inverted) an ordinary single-dispatch session still counts as ONE run under the bookend-count fix", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "ordinary2", action: "dispatch.start", handle: "coder" }),
+      tokenRec("ordinary2", 1, 100, 10),
+      tokenRec("ordinary2", 2, 50, 5),
+      rec({ session_id: "ordinary2", action: "dispatch.complete", payload: { total_tokens: 165 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(1);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
+  });
+
+  // (#2659) The classification MUST move with the run count, per the
+  // issue's own caution: a session whose two bookends disagree (one local,
+  // one cloud) must produce ONE cloudRun and no unknownRun, not two
+  // cloudRuns (over-crediting cloud) and not a session-wide cloud
+  // classification via the old `epBySid.has(k)` aggregate check (which
+  // would have painted the local bookend cloud too).
+  it("(#2659) a spanning session with mixed local+cloud bookends classifies each bookend on its OWN endpoint", () => {
+    const data: FlowRecord[] = [
+      // First dispatch: local (no endpoint).
+      rec({ session_id: "mixed", action: "dispatch.start", handle: "coder" }),
+      tokenRec("mixed", 1, 100, 10, "2026-08-08T00:00:00Z"),
+      rec({ session_id: "mixed", action: "dispatch.complete", payload: { total_tokens: 110 } }),
+
+      // Second dispatch under the SAME session id: cloud (named endpoint).
+      rec({ session_id: "mixed", action: "dispatch.start", handle: "coder", payload: { endpoint: "gemini" } }),
+      tokenRec("mixed", 1, 200, 20, "2026-08-08T00:05:00Z"),
+      rec({ session_id: "mixed", action: "dispatch.complete", payload: { total_tokens: 220, endpoint: "gemini" } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(2);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
+    // Implicit local run count: 2 - 1 - 0 = 1, matching the ONE genuinely
+    // local bookend — not 0 (which the old session-wide `epBySid.has(k)`
+    // aggregate check would have produced, since the session DOES have an
+    // endpoint-bearing bookend somewhere).
+    expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(1);
+    // (post-review, pinning a KNOWN gap) The RUN split is per-bookend-exact
+    // (1 local + 1 cloud, asserted above), but the aggregate TOKEN split
+    // is NOT — `cloud`/`local` still classify every telemetry turn in this
+    // session via the session-wide `epBySid`, which is true for "mixed"
+    // (it DOES have a cloud bookend), so ALL 330 tokens land in `cloud`
+    // and NONE in `local` — even though 110 of them were genuinely local.
+    // This is the narrower gap named in `savings.ts`'s per-bookend loop
+    // comment (a #2665 follow-up would need per-bookend TURN attribution
+    // to close it), pinned here so it's visible rather than assumed away.
+    expect(t.cloud).toBe(330);
+    expect(t.local).toBe(0);
+  });
+
+  // (post-review MUST-FIX regression test) A session with exactly ONE
+  // bookend must classify via the ORIGINAL `epBySid.has(k)` aggregate —
+  // never via that bookend's own `endpoint` field in isolation. `epBySid`
+  // registers from a `dispatch.start` OR a `dispatch.complete` naming an
+  // endpoint; here the START names one but the single COMPLETE doesn't
+  // (a producer edge case, not asserted to be common — see `savings.ts`'s
+  // own `(CONSIDER 3, #2635)` note on completions that don't re-state their
+  // start's endpoint). A `bookends[0].endpoint`-only check would flip this
+  // session from cloud to local — a real regression the #2659 fix must not
+  // introduce for the single-bookend case, which is nearly every session.
+  it("(post-review) a single-bookend session with an endpoint on its START (not its lone COMPLETE) still classifies cloud via epBySid, not the bookend alone", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "start-only-ep", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure-foundry" } }),
+      tokenRec("start-only-ep", 1, 100, 10),
+      rec({ session_id: "start-only-ep", action: "dispatch.complete", payload: { total_tokens: 110 } }),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(1);
+    expect(t.cloudRuns).toBe(1);
+    expect(t.unknownRuns).toBe(0);
+    // The token-level split already used `epBySid` (unchanged by this fix)
+    // and was never at risk — pinned alongside the run-level assertions so
+    // the two can't drift apart silently.
+    expect(t.cloud).toBe(110);
+    expect(t.local).toBe(0);
+  });
+
+  // (post-review, MINOR — a second population the fix widens) `dispatch.
+  // single_shot`'s session id is TASK-scoped (`session_id::task`), so
+  // sibling seats fanned out within one task can share it. The `(#2635)`
+  // tests above already cover this shape for sessions with NO telemetry
+  // family (handled by `directRuns`, unaffected by this fix). This pins
+  // the OTHER case: sibling seats that ALSO carry a `telemetry.tokens`
+  // family (so they're `sess` members) now correctly count as separate
+  // runs too, via the same `dcTok`-bookend mechanism — before this fix
+  // they collapsed to 1 (`sess.size`), same undercount shape as the
+  // mission-run spanning case, just from a different producer.
+  it("(post-review) three sibling single-shot seats sharing one task-scoped session id, each WITH telemetry, count as THREE runs", () => {
+    const data: FlowRecord[] = [
+      rec({ session_id: "task:siblings", action: "dispatch.complete", payload: { total_tokens: 100 } }),
+      tokenRec("task:siblings", 1, 90, 10, "2026-08-08T00:00:00Z"),
+
+      rec({ session_id: "task:siblings", action: "dispatch.complete", payload: { total_tokens: 200 } }),
+      tokenRec("task:siblings", 1, 180, 20, "2026-08-08T00:01:00Z"),
+
+      rec({ session_id: "task:siblings", action: "dispatch.complete", payload: { total_tokens: 300 } }),
+      tokenRec("task:siblings", 1, 270, 30, "2026-08-08T00:02:00Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.runs).toBe(3);
+    expect(t.cloudRuns).toBe(0);
+    expect(t.unknownRuns).toBe(0);
+    expect(t.total).toBe(600);
+  });
+
   it("a remote_tokens-only completion (the review path's own spelling) counts as cloud AND unclassified", () => {
     const data: FlowRecord[] = [
       rec({ session_id: "s7", action: "dispatch.start", handle: "pr-reviewer", payload: { endpoint: "gemini" } }),
