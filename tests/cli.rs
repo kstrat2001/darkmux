@@ -6,6 +6,7 @@
 //! `DARKMUX_LMS_BIN` is unset (i.e., not in CI without LMStudio).
 
 use assert_cmd::Command;
+use darkmux_types::test_isolation::neutralize_state_vars;
 use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
@@ -45,9 +46,10 @@ use tempfile::TempDir;
 // side effect of a feature-resolution rule nobody stated as a guarantee,
 // and it does nothing for the path tiers above. Isolate at the spawn.
 //
-// `every_darkmux_spawn_in_this_file_goes_through_the_isolating_helpers`
+// `every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper`
 // (below) is the structural half: it fails if a raw spawn is ever
-// reintroduced anywhere outside this block.
+// reintroduced anywhere outside a marker-fenced block — in this file or
+// in any other integration target under `tests/` (#2710).
 
 /// The darkmux binary under test. `CARGO_BIN_EXE_darkmux` is cargo's own
 /// compile-time path to the bin target built for this integration test:
@@ -144,42 +146,35 @@ fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
 /// hash-chained records cannot be removed without breaking the chain.
 ///
 /// They are REMOVED rather than pinned, so each falls back to a default
-/// derived from the `DARKMUX_HOME` this helper already pins — which keeps
+/// derived from the `DARKMUX_HOME` this helper pins below — which keeps
 /// `darkmux_cmd_in_project`'s single `.env("DARKMUX_HOME", …)` override
 /// sufficient to move the whole set at once. A later `.env` still wins
 /// over an `env_remove`, so the handful of tests that exercise a specific
 /// override are untouched.
+///
+/// (#2710) `neutralize_state_vars` no longer lives in this file. It was
+/// private to this test BINARY, which exports nothing, so the four other
+/// integration targets that spawn darkmux could not call it and did not
+/// copy it — they pinned `HOME`, removed `DARKMUX_HOME`, and inherited the
+/// other twelve. It now sits beside `IsolatedState` in
+/// `darkmux_types::test_isolation`, one call away from every target.
+///
+/// Two consequences here. The helper clears `DARKMUX_HOME` too (no
+/// exception, so a caller whose point is default resolution gets a removal
+/// rather than the ambient shell's value), and therefore the ORDER
+/// inverted: neutralize FIRST, pin SECOND. `Command` applies `.env` and
+/// `.env_remove` in call order, so the two pins below would be erased if
+/// they came first. `the_spawn_helper_neutralizes_every_variable_the_
+/// isolation_guard_knows_about` reads the built `Command` back and holds
+/// both halves — the removals AND that `DARKMUX_HOME` survives as a
+/// tempdir path — so getting the order wrong is a RED test, not a silent
+/// fallback to defaults under an unpinned `HOME`.
 fn darkmux_std_cmd() -> std::process::Command {
     let (home, darkmux_home) = isolated_roots();
     let mut cmd = std::process::Command::new(darkmux_bin_path());
-    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
     neutralize_state_vars(&mut cmd);
+    cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
     cmd
-}
-
-/// Clear every darkmux state variable EXCEPT `DARKMUX_HOME`, so the child
-/// derives all of them from whichever root the caller pinned.
-///
-/// Taken from `test_isolation`'s two lists rather than written out, so a
-/// destination added there later is covered here the moment it lands. A
-/// later `.env` still wins over an `env_remove`, so a test that genuinely
-/// exercises one override sets it after calling this and is unaffected.
-///
-/// Applied to the `sh` spawns too (`run_wait_command`), not just the ones
-/// that name the binary: that command's script calls `$DARKMUX_BIN`, so
-/// the child is a darkmux process either way, and an inherited
-/// `DARKMUX_MODS_DIR` there made the seeding side and the reading side of
-/// the same test resolve to different stores.
-fn neutralize_state_vars(cmd: &mut std::process::Command) {
-    use darkmux_types::test_isolation::{CLEARED_STATE_VARS, PINNED_STATE_VARS};
-    for (var, _) in PINNED_STATE_VARS {
-        if *var != "DARKMUX_HOME" {
-            cmd.env_remove(var);
-        }
-    }
-    for var in CLEARED_STATE_VARS {
-        cmd.env_remove(var);
-    }
 }
 
 /// The helper above, asserted — cheaply, without spawning anything.
@@ -365,20 +360,64 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     );
 }
 
-/// (#2184) The structural half of the fix: a source-scanning conformance
-/// test, in the shape this repo already uses elsewhere.
+/// Every `.rs` file under `tests/`, recursively. Sorted, so a failure
+/// message is stable run to run.
+fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
+/// (#2184/#2710) The structural half of the fix: a source-scanning
+/// conformance test, in the shape this repo already uses elsewhere.
 ///
-/// Before this pass, `tests/cli.rs` named the binary at 135 sites and set
+/// Before #2184, `tests/cli.rs` named the binary at 135 sites and set
 /// `DARKMUX_HOME` at 55 of them. Nothing made the other 80 visible, and
-/// nothing stops site 136 from being written the same way tomorrow. So
-/// the invariant is asserted against this file's own source: the binary
-/// may be named ONLY inside the helper block above.
+/// nothing stopped site 136 from being written the same way tomorrow. So
+/// the invariant is asserted against the source: the binary may be named
+/// ONLY inside a marker-fenced helper block, and that block must call
+/// `neutralize_state_vars`.
 ///
-/// The block itself is the trusted region, deliberately. It is ~90 lines
-/// long, fenced by two markers, and it is where a reviewer looking for
-/// "how do these tests isolate themselves" already has to look.
+/// (#2710) The scan now WALKS `tests/` instead of reading one hardcoded
+/// path. The old version pinned `concat!(env!("CARGO_MANIFEST_DIR"),
+/// "/tests/cli.rs")`, so it was blind to all ten other integration targets
+/// **by construction** — and that blindness is the whole reason #2710
+/// existed. Four of those targets were spawning the real binary with
+/// nothing neutralized; two of them wrote `fleet.json` into a sentinel
+/// root, and one wrote a BLAKE3-chained `mission start` into the audit
+/// chain. A guard that can only see the file it was written in does not
+/// prevent a sixth copy; it guarantees the sixth copy goes somewhere it
+/// cannot look.
+///
+/// Two assertions, because "fenced" and "isolated" are different claims:
+///
+/// 1. Every spawn token outside a fenced block is an offender. A new test
+///    file that spawns darkmux with no markers at all fails here, named by
+///    file and line.
+/// 2. Every fenced block that CONTAINS a spawn token must also call
+///    `neutralize_state_vars`. Without this, fencing a raw spawn would
+///    silence the guard while changing nothing — the markers would become
+///    a way to opt OUT of isolation rather than into it.
+///
+/// The blocks are the trusted region, deliberately: each is short, fenced
+/// by two markers, and is where a reviewer looking for "how does this
+/// target isolate itself" already has to look.
 #[test]
-fn every_darkmux_spawn_in_this_file_goes_through_the_isolating_helpers() {
+fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
     // Split with `concat!` on purpose: written as one literal, these two
     // lines would themselves contain the markers, and the scan below would
     // find the END marker HERE instead of at the real end of the block,
@@ -387,54 +426,147 @@ fn every_darkmux_spawn_in_this_file_goes_through_the_isolating_helpers() {
     const END: &str = concat!("DARKMUX-SPAWN-", "HELPERS: END");
     // The tokens that can only mean "this line resolves or spawns the
     // darkmux binary": `assert_cmd`'s `Command::cargo_bin` /
-    // `assert_cmd::cargo::cargo_bin`, and cargo's own
-    // `CARGO_BIN_EXE_darkmux` env.
-    const SPAWN_TOKENS: [&str; 2] = ["cargo_bin", "CARGO_BIN_EXE_darkmux"];
+    // `assert_cmd::cargo::cargo_bin`, cargo's own `CARGO_BIN_EXE_darkmux`
+    // env, and — for the e2e harness, which deliberately runs a plain
+    // `cargo build --release` artifact rather than a `cargo test` one —
+    // `darkmux_release_binary`, the resolver that names
+    // `target/release/darkmux`.
+    //
+    // The fourth is narrower on purpose. `run_wait_command` spawns `sh`,
+    // not darkmux — but hands the child the binary in `DARKMUX_BIN` and
+    // the script calls it, so the grandchild is a darkmux process that
+    // inherits whatever the `sh` got. Nothing on those lines named the
+    // binary, so the guard could not see them, and that blind spot
+    // produced a real red while #2710 was being written: reordering
+    // `neutralize_state_vars` to run first (it clears `DARKMUX_HOME` now)
+    // silently erased the caller's pin at those two sites, and
+    // `the_wait_command_returns_at_once…` burned its full 60-second bound.
+    // Matching the `.env("DARKMUX_BIN"` form rather than the bare name
+    // keeps the prose and assertion lists that merely MENTION the variable
+    // from reading as spawn sites.
+    const SPAWN_TOKENS: [&str; 4] = [
+        "cargo_bin",
+        "CARGO_BIN_EXE_darkmux",
+        "darkmux_release_binary",
+        ".env(\"DARKMUX_BIN\"",
+    ];
+    const NEUTRALIZER: &str = "neutralize_state_vars";
 
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cli.rs");
-    let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
-    let lines: Vec<&str> = src.lines().collect();
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let files = rust_sources_under_tests();
 
-    let begin = lines
-        .iter()
-        .position(|l| l.contains(BEGIN))
-        .unwrap_or_else(|| panic!("the `{BEGIN}` marker is gone from tests/cli.rs; this guard \
-             cannot tell helper code from a raw spawn without it"));
-    let end = lines
-        .iter()
-        .position(|l| l.contains(END))
-        .unwrap_or_else(|| panic!("the `{END}` marker is gone from tests/cli.rs; this guard \
-             cannot tell helper code from a raw spawn without it"));
+    // Anti-vacuity: a walk that silently returned nothing (a renamed
+    // directory, a permissions change) would make every assertion below
+    // pass while checking no source at all.
     assert!(
-        begin < end,
-        "the spawn-helper markers are out of order (BEGIN at line {}, END at line {})",
-        begin + 1,
-        end + 1
+        files.len() >= 10,
+        "the tests/ walk found only {} .rs file(s); this guard is scanning an empty or wrong \
+         tree and proves nothing",
+        files.len()
     );
+    for expected in ["tests/cli.rs", "tests/e2e/harness.rs"] {
+        assert!(
+            files.iter().any(|p| p.ends_with(expected)),
+            "the tests/ walk did not reach {expected}, which is one of the files this guard \
+             exists to cover"
+        );
+    }
 
-    let offenders: Vec<String> = lines
-        .iter()
-        .enumerate()
-        // Inside the helper block is the one place the binary may be named.
-        .filter(|(i, _)| *i < begin || *i > end)
-        // A whole-line comment cannot spawn anything (this guard's own
-        // prose above says `cargo_bin` several times).
-        .filter(|(_, l)| !l.trim_start().starts_with("//"))
-        .filter(|(_, l)| SPAWN_TOKENS.iter().any(|t| l.contains(t)))
-        .map(|(i, l)| format!("  tests/cli.rs:{}: {}", i + 1, l.trim()))
-        .collect();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut unisolated_blocks: Vec<String> = Vec::new();
+    // Anti-vacuity again, one level down: at least one fenced block must
+    // actually match a spawn token, or the token list has drifted away
+    // from how this repo names the binary and the scan matches nothing.
+    let mut fenced_spawn_blocks = 0usize;
+
+    for path in &files {
+        let rel = path.strip_prefix(manifest).unwrap_or(path).display().to_string();
+        let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Pair the markers up. Multiple blocks per file are allowed: the
+        // e2e harness resolves its binary in one place and spawns from
+        // two, and forcing those into one contiguous region would mean
+        // moving unrelated code to satisfy a guard.
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut open: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains(BEGIN) {
+                assert!(
+                    open.is_none(),
+                    "{rel}:{}: a second `{BEGIN}` marker opened while one was still open at \
+                     line {}; nested blocks would make the trusted region ambiguous",
+                    i + 1,
+                    open.unwrap_or(0) + 1
+                );
+                open = Some(i);
+            } else if line.contains(END) {
+                let begin = open.take().unwrap_or_else(|| {
+                    panic!("{rel}:{}: `{END}` with no matching `{BEGIN}` above it", i + 1)
+                });
+                blocks.push((begin, i));
+            }
+        }
+        assert!(
+            open.is_none(),
+            "{rel}:{}: `{BEGIN}` is never closed by `{END}`; an unterminated block would \
+             swallow the rest of the file into the trusted region",
+            open.unwrap_or(0) + 1
+        );
+
+        let is_code = |l: &str| !l.trim_start().starts_with("//");
+        let has_spawn = |l: &&str| is_code(l) && SPAWN_TOKENS.iter().any(|t| l.contains(t));
+
+        for (begin, end) in &blocks {
+            let body = &lines[*begin..=*end];
+            if !body.iter().any(has_spawn) {
+                continue;
+            }
+            fenced_spawn_blocks += 1;
+            if !body.iter().any(|l| is_code(l) && l.contains(NEUTRALIZER)) {
+                unisolated_blocks.push(format!("  {rel}:{}", begin + 1));
+            }
+        }
+
+        for (i, line) in lines.iter().enumerate() {
+            if !has_spawn(line) {
+                continue;
+            }
+            if blocks.iter().any(|(b, e)| i >= *b && i <= *e) {
+                continue;
+            }
+            offenders.push(format!("  {rel}:{}: {}", i + 1, line.trim()));
+        }
+    }
+
+    assert!(
+        fenced_spawn_blocks >= 2,
+        "only {fenced_spawn_blocks} fenced block(s) under tests/ contain a spawn token. This \
+         guard's token list has drifted away from how the binary is actually named, so its \
+         scan is matching nothing and its green is meaningless"
+    );
 
     assert!(
         offenders.is_empty(),
-        "(#2184) {} spawn site(s) in tests/cli.rs name the darkmux binary directly instead of \
-         going through `darkmux_cmd()` / `darkmux_std_cmd()`. A raw spawn inherits the \
-         developer's environment, so with no `DARKMUX_HOME` the child resolves the operator's \
-         REAL `~/.darkmux` and reads and writes their actual roster, missions and notebook \
-         (and, in a non-`test-support` build, POSTs their real hook rules). Route it through \
-         the helper; override `DARKMUX_HOME` after the call if this test needs a specific \
-         root:\n{}",
+        "(#2184/#2710) {} spawn site(s) under tests/ name the darkmux binary outside a \
+         `{BEGIN}` / `{END}` block. A raw spawn inherits the developer's environment, so the \
+         child resolves the operator's REAL `~/.darkmux` — reading and writing their actual \
+         roster, missions and notebook, and, with `DARKMUX_AUDIT_DIR` exported, appending \
+         records to a hash chain they cannot be removed from. Put the spawn inside a fenced \
+         helper that calls `{NEUTRALIZER}` first, then pin whatever roots this target \
+         needs:\n{}",
         offenders.len(),
         offenders.join("\n")
+    );
+
+    assert!(
+        unisolated_blocks.is_empty(),
+        "(#2710) {} fenced spawn-helper block(s) never call `{NEUTRALIZER}`. Fencing a raw \
+         spawn silences the offender check above while changing nothing about what the child \
+         inherits — the markers must mean `isolation lives here`, not `exempt from the \
+         guard`:\n{}",
+        unisolated_blocks.len(),
+        unisolated_blocks.join("\n")
     );
 }
 
@@ -9114,6 +9246,13 @@ fn record_mod_for(home: &std::path::Path, workdir: &std::path::Path, finding_key
     );
 }
 
+// ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
+//
+// (#2710) The `sh` spawns are fenced too. The child is a shell, but the
+// script it runs calls `$DARKMUX_BIN`, so the grandchild is a darkmux
+// process inheriting everything the shell inherited — and until this
+// fence the structural guard had no way to see either site.
+
 /// Run the shipped wait command with a real store behind it.
 fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Output {
     // (#2184) The child here is `sh`, not darkmux — but the shell script it
@@ -9124,12 +9263,6 @@ fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Outp
     // the same one. `HOME` is a throwaway so the accessors that resolve
     // through `dirs::home_dir()` instead (see `darkmux_std_cmd`'s doc) can't
     // reach the operator either.
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .env("HOME", isolated_roots().0)
-        .env("DARKMUX_HOME", home)
-        .env("DARKMUX_BIN", darkmux_bin_path());
     // (#2704 fix-pass) Same neutralization as `darkmux_std_cmd`. Measured
     // before this line: with `DARKMUX_MODS_DIR` exported, the seeding side
     // (`record_mod_for`, which goes through `darkmux_cmd()`) wrote to
@@ -9137,9 +9270,25 @@ fn run_wait_command(home: &std::path::Path, command: &str) -> std::process::Outp
     // somewhere else, so `the_wait_command_returns_at_once…` polled the
     // full 60-second bound and failed. They agreed before only because
     // BOTH inherited — agreement by coincidence, not isolation.
+    //
+    // (#2710) FIRST, not last. `neutralize_state_vars` now clears
+    // `DARKMUX_HOME` along with the rest, so the caller's pin below has to
+    // come after it. Measured while making that change: with the call left
+    // where it used to sit, the pin was erased, this child read a different
+    // mod store than `record_mod_for` wrote, and
+    // `the_wait_command_returns_at_once…` burned its full 60-second bound
+    // again — the identical symptom, from the opposite cause.
+    let mut cmd = std::process::Command::new("sh");
     neutralize_state_vars(&mut cmd);
+    cmd.arg("-c")
+        .arg(command)
+        .env("HOME", isolated_roots().0)
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_BIN", darkmux_bin_path());
     cmd.output().expect("the wait command runs")
 }
+
+// ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
 
 /// (#2310 P4e) The SHAPE of the change: no local seat is staffed for mod
 /// creation any more. Red-proved by restoring `dispatch.internal` as the
@@ -9290,6 +9439,8 @@ fn the_wait_command_completes_with_found_false_when_no_mod_appears_within_the_bo
     assert!(stderr.contains("3s"), "and the bound it waited: {stderr}");
 }
 
+// ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
+
 /// Run the shipped wait command with `DARKMUX_BIN` overridden — for tests
 /// that need the `mod list` call itself to fail, rather than the real
 /// binary under test.
@@ -9298,15 +9449,18 @@ fn run_wait_command_with_bin(
     command: &str,
     darkmux_bin: &str,
 ) -> std::process::Output {
+    // (#2710) Neutralize FIRST, pin SECOND — see `run_wait_command`.
     let mut cmd = std::process::Command::new("sh");
+    neutralize_state_vars(&mut cmd);
     cmd.arg("-c")
         .arg(command)
         .env("HOME", isolated_roots().0)
         .env("DARKMUX_HOME", home)
         .env("DARKMUX_BIN", darkmux_bin);
-    neutralize_state_vars(&mut cmd);
     cmd.output().expect("the wait command runs")
 }
+
+// ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
 
 /// (#2552) `mod list` never runs at all — the binary the step calls back
 /// into does not exist (a worktree build not yet installed, a `PATH` a
