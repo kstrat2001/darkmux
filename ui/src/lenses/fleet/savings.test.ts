@@ -608,15 +608,27 @@ describe("tokensOffMeter", () => {
   // `epBySid` and showed LOCAL TOKENS 0 / CLOUD TOKENS 2,000 for the very
   // same session.
   //
-  // (fix-pass correction) The incoherence #2690 named was the DISPATCH line
-  // reading "2 local" — a claim about the operator's hardware that the data
-  // did not support. That is fixed and asserted below. The tokens under a
-  // key with a called hosted endpoint read CLOUD, for the reason given on
-  // K1 above; the screen is coherent because it no longer claims two LOCAL
-  // dispatches produced zero local tokens — it reports two dispatches whose
-  // own terminals were local, sharing a key whose spend cannot be separated
-  // from a hosted seat's. Splitting that is #2665.
-  it("(#2690, K2) the dispatches line no longer claims local work the data cannot support", () => {
+  // (fix-pass, CORRECTED twice) An earlier revision of this comment claimed
+  // "the screen is coherent because it no longer claims two LOCAL dispatches
+  // produced zero local tokens." Read the five assertions twenty lines
+  // below: `runs=2`, `cloudRuns=0`, `unknownRuns=0`, `local=0`, and a
+  // derived `localRuns=2`. That renders "2 local dispatches. The hybrid loop
+  // is humming, keep it up." beside LOCAL 0 / CLOUD 2,000 — which is
+  // VERBATIM the contradiction #2690 opens with, not its repair. The comment
+  // asserted the opposite of the code directly beneath it.
+  //
+  // That is the same failure class as round 1's MUST FIX 4, in a different
+  // comment, and it is how this class propagated across four PRs: the next
+  // author reasons from the prose, not from the assertions. So the rendered
+  // sentence is now PINNED as an assertion rather than described, and the
+  // test is named for what it actually demonstrates.
+  //
+  // What this shape genuinely shows: K2 is NOT fixed by this PR. Sibling
+  // seats within one task share the session id AND the mission id by
+  // construction, so the composite `runKey` cannot separate them — this
+  // fixture behaves identically to main. Splitting it needs per-seat turn
+  // attribution (#2665), tracked in #2709.
+  it("(#2690, K2) NOT FIXED — the dispatches line still contradicts the token tiles for one mixed key", () => {
     const sid = "task:review-probe-k2";
     const data: FlowRecord[] = [
       rec({ session_id: sid, action: "dispatch.error", handle: "judge-hosted", payload: { endpoint: "azure-foundry", result_class: "error" } }),
@@ -636,10 +648,14 @@ describe("tokensOffMeter", () => {
     // be separated from it over-claims CLOUD (see K1 above).
     expect(t.cloud).toBe(2000);
     expect(t.local).toBe(0);
-    // What #2690 actually fixed, and what stays fixed: the DISPATCH line no
-    // longer reports the hosted seat's failure as the operator's hardware.
+    // THE CONTRADICTION, pinned rather than described: the derived local
+    // dispatch count is 2 while the local token tile is 0.
     const localRuns = t.runs - t.cloudRuns - t.unknownRuns;
     expect(localRuns).toBe(2);
+    expect(t.local).toBe(0);
+    // And the sentence an operator actually reads, beside CLOUD 2,000.
+    // When this starts failing, K2 is fixed — update it, don't delete it.
+    expect(hybridNote(data, t).text).toBe("2 local dispatches. The hybrid loop is humming, keep it up.");
   });
 
   // (#2690, the ARITY-1 half of the `(CONSIDER 3)` gap #2687 named and
@@ -1613,20 +1629,29 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
 /**
  * KNOWN GAPS — pinned, not claimed away.
  *
- * Every test in this block asserts behavior that is WRONG or INCOHERENT,
- * and every one of them is PRE-EXISTING: identical on `main` and unchanged
- * by the run-scoped-verdict fix above. They are here because this function
- * has now been reasoned about five times from comments that overstated what
- * it guaranteed, and the cheapest way to stop that is a failing-looking
- * test with the real numbers in it.
+ * Every test in this block asserts behavior that is WRONG or INCOHERENT.
+ * They are here because this function has now been reasoned about five
+ * times from comments that overstated what it guaranteed, and the cheapest
+ * way to stop that is a test with the real numbers in it.
+ *
+ * They are NOT all the same provenance, and an earlier revision of this
+ * docblock wrongly said they were ("every one of them is PRE-EXISTING:
+ * identical on `main`"). Getting this label right is what decides whether
+ * the follow-up gets prioritized, so:
+ *
+ *   GAP A is INTRODUCED BY THIS CHANGE — an accepted risk, not a carried
+ *          one. See its own docblock for the main-vs-branch measurement.
+ *   GAP B is PRE-EXISTING — identical on `main`.
+ *   GAP C is PRE-EXISTING — identical on `main`.
  *
  * All three share ONE root cause: the verdict sets are keyed by RUN
  * (`runKey`), but `dcTok` and `sess` — the GROUPING the run count and the
  * double-count guard are built on — are still keyed by bare `session_id`.
  * Fixing that moves `runs` itself and every surface derived from it, so it
- * belongs in its own measured change rather than folded in here.
+ * belongs in its own measured change rather than folded in here. Tracked
+ * in #2709.
  */
-describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
+describe("tokensOffMeter — known gaps (pinned; A introduced, B+C pre-existing)", () => {
   const SID = "task-known-gap";
   const AZURE = "azure:my.endpoint/gpt-4o";
 
@@ -1645,9 +1670,38 @@ describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
     });
 
   /**
-   * GAP A — `cloudRuns` is NOT monotonic.
+   * GAP A — `cloudRuns` is NOT monotonic. **INTRODUCED BY THIS CHANGE.**
    *
-   * `cloudRuns` has two writers: the zero-bookend branch (reads
+   * Measured on this test's own fixture, main against branch:
+   *
+   *   MAIN    cloudRuns [0,0,1,1,1]
+   *           hero "1 dispatch via cloud. The right brain for the job..."
+   *   BRANCH  cloudRuns [0,0,1,1,0]
+   *           hero "1 local dispatch. The hybrid loop is humming..."
+   *
+   * Main never dips: its arity-1 `else` branch consults the session map and
+   * lands on 1. This change relaxed that guard to `length > 0`, which sends
+   * the group to the per-bookend loop, where the only token-bearing bookend
+   * is the LOCAL seat's — so the hosted seat stops counting and the resting
+   * state asserts the operator's own hardware did the work, beside a
+   * 100%-cloud token tile. On darkmux's own asymmetry (never credit hosted
+   * work as free) that is WORSE THAN MAIN, and calling it pre-existing —
+   * as an earlier revision of this comment did — would have buried it.
+   *
+   * It is accepted, not fixed, because it is UNREACHABLE on recorded data,
+   * and that claim is measured rather than assumed:
+   *
+   *   - ZERO `cloudRuns` dips on main AND on branch across the two-day live
+   *     window (2,073 playheads), its playback shape (709), `flow-today`
+   *     alone (657), and the demo replay (3,648).
+   *   - ZERO `(session_id, mission_id)` keys in any committed corpus carry
+   *     BOTH a hosted and a local completion — GAP A's entry condition.
+   *     (two-day: 0 of 50 keys with a completion; demo: 0 of 13.)
+   *
+   * Carried into #2709 with those numbers. The real fix is run-scoped
+   * GROUPING, which this change deliberately does not attempt.
+   *
+   * Mechanism: `cloudRuns` has two writers — the zero-bookend branch (reads
    * `cloudTerminalKeys`) and the per-bookend branch (reads each bookend's
    * own `endpoint`). The second takes over as soon as ONE token-bearing
    * completion joins the group, and re-decides the whole group from the
@@ -1664,7 +1718,7 @@ describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
    * The resting state is incoherent on one screen: the tokens tile reads
    * 100% cloud while the hero says "1 local dispatch".
    */
-  it("GAP A: cloudRuns falls from 1 to 0 when a local sibling's completion lands", () => {
+  it("GAP A (INTRODUCED, accepted): cloudRuns falls from 1 to 0 when a local sibling's completion lands", () => {
     const M = "mission-gap-a";
     const arrivals: FlowRecord[] = [
       rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: M, action: "dispatch start", handle: "hosted", payload: { endpoint: AZURE } }),
@@ -1700,7 +1754,7 @@ describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
    * Measured on the committed corpus: 50 distinct `(session_id,
    * mission_id)` keys carry a dispatch bookend; `runs` reports 40.
    */
-  it("GAP B: three local runs and one hosted run under one session id report as 1 run", () => {
+  it("GAP B (pre-existing): three local runs and one hosted run under one session id report as 1 run", () => {
     const localMapComplete = (m: string, ts: string) =>
       rec({ ts, session_id: SID, mission_id: m, action: "dispatch complete", payload: { kind: "dispatch.map", result_class: "ok" } });
     const data: FlowRecord[] = [
@@ -1734,7 +1788,7 @@ describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
    * failure from misattributing it: the operator sees a smaller number
    * rather than a wrong one, and nothing on the card says so.
    */
-  it("GAP C: a second run's tokens are dropped entirely when a sibling run had telemetry", () => {
+  it("GAP C (pre-existing): a second run's tokens are dropped entirely when a sibling run had telemetry", () => {
     const data: FlowRecord[] = [
       // Run A: has a telemetry family.
       rec({ ts: "2026-08-08T00:00:01Z", session_id: SID, mission_id: "mA", action: "dispatch start" }),
@@ -1754,5 +1808,94 @@ describe("tokensOffMeter — known gaps (pinned, pre-existing)", () => {
     // is missing, which is what makes this easy to miss on the card.
     expect(t.runs).toBe(2);
     expect(t.cloudRuns).toBe(1);
+  });
+});
+
+/**
+ * (re-review round 2) COMPOSITE-KEY INJECTIVITY.
+ *
+ * `runKey` is `(session_id, mission_id)` joined by a NUL. Round 1's suite
+ * pinned the mission half and the cloud-over-local precedence, but a
+ * 12-mutation sweep found TWO survivors that both live in that one line —
+ * every cross-key test above varies the MISSION and holds the session
+ * constant, so neither the session half nor the separator was doing any
+ * work a test could see.
+ *
+ * Both mutations below left 64 of 64 green before these two tests existed.
+ */
+describe("tokensOffMeter — runKey injectivity", () => {
+  const hostedComplete = (sid: string, mission: string | undefined, ts: string): FlowRecord =>
+    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), action: "dispatch complete",
+          payload: { kind: "dispatch.map", endpoint: "azure:my.endpoint/gpt-4o", result_class: "ok" } });
+  const localComplete = (sid: string, mission: string | undefined, ts: string): FlowRecord =>
+    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), action: "dispatch complete",
+          payload: { kind: "dispatch.map", result_class: "ok" } });
+  const telem = (sid: string, mission: string | undefined, total: number, ts: string): FlowRecord =>
+    rec({ ts, session_id: sid, ...(mission ? { mission_id: mission } : {}), category: "telemetry", source: "tokens",
+          payload: { turn_seq: 1, prompt_tokens: total, completion_tokens: 0, total_tokens: total } });
+
+  /**
+   * GUARD 1 — the SESSION half of the composite.
+   *
+   * Mutation that survived: `runKey` returning `mission_id || sid`, which
+   * discards the session id entirely. Nothing caught it, because every
+   * other test in this file separates runs by varying the MISSION.
+   *
+   * That half is not decorative — it does most of the separating in real
+   * data. One review mission fans out roughly six seat sessions
+   * (`task-review-bundle-task`, `-probe-{low,mid,high}-task`,
+   * `-dedup-task`, `-judge-task`, `-verify-task`, `-synthesis-task`) under
+   * ONE `mission_id`, and they need not share a tier. Collapsing them to
+   * the mission key makes cloud-over-local paint every local seat's tokens
+   * cloud the moment any one seat is hosted.
+   */
+  it("GUARD 1: two SESSIONS under one mission classify independently", () => {
+    const M = "review-1786150410-209398";
+    const data: FlowRecord[] = [
+      hostedComplete("task-review-judge-task", M, "2026-08-08T01:00:00Z"),
+      telem("task-review-judge-task", M, 1000, "2026-08-08T00:59:00Z"),
+      localComplete("task-review-verify-task", M, "2026-08-08T01:05:00Z"),
+      telem("task-review-verify-task", M, 500, "2026-08-08T01:04:00Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1500);
+    // Under `mission_id || sid` both sessions collapse to one key, cloud
+    // wins the precedence, and this reads cloud=1500 local=0.
+    expect(t.cloud).toBe(1000);
+    expect(t.local).toBe(500);
+    expect(t.unknown).toBe(0);
+  });
+
+  /**
+   * GUARD 2 — the SEPARATOR.
+   *
+   * Mutation that survived: deleting the NUL from the template, making the
+   * key a bare concatenation. Ids here are hyphen-delimited and drawn from
+   * one alphabet, and `session_id::scope_to_run`
+   * (`crates/darkmux-types/src/session_id.rs:166-173`) literally composes
+   * them as `format!("{session_id}-{run_id}")` — so a session id that
+   * already CONTAINS a mission id is a shape the producers emit, not a
+   * hypothetical.
+   *
+   * The pair below is constructed to be minimal rather than realistic; its
+   * job is to prove the key is injective, which a concatenation is not.
+   * Without a separator both rows spell `task-judgem1`, and the hosted
+   * row's endpoint then paints the local row's tokens cloud.
+   */
+  it("GUARD 2: two runs whose ids concatenate to the same string stay distinct", () => {
+    const data: FlowRecord[] = [
+      // ("task-judge", "m1")  -> "task-judge" + SEP + "m1"
+      hostedComplete("task-judge", "m1", "2026-08-08T01:00:00Z"),
+      telem("task-judge", "m1", 1000, "2026-08-08T00:59:00Z"),
+      // ("task-judgem1", "")  -> "task-judgem1" + SEP + ""
+      localComplete("task-judgem1", undefined, "2026-08-08T01:05:00Z"),
+      telem("task-judgem1", undefined, 500, "2026-08-08T01:04:00Z"),
+    ];
+    const t = tokensOffMeter(data);
+    expect(t.total).toBe(1500);
+    // Without the separator both keys are "task-judgem1": cloud=1500 local=0.
+    expect(t.cloud).toBe(1000);
+    expect(t.local).toBe(500);
+    expect(t.unknown).toBe(0);
   });
 });
