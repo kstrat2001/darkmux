@@ -2793,6 +2793,40 @@ mod tests {
         }
     }
 
+    /// (#2682 fix-pass round 2, MUST FIX 2) RAII pin for the staleness
+    /// budget. [`stale_after_ms`] is `config_access::
+    /// inactivity_timeout_seconds() * 2`, whose TOP tier is the
+    /// `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` env var — a documented operator
+    /// knob, read LIVE per access. A fixture that places a mission "90
+    /// minutes ago" and expects that to read stale is therefore asserting
+    /// against a threshold the ENVIRONMENT owns: with `7200` exported the
+    /// budget becomes 4 hours and the fixture's own premise evaporates.
+    /// That is the clock rule one axis over — freeze the distance's
+    /// DENOMINATOR, not just its numerator. Caller must hold
+    /// `#[serial_test::serial]`.
+    struct InactivityBudgetGuard {
+        prev: Option<String>,
+    }
+    impl InactivityBudgetGuard {
+        fn seconds(secs: u64) -> Self {
+            let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+            unsafe {
+                std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", secs.to_string());
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for InactivityBudgetGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                    None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+                }
+            }
+        }
+    }
+
     fn now_unix() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3679,10 +3713,15 @@ mod tests {
     #[serial_test::serial]
     fn local_dispatch_status_ambiguous_session_reads_no_attributable_session_not_stale() {
         let _g = CrewGuard::new();
+        // (MUST FIX 2) 60s knob → a 120s budget. Without this pin the
+        // 90-minute distance below is measured against whatever
+        // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` the environment exports, and
+        // this test fails outright under the documented `7200`.
+        let _budget = InactivityBudgetGuard::seconds(60);
         let flows = TempDir::new().unwrap();
 
         let mut m = minimal_mission("m-ambiguous-e2e", vec![], None);
-        // 90 minutes old — well past the default ~20-minute staleness
+        // 90 minutes old — well past the pinned 120-second staleness
         // budget, so the age branch genuinely fires once the session pool
         // is empty (mirrors the review's Probe E2 fixture exactly).
         m.started_ts = Some(now_unix().saturating_sub(90 * 60));
@@ -4062,8 +4101,18 @@ mod tests {
     /// one question the filter exists to answer.
     ///
     /// "Running" is a claim about the PRESENT and needs positive evidence.
+    ///
+    /// (#2682 fix-pass round 2, MUST FIX 2 — same hazard, found by running
+    /// this selection with the knob exported) The "2.6 hours" assertion at
+    /// the bottom is a FIXED distance measured against `stale_after_ms()`,
+    /// which the environment owns: with `DARKMUX_INACTIVITY_TIMEOUT_
+    /// SECONDS=7200` exported the budget becomes 4 hours and 2.6h reads
+    /// live, failing this test outright. Pinned to the built-in default it
+    /// was written against.
     #[test]
+    #[serial_test::serial]
     fn an_unfinished_lab_run_stops_reading_as_live_once_it_goes_quiet() {
+        let _budget = InactivityBudgetGuard::seconds(600);
         let summary = minimal_lab_summary("live/killed", false, false);
 
         // Just now: still live. The floor must not break a real in-flight run.
@@ -6440,7 +6489,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_peers_mission_becomes_one_run_row_from_the_fleet_stream() {
+        // (#2682 fix-pass round 2, MUST FIX 3) `build_runs`/
+        // `peer_mission_runs` call `load_missions()` internally, so an
+        // unguarded test here reads the OPERATOR'S real `~/.darkmux`
+        // missions — and, unannotated, also raced whichever scratch
+        // `DARKMUX_CREW_DIR` a concurrent sibling happened to have set.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
         // records were never written to this machine's flows dir.
         let fleet = vec![
@@ -6470,7 +6526,11 @@ mod tests {
     /// machine 40 of 104 mission rows were exactly this shape, and the
     /// board sorts newest-first, so this was the first page a person saw.
     #[test]
+    #[serial_test::serial]
     fn a_peers_untracked_mission_carries_its_representative_session_as_the_drill_target() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
             peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
@@ -6494,7 +6554,11 @@ mod tests {
     /// mechanically; the ambiguity guard is what has to catch that the pick
     /// is no longer trustworthy as a drill target.
     #[test]
+    #[serial_test::serial]
     fn an_untracked_missions_ambiguous_representative_session_gets_no_drill_target() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let mut collided_record = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
         collided_record["mission_id"] = serde_json::json!("review-on-a-different-hub");
@@ -6519,7 +6583,11 @@ mod tests {
     /// happily if `build_runs` fabricated rows from somewhere other than the
     /// fleet input — the assertion would be measuring nothing.
     #[test]
+    #[serial_test::serial]
     fn with_no_fleet_records_there_is_no_peer_row() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let runs = build_runs(flows.path(), None, &[]);
         assert!(
@@ -6531,7 +6599,11 @@ mod tests {
     // ─── #1711: `peer_mission_runs` — the standalone narrow entry point ────
 
     #[test]
+    #[serial_test::serial]
     fn peer_mission_runs_matches_build_runs_peer_half_for_the_same_input() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         // The narrow entry point must not silently diverge from the
         // aggregation `build_runs` already ships — `mission status` and
         // `/runs`/`darkmux run list` are answering the SAME question, and
@@ -6555,7 +6627,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn peer_mission_runs_excludes_a_known_local_mission_id() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         // The exact bug this function exists to make impossible: a caller
         // that already knows a mission is LOCAL (its own `known_mission_ids`
         // from `load_missions()`) must never see it echoed back as a "peer"
@@ -6655,7 +6731,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_closed_peer_mission_reads_complete_not_running() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
             peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
@@ -6677,7 +6757,11 @@ mod tests {
     /// A peer that fell asleep mid-mission must not leave a row claiming to
     /// be running forever — the same staleness rule every other row obeys.
     #[test]
+    #[serial_test::serial]
     fn a_stale_unclosed_peer_mission_is_abandoned_not_running() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         // Yesterday: comfortably INSIDE the 14-day scan window, comfortably
         // OUTSIDE the liveness budget. The two bounds answer different
@@ -6700,7 +6784,11 @@ mod tests {
     /// owning machine correctly read `abandoned` — a killed run inheriting a
     /// success verdict it never earned.
     #[test]
+    #[serial_test::serial]
     fn an_aborted_peer_mission_reads_abandoned_not_complete() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![
             peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
@@ -6740,7 +6828,11 @@ mod tests {
     /// month-old records that would otherwise resurface as rows that never
     /// age out.
     #[test]
+    #[serial_test::serial]
     fn a_fleet_record_older_than_the_scan_window_never_enters_runs() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let fleet = vec![peer_record("dispatch start", "2020-01-01T00:00:00Z")];
         let runs = build_runs(flows.path(), None, &fleet);
@@ -6751,7 +6843,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn a_record_present_in_both_sinks_is_counted_once() {
+        // (MUST FIX 3) `load_missions()` runs inside — guard + serial,
+        // same reason as the first of these, above.
+        let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         // The SAME record in the local day-file and in the fleet stream —
         // exactly what happens for this machine's own work, which is

@@ -840,20 +840,43 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// It is FALSE for the other two roads `mission_run_status_and_evidence` can
 /// take to the same `RunStatus::Abandoned`:
 ///   - [`DispatchSessionEvidence::NoAttributableSession`] — no session was
-///     ever attributed to this mission at all (never dispatched yet, every
-///     session pruned/out-of-window, or every candidate refused as
-///     AMBIGUOUS per #1918/#2487). The verdict rests on the mission's own
-///     AGE, not on any dispatch — claiming "the dispatch session shows no
-///     evidence of life" invents a session that isn't there, and a mission
-///     merely waiting at its sign-off gate reads identically to a genuinely
-///     dead one. Abort is dropped from the suggestion set here — tearing
-///     down a mission on pure absence, possibly one still waiting to start,
-///     is the wrong default action.
+///     ever attributed to this mission at all. Fires NOTHING now; see the
+///     next paragraph.
 ///   - [`DispatchSessionEvidence::RecordedEnd`] — darkmux POSITIVELY
 ///     recorded this mission's session ending (a `session.end` crash/kill/
 ///     timeout close-edge). "No evidence of life" describes an absence;
 ///     this is an observed fact. Abort is a reasonable option here — the
 ///     mission being torn down was actually seen.
+///
+/// **Why `NoAttributableSession` fires NOTHING (#2682 fix-pass round 2,
+/// MUST FIX 1).** Re-wording that arm was not enough: two probes measured
+/// at the round-1 head still FIRED, and both were false alarms.
+///   - Probe A2 — an Active mission, `started_ts` 25 minutes ago, one
+///     Running phase, a step on disk, zero flow records. That is the
+///     ORDINARY state of a mission parked at a sign-off gate.
+///   - Probe E3 — records written THIS SECOND under a session id that
+///     names two missions and is therefore refused as ambiguous (#1918/
+///     #2487), mission 90 minutes old. The mission is demonstrably alive.
+///
+/// Both fired because the firing condition — `Active` + a Running phase +
+/// no attributable session + older than `stale_after_ms()` (20 minutes at
+/// default config) — never mentions a dispatch at all. Every Active
+/// mission whose dispatches fell outside `RUNS_FLOW_SCAN_WINDOW_DAYS`
+/// fires it PERMANENTLY, and `attention_rollup` counts drifts
+/// kind-agnostically, so each one removes the board's clean checkmark for
+/// good.
+///
+/// `NoAttributableSession` carries ZERO dispatch-liveness information,
+/// which is this rule's entire subject — and in Probe E3's shape it is an
+/// honest statement about darkmux's own ATTRIBUTION layer, not about the
+/// mission, so rendering it as mission drift blames the mission for a
+/// flow-emitter defect. It is dropped here rather than re-worded again.
+/// (The ambiguity case is still worth surfacing SOMEWHERE — `darkmux
+/// doctor` is the right home for a flow-attribution defect, not the
+/// mission board. Filed as #2691, deliberately not built here.)
+/// `RecordedEnd` and `StaleNoTerminal` are genuine dispatch observations
+/// and stay, which is what keeps the `kind` string
+/// (`running-phase-session-dead`) accurate for every arm that survives.
 ///
 /// Fires ONLY when:
 ///   - `m.status == MissionStatus::Active` — checked explicitly by THIS
@@ -876,6 +899,9 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 ///     `darkmux run list` renders for this mission today. `RunStatus::
 ///     Error`/`Unparseable`/etc. are real terminal signals of their own and
 ///     are left to whatever surfaces those, not folded into this rule.
+///   - `local_evidence` is an actual dispatch OBSERVATION — `RecordedEnd`
+///     or `StaleNoTerminal`. `NoAttributableSession` (and a `None` the
+///     caller never named) fire nothing; see above.
 ///
 /// Describes, never adjudicates — matching the posture `peer_status_word`'s
 /// own doc states: the wording says what was OBSERVED and never claims the
@@ -883,28 +909,53 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// are reconcile OPTIONS, not a verdict — the same "debrief first, then
 /// choose" shape `stale_active_drift` already uses above.
 ///
-/// **Scope, stated exactly (#2682 fix-pass review MUST FIX 4).** This rule
-/// closes the ONE disagreement #2682 was filed over — an Active mission
-/// with a `Running` phase whose `run list` status is `Abandoned` — and
-/// deliberately does NOT attempt board/`run list` parity for every OTHER
-/// shape the review's audit enumerated (100 `MissionStatus` × `PhaseStatus`
-/// × flow-shape rows checked against the real pair). Left silent on
-/// purpose, because each would need its own reasoning about what "drift"
-/// even means for that phase status, not a mechanical widen of this rule.
-/// Per the review's own count:
-///   - Active mission, `Abandoned`-per-`run-list`, phase Planned/Complete/
-///     Abandoned/no-phases (12 rows) — this rule only fires for Running.
-///   - Finalized mission, phase Planned/Running/Abandoned (15 rows) —
-///     `run list` renders a Finalized mission with no successful envelope
-///     as `Abandoned` (`mission_finalized_status`'s `Ok(None)` arm); a
-///     Finalized mission is CLOSED by construction, and "the board should
-///     also flag it as dead" is a different, unexamined claim this PR
-///     does not make.
-///   - Paused mission with a recorded `session.end` (5 rows) — `run list`
-///     shows `Abandoned` for a mission the board correctly shows `Paused`;
-///     genuinely a display disagreement, but distinct in kind from the
-///     "Running phase, dead session" gap this issue named, and not fixed
-///     here.
+/// **Scope, stated exactly (#2682 fix-pass review MUST FIX 4; re-derived
+/// after round 2's MUST FIX 1).** This rule closes the ONE disagreement
+/// #2682 was filed over — an Active mission with a `Running` phase whose
+/// `run list` status is `Abandoned` AND whose evidence is an actual
+/// dispatch observation — and deliberately does NOT attempt board/`run
+/// list` parity for every OTHER shape. Left silent on purpose, because
+/// each would need its own reasoning about what "drift" even means for
+/// that shape, not a mechanical widen of this rule.
+///
+/// The numbers below are NOT hand-counted. They are produced by
+/// `board_vs_run_list_disagreement_matrix_is_exactly_as_documented` in
+/// this module's own test suite, which sweeps 4 `MissionStatus` × 5 phase
+/// shapes × 5 flow shapes = 100 rows through the REAL pair
+/// (`darkmux_serve::local_dispatch_status` → `detect_drift`) and asserts
+/// every figure here, so a change on either side fails that test rather
+/// than silently rotting this paragraph. **33 rows** disagree — `run list`
+/// reads them `Abandoned` while this rule stays silent:
+///   - Active mission, phase Planned/Complete/Abandoned/no-phases, × the 3
+///     `Abandoned`-producing flow shapes (12 rows) — this rule only fires
+///     for a Running phase. PLUS the Running-phase row whose evidence is
+///     `NoAttributableSession` (1 row), silent by round 2's MUST FIX 1
+///     above. **13 rows.**
+///   - Finalized mission, phase Planned/Running/Abandoned, × all 5 flow
+///     shapes (15 rows) — `run list` renders a Finalized mission with no
+///     successful envelope as `Abandoned` (`mission_finalized_status`'s
+///     `Ok(None)` arm, which ignores flow records entirely); a Finalized
+///     mission is CLOSED by construction, and "the board should also flag
+///     it as dead" is a different, unexamined claim this PR does not make.
+///   - Paused mission with a recorded `session.end`, × all 5 phase shapes
+///     (5 rows) — `run list` shows `Abandoned` for a mission the board
+///     correctly shows `Paused`; genuinely a display disagreement, but
+///     distinct in kind from the "Running phase, dead session" gap this
+///     issue named, and not fixed here.
+///
+/// **Two counting subtleties, so a recount doesn't come out wrong.**
+///   1. The naive sweep returns **58**, not 33. The extra 25 are the whole
+///      `MissionStatus::Aborted` block (5 phase × 5 flow shapes), and they
+///      are NOT disagreements: an aborted mission's row carries
+///      `abandoned_reason = Aborted`, which `run_list::subtitle_for`
+///      renders as the literal word "aborted" — the same thing the board
+///      itself shows for a mission the operator tore down. Splitting on
+///      the REASON is what turns 58 into 33.
+///   2. These count rows where THIS RULE is silent. The stricter reading —
+///      no drift of ANY kind on the row — gives **29** (raw 54), because
+///      an Active/Paused mission holding a Complete phase already draws
+///      `done-not-finalized`. The matrix test asserts both numbers.
+///
 /// Narrowing the claim to exactly this, rather than silently shipping a
 /// partial fix under the original issue's full title, is a deliberate
 /// choice — the remaining rows are real and worth a follow-up, not a
@@ -939,17 +990,13 @@ fn running_phase_session_drift(
         format!("darkmux mission abort {id}   # …if the work is in fact dead", id = m.id);
 
     let (fact, suggest) = match local_evidence {
-        // (#2682 fix-pass MUST FIX 1/2) No session — real or ambiguous —
-        // is attributable to this mission. Say so plainly, and don't
-        // suggest tearing the mission down on absence alone.
-        None | Some(DispatchSessionEvidence::NoAttributableSession) => (
-            "no dispatch session can be attributed to this mission at all — either none was ever \
-             recorded, or every session seen names more than one mission and is refused as \
-             ambiguous. This verdict rests on the mission's own AGE, not on any observed dispatch \
-             (the same rule `darkmux run list` reports this mission Abandoned under)"
-                .to_string(),
-            vec![cross_check, debrief],
-        ),
+        // (#2682 fix-pass round 2 MUST FIX 1) STAY SILENT — no drift at
+        // all. No session, real or ambiguous, is attributable to this
+        // mission, so there is no dispatch-liveness observation here, and
+        // dispatch liveness is this rule's ENTIRE subject. See this
+        // function's own doc ("Why `NoAttributableSession` fires nothing")
+        // for the two measured probes that forced this arm out.
+        None | Some(DispatchSessionEvidence::NoAttributableSession) => return None,
         // (#2682 fix-pass MUST FIX 5) darkmux positively recorded this
         // session ending — a fact, not an absence.
         Some(DispatchSessionEvidence::RecordedEnd) => (
@@ -2029,6 +2076,40 @@ mod tests {
         }
     }
 
+    /// (#2682 fix-pass round 2, MUST FIX 2) RAII pin for the staleness
+    /// budget every liveness verdict in this module is measured against.
+    /// `stale_after_ms()` is `config_access::inactivity_timeout_seconds()
+    /// * 2`, whose TOP tier is `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` — a
+    /// documented operator knob. A fixture that places a mission "25
+    /// minutes ago" and expects that to read stale is therefore asserting
+    /// against a threshold the ENVIRONMENT owns: with the knob exported at
+    /// `7200`, the budget becomes 4 hours and the fixture's own premise
+    /// evaporates. That is the clock rule one axis over — freeze the
+    /// distance's DENOMINATOR, not just its numerator. Caller must hold
+    /// `#[serial_test::serial]`.
+    struct InactivityBudgetGuard {
+        prev: Option<String>,
+    }
+    impl InactivityBudgetGuard {
+        fn seconds(secs: u64) -> Self {
+            let prev = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+            // SAFETY: caller holds #[serial_test::serial].
+            unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", secs.to_string()) };
+            Self { prev }
+        }
+    }
+    impl Drop for InactivityBudgetGuard {
+        fn drop(&mut self) {
+            // SAFETY: caller holds #[serial_test::serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                    None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+                }
+            }
+        }
+    }
+
     fn mission(id: &str, status: MissionStatus) -> Mission {
         Mission {
             id: id.into(),
@@ -2418,10 +2499,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn display_label_prefers_the_config_name_over_a_config_launched_missions_own_long_description() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        // (#2682 fix-pass round 2, MUST FIX 4) `DarkmuxHomeGuard` instead
+        // of a hand-rolled save/restore: every `unwrap()`/`assert!` below
+        // used to sit BETWEEN the set and the restore, so one real failure
+        // left `DARKMUX_HOME` pointing at a `TempDir` about to be dropped
+        // and every subsequent serial test in the process read through a
+        // deleted directory — one failure rendering as a wall of them.
+        let _home = DarkmuxHomeGuard::new();
 
         let mut m = mission("review-1788656497-cf872b", MissionStatus::Active);
         m.description = "(#2310 P4d) The code review, built on the shared mission building \
@@ -2435,13 +2519,6 @@ mod tests {
         });
 
         let label = display_label(&m);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
 
         assert_eq!(
             label, "Review",
@@ -2488,10 +2565,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn description_note_is_the_first_sentence_capped_and_never_mid_identifier() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        // (MUST FIX 4) See the sibling test above for why this is a guard
+        // and no longer a hand-rolled save/restore.
+        let _home = DarkmuxHomeGuard::new();
 
         let real_description =
             crew::mission_config::load::load("review").unwrap().config.description.unwrap();
@@ -2508,13 +2584,6 @@ mod tests {
             origin: None,
         });
         let note = description_note(&m);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
 
         assert_eq!(note_without_config, None);
 
@@ -2732,10 +2801,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn live_steps_for_reads_the_live_steps_of_a_terminal_phase() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        // (MUST FIX 4) A guard, not a hand-rolled save/restore — the
+        // `save_step` unwraps below sat between the set and the restore.
+        let _home = DarkmuxHomeGuard::new();
 
         let m = mission("m1", MissionStatus::Finalized);
         let closed = phase("m1-p1", "m1", PhaseStatus::Complete);
@@ -2758,13 +2826,6 @@ mod tests {
         step("s-running", crew::types::NodeStatus::Running);
 
         let live = live_steps_for(&m, &[&closed]);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
 
         assert_eq!(
             live.get("m1-p1").cloned(),
@@ -3054,13 +3115,16 @@ mod tests {
         );
     }
 
-    /// (#2682 fix-pass MUST FIX 1/2/5) A mission with NO attributable
-    /// session at all — the review's "never dispatched at all, offers
-    /// abort" finding. The detail must describe the mission's AGE, never
-    /// invent a dispatch session that isn't there, and abort must NOT be
-    /// suggested on pure absence.
+    /// (#2682 fix-pass round 2, MUST FIX 1) A mission with NO attributable
+    /// session at all must fire NOTHING. Round 1 re-worded this arm and
+    /// left it firing; two measured probes then showed the two shapes that
+    /// reach it — a mission parked at a sign-off gate past the 20-minute
+    /// default budget, and a mission emitting records THIS SECOND under a
+    /// session id refused as ambiguous — are both false alarms.
+    /// `NoAttributableSession` carries no dispatch-liveness information,
+    /// which is this rule's entire subject.
     #[test]
-    fn running_phase_session_drift_no_attributable_session_names_age_not_a_phantom_session() {
+    fn running_phase_session_drift_stays_silent_with_no_attributable_session() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("p1", "m1", PhaseStatus::Running);
         let d = detect_drift(
@@ -3072,38 +3136,23 @@ mod tests {
             0,
             14,
         );
-        let hit = d
-            .iter()
-            .find(|dr| dr.kind == "running-phase-session-dead")
-            .unwrap_or_else(|| panic!("no running-phase-session-dead drift: {d:?}"));
         assert!(
-            !hit.detail.to_lowercase().contains("dispatch session shows no evidence"),
-            "must not claim a dispatch session was observed when there wasn't one: {}",
-            hit.detail
-        );
-        assert!(hit.detail.to_lowercase().contains("age"), "{}", hit.detail);
-        assert!(
-            !hit.suggest.iter().any(|s| s.contains("mission abort")),
-            "must never suggest tearing a mission down on pure absence: {:?}",
-            hit.suggest
+            !d.iter().any(|dr| dr.kind == "running-phase-session-dead"),
+            "a mission with no attributable dispatch session must not be flagged as one whose \
+             dispatch session died: {d:?}"
         );
     }
 
     /// `local_evidence: None` alongside `local_status: Some(Abandoned)` — a
     /// caller that classified the mission Abandoned but could not (or did
-    /// not) name a reason — must fall into the SAME safe, no-abort branch
-    /// as `NoAttributableSession`, never the fixed "no evidence of life"
-    /// wording that would over-claim what was observed.
+    /// not) name a reason — must take the SAME silent road as
+    /// `NoAttributableSession`. An unnamed reason is not an observation.
     #[test]
-    fn running_phase_session_drift_missing_evidence_is_treated_as_absence_not_a_dead_session() {
+    fn running_phase_session_drift_stays_silent_when_evidence_is_missing() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("p1", "m1", PhaseStatus::Running);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), None, 0, 14);
-        let hit = d
-            .iter()
-            .find(|dr| dr.kind == "running-phase-session-dead")
-            .unwrap_or_else(|| panic!("no running-phase-session-dead drift: {d:?}"));
-        assert!(!hit.suggest.iter().any(|s| s.contains("mission abort")), "{:?}", hit.suggest);
+        assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
     }
 
     /// (#2682 fix-pass MUST FIX 5) darkmux POSITIVELY recorded the session
@@ -3226,6 +3275,251 @@ mod tests {
         let s = phase("p1", "m1", PhaseStatus::Planned);
         let d = detect_drift(&m, &[&s], &BTreeMap::new(), Some(RunStatus::Abandoned), Some(DispatchSessionEvidence::StaleNoTerminal), 0, 14);
         assert!(!d.iter().any(|dr| dr.kind == "running-phase-session-dead"), "{d:?}");
+    }
+
+    // ─── the board-vs-`run list` disagreement matrix (#2682 round 2) ───
+
+    /// The five flow-record shapes the matrix below sweeps, one per row of
+    /// its third axis. Each is a genuinely different road
+    /// `mission_run_status_and_evidence` can take, NOT five spellings of
+    /// the same one.
+    #[derive(Clone, Copy, Debug)]
+    enum MatrixFlow {
+        /// No records at all — the session pool is empty, so the verdict
+        /// rests on the mission's own AGE (`NoAttributableSession`).
+        NoRecords,
+        /// One open session whose last activity is NOW — live.
+        LiveSession,
+        /// One open session whose last activity is far past any budget and
+        /// which never reached a terminal (`StaleNoTerminal`).
+        StaleOpenSession,
+        /// One session darkmux positively saw END (`session.end` →
+        /// `RecordedEnd`).
+        RecordedEnd,
+        /// One session that reached a `dispatch error` terminal — a real
+        /// terminal signal of its own, deliberately NOT `Abandoned`.
+        ErrorTerminal,
+    }
+
+    /// (#2682 fix-pass round 2, CONSIDER 1) The scope claim in
+    /// [`running_phase_session_drift`]'s own doc — "N rows where `darkmux
+    /// run list` reads a mission `Abandoned` while this board stays
+    /// silent" — DERIVED by running the real pair over the whole matrix,
+    /// never hand-counted. Any future change to either side moves these
+    /// numbers and fails here, which is the only way a prose count in a
+    /// doc comment can be kept honest.
+    ///
+    /// The matrix is 4 `MissionStatus` × 5 phase shapes (none, plus each
+    /// `PhaseStatus`) × 5 [`MatrixFlow`] shapes = 100 rows. For each row it
+    /// asks `darkmux_serve::local_dispatch_status` (the SAME computation
+    /// `darkmux run list` renders from) for a verdict, hands that verdict
+    /// to this module's own `detect_drift`, and records the rows where the
+    /// two disagree.
+    ///
+    /// **The counting subtlety, stated so a recount doesn't come out
+    /// wrong.** The naive "`run list` says `Abandoned`, board is silent"
+    /// predicate returns 58, not 33. Twenty-five of those are the whole
+    /// `MissionStatus::Aborted` block (5 × 5), and they are NOT
+    /// disagreements: an aborted mission's row carries `abandoned_reason =
+    /// Aborted`, which `run_list::subtitle_for` renders as the literal word
+    /// "aborted" (its sibling `AbandonReason::NoTerminal` is the one that
+    /// reads "no ending recorded") — the same thing the board itself shows
+    /// for a mission the operator tore down. Splitting on the REASON is
+    /// what turns the raw count into
+    /// the real one. A future reader recounting without that split will
+    /// get 58 and think this doc drifted.
+    ///
+    /// Pins `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (MUST FIX 2): the
+    /// `NoRecords` row's verdict is the mission's age measured against
+    /// `stale_after_ms()`, so the matrix would otherwise re-shape itself
+    /// under an operator's exported budget.
+    #[test]
+    #[serial_test::serial]
+    fn board_vs_run_list_disagreement_matrix_is_exactly_as_documented() {
+        let _home = DarkmuxHomeGuard::new();
+        // 60s knob → a 120s staleness budget: the fixtures below sit 90
+        // minutes back, unambiguously outside it.
+        let _budget = InactivityBudgetGuard::seconds(60);
+
+        let now = now_unix();
+        let mission_statuses = [
+            MissionStatus::Active,
+            MissionStatus::Paused,
+            MissionStatus::Aborted,
+            MissionStatus::Finalized,
+        ];
+        let phase_shapes = [
+            None,
+            Some(PhaseStatus::Planned),
+            Some(PhaseStatus::Running),
+            Some(PhaseStatus::Complete),
+            Some(PhaseStatus::Abandoned),
+        ];
+        let flow_shapes = [
+            MatrixFlow::NoRecords,
+            MatrixFlow::LiveSession,
+            MatrixFlow::StaleOpenSession,
+            MatrixFlow::RecordedEnd,
+            MatrixFlow::ErrorTerminal,
+        ];
+
+        let mut rows = 0usize;
+        // Predicate 1 — "THIS RULE stayed silent": `Abandoned` per `run
+        // list`, no `running-phase-session-dead` drift. This is the one the
+        // scope claim in `running_phase_session_drift`'s doc is about
+        // ("this rule only fires for Running").
+        let mut raw_rule_silent = 0usize;
+        let mut real_rule_silent = 0usize;
+        let mut per_status: BTreeMap<String, usize> = BTreeMap::new();
+        // Predicate 2 — "the WHOLE BOARD stayed silent": `Abandoned` per
+        // `run list` and NO drift of any kind. Strictly narrower, because
+        // an Active/Paused mission with a Complete phase already draws
+        // `done-not-finalized`. Reported so a recount under either reading
+        // lands on a number this test names.
+        let mut raw_board_silent = 0usize;
+        let mut real_board_silent = 0usize;
+        let mut detail: Vec<String> = Vec::new();
+
+        for (mi, ms) in mission_statuses.iter().enumerate() {
+            for (pi, ps) in phase_shapes.iter().enumerate() {
+                for (fi, fs) in flow_shapes.iter().enumerate() {
+                    rows += 1;
+                    let id = format!("matrix-{mi}-{pi}-{fi}");
+                    let mut m = mission(&id, *ms);
+                    // 90 minutes old: past the pinned budget, so the
+                    // `NoRecords` age branch genuinely fires.
+                    m.started_ts = Some(now.saturating_sub(90 * 60));
+                    let phases: Vec<Phase> = ps
+                        .map(|status| phase(&format!("{id}-p"), &id, status))
+                        .into_iter()
+                        .collect();
+                    m.phase_ids = phases.iter().map(|p| p.id.clone()).collect();
+                    crew::lifecycle::save_mission(&m).unwrap();
+                    for p in &phases {
+                        crew::lifecycle::save_phase(p).unwrap();
+                    }
+
+                    let flows = tempfile::TempDir::new().unwrap();
+                    let session = format!("{id}-s");
+                    let rec = |action: &str, ts: &str| {
+                        serde_json::json!({
+                            "ts": ts,
+                            "action": action,
+                            "session_id": session,
+                            "mission_id": id,
+                            "handle": "coder",
+                        })
+                        .to_string()
+                    };
+                    // A fixed past stamp rather than "an hour ago": no
+                    // arithmetic, and nothing that can land on the wrong
+                    // side of a UTC midnight while the suite runs.
+                    let old = "2024-01-01T09:00:00Z";
+                    let live = darkmux_flow::ts_utc_now();
+                    let lines: Vec<String> = match fs {
+                        MatrixFlow::NoRecords => Vec::new(),
+                        MatrixFlow::LiveSession => vec![rec("dispatch start", &live)],
+                        MatrixFlow::StaleOpenSession => vec![rec("dispatch start", old)],
+                        MatrixFlow::RecordedEnd => {
+                            vec![rec("dispatch start", old), rec("session.end", old)]
+                        }
+                        MatrixFlow::ErrorTerminal => {
+                            vec![rec("dispatch start", old), rec("dispatch error", old)]
+                        }
+                    };
+                    if !lines.is_empty() {
+                        std::fs::write(
+                            flows.path().join(format!("{}.jsonl", darkmux_flow::day_utc_now())),
+                            format!("{}\n", lines.join("\n")),
+                        )
+                        .unwrap();
+                    }
+
+                    let local = darkmux_serve::local_dispatch_status(
+                        std::slice::from_ref(&m),
+                        flows.path(),
+                        &[],
+                    );
+                    let (status, evidence) = local
+                        .get(&id)
+                        .copied()
+                        .unwrap_or_else(|| panic!("no local_dispatch_status entry for {id}"));
+
+                    let phase_refs: Vec<&Phase> = phases.iter().collect();
+                    // `now: 0` keeps `stale_active_drift` (a DAY-scale rule
+                    // on a different clock) out of the measurement — this
+                    // matrix is about the `run list` pair, not that rule.
+                    let d = detect_drift(
+                        &m,
+                        &phase_refs,
+                        &BTreeMap::new(),
+                        Some(status),
+                        evidence,
+                        0,
+                        14,
+                    );
+
+                    if status != RunStatus::Abandoned {
+                        continue;
+                    }
+                    // The `abandoned_reason = Aborted` split described in
+                    // this test's doc: a torn-down mission reads "aborted"
+                    // on BOTH surfaces, so it is not a disagreement.
+                    let counts_as_disagreement = *ms != MissionStatus::Aborted;
+                    if !d.iter().any(|dr| dr.kind == "running-phase-session-dead") {
+                        raw_rule_silent += 1;
+                        if counts_as_disagreement {
+                            real_rule_silent += 1;
+                            *per_status.entry(format!("{ms:?}")).or_default() += 1;
+                            detail.push(format!("{ms:?}/{ps:?}/{fs:?} evidence={evidence:?}"));
+                        }
+                    }
+                    if d.is_empty() {
+                        raw_board_silent += 1;
+                        if counts_as_disagreement {
+                            real_board_silent += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Printed so the numbers in `running_phase_session_drift`'s doc can
+        // be re-derived by RUNNING this (`-- --nocapture`), never by
+        // editing prose.
+        println!("matrix rows: {rows}");
+        println!("rule-silent, raw (incl. Aborted): {raw_rule_silent}");
+        println!("rule-silent, real disagreements:  {real_rule_silent}");
+        println!("board-silent, raw (incl. Aborted): {raw_board_silent}");
+        println!("board-silent, real disagreements:  {real_board_silent}");
+        println!("per mission status (rule-silent): {per_status:?}");
+        for line in &detail {
+            println!("  · {line}");
+        }
+
+        assert_eq!(rows, 100, "the matrix must stay 4 x 5 x 5");
+        assert_eq!(
+            raw_rule_silent, 58,
+            "naive count changed — see this test's doc on the Aborted split: {detail:?}"
+        );
+        assert_eq!(real_rule_silent, 33, "the documented disagreement count moved: {detail:?}");
+        assert_eq!(
+            per_status.get("Active").copied(),
+            Some(13),
+            "Active breakdown moved: {per_status:?}"
+        );
+        assert_eq!(
+            per_status.get("Finalized").copied(),
+            Some(15),
+            "Finalized breakdown moved: {per_status:?}"
+        );
+        assert_eq!(
+            per_status.get("Paused").copied(),
+            Some(5),
+            "Paused breakdown moved: {per_status:?}"
+        );
+        assert_eq!(raw_board_silent, 54, "whole-board-silent raw count moved");
+        assert_eq!(real_board_silent, 29, "whole-board-silent disagreement count moved");
     }
 
     /// (#2682) The invariant the issue exists to close, pinned directly
@@ -3910,18 +4204,15 @@ mod tests {
     /// happens to hold on the machine running the suite). Callers must be
     /// `#[serial_test::serial]` — this mutates process-global env.
     fn with_isolated_darkmux_home<R>(f: impl FnOnce() -> R) -> R {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_HOME").ok();
-        // SAFETY: caller is `#[serial_test::serial]`; restored below.
-        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
-        let result = f();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-        result
+        // (#2682 fix-pass round 2, MUST FIX 4) `DarkmuxHomeGuard` rather
+        // than a hand-rolled save/restore. `f` is a test body full of
+        // assertions: when one of them panicked, the restore below it never
+        // ran, `DARKMUX_HOME` stayed pointed at a `TempDir` about to drop,
+        // and every subsequent serial test in the process read through a
+        // deleted directory. The guard's `Drop` still runs during unwind,
+        // so one real failure now reports as one failure.
+        let _home = DarkmuxHomeGuard::new();
+        f()
     }
 
     #[test]
