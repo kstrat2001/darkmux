@@ -67,6 +67,33 @@
 //! env var, and the keystone test in `darkmux-doctor`
 //! (`every_state_root_resolves_under_an_isolated_darkmux_home`) asserts
 //! over those as well, so the exposure is measured rather than assumed.
+//!
+//! # Two further limits, stated rather than discovered later
+//!
+//! **`DARKMUX_HOME` is itself a presence-changes-behavior variable, and it
+//! is in [`PINNED_STATE_VARS`] anyway.** `paths::resolve` returns
+//! `paths_from_root(root, Scope::User)` from the `DARKMUX_HOME` tier
+//! BEFORE it reaches the `ResolveScope` match, so while this guard is held
+//! `ForceProject` and `ForceUser` resolve to the same root with
+//! `scope = User`. That is the right trade — the whole point is one root —
+//! but it means the project-scope branch is unreachable under the guard,
+//! and a test that asserts on `DarkmuxPaths::scope` or on project-vs-user
+//! resolution is silently testing nothing while holding an
+//! [`IsolatedState`]. Such a test has to drive `paths::resolve` with
+//! `DARKMUX_HOME` removed.
+//!
+//! **The subpath half of the contract is weaker than the root half.**
+//! `every_pinned_variable_points_under_the_isolated_root` asserts
+//! `path == state.join(subpath)` using the same list entry it read `path`
+//! from, so it is tautological in `subpath`: mutating an entry's subpath
+//! (`"flows"` → `"flowz"`) is MISSED by that test and by the doctor
+//! keystone, and caught only incidentally by
+//! `darkmux-crew`'s `lifecycle::` tests, which happen to hardcode
+//! `guard.join("flows")`. The root claim IS held; the "mirrors the
+//! built-in default layout" claim is documentation, and the
+//! `identity.md`/`identity.json` entry below is what a drifted one looks
+//! like. Blast radius is low — a wrong subpath still isolates — but a test
+//! planting a fixture at the production path will not find it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -101,7 +128,12 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
     ("DARKMUX_NOTEBOOK_DIR", "notebook"),
     ("DARKMUX_ACK_DIR", "acks"),
     ("DARKMUX_FLEET_FILE", "fleet.json"),
-    ("DARKMUX_IDENTITY_PATH", "identity.json"),
+    // `.md`, not `.json`: `crew::dispatch::identity_path()`'s default is
+    // `<root>/identity.md` (documented at
+    // `config_access::identity_path_override`). The subpath is the SHAPE
+    // claim this list makes, so a wrong one hands a future test that
+    // plants a fixture at `state.join("identity.md")` a silent `None`.
+    ("DARKMUX_IDENTITY_PATH", "identity.md"),
 ];
 
 /// Variables the guard REMOVES rather than pins, because their presence
