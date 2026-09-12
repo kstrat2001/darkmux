@@ -10787,6 +10787,17 @@ mod tests {
             let _ = ca::identity_path_override();
             let _ = ca::templates_override_dirs();
             let _ = ca::skills_override_dirs();
+            // (#2704 fix-pass, CONSIDER B) `DARKMUX_PROFILES` was the one
+            // list entry whose deletion NOTHING caught: no `config_access`
+            // accessor reads it, so without this line the key never
+            // reached the audit log and removing it from
+            // `CLEARED_STATE_VARS` was EXIT=0 in darkmux-types,
+            // darkmux-doctor AND tests/cli.rs. `load_registry` is its one
+            // instrumented chokepoint. The `Result` is discarded on
+            // purpose — under the guard there is no registry to find, and
+            // this call is here for the env READ it performs, not its
+            // outcome.
+            let _ = darkmux_profiles::profiles::load_registry(None);
             let _ = darkmux_crew::loader::user_state_root();
             let _ = darkmux_crew::loader::missions_dir();
             let _ = darkmux_crew::loader::phases_dir();
@@ -10844,11 +10855,23 @@ mod tests {
             destination_keys.iter().filter(|k| !known.contains(k)).collect();
         assert!(
             unguarded.is_empty(),
-            "these destination variables are read by darkmux's own resolvers but are not in \
-             the isolation guard's lists: {unguarded:?}. Add each to \
-             `test_isolation::PINNED_STATE_VARS` (it only names a location) or \
-             `CLEARED_STATE_VARS` (its presence also changes behavior). Recorded keys: \
-             {destination_keys:?}"
+            "these variables are read by darkmux's own resolvers and are accounted for \
+             nowhere: {unguarded:?}. Each needs ONE of three homes. Decide by asking what the \
+             variable IS — not by picking whichever makes this test pass:\n\
+             \n\
+             • It NAMES a write destination and nothing more -> \
+             `test_isolation::PINNED_STATE_VARS`, with the subpath its built-in default \
+             produces.\n\
+             • It names a destination AND its presence changes behavior (the way \
+             `DARKMUX_AUDIT_DIR`'s mere presence turns the hash-chained sink on) -> \
+             `test_isolation::CLEARED_STATE_VARS`, which removes it instead of pinning it.\n\
+             • It is a BEHAVIOR KNOB that a destination resolver happens to read — a bool, a \
+             number, an enum, a mode — -> `NOT_A_DESTINATION`, the list at the top of THIS \
+             test. Never `PINNED_STATE_VARS`: that would write a path string into a knob, \
+             which a bool reads as false and a number or an enum reads as garbage, and this \
+             test would go green having silently changed the behavior under test.\n\
+             \n\
+             Recorded keys: {destination_keys:?}"
         );
     }
 
