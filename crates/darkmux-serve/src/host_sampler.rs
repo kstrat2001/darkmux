@@ -38,7 +38,10 @@
 //! negligible" and "the cadence is what it claims" are both verifiable
 //! facts in the response, not assumptions.
 
-use darkmux_crew::host_probe::{reduce_host_extras, HostExtraAt, HostProbe, HostSampleFull, MwStats};
+use darkmux_crew::host_probe::{
+    battery, reduce_host_extras, BatteryHealth, BatterySample, HostExtraAt, HostProbe,
+    HostSampleFull, MwStats,
+};
 use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +99,13 @@ pub(crate) struct HostSamplerRing {
     /// every clone of this `Arc`-backed ring sees the same value the
     /// sampler thread stored, without a second lock.
     configured_interval_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// (#2705) The most recent battery HEALTH reading — a MACHINE FACT,
+    /// not a time series, so it is a single latest value rather than a
+    /// ring entry. Refreshed on `battery::HEALTH_POLL_INTERVAL_MS`, which
+    /// is three orders of magnitude slower than the ring's own cadence;
+    /// keeping it in the ring would mean 1,800 identical copies of one
+    /// unchanged reading per poll interval.
+    battery_health: Arc<Mutex<Option<BatteryHealth>>>,
 }
 
 /// `mean`/`p95`/`max` — the ROUTE's wire names for one metric's window
@@ -118,6 +128,7 @@ impl HostSamplerRing {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))),
             configured_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            battery_health: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -220,7 +231,13 @@ impl HostSamplerRing {
         // the periodic `machine.telemetry` flow record's payload — so the
         // two never independently drift on what a host reading's JSON shape
         // means.
+        // (#2705) Battery HEALTH sits beside `now`/`window` rather than
+        // inside either: it is not a reading of this instant (`now`) and
+        // not a reduction over the window — it is a slow-moving machine
+        // FACT, refreshed hourly. `null` on a machine with no battery.
+        let health = self.battery_health.lock().ok().and_then(|h| h.clone());
         Some(serde_json::json!({
+            "battery_health": health.as_ref().map(darkmux_crew::host_probe::battery_health_json),
             "now": darkmux_crew::host_probe::sample_full_json(&latest.sample, latest.at_ms),
             "window": {
                 "samples": stats.samples,
@@ -352,6 +369,211 @@ fn thermal_edge(
     }
 }
 
+/// (#2705) Is a battery-HEALTH poll due?
+///
+/// Pure and integer-only ON PURPOSE: the cadence this gates is an hour
+/// long, and an assertion about an hourly cadence that consulted the wall
+/// clock would either take an hour to run or prove nothing. The caller
+/// accumulates the MEASURED gap between sampler ticks and hands it here, so
+/// the tests drive a scripted clock.
+///
+/// `interval_ms == 0` is "never poll" — the same zero-means-off convention
+/// `runtime.host_sampler_interval_ms` and `redis.maxlen` use, never
+/// "poll continuously", which is what a naive `>=` would give it.
+fn health_poll_due(ms_since_last_poll: u64, interval_ms: u64) -> bool {
+    interval_ms != 0 && ms_since_last_poll >= interval_ms
+}
+
+/// (#2705) Build a `machine.battery_health` MACHINE-RECORD flow record.
+///
+/// Always `Level::Info`: these are inventory numbers, and darkmux does not
+/// adjudicate what a cycle count or a capacity ratio means. A `Warn` here
+/// would BE the advice the issue rules out.
+///
+/// `poll_interval_ms` rides in the payload because the observability
+/// contract says the cadence is a recorded knob, never adaptive-silent: an
+/// artifact says what cadence produced it, and a tightened debug cadence is
+/// visible in the data rather than inferred from row spacing.
+fn build_battery_health_record(
+    health: &BatteryHealth,
+    poll_interval_ms: u64,
+    sampled_at_ms: u64,
+) -> darkmux_flow::FlowRecord {
+    let mut payload = darkmux_crew::host_probe::battery_health_json(health);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("poll_interval_ms".into(), serde_json::json!(poll_interval_ms));
+        obj.insert("sampled_at_ms".into(), serde_json::json!(sampled_at_ms));
+    }
+    let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: darkmux_flow::Level::Info,
+        category: darkmux_flow::Category::Machinery,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: "machine.battery_health".to_string(),
+        handle: display_name,
+        phase_id: None,
+        session_id: None,
+        source: Some("host-sampler".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
+/// (#2705) Pure edge detector for battery HEALTH — emit only when a value
+/// actually CHANGED, the same edge-triggered shape [`thermal_edge`] uses.
+///
+/// - `now` absent (no battery, or the poll failed): no record, and the
+///   known health is UNCHANGED. An absent reading is not evidence anything
+///   moved.
+/// - **No prior reading: EMIT.** This is the one deliberate divergence from
+///   [`thermal_edge`], which seeds its first reading silently. A thermal
+///   record is a TRANSITION and a first reading has nothing to have
+///   transitioned from; a health record is an INVENTORY, and the first one
+///   at daemon start IS the machine fact. Seeding it silently would mean a
+///   battery whose numbers never change never reports its cycle count at
+///   all — which is exactly the "the charge number looked healthy every day
+///   and the cost was only visible in the slow fields" failure the issue
+///   was filed from.
+/// - Identical to the last reading: no record. Hour-over-hour capacity
+///   differences are below the noise floor, and emitting anyway would add
+///   24 identical rows a day to a stream this feature is supposed to keep
+///   quiet.
+/// - Any field differs: a real movement — emit, stamped with the time it
+///   was observed, which is what makes the series answer "when did this
+///   start degrading" rather than only "what is it now".
+fn battery_health_edge(
+    prev: Option<&BatteryHealth>,
+    now: Option<&BatteryHealth>,
+    poll_interval_ms: u64,
+    sampled_at_ms: u64,
+) -> (Option<BatteryHealth>, Option<darkmux_flow::FlowRecord>) {
+    let Some(h) = now else {
+        return (prev.cloned(), None);
+    };
+    if prev == Some(h) {
+        return (Some(h.clone()), None);
+    }
+    (Some(h.clone()), Some(build_battery_health_record(h, poll_interval_ms, sampled_at_ms)))
+}
+
+/// (#2705) The battery TRANSITIONS worth a record, as stable strings a
+/// consumer can key on. Pure, and separate from the record builder so every
+/// crossing is table-tested without a battery.
+///
+/// The floor crossings are computed against the SAME
+/// `power.min_battery_pct` #2706's gate enforces, so "the stream said it
+/// crossed" and "the gate refused" can never disagree about where the line
+/// was.
+fn battery_transitions(prev: &BatterySample, now: &BatterySample, floor_pct: u8) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    match (prev.on_ac, now.on_ac) {
+        (true, false) => out.push("to-battery"),
+        (false, true) => out.push("to-ac"),
+        _ => {}
+    }
+    let was_below = prev.charge_pct < floor_pct;
+    let is_below = now.charge_pct < floor_pct;
+    if !was_below && is_below {
+        out.push("below-floor");
+    } else if was_below && !is_below {
+        out.push("at-or-above-floor");
+    }
+    out
+}
+
+/// (#2705) Build a `machine.battery` TRANSITION flow record.
+///
+/// `Level::Warn` only for `below-floor` — the one transition that changes
+/// what the machine will DO (runs refuse to start, and an in-flight run
+/// pauses, per #2706). Going onto battery or back to AC is `Info`: it is
+/// normal laptop life, and warning on it would be the editorializing the
+/// issue rules out.
+fn build_battery_transition_record(
+    transitions: &[&'static str],
+    from: &BatterySample,
+    to: &BatterySample,
+    floor_pct: u8,
+    sampled_at_ms: u64,
+) -> darkmux_flow::FlowRecord {
+    let level = if transitions.contains(&"below-floor") {
+        darkmux_flow::Level::Warn
+    } else {
+        darkmux_flow::Level::Info
+    };
+    let payload = serde_json::json!({
+        "transitions": transitions,
+        "from": darkmux_crew::host_probe::battery_sample_json(from),
+        "to": darkmux_crew::host_probe::battery_sample_json(to),
+        // The floor this crossing was judged against, recorded so a reader
+        // is not left to guess which config was in force at the time.
+        "floor_pct": floor_pct,
+        "floor_field": darkmux_crew::power_policy::FLOOR_FIELD,
+        "sampled_at_ms": sampled_at_ms,
+    });
+    let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level,
+        category: darkmux_flow::Category::Machinery,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: "machine.battery".to_string(),
+        handle: display_name,
+        phase_id: None,
+        session_id: None,
+        source: Some("host-sampler".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
+/// (#2705) Pure edge detector for battery CHARGE transitions — the same
+/// contract [`thermal_edge`] documents, field for field:
+///
+/// - `sample.battery` absent: no transition, known state UNCHANGED.
+/// - No prior state (daemon just started, or a battery just appeared): seed
+///   SILENTLY. A first reading is not a transition — unlike health above,
+///   which is an inventory rather than an edge.
+/// - No qualifying transition: no emit, however much wall-clock passed.
+/// - A qualifying transition: emit, whether or not a gap preceded it.
+fn battery_edge(
+    prev: Option<&BatterySample>,
+    sample: &HostSampleFull,
+    floor_pct: u8,
+    sampled_at_ms: u64,
+) -> (Option<BatterySample>, Option<darkmux_flow::FlowRecord>) {
+    let Some(b) = sample.battery.as_ref() else {
+        return (prev.copied(), None);
+    };
+    let Some(p) = prev else {
+        return (Some(*b), None);
+    };
+    let transitions = battery_transitions(p, b, floor_pct);
+    if transitions.is_empty() {
+        return (Some(*b), None);
+    }
+    let rec = build_battery_transition_record(&transitions, p, b, floor_pct, sampled_at_ms);
+    (Some(*b), Some(rec))
+}
+
 /// Spawn the daemon-side host sampler thread. `interval_ms` is the
 /// resolved `config_access::host_sampler_interval_ms()` cadence; `0`
 /// disables the sampler entirely and this returns `None` without spawning
@@ -410,6 +632,23 @@ pub(crate) fn spawn(
         // (#2111) The known thermal state carried between ticks for
         // `thermal_edge`'s edge detection — see that function's own doc.
         let mut known_thermal_state: Option<String> = None;
+        // (#2705) The battery CHARGE state carried between ticks for
+        // `battery_edge`'s edge detection, and the battery HEALTH reading
+        // carried between POLLS for `battery_health_edge`'s. Two different
+        // clocks on purpose — see the battery module's own doc for why
+        // health on the telemetry cadence would be a kernel read per tick
+        // for a value unchanged since the last thousand.
+        let mut known_battery: Option<BatterySample> = None;
+        let mut known_battery_health: Option<BatteryHealth> = None;
+        // Accumulated MEASURED time since the last health poll, seeded past
+        // the interval so the FIRST tick polls — the issue's "plus one read
+        // at daemon start, so a short-lived daemon still contributes a
+        // reading".
+        let mut ms_since_health_poll: u64 = u64::MAX;
+        // Previous tick's epoch stamp, for that measured gap. `None` on the
+        // first tick, which has no gap to measure and does not need one
+        // (the seed above already makes that tick due).
+        let mut prev_tick_at_ms: Option<u64> = None;
         // (#2413) This thread is a candidate to be the machine's singleton
         // `machine.telemetry` emitter — see the module doc's "one emitter
         // per machine" section. `None` means it currently does NOT hold
@@ -459,6 +698,49 @@ pub(crate) fn spawn(
             known_thermal_state = next_state;
             if let Some(rec) = transition {
                 let _ = darkmux_flow::record(rec);
+            }
+
+            // (#2705) Battery CHARGE transitions — onto battery, back to
+            // AC, and crossing the #2706 floor. Same pure-edge shape as
+            // thermal above, and the same "an absent sample means no
+            // transition" rule: a desktop's permanent `None` emits nothing,
+            // ever.
+            let floor_pct = darkmux_types::config_access::power_min_battery_pct();
+            let (next_battery, battery_transition) =
+                battery_edge(known_battery.as_ref(), &sample, floor_pct, at_ms);
+            known_battery = next_battery;
+            if let Some(rec) = battery_transition {
+                let _ = darkmux_flow::record(rec);
+            }
+
+            // (#2705) Battery HEALTH — polled on its OWN long cadence off
+            // the MEASURED gap between ticks (not a tick count, which would
+            // drift with the configured interval and lie across a host
+            // sleep), and recorded only when a value actually changed.
+            ms_since_health_poll = match prev_tick_at_ms {
+                Some(prev) => ms_since_health_poll.saturating_add(at_ms.saturating_sub(prev)),
+                None => ms_since_health_poll,
+            };
+            prev_tick_at_ms = Some(at_ms);
+            if health_poll_due(ms_since_health_poll, battery::HEALTH_POLL_INTERVAL_MS) {
+                ms_since_health_poll = 0;
+                let (next_health, health_record) = battery_health_edge(
+                    known_battery_health.as_ref(),
+                    battery::health().as_ref(),
+                    battery::HEALTH_POLL_INTERVAL_MS,
+                    at_ms,
+                );
+                known_battery_health = next_health;
+                // The machine-facts surface (`/machine/resources`'s
+                // `battery_health`) is refreshed on every POLL, not only on
+                // an emitted change — a reader asking "what is it now"
+                // should get an answer even when nothing moved.
+                if let Ok(mut slot) = ring.battery_health.lock() {
+                    slot.clone_from(&known_battery_health);
+                }
+                if let Some(rec) = health_record {
+                    let _ = darkmux_flow::record(rec);
+                }
             }
 
             // (found live 2026-09-06) Re-probe liveness on a FIXED PER-TICK
@@ -579,6 +861,263 @@ mod tests {
         }
     }
 
+    // ── #2705: battery charge transitions + the hourly health cadence ──
+
+    fn battery_at(pct: u8, on_ac: bool) -> BatterySample {
+        BatterySample { charge_pct: pct, on_ac, charging: on_ac, minutes_to_empty: None }
+    }
+
+    fn sample_with_battery(b: Option<BatterySample>) -> HostSampleFull {
+        HostSampleFull { battery: b, ..Default::default() }
+    }
+
+    #[test]
+    fn a_machine_with_no_battery_never_emits_a_transition_however_long_it_runs() {
+        // A desktop's permanent `None`. This is the daemon-side half of the
+        // inertness requirement: the always-on hub must not fill the fleet
+        // stream with battery records it has no battery for.
+        let mut known: Option<BatterySample> = None;
+        for tick in 0..50u64 {
+            let (next, rec) = battery_edge(known.as_ref(), &sample_with_battery(None), 50, tick * 5_000);
+            known = next;
+            assert!(rec.is_none(), "tick {tick}: no battery ⇒ no record, ever");
+        }
+        assert!(known.is_none(), "an absent reading must not seed a state");
+    }
+
+    #[test]
+    fn the_first_battery_reading_seeds_silently_because_it_is_not_a_transition() {
+        let (known, rec) = battery_edge(None, &sample_with_battery(Some(battery_at(80, true))), 50, 1_000);
+        assert!(rec.is_none(), "there is nothing to have transitioned FROM");
+        assert_eq!(known.map(|b| b.charge_pct), Some(80), "but the baseline is now known");
+    }
+
+    #[test]
+    fn going_onto_battery_and_back_to_ac_each_emit_once() {
+        let on_ac = battery_at(80, true);
+        let unplugged = battery_at(80, false);
+
+        let (known, rec) = battery_edge(Some(&on_ac), &sample_with_battery(Some(unplugged)), 50, 1_000);
+        let rec = rec.expect("unplugging is a transition");
+        assert_eq!(rec.action, "machine.battery");
+        assert!(
+            matches!(rec.level, darkmux_flow::Level::Info),
+            "normal laptop life is not a warning"
+        );
+        let p = rec.payload.expect("payload");
+        assert_eq!(p["transitions"], serde_json::json!(["to-battery"]));
+        assert_eq!(p["from"]["on_ac"], true);
+        assert_eq!(p["to"]["on_ac"], false);
+
+        // Staying on battery emits nothing, however many ticks pass.
+        let (known, rec) = battery_edge(known.as_ref(), &sample_with_battery(Some(unplugged)), 50, 3_000);
+        assert!(rec.is_none(), "an unchanged state is not a transition");
+
+        let (_, rec) = battery_edge(known.as_ref(), &sample_with_battery(Some(on_ac)), 50, 5_000);
+        let p = rec.expect("replugging is a transition").payload.expect("payload");
+        assert_eq!(p["transitions"], serde_json::json!(["to-ac"]));
+    }
+
+    #[test]
+    fn crossing_the_floor_downward_warns_and_names_the_floor_it_was_judged_against() {
+        let above = battery_at(51, false);
+        let below = battery_at(49, false);
+        let (_, rec) = battery_edge(Some(&above), &sample_with_battery(Some(below)), 50, 1_000);
+        let rec = rec.expect("crossing the floor is a transition");
+        assert!(
+            matches!(rec.level, darkmux_flow::Level::Warn),
+            "below-floor is the one transition that changes what the machine will DO"
+        );
+        let p = rec.payload.expect("payload");
+        assert_eq!(p["transitions"], serde_json::json!(["below-floor"]));
+        assert_eq!(p["floor_pct"], 50);
+        assert_eq!(p["floor_field"], darkmux_crew::power_policy::FLOOR_FIELD);
+    }
+
+    #[test]
+    fn exactly_at_the_floor_is_not_a_crossing_matching_the_gate_that_enforces_it() {
+        // The stream and the gate must agree about where the line is:
+        // `power_policy::start_decision` starts AT the floor, so landing on
+        // it is not "below-floor" here either.
+        let above = battery_at(51, false);
+        let at = battery_at(50, false);
+        let (_, rec) = battery_edge(Some(&above), &sample_with_battery(Some(at)), 50, 1_000);
+        assert!(rec.is_none(), "50 with a floor of 50 has not crossed anything");
+    }
+
+    #[test]
+    fn recovering_past_the_floor_emits_and_is_only_info() {
+        let below = battery_at(20, false);
+        let recovered = battery_at(50, true);
+        let (_, rec) = battery_edge(Some(&below), &sample_with_battery(Some(recovered)), 50, 1_000);
+        let rec = rec.expect("recovery is a transition");
+        assert!(matches!(rec.level, darkmux_flow::Level::Info));
+        let p = rec.payload.expect("payload");
+        // Plugging in and crossing back up happen together and are both named.
+        assert_eq!(p["transitions"], serde_json::json!(["to-ac", "at-or-above-floor"]));
+    }
+
+    #[test]
+    fn an_absent_reading_mid_series_holds_the_known_state_rather_than_resetting_it() {
+        let below = battery_at(20, false);
+        let (known, _) = battery_edge(Some(&battery_at(60, false)), &sample_with_battery(Some(below)), 50, 1_000);
+        let (held, rec) = battery_edge(known.as_ref(), &sample_with_battery(None), 50, 3_000);
+        assert!(rec.is_none());
+        assert_eq!(held.map(|b| b.charge_pct), Some(20), "a failed probe is not evidence anything moved");
+    }
+
+    // ── The hourly health cadence, driven by an INJECTED clock ──
+
+    #[test]
+    fn the_health_poll_is_due_only_once_the_injected_gap_reaches_the_interval() {
+        // Integer-only on purpose: an assertion about an HOURLY cadence
+        // that consulted the wall clock would either take an hour to run or
+        // prove nothing.
+        let hour = battery::HEALTH_POLL_INTERVAL_MS;
+        assert!(!health_poll_due(0, hour));
+        assert!(!health_poll_due(hour - 1, hour), "one millisecond short is not due");
+        assert!(health_poll_due(hour, hour), "exactly at the interval is due");
+        assert!(health_poll_due(hour * 3, hour), "a long gap (a host sleep) is still just due");
+    }
+
+    #[test]
+    fn a_zero_health_interval_means_never_poll_not_poll_continuously() {
+        // The zero-means-off convention `host_sampler_interval_ms` and
+        // `redis.maxlen` already use — a naive `>=` would read it as
+        // "always due", which is the opposite.
+        assert!(!health_poll_due(0, 0));
+        assert!(!health_poll_due(u64::MAX, 0));
+    }
+
+    #[test]
+    fn the_seeded_accumulator_makes_the_first_tick_due_at_daemon_start() {
+        // The issue's "plus one read at daemon start, so a short-lived
+        // daemon still contributes a reading" — expressed in the loop as a
+        // `u64::MAX` seed, pinned here so a later refactor to `0` (the
+        // obvious-looking initial value) is caught.
+        assert!(
+            health_poll_due(u64::MAX, battery::HEALTH_POLL_INTERVAL_MS),
+            "the daemon's first tick must poll rather than wait an hour"
+        );
+    }
+
+    fn health_with(cycles: u64) -> BatteryHealth {
+        BatteryHealth {
+            cycle_count: Some(cycles),
+            design_capacity_mah: Some(6249),
+            raw_max_capacity_mah: Some(5648),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_first_health_reading_is_emitted_because_it_is_an_inventory_not_an_edge() {
+        // The deliberate divergence from `thermal_edge`: a battery whose
+        // numbers never move would otherwise never report its cycle count
+        // at all.
+        let (known, rec) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 1_000);
+        let rec = rec.expect("the first reading IS the machine fact");
+        assert_eq!(rec.action, "machine.battery_health");
+        assert!(
+            matches!(rec.level, darkmux_flow::Level::Info),
+            "inventory numbers are not a verdict"
+        );
+        assert_eq!(known.map(|h| h.cycle_count), Some(Some(26)));
+    }
+
+    #[test]
+    fn an_unchanged_health_reading_emits_nothing_however_many_hours_pass() {
+        let h = health_with(26);
+        let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
+        for hour in 1..=24u64 {
+            let (next, rec) = battery_health_edge(known.as_ref(), Some(&h), 3_600_000, hour * 3_600_000);
+            known = next;
+            assert!(
+                rec.is_none(),
+                "hour {hour}: emitting anyway would add 24 identical rows a day to a stream this \
+                 feature is supposed to keep quiet"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_health_value_emits_with_the_cadence_that_produced_it() {
+        let (known, _) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 0);
+        let (_, rec) = battery_health_edge(known.as_ref(), Some(&health_with(27)), 3_600_000, 3_600_000);
+        let p = rec.expect("a real movement").payload.expect("payload");
+        assert_eq!(p["cycle_count"], 27);
+        assert_eq!(
+            p["poll_interval_ms"], 3_600_000,
+            "the cadence is a RECORDED knob — an artifact must say what produced it"
+        );
+        assert_eq!(p["sampled_at_ms"], 3_600_000, "stamped with when it was observed, not when it was read back");
+        // Both capacity readings ride along, each labeled by its source.
+        assert_eq!(p["raw_capacity_pct"], 90.4);
+        assert!(p.get("nominal_capacity_pct").is_some(), "the other reading is recorded too: {p}");
+    }
+
+    #[test]
+    fn a_failed_health_poll_holds_the_last_known_reading_and_emits_nothing() {
+        let (known, _) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 0);
+        let (held, rec) = battery_health_edge(known.as_ref(), None, 3_600_000, 3_600_000);
+        assert!(rec.is_none(), "an absent reading is not a change");
+        assert_eq!(held.map(|h| h.cycle_count), Some(Some(26)));
+    }
+
+    #[test]
+    fn a_desktop_never_emits_a_health_record_at_all() {
+        let mut known: Option<BatteryHealth> = None;
+        for hour in 0..48u64 {
+            let (next, rec) = battery_health_edge(known.as_ref(), None, 3_600_000, hour * 3_600_000);
+            known = next;
+            assert!(rec.is_none(), "hour {hour}");
+        }
+        assert!(known.is_none());
+    }
+
+    #[test]
+    fn the_snapshot_carries_battery_health_as_a_machine_fact_beside_the_window() {
+        let ring = HostSamplerRing::new();
+        ring.push(entry(0, 50, 60, 70, 5));
+        let v = ring.snapshot().expect("samples present");
+        assert!(v["battery_health"].is_null(), "no health polled yet ⇒ null, never a fabricated block");
+        assert!(
+            v["window"].get("battery_health").is_none(),
+            "health is not a time series and must not sit inside the window reduction"
+        );
+
+        *ring.battery_health.lock().expect("lock") = Some(health_with(26));
+        let v = ring.snapshot().expect("samples present");
+        assert_eq!(v["battery_health"]["cycle_count"], 26);
+        assert_eq!(v["battery_health"]["raw_capacity_pct"], 90.4);
+    }
+
+    #[test]
+    fn the_now_block_carries_charge_and_reads_null_on_a_machine_with_no_battery() {
+        let ring = HostSamplerRing::new();
+        ring.push(RingEntry { at_ms: 0, sample: sample_with_battery(None) });
+        let v = ring.snapshot().expect("samples present");
+        assert!(v["now"]["battery"].is_null(), "not measured must never serialize as a zero");
+
+        let ring = HostSamplerRing::new();
+        ring.push(RingEntry {
+            at_ms: 0,
+            sample: sample_with_battery(Some(BatterySample {
+                charge_pct: 42,
+                on_ac: false,
+                charging: false,
+                minutes_to_empty: None,
+            })),
+        });
+        let v = ring.snapshot().expect("samples present");
+        assert_eq!(v["now"]["battery"]["charge_pct"], 42);
+        assert_eq!(v["now"]["battery"]["on_ac"], false);
+        assert!(
+            v["now"]["battery"]["minutes_to_empty"].is_null(),
+            "no estimate must read null, never 0 — they are opposite claims"
+        );
+    }
+
     #[test]
     fn empty_ring_snapshots_to_none() {
         let ring = HostSamplerRing::new();
@@ -660,6 +1199,14 @@ mod tests {
                     cpu_speed_limit_pct: 100,
                 }),
                 power: Some(PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 0.0 }),
+                // (#2705) A laptop on battery, so the `now` block's charge
+                // half is exercised by this full-shape snapshot test too.
+                battery: Some(BatterySample {
+                    charge_pct: 73,
+                    on_ac: false,
+                    charging: false,
+                    minutes_to_empty: Some(184),
+                }),
             },
         };
         ring.push(mk(0));

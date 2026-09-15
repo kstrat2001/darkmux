@@ -163,6 +163,13 @@ const KEYS: &[(&str, Ty)] = &[
     // (#1230 Packet 1) Max concurrent remote dispatches
     // `darkmux_crew::concurrent_dispatch::run_bounded` runs at once.
     ("remote.concurrent_cap", Ty::Uint),
+    // (#2706) The battery-charge gate. Two separate booleans, one per
+    // decision (start vs in-flight) — see `PowerConfig`'s own doc for why
+    // that is not one mode. A machine with no battery is never gated by
+    // any of them.
+    ("power.min_battery_pct", Ty::Uint),
+    ("power.refuse_start_below_min", Ty::Bool),
+    ("power.pause_running_below_min", Ty::Bool),
     // (#1230 Packet 5) `mission status`'s stale-active drift threshold.
     ("mission.stale_active_days", Ty::Uint),
     // (#1698 Packet B2) The radio interpreter's staffing + persona knobs.

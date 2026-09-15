@@ -33,6 +33,10 @@
 //! window reductions) stays compiled and unit-tested everywhere, so the
 //! logic is covered on any CI host even though the readings are not.
 
+// (#2705) Battery charge (fast, rides this sampler) + battery health
+// (slow, polled hourly by the daemon sampler and recorded only on change).
+// See that module's doc for why the two halves are split.
+pub mod battery;
 pub mod iokit;
 pub mod ioreport;
 pub mod mach_cpu;
@@ -43,6 +47,7 @@ pub mod mach_cpu;
 pub mod power_posture;
 pub mod thermal;
 
+pub use battery::{BatteryHealth, BatterySample};
 pub use thermal::ThermalSample;
 
 // Only used by `attach_cluster_mhz` and its direct unit tests, both
@@ -95,6 +100,14 @@ pub struct HostSampleFull {
     pub gpu_mhz: Option<u32>,
     pub gpu_mem_bytes: Option<u64>,
     pub thermal: Option<ThermalSample>,
+    /// (#2705) Battery CHARGE — the fast half only (percent, AC, charging,
+    /// time-to-empty). `None` on a machine with no battery, which is a
+    /// first-class reading and not a failure: every Mac Studio, mini and
+    /// Pro reports it, and #2706's gate is inert on it by construction.
+    /// Battery HEALTH is deliberately NOT here — it moves over weeks and is
+    /// polled on its own long cadence (`battery::HEALTH_POLL_INTERVAL_MS`),
+    /// never per sample.
+    pub battery: Option<BatterySample>,
     /// `None` on the first sample (an energy delta needs two reads) and
     /// whenever IOReport is unavailable.
     pub power: Option<PowerSample>,
@@ -114,6 +127,11 @@ pub struct HostProbeSources {
     pub freq_tables: bool,
     /// `ProcessInfo.thermalState` + `IOPMCopyCPUPowerStatus`.
     pub thermal: bool,
+    /// (#2705) The `AppleSmartBattery` IORegistry node. **`false` is the
+    /// CORRECT, healthy reading on a desktop** — it distinguishes "this Mac
+    /// has no battery" from "darkmux forgot to read it", which is exactly
+    /// the distinction #2706's gate depends on.
+    pub battery: bool,
     /// The `IOAccelerator` IORegistry node (GPU utilization + memory).
     pub ioreg_gpu: bool,
 }
@@ -185,12 +203,58 @@ pub fn sample_full_json(s: &HostSampleFull, sampled_at_ms: u64) -> serde_json::V
             "state": t.state,
             "cpu_speed_limit_pct": t.cpu_speed_limit_pct,
         })),
+        // (#2705) The CHARGE half only. `null` on a machine with no
+        // battery — the same "not measured" vs "measured, and zero"
+        // distinction this function's own doc draws, and the one #2706's
+        // gate reads as "inert" rather than as 0%.
+        "battery": s.battery.as_ref().map(battery_sample_json),
         "power_mw": s.power.as_ref().map(|p| serde_json::json!({
             "cpu": p.cpu_mw.round() as i64,
             "gpu": p.gpu_mw.round() as i64,
             "ane": p.ane_mw.round() as i64,
             "total": p.total_mw().round() as i64,
         })),
+    })
+}
+
+/// (#2705) One battery CHARGE reading's wire shape. Extracted so the two
+/// consumers that render it — `sample_full_json` above (the telemetry ring
+/// and `machine.telemetry`) and `darkmux-serve`'s `machine.battery`
+/// transition record — cannot drift into two spellings of one reading.
+///
+/// `minutes_to_empty` serializes as JSON `null` whenever the OS declines to
+/// estimate; see [`battery::minutes_to_empty_from`] for why that must never
+/// become a zero.
+pub fn battery_sample_json(b: &BatterySample) -> serde_json::Value {
+    serde_json::json!({
+        "charge_pct": b.charge_pct,
+        "on_ac": b.on_ac,
+        "charging": b.charging,
+        "minutes_to_empty": b.minutes_to_empty,
+    })
+}
+
+/// (#2705) One battery HEALTH reading's wire shape — the MACHINE-RECORD
+/// half, emitted only when a value actually changed (see
+/// `battery::HEALTH_POLL_INTERVAL_MS`), never per telemetry sample.
+///
+/// Both capacity ratios ride alongside the raw mAh counters they were
+/// derived from, each under a name that says WHICH reading it is. See the
+/// battery module's own doc for the measurement behind that: macOS's
+/// displayed figure reproduces from neither pair, so darkmux records what
+/// it read and does not synthesize the third.
+pub fn battery_health_json(h: &BatteryHealth) -> serde_json::Value {
+    serde_json::json!({
+        "cycle_count": h.cycle_count,
+        "design_capacity_mah": h.design_capacity_mah,
+        "raw_max_capacity_mah": h.raw_max_capacity_mah,
+        "nominal_charge_capacity_mah": h.nominal_charge_capacity_mah,
+        "raw_capacity_pct": h.raw_capacity_pct(),
+        "nominal_capacity_pct": h.nominal_capacity_pct(),
+        "condition": h.condition,
+        "temperature_c": h.temperature_c,
+        "time_at_soc_hours": h.time_at_soc_hours,
+        "total_operating_time_hours": h.total_operating_time_hours,
     })
 }
 
@@ -488,6 +552,7 @@ impl HostProbe {
         let sources = HostProbeSources {
             mach: mach_cpu::per_core_ticks().is_some(),
             thermal: thermal::sample().is_some(),
+            battery: battery::sample().is_some(),
             ioreg_gpu: platform::gpu_read().is_some(),
             ..Default::default()
         };
@@ -618,6 +683,9 @@ impl HostProbe {
             gpu_mhz,
             gpu_mem_bytes: gpu.and_then(|g| g.1),
             thermal: thermal::sample(),
+            // (#2705) The fast half only — one IORegistry walk, ~1 ms. The
+            // slow half (health) is NOT read here; see the field's doc.
+            battery: battery::sample(),
             power,
         }
     }

@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.22",
+  "schema_version": "1.23",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -45,6 +45,11 @@
   "remote": {
     "max_tokens_per_execution": 500000,
     "concurrent_cap": 1
+  },
+  "power": {
+    "min_battery_pct": 50,
+    "refuse_start_below_min": true,
+    "pause_running_below_min": true
   },
   "mission": {
     "stale_active_days": 14

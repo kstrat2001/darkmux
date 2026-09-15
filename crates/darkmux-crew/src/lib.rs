@@ -114,6 +114,14 @@ pub mod mods;
 // retired the same way once coder-phase's own launch went fully
 // config-driven; `mission_config::interpret` is the only path left.
 pub mod mission_config;
+// (#2706) The pace file `<host_out>/pace.json` — path, wire shape, atomic
+// write. Promoted out of `thermal_governor` when the battery governor
+// became its second writer; see the module doc.
+pub mod pace_file;
+// (#2706) The battery-charge policy — refuse to START below the operator's
+// floor, and PAUSE a run in flight that crosses it. Consumes #2705's charge
+// telemetry. A machine with NO battery is never gated; see the module doc.
+pub mod power_policy;
 // (#1877 first extraction) The shared remote-token-bucket type — the
 // promotion of what was two hand-copied buckets (`step_kinds::MapRemoteBucket`
 // and `darkmux-lab`'s own `RemoteBucket`) into one public home both the

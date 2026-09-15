@@ -29,7 +29,8 @@
 //! deferred.
 
 use anyhow::{bail, Result};
-use darkmux_crew::host_probe::power_posture;
+use darkmux_crew::host_probe::{battery, power_posture, BatterySample};
+use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
 use darkmux_types::style;
 
 /// Read a `force=true` entry out of a launcher's raw `--param key=value`
@@ -49,7 +50,48 @@ fn force_requested(params: &[String]) -> bool {
 pub fn check_power_posture(params: &[String]) -> Result<()> {
     let force = force_requested(params);
     let p = power_posture::sample_for_preflight();
-    evaluate(&p, force)
+    evaluate(&p, force)?;
+    // (#2706) The battery-charge gate, on the SAME pre-flight surface and
+    // honoring the SAME `--force` escape as the thermal refusal above.
+    //
+    // Reads the in-process battery probe (#2705) rather than
+    // `PowerPosture::battery_pct`: that field comes from a `pmset -g ps`
+    // spawn and parses a human sentence, and — decisively for this gate —
+    // it cannot distinguish "no battery" from "the spawn failed", which is
+    // exactly the distinction the whole feature turns on. The IOKit read
+    // answers `None` for "this Mac has no battery" and nothing else.
+    evaluate_battery_floor(battery::sample().as_ref(), &PowerPolicyConfig::from_env(), force)
+}
+
+/// The pure battery-floor decision, split out for the same reason
+/// [`evaluate`] is: every case the issue names is table-tested without a
+/// real battery on the test host, and deleting the refusal is provably red
+/// rather than leaving every suite green.
+///
+/// `battery: None` — a machine with no battery — proceeds, always. That
+/// rule lives in `power_policy::start_decision`, not here, so a second
+/// caller cannot reimplement it differently.
+fn evaluate_battery_floor(
+    battery: Option<&BatterySample>,
+    cfg: &PowerPolicyConfig,
+    force: bool,
+) -> Result<()> {
+    let StartDecision::Refuse(refusal) = power_policy::start_decision(battery, cfg) else {
+        return Ok(());
+    };
+    if force {
+        eprintln!(
+            "{}",
+            style::warn(&format!(
+                "--force set: starting anyway at {}% battery ({} is {}%)",
+                refusal.observed_pct,
+                power_policy::FLOOR_FIELD,
+                refusal.floor_pct
+            ))
+        );
+        return Ok(());
+    }
+    bail!("{}", refusal.message());
 }
 
 /// The pure decision: print the warnings, and refuse (unless `force`)
@@ -230,6 +272,95 @@ mod tests {
         assert!(msg.contains("mission launch <config-id> --force"), "{msg}");
         assert!(msg.contains("mission launch crawl --force"), "{msg}");
         assert!(msg.contains("mission propose --start"), "{msg}");
+    }
+
+    // ── #2706: the battery-charge gate, every case the issue names.
+    //    Table-tested through `evaluate_battery_floor` — the same split
+    //    `evaluate` uses — so a real battery is never needed and deleting
+    //    the `bail!` is provably red. ──
+
+    fn power_cfg(floor: u8, refuse_start: bool) -> PowerPolicyConfig {
+        PowerPolicyConfig {
+            min_battery_pct: floor,
+            refuse_start_below_min: refuse_start,
+            // Irrelevant to the START decision — and that irrelevance is
+            // itself the point of the two knobs being separate.
+            pause_running_below_min: true,
+        }
+    }
+
+    fn battery_at(pct: u8) -> BatterySample {
+        BatterySample { charge_pct: pct, on_ac: false, charging: false, minutes_to_empty: Some(90) }
+    }
+
+    #[test]
+    fn a_machine_with_no_battery_is_never_gated_by_the_pre_flight() {
+        // The always-on hub is a desktop. If absence read as 0% it would
+        // refuse every launch on that machine, forever.
+        for floor in [0, 50, 100] {
+            assert!(
+                evaluate_battery_floor(None, &power_cfg(floor, true), false).is_ok(),
+                "floor={floor}: a machine with no battery must start"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pre_flight_gate_is_live_so_no_battery_is_inertness_not_a_dead_gate() {
+        // The other direction: absence read as 100% would silently disable
+        // the gate on the one machine it protects. Proven by contrast — the
+        // SAME config that passes on `None` refuses on a real low reading.
+        let cfg = power_cfg(50, true);
+        assert!(evaluate_battery_floor(None, &cfg, false).is_ok());
+        assert!(
+            evaluate_battery_floor(Some(&battery_at(49)), &cfg, false).is_err(),
+            "the gate must actually refuse here, or the `None` case above proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_pre_flight_gate_refuses_below_the_floor_and_starts_at_or_above_it() {
+        let cfg = power_cfg(50, true);
+        assert!(evaluate_battery_floor(Some(&battery_at(49)), &cfg, false).is_err(), "one below refuses");
+        assert!(evaluate_battery_floor(Some(&battery_at(50)), &cfg, false).is_ok(), "exactly at the floor starts");
+        assert!(evaluate_battery_floor(Some(&battery_at(51)), &cfg, false).is_ok(), "one above starts");
+    }
+
+    #[test]
+    fn the_start_policy_switched_off_lets_a_drained_machine_start() {
+        assert!(evaluate_battery_floor(Some(&battery_at(2)), &power_cfg(50, false), false).is_ok());
+    }
+
+    #[test]
+    fn force_starts_below_the_floor_the_same_way_it_does_past_a_thermal_refusal() {
+        assert!(evaluate_battery_floor(Some(&battery_at(2)), &power_cfg(50, true), true).is_ok());
+    }
+
+    #[test]
+    fn the_battery_refusal_names_the_charge_the_floor_and_the_field_that_decided() {
+        let err = evaluate_battery_floor(Some(&battery_at(31)), &power_cfg(50, true), false)
+            .expect_err("31% below a floor of 50 must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("31%"), "{msg}");
+        assert!(msg.contains("50%"), "{msg}");
+        assert!(msg.contains(power_policy::FLOOR_FIELD), "{msg}");
+        assert!(msg.contains(power_policy::START_POLICY_FIELD), "{msg}");
+    }
+
+    #[test]
+    fn the_pre_flight_calls_the_battery_gate_at_all() {
+        // (#2112's own precedent, applied here) A wiring fact no unit test
+        // can reach without a real battery and a real launch: deleting the
+        // call from `check_power_posture` leaves every behavioral test above
+        // green, because they all drive `evaluate_battery_floor` directly.
+        // So the WIRING gets a physical source check, same as the
+        // sleep-assertion one below.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("src/preflight.rs")).expect("read source");
+        assert!(
+            text.contains("evaluate_battery_floor(battery::sample().as_ref()"),
+            "check_power_posture must actually call the battery gate with the IOKit probe"
+        );
     }
 
     // ── #2112 review finding 1 (+ second-pass finding A): every
