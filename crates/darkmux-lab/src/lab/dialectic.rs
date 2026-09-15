@@ -1252,7 +1252,17 @@ mod tests {
 
     #[test]
     fn rebuttal_quote_verified_against_workdir_file_or_voided() {
-        let root = std::env::temp_dir().join(format!("dmx-dialectic-test-{}", std::process::id()));
+        // (#2707) These three tests each built `$TMPDIR/<name>-<pid>` by
+        // hand and removed it on the LAST LINE of the test — which is a
+        // cleanup that runs only when everything passed. A failing
+        // assertion, or nextest's `terminate-after` killing the process,
+        // left the directory behind. The helper owns the same path
+        // instead: one directory per prefix per process, removed at exit
+        // however the test ended, and swept by the next process if this
+        // one was killed before it could. The trailing `remove_dir_all`
+        // is gone rather than kept alongside — two owners for one path is
+        // how a memoized handle ends up pointing at something deleted.
+        let root = darkmux_types::test_isolation::process_scratch_dir("dmx-dialectic-test");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("src/intake.ts"),
@@ -1293,7 +1303,6 @@ mod tests {
         let mut again = rebuttals.clone();
         again.iter_mut().for_each(|r| r.voided = false);
         assert_eq!(validate_rebuttal_quotes(&mut again, &charges, DIFF, None), 0);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── excerpts ──────────────────────────────────────────────────────
@@ -1398,8 +1407,8 @@ mod tests {
             body: "b".into(),
             struck: false,
         }];
-        let root = std::env::temp_dir().join(format!("dmx-fence-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // (#2707) Owned by the helper — see the sibling call above.
+        let root = darkmux_types::test_isolation::process_scratch_dir("dmx-fence-test");
         // Honest: one real inline span (verbatim from the diff) + a folded
         // fenced block whose content is NOT a verbatim line anywhere.
         let mut rebuttals = vec![
@@ -1428,7 +1437,6 @@ mod tests {
             "fence content must not manufacture unverifiable spans"
         );
         assert!(rebuttals[1].voided);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Shakedown-1+3 regression (#1222): defenders write the file reference
@@ -1446,8 +1454,8 @@ mod tests {
             body: "b".into(),
             struck: false,
         }];
-        let root = std::env::temp_dir().join(format!("dmx-path-span-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // (#2707) Owned by the helper — see the sibling call above.
+        let root = darkmux_types::test_isolation::process_scratch_dir("dmx-path-span");
         let mut rebuttals = vec![Rebuttal {
             charge: 1,
             stance: Stance::Refute,
@@ -1464,7 +1472,6 @@ mod tests {
              real citation validates"
         );
         assert!(!rebuttals[0].voided);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── synthesis + the full chain ────────────────────────────────────

@@ -138,6 +138,15 @@ impl Default for LocalFileSink {
 /// pattern. Only the FALLBACK tier changes: instead of the operator's
 /// real flows dir, a per-process temp dir
 /// (`$TMPDIR/darkmux-flow-test-<pid>`), created once per test binary.
+///
+/// (#2707) That directory used to be created here by hand and never
+/// removed, so every test process this repo has ever run left one
+/// behind — 8,263 of them on one developer machine, the single largest
+/// population in its temp root. The NAME is unchanged; only the
+/// ownership is. `process_scratch_dir` hands back the same
+/// `$TMPDIR/darkmux-flow-test-<pid>` and takes responsibility for
+/// removing it, at exit and — for a process that was killed before it
+/// could unwind — on the next test process's way in.
 fn local_sink_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
     {
@@ -155,10 +164,7 @@ fn local_sink_dir() -> PathBuf {
             static DIR: OnceLock<PathBuf> = OnceLock::new();
             return DIR
                 .get_or_init(|| {
-                    let dir = std::env::temp_dir()
-                        .join(format!("darkmux-flow-test-{}", std::process::id()));
-                    let _ = std::fs::create_dir_all(&dir);
-                    dir
+                    darkmux_types::test_isolation::process_scratch_dir("darkmux-flow-test")
                 })
                 .clone();
         }

@@ -362,6 +362,227 @@ impl Drop for IsolatedState {
     }
 }
 
+// ─── (#2707) Per-process scratch directories that do not accumulate ───
+//
+// A test process that pins nothing still needs somewhere to write. Five
+// sites answered that the same way — `$TMPDIR/<name>-<pid>`, created by
+// hand, never removed — and the result was measured on one developer
+// machine as 12,745 entries in the temp directory, 8,263 of them from
+// `darkmux-flow-test-<pid>` alone and 297 from `darkmux-cli-tests-<pid>`,
+// each of the latter holding a whole isolated `$HOME` tree.
+//
+// Disk is the least of it. Every create and delete flows through the OS
+// filesystem-event daemon that feeds the desktop index, so an unbounded
+// tree is a permanent background cost on an indexed volume; per-pid
+// naming makes collisions unlikely rather than impossible; and — the one
+// that actually cost review time — a leak audit that counts files under
+// `~/.darkmux` and reports zero is scoped to two directories, not to "no
+// test wrote anywhere it should not have". This whole population is
+// invisible to exactly that method.
+//
+// The fallback is not the bug, so it is not removed. What is removed is
+// the abandonment.
+
+/// Every per-process scratch directory this process has handed out, keyed
+/// by prefix.
+///
+/// Doubles as the memo (one directory per prefix per process, so repeated
+/// calls are stable and cheap) and as the removal list
+/// [`remove_registered_scratch_dirs`] walks at exit.
+static SCRATCH_DIRS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn scratch_dirs() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, PathBuf>> {
+    SCRATCH_DIRS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Remove every scratch directory this process registered.
+///
+/// Registered once with `atexit(3)`, so it runs when the process ends
+/// normally — `main` returning, or `std::process::exit`.
+///
+/// # Why not `Drop`
+///
+/// There is no value to drop. The directory has to outlive every caller
+/// (a `LocalFileSink` resolves it per record write, for the whole life of
+/// the test binary), so it lives in a `static` — and Rust never runs
+/// destructors for statics. A `Drop` guard here would be a guard that
+/// never fires, which is worse than none: it reads like cleanup.
+///
+/// # Why `atexit` is not enough on its own
+///
+/// A process killed hard never reaches its exit handlers, and in this
+/// repo that is routine rather than hypothetical: `.config/nextest.toml`
+/// sets a per-test `terminate-after`, which exists precisely to kill a
+/// hung test process, and CLAUDE.md records it firing twice. So the
+/// creation path also sweeps siblings whose owning process is gone (see
+/// [`sweep_dead_siblings`]). The two halves cover different failures:
+/// `atexit` makes the common case immediate, the sweep makes the
+/// population bounded no matter how a process died — and drains whatever
+/// backlog a machine already carries.
+///
+/// `try_lock`, never `lock`: a deadlock during process teardown would
+/// hang the test binary, which is a far worse outcome than one directory
+/// surviving until the next run sweeps it.
+extern "C" fn remove_registered_scratch_dirs() {
+    let Some(registry) = SCRATCH_DIRS.get() else {
+        return;
+    };
+    let Ok(dirs) = registry.try_lock() else {
+        return;
+    };
+    for dir in dirs.values() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Does a process with this id exist?
+///
+/// `kill(pid, 0)` delivers no signal — POSIX defines signal 0 as an
+/// existence-and-permission probe. Three answers, and only one of them
+/// means "gone":
+///
+/// * `0` — the process exists and we may signal it.
+/// * `EPERM` — the process exists and belongs to another user. Alive, and
+///   emphatically not ours to clean up after.
+/// * `ESRCH` — no such process.
+///
+/// Anything unexpected is treated as alive, because the conservative
+/// direction here is to keep a directory, never to remove one.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 performs no delivery. `pid` is checked
+    // `> 0` by the caller, so this can never address a process GROUP
+    // (`kill(0, …)`) or every process (`kill(-1, …)`).
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// No portable existence probe off unix, so nothing is ever swept there:
+/// the `atexit` half still runs, and a leftover is left alone rather than
+/// removed on a guess.
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: i32) -> bool {
+    true
+}
+
+/// Remove `<prefix>-<pid>` directories in the temp root whose owning
+/// process is gone.
+///
+/// Deliberately narrow, because this deletes things:
+///
+/// * the name must be EXACTLY `<prefix>-<all ascii digits>`, so
+///   `darkmux-flow-test-123` matches while `darkmux-flow-test-123-keep`
+///   and `darkmux-flow-testing-1` do not;
+/// * the pid must be `> 0` (never a process-group or broadcast id) and
+///   must not be our own;
+/// * the process must be provably gone, not merely unreachable;
+/// * the entry must be a real directory, not a symlink wearing the
+///   right name.
+///
+/// Pid reuse resolves in the safe direction: a recycled pid now belonging
+/// to an unrelated live process reads as alive, so the directory is kept
+/// rather than removed.
+fn sweep_dead_siblings(prefix: &str) {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(prefix).and_then(|r| r.strip_prefix('-')) else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = rest.parse::<i32>() else { continue };
+        if pid <= 0 || pid as u32 == me || pid_is_alive(pid) {
+            continue;
+        }
+        // A REAL directory, never a symlink to one. The name is
+        // predictable ahead of creation, so a symlink planted at it would
+        // turn this into a recursive delete of whatever it points at —
+        // the same pre-planted-name hazard #2158 closed on the dispatch
+        // out-dir. `DirEntry::file_type` describes the entry itself, not
+        // its target, so a symlink fails this test and is skipped.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// A scratch directory under the system temp root, owned by this process
+/// and cleaned up after it.
+///
+/// Returns `$TMPDIR/<prefix>-<pid>` — the same name the five hand-rolled
+/// call sites this replaces produced, so nothing downstream had to learn
+/// a new path — created if absent, memoized per prefix, and removed
+/// again by the two mechanisms described on
+/// [`remove_registered_scratch_dirs`].
+///
+/// # Contract
+///
+/// * **Test-only.** The module is `#[cfg(any(test, feature =
+///   "test-support"))]`, so this cannot be reached from a release build.
+///   A production path that wants a temp directory wants a different
+///   thing: a dispatch's out-dir holds the run's prompt, trajectory and
+///   checkpoint, and is kept ON PURPOSE.
+/// * **Best effort on creation**, matching every site it replaces: a temp
+///   root that cannot be written is already a broken environment, and a
+///   panic on the flow sink's per-record resolve path would be a worse
+///   failure than the write error the caller already handles.
+/// * **The directory starts empty.** A recycled pid can land on a name a
+///   long-dead process left behind — the sweep only removes what it can
+///   prove is dead, and a name whose pid is now OURS is never swept — so
+///   the existing tree is removed before creation rather than reused.
+///
+/// # Panics
+///
+/// On a prefix that is empty or carries anything but ASCII alphanumerics,
+/// `-` and `_`. The prefix is a literal at every call site, so this is a
+/// compile-time-shaped mistake caught at the first call; a prefix
+/// carrying `/` or `..` would make the sweep's name matching mean
+/// something other than what its doc says.
+pub fn process_scratch_dir(prefix: &str) -> PathBuf {
+    assert!(
+        !prefix.is_empty()
+            && prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "a scratch-dir prefix must be a non-empty run of ASCII alphanumerics, `-` and `_`; \
+         got {prefix:?}"
+    );
+
+    // A poisoned registry is not a reason to stop cleaning up: the map
+    // holds paths, and a panic elsewhere cannot have left one half-built.
+    let mut registry = scratch_dirs().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = registry.get(prefix) {
+        return dir.clone();
+    }
+
+    static ATEXIT: std::sync::Once = std::sync::Once::new();
+    ATEXIT.call_once(|| {
+        // SAFETY: `atexit` takes an `extern "C" fn()` and this one only
+        // removes paths this process itself registered above. Registered
+        // AFTER `scratch_dirs()` has initialized the `OnceLock`, so the
+        // handler's `SCRATCH_DIRS.get()` can never be `None` at exit.
+        unsafe {
+            libc::atexit(remove_registered_scratch_dirs);
+        }
+    });
+
+    sweep_dead_siblings(prefix);
+
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    registry.insert(prefix.to_string(), dir.clone());
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +884,286 @@ mod tests {
                     None => std::env::remove_var(var),
                 }
             }
+        }
+    }
+
+    // ─── (#2707) process_scratch_dir ──────────────────────────────────
+
+    /// Remove a set of temp-root fixtures however the test ends.
+    ///
+    /// The sweep tests have to plant their fixtures as SIBLINGS in the
+    /// real temp root — that is the only place the sweep looks — and the
+    /// ones they plant to prove a name is SPARED are, by construction,
+    /// names nothing will ever collect. A plain removal on the last line
+    /// is the exact shape #2707 is about: it runs only when the test
+    /// passed. Measured while building this module: a red run left
+    /// `<prefix>-+<pid>` and `<prefix>-victim-<pid>` behind.
+    struct TempFixtures(Vec<PathBuf>);
+
+    impl TempFixtures {
+        fn dir(&mut self, path: PathBuf) -> PathBuf {
+            std::fs::create_dir_all(&path).unwrap();
+            self.0.push(path.clone());
+            path
+        }
+
+        fn track(&mut self, path: PathBuf) -> PathBuf {
+            self.0.push(path.clone());
+            path
+        }
+    }
+
+    impl Drop for TempFixtures {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                // `remove_dir_all` does not follow a symlink, and a
+                // planted one has to go too.
+                if std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(path);
+                } else {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+    }
+
+    /// A prefix no other test in this binary uses, so each case gets its
+    /// own memo slot and its own directory.
+    fn unique_prefix(label: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!("darkmux-scratch-selftest-{label}-{}", N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The point of the fallback, asserted: a process that pinned nothing
+    /// still has somewhere real to write.
+    ///
+    /// This is the half an over-eager cleanup breaks. A fix that removed
+    /// the directory too early — or never created it — would leave the
+    /// flow sink writing into a path that does not exist, and a sink
+    /// whose writes all fail looks exactly like a test with nothing to
+    /// say. So existence, writability and readback are all asserted, not
+    /// just the returned path.
+    #[test]
+    #[serial_test::serial]
+    fn the_scratch_dir_exists_and_is_actually_writable() {
+        let prefix = unique_prefix("writable");
+        let dir = process_scratch_dir(&prefix);
+
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "the scratch dir must live under the temp root, got {}",
+            dir.display()
+        );
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(format!("{prefix}-{}", std::process::id()).as_str()),
+            "the name is `<prefix>-<pid>` — the five call sites this replaces all built that \
+             name by hand, and downstream fixtures were written against it"
+        );
+        assert!(dir.is_dir(), "the scratch dir must exist on disk, not merely be named");
+
+        let probe = dir.join("probe.jsonl");
+        std::fs::write(&probe, b"{}\n").expect("the scratch dir must accept a write");
+        assert_eq!(std::fs::read(&probe).unwrap(), b"{}\n");
+    }
+
+    /// One directory per prefix per process — the memo — and different
+    /// prefixes are genuinely different directories.
+    #[test]
+    #[serial_test::serial]
+    fn the_scratch_dir_is_memoized_per_prefix() {
+        let a = unique_prefix("memo");
+        let b = unique_prefix("memo");
+
+        assert_eq!(
+            process_scratch_dir(&a),
+            process_scratch_dir(&a),
+            "repeated calls with one prefix must return the same directory — the flow sink \
+             resolves this per record write"
+        );
+        assert_ne!(
+            process_scratch_dir(&a),
+            process_scratch_dir(&b),
+            "two prefixes must not share a directory"
+        );
+    }
+
+    /// The recycled-pid clause: a leftover tree at this process's own name
+    /// is removed before the directory is handed out, never reused.
+    #[test]
+    #[serial_test::serial]
+    fn a_recycled_pids_leftovers_are_cleared_rather_than_reused() {
+        let prefix = unique_prefix("recycled");
+        let planted =
+            std::env::temp_dir().join(format!("{prefix}-{}", std::process::id())).join("stale");
+        std::fs::create_dir_all(&planted).unwrap();
+        // The parent here IS `<prefix>-<pid>`, which the helper registers
+        // and removes at exit, so no extra tracking is needed.
+        std::fs::write(planted.join("old.jsonl"), b"records from a dead process\n").unwrap();
+
+        let dir = process_scratch_dir(&prefix);
+
+        assert!(dir.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a directory handed out with a previous process's records still in it would make \
+             a test read another run's data as its own"
+        );
+    }
+
+    /// The sweep, both directions at once: a directory whose owning
+    /// process is gone is removed, and one whose process is alive is not.
+    ///
+    /// `pid 1` is the live case deliberately — it is always running and
+    /// belongs to root, so `kill(1, 0)` answers `EPERM` rather than `0`.
+    /// That is the branch a naive `== 0` existence check gets wrong, and
+    /// getting it wrong means deleting a live process's directory.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn the_sweep_removes_a_dead_pids_dir_and_spares_a_live_ones() {
+        let prefix = unique_prefix("sweep");
+        let tmp = std::env::temp_dir();
+
+        // Two pids that are definitively gone: spawn, wait, reap.
+        let reaped = || {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawning a throwaway child");
+            let pid = child.id();
+            child.wait().expect("reaping the throwaway child");
+            pid
+        };
+        let dead_pid = reaped();
+        let planted_pid = reaped();
+
+        let mut fixtures = TempFixtures(Vec::new());
+        let dead_dir = fixtures.dir(tmp.join(format!("{prefix}-{dead_pid}")));
+        let live_dir = fixtures.dir(tmp.join(format!("{prefix}-1")));
+        // `<prefix>-+<dead pid>`: the case the explicit all-digits name
+        // check is FOR. `"+123".parse::<i32>()` succeeds and yields 123,
+        // so a parse-only rule would read this as the dead pid and delete
+        // a directory whose name this helper never produces and does not
+        // own. Measured: with the all-digits check deleted, this is the
+        // only assertion in the module that goes red.
+        let signed_dead_dir = fixtures.dir(tmp.join(format!("{prefix}-+{dead_pid}")));
+
+        // A SYMLINK wearing a dead pid's name. The name is predictable
+        // ahead of creation, so this is the pre-planted-name hazard
+        // #2158 closed on the dispatch out-dir, arriving at the sweep:
+        // following it would recursively delete whatever it points at.
+        let victim = fixtures.dir(tmp.join(format!("{prefix}-victim-{planted_pid}")));
+        std::fs::write(victim.join("precious.txt"), b"do not delete\n").unwrap();
+        let planted = fixtures.track(tmp.join(format!("{prefix}-{planted_pid}")));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        assert!(!pid_is_alive(dead_pid as i32), "sanity: the reaped child must read as gone");
+        assert!(
+            pid_is_alive(1),
+            "sanity: pid 1 must read as alive — it answers EPERM, not 0, and treating EPERM \
+             as 'gone' would delete a live process's scratch dir"
+        );
+
+        process_scratch_dir(&prefix);
+
+        assert!(
+            !dead_dir.exists(),
+            "the dead process's directory must be swept: {}",
+            dead_dir.display()
+        );
+        assert!(
+            live_dir.is_dir(),
+            "a live process's directory must be left alone: {}",
+            live_dir.display()
+        );
+        assert!(
+            signed_dead_dir.is_dir(),
+            "the name must be EXACTLY `<prefix>-<digits>`; a `+`-signed tail parses as a pid \
+             but is not a name this helper writes: {}",
+            signed_dead_dir.display()
+        );
+
+        assert!(
+            std::fs::symlink_metadata(&planted).unwrap().file_type().is_symlink(),
+            "a symlink at a dead pid's name must be left exactly as it was, never followed"
+        );
+        assert!(
+            victim.join("precious.txt").exists(),
+            "the symlink's target must be untouched — nothing was ever deleted through it"
+        );
+    }
+
+    /// The sweep deletes things, so its name matching is asserted to be
+    /// exact rather than prefix-ish. Both shapes here would be destroyed
+    /// by a `starts_with`-only match, and neither belongs to this helper.
+    #[test]
+    #[serial_test::serial]
+    fn the_sweep_spares_names_that_merely_begin_with_the_prefix() {
+        let prefix = unique_prefix("exactness");
+        let tmp = std::env::temp_dir();
+        let mut fixtures = TempFixtures(Vec::new());
+
+        // `<prefix>-<digits>-<something>`: a dead pid in the name, but a
+        // tail that says this is not one of ours.
+        let suffixed = fixtures.dir(tmp.join(format!("{prefix}-1-keepme")));
+        // `<prefix><more>-<digits>`: a different prefix that happens to
+        // start with the same bytes.
+        let extended = fixtures.dir(tmp.join(format!("{prefix}extra-1")));
+        // A digit-free tail.
+        let worded = fixtures.dir(tmp.join(format!("{prefix}-notapid")));
+
+        process_scratch_dir(&prefix);
+
+        for d in [&suffixed, &extended, &worded] {
+            assert!(d.is_dir(), "the sweep must not touch {}", d.display());
+        }
+    }
+
+    /// The exit handler's body, exercised directly.
+    ///
+    /// `atexit` firing is not observable from inside the process that
+    /// registered it, so this asserts the half that is: given a
+    /// registered directory, the handler removes it. That the handler is
+    /// REGISTERED is held by `process_scratch_dir`'s `Once` above; that
+    /// it actually fires was measured by counting directories in the temp
+    /// root before and after a real test run (see the PR).
+    #[test]
+    #[serial_test::serial]
+    fn the_exit_handler_removes_every_registered_directory() {
+        let prefix = unique_prefix("atexit");
+        let dir = process_scratch_dir(&prefix);
+        std::fs::write(dir.join("some.jsonl"), b"{}\n").unwrap();
+        assert!(dir.is_dir(), "sanity: the directory exists before the handler runs");
+
+        remove_registered_scratch_dirs();
+
+        assert!(
+            !dir.exists(),
+            "the exit handler must remove a registered directory and everything under it: {}",
+            dir.display()
+        );
+    }
+
+    /// A prefix that could make the sweep's name matching mean something
+    /// other than what its doc says is refused at the first call, not
+    /// quietly accepted.
+    #[test]
+    fn a_path_bearing_prefix_is_refused() {
+        for bad in ["", "../escape", "with/slash", "with space"] {
+            let err = std::panic::catch_unwind(|| process_scratch_dir(bad)).unwrap_err();
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("scratch-dir prefix"),
+                "a refused prefix must say why; got {msg:?} for {bad:?}"
+            );
         }
     }
 }
