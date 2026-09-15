@@ -122,6 +122,30 @@ export function useFleetRoster(enabled = true): FleetRosterResult {
   }, [query.data]);
 }
 
+/** `useFleetCoverage`'s return shape — the server's own coverage report,
+ * PLUS whether the read that should have produced it even got an answer.
+ * See that hook's doc. */
+export interface FleetCoverageResult {
+  /** The daemon's `meta`, or `null` when there isn't one to report — still
+   * pending, or the read failed (`unreadable` below is what says which). */
+  meta: CoverageMeta | null;
+  /** (#2683) The presence READ itself failed — the daemon is unreachable,
+   * answered non-2xx, or sent something that wasn't JSON. Distinct from
+   * `meta.sources.fleet.state === "unavailable"`, which is the daemon
+   * successfully REPORTING that IT could not reach the fleet substrate.
+   *
+   * This is reported as its own field rather than synthesized into `meta`:
+   * the contract below is that this hook never invents a coverage state, and
+   * a transport failure is the caller's to interpret. What it must not do
+   * any more is vanish — `fetchJson` returns a discriminated result rather
+   * than throwing, so a failed poll is a SUCCESSFUL query whose data says
+   * `ok:false` (the #1812 shape), TanStack replaces the last good payload
+   * with it, and every consumer of the beats sees exactly what a genuinely
+   * empty fleet looks like. Silently reading "presence says nobody is here"
+   * off a read that never happened is the whole of #2683. */
+  unreadable: boolean;
+}
+
 /**
  * The COVERAGE half of the same presence query (#1729) — whether the fleet
  * substrate could actually be read, as opposed to being genuinely quiet.
@@ -130,18 +154,24 @@ export function useFleetRoster(enabled = true): FleetRosterResult {
  * that only want the beats are untouched. It shares the query key, so this
  * costs no extra request: TanStack serves both from one cache entry.
  *
- * Returns `null` while pending or on a transport failure — the caller's own
- * pending/error handling owns those, and inventing a state here would be the
- * fabrication this contract exists to prevent.
+ * `meta` is `null` while pending and on a transport failure — the caller's
+ * own pending/error handling owns those, and inventing a coverage state here
+ * would be the fabrication this contract exists to prevent. The transport
+ * failure is REPORTED (`unreadable`), not interpreted.
  */
 /** `enabled` (#1800 P2) — same reason as `useLiveMachines`: on a replay this
  * banner would report the CURRENT fleet's coverage over a past day's records. */
-export function useFleetCoverage(enabled = true): CoverageMeta | null {
+export function useFleetCoverage(enabled = true): FleetCoverageResult {
   const query = useQuery({
     enabled,
     queryKey: queryKeys.fleetMachinesLive(),
     queryFn: () => fetchJson<FleetMachinesLiveResponse>("/fleet/machines/live"),
     refetchInterval: PRESENCE_POLL_MS,
   });
-  return query.data?.ok ? (query.data.data.meta ?? null) : null;
+  // `query.data === undefined` is pending (or disabled) — no claim either
+  // way. Only a SETTLED `ok:false` is a failed read.
+  return {
+    meta: query.data?.ok ? (query.data.data.meta ?? null) : null,
+    unreadable: query.data !== undefined && !query.data.ok,
+  };
 }
