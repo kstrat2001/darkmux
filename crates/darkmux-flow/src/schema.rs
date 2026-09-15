@@ -77,8 +77,71 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.48.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.49.0";
 // Version history:
+//   1.49.0 (#2705, #2706): battery. THREE additive changes, all MINOR:
+//
+//           * `machine.telemetry`'s payload gains a `battery` object —
+//             `{charge_pct, on_ac, charging, minutes_to_empty}`, or `null`
+//             on a machine with no battery. It rides `sample_full_json`,
+//             so `/machine/resources`' `load.now` block carries the same
+//             shape from the same producer. `minutes_to_empty` is `null`
+//             whenever the OS declines to estimate (on AC, while charging,
+//             and during the gas gauge's settling window, where it reports
+//             its 65535 sentinel) — deliberately NOT zero, since "no
+//             estimate" and "zero minutes left" are opposite claims.
+//
+//           * New action `machine.battery` (Category::Machinery, source
+//             `host-sampler`) — a TRANSITION record on the same
+//             edge-triggered contract `machine.thermal` uses: going onto
+//             battery, returning to AC, and crossing the configured
+//             `power.min_battery_pct` floor. `payload.transitions` is an
+//             array of stable strings (`to-battery`, `to-ac`,
+//             `below-floor`, `at-or-above-floor`) with `from`/`to` charge
+//             readings, the `floor_pct` the crossing was judged against,
+//             and the config field that carried it. `Level::Warn` only for
+//             `below-floor` — the one transition that changes what the
+//             machine will DO.
+//
+//           * New action `machine.battery_health` (Category::Machinery,
+//             source `host-sampler`) — the MACHINE-RECORD half: cycle
+//             count, design/raw/nominal capacity in mAh plus both derived
+//             capacity ratios (labeled `raw_capacity_pct` and
+//             `nominal_capacity_pct` — the two differ materially and
+//             neither is the figure macOS Settings displays, so both are
+//             recorded rather than one being called "capacity"), the OS's
+//             own reported condition word, temperature, and the battery's
+//             OWN cumulative `TimeAtHighSoc` counters in hours. Polled
+//             HOURLY plus once at daemon start, and emitted ONLY ON
+//             CHANGE: hour-over-hour capacity differences are below the
+//             noise floor, and emitting every poll would add 24 identical
+//             rows a day. `payload.poll_interval_ms` carries the cadence
+//             that produced the row, per the observability contract's
+//             "the cadence is a recorded knob, never adaptive-silent".
+//
+//           Plus two producer-side additions that are NOT shape changes
+//           and are named here only so the entry is complete: the
+//           existing `dispatch.rest` action can now carry
+//           `payload.reason: "battery"` (a new VALUE of a field that has
+//           always carried a governor's reason word — `runtime/src/
+//           pace.rs` treats `reason` as opaque text, so no consumer
+//           predicts its contents), and a new `battery.pause_unsupported`
+//           WARN telemetry record fires when the operator asked for an
+//           in-flight pause on a run type that cannot be resumed from one.
+//
+//           MINOR, on this history's own repeated precedent for additive
+//           actions and additive payload keys (1.21.0, 1.25.0, 1.29.0,
+//           1.32.0, 1.33.0, 1.36.0, 1.48.0). "Only producers changed" is
+//           explicitly NOT the argument being made — the same rejection
+//           1.43.0/1.45.0/1.47.0 recorded applies: a consumer can now get
+//           answers from these records it could not get before. Older
+//           readers ignore the new action and the new payload key; no
+//           existing consumer's computed output changes for a record that
+//           carries neither. The viewer needs no change either: its
+//           activity sectioning routes any `machine*` action to the
+//           MACHINE section by prefix (`ui/src/lib/eventFilters.ts`'s
+//           `activitySectionOf`), so both new actions land there without
+//           a mapping entry.
 //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2694: `hook.failed`'s
 //           existing `payload.error` no longer carries a refused
 //           redirect's `Location` header verbatim. That header is

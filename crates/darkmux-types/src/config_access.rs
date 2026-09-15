@@ -1240,6 +1240,45 @@ pub fn thermal_speed_limit_hold_samples_raw() -> u32 {
     pick_parsed("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", cfg, Some(3)).unwrap()
 }
 
+// ── Battery-charge policy (#2706) ──
+// `env(DARKMUX_POWER_*) > config.power.* > default`, the same wiring the
+// thermal block above uses. See `PowerConfig`'s own doc for why the start
+// policy and the in-flight policy are two items rather than one mode, and
+// for why a machine with NO battery is never gated by any of them (that
+// rule lives in `darkmux_crew::power_policy`, not here — these three
+// accessors resolve an operator's numbers and nothing else).
+
+/// The charge floor, in percent. Default `50`.
+///
+/// Clamped to `0..=100` on read: a configured `250` is not a floor any
+/// machine can satisfy, and silently refusing every run forever is a worse
+/// answer than treating the value as "always above the floor is
+/// impossible" -> 100. A `0` is meaningful and NOT coerced — it means "no
+/// charge is too low", the numeric way to disable the floor without
+/// touching either boolean.
+pub fn power_min_battery_pct() -> u8 {
+    let cfg = config().power.as_ref().and_then(|p| p.min_battery_pct);
+    pick_parsed::<u64>("DARKMUX_POWER_MIN_BATTERY_PCT", cfg, Some(50)).unwrap().min(100) as u8
+}
+
+/// Whether a new run refuses to start below [`power_min_battery_pct`].
+/// Default `true`.
+pub fn power_refuse_start_below_min() -> bool {
+    if let Some(s) = env_str("DARKMUX_POWER_REFUSE_START_BELOW_MIN") {
+        return !matches!(s.as_str(), "0" | "false" | "no");
+    }
+    config().power.as_ref().and_then(|p| p.refuse_start_below_min).unwrap_or(true)
+}
+
+/// Whether a run already in flight pauses when charge crosses
+/// [`power_min_battery_pct`]. Default `true`.
+pub fn power_pause_running_below_min() -> bool {
+    if let Some(s) = env_str("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN") {
+        return !matches!(s.as_str(), "0" | "false" | "no");
+    }
+    config().power.as_ref().and_then(|p| p.pause_running_below_min).unwrap_or(true)
+}
+
 // ── Mission board (#1230 Packet 5) ──
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.
@@ -2928,6 +2967,128 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // ── power.* (#2706): env > config > built-in default, for all three ──
+    //
+    // The CONFIG tier is exercised through `pick_parsed`/the same
+    // `.unwrap_or` idiom the accessors use, with a `Some(..)` standing in
+    // for a populated `power` block: the process-wide `config()` under test
+    // is the empty test config (#811), so a config-tier value cannot reach
+    // the accessors themselves here. What that leaves proven is the
+    // ORDERING and the key NAMES, which is where this class of bug lives —
+    // `every_with_defaults_key_is_settable` and the `config.example.json`
+    // drift guard cover the field actually being present and settable.
+
+    #[serial_test::serial]
+    #[test]
+    fn power_min_battery_pct_env_beats_config_beats_default() {
+        let k = "DARKMUX_POWER_MIN_BATTERY_PCT";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+
+        // default tier
+        assert_eq!(power_min_battery_pct(), 50, "the built-in floor");
+        // config tier (a populated `power.min_battery_pct` of 70)
+        assert_eq!(pick_parsed::<u64>(k, Some(70), Some(50)), Some(70), "config beats default");
+        // env tier
+        unsafe { std::env::set_var(k, "20"); }
+        assert_eq!(power_min_battery_pct(), 20, "env wins live");
+        assert_eq!(pick_parsed::<u64>(k, Some(70), Some(50)), Some(20), "env beats config too");
+        // an unparseable env value falls through rather than panicking
+        unsafe { std::env::set_var(k, "half"); }
+        assert_eq!(power_min_battery_pct(), 50);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn power_min_battery_pct_clamps_an_impossible_floor_instead_of_refusing_forever() {
+        // Lenient-read contract: an out-of-range value must not fail the
+        // parse, and must not become a floor no machine can satisfy.
+        let k = "DARKMUX_POWER_MIN_BATTERY_PCT";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "250"); }
+        assert_eq!(power_min_battery_pct(), 100, "clamped at resolution, not rejected at parse");
+        // `0` is meaningful and must NOT be coerced: it is the numeric way
+        // to disable the floor without touching either boolean.
+        unsafe { std::env::set_var(k, "0"); }
+        assert_eq!(power_min_battery_pct(), 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn both_power_policies_default_on_and_take_their_own_env_override() {
+        // Two knobs, two env vars, independently overridable — the whole
+        // reason they are separate config items rather than one mode.
+        let ks = ["DARKMUX_POWER_REFUSE_START_BELOW_MIN", "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN"];
+        let prev: Vec<_> = ks.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            for k in ks {
+                std::env::remove_var(k);
+            }
+        }
+        assert!(power_refuse_start_below_min(), "default on");
+        assert!(power_pause_running_below_min(), "default on");
+
+        // Turning ONE off must not touch the other.
+        unsafe { std::env::set_var(ks[0], "false"); }
+        assert!(!power_refuse_start_below_min());
+        assert!(power_pause_running_below_min(), "the in-flight policy is independent of the start policy");
+
+        unsafe { std::env::set_var(ks[0], "true"); std::env::set_var(ks[1], "0"); }
+        assert!(power_refuse_start_below_min());
+        assert!(!power_pause_running_below_min());
+
+        // Every documented off-spelling.
+        for off in ["0", "false", "no"] {
+            unsafe { std::env::set_var(ks[1], off); }
+            assert!(!power_pause_running_below_min(), "{off} must read as off");
+        }
+
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_written_power_defaults_are_the_resolved_ones() {
+        // The visible-defaults doctrine only holds if what `init` WRITES is
+        // what an absent config RESOLVES to — otherwise the file documents
+        // a behavior the binary does not have.
+        let written = crate::config::DarkmuxConfig::with_defaults().power.expect("init writes the block");
+        assert_eq!(written.min_battery_pct, Some(50));
+        assert_eq!(written.refuse_start_below_min, Some(true));
+        assert_eq!(written.pause_running_below_min, Some(true));
+    }
+
+    #[test]
+    fn an_out_of_range_power_floor_does_not_fail_the_whole_config_parse() {
+        // Config-leniency contract 7, pinned at the type level: a `u8`
+        // field would reject this at DESERIALIZE time and take every other
+        // setting in the file down with it.
+        let cfg: crate::config::DarkmuxConfig =
+            serde_json::from_str(r#"{"power":{"min_battery_pct":300},"lms_bin":"lms"}"#)
+                .expect("a hand-written out-of-range floor must not brick the config");
+        assert_eq!(cfg.power.and_then(|p| p.min_battery_pct), Some(300));
+        assert_eq!(cfg.lms_bin.as_deref(), Some("lms"), "the rest of the file still loaded");
     }
 
     // ── role_profiles / role_profile (#1475 packet 1) ──

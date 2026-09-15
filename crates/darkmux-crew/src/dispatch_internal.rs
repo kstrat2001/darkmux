@@ -7831,6 +7831,21 @@ fn run_telemetry_sampler(
     // see `stop_file_unresolved_reason`'s own doc for the distinction.
     let thermal_stop_unresolved_reason =
         crate::thermal_governor::stop_file_unresolved_reason(record_context.as_ref());
+    // (#2706) The battery governor rides this SAME tick — the probe above
+    // already reads `sample.battery` every 2s, so no separate poller is
+    // needed, exactly as the thermal governor rides the thermal half.
+    //
+    // `pause_supported(true)`: this sampler exists only on the
+    // CONTAINER-backed dispatch path (its caller `spawn_guarded_sampler`
+    // is reached after a `child` is spawned), whose pause is an in-memory
+    // rest at a turn boundary — `runtime/src/pace.rs`'s bounded ≤2s poll
+    // loop, which keeps the whole conversation in memory and continues
+    // from exactly where it rested. That run type CAN be resumed, so it
+    // is allowed to pause. A run type that could not would pass `false`
+    // and get `BatteryEvent::PauseUnsupported` instead of a park it could
+    // not leave.
+    let mut battery_governor =
+        crate::power_policy::BatteryGovernor::new(crate::power_policy::PowerPolicyConfig::from_env());
     let emit_rest = |reason: &str, state: &str, pause: bool| {
         let mut payload = serde_json::json!({ "reason": reason, "state": state, "pause": pause });
         merge_record_context(&mut payload, &record_context);
@@ -8015,6 +8030,79 @@ fn run_telemetry_sampler(
                 }
             }
         }
+        // (#2706) The battery governor, fed the SAME tick's reading and
+        // the SAME measured `thermal_elapsed_ms` the thermal governor just
+        // used — one clock, so the two governors' heartbeat accounting can
+        // never disagree about how much time passed.
+        //
+        // `thermal_governor.is_pacing()` is read AFTER the thermal tick
+        // above, so this is the post-decision state: thermal owns the pace
+        // file this tick if it is pausing or broken, and the battery
+        // governor stands down and re-asserts on the first free tick. See
+        // `power_policy::BatteryGovernor`'s own doc for that precedence.
+        //
+        // A machine with NO battery reaches this line every tick and does
+        // nothing at all: `sample.battery` is `None` on a desktop, and the
+        // governor's first act is to return on that — before any config
+        // read, threshold comparison or file write.
+        if let Some(event) = battery_governor.on_sample(
+            sample.battery.as_ref(),
+            thermal_elapsed_ms,
+            &host_out,
+            thermal_governor.is_pacing(),
+        ) {
+            match event {
+                // The `state` string carries BOTH numbers the decision was
+                // made on — the observation and the operator's floor — so
+                // the flow record answers "why did this rest" without a
+                // reader having to go look up the config that was in force
+                // at the time.
+                crate::power_policy::BatteryEvent::Paused { charge_pct, floor_pct } => {
+                    emit_rest(
+                        crate::power_policy::PACE_REASON,
+                        &format!("{charge_pct}% (floor {floor_pct}%)"),
+                        true,
+                    );
+                }
+                crate::power_policy::BatteryEvent::Resumed { charge_pct, floor_pct } => {
+                    emit_rest(
+                        crate::power_policy::PACE_REASON,
+                        &format!("{charge_pct}% (floor {floor_pct}%)"),
+                        false,
+                    );
+                }
+                crate::power_policy::BatteryEvent::PauseUnsupported { charge_pct, floor_pct } => {
+                    // WARN, not Info: the operator asked for a pause and is
+                    // not getting one. Loud beats quiet — a silent
+                    // non-pause is exactly the "silently disables itself"
+                    // failure #2706 exists to prevent. Names the numbers
+                    // and the field, and gives no advice, same contract as
+                    // the start refusal.
+                    let mut payload = serde_json::json!({
+                        "reason": crate::power_policy::PACE_REASON,
+                        "charge_pct": charge_pct,
+                        "floor_pct": floor_pct,
+                        "policy_field": crate::power_policy::INFLIGHT_POLICY_FIELD,
+                        "paused": false,
+                        "detail": "this run type cannot be resumed from a pace pause, so it \
+                                   continues rather than parking in a state it cannot leave",
+                    });
+                    merge_record_context(&mut payload, &record_context);
+                    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+                        darkmux_flow::Level::Warn,
+                        "battery.pause_unsupported",
+                        "battery",
+                        &role_id,
+                        &session_id,
+                        Some(&model),
+                        mission_id.as_deref(),
+                        phase_id.as_deref(),
+                        payload,
+                    ));
+                }
+            }
+        }
+
         if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
             // (#2107) Record the raw reading, timestamped against this
             // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
