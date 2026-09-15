@@ -860,6 +860,59 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(card.className).toContain("absent");
   });
 
+  // (#1855) The card's HARDWARE line, on the same card. Rendering the
+  // rostered-but-silent machine is half the fix; the other half is that its
+  // card must not then assert something about it that nothing supports.
+  // "hardware not reported" reads as a fact about the machine — it answered
+  // and withheld its hardware — and nothing has been received from this one
+  // at all.
+  it("a rostered-but-silent card says its hardware is unknown, not that the machine failed to report it", async () => {
+    mockFleetFetch({ roster: [{ id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }] });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("hardware unknown — nothing received");
+    expect(card.textContent).not.toContain("hardware not reported");
+  });
+
+  // The INVERTED case for that line: a machine that DID beat, carrying no
+  // `specs` (every peer on a build older than #2083 — and both machines in
+  // this issue's own wire dump), keeps the original sentence. It answered.
+  it("a machine that beat WITHOUT specs still reads 'hardware not reported'", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "u1", display_name: "studio", schema_version: "1.20.0", beat_ts_ms: 1 }],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("hardware not reported");
+    expect(card.textContent).not.toContain("hardware unknown");
+  });
+
+  // And the fully-healthy inverted case: a beat that DOES carry hardware
+  // renders the hardware and neither sentence. A change that made every card
+  // read as uncertain would be as wrong as the one that made them all read
+  // as confident.
+  it("a machine beating WITH specs shows the hardware and no unknown line at all", async () => {
+    mockFleetFetch({
+      machines: [
+        {
+          machine_uid: "u1",
+          display_name: "studio",
+          schema_version: "1.20.0",
+          beat_ts_ms: 1,
+          specs: "Apple M1 Max · 32 GB",
+        },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("Apple M1 Max · 32 GB");
+    expect(card.textContent).not.toContain("hardware not reported");
+    expect(card.textContent).not.toContain("hardware unknown");
+  });
+
   // The INVERTED case: a roster entry naming a machine that IS actually
   // live must not draw a SECOND, duplicate "offline" card for the same
   // machine beside its real one.

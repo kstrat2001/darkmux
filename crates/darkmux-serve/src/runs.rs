@@ -167,7 +167,7 @@ pub enum AbandonReason {
 }
 
 /// (#2682 fix-pass) Which of THREE genuinely different situations produced
-/// an `Active`/`Paused` mission's `RunStatus::Abandoned` verdict inside
+/// an ACTIVE mission's `RunStatus::Abandoned` verdict inside
 /// [`mission_run_status_and_evidence`] — never surfaced on the `/runs` wire
 /// (that's [`AbandonReason`]'s job, and its two-way split is a different
 /// axis: deliberate teardown vs. everything else). This is consumed
@@ -176,6 +176,11 @@ pub enum AbandonReason {
 /// describe what was actually OBSERVED instead of asserting the same fixed
 /// sentence for three different facts — see that function's own doc for
 /// the review finding this closes (#2682 fix-pass MUST FIX 1/2/5).
+///
+/// (#2682 round 4) `Active` ONLY, not `Active`/`Paused` as this doc used to
+/// say: a Paused mission no longer reaches ANY of these three, because the
+/// only arm it could reach (`RecordedEnd`, via the all-terminal branch) is
+/// now gated on `mission.status != Paused` — see that gate's own comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchSessionEvidence {
     /// darkmux POSITIVELY recorded this mission's dispatch session ending —
@@ -1346,7 +1351,35 @@ fn mission_run_status_and_evidence(
                 return (RunStatus::Planned, None);
             };
             if !sessions.is_empty() && sessions.iter().all(|s| s.terminal_status.is_some()) {
-                if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Abandoned)) {
+                // (#2682 round 4) `mission.status != Paused` extends #1642's
+                // OWN rule — stated one branch below as "a paused mission
+                // must not decay into Abandoned" — to the branch that
+                // OUTRANKS it. This arm runs BEFORE that early-return, so
+                // before this guard a Paused mission whose session carried a
+                // `session.end` read `Abandoned` on `darkmux run list` and in
+                // the viewer while `mission status`'s board read `Paused` —
+                // 5 of the 33 board-vs-`run list` disagreement rows #2682
+                // enumerates, and the one family where the BOARD was right.
+                //
+                // #1642's argument transfers intact, and is not weakened by
+                // this being an OBSERVATION rather than an inference from
+                // silence: `mission pause` does not touch any process (it
+                // flips the record — `lifecycle::mission_pause_with_
+                // reasoning`), so a paused mission's dispatch not being alive
+                // is the expected state, not news. The mission-level fact the
+                // operator wants back is "I paused this", and `RunStatus` has
+                // no `Paused` variant to say it with — so the same
+                // lesser-error trade #1642 already took (report `Running`,
+                // never `Abandoned`) is taken here.
+                //
+                // Deliberately narrow: only the `Abandoned` arm is gated. A
+                // Paused mission whose session genuinely reached `dispatch
+                // error` still reads `Error` below — a recorded FAILURE, not
+                // an abandonment inference, and suppressing it would lose
+                // real signal the operator has no other way to see here.
+                if mission.status != MissionStatus::Paused
+                    && sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Abandoned))
+                {
                     // A `session.end` terminal really did land — darkmux
                     // OBSERVED this session stop (see
                     // `terminal_status_for_action`), never a guess from
@@ -1369,6 +1402,12 @@ fn mission_run_status_and_evidence(
             // is unavoidable here, and over-reporting a mission the operator
             // KNOWS they paused costs nothing, while calling it abandoned
             // actively misinforms.
+            //
+            // (#2682 round 4) This is no longer the ONLY place the pause
+            // exemption is applied — the all-terminal branch above carries
+            // its own `mission.status != Paused` gate, because it returns
+            // BEFORE this line is ever reached. Both are load-bearing; see
+            // that one's comment for why #1642's argument covers it too.
             if mission.status == MissionStatus::Paused {
                 return (RunStatus::Running, None);
             }
@@ -4548,6 +4587,71 @@ mod tests {
             mission_run_status(&mission, &[&ancient], now_ms),
             RunStatus::Abandoned,
             "the pause exemption must not disable the gate for Active missions"
+        );
+    }
+
+    /// (#2682 round 4) The half of the test above that its NAME already
+    /// promised and its body did not reach. `a_paused_mission_never_decays_
+    /// into_abandoned` exercises two shapes — no sessions, and a long-quiet
+    /// OPEN session — and both of those resolve through the staleness gate.
+    /// The all-terminal branch sits ABOVE that gate, so a paused mission
+    /// whose session carried a `session.end` (`terminal_status ==
+    /// Abandoned`) walked straight past the exemption and read `Abandoned`
+    /// anyway. That is 5 of #2682's 33 board-vs-`run list` disagreement
+    /// rows: `mission status` said `Paused`, `run list` said `abandoned`,
+    /// about the same mission at the same moment.
+    ///
+    /// Both directions, and the `Error` neighbor that must NOT be silenced:
+    /// the guard is scoped to the `Abandoned` arm on purpose, because a
+    /// recorded `dispatch error` is a FAILURE darkmux observed, not an
+    /// abandonment it inferred.
+    #[test]
+    fn a_paused_mission_does_not_read_abandoned_from_a_recorded_session_end() {
+        let mut mission = minimal_mission("paused-recorded-end", vec![], None);
+        mission.started_ts = Some(parse_flow_ts("2026-01-01T00:00:00Z").unwrap());
+
+        let ended = SessionAgg {
+            has_start: true,
+            terminal_status: Some(RunStatus::Abandoned),
+            terminal_ts: Some("2026-01-01T01:00:00Z".to_string()),
+            last_activity_ts: Some("2026-01-01T01:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let errored = SessionAgg {
+            has_start: true,
+            terminal_status: Some(RunStatus::Error),
+            terminal_ts: Some("2026-01-01T01:00:00Z".to_string()),
+            last_activity_ts: Some("2026-01-01T01:00:00Z".to_string()),
+            ..Default::default()
+        };
+        // Comfortably past any staleness budget, so nothing here passes by
+        // sitting inside the window.
+        let now_ms = u64::from(u32::MAX) * 1_000;
+
+        mission.status = MissionStatus::Paused;
+        assert_eq!(
+            mission_run_status_and_evidence(&mission, &[&ended], now_ms),
+            (RunStatus::Running, None),
+            "a paused mission whose dispatch session was positively recorded ENDING must not \
+             read abandoned — `mission pause` never touches a process, so a dead dispatch under \
+             a pause is the expected state, not news"
+        );
+        assert_eq!(
+            mission_run_status_and_evidence(&mission, &[&errored], now_ms),
+            (RunStatus::Error, None),
+            "the guard is scoped to the Abandoned arm: a recorded `dispatch error` under a pause \
+             is an observed FAILURE and must still surface"
+        );
+
+        // The control, and the reason this cannot pass with the whole arm
+        // deleted: the SAME session shape under an ACTIVE mission still
+        // resolves to Abandoned/RecordedEnd, which is what #2689's board
+        // drift consumes.
+        mission.status = MissionStatus::Active;
+        assert_eq!(
+            mission_run_status_and_evidence(&mission, &[&ended], now_ms),
+            (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd)),
+            "the pause exemption must not disable the recorded-end verdict for Active missions"
         );
     }
 

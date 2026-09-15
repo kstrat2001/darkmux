@@ -513,7 +513,6 @@ mod tests {
             beat_ts_ms: 1,
             specs: None,
             darkmux_version: None,
-            loaded_models: Vec::new(),
         }
     }
 

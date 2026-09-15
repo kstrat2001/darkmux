@@ -1,6 +1,8 @@
 === topbar ===
 darkmux
-▣2026-08-07
+⟳
+◌LIVE
+LIVE
 home
 guide
 articles
@@ -10,37 +12,46 @@ github
 (empty)
 
 === meta ===
-(empty)
+2
 
 === logscope ===
 fleet
 
 === stage ===
-TOKENS
-584,118
+TOKENS · LAST 24H
+600,113
 LOCAL TOKENS
-0
+396,926
 CLOUD TOKENS
-0
+2,209
 UNATTRIBUTED
-289k
+382k
 GENERATED
-19k
+33k
 FRESH INPUT
-0
+320
 RE-READ
-277k
+585k
 UNCLASSIFIED
-38
+52
 DISPATCHES
 Orchestrator note: First editor-embedded review shipped tonight — the crew reviewed a real ticket inside Zed, end to end on local models, and the report rendered beautifully. Four feature findings captured for the real integration. Great night. · 03:06:54 history →
 MacBook-Pro
-hardware unknown — nothing received
+Apple M5 Max · 128 GB
 idle
-48 specialists
-ACTIVITY
+0 running
+m1-max-32gb-studio
+hardware not reported
+idle
+0 running
+RECENT ACTIVITY
+10M
+1H
+4H
+24H
 MacBook-Pro
-02:09
-10:18
-18:28
+m1-max-32gb-studio
+14:28
+02:28
+14:28
 

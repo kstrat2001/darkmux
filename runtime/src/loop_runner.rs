@@ -1188,9 +1188,18 @@ fn recover_intra_turn_stall(
 /// 124 tests that exercise this wrapper, noise that could mask a real
 /// failure. Hand-rolled (no `tempfile` — that crate is dev-only, and this
 /// fn compiles in the release binary) with a PID+nanos+counter suffix so
-/// parallel test threads (same PID) never collide; the dir is left behind
-/// in the OS temp root rather than cleaned up, same tradeoff `dispatch_
-/// internal.rs`'s `host_out` makes for a real dispatch's out-dir.
+/// parallel test threads (same PID) never collide.
+///
+/// (#2707) This paragraph used to end "the dir is left behind in the OS
+/// temp root rather than cleaned up, same tradeoff `dispatch_internal.rs`'s
+/// `host_out` makes" — which stopped being true when #2114 finding 8 added
+/// the `remove_dir_all` at the bottom of this function, and a comment that
+/// contradicts the code six screens below it is the kind of artifact a
+/// reader trusts by mistake. The dir IS removed, on both the Ok and the Err
+/// path. The comparison to `host_out` was also the wrong one: a real
+/// dispatch's out-dir is kept ON PURPOSE (it holds the run's prompt,
+/// trajectory and checkpoint for the operator to read afterward), so it is
+/// not a tradeoff this test-only wrapper shares.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn run(

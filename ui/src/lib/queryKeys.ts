@@ -47,6 +47,15 @@ import { variantKey } from "../lenses/console/panels";
 
 export const PRESENCE_POLL_MS = 5_000;
 export const RECONCILE_BACKSTOP_MS = 20_000;
+/** (#2683) How long the live tail may hear NOTHING from the daemon — no SSE
+ * message AND no successful reconcile fetch — before it stops claiming
+ * `live`. Two reconcile windows, so one failed backstop is tolerated and the
+ * second is what flips the status: a single transient blip must not repaint
+ * the header. See `hooks/useLiveTail.ts`'s watchdog for why CONTACT (the
+ * daemon answered, over either transport) is the signal rather than
+ * records-arrived — a genuinely idle fleet emits no records for hours and is
+ * perfectly healthy. */
+export const LIVE_CONTACT_TIMEOUT_MS = 2 * RECONCILE_BACKSTOP_MS;
 export const MACHINE_RESOURCES_CACHE_MS = 2_000;
 export const MACHINE_MEM_POLL_MS = 5_000;
 export const PANEL_CACHE_MS = 3_000;

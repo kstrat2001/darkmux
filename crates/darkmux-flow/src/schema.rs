@@ -77,9 +77,9 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.49.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.50.0";
 // Version history:
-//   1.49.0 (#2705, #2706): battery. THREE additive changes, all MINOR:
+//   1.50.0 (#2705, #2706): battery. THREE additive changes, all MINOR:
 //
 //           * `machine.telemetry`'s payload gains a `battery` object —
 //             `{charge_pct, on_ac, charging, minutes_to_empty}`, or `null`
@@ -142,6 +142,58 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.49.0";
 //           MACHINE section by prefix (`ui/src/lib/eventFilters.ts`'s
 //           `activitySectionOf`), so both new actions land there without
 //           a mapping entry.
+//   1.49.0 (#2690): the `dispatch.map` per-item `telemetry.tokens` record
+//           gains two additive keys, `remote` (bool) and `index` (u64) —
+//           `map_item_token_payload`, `crates/darkmux-crew/src/step_kinds/
+//           builtins.rs`. MINOR, on this history's own precedent for a new
+//           payload key on an existing action (1.21.0, 1.25.0, 1.29.0,
+//           1.32.0, 1.33.0, 1.36.0, 1.44.0, 1.48.0): a consumer can now get
+//           an answer off the record it previously could not get at all.
+//
+//           WHAT IT ANSWERS. That record's `session_id` is
+//           `session_id::task(&step.task_id)`, which sibling seats fanned
+//           out within ONE task share by construction — and they share
+//           `mission_id` too, so the savings hero's `(session_id,
+//           mission_id)` run key cannot separate them either. With no seat
+//           coordinate on the record, the hero fell back to a per-KEY rule:
+//           if ANY bookend under the key named a hosted endpoint, every
+//           token arriving under it counted CLOUD. For a genuinely mixed
+//           task that reports the operator's OWN HARDWARE's work as hosted
+//           spend, measured at three arities in
+//           `ui/src/lenses/fleet/savings.test.ts`. `remote` is that seat's
+//           own hosted-or-local verdict, the SAME `endpoint.is_some()` the
+//           kind already stamps on this item's `step result` record;
+//           `index` is the item's position, which is what makes two
+//           telemetry records of one step distinguishable at all.
+//
+//           BOTH KEYS ARE UNCONDITIONAL, unlike the `Option` token fields
+//           beside them: they describe the emitter's own call, never
+//           something a provider did or did not report. That is deliberate
+//           and load-bearing — it lets a consumer read an ABSENT `remote`
+//           as "a different `telemetry.tokens` lineage" rather than "this
+//           producer had nothing to say", so the viewer keeps its
+//           pre-#2690 per-key fallback for the container path's per-turn
+//           tailer with no version check anywhere.
+//
+//           SCOPE. Only THIS emitter changes. `dispatch.single_shot` is the
+//           only other kind minting `session_id::task`, and it emits no
+//           `telemetry.tokens` at all (its tokens ride its own `dispatch
+//           complete` bookend, which the hero already classifies per
+//           completion); the container path's tailer runs under
+//           `session_id::step(&step.id)` and `crawl.unit` under
+//           `crawl-<mission>-<rule>-<unit>` (+ a per-draw suffix), neither
+//           of which can share a key with another seat. So one emitter is
+//           the whole affected population.
+//
+//           NOT YET VERIFIED BY A LIVE DISPATCH. This landed from a
+//           session with no model dispatches available; the release gate's
+//           "a green test proves the pieces; only a live run proves the
+//           thing" applies and the run is OWED — one `dispatch.map` step
+//           per tier, reading the emitted records, before the next tag.
+//           What IS proven: the payload shape (unit tests beside the
+//           function), the two records' agreement on one seat's tier, and
+//           the consumer's behavior on both the present and absent forms
+//           (`savings.test.ts`).
 //   (code-internal, no FLOW_SCHEMA_VERSION bump) — #2694: `hook.failed`'s
 //           existing `payload.error` no longer carries a refused
 //           redirect's `Location` header verbatim. That header is

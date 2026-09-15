@@ -587,6 +587,15 @@ fn print_peer_missions(peer: &[Run], now: u64, width: Option<usize>) {
 ///     session shows no evidence of life, by the same staleness rule
 ///     `darkmux run list` already applies to this exact mission on this
 ///     exact machine — see [`running_phase_session_drift`]'s own doc.
+///   - (#2682 round 4) an ACTIVE/PAUSED mission whose phases are all
+///     terminal with NONE complete — the complement `done-not-finalized`
+///     excludes, because "looks done" is the one thing that shape is not.
+///     See [`nothing_complete_not_closed_drift`].
+///   - (#2682 round 4) a CLOSED mission still holding a Planned/Running
+///     phase — the phase-level twin of `mission-terminal-live-step`, and
+///     NOT the #1463 arm named below: see
+///     [`terminal_mission_open_phase_drift`] for why that retirement's
+///     "no longer reachable" is true of the happy path only.
 ///
 /// (#2406) The former third bullet here — a PLANNED phase with an
 /// earlier-in-mission-order Abandoned phase, flagged "can never run" — was
@@ -640,6 +649,10 @@ fn detect_drift(
         });
     }
 
+    if let Some(d) = nothing_complete_not_closed_drift(m, phases, complete, all_terminal) {
+        out.push(d);
+    }
+
     if let Some(d) = stale_active_drift(m, complete, now, stale_days) {
         out.push(d);
     }
@@ -650,9 +663,163 @@ fn detect_drift(
 
     // (#2406) `unreachable_phase_drifts` retired — see its doc comment
     // above for why the phase-order heuristic it used was simply wrong.
-    out.extend(live_step_drifts(m, phases, live_steps));
+    let step_drifts = live_step_drifts(m, phases, live_steps);
+    if let Some(d) = terminal_mission_open_phase_drift(m, phases, &step_drifts) {
+        out.push(d);
+    }
+    out.extend(step_drifts);
 
     out
+}
+
+/// (#2682 round 4) The sibling `done-not-finalized` deliberately excludes:
+/// an ACTIVE/PAUSED mission whose phases are ALL terminal and NONE of which
+/// completed. Nothing is left to run, nothing succeeded, and the mission is
+/// still open.
+///
+/// Split into its own kind rather than by relaxing `done-not-finalized`'s
+/// `complete > 0` guard, because that rule's whole sentence is "the mission
+/// looks DONE" — which is exactly what this shape is not. One kind, one
+/// claim.
+///
+/// **Why it needs no dispatch evidence.** Every fact it rests on is already
+/// in the mission's own records, so unlike [`running_phase_session_drift`]
+/// this rule does not consult `darkmux run list` at all; it is a board rule
+/// that happens to close three of #2682's disagreement rows (Active + an
+/// Abandoned-only phase set, across all three `Abandoned`-producing flow
+/// shapes), not a mechanical widen of the flow-fed one.
+///
+/// **Why it cannot fire on a healthy mission.** A mission still has work in
+/// flight ⇒ some phase is non-terminal ⇒ `all_terminal` is false. A mission
+/// that produced anything ⇒ `complete > 0` ⇒ `done-not-finalized` owns it
+/// (a `Degraded` phase is `Complete` ON DISK — see [`MissionView::degraded`]
+/// — so a mixed-outcome mission lands there, not here). A mission that was
+/// closed ⇒ not Active/Paused. What remains is only the shape
+/// `coder_phase::finalize_mission_if_complete` would itself have closed
+/// (it drives an all-terminal mission to `Finalized` with a `Degraded`
+/// envelope) had it run — the same "that path didn't run" residue
+/// `done-not-finalized` has always existed to name.
+///
+/// Describes, never adjudicates: the detail states the counts observed, and
+/// the suggestions are the same "debrief first, then choose" shape
+/// [`stale_active_drift`] uses — `abort` and `finalize` are offered as
+/// alternatives, not prescribed.
+fn nothing_complete_not_closed_drift(
+    m: &Mission,
+    phases: &[&Phase],
+    complete: usize,
+    all_terminal: bool,
+) -> Option<Drift> {
+    if !matches!(m.status, MissionStatus::Active | MissionStatus::Paused) {
+        return None;
+    }
+    if !all_terminal || complete > 0 {
+        return None;
+    }
+    let abandoned = phases.iter().filter(|p| p.status == PhaseStatus::Abandoned).count();
+    Some(Drift {
+        kind: "all-phases-terminal-none-complete",
+        detail: format!(
+            "every phase is terminal and none completed ({abandoned} of {} abandoned) — the \
+             mission is still open with nothing left to run",
+            phases.len()
+        ),
+        suggest: vec![
+            format!(
+                "darkmux mission debrief {id} --json   # inspect what each phase recorded first",
+                id = m.id
+            ),
+            format!(
+                "darkmux mission abort {id}   # …then this, to close it as a teardown",
+                id = m.id
+            ),
+            format!(
+                "darkmux mission finalize {id}   # …or this instead, if you consider the work concluded",
+                id = m.id
+            ),
+        ],
+    })
+}
+
+/// (#2682 round 4) The PHASE-level twin of `mission-terminal-live-step`: a
+/// `Finalized`/`Aborted` mission still holding a `Planned`/`Running` phase.
+/// The mission closed around work its own records never accounted for.
+///
+/// **Why this is not the arm #1463 retired.** `detect_drift`'s doc says the
+/// old "CLOSED mission with a non-terminal phase" check was removed because
+/// `mission finalize`/`mission abort` now reconcile every phase first, "so
+/// a Finalized mission with an open phase is no longer a reachable state to
+/// detect". That is true of the HAPPY path and only of it. The reconcile
+/// (`darkmux_crew::lifecycle::reconcile_mission_phases_terminal`) is
+/// best-effort by construction — it swallows each `phase_abandon` result
+/// (`let _ = ...`) and then the mission is saved `Finalized` regardless — so
+/// one unwritable phase file, or a kill between the reconcile and the save,
+/// lands exactly here. Records written before #1463, or hand-edited, land
+/// here too. A state reachable only through failure is precisely what a
+/// drift board is for; what #1463 correctly removed was the check's old
+/// `phase complete`/`phase abandon` suggestions, which named a retired verb
+/// family.
+///
+/// It also closes 10 of #2682's 33 disagreement rows — every Finalized row
+/// whose phase is `Planned` or `Running` — and it does so WITHOUT consulting
+/// `darkmux run list`: the contradiction is inside the mission's own records.
+///
+/// **Counted ONCE.** `live_step_drifts` already emits
+/// `mission-terminal-live-step` when a terminal mission holds live STEPS,
+/// and an open phase under a closed mission is usually the same instance of
+/// the same problem seen one layer up. Per that function's own precedent
+/// (and #1582's one-drift-per-KIND rule) this stays silent whenever that
+/// drift is already speaking for the mission, and fires only when the phase
+/// is stranded on its own — the case nothing names today, because
+/// `live_steps_for` yields nothing when every step under the open phase is
+/// already terminal.
+///
+/// **Why it cannot fire on a healthy mission.** A closed mission with an
+/// open phase is self-contradictory on its face: `mission_terminal_with_
+/// reasoning` refuses to close a mission twice and reconciles phases before
+/// it closes at all, so there is no ordering of the supported verbs that
+/// produces this state deliberately.
+fn terminal_mission_open_phase_drift(
+    m: &Mission,
+    phases: &[&Phase],
+    step_drifts: &[Drift],
+) -> Option<Drift> {
+    if !matches!(m.status, MissionStatus::Finalized | MissionStatus::Aborted) {
+        return None;
+    }
+    if step_drifts.iter().any(|d| d.kind == "mission-terminal-live-step") {
+        return None;
+    }
+    let open: Vec<&str> =
+        phases.iter().filter(|p| !is_terminal(p.status)).map(|p| p.id.as_str()).collect();
+    if open.is_empty() {
+        return None;
+    }
+    let mut suggest = vec![format!(
+        "darkmux mission debrief {id} --json   # inspect what each phase recorded first",
+        id = m.id
+    )];
+    // One entry PER COMMAND (#1582/#1569): `mission abort --phase` is
+    // per-phase, and it is the surviving verb that records a terminal on a
+    // phase whose mission is already closed (`coder_phase::abort`'s narrow
+    // arm — it resolves the phase by id at any status and never re-closes
+    // the mission).
+    suggest.extend(open.iter().map(|pid| {
+        format!(
+            "darkmux mission abort {id} --phase {pid}   # …then this, once per stranded phase",
+            id = m.id
+        )
+    }));
+    Some(Drift {
+        kind: "mission-terminal-open-phase",
+        detail: format!(
+            "mission is {:?} but {} phase(s) never reached a terminal status: {}",
+            m.status,
+            open.len(),
+            open.join(", ")
+        ),
+        suggest,
+    })
 }
 
 /// (#2310 fix-loop C4 / S4-C4) Drift BELOW the phase level: a step left
@@ -929,30 +1096,82 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// shapes × 5 flow shapes = 100 rows through the REAL pair
 /// (`darkmux_serve::local_dispatch_status` → `detect_drift`) and asserts
 /// every figure here, so a change on either side fails that test rather
-/// than silently rotting this paragraph. **33 rows** disagree — `run list`
-/// reads them `Abandoned` while this rule stays silent:
-///   - Active mission, phase Planned/Complete/Abandoned/no-phases, × the 3
-///     `Abandoned`-producing flow shapes (12 rows) — this rule only fires
-///     for a Running phase. PLUS the Running-phase row whose evidence is
-///     `NoAttributableSession` (1 row), silent by round 2's MUST FIX 1
-///     above. **13 rows.**
-///   - Finalized mission, phase Planned/Running/Abandoned, × all 5 flow
-///     shapes (15 rows) — `run list` renders a Finalized mission with no
-///     successful envelope as `Abandoned` (`mission_finalized_status`'s
-///     `Ok(None)` arm, which ignores flow records entirely); a Finalized
-///     mission is CLOSED by construction, and "the board should also flag
-///     it as dead" is a different, unexamined claim this PR does not make.
-///   - Paused mission with a recorded `session.end`, × all 5 phase shapes
-///     (5 rows) — `run list` shows `Abandoned` for a mission the board
-///     correctly shows `Paused`; genuinely a display disagreement, but
-///     distinct in kind from the "Running phase, dead session" gap this
-///     issue named, and not fixed here.
+/// than silently rotting this paragraph.
 ///
-/// **One of those Active rows has NO other rule behind it (round 3,
-/// CONSIDER 1).** Most of the 13 are silent HERE and still drawn
+/// **THE HEADLINE NUMBER IS THE BOARD'S, NOT THIS RULE'S (round 4).** Two
+/// predicates are asserted and they answer different questions. "`run list`
+/// says `Abandoned` and THIS RULE is silent" is **28 rows**; it is a
+/// coverage measure for one rule and does not move when a DIFFERENT board
+/// rule starts drawing a row. "`run list` says `Abandoned` and the board
+/// draws NOTHING AT ALL" is **12 rows**, down from 29, and that is the one
+/// #2682 is about. Round 4 closed 17 of those 29 — and closed 5 of them by
+/// fixing `run list` rather than the board.
+///
+/// What round 4 changed, and why each was a judgment call and not a widen:
+///   - **Paused mission with a recorded `session.end` (5 rows) — FIXED ON
+///     THE `run list` SIDE.** The board was RIGHT here; the mission is
+///     paused. `mission_run_status_and_evidence`'s all-terminal branch sat
+///     ABOVE #1642's own "a paused mission must never decay into Abandoned"
+///     early-return, so the exemption leaked. `mission pause` does not
+///     touch any process, so a dead dispatch under a pause is the expected
+///     state, not news. Gated to the `Abandoned` arm only — a recorded
+///     `dispatch error` still surfaces.
+///   - **Finalized mission holding a Planned/Running phase (10 rows) — new
+///     `mission-terminal-open-phase`.** A closed mission whose own records
+///     say work never finished. See
+///     [`terminal_mission_open_phase_drift`], including why #1463's "no
+///     longer a reachable state" is true of the happy path only.
+///   - **Active mission whose phases are all terminal with none complete (3
+///     rows) — new `all-phases-terminal-none-complete`.** The complement
+///     `done-not-finalized` deliberately excludes. See
+///     [`nothing_complete_not_closed_drift`].
+///
+/// **The 12 rows still silent, each on purpose.** Closing all of them was
+/// never the goal; making the two surfaces agree OR differ honestly was.
+///   - **Active + a Running phase, evidence `NoAttributableSession` (1
+///     row).** Unchanged from round 2 — no dispatch-liveness observation
+///     exists, which is this rule's entire subject. #2691.
+///   - **Active + no phases at all, × the 3 `Abandoned`-producing flow
+///     shapes (3 rows).** A mission with no phases makes no board-visible
+///     claim about work being in flight, so there is nothing for a
+///     dispatch observation to contradict. The shape itself — an Active
+///     mission that never minted a phase — is a MINT failure, and
+///     `lifecycle::reconcile_mint_failure` already owns closing it; a
+///     board rule here would be a second, weaker answer to a question
+///     something else already answers properly.
+///   - **Active + a Planned phase, × the same 3 flow shapes (3 rows).** The
+///     one where firing would be actively wrong. A Planned phase is the
+///     board saying work is QUEUED, not in flight — the ordinary shape of a
+///     mission parked at a sign-off gate between phases. And
+///     `mission_run_status_and_evidence` reaches `Abandoned` through `any`
+///     over the mission's WHOLE session history, so a dispatch that was
+///     killed and then successfully re-run leaves the mission reading
+///     `Abandoned` forever: a rule firing here would flag a healthy parked
+///     mission, which is exactly the false alarm round 2 removed. The
+///     Running-phase restriction is not arbitrary — a Running phase is the
+///     only shape where the BOARD positively asserts something a dead
+///     dispatch contradicts.
+///   - **Finalized mission whose phases are all terminal with none
+///     complete (5 rows).** `run list` reads this `Abandoned`
+///     (`mission_finalized_status`'s `Ok(None)` arm). The two surfaces are
+///     answering different questions and both answers are true: `run list`
+///     is a RUN view ("how did this end" — it produced nothing), the board
+///     is a MISSION-STATE view ("it was closed"). Flagging it would put a
+///     permanent, unclearable drift on every mission that ever failed —
+///     `attention_rollup` counts drifts kind-agnostically, so each one
+///     removes the board's clean checkmark forever — and there is no
+///     reconcile command to offer, because nothing is inconsistent. That is
+///     the same never-clears failure mode round 2 rejected. The honest home
+///     for "this closed mission produced nothing" is the progress column
+///     and `mission debrief`, not the drift list.
+///
+/// **One Active row has NO other rule behind it (round 3, CONSIDER 1).**
+/// Most of the 13 rule-silent Active rows are silent HERE and still drawn
 /// elsewhere — the day-scale `stale_active_drift` covers the aged
 /// zero-complete shapes, `done-not-finalized` covers the all-terminal
-/// ones. One is not covered by anything: an Active mission past
+/// complete-bearing ones, and (round 4)
+/// `all-phases-terminal-none-complete` covers the all-abandoned ones. One
+/// is still not covered by anything: an Active mission past
 /// `RUNS_FLOW_SCAN_WINDOW_DAYS` whose records aged out, holding a Running
 /// phase AND at least one Complete phase, draws no drift of any kind
 /// while `run list` reads it `abandoned`. `done-not-finalized` needs every
@@ -972,22 +1191,26 @@ fn stale_active_drift(m: &Mission, complete: usize, now: u64, stale_days: u64) -
 /// asserting the board's silence.
 ///
 /// **Two counting subtleties, so a recount doesn't come out wrong.**
-///   1. The naive sweep returns **58**, not 33. The extra 25 are the whole
-///      `MissionStatus::Aborted` block (5 phase × 5 flow shapes), and they
-///      are NOT disagreements: an aborted mission's row carries
-///      `abandoned_reason = Aborted`, which `run_list::subtitle_for`
-///      renders as the literal word "aborted" — the same thing the board
-///      itself shows for a mission the operator tore down. Splitting on
-///      the REASON is what turns 58 into 33.
-///   2. These count rows where THIS RULE is silent. The stricter reading —
-///      no drift of ANY kind on the row — gives **29** (raw 54), because
-///      an Active/Paused mission holding a Complete phase already draws
-///      `done-not-finalized`. The matrix test asserts both numbers.
+///   1. The naive rule-silent sweep returns **53**, not 28. The extra 25
+///      are the whole `MissionStatus::Aborted` block (5 phase × 5 flow
+///      shapes), and they are NOT disagreements: an aborted mission's row
+///      carries `abandoned_reason = Aborted`, which
+///      `run_list::subtitle_for` renders as the literal word "aborted" —
+///      the same thing the board itself shows for a mission the operator
+///      tore down. Splitting on the REASON is what turns 53 into 28. (The
+///      board-silent sweep splits the same way: raw **27**, real **12**.)
+///   2. The 28 counts rows where THIS RULE is silent; the 12 counts rows
+///      where NO rule speaks. The gap between them is every row some OTHER
+///      board rule already draws — `done-not-finalized` for the
+///      complete-bearing all-terminal shapes, and (round 4)
+///      `all-phases-terminal-none-complete` and
+///      `mission-terminal-open-phase`. The matrix test asserts both numbers
+///      and both per-status breakdowns.
 ///
-/// Narrowing the claim to exactly this, rather than silently shipping a
-/// partial fix under the original issue's full title, is a deliberate
-/// choice — the remaining rows are real and worth a follow-up, not a
-/// gap this PR is unaware of.
+/// Leaving 12 rows silent WITH the reasoning above, rather than widening
+/// this rule until the count reaches zero, is the deliberate choice — a
+/// drift that fires on a healthy mission is noise however it is worded, and
+/// three of the twelve would do exactly that.
 fn running_phase_session_drift(
     m: &Mission,
     phases: &[&Phase],
@@ -2991,18 +3214,79 @@ mod tests {
         assert_eq!(a.chars().count(), 20);
     }
 
+    /// (#2682 round 4) SUPERSEDES `finalized_mission_with_open_phase_no_
+    /// longer_drifts`, which pinned the opposite and is why this rename is
+    /// deliberate rather than an edit in place.
+    ///
+    /// That test rested on #1463's "no longer a reachable state" claim. The
+    /// claim is true of the HAPPY path only: `reconcile_mission_phases_
+    /// terminal` swallows every `phase_abandon` result (`let _ = ...`) and
+    /// the mission is saved `Finalized` regardless, so a single unwritable
+    /// phase file — or a kill between the reconcile and the save — lands
+    /// exactly here, as do pre-#1463 records. Meanwhile `run list` reads all
+    /// ten of these matrix rows `abandoned` while the board said nothing.
+    /// See `terminal_mission_open_phase_drift`'s own doc.
     #[test]
-    fn finalized_mission_with_open_phase_no_longer_drifts() {
-        // (#1463) The "finalized-with-open-phase" arm retired: `mission
-        // finalize` / `mission abort` reconcile every phase to terminal as
-        // part of closing, so this is no longer a reachable state — and a
-        // Finalized mission never surfaces a drift on this axis anymore,
-        // even if a hand-edited JSON produced one. (Legacy on-disk data is a
-        // `mission finalize`/`abort` re-run away from clean.)
+    fn finalized_mission_with_an_open_phase_is_named_not_silently_accepted() {
         let m = mission("m1", MissionStatus::Finalized);
         let running = phase("s1", "m1", PhaseStatus::Running);
         let planned = phase("s2", "m1", PhaseStatus::Planned);
-        assert!(detect_drift(&m, &[&running, &planned], &BTreeMap::new(), None, None, 0, 14).is_empty());
+        let d = detect_drift(&m, &[&running, &planned], &BTreeMap::new(), None, None, 0, 14);
+        assert_eq!(
+            d.iter().map(|dr| dr.kind).collect::<Vec<_>>(),
+            vec!["mission-terminal-open-phase"],
+            "got: {d:?}"
+        );
+        assert!(d[0].detail.contains("s1") && d[0].detail.contains("s2"), "{}", d[0].detail);
+        // A remedy the operator can paste, one per stranded phase.
+        assert!(
+            d[0].suggest.iter().any(|s| s.starts_with("darkmux mission abort m1 --phase s1")),
+            "{:?}",
+            d[0].suggest
+        );
+
+        // THE HEALTHY NEIGHBOR, one step away: the same Finalized mission
+        // whose phases DID reach terminals draws nothing. Without this the
+        // assertion above would still pass if the rule fired on every
+        // Finalized mission there is.
+        let done = phase("s1", "m1", PhaseStatus::Complete);
+        let torn = phase("s2", "m1", PhaseStatus::Abandoned);
+        assert!(
+            detect_drift(&m, &[&done, &torn], &BTreeMap::new(), None, None, 0, 14).is_empty(),
+            "a reconciled Finalized mission must stay silent"
+        );
+    }
+
+    /// (#2682 round 4) COUNTED ONCE. `live_step_drifts` already emits
+    /// `mission-terminal-live-step` for a closed mission holding live STEPS,
+    /// and an open phase above those steps is the same instance of the same
+    /// problem one layer up — so the phase-level rule yields to it, matching
+    /// that function's own precedent and #1582's one-drift-per-KIND rule.
+    #[test]
+    fn a_closed_mission_holding_live_steps_is_not_reported_twice() {
+        let m = mission("m1", MissionStatus::Finalized);
+        let running = phase("s1", "m1", PhaseStatus::Running);
+        let mut live = BTreeMap::new();
+        live.insert("s1".to_string(), vec!["step-1".to_string()]);
+
+        let kinds: Vec<&str> = detect_drift(&m, &[&running], &live, None, None, 0, 14)
+            .iter()
+            .map(|d| d.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["mission-terminal-live-step"],
+            "the step-level drift already speaks for this mission: {kinds:?}"
+        );
+
+        // …and the contrast that makes the suppression measurable rather
+        // than accidental: the SAME phase with no live steps under it is the
+        // stranded-on-its-own case nothing named before.
+        let kinds: Vec<&str> = detect_drift(&m, &[&running], &BTreeMap::new(), None, None, 0, 14)
+            .iter()
+            .map(|d| d.kind)
+            .collect();
+        assert_eq!(kinds, vec!["mission-terminal-open-phase"], "got: {kinds:?}");
     }
 
     #[test]
@@ -3030,12 +3314,57 @@ mod tests {
         assert!(detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 0, 14).is_empty());
     }
 
+    /// (#2682 round 4) SUPERSEDES `active_mission_only_abandoned_is_not_
+    /// done`, which asserted this shape draws NOTHING.
+    ///
+    /// That assertion was right about one thing and wrong about the
+    /// conclusion: an all-abandoned mission is indeed not "done", so
+    /// `done-not-finalized`'s sentence must not be applied to it. But "this
+    /// rule's wording does not fit" is not "the board has nothing to say" —
+    /// and the board said nothing while `run list` read the same mission
+    /// `abandoned` (three of #2682's rows). The fix is a second kind with
+    /// its own claim, not a relaxed guard on the first.
     #[test]
-    fn active_mission_only_abandoned_is_not_done() {
-        // All terminal but nothing COMPLETE → not "done", don't nag to close.
+    fn active_mission_with_every_phase_abandoned_is_named_with_its_own_wording() {
         let m = mission("m1", MissionStatus::Active);
         let s = phase("s1", "m1", PhaseStatus::Abandoned);
-        assert!(detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 0, 14).is_empty());
+        let d = detect_drift(&m, &[&s], &BTreeMap::new(), None, None, 0, 14);
+        assert_eq!(
+            d.iter().map(|dr| dr.kind).collect::<Vec<_>>(),
+            vec!["all-phases-terminal-none-complete"],
+            "got: {d:?}"
+        );
+        assert!(
+            !d[0].detail.contains("looks done"),
+            "the whole reason this is a separate kind: {}",
+            d[0].detail
+        );
+        assert!(d[0].detail.contains("1 of 1 abandoned"), "{}", d[0].detail);
+
+        // THE HEALTHY NEIGHBORS, one step away in each direction that
+        // matters — without these the rule above could fire on every Active
+        // mission and still pass.
+        let running = phase("s2", "m1", PhaseStatus::Running);
+        assert!(
+            detect_drift(&m, &[&s, &running], &BTreeMap::new(), None, None, 0, 14).is_empty(),
+            "work still in flight is not this shape"
+        );
+        let complete = phase("s3", "m1", PhaseStatus::Complete);
+        let kinds: Vec<&str> = detect_drift(&m, &[&s, &complete], &BTreeMap::new(), None, None, 0, 14)
+            .iter()
+            .map(|dr| dr.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["done-not-finalized"],
+            "a mission that produced SOMETHING stays with the rule whose sentence fits it — the \
+             two kinds must never both fire: {kinds:?}"
+        );
+        let closed = mission("m1", MissionStatus::Finalized);
+        assert!(
+            detect_drift(&closed, &[&s], &BTreeMap::new(), None, None, 0, 14).is_empty(),
+            "an already-closed mission is not still open"
+        );
     }
 
     #[test]
@@ -3489,18 +3818,29 @@ mod tests {
     /// to this module's own `detect_drift`, and records the rows where the
     /// two disagree.
     ///
+    /// **Which predicate is the HEADLINE (#2682 round 4).** Predicate 2 —
+    /// "`run list` reads it `Abandoned` and the board draws NO drift of any
+    /// kind" — is the one that answers this issue's actual question, "do
+    /// the two surfaces disagree". Predicate 1 measures one RULE's coverage
+    /// (`running-phase-session-dead`), which is narrower by construction and
+    /// is not moved at all by a row that a DIFFERENT board rule starts
+    /// drawing. Round 4 closed 17 of predicate 2's 29 rows with rules that
+    /// are not that one, so predicate 1 barely moved (33 → 28, and only
+    /// because the Paused family stopped reading `Abandoned` at all) while
+    /// predicate 2 went 29 → 12. Read predicate 2 first.
+    ///
     /// **The counting subtlety, stated so a recount doesn't come out
     /// wrong.** The naive "`run list` says `Abandoned`, board is silent"
-    /// predicate returns 58, not 33. Twenty-five of those are the whole
-    /// `MissionStatus::Aborted` block (5 × 5), and they are NOT
-    /// disagreements: an aborted mission's row carries `abandoned_reason =
-    /// Aborted`, which `run_list::subtitle_for` renders as the literal word
-    /// "aborted" (its sibling `AbandonReason::NoTerminal` is the one that
-    /// reads "no ending recorded") — the same thing the board itself shows
-    /// for a mission the operator tore down. Splitting on the REASON is
-    /// what turns the raw count into
-    /// the real one. A future reader recounting without that split will
-    /// get 58 and think this doc drifted.
+    /// predicate returns 53 for predicate 1, not 28. Twenty-five of those
+    /// are the whole `MissionStatus::Aborted` block (5 × 5), and they are
+    /// NOT disagreements: an aborted mission's row carries
+    /// `abandoned_reason = Aborted`, which `run_list::subtitle_for` renders
+    /// as the literal word "aborted" (its sibling `AbandonReason::NoTerminal`
+    /// is the one that reads "no ending recorded") — the same thing the
+    /// board itself shows for a mission the operator tore down. Splitting on
+    /// the REASON is what turns the raw count into the real one. A future
+    /// reader recounting without that split will get 53 and think this doc
+    /// drifted.
     ///
     /// Pins `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (MUST FIX 2): the
     /// `NoRecords` row's verdict is the mission's age measured against
@@ -3547,10 +3887,11 @@ mod tests {
         // Predicate 2 — "the WHOLE BOARD stayed silent": `Abandoned` per
         // `run list` and NO drift of any kind. Strictly narrower, because
         // an Active/Paused mission with a Complete phase already draws
-        // `done-not-finalized`. Reported so a recount under either reading
-        // lands on a number this test names.
+        // `done-not-finalized`. THE HEADLINE — see this test's doc.
         let mut raw_board_silent = 0usize;
         let mut real_board_silent = 0usize;
+        let mut board_per_status: BTreeMap<String, usize> = BTreeMap::new();
+        let mut board_detail: Vec<String> = Vec::new();
         let mut detail: Vec<String> = Vec::new();
 
         for (mi, ms) in mission_statuses.iter().enumerate() {
@@ -3651,6 +3992,9 @@ mod tests {
                         raw_board_silent += 1;
                         if counts_as_disagreement {
                             real_board_silent += 1;
+                            *board_per_status.entry(format!("{ms:?}")).or_default() += 1;
+                            board_detail
+                                .push(format!("{ms:?}/{ps:?}/{fs:?} evidence={evidence:?}"));
                         }
                     }
                 }
@@ -3669,13 +4013,19 @@ mod tests {
         for line in &detail {
             println!("  · {line}");
         }
+        println!("per mission status (board-silent): {board_per_status:?}");
+        for line in &board_detail {
+            println!("  ▪ {line}");
+        }
 
         assert_eq!(rows, 100, "the matrix must stay 4 x 5 x 5");
+
+        // ── Predicate 1: one rule's coverage (NOT the headline) ──────────
         assert_eq!(
-            raw_rule_silent, 58,
+            raw_rule_silent, 53,
             "naive count changed — see this test's doc on the Aborted split: {detail:?}"
         );
-        assert_eq!(real_rule_silent, 33, "the documented disagreement count moved: {detail:?}");
+        assert_eq!(real_rule_silent, 28, "the documented disagreement count moved: {detail:?}");
         assert_eq!(
             per_status.get("Active").copied(),
             Some(13),
@@ -3688,11 +4038,38 @@ mod tests {
         );
         assert_eq!(
             per_status.get("Paused").copied(),
-            Some(5),
-            "Paused breakdown moved: {per_status:?}"
+            None,
+            "(#2682 round 4) the Paused family must no longer read `Abandoned` at all — a paused \
+             mission whose session was recorded ENDING now reads Running, so these 5 rows leave \
+             the disagreement set entirely rather than being papered over with a drift: \
+             {per_status:?}"
         );
-        assert_eq!(raw_board_silent, 54, "whole-board-silent raw count moved");
-        assert_eq!(real_board_silent, 29, "whole-board-silent disagreement count moved");
+
+        // ── Predicate 2: THE HEADLINE — the board says nothing at all ────
+        assert_eq!(raw_board_silent, 27, "whole-board-silent raw count moved");
+        assert_eq!(
+            real_board_silent, 12,
+            "(#2682 round 4) 29 before this round, 12 after. Every remaining row is named, with \
+             its reasoning, in `running_phase_session_drift`'s scope doc — if this number moves, \
+             update that doc rather than this assertion: {board_detail:?}"
+        );
+        assert_eq!(
+            board_per_status.get("Active").copied(),
+            Some(7),
+            "Active board-silent breakdown moved: {board_detail:?}"
+        );
+        assert_eq!(
+            board_per_status.get("Finalized").copied(),
+            Some(5),
+            "Finalized board-silent breakdown moved — only the all-terminal-phases rows should \
+             remain; a Finalized mission holding a Planned/Running phase now draws \
+             `mission-terminal-open-phase`: {board_detail:?}"
+        );
+        assert_eq!(
+            board_per_status.get("Paused").copied(),
+            None,
+            "the Paused family left the disagreement set: {board_detail:?}"
+        );
     }
 
     /// (#2682) The invariant the issue exists to close, pinned directly

@@ -59,7 +59,9 @@ import {
  * target in the legacy viewer distinct from this one filtered by kind=mission.
  *
  * Failure handling deliberately mirrors legacy's own SILENCE rather than the
- * scaffold's usual `fetchJson`-driven visible-error pattern (`FleetStrip`):
+ * scaffold's usual `fetchJson`-driven visible-error pattern (the strip that
+ * demonstrated it, `FleetStrip`, was deleted in #2725; `FleetLens`'s
+ * `RunsUnreadableNotice` is the live exemplar):
  * `loadRuns()`/`loadLabRuns()` both catch a fetch failure into an EMPTY
  * result (`RUNS=[]; RUNS_LOADED=true`), never a distinct error state — Rule 1
  * (pure port, including its silences) governs here; the three-state

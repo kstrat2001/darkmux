@@ -1083,3 +1083,57 @@
             );
         }
     }
+
+    /// (#2721) The bench's own stdout→verdict path, with image-pull progress
+    /// ahead of the compact `--json` envelope — the cold-run shape.
+    ///
+    /// The noise line is JSON-SHAPED deliberately. `envelope_candidate` selects
+    /// the LAST `{`-line; with plain-text noise the envelope is the only
+    /// `{`-line, so dropping the `.rev()` would still select it and this test
+    /// would pass through the mutation it exists to catch. A second `{`-line
+    /// makes the selection observable: without `.rev()` the noise wins, it
+    /// carries no `final_assistant`, the reply goes empty, and every assertion
+    /// below fails.
+    ///
+    /// Both bench modes are covered because they run different parsers
+    /// (`parse_review` vs `parse_freeform_review`) over the same reply.
+    #[test]
+    fn a_json_shaped_noise_line_ahead_of_the_envelope_does_not_defeat_the_verdict() {
+        const PULL_NOISE: &str = r#"{"status":"Pulling fs layer","id":"a1b2c3"}"#;
+        // Pinned: the noise alone yields EMPTY text, which is what turns a bad
+        // selection into a red test rather than a merely different one.
+        assert_eq!(super::envelope_reply_text(PULL_NOISE), "");
+
+        let envelope = |reply: &str| {
+            serde_json::json!({
+                "result": "stop",
+                "final_assistant": reply,
+                "metrics": { "model": "test-35b", "total_tokens": 42 }
+            })
+            .to_string()
+        };
+        let noisy = |reply: &str| format!("{PULL_NOISE}\n{}", envelope(reply));
+
+        // Strict mode: a JSON review object inside the envelope's text.
+        let strict = noisy(
+            "{\"verdict\":\"flag\",\"findings\":[{\"severity\":\"high\",\"anchor\":\"const total = base * rate\",\"title\":\"unit mismatch\"}]}",
+        );
+        let r = super::review_from_stdout(&strict, super::BenchMode::Strict);
+        assert!(r.parsed, "strict verdict must survive noise ahead of envelope");
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].anchor, "const total = base * rate");
+
+        // Freeform mode: the marker dialect inside the envelope's text.
+        let freeform =
+            noisy("MUST FIX: `const total = base * rate` is per-day against a per-month base\n");
+        let r = super::review_from_stdout(&freeform, super::BenchMode::FreeForm);
+        assert!(r.parsed, "freeform verdict must survive noise ahead of envelope");
+        assert_eq!(r.verdict, "flag");
+        assert_eq!(r.findings.len(), 1);
+
+        // The metrics half reads the SAME line — that agreement is the claim.
+        let m = super::envelope_meta_with_exit(&strict, 0);
+        assert_eq!(m.model.as_deref(), Some("test-35b"));
+        assert_eq!(m.total_tokens, Some(42));
+    }

@@ -33,4 +33,5 @@
 #![allow(dead_code)]
 
 pub mod mock_lmstudio;
+pub mod fixture_reaper;
 pub mod harness;

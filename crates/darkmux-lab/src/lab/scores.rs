@@ -372,9 +372,95 @@ pub(crate) struct EnvelopeMeta {
     pub infra_exit: bool,
 }
 
+/// (#2719) WHICH line of a dispatch's stdout is the envelope — the last one
+/// starting with `{`, falling back to the whole stdout when none does,
+/// trimmed. The ONE place that decision is made, for every caller in the
+/// crate that isolates an envelope line at all.
+///
+/// That qualifier is exact, not a hedge, and it is narrower than "every
+/// reader of dispatch stdout in this crate". Read [`envelope_reply_text`]
+/// below for which callers isolate and which deliberately still do not.
+///
+/// (#2721) `lab::review_bench` and `lab::dialectic`'s `run_debate` USED to be
+/// the counter-examples named here: each took METRICS through
+/// [`envelope_meta`] (isolated, via this) and its TEXT through
+/// `providers::prompt::extract_reply_text` on the WHOLE stdout, so the two
+/// halves of one trial could come from different places. Both now go through
+/// [`envelope_reply_text`], so text and metrics come from the same line by
+/// construction, and one mutation of the selection below turns a guard red in
+/// EACH bench rather than in neither.
+///
+/// It was two places until #2719: [`parse_envelope`] below and
+/// `providers::tool_bench::extract_reply` each carried their own copy of the
+/// same `.rev().find(…)`, so a bench could read its VERDICT off one line and
+/// its METRICS off another the moment the two drifted. Nothing pinned the
+/// duplicate — mutating `tool_bench`'s `.rev().find(…)` to `.find(…)` left
+/// the whole selection green, while making every trial with JSON-shaped
+/// progress noise ahead of the envelope resolve to no answer and score a
+/// capability zero inside the pass-rate denominator (a healthy bench run
+/// silently reporting an all-zero model). Both consumers now call this, and
+/// both have a guard that goes red when this line changes.
+///
+/// KNOWN LIMITATION, deliberately not fixed here (#2719): a JSON line AFTER
+/// a real envelope wins this heuristic, so `{envelope}\n{"status":"…"}`
+/// reads the trailing line and discards the envelope's counts. Neither
+/// answer is right, the producer is unlikely (docker writes pull progress to
+/// stderr), and closing it needs a DIFFERENT heuristic — "the last line that
+/// parses as an object AND looks like an envelope" — which is a semantic
+/// change to what counts as an envelope for both benches, not a shared call.
+/// It is scoped to its own change on purpose. What unification buys is that
+/// such a change is now a one-line edit here rather than two edits that can
+/// disagree.
+pub fn envelope_candidate(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or(stdout)
+        .trim()
+}
+
+/// (#2721) The model's final message, read off the SAME line
+/// [`envelope_meta`] reads the metrics off. The one way a caller should turn
+/// a dispatch's stdout into text.
+///
+/// Callers: `providers::tool_bench`, `lab::review_bench`, `lab::dialectic`'s
+/// three seats, and the root crate's `notebook draft` (which is why this is
+/// `pub`). A mutation of [`envelope_candidate`] turns a guard red in each.
+///
+/// # This is for dispatch STDOUT, and only for dispatch stdout
+///
+/// The input must be what the internal runtime prints: `serde_json::to_string`
+/// (COMPACT) + `println!` (`runtime/src/main.rs:1110`, `:1216`), i.e. the
+/// envelope occupies exactly one line, possibly preceded by noise.
+///
+/// Do NOT route a stored, PRETTY-PRINTED artifact through this. The last line
+/// starting with `{` in a pretty-printed document is an inner array-element
+/// opener (`          {`), which is not parseable JSON on its own, so the
+/// result is the string `"{"` — the entire reply destroyed. That is measured,
+/// not feared: over the 181 recorded `qa-reply.json` artifacts on this
+/// machine, all 19 pretty-printed ones collapsed from up to 4698 bytes of
+/// reply to 1 byte, while all 142 in the real single-line dispatch-stdout
+/// shape were byte-identical before and after (#2721's before/after).
+///
+/// That is why two `extract_reply_text` callers are deliberately left reading
+/// the whole input and are NOT bugs:
+/// - `providers::prompt`'s reply-FILE path and the root crate's
+///   `notebook::build_run_data_summary` both read `qa-reply.json`, a
+///   pretty-printed artifact, not stdout.
+/// - `providers::prompt`'s and `providers::coding_task`'s own stdout reads are
+///   a genuine remaining instance of the split, left alone on purpose: they
+///   feed workload VERIFY outcomes rather than a bench score, so changing them
+///   changes what recorded lab runs verify to. Not in #2721's scope; named
+///   here so this doc stays true rather than implying a unification that did
+///   not happen.
+pub fn envelope_reply_text(stdout: &str) -> String {
+    crate::providers::prompt::extract_reply_text(envelope_candidate(stdout))
+}
+
 /// (#2685 frontier-QA) Was an envelope recovered at all, and if so what was
-/// in it? The candidate is the last stdout line starting with `{` (falling
-/// back to the whole stdout); `None` means it did not parse as JSON.
+/// in it? The candidate line is [`envelope_candidate`]'s; `None` means it did
+/// not parse as a JSON OBJECT.
 ///
 /// Shared by [`envelope_meta`] and [`envelope_meta_with_exit`] so "was an
 /// envelope recovered" is decided in exactly ONE place. The exit-promotion
@@ -384,13 +470,22 @@ pub(crate) struct EnvelopeMeta {
 /// `final_assistant` to read a verdict out of. That approximation was
 /// harmless while the promotion was gated on the caller's eligibility bool
 /// and wrong the moment it stopped being — see [`is_infra_failure`].
+///
+/// (#2719) The `is_object` filter is what makes the name true. Without it
+/// this answered "did any JSON VALUE parse", so a bare scalar or array on
+/// stdout — `null`, `true`, `123`, `"a string"`, `[1,2,3]` — counted as a
+/// recovered envelope and blocked [`envelope_meta_with_exit`]'s promotion,
+/// scoring a dead container as a capability zero charged to the model. Same
+/// gap one level over from the one #2685 closed: a thing that PARSES is not
+/// a thing that was RECOVERED. No live producer emits one (the runtime's
+/// `build_json_envelope` always prints an object, and its
+/// serialization-failure fallback prints `"{}"` — an object, which still
+/// lands correctly as a recovered-but-empty envelope), so this is a contract
+/// defect rather than an observed misclassification. Pinned either way.
 fn parse_envelope(stdout: &str) -> Option<serde_json::Value> {
-    let candidate = stdout
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .unwrap_or(stdout);
-    serde_json::from_str::<serde_json::Value>(candidate.trim()).ok()
+    serde_json::from_str::<serde_json::Value>(envelope_candidate(stdout))
+        .ok()
+        .filter(serde_json::Value::is_object)
 }
 
 /// Parse the dispatch envelope (the last stdout line starting with `{` —
@@ -723,6 +818,59 @@ mod tests {
         // Garbage stdout degrades to None, never errors.
         let g = envelope_meta("not json at all");
         assert!(g.model.is_none() && g.total_tokens.is_none());
+    }
+
+    /// (#2719) The candidate is the LAST `{` line, and this pins it with
+    /// JSON-SHAPED noise so the `.rev()` is not an equivalent mutant: the
+    /// test above uses plain-text noise (`pulling image...`), where the first
+    /// and last `{` line are the same line.
+    ///
+    /// This is half of the unification proof. `providers::tool_bench`'s
+    /// `extract_reply_reads_past_json_shaped_noise_ahead_of_the_envelope` is
+    /// the other half, and both now route through
+    /// [`envelope_candidate`] — so ONE mutation there turns BOTH red. If only
+    /// one goes red, the crate has two implementations again and the "in
+    /// exactly ONE place" claim in this file is false, which is exactly the
+    /// state #2719 found it in.
+    #[test]
+    fn envelope_meta_reads_past_json_shaped_noise_ahead_of_the_envelope() {
+        let stdout = "{\"status\":\"Downloading\",\"id\":\"sha256:abc\"}\n\
+                      {\"status\":\"Extracting\",\"id\":\"sha256:abc\"}\n\
+                      {\"result\":\"stop\",\"final_assistant\":\"ANSWER: DMX-K7RW2MPQ\",\
+                        \"metrics\":{\"model\":\"m-x\",\"prompt_tokens\":8,\"completion_tokens\":2}}";
+        let m = envelope_meta(stdout);
+        assert_eq!(m.model.as_deref(), Some("m-x"), "a JSON progress line ahead of the envelope is not the envelope");
+        assert_eq!(m.total_tokens, Some(10));
+    }
+
+    /// (#2719) [`parse_envelope`] answers "was an ENVELOPE recovered", not
+    /// "did any JSON value parse". A bare scalar or array on stdout is not an
+    /// envelope, and counting it as one blocked the exit promotion below:
+    /// `null` at exit 137 came back `infra_exit: false`, so a hard-killed
+    /// container scored a capability failure at 0.0 — a zero charged to the
+    /// model for a dispatch that never ran. Same gap one level over from the
+    /// one #2685 closed.
+    ///
+    /// No live producer emits one; the runtime always prints an object. The
+    /// inverted case is the one that has a producer and it is asserted here
+    /// too: `"{}"` is the runtime's own serialization-failure fallback, is an
+    /// object, and must keep landing as a recovered (if empty) envelope
+    /// rather than being swept into infra by an over-broad filter.
+    #[test]
+    fn parse_envelope_rejects_bare_scalars_and_arrays_but_keeps_an_empty_object() {
+        for bare in ["null", "true", "123", "\"a string\"", "[1,2,3]", "[]"] {
+            let m = envelope_meta_with_exit(bare, 137);
+            assert!(
+                m.infra_exit,
+                "{bare} is not an envelope — a dead container must not be charged to the model"
+            );
+            assert_eq!(m.total_tokens, None, "{bare}: promotion never fabricates a token count");
+        }
+        // The runtime's `"{}"` fallback IS an object: recovered, so never
+        // exit-promoted, exactly as before.
+        let empty = envelope_meta_with_exit("{}", 137);
+        assert!(!empty.infra_exit, "an empty OBJECT is a recovered envelope, not a dead dispatch");
+        assert_eq!(empty.total_tokens, None);
     }
 
     /// (#1210) The issue's "(or a non-zero exit)" clause: a dead

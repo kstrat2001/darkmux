@@ -62,14 +62,23 @@ on:
   push:
     branches: [main]
   schedule:
-    # Nightly sweep. Re-measured 2026-09-09 with cargo-mutants 27.1.0 (drifted
-    # slightly from the #2499 issue's 2026-09-08 numbers as the tree grew):
-    # `cargo mutants --list` (the scope this job actually runs at — the root
-    # `darkmux` package only, see mutants-full's comment) finds 2,176 mutants,
-    # and `cargo mutants --workspace --list` finds 12,764. Either number is a
-    # build+test per mutant and does not belong in anyone's review loop; the PR
-    # job (#2499) now mutates `--workspace`, scoped to the diff, which is far
-    # smaller and whose baseline is scoped to only the touched packages.
+    # Nightly sweep. Originally root-package-only (`cargo mutants --list`
+    # found 2,176 mutants at that scope, 2026-09-09) — the ~12 crates under
+    # `crates/` were never covered because an unsharded run there could not
+    # finish (see `mutants-full`'s own comment for the measured numbers and
+    # the #2499 fix). As of that fix this cron now drives a SHARDED sweep of
+    # the whole workspace (`mutants-full`'s 21-shard matrix + the small-crate
+    # job `mutants-full-small`, 13,636 mutants total, 2026-09-15 census) —
+    # not just the root package. The PR job (`mutants-in-diff`, #2499's
+    # earlier half) mutates `--workspace` too, but scoped to the diff, whose
+    # baseline is scoped to only the touched packages — a naturally SMALLER
+    # problem than this cron's whole-workspace sweep, but not the
+    # "already-cheap" one an earlier draft of this comment called it: #2734
+    # measured a single real diff (PR #2731) at 167 mutants concentrated in
+    # the tree's most expensive crate, enough to outrun that job's own
+    # 60-minute budget on its own — it now gets the SAME sharding treatment
+    # (`mutants-in-diff`'s own 6-way `--shard` matrix), for the same reason,
+    # just sized against that job's own much smaller mutant counts.
     - cron: "23 7 * * *"
   workflow_dispatch:
 
@@ -78,60 +87,104 @@ env:
 
 jobs:
   mutants-in-diff:
-    name: mutation — tests that cannot fail (PR diff only)
+    # (#2734) SHARDED — the root/workspace `--in-diff` invocation used to be
+    # one unsharded `cargo mutants --workspace --in-diff ... -j 4` call in
+    # this same job, the same disease #2499 already fixed for the nightly
+    # sweep (`mutants-full`, below) applied to the PR-diff gate instead.
+    #
+    # THE INCIDENT THIS FIXES, measured, not assumed: PR #2731 (+2,926/-67,
+    # 21 files, all Rust; `cbda2f6c`) on run 34972602499 — the "Mutate only
+    # what this PR touched" step ran 13:09:19 -> 14:10:06 UTC, 60m47s, then
+    # was CANCELLED. The job's OWN `timeout-minutes` at that commit was
+    # already 60 (confirmed via `git show cbda2f6c:.github/workflows/
+    # quality.yml`, not the 30 an earlier draft of this fix assumed without
+    # checking) — so the declared timeout DID fire close to schedule; the
+    # ~47s past 60:00 is GitHub Actions' ordinary cancellation-propagation
+    # lag, not a separate defect. The real bug was capacity, not the
+    # timeout's own honesty: one invocation legitimately needed more than
+    # 60 minutes and had nowhere to shed the excess.
+    #
+    # MEASURED MUTANT COUNT for that diff (`cargo mutants --workspace
+    # --in-diff <diff> --list --json` against the PR's own head commit,
+    # 2026-09-15, reproduced independently of the real CI run and CROSS-
+    # CHECKED against that run's own `mutants.json` — both read 167):
+    #
+    #   darkmux-crew   117    darkmux           2
+    #   darkmux-serve   38    darkmux-doctor    1
+    #   darkmux-types    9              TOTAL: 167
+    #
+    # (`runtime/`'s own scope, below, found 0 for this diff — its only
+    # touched lines were inside a `#[cfg(test)] mod tests` block.)
+    #
+    # WHY 167 mutants alone ran the job's WHOLE 60-minute budget without
+    # finishing: the real run's own partial `outcomes.json` (downloaded
+    # from the cancelled run's artifact) shows only 52 of 167 evaluated —
+    # 42 caught, 6 missed, 4 unviable, 0 timeout — after a combined 5-
+    # package baseline of 190.5s build + 221.2s test (~6.9 min). That is
+    # ~62s/mutant amortized under `-j 4` for the REMAINING ~54 minutes —
+    # far slower than the ~21.4s/mutant this file cites elsewhere for the
+    # nightly sweep, because that figure comes from smaller/leaf crates:
+    # individual mutant BUILD phases sampled from this same run's own
+    # `outcomes.json` ran 236.8s-464.8s, driven by `darkmux-crew` being the
+    # single largest, most expensive crate in the tree (3,748 mutants on
+    # its own census below — the nightly needs 6 shards for a FULL sweep of
+    # it alone). A diff-scoped run has a naturally smaller mutant set than
+    # the nightly's 13,636, per the issue's own framing, but "smaller total"
+    # is not "fast per mutant" when the diff concentrates in the tree's most
+    # expensive crate — which #2731's genuinely did.
+    #
+    # SHARDING AXIS: fixed-index `--shard i/6` over the SAME `--workspace
+    # --in-diff` invocation (not package-first like the nightly) —
+    # deliberately, because a per-PR diff touches an unpredictable SUBSET
+    # of packages each time (this PR touched 5; the next might touch 1 or
+    # 12), so the nightly's hand-enumerated, whole-crate-census matrix has
+    # no equivalent shape here: there is no stable "list of packages this
+    # job always covers" to hardcode. `--shard` operates on cargo-mutants'
+    # OWN already-`--in-diff`-filtered mutant list (confirmed locally: the
+    # 6-way split of the 167-mutant list above summed to exactly 167 with
+    # zero duplicates and zero drops — every mutant landed in exactly one
+    # shard), so it partitions whatever the diff happens to touch without
+    # needing to know the package layout up front.
+    #
+    # SHARD COUNT: 6, sized against the REAL throughput above, not the
+    # nightly's 21.4s/mutant (which would have undersized this by ~3x).
+    # 167 mutants / 6 ~= 28/shard; at the measured ~62s/mutant that is
+    # ~29 minutes of mutation-testing plus the ~7-minute baseline (paid
+    # PER SHARD — sharding parallelizes wall-clock, it does not reduce
+    # total baseline+mutation work, same COST note the nightly's own job
+    # comment already makes) ~= ~36 minutes per shard, comfortably under
+    # this job's `timeout-minutes` (60 -> 45, tightened: real margin over
+    # the ~36-minute estimate while failing a genuine runaway faster than
+    # the old 60-minute ceiling did). A future diff this size or smaller
+    # fits with real headroom; a future diff concentrated even more
+    # heavily in `darkmux-crew` than this one is the known remaining gap —
+    # this fixed shard count does not scale itself to the diff's actual
+    # size, tracked as a deliberate, documented follow-up (dynamic shard
+    # count / a genuine mutant CAP with honest partial reporting), not
+    # attempted here. What sharding already buys for that case regardless:
+    # a shard that still overruns fails CLOSED on its own (see "Report
+    # survivors" below) without silently discarding the other 5 shards'
+    # real, complete results the way one giant cancelled invocation used
+    # to discard all 167 mutants' worth of progress at once.
+    #
+    # WHAT MOVED OUT: the `runtime/` and `plugins/darkmux-bundler-rust/`
+    # invocations are NOT part of this shard axis (they are each their own
+    # standalone Cargo workspace, already independent of the root scope,
+    # already cheap/skippable per their own #2544 comments) — they now run
+    # in the separate `mutants-in-diff-extra` job below, in parallel with
+    # this matrix, exactly as before just relocated. The root scope's OWN
+    # "zero mutants but the diff added Rust code" floor check ALSO moved
+    # out, to `mutants-in-diff-root-floor` below — see that job's own
+    # comment for why a per-shard version of that check would itself be a
+    # new false-failure source.
+    name: "mutation — tests that cannot fail (PR diff only, root, shard ${{ matrix.shard }}/6)"
     runs-on: macos-latest
     if: github.event_name == 'pull_request'
-    # (#2499) 30 -> 45: the Mutate step's `--timeout` went 120 -> 300 (a
-    # larger per-mutant/baseline ceiling), so a slow mutant or a bigger diff
-    # needs more job-level headroom to match.
-    #
-    # (#2544) 45 -> 60: two more SEQUENTIAL invocations were added below
-    # (runtime/, plugins/darkmux-bundler-rust/), each with its own baseline.
-    # Measured on an M5 Max (faster than macos-latest, same caveat #2499's
-    # own numbers carry): `runtime/`'s baseline is ~70s (13-19s build + 55s
-    # test — it re-runs the crate's whole 667-test suite per mutant, same as
-    # any single-package cargo-mutants baseline) and its mutant-testing
-    # throughput on a real sample (21 mutants, `src/compaction.rs`) was
-    # ~17s/mutant amortized under `-j 4`.
-    #
-    # (#2602) That 17s/mutant figure is a LOCAL rate on the fastest hardware
-    # in play, and citing it here understates the real ceiling: frontier
-    # review independently sampled a DIFFERENT runtime file and measured
-    # ~21s/mutant, still on local hardware — one file alone already beats
-    # the 17s figure before the CI runner is even accounted for. Applying
-    # the SAME macos-latest-vs-M5-Max ratio the nightly sweep's own
-    # measurement already establishes below (~21.4s/mutant real CI rate vs
-    # ~17s/mutant local sample, ~1.26x) to that more conservative 21s/mutant
-    # local sample projects a real CI rate of roughly 26-27s/mutant. A heavy
-    # runtime-touching diff on the order of `src/compaction.rs`'s own full
-    # mutant count (126) would then cost roughly 126×26.5s ≈ 56 minutes of
-    # mutant testing alone, plus its own ~70s baseline — call it ~55-57
-    # minutes total, which is not merely "can exceed" this job's 60-minute
-    # budget, it consumes essentially the ENTIRE budget by itself, on a
-    # SINGLE file — the same per-invocation version of the large-diff
-    # timeout #2550 already documents for the root invocation.
-    # `plugins/darkmux-bundler-rust/` is comparatively free (baseline ~6s,
-    # ~0.8s/mutant amortized — a 28-mutant sample completed in 29s total).
-    #
-    # Two things keep this from being pure downside on every PR, not one:
-    # first, a PR touching NEITHER `runtime/` nor
-    # `plugins/darkmux-bundler-rust/` (the common case) pays ZERO extra
-    # minutes for either — both "Mutate ... only what this PR touched"
-    # steps below are skipped outright (`if: steps.diff.outputs.*_changed_
-    # lines != '0'`), and the matching "Note ... skipped" step just writes
-    # one line to the summary. Second, the ROOT invocation's own "Report
-    # survivors" step runs and posts to the job summary BEFORE either added
-    # invocation starts — so even a `runtime/`-touching diff big enough to
-    # burn the whole remaining budget (and time out) still leaves the root
-    # finding recorded, not lost with the rest of the job.
-    #
-    # 60 minutes gives real headroom for a TYPICAL diff (the common case
-    # touches far less than a whole file); sharding either invocation the
-    # way #2499/#2550 already call for is the real fix for a genuinely
-    # large one, and is explicitly NOT attempted
-    # here — see the `mutants-full` job's own comment for why a full sweep
-    # of `runtime/` specifically needs that before it can run at all.
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -144,130 +197,194 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: mutants
+          # Scoped per shard: 6 parallel jobs sharing ONE cache key would
+          # serialize on the cache lock / thrash each other's warm target
+          # dir for no benefit — each shard mutates a different slice of
+          # the same tree and gets no reuse from another shard's build.
+          key: mutants-in-diff-shard-${{ matrix.shard }}
 
       - name: Install cargo-mutants
-        # (#1716) PINNED. Unpinned, CI installs whatever is current, and this
-        # job's entire pass/fail decision is read out of cargo-mutants' exit
-        # codes and its `outcomes.json` field names. A rename in either turns
-        # the gate back into a false green — which is not hypothetical: an
-        # `outcomes.json` carrying none of the keys we read was the exact
-        # fixture that made the summary print "nothing to mutate" at exit 2
-        # over three real survivors. The summary script now falls back to the
-        # `.txt` files and cross-checks the exit code, so a rename degrades
-        # loudly rather than silently; the pin is what keeps the upgrade a
-        # deliberate, reviewed act. Bump both install sites together.
+        # (#1716) PINNED — see `mutants-in-diff-extra`'s own install step
+        # below for the full rationale (that job carries the comment
+        # because it is the direct descendant of where this originally
+        # lived). Five install sites now read this SAME pinned version —
+        # this job, `mutants-in-diff-root-floor`, `mutants-in-diff-extra`,
+        # `mutants-full`, and `mutants-full-small` — bump all five together.
         run: cargo install cargo-mutants --locked --version 27.1.0
 
       - name: Summary script self-test
-        # The whole pass/fail decision for this job lives in a Python file the
-        # repo's own mutation gate structurally cannot cover. Same wiring as
-        # `engagement-sentinel-guard.py --self-test` in ci.yml: the self-test
-        # runs FIRST, so a broken summarizer fails here instead of quietly
-        # mis-reporting a real sweep.
         run: python3 scripts/ci-mutants-summary.py --self-test
 
       - name: Diff against the merge base
+        # (#2734) Deliberately MINIMAL compared to the pre-sharding version
+        # of this step: this shard only needs `/tmp/pr.diff` for
+        # `--in-diff` below. The floor-check narrowing (`--list --json`,
+        # `--mutants-list`, `changed_lines`) moved to `mutants-in-diff-root-
+        # floor`'s own diff step, computed ONCE there instead of 6 times
+        # here — see that job's comment for why a per-shard floor would
+        # itself be a new false-failure source, not just redundant compute.
+        run: |
+          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr.diff
+          echo "changed Rust lines (all, informational only): $(grep -cE '^\+([^+]|$)' /tmp/pr.diff || true)"
+
+      - name: Mutate shard ${{ matrix.shard }}/6 of what this PR touched
+        id: mutants
+        # (#2602 round 3) `!cancelled()` — matches the pre-sharding job's
+        # own reasoning verbatim: an earlier step's failure must not leave
+        # this step's `exit_code` output silently absent while "Report
+        # survivors" below (`always()`) still reads it.
+        if: ${{ !cancelled() }}
+        run: |
+          # (#1716) No `|| true` — capture the real exit code, hand the
+          # pass/fail decision to "Report survivors" below.
+          #
+          # `--copy-vcs true`: this repo has tests that shell out to git
+          # and panic without a real `.git` in the copied tree (#1716).
+          #
+          # `--workspace`: scopes mutation to the whole tree, not just the
+          # root `darkmux` package (#2499) — cargo-mutants' own baseline
+          # then narrows to `PackageSelection::Explicit(all_mutated_
+          # packages)`, only the packages this invocation's mutants
+          # actually touch, not the whole workspace.
+          #
+          # `--timeout 300`: bounds both the baseline test phase and every
+          # mutant's own test phase (#2499's measurement). Per-mutant BUILD
+          # time is NOT bounded by this flag (cargo-mutants has no separate
+          # build timeout) — this job's own comment above names real
+          # samples up to 464.8s for a `darkmux-crew` mutant's build alone,
+          # which is why sharding, not a larger `--timeout`, is the actual
+          # fix here: raising this number moves the per-mutant cliff, it
+          # does not address 167 mutants queued behind one job's budget.
+          #
+          # `--shard ${{ matrix.shard }}/6`: this job's own reason to exist
+          # (#2734) — see the job-level comment above for the measurement
+          # behind the count and the proof this partitions cleanly.
+          set +e
+          cargo mutants --workspace --in-diff /tmp/pr.diff --shard ${{ matrix.shard }}/6 -j 4 --timeout 300 \
+            --copy-vcs true --output mutants-out
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Report survivors (shard ${{ matrix.shard }}/6)
+        # (#2550) `always()` — this step must report even a CANCELLED shard
+        # (this shard's own `timeout-minutes` running out, or a manual
+        # cancel), same reasoning as the pre-sharding job's identically-
+        # named step. `--job-status` carries the same CANCELLED-vs-failure
+        # distinction.
+        #
+        # (#2734) `--changed-lines 0`, ALWAYS, deliberately — this is the
+        # one deviation from the pre-sharding step's own arguments. A
+        # single shard cannot safely answer "should the WHOLE diff have
+        # produced at least one mutant" (a small diff spread across 6
+        # shards legitimately leaves some empty — see the false-failure
+        # this would otherwise cause, documented on `mutants-in-diff-root-
+        # floor` below and red-proven in `ci-mutants-summary.py`'s own
+        # `FLOOR_CHECK_SELF_TEST_CASES`). Passing 0 here disarms ONLY that
+        # one check in `main()`'s diff-mode branch — exit-code correctness,
+        # exit-code/count contradictions, and cancellation handling all
+        # stay fully armed per shard, completely unchanged. The floor
+        # itself did not go away; it moved to the aggregate job below,
+        # where "the whole invocation" is an answerable question again.
+        if: ${{ always() }}
+        run: |
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.mutants.outputs.exit_code }}" diff \
+            "Mutation testing — this PR's changed lines (root, shard ${{ matrix.shard }}/6)" \
+            --changed-lines 0 \
+            --job-status "${{ job.status }}" \
+            mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          # v4 requires run-unique artifact names — the shard index makes
+          # each of the 6 matrix jobs distinct, and is also the name
+          # `mutants-in-diff-root-floor` downloads by pattern below.
+          name: mutants-in-diff-shard-${{ matrix.shard }}
+          path: |
+            mutants-out/**
+            mutants.out/**
+
+  mutants-in-diff-root-floor:
+    # (#2734) THE AGGREGATE HALF of the root scope's "diff added Rust code
+    # but produced zero mutants" floor (#1716's original false-green guard)
+    # — the one check that could NOT simply move into each shard above
+    # unmodified. That floor's whole point is catching a WIRING defect
+    # (`--in-diff` paths not resolving, an unparseable diff, a package
+    # scope excluding the touched crate) by asserting the INVOCATION as a
+    # whole tested something. Sharding turns "the invocation" into 6
+    # invocations — and a small diff (say 3 real mutants) spread across 6
+    # shards legitimately leaves several of them with ZERO, for a reason
+    # that has nothing to do with wiring. Applying the old per-invocation
+    # floor to each shard individually would make THAT the new false-
+    # failure source #2734 opened by fixing the timeout — so each shard's
+    # own "Report survivors" step above disarms it (`--changed-lines 0`)
+    # and this job asks the SAME question, once, about the SUM of every
+    # shard's own total. Same assertion, same place it always logically
+    # lived (the whole invocation), just computed from 6 directories
+    # instead of 1 — see `ci-mutants-summary.py`'s own `floor_check_main`
+    # and `sum_shard_outcomes` for the mechanics, and
+    # `FLOOR_CHECK_SELF_TEST_CASES` for the case that is this job's entire
+    # reason to exist (a diff spread thinner than its shard count must NOT
+    # read as the wiring-broken shape).
+    #
+    # `needs:` + `if: always()`: this job must still report even when one
+    # or more shards failed or were cancelled — same "report the truth
+    # about what happened, never go silent" posture as every `always()` in
+    # this file. `github.event_name == 'pull_request'` keeps it from
+    # running (and erroring on missing artifacts) on `push`/`schedule`
+    # triggers, where the shard matrix's own `if:` already skips it
+    # entirely.
+    name: mutation — PR diff root floor check (aggregate across shards)
+    runs-on: macos-latest
+    needs: mutants-in-diff
+    if: always() && github.event_name == 'pull_request'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-in-diff-root-floor
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Summary script self-test
+        run: python3 scripts/ci-mutants-summary.py --self-test
+
+      - name: Diff against the merge base (root floor input)
+        # (#2734) The EXACT computation the pre-sharding job's own "Diff
+        # against the merge base" step did for the root scope's
+        # `changed_lines` — relocated here unchanged, not reinvented. See
+        # that step's own history (#1716/#2499/#2544/#2605/#2606) for why
+        # each piece exists; this is a straight move, not a rewrite.
         id: diff
         run: |
-          # What cargo-mutants gets. Unchanged: every Rust file in the diff.
-          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr.diff
-          echo "changed Rust lines (all): $(grep -cE '^\+([^+]|$)' /tmp/pr.diff || true)"
-
-          # (#1716) What the summary step asserts on, and it is deliberately a
-          # NARROWER number: the added Rust lines that are actually IN SCOPE for
-          # this job's mutation run.
-          #
-          # The summary fails the job when cargo-mutants mutated nothing while
-          # the diff added Rust code — the PROVEN-green shape behind an
-          # `--in-diff` whose paths don't resolve ("No mutants to filter", exit
-          # 0) and an unparseable diff ("Diff file is empty", exit 0). That
-          # assertion is only sound if the count and the mutation scope agree.
-          #
-          # (#2499) WIDENED to '*.rs': the Mutate step below now passes
-          # `--workspace`, so the mutation scope is the whole tree, not just
-          # the root `darkmux` package — a PR touching only `crates/**` now
-          # gets real coverage instead of the old "No mutants to filter"
-          # silent green, and this counter has to widen with it (this was
-          # previously 'src/*.rs' — see the capitalized comment that used to
-          # sit here — or a `crates/`-only PR would trip this floor for a
-          # defect that was already documented and merely deferred, not
-          # legitimate). A git pathspec's `*` crosses `/` (confirmed locally:
-          # `git diff -- '*.rs'` matches a `crates/**/*.rs` change; `git diff
-          # -- 'src/*.rs'` does not), so this covers any nesting.
-          #
-          # ADDED lines only, and not the `+++ b/path` file headers: a
-          # deletion-only diff legitimately yields zero mutants, and counting
-          # its header line would turn that into a failure.
-          #
-          # The count comes from the summary script, NOT from a `grep -c` here,
-          # for two reasons. First, `^\+([^+]|$)` counts every added line —
-          # including comments and attributes, which are Rust lines that
-          # legitimately produce no mutants. PR #2514 (12 doc-comment lines and
-          # one `#[serial_test::serial]`) failed this gate on exactly that. The
-          # script's `added_line_is_countable` throws those away and documents
-          # what it still gets wrong. Second, logic that decides pass/fail
-          # belongs where `--self-test` can reach it; untested gate logic in a
-          # workflow's shell is the shape #1716 was about, relocated.
-          #
-          # Written to a file first, deliberately: in a `git ... | grep -c`
-          # pipeline (no pipefail under GitHub's `bash -e`) a FAILING git diff
-          # feeds grep nothing, grep prints 0, and the guard silently switches
-          # itself off. As a plain command, a git failure fails the step — and
-          # the counter likewise exits non-zero rather than printing 0 if it
-          # cannot read the diff.
-          # (#2544) `--manifest-path Cargo.toml` scopes this count to what the
-          # ROOT-workspace invocation below can actually reach. Before this,
-          # the floor counted every added Rust line regardless of path — so a
-          # diff entirely under `runtime/` (which the root manifest's own
-          # `[workspace] exclude` keeps structurally out of `--workspace`'s
-          # reach, see that comment) counted as real, uncovered code, the
-          # Mutate step legitimately reported zero mutants, and rule 3 below
-          # read that as the under-scoping defect it exists to catch — failing
-          # an honest PR. Proven on #2599 (a diff entirely under `runtime/`):
-          # 511 added lines, 120 "countable" by the OLD unscoped counter,
-          # against zero mutants from a run that structurally could not reach
-          # any of them. `runtime/`'s own share is counted and mutated
-          # SEPARATELY below — this floor is the workspace invocation's own,
-          # not "every reachable line everywhere".
           git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr-scope.diff
 
-          # (#2605) The authoritative source, asked once per invocation
-          # BEFORE the floor is computed: `cargo mutants --list --json`,
-          # with NO `--in-diff` (see `ci-mutants-summary.py`'s own module
-          # comment, above `added_line_is_countable`, for why omitting
-          # `--in-diff` here is what keeps this independent of the exact
-          # circularity that sank the earlier `--list --in-diff` idea). It
-          # enumerates every file this invocation's manifest and flags
-          # could EVER produce a mutant for, so the floor can recognize a
-          # file whose only gate is a `#[cfg(test)]` `mod` DECLARATION in a
-          # DIFFERENT file (#2599's shape) as unmutable, the same way
-          # cargo-mutants' own source visitor already does — a per-file
-          # text scan structurally cannot resolve a cross-file attribute.
-          #
-          # Same flags as the root Mutate step below (`--workspace`, no
-          # `--manifest-path` — see that step's own comment for why root
-          # never passes one: cargo-mutants 27.1.0 errors `"" is not a
-          # directory` on a bare `--manifest-path Cargo.toml`, confirmed
-          # locally, #2605). Measured cost (cargo-mutants 27.1.0, this
-          # tree, 2026-09-10): ~10s wall, 13,037 mutants across 185 files —
-          # parse-only, no build, no test, negligible against this job's
-          # 60-minute budget. Failure here is FAIL-OPEN: if `--list` itself
-          # fails (a real tool problem, which the identically-flagged
-          # Mutate step below is then very likely to also hit on its own
-          # terms), `--mutants-list` is simply not passed to the counter —
-          # the counter's own docstring on `count_changed_lines_main` names
-          # this as the deliberate workflow-side fail-open path, so a
-          # broken listing narrows nothing rather than narrowing every PR's
-          # floor to zero. Still loud: a `::warning::` annotation, not a
-          # silently swallowed failure.
+          # (#2605) The authoritative source, asked once, BEFORE the floor
+          # is computed: `cargo mutants --list --json`, with NO `--in-diff`
+          # — see `ci-mutants-summary.py`'s own module comment for why
+          # omitting `--in-diff` here is what keeps this independent of the
+          # circularity that sank an earlier `--list --in-diff` idea (it
+          # would share cargo-mutants' diff parser and path resolution with
+          # the very invocation it is meant to guard, so a break in one
+          # zeroes both together). Same reasoning applies unchanged now
+          # that the guarded invocation is sharded 6 ways: this listing
+          # call has no `--shard` in it either, for the identical reason.
           #
           # (#2606 also-fix) Gated on `/tmp/pr-scope.diff` actually having
-          # content: a ~10s `cargo mutants --list` sweep on a PR that touches
-          # no `.rs` file at all (this very change's own PR, #2606, is one —
-          # a workflow YAML and a Python script) bought nothing, and a
-          # broken tool on such a PR would have spent the same 10s to then
-          # emit a warning about a listing nobody needed.
+          # content — a PR touching no `.rs` file anywhere has no business
+          # paying this ~10s sweep.
           MUTLIST_ROOT_FLAG=()
           if [ -s /tmp/pr-scope.diff ]; then
             if cargo mutants --workspace --list --json > /tmp/mutlist-root.json 2>/tmp/mutlist-root.err; then
@@ -284,50 +401,125 @@ jobs:
           echo "changed Rust lines (in workspace mutation scope, mutable-looking only): $CHANGED"
           echo "changed_lines=$CHANGED" >> "$GITHUB_OUTPUT"
 
-          # (#2544) The SECOND invocation's own floor: `runtime/` is its own
-          # standalone Cargo workspace (see `runtime/Cargo.toml`'s own
-          # comment) deliberately excluded from the root's `[workspace]`, so
-          # nothing above can ever see it — this counts the SAME diff against
-          # `runtime/Cargo.toml`'s own (empty) exclude list instead, which is
-          # the mirror image: everything under `runtime/` is reachable here,
-          # everything outside it is not. Reused from the same
-          # `/tmp/pr-scope.diff` (repo-root-relative paths) rather than a
-          # second `git diff` — the manifest-path exclusion, not the diff
-          # itself, is what changes between the two counts.
-          # (#2605) Same mechanism, this invocation's own manifest — see the
-          # root block above for the full rationale. Measured cost: ~1.7s
-          # wall, 1,529 mutants across 18 files. This is the invocation
-          # #2599 actually broke: `runtime/src/budget_request_tests.rs` and
-          # `runtime/src/checkpoint_regression_tests.rs`, both real files
-          # already in this tree, are each declared with `#[cfg(test)]
-          # #[path = "..."] mod ...;` in a SIBLING file and carry no
-          # `#[cfg(test)]` of their own — confirmed absent from this
-          # listing's own output.
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mutants-in-diff-shard-*
+          path: shard-artifacts
+          # A shard whose own upload step never ran at all (an extremely
+          # early cancellation) leaves fewer than 6 artifacts to match —
+          # `sum_shard_outcomes` already reports a missing directory as a
+          # real, visible absence rather than erroring, so this job should
+          # not error either; `warn` (the action's own default) logs it
+          # without failing the step.
+          if-no-artifact-found: warn
+
+      - name: Root floor check (aggregate across all 6 shards)
+        run: |
+          python3 scripts/ci-mutants-summary.py --floor-check \
+            "${{ steps.diff.outputs.changed_lines }}" \
+            "Mutation testing — this PR's changed lines (root, floor check across all 6 shards)" \
+            shard-artifacts/mutants-in-diff-shard-0 \
+            shard-artifacts/mutants-in-diff-shard-1 \
+            shard-artifacts/mutants-in-diff-shard-2 \
+            shard-artifacts/mutants-in-diff-shard-3 \
+            shard-artifacts/mutants-in-diff-shard-4 \
+            shard-artifacts/mutants-in-diff-shard-5 \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  mutants-in-diff-extra:
+    # (#2734) `runtime/` and `plugins/darkmux-bundler-rust/` — relocated
+    # out of the (now-sharded) root job unchanged, not rewritten. Both were
+    # already independent of the root `--workspace` scope before this fix
+    # (each is its own standalone Cargo workspace, per #2544's own
+    # comments below), so they gain nothing from the root's shard axis and
+    # lose nothing by running in their own job instead of trailing after it
+    # — if anything this now runs in PARALLEL with the 6 root shards
+    # instead of sequentially after them, which is a small additional
+    # wall-clock win this fix did not have to go looking for.
+    #
+    # `timeout-minutes: 60`, kept at the SAME number the old combined job
+    # used (not shrunk to match this job's now-narrower scope) — #2602's
+    # own worst-case estimate for `runtime/` ALONE, a diff on the order of
+    # `src/compaction.rs`'s full mutant count (126) at that job's measured
+    # per-mutant rate, was already ~55-57 minutes (~70s baseline + 126 x
+    # ~26.5s), consuming essentially the whole 60-minute budget it was
+    # THEN sharing with the root scope and `plugins/darkmux-bundler-rust/`.
+    # This job no longer shares that budget with root (root has its own,
+    # in `mutants-in-diff` above), so 60 minutes here is genuinely more
+    # headroom than `runtime/` alone ever had before, not less — shrinking
+    # it without re-measuring would have quietly reopened the #2550 shape
+    # for exactly the scope #2602 already showed could fill it.
+    name: mutation — tests that cannot fail (PR diff only, runtime/ + bundler/)
+    runs-on: macos-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-in-diff-extra
+
+      - name: Install cargo-mutants
+        # (#1716) PINNED. Unpinned, CI installs whatever is current, and
+        # this job's entire pass/fail decision is read out of cargo-mutants'
+        # exit codes and its `outcomes.json` field names. A rename in either
+        # turns the gate back into a false green — which is not
+        # hypothetical: an `outcomes.json` carrying none of the keys we read
+        # was the exact fixture that made the summary print "nothing to
+        # mutate" at exit 2 over three real survivors. The summary script
+        # now falls back to the `.txt` files and cross-checks the exit code,
+        # so a rename degrades loudly rather than silently; the pin is what
+        # keeps the upgrade a deliberate, reviewed act. (#2734) Five sites
+        # read this SAME pinned version now — `mutants-in-diff`,
+        # `mutants-in-diff-root-floor`, this job, `mutants-full`, and
+        # `mutants-full-small` — bump all five together.
+        run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Summary script self-test
+        run: python3 scripts/ci-mutants-summary.py --self-test
+
+      - name: Diff against the merge base
+        id: diff
+        run: |
+          # (#2544) `runtime/` is its own standalone Cargo workspace (see
+          # `runtime/Cargo.toml`'s own comment) deliberately excluded from
+          # the root's `[workspace]`, so the root scope (now sharded, in
+          # `mutants-in-diff` above) can never reach it — this counts the
+          # SAME diff against `runtime/Cargo.toml`'s own (empty) exclude
+          # list instead, the mirror image: everything under `runtime/` is
+          # reachable here, everything outside it is not.
           #
-          # (#2606 also-fix) The actual `--in-diff` file the runtime
-          # invocation's Mutate step needs below, computed HERE — moved
-          # ahead of its old position (right before the bundler block) —
-          # so the listing call just below can gate on it. cargo-mutants
-          # matches `--in-diff` paths against the SOURCE TREE IT WALKED FOR
-          # THAT MANIFEST — for `--manifest-path runtime/Cargo.toml` that
-          # tree is rooted at `runtime/` itself, so it lists (and matches)
-          # mutants under paths like `src/foo.rs`, NOT `runtime/src/foo.rs`.
-          # Confirmed locally: the repo-root-relative form silently matched
-          # nothing ("No mutants to filter", exit 0) — the exact
-          # false-clean shape this whole gate exists to catch — against a
-          # diff that genuinely added a real, uncovered mutant;
-          # `--relative=runtime` (paths relative to that directory, git's
-          # own flag for this) is what actually matched. `/tmp/pr-scope.diff`
-          # above stays repo-root-relative on purpose — it is what the
-          # manifest-path exclusion logic (and the root invocation) expects.
+          # `/tmp/pr-scope.diff` here is this job's OWN copy — recomputed
+          # fresh rather than shared with `mutants-in-diff-root-floor`'s
+          # identical-looking one, since jobs run on separate runners with
+          # no shared filesystem. Cheap (a `git diff`, not the `--list`
+          # sweep) to recompute.
+          git diff "origin/${{ github.base_ref }}"...HEAD -- '*.rs' > /tmp/pr-scope.diff
+
+          # (#2605) Same mechanism as the root floor job's own listing call
+          # — see that job's comment for the full non-circularity
+          # rationale, unchanged here. Measured cost: ~1.7s wall, 1,529
+          # mutants across 18 files.
+          #
+          # (#2606 also-fix) This invocation's own `--in-diff` file,
+          # computed HERE so the listing call below can gate on it.
+          # cargo-mutants matches `--in-diff` paths against the source tree
+          # it walked FOR THAT MANIFEST — for `--manifest-path
+          # runtime/Cargo.toml` that tree is rooted at `runtime/` itself,
+          # so `--relative=runtime` (paths relative to that directory) is
+          # what actually matches; the repo-root-relative form silently
+          # matches nothing ("No mutants to filter", exit 0) — confirmed
+          # locally, #2606.
           git diff "origin/${{ github.base_ref }}"...HEAD --relative=runtime -- 'runtime/*.rs' > /tmp/pr-runtime.diff
 
-          # (#2606 also-fix) Gated on `/tmp/pr-runtime.diff` actually having
-          # content — same rationale as the root block's own gate above,
-          # scoped to `runtime/` specifically rather than "any .rs anywhere":
-          # a PR that changes Rust elsewhere but not under `runtime/` still
-          # has no business paying this invocation's own ~1.7s `--list`
-          # sweep.
           MUTLIST_RUNTIME_FLAG=()
           if [ -s /tmp/pr-runtime.diff ]; then
             if cargo mutants --manifest-path runtime/Cargo.toml --list --json > /tmp/mutlist-runtime.json 2>/tmp/mutlist-runtime.err; then
@@ -344,35 +536,11 @@ jobs:
           echo "changed Rust lines (in runtime/ mutation scope, mutable-looking only): $RUNTIME_CHANGED"
           echo "runtime_changed_lines=$RUNTIME_CHANGED" >> "$GITHUB_OUTPUT"
 
-          # (#2544) THE THIRD invocation's own floor, same shape again:
-          # `plugins/darkmux-bundler-rust` is ALSO its own standalone Cargo
-          # workspace (see the root manifest's own comment on why — a
-          # genuinely independent project proving the public `--bundler`
-          # JSON contract is sufficient on its own, deliberately with zero
-          # darkmux-* dependencies and zero privileged path-dependency
-          # access). It is the one of the three deliberately-excluded
-          # projects this issue decided TO cover, not just document: it is a
-          # real cross-process wire contract (the class this whole
-          # machinery exists for), and it is small (a full `--list` sweep
-          # measures 224 mutants, baseline test suite ~0.5s), so a
-          # diff-scoped run on it costs almost nothing. `tools/darkmux-mock-model`
-          # (the fourth) is deliberately NOT covered — it is dev/test
-          # infrastructure the way a `#[cfg(test)]` item already is (see the
-          # module comment on `count_added_lines` in the summary script for
-          # why that class is excluded from the floor already); its own
-          # correctness is exercised by whatever integration test depends on
-          # it, not by mutating its internals.
-          # (#2605) Same mechanism again. Measured cost: ~0.2s wall, 224
-          # mutants across 5 files — this manifest's own baseline test
-          # suite already runs in well under a second, so the listing call
-          # is noise on top of noise.
-          #
-          # (#2606 also-fix) Same reordering as the runtime block above:
-          # this invocation's own `--in-diff` file, computed HERE (moved
-          # ahead of its old position after the count below) so the listing
-          # call can gate on it — a PR that never touches
-          # `plugins/darkmux-bundler-rust/` has no business paying even
-          # this manifest's ~0.2s `--list` sweep, small as it is.
+          # (#2544) `plugins/darkmux-bundler-rust` is ALSO its own
+          # standalone Cargo workspace — see the root manifest's own
+          # comment on why. Small (a full `--list` sweep measures 224
+          # mutants, baseline test suite ~0.5s), so a diff-scoped run on it
+          # costs almost nothing.
           git diff "origin/${{ github.base_ref }}"...HEAD --relative=plugins/darkmux-bundler-rust -- 'plugins/darkmux-bundler-rust/*.rs' > /tmp/pr-bundler.diff
 
           MUTLIST_BUNDLER_FLAG=()
@@ -391,205 +559,18 @@ jobs:
           echo "changed Rust lines (in plugins/darkmux-bundler-rust/ mutation scope, mutable-looking only): $BUNDLER_CHANGED"
           echo "bundler_changed_lines=$BUNDLER_CHANGED" >> "$GITHUB_OUTPUT"
 
-      - name: Mutate only what this PR touched
-        id: mutants
-        # (#2602 round 3) `!cancelled()`, matching "Report survivors" below
-        # (and the runtime/ and plugins/darkmux-bundler-rust/ pairs further
-        # down): this step previously had no condition at all, which is an
-        # IMPLICIT `success()` gate — on any earlier step's failure this step
-        # skips while "Report survivors" (`always()` below, now `!cancelled()`)
-        # still runs and reads an empty `steps.mutants.outputs.exit_code`,
-        # the exact drift the round-2 fix's own comment says must never
-        # happen between a Mutate/Report pair. The round-2 fix put the two
-        # OTHER pairs into lockstep on `!cancelled()` and left this, the
-        # ROOT pair, on the primitive it discarded. An empty exit_code is now
-        # honest (see the summary script's own empty-exit_code message)
-        # rather than a raw integer-parse crash, so this was mitigated, not a
-        # gate hole — but the pair was still out of lockstep.
-        if: ${{ !cancelled() }}
-        run: |
-          # (#1716) No more `|| true`. That swallowed EVERY exit code,
-          # including 4 (BaselineFailed — the unmutated tree's own tests
-          # failed, so zero mutants were ever tested) indistinguishably from
-          # 0 (clean) or 2 (survivors found, this job's entire point). Capture
-          # the real code and hand the decision to the "Report survivors"
-          # step, which is the one place that now owns pass/fail.
-          #
-          # `--copy-vcs true` is the actual fix for the baseline failure this
-          # issue documents: cargo-mutants tests a COPY of the tree, and
-          # without the VCS dirs that copy isn't a git repository, so any
-          # test that shells out to git (this repo has two, both gated on
-          # `darkmux mission launch coder-phase` needing a real repo) panics
-          # before a single mutant is generated. Confirmed locally (see the
-          # PR) by running those two tests against a copy with and without
-          # `.git` — fails both ways without it, passes both ways with it.
-          #
-          # (#2499) FIXED: `--workspace` added below. This repo's root
-          # `Cargo.toml` carries BOTH a `[workspace]` table AND a `[package]`
-          # (the `darkmux` bin), so cargo-mutants' auto package-filter — the
-          # same convention cargo itself uses — resolved to the ROOT package
-          # only when no `-p`/`--workspace` was given. Measured 2026-09-08: a
-          # diff touching only `crates/darkmux-eureka/src/lib.rs` produced "No
-          # mutants to filter" at root scope and 5 real mutants with
-          # `--workspace`. Re-confirmed locally 2026-09-09 (2 mutants for a
-          # smaller synthetic one-function diff, 0 without the flag): every
-          # one of the ~12 library crates under `crates/` got ZERO
-          # mutation-in-diff coverage for as long as this job existed, and a
-          # PR touching only `crates/**` passed this job green having tested
-          # nothing.
-          #
-          # This is the SAFE half of the workspace-scope widening (the
-          # `mutants-full` nightly's Sweep step is NOT changed — see its
-          # comment for why): `Lab::run_baseline` (cargo-mutants
-          # 27.1.0, src/lab.rs) scopes the baseline to
-          # `PackageSelection::Explicit(all_mutated_packages)` — only the
-          # packages that actually contain a mutant from this diff, not the
-          # whole workspace — so a PR touching one small crate still gets a
-          # small, fast baseline. Confirmed locally 2026-09-09: a diff
-          # touching only `darkmux-eureka` ran its baseline in 1s test time
-          # (vs the multi-hundred-second whole-workspace baseline the nightly
-          # would face), and the 2-mutant sweep for it completed in 17s total.
-          #
-          # `--timeout` RAISED 120 -> 300. `--timeout` bounds BOTH the
-          # baseline test phase and every mutant's test phase (cargo-mutants
-          # has no separate baseline timeout — confirmed by reading
-          # `Timeouts::for_baseline` in src/timeouts.rs, which reuses
-          # `options.test_timeout` verbatim). The 120s figure was already
-          # thin at root-only scope: two real PR-diff runs against root
-          # measured the baseline TEST phase (not build, which is unbounded
-          # during baseline) at 95s and 96s — see runs 34283477510 and
-          # 34256702344 on kstrat2001/darkmux, both root-only, both "Found 64
-          # mutants to test". Under `--workspace`, a PR that touches root
-          # `src/*.rs` AND a crate (say `darkmux-crew`, whose own suite ran
-          # 35s locally) stacks both packages' tests into ONE baseline test
-          # phase — measured locally 2026-09-09: darkmux-crew alone runs its
-          # unit tests in ~35s. Combined with root's ~95-96s that leaves
-          # single-digit percent headroom under 120s on a slower CI runner,
-          # for the single most common PR shape (touching both). 300s gives
-          # real margin without materially slowing typical mutants (most
-          # fail fast either way; a genuinely-hanging mutant now takes longer
-          # to be classified TIMEOUT instead of falsely tanking the baseline).
-          #
-          # `timeout-minutes` on this job RAISED 30 -> 45 to match: a larger
-          # per-mutant ceiling means a legitimately slow mutant (or a PR with
-          # many changed lines) needs more job-level headroom too.
-          set +e
-          cargo mutants --workspace --in-diff /tmp/pr.diff -j 4 --timeout 300 \
-            --copy-vcs true --output mutants-out
-          STATUS=$?
-          set -e
-          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
-          exit 0
-
-      - name: Report survivors
-        # (#2550) This step was ALREADY on `always()` at the time of the
-        # real incident (run 34324045744, PR head `386afc48`, 2026-09-09) —
-        # it ran, with conclusion `failure`. The actual mechanism was in the
-        # summary script: `${{ steps.mutants.outputs.exit_code }}` arrives
-        # empty when "Mutate only what this PR touched" above is cancelled
-        # (this job's own `timeout-minutes` budget running out, most likely
-        # — a manual cancel can also cause it) mid-run, and the script's old
-        # handling of an empty `exit_code` printed its message to **stderr**
-        # and exited 2 before any Markdown reached stdout — so nothing was
-        # ever appended to `$GITHUB_STEP_SUMMARY` and the root scope's
-        # section was simply ABSENT: indistinguishable, on the PR page, from
-        # a clean sweep. (A day after the incident, an unrelated fix —
-        # #2602 — briefly put this step on `!cancelled()`, which really
-        # would skip it outright on cancellation; that was a separate, real
-        # hole, not the cause of the original incident, and this fix reverts
-        # it back to `always()`.) "Mutate only what this PR touched" above
-        # stays on `!cancelled()` on purpose — it must NOT start a brand-new
-        # multi-minute mutation run once cancellation is already underway;
-        # only the (cheap, read-only) reporting step needs the wider gate.
-        #
-        # `--job-status "${{ job.status }}"` lets the summary script tell
-        # "this invocation was cut off by cancellation" (job.status ==
-        # cancelled, exit_code empty) apart from "an earlier unrelated step
-        # failed" (job.status == failure, exit_code also empty) — only the
-        # former gets the loud, distinct CANCELLED report instead of the old
-        # stderr-only error; see ci-mutants-summary.py's own
-        # `CANCELLED_SENTINEL`.
-        if: ${{ always() }}
-        run: |
-          python3 scripts/ci-mutants-summary.py \
-            "${{ steps.mutants.outputs.exit_code }}" diff \
-            "Mutation testing — this PR's changed lines" \
-            --changed-lines "${{ steps.diff.outputs.changed_lines }}" \
-            --job-status "${{ job.status }}" \
-            mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: mutants-in-diff
-          path: |
-            mutants-out/**
-            mutants.out/**
-          if-no-files-found: ignore
-
-      # (#2544) The SECOND invocation, against `runtime/Cargo.toml`'s own
-      # manifest — see the comment on `runtime_changed_lines` above for why
-      # the root invocation above can never reach this crate. Skipped
-      # entirely when the diff touches no mutable line under `runtime/`
-      # (the common case): cargo-mutants' own baseline build+test on this
-      # crate costs real minutes even when it finds nothing to filter
-      # afterward (measured locally: ~70s build+test before a single mutant
-      # runs), and this job's PR-diff budget is already tight (#2550: a
-      # large diff can exhaust the whole 45-minute ceiling on the root
-      # invocation alone). Paying that baseline cost on every PR regardless
-      # of whether it touched `runtime/` would make an already-tight budget
-      # worse for no signal.
-      #
-      # (#2602) `always() &&` added: without it, GitHub's implicit success
-      # gate skips this step the moment an earlier step in the job fails
-      # (e.g. the root "Mutate"/"Report survivors" steps above) — but
-      # "Report survivors (runtime/)" below already carries its own
-      # `always()` (it must, to report a failed root run at all) and reads
-      # `steps.mutants_runtime.outputs.exit_code`.
-      #
-      # (#2602 round 2) `always()` -> `!cancelled()`: `always()` means "run
-      # unconditionally, including when the job is CANCELLED" — not merely
-      # "run even if an earlier step failed", which is `!cancelled()`'s own
-      # actual meaning. Under the old `always()`, a cancelled run still
-      # dispatched this invocation's full baseline-plus-mutation pass (the
-      # same job whose own comment above says a single file can consume the
-      # whole 60-minute budget) for a result nobody would ever read.
-      # `!cancelled()` keeps the original intent — this invocation is
-      # independent of the root one and should still run if root failed —
-      # while actually honoring a cancellation. "Report survivors (runtime/)"
-      # below carries the identical `!cancelled()` so the two steps can never
-      # drift out of lockstep and reproduce the empty-`exit_code` integer-
-      # parse error the original `always()` fix was closing.
       - name: Mutate runtime/ only what this PR touched
         id: mutants_runtime
         if: ${{ !cancelled() && steps.diff.outputs.runtime_changed_lines != '0' }}
         run: |
-          # Same exit-code capture discipline as the root invocation above —
-          # no `|| true`, the real code goes to the "Report survivors
-          # (runtime/)" step, which owns this invocation's pass/fail exactly
-          # the way "Report survivors" owns the root one.
-          #
-          # `--manifest-path runtime/Cargo.toml` (not `-C runtime` / `--dir`)
-          # is what makes cargo-mutants treat `runtime/` as its OWN workspace
-          # root for both mutant discovery and its `--copy-vcs` tree copy —
-          # confirmed locally via cargo-mutants' own debug log
-          # (`copy_tree: paths: ["<repo>/runtime"]`): the copy contains ONLY
-          # `runtime/`, nothing above it. Two of this crate's own tests read
-          # a fixture one directory up (`../tests/fixtures/...`, shared with
-          # `crates/darkmux-crew` on the host side) and failed the baseline
-          # under that copy for exactly that reason before #2544 vendored a
-          # read-only copy into `runtime/tests/fixtures/` (see
-          # `tests/runtime_fixtures_in_sync.rs` for the drift guard) — this
-          # comment is here so the next person who sees a `runtime/`-only
-          # `BaselineFailed` checks for the SAME class of cross-boundary path
-          # first, not just re-derives it from scratch.
-          #
-          # `-j 4 --timeout 300 --copy-vcs true` mirror the root invocation's
-          # own settings and reasoning above (per-mutant/baseline ceiling,
-          # VCS copy for git-shelling-out tests) — `runtime/` has none of its
-          # own that shell out to git, but the flag is harmless and keeping
-          # both invocations' flags identical is one fewer thing to explain
-          # differently later.
+          # `--manifest-path runtime/Cargo.toml` (not `-C runtime` /
+          # `--dir`) is what makes cargo-mutants treat `runtime/` as its
+          # OWN workspace root for both mutant discovery and its
+          # `--copy-vcs` tree copy. Two of this crate's own tests read a
+          # fixture one directory up, shared with `crates/darkmux-crew` on
+          # the host side — #2544 vendored a read-only copy into
+          # `runtime/tests/fixtures/` for exactly that reason (see
+          # `tests/runtime_fixtures_in_sync.rs`).
           set +e
           cargo mutants --manifest-path runtime/Cargo.toml --in-diff /tmp/pr-runtime.diff -j 4 --timeout 300 \
             --copy-vcs true --output mutants-runtime-out
@@ -599,12 +580,13 @@ jobs:
           exit 0
 
       - name: Report survivors (runtime/)
-        # (#2550) `!cancelled()` -> `always()`, matching "Report survivors"
-        # (root)'s own change above — see that step's comment for the full
-        # rationale. Kept in lockstep with its OWN Mutate step, which stays
-        # on `!cancelled()` for the same reason root's does: don't start a
-        # brand-new baseline+mutation run once the job is already being
-        # cancelled. `--job-status` added for the same reason as root's.
+        # (#2550) `!cancelled()` -> `always()`, matching each shard's own
+        # "Report survivors (shard N/6)" step in `mutants-in-diff` above —
+        # see that step's comment for the full rationale. Kept in lockstep
+        # with its OWN Mutate step, which stays on `!cancelled()` for the
+        # same reason: don't start a brand-new baseline+mutation run once
+        # the job is already being cancelled. `--job-status` added for the
+        # same reason.
         if: ${{ always() && steps.diff.outputs.runtime_changed_lines != '0' }}
         run: |
           python3 scripts/ci-mutants-summary.py \
@@ -622,8 +604,8 @@ jobs:
       #
       # (#2550) `always() &&` added to this note's own condition too: it had
       # no status-check function at all before, which is an IMPLICIT
-      # `success()` gate — on a job cancelled elsewhere (root's own Mutate
-      # step, say) this note would silently vanish for a scope that never
+      # `success()` gate — on a job cancelled elsewhere (the Mutate step
+      # above, say) this note would silently vanish for a scope that never
       # had anything to report in the first place (no diff under `runtime/`
       # regardless of cancellation), leaving the summary looking incomplete
       # for a reason unrelated to the actual finding. `always()` keeps this
@@ -647,12 +629,13 @@ jobs:
             mutants-runtime.out/**
           if-no-files-found: ignore
 
-      # (#2544) THE THIRD invocation — see the comment on `bundler_changed_lines`
-      # above for why this project, specifically, was chosen to cover rather
-      # than just document. Same shape as the runtime block above throughout,
-      # including the (#2602 round 2) `!cancelled()` — see that condition's
-      # comment on `mutants_runtime` for why `always()` (which also runs on a
-      # CANCELLED job, not merely "an earlier step failed") was replaced.
+      # (#2544) THE SECOND invocation in this job — see the comment on
+      # `bundler_changed_lines` above for why this project, specifically,
+      # was chosen to cover rather than just document. Same shape as the
+      # `runtime/` block above throughout, including the (#2602 round 2)
+      # `!cancelled()` — see that condition's comment on `mutants_runtime`
+      # for why `always()` (which also runs on a CANCELLED job, not merely
+      # "an earlier step failed") was replaced.
       - name: Mutate plugins/darkmux-bundler-rust/ only what this PR touched
         id: mutants_bundler
         if: ${{ !cancelled() && steps.diff.outputs.bundler_changed_lines != '0' }}
@@ -666,11 +649,11 @@ jobs:
           exit 0
 
       - name: Report survivors (plugins/darkmux-bundler-rust/)
-        # (#2550) `always()`, matching "Report survivors" (root) and
-        # "Report survivors (runtime/)" above — see root's comment for the
-        # full rationale, and note the SAME `!cancelled()` -> `always()`
-        # constraint that comment names: the Mutate step above stays on
-        # `!cancelled()`, only the reporting step widens.
+        # (#2550) `always()`, matching "Report survivors (runtime/)" above
+        # — see that step's comment for the full rationale, and note the
+        # SAME `!cancelled()` -> `always()` constraint it names: the Mutate
+        # step above stays on `!cancelled()`, only the reporting step
+        # widens.
         if: ${{ always() && steps.diff.outputs.bundler_changed_lines != '0' }}
         run: |
           python3 scripts/ci-mutants-summary.py \
@@ -787,25 +770,167 @@ jobs:
           if-no-files-found: ignore
 
   mutants-full:
-    # NOTE the name overstates the scope: despite "full workspace", this job
-    # sweeps the ROOT `darkmux` package only — see the Sweep step's comment and
-    # the follow-up issue #2499. The name is left alone so the
-    # check's identity doesn't churn; renaming it belongs with the fix.
-    name: mutation — full workspace sweep (nightly)
-    runs-on: macos-latest
-    # (#1792) Was `!= 'pull_request'`, which meant ANY non-PR event. Adding a
-    # push:main trigger for the coverage badge would have made this large
-    # sweep run on EVERY MERGE. Pinned to the nightly it was written for.
-    # (The mutant count in the ORIGINAL version of this comment, ~1410, was
-    # itself wrong even at the time: `--list` at this job's actual scope
-    # measures 2,136 — see the Sweep step.)
+    # (#2499) SHARDED nightly sweep across the whole workspace (root package +
+    # every crate under `crates/`) — the job used to be root-package-only
+    # despite its "full workspace" name (see the git history of this comment
+    # for the full account of why an unsharded run, even `--workspace`,
+    # could never finish: the only nightly that ever ran to an honest
+    # conclusion under the post-#2504 exit-code-honest gate — run
+    # 34224570708, root-only scope — was CANCELLED at its 350-minute budget
+    # having completed only 973 of 2,136 mutants, ~21.4s/mutant on the real
+    # `macos-latest` runner, projecting ~12.7h for root alone and ~76h for
+    # the full workspace at that flat rate).
     #
-    # (#1716) `workflow_dispatch` added. Before it, `schedule` was the ONLY
-    # channel: this job could not be triggered to verify anything, so a defect
-    # in it — including the `|| true` false green this issue is about — could
-    # only ever be observed by waiting for cron.
+    # SHARDING AXIS: crate first (`-p <crate>`, the natural package boundary
+    # cargo-mutants already understands — matches this repo's actual
+    # `crates/*` structure rather than an arbitrary mutant-index split), then
+    # `--shard i/k` WITHIN a crate only when its own mutant count is large
+    # enough to blow a single job's budget on its own. Fresh census,
+    # 2026-09-15, `cargo mutants --workspace --list --json` (grown from
+    # #2499's own 2026-09-09/10 figures as the tree grew):
+    #
+    #   root (src/)      2,319     darkmux-flow        1,066
+    #   darkmux-crew     3,748     darkmux-doctor        695
+    #   darkmux-lab      2,591     darkmux-types         692
+    #   darkmux-serve    1,344     darkmux-profiles      600
+    #                              darkmux-gestalt       223
+    #                              darkmux-fleet         147
+    #                              darkmux-heuristics     97
+    #                              darkmux-hardware       88
+    #                              darkmux-eureka         26
+    #                                        TOTAL:  13,636
+    #
+    # SHARD SIZE: targeted at ~700 mutants/shard, sized against the one real
+    # CI-measured rate this repo has (21.4s/mutant, cited above) — 700
+    # mutants is ~250 minutes of mutate-testing, leaving headroom under this
+    # job's 300-minute timeout AND the platform's own 6-hour hard per-job cap
+    # (GitHub-hosted runners cannot exceed this regardless of
+    # `timeout-minutes` — a known platform constraint, not independently
+    # re-verified against this account). Two fresh local samples this
+    # session corroborate the 21.4s/mutant anchor rather than replace it —
+    # both on FASTER local hardware than `macos-latest`, so it stays the
+    # conservative choice for sizing CI shards: darkmux-eureka's full
+    # 26-mutant sweep (leaf crate, trivial rebuild) ran in 38s (~1.5s/mutant,
+    # and found 18 of 26 SURVIVING — see the GATE note below); a 38-mutant
+    # `--shard 0/100` sample of darkmux-crew (the largest, most
+    # representative crate) settled at ~20-27s/mutant once `-j 4` warmed up.
+    #
+    #   root      2,319 / 700 -> 4 shards     flow        1,066 / 700 -> 2 shards
+    #   crew      3,748 / 700 -> 6 shards     doctor        695        -> 1 shard
+    #   lab       2,591 / 700 -> 4 shards     types         692        -> 1 shard
+    #   serve     1,344 / 700 -> 2 shards     profiles      600        -> 1 shard
+    #
+    # 21 shard-jobs total, hand-enumerated in the matrix below rather than
+    # computed by a separate dynamic-matrix-generation job — same posture as
+    # every other hardcoded, dated, re-measurable number already in this
+    # file. Will need recalibrating as the tree grows; that is a comment
+    # update, not a redesign. The five smallest crates (gestalt, fleet,
+    # heuristics, hardware, eureka — 581 mutants combined, each individually
+    # too small to justify its own job's fixed toolchain-install +
+    # rust-cache overhead) are swept in ONE separate job below,
+    # `mutants-full-small`, as sequential un-sharded invocations — the same
+    # shape `mutants-in-diff` already uses for its `runtime/` and
+    # `plugins/darkmux-bundler-rust/` invocations.
+    #
+    # GATE: stays ADVISORY on survivor count, same reasoning as every other
+    # mutation job in this file (a hard gate would fail every honest PR
+    # against pre-existing debt) — and that is not a hypothetical here: a
+    # full sweep of darkmux-eureka THIS SESSION (26 mutants, a small,
+    # unassuming leaf crate) found 18 SURVIVORS (69%), almost entirely
+    # `eval_memory_headroom`'s arithmetic (`crates/darkmux-eureka/src/lib.rs`
+    # around line 259-278) — every `*`/`/`/`+`/`-`/`>` in that function can be
+    # swapped and the test suite notices nothing. Gating on that number today
+    # would fail every build; it is exactly the backlog this job exists to
+    # surface, not enforce. What still GATES, unchanged from before this fix:
+    # tool integrity — did the tool actually run, did it contradict its own
+    # exit code, was it cancelled — see `scripts/ci-mutants-summary.py`'s own
+    # module comment. Each shard's own "Summarize" step below still fails
+    # ITS job on that basis; `fail-fast: false` means one shard's tool-
+    # integrity failure never cancels its siblings.
+    #
+    # COST: total mutate-testing compute is the SAME regardless of sharding
+    # (sharding parallelizes wall-clock, it does not reduce total work) — SO
+    # roughly 13,636 mutants x 21.4s =~ 81 macOS-hours of mutate-testing per
+    # night, spread across these 21 shard-jobs plus `mutants-full-small`
+    # (22 jobs total).
+    # This repo is PUBLIC (verified via `gh repo view --json
+    # isPrivate,visibility` before writing this, not assumed — GitHub does
+    # not meter Actions minutes for GitHub-hosted runners on public repos,
+    # unlike the private-repo "metered minutes" framing this fix was
+    # originally briefed under), so this costs $0 in billed minutes. Real
+    # costs that remain: each shard's own wall-clock against the 6-hour
+    # platform cap (the shard sizing above addresses this), and how many of
+    # these 22 jobs the account's macOS-runner concurrency limit lets
+    # run AT ONCE — NOT verified against this account. If that limit is the
+    # commonly-cited default of 5 concurrent macOS jobs for Free/Pro
+    # accounts, 22 jobs / 5-at-a-time =~ 5 waves x ~4h =~ 20h wall-clock to
+    # fully complete every night, leaving buffer before the next 07:23 UTC
+    # cron fires. The per-shard `concurrency` group below queues a slow
+    # night's overrun instead of letting two sweeps of the SAME shard
+    # collide; it does not serialize DIFFERENT shards against each other.
+    #
+    # CADENCE: unchanged — nightly (`schedule:` at the top of this file) plus
+    # `workflow_dispatch` for on-demand validation, same triggers as before
+    # sharding. A full sweep every night, not a rotation across nights,
+    # because the real constraint here is wall-clock/job-count, not billed
+    # minutes (see COST above) — revisit toward a rotation if the real
+    # nightly runs this enables show the concurrency limit makes the ~20h
+    # projection above a recurring problem rather than a worst case.
+    #
+    # SCOPE: `runtime/` and `plugins/darkmux-bundler-rust/` are NOT part of
+    # this matrix, same exclusion the root `Cargo.toml`'s `[workspace]
+    # exclude` already documents — `cargo mutants --workspace` structurally
+    # cannot reach either (confirmed on #2599; that is why `mutants-in-diff`
+    # runs them as separate `--manifest-path` invocations). A nightly sweep
+    # of `runtime/` (1,529 mutants, `cargo mutants --manifest-path
+    # runtime/Cargo.toml --list`) is real, deferred follow-up work, not done
+    # here — #2499's own comment already projected it at ~9.1h unsharded on
+    # `macos-latest`, which is the SAME disease this fix closes for
+    # `crates/*` and would need the same shard treatment, not a flag.
+    # `plugins/darkmux-bundler-rust/` (224 mutants, ~4min unsharded) stays
+    # covered only by the PR-diff job, per the judgment call already
+    # recorded at its own former call site in this job's history — cheap
+    # enough that adding a nightly job for it later needs no re-measurement,
+    # just the job. `tools/darkmux-mock-model` stays uncovered everywhere,
+    # unchanged (dev/test infrastructure, not production code).
+    name: mutation — full workspace sweep (nightly, sharded)
+    runs-on: macos-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 350
+    timeout-minutes: 300
+    concurrency:
+      # Scoped to scope+shard, not the whole job: a re-run of the SAME shard
+      # (e.g. a `workflow_dispatch` fired to validate this fix while last
+      # night's cron run for that identical shard is still in flight) queues
+      # rather than doubling up. Different shards are NOT in each other's
+      # group, so they still run in parallel — this must never serialize the
+      # matrix, only protect a given shard against itself.
+      group: mutants-full-${{ matrix.scope }}-${{ matrix.shard_label }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { scope: root, package: "", shard: "0/4", shard_label: "0-4" }
+          - { scope: root, package: "", shard: "1/4", shard_label: "1-4" }
+          - { scope: root, package: "", shard: "2/4", shard_label: "2-4" }
+          - { scope: root, package: "", shard: "3/4", shard_label: "3-4" }
+          - { scope: crew, package: "darkmux-crew", shard: "0/6", shard_label: "0-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "1/6", shard_label: "1-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "2/6", shard_label: "2-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "3/6", shard_label: "3-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "4/6", shard_label: "4-6" }
+          - { scope: crew, package: "darkmux-crew", shard: "5/6", shard_label: "5-6" }
+          - { scope: lab, package: "darkmux-lab", shard: "0/4", shard_label: "0-4" }
+          - { scope: lab, package: "darkmux-lab", shard: "1/4", shard_label: "1-4" }
+          - { scope: lab, package: "darkmux-lab", shard: "2/4", shard_label: "2-4" }
+          - { scope: lab, package: "darkmux-lab", shard: "3/4", shard_label: "3-4" }
+          - { scope: serve, package: "darkmux-serve", shard: "0/2", shard_label: "0-2" }
+          - { scope: serve, package: "darkmux-serve", shard: "1/2", shard_label: "1-2" }
+          - { scope: flow, package: "darkmux-flow", shard: "0/2", shard_label: "0-2" }
+          - { scope: flow, package: "darkmux-flow", shard: "1/2", shard_label: "1-2" }
+          - { scope: doctor, package: "darkmux-doctor", shard: "", shard_label: "solo" }
+          - { scope: types, package: "darkmux-types", shard: "", shard_label: "solo" }
+          - { scope: profiles, package: "darkmux-profiles", shard: "", shard_label: "solo" }
     steps:
       - uses: actions/checkout@v4
 
@@ -815,7 +940,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: mutants-full
+          key: mutants-full-${{ matrix.scope }}
 
       - name: Install cargo-mutants
         # Pinned for the reason spelled out in mutants-in-diff's install step:
@@ -826,130 +951,201 @@ jobs:
       - name: Summary script self-test
         run: python3 scripts/ci-mutants-summary.py --self-test
 
-      - name: Sweep
+      - name: Sweep this shard
         id: mutants
         run: |
-          # (#1716) Same defect, same fix, as `mutants-in-diff` above: no
-          # more `|| true` swallowing cargo-mutants' exit code (a
-          # BaselineFailed here was SUSPECTED but unconfirmed — this job only
-          # runs on `schedule`, so it couldn't be triggered directly to
-          # observe; the exit-code capture makes it observable on the next
-          # scheduled run either way), and `--copy-vcs true` so the copied
-          # build tree is a real git repo (this repo has tests that shell out
-          # to git and panic without one).
-          #
-          # KNOWN UNDER-SCOPING, deliberately NOT fixed here (see #2499). This job's name says "full workspace
-          # sweep" and it has never been one. Without `-p`/`--workspace`,
-          # cargo-mutants (like plain `cargo test`) auto-scopes to the ROOT
-          # package when the workspace root also carries a `[package]` table,
-          # which this repo's does (the `darkmux` bin). Re-measured 2026-09-09
-          # with cargo-mutants 27.1.0 (drifted slightly from the issue's
-          # 2026-09-08 numbers): `cargo mutants --list` finds 2,176 mutants at
-          # this scope; `--workspace --list` finds 12,764. The ~12 library
-          # crates under `crates/` — most of this codebase — have never been
-          # swept.
-          #
-          # `--workspace` was tried here and reverted before #2499 was filed.
-          # #2499's own follow-up (2026-09-09) went further than re-measuring
-          # that attempt: it pulled the REAL run history for this job from
-          # `gh run view`/`gh api .../actions/jobs/<id>/logs`, because the
-          # first scheduled run after the exit-code-honesty fix (#2504,
-          # 2026-09-08T11:07Z) is the only nightly this job has EVER run to an
-          # honest conclusion — every run before it reported "success" off
-          # the old `wc -l`-style summary that could not distinguish a real
-          # sweep from an early exit. That one real run
-          # (github.com/kstrat2001/darkmux/actions/runs/34224570708, job
-          # 102055439077) is damning even at TODAY'S root-only scope: baseline
-          # passed (105s build + 68s test), then testing ran the full
-          # 350-minute budget and was CANCELLED having completed only 973 of
-          # 2,136 mutants (594 caught, 332 missed, 4 timeout, 43 unviable —
-          # counted from the uploaded `mutants-out` artifact's outcomes.json).
-          # That is 973 mutants in ~20,856s of testing = ~21.4s/mutant on the
-          # real macos-26-arm64 runner, which projects the ROOT-ONLY scope
-          # alone at ~12.7h to finish — already ~2.2x this job's 350-minute
-          # (5.83h) cap, before `--workspace` enters the picture at all.
-          # Flat-extrapolating that same rate across the 12,764 `--workspace`
-          # mutants (a real caveat: darkmux-types-style foundational crates
-          # rebuild much more of the graph per mutant than a leaf crate, so
-          # this is a rough single-rate model, not a per-crate one) projects
-          # ~76h for a full sweep — and GitHub-hosted runners hard-cap a
-          # single job at 6h of execution regardless of `timeout-minutes`
-          # (platform limit, not verifiable from this repo — stated here as a
-          # known constraint, not re-tested), so no `timeout-minutes` value
-          # can fix this even before sharding is designed. The earlier
-          # "~33h projected, --timeout 120 bounds the baseline too" framing
-          # from the reverted attempt undersold the problem: the real
-          # bottleneck isn't just the baseline timeout, it's that this job,
-          # even unchanged, no longer finishes within its own budget on the
-          # actual runner. Widening the scope needs a job-matrix shard design
-          # (`--shard i/k`) sized against these real numbers, which is
-          # follow-up work this fix deliberately does not carry — see #2499's
-          # continuation. Deliberately left under-scoped and DOCUMENTED
-          # rather than silently under-scoped or half-fixed.
-          #
-          # (#2544) `runtime/` and `plugins/darkmux-bundler-rust/` are NOT
-          # added here either, for the SAME reason stated above, tested
-          # rather than assumed: this step (root only) already cannot finish
-          # in the 350-minute budget, so ANYTHING appended after it in this
-          # same job is dead code — it would never start. Splitting either
-          # into its own parallel job (its own budget, not starved by this
-          # one) was considered instead of appending, and decided against
-          # for `runtime/` on real numbers: `cargo mutants --manifest-path
-          # runtime/Cargo.toml --list` finds 1,529 mutants, and a real
-          # 21-mutant sample (measured on an M5 Max, `src/compaction.rs`)
-          # ran at ~17s/mutant amortized under `-j 4` — flat-extrapolating
-          # that rate projects a full unsharded sweep at roughly 1,529×17s ≈
-          # 7.2h, already past this job's own 350-minute (5.83h) cap before
-          # accounting for the slower `macos-latest` runner (root's own
-          # measured CI rate above is ~21.4s/mutant, ~1.26x this sample —
-          # applying that ratio projects ~9.1h). Same disease as #2499's
-          # finding for `crates/`: needs `--shard i/k`, not just a flag or a
-          # separate job, and building that shard design is left to #2499's
-          # continuation rather than improvised here.
-          #
-          # `plugins/darkmux-bundler-rust/` is NOT the same problem — it
-          # measured cheap (a 28-mutant sample, `--list` finds 224 total,
-          # completed in 29s total at `-j 4`, so a full unsharded sweep
-          # projects to roughly 224×(29s/28) ≈ 4 minutes) and would fit an
-          # ordinary job's budget easily. It is left out of THIS job for a
-          # narrower reason: the PR-diff job (`mutants-in-diff`) already
-          # covers it on every PR that touches it, which is the coverage
-          # that actually matters operationally, and adding a fourth nightly
-          # job for a project this small is more workflow surface than the
-          # marginal signal over the PR-diff coverage justifies. Revisit if
-          # that judgment call turns out wrong — it is cheap enough that
-          # adding it later needs no numbers-gathering, just the job.
+          # Same fix as `mutants-in-diff`: no `|| true` swallowing the exit
+          # code, and `--copy-vcs true` so the copied build tree is a real
+          # git repo (this repo has tests that shell out to git and panic
+          # without one). `-p`/`--shard` are built from the matrix entry —
+          # root's four shards omit `-p` (cargo-mutants auto-scopes to the
+          # root `darkmux` package when the workspace root also carries a
+          # `[package]` table, the same behavior this job always had before
+          # #2499 widened it), everything else names its crate; the three
+          # single-shard scopes (doctor/types/profiles) omit `--shard`
+          # entirely rather than passing a meaningless `0/1`.
           set +e
-          cargo mutants -j 4 --timeout 120 --copy-vcs true --output mutants-out
+          ARGS=(-j 4 --timeout 120 --copy-vcs true --output mutants-out)
+          if [ -n "${{ matrix.package }}" ]; then
+            ARGS+=(-p "${{ matrix.package }}")
+          fi
+          if [ -n "${{ matrix.shard }}" ]; then
+            ARGS+=(--shard "${{ matrix.shard }}")
+          fi
+          cargo mutants "${ARGS[@]}"
           STATUS=$?
           set -e
           echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Summarize
-        # Already `always()` before #2550 — this job's own long history of
-        # never finishing a sweep (#2499) meant this step already needed to
-        # survive a cancellation to report anything at all. What #2550 adds
-        # is `--job-status`, so a cancelled/timed-out sweep gets the loud,
-        # distinguishable CANCELLED report (with whatever partial progress
-        # cargo-mutants had written) instead of the old empty-exit_code
-        # message, which only ever reached stderr and never
-        # `$GITHUB_STEP_SUMMARY` — see ci-mutants-summary.py's own
-        # `CANCELLED_SENTINEL` and the "Report survivors" step's comment in
-        # the `mutants-in-diff` job above for the full rationale.
+        # `always()`, same reasoning as the pre-existing "Summarize" step this
+        # replaces: a shard cut off by ITS OWN `timeout-minutes` must still
+        # report partial progress rather than leaving its section of the run
+        # summary silently absent — see ci-mutants-summary.py's own
+        # `CANCELLED_SENTINEL` and #2550's rationale, unchanged by sharding.
         if: always()
         run: |
           python3 scripts/ci-mutants-summary.py \
             "${{ steps.mutants.outputs.exit_code }}" full \
-            "Nightly mutation sweep (root \`darkmux\` package — see #1716)" \
+            "Nightly mutation sweep — ${{ matrix.scope }} shard ${{ matrix.shard_label }} (see #2499)" \
             --job-status "${{ job.status }}" \
             mutants-out/mutants.out mutants.out >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mutants-full
+          # (v4 requires run-unique artifact names, unlike v3 — scope+shard
+          # makes every one of the 21 matrix jobs distinct.)
+          name: mutants-full-${{ matrix.scope }}-${{ matrix.shard_label }}
           path: |
             mutants-out/**
             mutants.out/**
+          if-no-files-found: ignore
+
+  mutants-full-small:
+    # (#2499) The five crates too small to be worth their own matrix entry
+    # above (223+147+97+88+26 = 581 mutants combined) — one job, five
+    # sequential un-sharded invocations, the same shape `mutants-in-diff`
+    # already uses for its `runtime/` + `plugins/darkmux-bundler-rust/` pair.
+    # At the 21.4s/mutant anchor the matrix job's own comment cites, 581
+    # mutants is ~3.5h of mutate-testing before the five baselines are even
+    # counted; 270 minutes (4.5h) below gives real margin under that and the
+    # platform's 6-hour hard cap.
+    name: mutation — full workspace sweep (nightly, small crates)
+    runs-on: macos-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 270
+    concurrency:
+      group: mutants-full-small
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-full-small
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version 27.1.0
+
+      - name: Summary script self-test
+        run: python3 scripts/ci-mutants-summary.py --self-test
+
+      - name: Sweep darkmux-gestalt
+        id: gestalt
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-gestalt --output mutants-out-gestalt
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarize darkmux-gestalt
+        if: always()
+        run: |
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.gestalt.outputs.exit_code }}" full \
+            "Nightly mutation sweep — darkmux-gestalt (see #2499)" \
+            --job-status "${{ job.status }}" \
+            mutants-out-gestalt/mutants.out mutants.out-gestalt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sweep darkmux-fleet
+        id: fleet
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-fleet --output mutants-out-fleet
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarize darkmux-fleet
+        if: always()
+        run: |
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.fleet.outputs.exit_code }}" full \
+            "Nightly mutation sweep — darkmux-fleet (see #2499)" \
+            --job-status "${{ job.status }}" \
+            mutants-out-fleet/mutants.out mutants.out-fleet >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sweep darkmux-heuristics
+        id: heuristics
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-heuristics --output mutants-out-heuristics
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarize darkmux-heuristics
+        if: always()
+        run: |
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.heuristics.outputs.exit_code }}" full \
+            "Nightly mutation sweep — darkmux-heuristics (see #2499)" \
+            --job-status "${{ job.status }}" \
+            mutants-out-heuristics/mutants.out mutants.out-heuristics >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sweep darkmux-hardware
+        id: hardware
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-hardware --output mutants-out-hardware
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarize darkmux-hardware
+        if: always()
+        run: |
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.hardware.outputs.exit_code }}" full \
+            "Nightly mutation sweep — darkmux-hardware (see #2499)" \
+            --job-status "${{ job.status }}" \
+            mutants-out-hardware/mutants.out mutants.out-hardware >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sweep darkmux-eureka
+        id: eureka
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          cargo mutants -j 4 --timeout 120 --copy-vcs true -p darkmux-eureka --output mutants-out-eureka
+          STATUS=$?
+          set -e
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Summarize darkmux-eureka
+        # (#2499) Real numbers from this session, not a placeholder: this
+        # crate's full 26-mutant sweep found 18 survivors (69%) — see the
+        # matrix job's GATE comment above. Expect this section of the nightly
+        # summary to report that until someone works the backlog down; it is
+        # advisory, not a broken check.
+        if: always()
+        run: |
+          python3 scripts/ci-mutants-summary.py \
+            "${{ steps.eureka.outputs.exit_code }}" full \
+            "Nightly mutation sweep — darkmux-eureka (see #2499)" \
+            --job-status "${{ job.status }}" \
+            mutants-out-eureka/mutants.out mutants.out-eureka >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-full-small
+          path: |
+            mutants-out-*/**
+            mutants.out-*/**
           if-no-files-found: ignore

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, rosterOnlyEntries } from "./cards";
+import { machActive, specOf, buildFleetCard, rosterOnlyEntries, specUnknownLabel } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 
@@ -502,5 +502,63 @@ describe("rosterOnlyEntries", () => {
     const roster = [rosterEntry({ id: "mini-1" })];
     const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
     expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
+  });
+});
+
+/**
+ * (#1855) A card with no hardware line used to say ONE thing for two facts.
+ *
+ * The issue's own wire dump is the `not-reported` case: both real machines
+ * beat with no `specs` key at all, because the emitter hardcoded
+ * `specs: None` until #2083. That peer ANSWERED and said nothing about its
+ * hardware, and "hardware not reported" is the honest sentence for it.
+ *
+ * The `not-seen` case is the one #1855's roster cards created. A machine the
+ * operator declared with `darkmux machine add` that is down, or has never
+ * started its daemon, now renders a card instead of vanishing — and that card
+ * was asserting the machine had reported and withheld its hardware, when
+ * nothing had ever been received from it at all. Same class as the vanishing
+ * itself: a confident answer the page cannot back up.
+ */
+describe("(#1855) the spec line says WHICH kind of unknown", () => {
+  const T = 9e15;
+
+  it("a machine that beat WITHOUT specs reads 'not-reported' — it answered and said nothing", () => {
+    const live = new Map([["u1", beat({ machine_uid: "u1" })]]);
+    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T, live);
+    expect(card.spec).toBe("");
+    expect(card.specUnknown).toBe("not-reported");
+    expect(specUnknownLabel(card.specUnknown!)).toBe("hardware not reported");
+  });
+
+  it("a machine nothing has been received from reads 'not-seen'", () => {
+    // The rostered-but-silent card: forced absent, no beat, no snapshot entry.
+    const card = buildFleetCard([], new Map(), null, new Set(), /* machAbsent */ true, "studio-2", true, T);
+    expect(card.spec).toBe("");
+    expect(card.specUnknown).toBe("not-seen");
+    expect(specUnknownLabel(card.specUnknown!)).toBe("hardware unknown — nothing received");
+  });
+
+  it("a machine WITH hardware reports no unknown at all", () => {
+    // Inverted case 1 — the healthy card must carry no marker of any kind.
+    const live = new Map([["u1", beat({ machine_uid: "u1", specs: "Apple M5 Max · 128 GB" })]]);
+    const card = buildFleetCard([], live, null, new Set(), false, "u1", true, T, live);
+    expect(card.spec).toBe("Apple M5 Max · 128 GB");
+    expect(card.specUnknown).toBeNull();
+  });
+
+  it("THIS machine's own /machine/specs read also clears the unknown", () => {
+    // Inverted case 2: the local card resolves its hardware from the specs
+    // probe, not from a beat, and must not be pushed into either unknown
+    // bucket just because presence is switched off.
+    const data = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro", action: "dispatch.start" })];
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 });
+    const card = buildFleetCard(data, new Map(), specs, new Set(), false, "u1", true, T);
+    expect(card.spec).toBe("Apple M5 Max · 128 GB");
+    expect(card.specUnknown).toBeNull();
+  });
+
+  it("the two labels are different sentences — a regression that collapsed them would be invisible otherwise", () => {
+    expect(specUnknownLabel("not-seen")).not.toBe(specUnknownLabel("not-reported"));
   });
 });

@@ -42,6 +42,12 @@ export interface FlowTailHandlers {
    * `LIVE_ES.onopen`'s own `everOpened` flag does. */
   onOpen?: () => void;
   onError?: () => void;
+  /** (#2683) Fires on every `message` event the stream delivers, BEFORE the
+   * record is parsed — a malformed line still proves the transport is alive,
+   * which is the only thing this callback reports. `useLiveTail`'s silence
+   * watchdog uses it as one of its two contact signals; nothing else does.
+   * Optional and purely additive, same as the two above. */
+  onMessage?: () => void;
 }
 
 /**
@@ -77,7 +83,10 @@ export function startFlowTail(
   const open = () => {
     source?.close();
     source = eventSourceFactory(`/flow/${date}/stream`);
-    source.onmessage = (event: MessageEvent<string>) => appendRecord(event.data);
+    source.onmessage = (event: MessageEvent<string>) => {
+      handlers?.onMessage?.();
+      appendRecord(event.data);
+    };
     source.onopen = () => handlers?.onOpen?.();
     source.onerror = () => handlers?.onError?.();
   };

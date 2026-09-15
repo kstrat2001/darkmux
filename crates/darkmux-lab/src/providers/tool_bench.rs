@@ -1440,17 +1440,25 @@ fn render_summary(trials: &[Trial<'_>], k: u32, scores_path: &Path) -> String {
 /// Extract the model's final message from dispatch stdout. A cold run can
 /// emit image-pull progress on stdout AHEAD of the single-line JSON envelope,
 /// which fails `extract_reply_text`'s whole-stdout parse — so isolate the
-/// envelope the same way `envelope_meta` does (last line starting with `{`)
-/// before handing it over (frontier-QA finding on this PR). No `{` line at
-/// all falls back to the raw stdout, which `extract_reply_text` passes
-/// through unchanged.
+/// envelope first. No `{` line at all falls back to the raw stdout, which
+/// `extract_reply_text` passes through unchanged.
+///
+/// (#2719) WHICH line that is comes from [`scores::envelope_candidate`], the
+/// one place that decision lives. This used to be its own `.rev().find(…)`
+/// copy of the same heuristic sitting beside `scores::parse_envelope`'s, so
+/// `scores.rs`'s claim that the choice is made "in exactly ONE place" was
+/// true inside that file and false across the crate. The two MUST agree:
+/// this function decides the trial's VERDICT (the reply `extract_answer`
+/// reads the nonce out of) while `envelope_meta` decides the SAME trial's
+/// METRICS off the same stdout, and a bench reading those off different
+/// lines scores a capability zero for a model that answered correctly.
+///
+/// (#2721) The composition itself — `extract_reply_text(envelope_candidate(…))`
+/// — is now [`scores::envelope_reply_text`], because `review_bench` and
+/// `dialectic` needed the identical pair and spelling it out a third time is
+/// how the `.rev().find(…)` duplicate got here in the first place.
 fn extract_reply(stdout: &str) -> String {
-    let candidate = stdout
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .unwrap_or(stdout);
-    super::prompt::extract_reply_text(candidate.trim())
+    scores::envelope_reply_text(stdout)
 }
 
 /// Dispatch one task via the internal runtime. Same shape as the coding-task
@@ -1625,6 +1633,56 @@ mod tests {
         );
         // No JSON at all passes through raw.
         assert_eq!(extract_reply("plain text"), "plain text");
+    }
+
+    /// (#2719) The guard above cannot see the mutation this one exists for:
+    /// its noise is PLAIN TEXT with no `{`, so the first and the last line
+    /// starting with `{` are the same line, and dropping the `.rev()` from
+    /// the candidate choice is an equivalent mutant against it.
+    ///
+    /// Make the noise JSON-SHAPED — a `{…}` progress line AHEAD of a complete
+    /// envelope at a clean exit — and the two differ. The consequence is the
+    /// whole point, so it is asserted end-to-end rather than on the reply
+    /// alone: the mutant reads the progress line as the reply, `extract_answer`
+    /// finds no `ANSWER:`/`BLOCKED:` verdict in it, and the trial scores a
+    /// capability failure at 0.0 with `infra_fail: false` — INSIDE the
+    /// pass-rate denominator, so a healthy bench run silently reports an
+    /// all-zero model. That is the failure class #2685 exists to prevent,
+    /// arriving through a different door.
+    ///
+    /// The metrics are read off the SAME stdout by `envelope_meta_with_exit`,
+    /// which is why this asserts both: verdict and metrics must come from one
+    /// line, and since #2719 they come from one decision
+    /// (`scores::envelope_candidate`) rather than two copies of it.
+    #[test]
+    fn extract_reply_reads_past_json_shaped_noise_ahead_of_the_envelope() {
+        let t = nonce_task();
+        let exp = expected_nonce(&t);
+        let stdout = format!(
+            "{{\"status\":\"Downloading\",\"id\":\"sha256:abc\"}}\n\
+             {{\"status\":\"Extracting\",\"id\":\"sha256:abc\"}}\n\
+             {{\"result\":\"stop\",\"final_assistant\":\"ANSWER: {exp}\",\
+               \"metrics\":{{\"model\":\"m-x\",\"prompt_tokens\":8,\"completion_tokens\":2}}}}"
+        );
+
+        let reply = extract_reply(&stdout);
+        assert_eq!(
+            reply,
+            format!("ANSWER: {exp}"),
+            "the envelope is the LAST `{{` line — a JSON progress line ahead of it is not the reply"
+        );
+
+        // Same stdout, same decision, read for metrics.
+        let meta = envelope_meta_with_exit(&stdout, 0);
+        assert_eq!(meta.model.as_deref(), Some("m-x"));
+        assert_eq!(meta.total_tokens, Some(10));
+        assert!(!meta.infra_exit);
+
+        // And the trial the bench actually records.
+        let sc = score_task(&t, &meta, &reply, &TrajStats::default());
+        assert!(sc.passed, "the model answered correctly; a pull-progress line must not erase that");
+        assert!(!sc.infra_fail, "a clean exit with a complete envelope is not a rerun");
+        assert!(!sc.fabricated);
     }
 
     #[test]

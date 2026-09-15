@@ -100,8 +100,8 @@ describe("App", () => {
     expect(document.getElementById("stage")).toBeTruthy();
     // Packet 8: the default route is `FleetLens` (the savings hero +
     // machine cards + activity timeline), superseding the scaffold's
-    // original `FleetStrip` presence-only region — see that component's
-    // own doc. With every endpoint answering a blank `[]`, the hero still
+    // original `FleetStrip` presence-only region (deleted in #2725). With
+    // every endpoint answering a blank `[]`, the hero still
     // renders (always-render-even-at-zero, per its own doc) and the
     // timeline falls to its empty-fleet branch.
     await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
@@ -1586,5 +1586,129 @@ describe("App", () => {
       meta.remove();
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * (#2683) The masthead's `N ⬚ · last dispatch …` headline is presence-derived
+ * and GLOBAL — it shows on every lens. Before this it read `useLiveMachines()`
+ * and nothing else, so a degraded or dead presence substrate produced a
+ * confident machine count (or a confident "waiting for a machine") with no
+ * caveat anywhere near it. The fleet lens had carried that caveat since
+ * #1729; the masthead, which makes the same claim on every other route, had
+ * not.
+ *
+ * These are the MOUNT assertions — that the shared notice is actually on
+ * screen, and that the headline itself is marked. The component's own state
+ * matrix lives in `components/FleetCoverageNotice.test.tsx`. Both halves
+ * exist because the regression this whole marker has already suffered once
+ * was precisely a component whose own tests kept passing while it stopped
+ * being mounted.
+ */
+describe("App — presence coverage on the masthead", () => {
+  // Two pieces of leaked state, both of which turned these cases into a
+  // PLAYBACK route (the replay meta line, no live headline at all) — and only
+  // in a full-file run, which is why they passed under `-t` first. Verified
+  // by rendering the DOM, not inferred.
+  //
+  // 1. A leftover `<meta name="darkmux-*-src">` from an earlier case makes
+  //    `getSource()` report a STATIC build, which `parseRoute` resolves to
+  //    playback unconditionally (and which also gates the presence poll off).
+  //    Cleared here rather than in `test-setup.ts` so this cannot change what
+  //    any other suite sees.
+  // 2. `useHashRoute`'s snapshot memo is keyed on `location.href` and lives
+  //    at MODULE scope, so removing the meta alone changes nothing: the
+  //    already-cached playback route is handed back for the same URL. Naming
+  //    the route in the hash moves the href and forces a fresh parse.
+  beforeEach(() => {
+    document.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+    window.location.hash = "#lens=fleet";
+  });
+
+  const BEAT = (uid: string) => ({
+    machine_uid: uid,
+    display_name: uid,
+    schema_version: "1",
+    beat_ts_ms: Date.now(),
+  });
+
+  function mockPresence(body: unknown | null, status = 200) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url).includes("/fleet/machines/live")) {
+          return body === null
+            ? Promise.resolve(new Response("gone", { status, statusText: "Service Unavailable" }))
+            : Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+        }
+        if (String(url) === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: [], generated_at_ms: 1 }), { status: 200 }));
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+  }
+
+  function renderApp() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("states the machine count plainly when presence is healthy — the inverted case", async () => {
+    mockPresence({ machines: [BEAT("a"), BEAT("b")], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector(".mco")).toBeTruthy());
+    const mco = container.querySelector(".mco") as HTMLElement;
+    expect(mco.textContent).toContain("2");
+    expect(mco.getAttribute("title")).toBe("2 machines online");
+    expect(mco.hasAttribute("data-coverage"), "a healthy read must not be marked").toBe(false);
+    expect(container.querySelector(".fleetcov")).toBeNull();
+  });
+
+  it("marks the count AND shows the shared notice when presence is stale", async () => {
+    mockPresence({
+      machines: [BEAT("a"), BEAT("b")],
+      meta: { sources: { fleet: { state: "stale", age_ms: 41200, detail: "x" } }, complete: false },
+    });
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="stale"]')).toBeTruthy());
+    // The wording is #1729's, unchanged — the point of sharing the component
+    // rather than writing a second staleness vocabulary for the masthead.
+    expect(
+      container.querySelector(".fleetcov")?.textContent,
+    ).toContain("Fleet presence is stale (41s old) — machines and run counts below may have moved on.");
+    // …and the claim itself carries the caveat, not just the banner: the
+    // count is still shown (the last answer beats no answer) but it is no
+    // longer asserted bare.
+    const mco = container.querySelector(".mco") as HTMLElement;
+    expect(mco.getAttribute("data-coverage")).toBe("stale");
+    expect(mco.textContent).toContain("2");
+    expect(mco.getAttribute("title")).toBe("Fleet presence is stale (41s old) — machines and run counts below may have moved on.");
+  });
+
+  it("stops claiming the fleet is empty when the presence READ failed — a daemon death mid-session", async () => {
+    // The shape #2683 named. `fetchJson` returns a discriminated result
+    // rather than throwing, so this is a SUCCESSFUL query carrying
+    // `ok:false`: `useLiveMachines` hands the headline an EMPTY map, which
+    // renders identically to a fleet that genuinely has nobody in it. The
+    // page went on to say "waiting for a machine" — presence answering that
+    // nobody is there — off a read that never happened.
+    mockPresence(null, 503);
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="unavailable"]')).toBeTruthy());
+    expect(container.querySelector(".fleetcov")?.textContent).toContain("Fleet presence could not be read");
+    expect(screen.queryByText(/waiting for a machine/i), "no claim beats a false one").not.toBeInTheDocument();
+  });
+
+  it("still says 'waiting for a machine' on a healthy but EMPTY fleet — the inverted case", async () => {
+    // A daemon that answers cleanly with nobody beating is a real, correct
+    // state (a fresh install, every machine off). Suppressing the idle line
+    // here would be the over-fire this guard has to avoid.
+    mockPresence({ machines: [], meta: { sources: { fleet: { state: "ok" } }, complete: true } });
+    const { container } = renderApp();
+    await waitFor(() => expect(screen.getByText(/waiting for a machine/i)).toBeInTheDocument());
+    expect(container.querySelector(".fleetcov")).toBeNull();
   });
 });

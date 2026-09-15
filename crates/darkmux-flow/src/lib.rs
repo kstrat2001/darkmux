@@ -138,6 +138,15 @@ impl Default for LocalFileSink {
 /// pattern. Only the FALLBACK tier changes: instead of the operator's
 /// real flows dir, a per-process temp dir
 /// (`$TMPDIR/darkmux-flow-test-<pid>`), created once per test binary.
+///
+/// (#2707) That directory used to be created here by hand and never
+/// removed, so every test process this repo has ever run left one
+/// behind — 8,263 of them on one developer machine, the single largest
+/// population in its temp root. The NAME is unchanged; only the
+/// ownership is. `process_scratch_dir` hands back the same
+/// `$TMPDIR/darkmux-flow-test-<pid>` and takes responsibility for
+/// removing it, at exit and — for a process that was killed before it
+/// could unwind — on the next test process's way in.
 fn local_sink_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-support"))]
     {
@@ -155,10 +164,7 @@ fn local_sink_dir() -> PathBuf {
             static DIR: OnceLock<PathBuf> = OnceLock::new();
             return DIR
                 .get_or_init(|| {
-                    let dir = std::env::temp_dir()
-                        .join(format!("darkmux-flow-test-{}", std::process::id()));
-                    let _ = std::fs::create_dir_all(&dir);
-                    dir
+                    darkmux_types::test_isolation::process_scratch_dir("darkmux-flow-test")
                 })
                 .clone();
         }
@@ -3149,7 +3155,7 @@ mod tests {
         //           this same fix adds (`last_receiver_rejected_reasons`
         //           on `.last` and on `HookRuleStatus`) are NOT part of
         //           this constant's scope.
-        //   1.49.0 (#2705/#2706): `machine.telemetry`'s payload gains an
+        //   1.50.0 (#2705/#2706): `machine.telemetry`'s payload gains an
         //           additive `battery` object, and two new actions land —
         //           `machine.battery` (charge TRANSITIONS, edge-triggered
         //           like `machine.thermal`) and `machine.battery_health`
@@ -3162,7 +3168,25 @@ mod tests {
         //           `schema.rs`'s own entry for the full explanation,
         //           including why `dispatch.rest` gaining a `reason` of
         //           `"battery"` is a new VALUE rather than a shape change.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.49.0");
+        //   1.49.0 (#2690): the `dispatch.map` per-item
+        //           `telemetry.tokens` record gains additive `remote`
+        //           (bool) and `index` (u64) keys — the SEAT's own
+        //           hosted-or-local verdict and its position in the
+        //           fan-out. Sibling seats inside one task share both
+        //           `session_id` (`session_id::task`) and `mission_id`,
+        //           so the savings hero had no coordinate to separate
+        //           them and fell back to painting every token under the
+        //           key cloud whenever any bookend named an endpoint —
+        //           reporting local work as hosted spend. Both keys are
+        //           UNCONDITIONAL, so an absent `remote` means "a
+        //           different `telemetry.tokens` lineage" and the
+        //           consumer's per-key fallback needs no version check.
+        //           Minor, same "new optional payload key on an existing
+        //           action" bar as 1.44.0/1.48.0 above. See `schema.rs`'s
+        //           own history entry, including why ONE emitter is the
+        //           whole affected population and what live verification
+        //           is still owed.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.50.0");
     }
 
     #[test]

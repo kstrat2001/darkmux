@@ -287,6 +287,117 @@ describe("useLiveTail", () => {
     unmount();
   });
 
+  // ── (#2683) The silence watchdog ────────────────────────────────────────
+  //
+  // `EventSource` only reports a drop it NOTICES. A half-open TCP connection
+  // — the host slept, the path went away without an RST — delivers no `error`
+  // event ever, so every test above this block passes while the hook happily
+  // claims `live` over a connection that will never deliver another byte.
+  //
+  // The trap in fixing it is the INVERTED case: a healthy fleet that nobody
+  // is dispatching to emits no records for hours, and a watchdog keyed on
+  // "records arrived" would repaint the header on every quiet afternoon. So
+  // the signal is CONTACT — the daemon answered, over either transport — and
+  // both directions are pinned below.
+
+  it("goes reconnecting when a stream that never errors stops delivering AND the daemon stops answering", async () => {
+    const queryClient = new QueryClient();
+    // Every reconcile fails: this is a daemon that is simply gone. Note it
+    // fails the way `fetchJson` really fails — a resolved `ok:false`, not a
+    // rejection (see `lib/fetcher.ts`).
+    const { impl } = makeFetchImpl(() => ({ ok: false, status: null, message: "network error" }));
+
+    const { result, unmount } = renderHook(
+      () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
+      { wrapper: wrapper(queryClient) },
+    );
+
+    act(() => {
+      MockEventSource.instances[0].open();
+    });
+    expect(result.current).toBe("live");
+
+    // 40s — two whole reconcile windows — with no message and no successful
+    // fetch. The EventSource is never told to error, and never does.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+
+    expect(result.current, "a silent connection must stop being called live").toBe("reconnecting");
+    // …and `reconnecting` is made TRUE rather than merely said: a half-open
+    // EventSource never retries on its own, so the watchdog tears it down
+    // and opens a real replacement.
+    expect(MockEventSource.instances[0].closed).toBe(true);
+    expect(MockEventSource.instances).toHaveLength(2);
+    expect(MockEventSource.instances[1].url).toBe("/flow/2026-08-09/stream");
+
+    // The replacement connecting is what flips it back.
+    act(() => {
+      MockEventSource.instances[1].open();
+    });
+    expect(result.current).toBe("live");
+
+    unmount();
+  });
+
+  it("stays live on a healthy but IDLE connection — no records is normal, not a failure (the inverted case)", async () => {
+    const queryClient = new QueryClient();
+    // Reconciles succeed and return NOTHING, which is exactly what a quiet
+    // fleet looks like all day.
+    const { impl } = makeFetchImpl(() => ({ ok: true, data: [] }));
+
+    const { result, unmount } = renderHook(
+      () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
+      { wrapper: wrapper(queryClient) },
+    );
+
+    act(() => {
+      MockEventSource.instances[0].open();
+    });
+    expect(result.current).toBe("live");
+
+    // Three times the watchdog window, with not one record in it.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000);
+    });
+
+    expect(result.current, "an idle fleet is not a dead daemon").toBe("live");
+    expect(MockEventSource.instances, "and nothing was torn down and reopened").toHaveLength(1);
+
+    unmount();
+  });
+
+  it("SSE traffic alone keeps it live — the stream answering IS contact, even with the backstop failing", async () => {
+    const queryClient = new QueryClient();
+    const { impl } = makeFetchImpl(() => ({ ok: false, status: 500, message: "500 Internal Server Error" }));
+
+    const { result, unmount } = renderHook(
+      () => useLiveTail(true, { eventSourceFactory: factory, fetchImpl: impl, tickMs: 5000 }),
+      { wrapper: wrapper(queryClient) },
+    );
+
+    act(() => {
+      MockEventSource.instances[0].open();
+    });
+
+    // 30s of silence — inside the window — then one record, then 30s more.
+    // Neither gap alone reaches the timeout, so the status never flips.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    act(() => {
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:30Z" }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+
+    expect(result.current).toBe("live");
+    expect(MockEventSource.instances).toHaveLength(1);
+
+    unmount();
+  });
+
   it("unmount tears down the EventSource and clears the ticker (no further reconcile fetches)", async () => {
     const queryClient = new QueryClient();
     const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: [] }));

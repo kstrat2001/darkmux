@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
-import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
+import { queryKeys, PRESENCE_POLL_MS, LIVE_CONTACT_TIMEOUT_MS } from "../lib/queryKeys";
 import { asRecordArray, mergeTailRecords, prevDateUTC, todayUTC, LIVE_WINDOW_MS } from "../lib/flow";
 import { startFlowTail, type FlowTailHandle } from "../lib/sse";
 import type { FlowRecord } from "../types/handwritten";
@@ -42,6 +42,19 @@ import type { FlowRecord } from "../types/handwritten";
  * component's own doc for why one mounted copy at a time is what actually
  * runs, never two.
  */
+/**
+ * What the header's badge is allowed to claim. `live` means the daemon has
+ * been in CONTACT with this page inside `LIVE_CONTACT_TIMEOUT_MS` — not that
+ * records are arriving, and (#2683) no longer merely that `EventSource` has
+ * not complained. See the silence watchdog in the ticker below.
+ *
+ * The deliberate boundary: a stream that goes half-open while the daemon's
+ * HTTP still answers keeps reporting `live`, because the reconcile backstop
+ * is still pulling current records over that working transport — the page's
+ * claim ("what you are looking at is current") remains true, only the push
+ * path is degraded. What the watchdog removes is the case where NEITHER
+ * transport is answering and the page said `live` anyway.
+ */
 export type LiveTailStatus = "live" | "reconnecting";
 
 /** `RECONCILE_OVERLAP_MS` — viewer.html:3385. Safety margin the reconcile
@@ -78,7 +91,13 @@ async function reconcile(
   queryClient: QueryClient,
   date: string,
   fetchImpl: typeof fetchJson,
-): Promise<void> {
+): Promise<boolean> {
+  // (#2683) Returns whether the daemon ANSWERED — at least one of the two
+  // days' reads came back `ok`. Deliberately not "did records arrive": an
+  // idle fleet reconciles successfully with an empty body all day long, and
+  // conflating the two is exactly the watchdog misfire this function's one
+  // caller has to avoid. A thrown fetch or a non-2xx is no contact.
+  let contacted = false;
   const cutMs = Date.now() - LIVE_WINDOW_MS;
   for (const d of [prevDateUTC(date), date]) {
     const tailKey = queryKeys.flowTail(d);
@@ -100,10 +119,12 @@ async function reconcile(
       continue; // transient — the next tick retries, same as legacy's try/catch-per-day
     }
     if (!res.ok) continue;
+    contacted = true;
     const recs = asRecordArray(res.data);
     if (!recs.length) continue;
     queryClient.setQueryData<FlowRecord[]>(tailKey, (prev) => mergeTailRecords(prev ?? [], recs, cutMs));
   }
+  return contacted;
 }
 
 export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveTailStatus {
@@ -133,16 +154,41 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
     let tailDate = todayUTC();
     let everOpened = false;
     let handle: FlowTailHandle | null = null;
+    // (#2683) The silence watchdog's two pieces of state.
+    //
+    // `liveNow` mirrors `status` inside the effect so the ticker can read it
+    // without a ref and without re-running this effect on every flip — every
+    // `setStatus` in this hook happens here, so the two cannot diverge.
+    //
+    // `lastContactMs` is the last moment the DAEMON answered this page, by
+    // either transport: an SSE message, an SSE (re)connect, or a reconcile
+    // fetch that came back `ok`. It is NOT "the last record we received" —
+    // that is the distinction between dead and idle, and getting it wrong in
+    // the other direction (a watchdog that fires on a quiet fleet) would be
+    // worse than the bug it fixes, since silence is the NORMAL state of a
+    // machine nobody is dispatching to.
+    let liveNow = false;
+    let lastContactMs = Date.now();
+    const markContact = () => {
+      lastContactMs = Date.now();
+    };
+    const runReconcile = (date: string) => {
+      void reconcile(queryClient, date, doFetch).then((contacted) => {
+        if (!cancelled && contacted) markContact();
+      });
+    };
 
     const openTail = (date: string) => {
       handle = startFlowTail(queryClient, queryKeys.flowTail(date), date, eventSourceFactory, {
         onOpen: () => {
           if (cancelled) return;
           setStatus("live");
+          liveNow = true;
+          markContact();
           // (#1480 part 1) Self-heal on RECONNECT (not the initial connect)
           // — a reconnected EventSource tails from NOW, silently dropping
           // whatever was emitted during the gap. Reconcile pulls it back in.
-          if (everOpened) void reconcile(queryClient, date, doFetch);
+          if (everOpened) runReconcile(date);
           everOpened = true;
         },
         onError: () => {
@@ -150,6 +196,13 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
           // (#1480 part 2) A drop is visible — never silently keep showing
           // stale "live" state over a dead stream.
           setStatus("reconnecting");
+          liveNow = false;
+        },
+        // A message — even one that fails to parse — proves the stream is
+        // carrying bytes right now.
+        onMessage: () => {
+          if (cancelled) return;
+          markContact();
         },
       });
     };
@@ -166,7 +219,32 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
         if (canStream) openTail(nd);
       }
       tick += 1;
-      if (tick % 4 === 0) void reconcile(queryClient, tailDate, doFetch);
+      if (tick % 4 === 0) runReconcile(tailDate);
+      // (#2683) The silence watchdog. `EventSource` only reports a drop it
+      // NOTICES: a half-open TCP connection (the host slept, the path went
+      // away without an RST) delivers no `error` event at all, so `onError`
+      // above never fires and the header goes on claiming `live` over a
+      // connection that will never deliver another byte. Nothing else in
+      // this hook could catch that — the reconcile backstop keeps the DATA
+      // roughly current when it can still reach the daemon, but it never
+      // touched the status.
+      //
+      // Only fires while we currently claim `live`: once the status is
+      // already `reconnecting`, the EventSource's own retry loop owns the
+      // reconnect and forcing a second one on top of it would fight it.
+      if (liveNow && Date.now() - lastContactMs >= LIVE_CONTACT_TIMEOUT_MS) {
+        setStatus("reconnecting");
+        liveNow = false;
+        // Say it and MEAN it: `reconnecting` is a false label of its own if
+        // nothing is actually reconnecting, and a half-open EventSource
+        // never retries on its own. Tear it down and open a fresh one — a
+        // real attempt, whose `onOpen` flips the status back and whose
+        // #1480 self-heal reconcile backfills whatever the gap swallowed.
+        if (canStream) {
+          handle?.close();
+          openTail(tailDate);
+        }
+      }
     }, tickMs ?? PRESENCE_POLL_MS);
 
     return () => {

@@ -2004,7 +2004,7 @@ impl DispatchMapStepKind {
             // landed in no bucket. Still never FABRICATED: a provider that
             // reported no split leaves both fields `None`, and the payload
             // omits them entirely rather than claiming a zero.
-            if let Some(payload) = map_item_token_payload(&res) {
+            if let Some(payload) = map_item_token_payload(&res, endpoint.is_some()) {
                 push(
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
@@ -2217,12 +2217,69 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
 /// own `tokensOffMeter()` already does for the single-shot hosted path.
 /// Without it, a split the item genuinely had would be dropped entirely —
 /// the exact class of loss this function exists to close.
-fn map_item_token_payload(res: &MapItemResult) -> Option<serde_json::Value> {
+///
+/// (#2690, FLOW_SCHEMA_VERSION 1.49.0) `remote` and `index` are the SEAT's
+/// own identity, and they are here because the viewer could not otherwise
+/// recover it. `session_id` on this record is `session_id::task(&step.task_id)`
+/// (the emitter below), which sibling seats fanned out within ONE task SHARE
+/// by construction — and `mission_id` is shared too, so the savings hero's
+/// `(session_id, mission_id)` run key cannot separate them either. The hero
+/// therefore fell back to a per-KEY rule: if ANY bookend under the key named
+/// a hosted endpoint, every token arriving under it counted CLOUD. That
+/// over-claims cloud for a genuinely mixed task — it reports the operator's
+/// OWN HARDWARE's work as hosted spend, which is the defect #2690 is about,
+/// measured at three arities (`ui/src/lenses/fleet/savings.test.ts`).
+///
+/// This record now carries the answer instead of the consumer guessing it.
+/// `remote` is the step's own hosted-or-local verdict — the SAME
+/// `endpoint.is_some()` this kind already stamps on its `step result`
+/// (`Self::item_record`) and aggregate records, so a seat's telemetry and a
+/// seat's per-item record cannot disagree. It is uniform across a step's
+/// items by construction: `run_map` resolves ONE `endpoint` for the whole
+/// step and every item takes the same arm (`map_hosted_item` vs
+/// `map_local_item`).
+///
+/// `index` rides along as the item's own position, which is what makes two
+/// telemetry records of the SAME step distinguishable at all — the fields
+/// this payload otherwise carries are all counts, and two items can
+/// legitimately report identical ones.
+///
+/// WHY THE PRODUCER AND NOT THE VIEWER. `Self::item_record` already emits a
+/// literal per-seat `remote` for the same item, pushed from the same
+/// `MapItemResult` in the same loop iteration — so a consumer COULD join the
+/// two. Measured on the committed parity corpora, that join is
+/// `(session_id, ts, total_tokens)`, it pairs 180 of 364 telemetry records,
+/// and its collision case (k identical draws of one prompt closing inside
+/// one second — the normal shape of a probe stage) is exactly the shape the
+/// map fan-out produces. A field costs one key and cannot collide.
+///
+/// SCOPE, stated because "half the population" was the reason this was
+/// declined twice. That figure measured the JOIN's reach across EVERY
+/// `telemetry.tokens` record. The DEFECT's population is narrower: only a
+/// record under a seat-SHARING session id can be misattributed, and
+/// `session_id::task` is minted by exactly two step kinds
+/// (`dispatch.single_shot` and `dispatch.map`), of which only THIS one emits
+/// `telemetry.tokens` at all — `dispatch.single_shot`'s tokens ride its own
+/// `dispatch complete` bookend, which the hero already classifies per
+/// completion. The other live producer, the container path's per-turn tailer
+/// (`dispatch_internal.rs`'s `emit_telemetry`), runs under
+/// `session_id::step(&step.id)` (`dispatch_opts_for`, this file) — unique per
+/// step — and `crawl.unit` mints `crawl-<mission>-<rule>-<unit>` plus a
+/// per-draw suffix. Neither can share a key with another seat. So this one
+/// emitter is the whole live population.
+fn map_item_token_payload(res: &MapItemResult, remote: bool) -> Option<serde_json::Value> {
     let total = res.total_tokens.or_else(|| match (res.prompt_tokens, res.completion_tokens) {
         (None, None) => None,
         (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
     })?;
-    let mut payload = serde_json::json!({ "total_tokens": total });
+    // Unconditional, unlike every `Option` field below: these two are facts
+    // about THIS emitter's own call, never something a provider did or did
+    // not report, so the omit-never-zero rule that governs the token fields
+    // does not apply to them. A consumer can therefore treat an ABSENT
+    // `remote` as "not this producer" rather than "this producer had nothing
+    // to say", which is what lets the viewer keep its pre-#2690 fallback for
+    // every other `telemetry.tokens` lineage without a version check.
+    let mut payload = serde_json::json!({ "total_tokens": total, "remote": remote, "index": res.index });
     let obj = payload.as_object_mut().expect("json! built an object");
     if let Some(p) = res.prompt_tokens {
         obj.insert("prompt_tokens".into(), serde_json::json!(p));
@@ -5082,10 +5139,109 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res).expect("a reply with usage emits a record");
+        let payload = map_item_token_payload(&res, false).expect("a reply with usage emits a record");
         assert_eq!(payload["total_tokens"], 4547);
         assert_eq!(payload["prompt_tokens"], 2490, "GENERATED/fresh/re-read read the split");
         assert_eq!(payload["completion_tokens"], 2057);
+    }
+
+    /// (#2690) The SEAT fields. `session_id` on a map item's
+    /// `telemetry.tokens` record is `session_id::task(&step.task_id)`, which
+    /// sibling seats inside one task SHARE — and they share `mission_id`
+    /// too, so the savings hero's `(session_id, mission_id)` run key cannot
+    /// tell them apart. Without these two keys the hero falls back to a
+    /// per-KEY rule (any hosted bookend under the key paints every token
+    /// under it cloud), which reports a LOCAL seat's spend as hosted.
+    ///
+    /// Unconditional, unlike every token field beside them: they describe
+    /// this emitter's own call, not something a provider reported, so the
+    /// omit-never-zero rule does not apply. That is what lets a consumer
+    /// read an ABSENT `remote` as "a different `telemetry.tokens` lineage"
+    /// rather than "this producer had nothing to say".
+    #[test]
+    fn map_item_token_telemetry_carries_the_seat_tier_and_index() {
+        let local = MapItemResult {
+            index: 3,
+            ok: true,
+            content: "x".to_string(),
+            error: None,
+            total_tokens: Some(100),
+            prompt_tokens: Some(90),
+            completion_tokens: Some(10),
+            reasoning_tokens: None,
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        let payload = map_item_token_payload(&local, false).expect("emits");
+        assert_eq!(payload["remote"], false, "a local seat's own tier, on its own token record");
+        assert_eq!(payload["index"], 3, "which item of the fan-out this was");
+
+        let hosted = map_item_token_payload(&local, true).expect("emits");
+        assert_eq!(hosted["remote"], true);
+        assert_eq!(hosted["index"], 3);
+    }
+
+    /// (#2690) `remote: false` is a REPORTED FALSE, not an absent key — the
+    /// distinction the viewer's fallback branch depends on. A serializer (or
+    /// a future `skip_serializing_if`) that dropped the `false` case would
+    /// leave a local seat indistinguishable from a pre-1.49.0 record and
+    /// silently restore the defect for exactly half the arms.
+    #[test]
+    fn map_item_token_telemetry_reports_a_local_seat_as_an_explicit_false() {
+        let res = MapItemResult {
+            index: 0,
+            ok: true,
+            content: String::new(),
+            error: None,
+            total_tokens: Some(7),
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        let payload = map_item_token_payload(&res, false).expect("emits");
+        let obj = payload.as_object().expect("object");
+        assert!(obj.contains_key("remote"), "the key is present even when the seat is local");
+        assert_eq!(obj["remote"], serde_json::Value::Bool(false));
+        assert!(obj.contains_key("index"), "and so is the index, at index 0");
+        assert_eq!(obj["index"], 0);
+    }
+
+    /// (#2690) The seat tier a map step stamps on its `telemetry.tokens`
+    /// record and the one it stamps on that same item's `step result` record
+    /// are the SAME fact, and the emission site derives both from one
+    /// `endpoint.is_some()`. Pinned together so a future edit cannot move
+    /// one without the other — two records disagreeing about where one seat
+    /// ran is worse than neither reporting it.
+    #[test]
+    fn map_item_seat_tier_agrees_between_the_token_record_and_the_step_result() {
+        let step = map_step(json!({}));
+        let res = MapItemResult {
+            index: 1,
+            ok: true,
+            content: String::new(),
+            error: None,
+            total_tokens: Some(42),
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            served_model: None,
+            wall_ms: 0,
+            retried: 0,
+        };
+        for remote in [false, true] {
+            let tok = map_item_token_payload(&res, remote).expect("emits");
+            let item = DispatchMapStepKind::item_record(&step, "m", remote, &res);
+            let item_payload = item.payload.as_ref().expect("payload");
+            assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
+            assert_eq!(tok["index"], item_payload["index"], "and one item position");
+        }
     }
 
     /// (#1444 review) `dispatch.map` is the highest-volume hosted-remote
@@ -5112,7 +5268,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res).expect("a reply with usage emits a record");
+        let payload = map_item_token_payload(&res, true).expect("a reply with usage emits a record");
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         // The neighbors must still land where they belong.
@@ -5141,7 +5297,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res).expect("emits");
+        let payload = map_item_token_payload(&res, false).expect("emits");
         assert_eq!(payload["reasoning_tokens"], 300);
         assert!(
             payload.get("cached_tokens").is_none(),
@@ -5150,7 +5306,7 @@ mod tests {
         );
 
         let neither = MapItemResult { reasoning_tokens: None, cached_tokens: None, ..res };
-        let payload = map_item_token_payload(&neither).expect("emits");
+        let payload = map_item_token_payload(&neither, false).expect("emits");
         assert!(payload.get("reasoning_tokens").is_none());
         assert!(payload.get("cached_tokens").is_none());
     }
@@ -5209,7 +5365,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res).expect("a total alone still emits");
+        let payload = map_item_token_payload(&res, false).expect("a total alone still emits");
         assert_eq!(payload["total_tokens"], 1521);
         assert!(payload.get("prompt_tokens").is_none(), "never fabricate a split");
         assert!(payload.get("completion_tokens").is_none());
@@ -5236,7 +5392,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res).expect("a split alone still emits");
+        let payload = map_item_token_payload(&res, false).expect("a split alone still emits");
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
         assert_eq!(payload["prompt_tokens"], 30);
         assert_eq!(payload["completion_tokens"], 12);
@@ -5260,7 +5416,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        assert!(map_item_token_payload(&res).is_none());
+        assert!(map_item_token_payload(&res, false).is_none());
     }
 
     /// The accumulator folds multi-attempt usage and keeps `None` honest.
@@ -5885,6 +6041,114 @@ mod tests {
                 model: served.map(str::to_string),
             })
         });
+    }
+
+    /// (#2690) THE WIRING test for the seat fields, and the reason it is an
+    /// end-to-end run rather than another `map_item_token_payload` unit
+    /// test: the payload function takes `remote` as an ARGUMENT, so its own
+    /// tests prove only that it copies what it is handed. What decides the
+    /// answer is the ONE call site
+    /// (`map_item_token_payload(&res, endpoint.is_some())`), and a
+    /// transposed or hardcoded argument there would leave every unit test
+    /// beside the function green while every emitted record lied about
+    /// where its seat ran.
+    ///
+    /// Both arms, because a constant on either side of the branch is the
+    /// realistic slip and one arm alone cannot see it.
+    #[test]
+    #[serial_test::serial] // mutates the remote-budget env var
+    fn dispatch_map_hosted_telemetry_reports_its_seat_as_remote() {
+        let k = "DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::set_var(k, "500000");
+        }
+        clear_hosted_override();
+        install_hosted_delayed(0, None, Some(42));
+        let s = map_step(json!({
+            "model": "gpt-4o",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "endpoint": { "url": "https://example.cognitiveservices.azure.com" },
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        clear_hosted_override();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let out = out.expect("the overridden hosted transport must not fail the step");
+
+        let telemetry: Vec<&darkmux_flow::FlowRecord> =
+            out.flow_records.iter().filter(|r| r.action == "telemetry.tokens").collect();
+        assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
+        for (i, rec) in telemetry.iter().enumerate() {
+            let payload = rec.payload.as_ref().expect("telemetry payload");
+            assert_eq!(
+                payload["remote"],
+                serde_json::Value::Bool(true),
+                "a HOSTED map seat must report itself remote: {rec:?}"
+            );
+            assert_eq!(payload["index"], i, "and its own position in the fan-out: {rec:?}");
+        }
+    }
+
+    /// (#2690) The local arm of the same wiring. See the hosted twin above
+    /// for why the call site needs its own coverage.
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn dispatch_map_local_telemetry_reports_its_seat_as_not_remote() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "application/json").json_body(json!({
+                "id": "mock-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "qwen3-4b",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "ok" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }));
+        });
+
+        let url_key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(url_key).ok();
+        unsafe {
+            std::env::set_var(url_key, server.base_url());
+        }
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(url_key, v),
+                None => std::env::remove_var(url_key),
+            }
+        }
+        let out = out.expect("dispatch.map's local per-item dispatch must not fail outright");
+
+        let telemetry: Vec<&darkmux_flow::FlowRecord> =
+            out.flow_records.iter().filter(|r| r.action == "telemetry.tokens").collect();
+        assert_eq!(telemetry.len(), 2, "one per item that reported usage: {:?}", out.flow_records);
+        for (i, rec) in telemetry.iter().enumerate() {
+            let payload = rec.payload.as_ref().expect("telemetry payload");
+            assert_eq!(
+                payload["remote"],
+                serde_json::Value::Bool(false),
+                "a LOCAL map seat must report itself NOT remote — an absent or `true` value                  here is how the savings hero credits the operator's own hardware to a                  hosted endpoint: {rec:?}"
+            );
+            assert_eq!(payload["index"], i, "and its own position in the fan-out: {rec:?}");
+        }
     }
 
     #[test]

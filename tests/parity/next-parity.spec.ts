@@ -29,7 +29,7 @@
 import { test, expect } from "@playwright/test";
 import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { GOLDENS_DIR } from "./lib/paths.js";
+import { GOLDENS_DIR, CORPUS_DIR } from "./lib/paths.js";
 import { loadMeta, installCorpusRoutes, installBlankRoutes } from "./lib/mock-routes.js";
 import { extractLensText, waitSettled, installFrozenClock, regionText, normalize } from "./lib/extract-lens.js";
 
@@ -547,4 +547,154 @@ test("next: fleet lens render-sanity screenshot at desktop width (populated, for
   await page.goto("/index.html");
   await waitSettled(page, expect, FLEET_LOADED);
   await page.screenshot({ path: fleetShot("fleet-1280px.png"), fullPage: true });
+});
+
+// ── #2702 — the CONCATENATED two-day window.
+//
+// Every live boot of this app fetches TWO days (`useFlowWindow`:
+// `[prevDateUTC(today), today]`) and folds them through `buildFlowWindow`,
+// which keeps `ts >= nowMs - LIVE_WINDOW_MS`. There is no upper bound in that
+// filter — the live playhead is `computeTMax(data)`, not `now` — so how much
+// of YESTERDAY survives is a function of the wall clock alone, and "the
+// two-day window" is a family of inputs, not one input.
+//
+// `fleet.txt` above pins exactly one member of that family: at
+// `meta.frozen_clock_ms` (2026-08-08T16:40:59Z) the 24h boundary lands at
+// 2026-08-07T16:40:59Z, and 28 of this corpus's 1,994 yesterday records
+// survive it. (Measured, not assumed — #2702 states the golden "renders
+// flow-today.json alone", which is 97% true and worth stating exactly: 963
+// records reach the hero there, 935 of them today's.) So the one golden this
+// suite had covered the END of the family where yesterday contributes
+// almost nothing.
+//
+// The clock below sits at the OTHER end: at 2026-08-08T02:00:00Z the 24h
+// boundary lands at 2026-08-07T02:00:00Z, which is earlier than this
+// corpus's earliest yesterday record (02:09:42Z), so `buildFlowWindow`
+// truncates nothing and the hero sums the whole concatenation — 2,943
+// records, both days. That is the input shape an operator sees whenever
+// they look at the fleet early in a UTC day, and nothing graded it.
+//
+// WHY THIS MATTERS, measured rather than argued. Re-key `runKey` (savings.ts)
+// to the bare `session_id` — the shape of the experimental change #2702 was
+// filed from — and this corpus answers:
+//
+//   one-day window (fleet.txt's clock) :    0 of   673 playhead positions move
+//   two-day window (this test's clock) : 1998 of 2,073 playhead positions move
+//                                        LOCAL 600,113 -> 497,992
+//                                        CLOUD 396,926 -> 499,047
+//                                        (102,121 tokens off the operator's
+//                                         own hardware, DISPATCHES 52 -> 42)
+//
+// A quarter of the hero's headline can move with `fleet.txt` byte-identical.
+// That is the gap this golden closes, and the non-vacuity test below is what
+// keeps it closed rather than assumed.
+//
+// ONE artifact of replaying a STATIC corpus at this clock, named so it is not
+// read as a port bug: this corpus's today-fixture runs to 14:28Z, which is
+// AFTER the 02:00Z clock, and a live daemon could not have handed the viewer
+// records from its own future. The only visible consequence is in `=== meta
+// ===`: `readyParts` (`ui/src/lib/metaLine.ts`) refuses a negative age
+// (`known = nowMs - last >= 0`), so the "· last dispatch Xh ago" suffix
+// `fleet.txt` carries is absent here. That guard is real code doing the right
+// thing with an impossible input, and this golden pins it.
+const TWO_DAY_CLOCK_MS = Date.UTC(2026, 7, 8, 2, 0, 0);
+
+test("next: fresh boot into the fleet lens over the CONCATENATED two-day window matches goldens/fleet-two-day.txt", async ({ page }) => {
+  const meta = loadMeta();
+  await installFrozenClock(page, TWO_DAY_CLOCK_MS);
+  installCorpusRoutes(page, meta);
+
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+  await expect(page.locator("body")).not.toHaveClass(/booting/);
+
+  const got = await extractLensText(page);
+  expect(got).toBe(readGolden("fleet-two-day"));
+});
+
+// Red-prove, same discipline as every other golden in this file: a blank
+// daemon must not produce text matching the real two-day golden.
+test("next: blank daemon fails the two-day fleet golden comparison", async ({ page }) => {
+  await installFrozenClock(page, Date.UTC(2026, 0, 1));
+  installBlankRoutes(page);
+
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+
+  const got = await extractLensText(page);
+  expect(got, "redprove FAILED: a blank/unreachable daemon must not match the real two-day golden").not.toBe(readGolden("fleet-two-day"));
+});
+
+/**
+ * NON-VACUITY (#2702's actual ask: "a golden that cannot fail is worse than
+ * none, and the existing one-day golden is currently in that position for
+ * anything cross-day").
+ *
+ * The two assertions below are ONE claim in two halves, and the second half
+ * is the load-bearing one: the SAME mutation, served to the SAME app,
+ * *moves* the two-day golden and leaves `fleet.txt` BYTE-IDENTICAL.
+ *
+ * The mutation stamps an `endpoint` onto `task-review-probe-high-task`'s
+ * YESTERDAY completions (02:09:43Z–06:03:33Z), which reclassifies that
+ * session's yesterday runs from local to hosted. Every one of those records
+ * is outside `fleet.txt`'s own 24h boundary (2026-08-07T16:40:59Z), so the
+ * one-day golden structurally cannot observe the change — which is the
+ * property being demonstrated, not an accident of this fixture.
+ *
+ * WHAT THIS DOES *NOT* CLAIM, measured and stated because the next reader
+ * will assume otherwise from #2702's wording. On the CURRENT lens there is
+ * no cross-day *interaction* left to catch: `runKey` is
+ * `(session_id, mission_id)` since #2701/#2709, and ZERO run keys in this
+ * corpus span both days (9 session IDs do — `task-review-*-task`,
+ * `task-list`, `task-__panel_args__`, `task-view` — but each day's records
+ * carry a different `mission_id`, so they land under different keys).
+ * Yesterday evidence therefore cannot reach today's tokens today. What the
+ * two-day window still catches, and the one-day window still cannot, is any
+ * change that MERGES those keys back together — which is exactly what the
+ * bare-`session_id` measurement above is. So this test proves reach ("this
+ * golden sees evidence `fleet.txt` cannot"), and the golden itself is what
+ * catches the merge.
+ */
+test("next: the two-day golden is non-vacuous where fleet.txt is structurally blind", async ({ page }) => {
+  const meta = loadMeta();
+  const yesterday = JSON.parse(readFileSync(path.join(CORPUS_DIR, "flow-yesterday.json"), "utf8"));
+  let stamped = 0;
+  for (const r of yesterday) {
+    if (r?.session_id !== "task-review-probe-high-task") continue;
+    // BOTH spellings — `darkmux-crew` emits the spaced form, the runtime the
+    // dotted one (`crates/darkmux-flow/src/schema.rs`'s own doc), and a
+    // mutation that matched only one would quietly stamp nothing.
+    if (r.action !== "dispatch complete" && r.action !== "dispatch.complete") continue;
+    if (!r.payload || typeof r.payload !== "object") continue;
+    if (r.payload.endpoint) continue;
+    r.payload.endpoint = "azure:parity-nonvacuity-probe";
+    stamped++;
+  }
+  // The mutation has to BITE, or both assertions below pass vacuously —
+  // which is the exact failure this whole test exists to rule out.
+  expect(stamped, "the mutation must reclassify at least one yesterday completion").toBeGreaterThan(0);
+
+  const installMutated = async () => {
+    installCorpusRoutes(page, meta);
+    // Registered AFTER `installCorpusRoutes`, so it wins: Playwright matches
+    // the most recently registered route first (the same ordering
+    // `nav-chrome.spec.ts` relies on for its own `/fleet/machines/live`
+    // override).
+    await page.route(`**/flow/${meta.captured_prev_date}`, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(yesterday) }),
+    );
+  };
+
+  await installFrozenClock(page, TWO_DAY_CLOCK_MS);
+  await installMutated();
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+  const twoDay = await extractLensText(page);
+  expect(twoDay, "NON-VACUITY FAILED: the two-day golden did not move on cross-day evidence that reclassifies a session").not.toBe(readGolden("fleet-two-day"));
+
+  await installFrozenClock(page, meta.frozen_clock_ms);
+  await page.goto("/index.html");
+  await waitSettled(page, expect, FLEET_LOADED);
+  const oneDay = await extractLensText(page);
+  expect(oneDay, "fleet.txt must be blind to this — that blindness is the gap #2702 names").toBe(readGolden("fleet"));
 });

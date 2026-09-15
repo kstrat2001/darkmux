@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
-import { useFleetCoverage, useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
+import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS, T } from "../../lib/flow";
@@ -14,7 +14,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, rosterOnlyEntries } from "./cards";
+import { buildFleetCard, rosterOnlyEntries, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -211,44 +211,13 @@ function SavingsHero({
  * `/fleet/sessions/live` (presence), `/machine/specs` (this machine's own
  * hardware string).
  */
-/**
- * (#1729) Presence coverage, on the default view.
- *
- * Every machine card and every "N running" count on this screen is derived
- * from presence. When the fleet substrate cannot be read, those surfaces do
- * not go blank — they render CONFIDENTLY WRONG: machines read idle, running
- * work reads zero, and timeline bars lose their run colouring. That is the
- * dead-looking-seats bug (#1483) with a nicer layout.
- *
- * `off` and `ok` say nothing, deliberately: a standalone machine has no
- * fleet substrate by design, and warning it would be the bug.
- *
- * This restores a marker that briefly existed on `FleetStrip` and was lost
- * when this lens replaced it — a regression no test caught, because
- * FleetStrip's own tests kept passing while it stopped being mounted.
- */
-function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
-  // A replay has no live coverage to report — see useFleetCoverage's note.
-  // (U5-1) …and a daemon-less build has no coverage endpoint at all. This
-  // hook SHARES `queryKeys.fleetMachinesLive` with `useLiveMachines`, so
-  // leaving it enabled would re-open the very request the lens below just
-  // gated off — one enabled observer of a shared key is enough to make the
-  // poll happen (the trap `FleetLens`'s own `liveMachines` comment records).
-  const coverage = useFleetCoverage(!historical && getSource().kind === "daemon");
-  const fleet = coverage?.sources?.fleet;
-  if (!fleet || fleet.state === "ok" || fleet.state === "off") return null;
-  const stale = fleet.state === "stale";
-  return (
-    <div className="fleetcov" data-state={fleet.state} role="status">
-      <span className="fleetcov__icon">⚠</span>
-      <span>
-        {stale
-          ? `Fleet presence is stale${"age_ms" in fleet ? ` (${Math.round(fleet.age_ms / 1000)}s old)` : ""} — machines and run counts below may have moved on.`
-          : "Fleet presence could not be read — machines and run counts below cover THIS MACHINE only, and are not the whole fleet."}
-      </span>
-    </div>
-  );
-}
+// (#1729) The presence-coverage notice this lens used to own MOVED to
+// `components/FleetCoverageNotice.tsx` in #2683 and now mounts once, from
+// `App.tsx`, above every lens. It is not re-mounted here: the masthead makes
+// the same presence-derived claim this view does, one shared indicator covers
+// both, and two copies on the fleet route would have shown the identical
+// banner twice. The reasoning (and the unchanged wording) lives in that
+// component's own doc.
 
 /**
  * (#1923 review) The `/runs` read failed — say so, rather than letting the
@@ -257,7 +226,8 @@ function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
  * The cards' lab-run count comes from `GET /runs`; a failed read yields the
  * same empty list a healthy idle machine does, so the card falls back to
  * exactly the "idle while a lab run is live" reading #1923 removed. It is
- * the sibling of `FleetCoverageNotice` above (presence unreadable) applied
+ * the sibling of the app-level `FleetCoverageNotice` (presence unreadable,
+ * mounted from `App.tsx` since #2683) applied
  * to the other source this lens depends on, and follows `RunsBoard`'s own
  * habit of naming what it could not read instead of rendering the absence
  * as data.
@@ -417,7 +387,16 @@ export function FleetLens({
   // the property true in the composed app rather than only in this lens's own
   // isolated test.
   const liveMachines = useLiveMachines(livePolling);
-  const liveSessionIds = useLiveSessionIds(livePolling);
+  // (#2725) `coverage` is deliberately NOT read here: this lens sits under
+  // the app-wide `FleetCoverageNotice` (`App.tsx` mounts it for every route),
+  // which already says the one sentence this app has about a degraded
+  // presence read — and it derives that from the machines half of the same
+  // substrate, so a sessions read that failed means the machines read failed
+  // too. A second marker on this page would be the duplicate wording #2683
+  // removed. Destructured explicitly rather than ignored implicitly so the
+  // choice is visible: the hook no longer discards the signal, this caller
+  // does, on the record, for a stated reason.
+  const { sessions: liveSessionIds } = useLiveSessionIds(livePolling);
   // (#1855) The operator's DECLARED roster, gated the same way as presence
   // above — a replay must not assert the CURRENT roster over a past day.
   // See `rosterOnlyEntries`'s own doc for how this is reconciled with the
@@ -626,7 +605,6 @@ export function FleetLens({
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
       <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={scopedData} nowMs={nowMs} />
-      <FleetCoverageNotice historical={historical} />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
       <div className="fleet">
@@ -695,7 +673,19 @@ export function FleetLens({
               </span>
               {card.name}
             </div>
-            <div className="spec">{card.spec ? card.spec : <span className="specdim">hardware not reported</span>}</div>
+            {/* (#1855) The dim fallback says WHICH kind of unknown this is —
+                a machine that beat and carried no hardware, vs one nothing
+                has ever been received from (a rostered-but-silent peer, the
+                cards this issue made visible in the first place). The
+                wording lives in `cards.ts::specUnknownLabel` so the card and
+                its tests read the same string. */}
+            <div className="spec">
+              {card.spec ? (
+                card.spec
+              ) : (
+                <span className="specdim">{specUnknownLabel(card.specUnknown ?? "not-reported")}</span>
+              )}
+            </div>
             <div className="stat">
               <span className="dot" />
               {card.stat}
