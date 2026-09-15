@@ -148,13 +148,13 @@ import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../l
  *       entirely. The guard is run-scoped now, so it only ever skips the
  *       run it is actually about.
  *
- * What this pass does NOT reach is #2690's TOKEN half. Sibling seats fanned
+ * (#2690, TOKEN half — FIXED AT THE PRODUCER, not in this file's
+ * precedence; live verification still owed, see the end of this block.)
+ * #2709 left this open and recorded why: sibling seats fanned
  * out within one task share the session id AND the mission id by
- * construction, so `runKey` is identical for them and the cloud-over-local
- * precedence on the split below is unchanged. FOUR candidate seat
- * coordinates were measured on the committed corpora before settling that,
- * because "no coordinate exists" is a much stronger claim than any one of
- * them supports:
+ * construction, so `runKey` is identical for them and no coordinate on the
+ * `telemetry.tokens` record separated them. FOUR were measured on the
+ * committed corpora and all four failed, which is why the fix is upstream:
  *
  *   `payload.step_id` — stamped only by the container path's
  *   `stamp_step_id` (`crates/darkmux-crew/src/dispatch_internal.rs`) and
@@ -169,41 +169,81 @@ import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../l
  *   telemetry models match no completion model under their own key, so it
  *   would orphan.
  *
- *   `handle` — NOT uniformly the role id, which an earlier revision of this
- *   comment claimed. The map-item emitter passes `&step.id` as the role_id
- *   argument (`builtins.rs`, beside `map_item_token_payload`), so a map
- *   item's telemetry carries a STEP handle while the container path's
- *   carries a ROLE handle. Measured anyway, and it fails harder than the
- *   others: ZERO keys whose telemetry spans more than one handle, and 163
- *   of the 364 two-day telemetry records (45%) carry a handle matching no
- *   bookend handle under their own key. The live structural reason is the
- *   map-item emitter passing `&step.id` as its `role_id` argument
- *   (`builtins.rs:2012`), so the handle is a STEP id there, not a role. (162
- *   of those 163 records carry handle `review`, from the bespoke review
+ *   `handle` — NOT uniformly the role id. The map-item emitter passes
+ *   `&step.id` as the role_id argument (`builtins.rs`, beside
+ *   `map_item_token_payload`), so a map item's telemetry carries a STEP
+ *   handle while the container path's carries a ROLE handle. Measured
+ *   anyway, and it fails harder than the others: ZERO keys whose telemetry
+ *   spans more than one handle, and 163 of the 364 two-day telemetry
+ *   records (45%) carry a handle matching no bookend handle under their own
+ *   key. (162 of those 163 carry handle `review`, from the bespoke review
  *   launcher deleted in #2310 P4d — the corpus predates that deletion, so
- *   read those as history, not as a current producer.) Keying on it would move 45% of the corpus's telemetry into
- *   `unknown`, including the 144,638-token Azure run, which is the one
- *   direction this function may never take.
+ *   read those as history, not as a current producer.) Keying on it would
+ *   move 45% of the corpus's telemetry into `unknown`, including the
+ *   144,638-token Azure run, which is the one direction this function may
+ *   never take.
  *
- * The honest remaining candidate, named so the next reader does not
- * re-derive it: `DispatchMapStepKind::item_record`'s `payload.remote` is a
- * literal per-seat hosted-or-local verdict, already emitted, for exactly the
- * map fan-out population #2690 is about — the item record and that item's
- * `telemetry.tokens` record are pushed from the SAME `MapItemResult` in the
- * same loop iteration. Measured: 180 of the 364 two-day telemetry records
- * pair 1:1 with one on `(session_id, ts, total_tokens)`, zero ambiguous, 88
- * of them remote. Two reasons it is not consumed here. It covers half the
- * population (the container and review paths emit no item record), and the
- * join available today is a three-field heuristic on a SECOND-precision
- * timestamp whose collision case — k identical draws of one prompt closing
- * in the same second — is the normal shape of a probe stage. That second
- * reason is a HAZARD, not a measurement: zero `(session_id, ts)` buckets in
- * any committed corpus hold more than one per-item record, so the collision
- * is plausible and undemonstrated. Reason one decides on its own. The clean version is a producer change (carry the item's own
- * `remote`/`index` into `map_item_token_payload`, a flow-schema minor bump)
- * and belongs with a live dispatch to verify it, not in a viewer lens.
- * Nothing committed exercises any of it: ZERO run keys in either corpus
- * hold both a hosted and an endpoint-less completion.
+ * So the record gained the coordinate instead. `map_item_token_payload`
+ * (`crates/darkmux-crew/src/step_kinds/builtins.rs`, FLOW_SCHEMA_VERSION
+ * 1.49.0) now stamps `remote` — the seat's own hosted-or-local verdict,
+ * the SAME `endpoint.is_some()` that item's `step result` record already
+ * carried — and `index`. The split below reads `remote` FIRST and falls
+ * back to the run-key precedence only when it is absent. See that branch's
+ * own comment for why absence is meaningful rather than a gap.
+ *
+ * WHY A PRODUCER CHANGE AND NOT A CONSUMER-SIDE JOIN. `item_record`'s
+ * `payload.remote` was already on the wire for the same item, so a consumer
+ * COULD have joined the two records. Measured, that join is
+ * `(session_id, ts, total_tokens)`: it pairs 180 of 364 two-day telemetry
+ * records 1:1 with zero ambiguous multi-hits, and its collision case is k
+ * identical draws of one prompt closing inside one second — the normal
+ * shape of a probe stage. A field costs one key and cannot collide.
+ *
+ * SCOPE, because "it covers half the population" was the measurement that
+ * declined this twice and it answers a different question than it looks
+ * like. 180-of-364 is the JOIN's reach across EVERY `telemetry.tokens`
+ * record. The DEFECT's population is narrower: only a record under a
+ * seat-SHARING session id can be misattributed at all. `session_id::task`
+ * is minted by exactly two step kinds — `dispatch.single_shot` and
+ * `dispatch.map` — and only `dispatch.map` emits `telemetry.tokens`
+ * (`dispatch.single_shot`'s tokens ride its own `dispatch complete`
+ * bookend, which the run loop below already classifies per completion).
+ * The other live emitter, the container path's per-turn tailer
+ * (`dispatch_internal.rs`'s `emit_telemetry`), runs under
+ * `session_id::step(&step.id)`, unique per step; `crawl.unit` mints
+ * `crawl-<mission>-<rule>-<unit>` plus a per-draw suffix. Neither can share
+ * a key with a second seat. One emitter is the whole live population, and
+ * it is the one that changed.
+ *
+ * WHAT IS STILL OWED, stated rather than implied: a LIVE dispatch. The
+ * payload shape, the two records' agreement on one seat's tier, and this
+ * function's behavior on both the present and absent forms are unit-pinned
+ * — but this repo's release gate is explicit that a green test proves the
+ * pieces and only a live run proves the thing (#975, #1135). Nothing
+ * committed can stand in: ZERO run keys in either corpus hold both a hosted
+ * and an endpoint-less completion, so the corpora cannot exercise a mixed
+ * task at all, and every corpus record predates 1.49.0 so none carries
+ * `remote`. Both facts are why this change moves NOTHING on the goldens,
+ * which is the correct outcome and not evidence of anything.
+ *
+ * WHAT IT DOES MOVE, once records carry the field. Measured by replaying
+ * the two-day corpus with each map item's own `step result` `remote`
+ * copied onto its paired `telemetry.tokens` record (180 of 364 pair 1:1) —
+ * a MODEL of the 1.49.0 wire, not live data — at every playhead position:
+ *
+ *   terminal snapshot            : identical
+ *   playhead positions diverged  : 392 of 2,073
+ *   max cloud GAIN / LOSS        : 0 / 0
+ *   max local GAIN               : 62,218 (all of it out of `unknown`)
+ *
+ * No token moves onto or off the CLOUD tile in either direction. What moves
+ * is UNKNOWN -> LOCAL, and only mid-scrub: a map seat whose own
+ * `dispatch.complete` has not landed yet at that playhead has no entry in
+ * `localKeys`, so it used to read unattributed until its terminal arrived.
+ * Its own record now says local the moment the tokens do. Note the terminal
+ * snapshot is IDENTICAL while a fifth of the scrub positions are not —
+ * which is why a comparison taken at end-of-file would have reported this
+ * change as a no-op.
  *
  * Producer note, still true and still load-bearing: `endpoint` is stamped
  * from one `endpoint_label` onto start/error/complete alike by
@@ -230,6 +270,24 @@ interface TokenPayload {
   remote_tokens?: number;
   turn_seq?: number;
   endpoint?: string;
+  /** (#2690, FLOW_SCHEMA_VERSION 1.49.0) The SEAT's own hosted-or-local
+   * verdict, on a `telemetry.tokens` record emitted by `dispatch.map`'s
+   * per-item emitter (`map_item_token_payload`,
+   * `crates/darkmux-crew/src/step_kinds/builtins.rs`).
+   *
+   * Optional here and forever: it is absent on every record written before
+   * 1.49.0, and absent by design on every OTHER `telemetry.tokens` lineage
+   * (the container path's per-turn tailer emits none). The producer stamps
+   * it UNCONDITIONALLY, `false` included, so absence means "not that
+   * producer" — never "that producer had nothing to say". The split below
+   * depends on that distinction; see its own comment. */
+  remote?: boolean;
+  /** (#2690) The item's position within its `dispatch.map` fan-out. Not read
+   * by this function — two seats are separated by `remote` alone, since a
+   * step's items are uniformly one tier. Declared so the field is
+   * documented where the payload is, rather than looking like drift the
+   * next time somebody diffs the wire against this interface. */
+  index?: number;
 }
 
 /** A `sess`-grouped turn, carrying the record's own `ts` alongside its
@@ -359,7 +417,15 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // `cloudKeys` WINS when one run lands in both (sibling seats sharing a
   // task-scoped id, one hosted and one local). That is over-claiming CLOUD,
   // never crediting hosted spend as local: if any seat in a task is hosted,
-  // that task really did bill. The per-seat split is the #2665 follow-up.
+  // that task really did bill.
+  //
+  // (#2690) That precedence is now the FALLBACK, not the only rule. A
+  // `telemetry.tokens` record carrying `payload.remote` names its own
+  // seat's tier and is read before these sets are consulted at all — see
+  // the token split below. These sets still decide every record that does
+  // NOT carry it, which is every record written before
+  // FLOW_SCHEMA_VERSION 1.49.0 and every record from a lineage other than
+  // `dispatch.map`'s per-item emitter.
   //
   // (#2690) What this KEEPS from #2690 is the run-count fix a few dozen
   // lines down — every token-bearing bookend classifies on its OWN
@@ -527,11 +593,13 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       // is humming" while an endpoint billed. Keyed on `runKey` the stale
       // verdicts live under their own missions' keys and cannot be reached.
       //
-      // Precedence: CLOUD beats LOCAL when one run's own evidence disagrees
-      // with itself (sibling seats sharing a task-scoped id, one hosted and
-      // one local). That over-claims cloud for a genuinely mixed task and
-      // never credits hosted spend as local. Pinned by name in
-      // savings.test.ts, here AND on its run-level twin below.
+      // Precedence, for a record with no seat of its own: CLOUD beats LOCAL
+      // when one run's own evidence disagrees with itself (sibling seats
+      // sharing a task-scoped id, one hosted and one local). That
+      // over-claims cloud for a genuinely mixed task and never credits
+      // hosted spend as local. Pinned by name in savings.test.ts, here AND
+      // on its run-level twin below. A record that DOES name its seat
+      // (`payload.remote`, #2690) never reaches this rule.
       //
       // TWO sites read this evidence and they do NOT agree. The run loop's
       // per-bookend token sum (the telemetry-ABSENT path, at the bottom of
@@ -545,21 +613,59 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       // so the divergence is a decision a future change has to make
       // deliberately, not discover.
       //
-      // (#2709) This is the one place #2690's TOKEN half would have to be
-      // fixed, and it cannot be fixed from the records that exist. Sibling
+      // (#2709, SUPERSEDED by #2690's producer change.) This is the one
+      // place #2690's TOKEN half had to be fixed, and #2709 recorded that
+      // it could not be fixed from the records that existed THEN: sibling
       // seats fanned out within one task share the session id AND the
       // mission id, so `runKey` is identical for them by construction, and
-      // no third coordinate is available: `payload.step_id` appears on ZERO
-      // of the 774 `telemetry.tokens` records across all four committed
-      // corpora (the container path stamps it only for a graph step),
-      // `handle` on such a record is the ROLE id, and `work_id` is `None`
-      // on every crew record builder. So the precedence above stands and
-      // #2690's three token shapes are unchanged by this pass.
+      // none of `payload.step_id`, `handle` or `work_id` could separate
+      // them (measurements in this file's module doc). The record now
+      // carries the coordinate — `payload.remote`, FLOW_SCHEMA_VERSION
+      // 1.49.0 — and the branch immediately below reads it. The precedence
+      // above is what remains for records that do not carry it.
       const rk = runKey(r);
-      if (cloudKeys.has(rk)) {
+      // (#2690) THE SEAT'S OWN VERDICT WINS, when the record carries one.
+      //
+      // `payload.remote` (FLOW_SCHEMA_VERSION 1.49.0) is `dispatch.map`'s
+      // per-item emitter reporting the tier of the seat that spent these
+      // tokens — the SAME `endpoint.is_some()` it stamps on that item's own
+      // `step result` record, pushed from the same `MapItemResult` in the
+      // same loop iteration. It is strictly better evidence than anything
+      // below it: the run key's aggregate describes a TASK, this describes
+      // the SEAT, and the whole of #2690 is that those are not the same
+      // thing when a task fans out.
+      //
+      // `=== true` / `=== false` rather than a truthiness test, so a hostile
+      // or malformed value falls through to the fallback instead of
+      // silently deciding a tier.
+      //
+      // A `false` seat contributes to NEITHER `cloud` NOR `unknown`, which
+      // is how it lands in `local` — `local` is the remainder
+      // (`total - cloud - unknown`) and is never added to directly. That is
+      // the one direction this function is normally forbidden to guess in,
+      // and the reason it is allowed here is that this is not a guess: the
+      // producer only reaches `map_local_item` when the step resolved NO
+      // endpoint, so `remote: false` is the same class of positive local
+      // evidence as an endpoint-less `dispatch.complete` (what `localKeys`
+      // is built from), one grain finer.
+      //
+      // WHY THE FALLBACK STAYS. Absence is meaningful, not a gap to paper
+      // over: the producer stamps the key unconditionally, so a record
+      // WITHOUT it is either pre-1.49.0 (archives are append-only and are
+      // never rewritten) or from another lineage — the container path's
+      // per-turn tailer, which cannot share a run key with a second seat
+      // anyway (`session_id::step(&step.id)`, unique per step). Those
+      // records keep exactly the pre-#2690 behavior, unchanged, and
+      // `savings.test.ts` pins both forms side by side so neither can move
+      // without the other being considered.
+      if (p.remote === true) {
         cloud += p.total_tokens || 0;
-      } else if (!localKeys.has(rk)) {
-        unknown += p.total_tokens || 0;
+      } else if (p.remote !== false) {
+        if (cloudKeys.has(rk)) {
+          cloud += p.total_tokens || 0;
+        } else if (!localKeys.has(rk)) {
+          unknown += p.total_tokens || 0;
+        }
       }
       // (#2709) Grouped by `runKey`, the same key the verdicts use — so a
       // group is ONE run's turns. `runKey` already carries the composite

@@ -1,0 +1,57 @@
+=== topbar ===
+darkmux
+⟳
+◌LIVE
+LIVE
+home
+guide
+articles
+github
+
+=== crumb ===
+(empty)
+
+=== meta ===
+2
+
+=== logscope ===
+fleet
+
+=== stage ===
+TOKENS · LAST 24H
+600,113
+LOCAL TOKENS
+396,926
+CLOUD TOKENS
+2,209
+UNATTRIBUTED
+382k
+GENERATED
+33k
+FRESH INPUT
+320
+RE-READ
+585k
+UNCLASSIFIED
+52
+DISPATCHES
+Orchestrator note: First editor-embedded review shipped tonight — the crew reviewed a real ticket inside Zed, end to end on local models, and the report rendered beautifully. Four feature findings captured for the real integration. Great night. · 03:06:54 history →
+MacBook-Pro
+Apple M5 Max · 128 GB
+idle
+0 running
+m1-max-32gb-studio
+hardware not reported
+idle
+0 running
+RECENT ACTIVITY
+10M
+1H
+4H
+24H
+MacBook-Pro
+m1-max-32gb-studio
+14:28
+02:28
+14:28
+

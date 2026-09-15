@@ -233,7 +233,7 @@ one's vocabulary.
 
 | Lens | Hash route | Golden(s) |
 |---|---|---|
-| fleet (default) | `#` (no hash) | `fleet.txt` |
+| fleet (default) | `#` (no hash) | `fleet.txt` (the live rolling window at `meta.frozen_clock_ms`), `fleet-two-day.txt` (#2702 — the SAME boot at a clock where the 24h filter truncates nothing, so the hero sums the whole `[yesterday, today]` concatenation; see "Which window does the hero actually load" below) |
 | console | `#lens=console` (`&panel=<id>`, `&opt.<name>=<value>` since #1911) | `console.txt` (the bare default — `run-list`, a real CLI panel, since #1905 step 3; BYTE-IDENTICAL to `console-run-list.txt`, its own explicit-deep-link golden, the same relationship `mission-status`/`console.txt` had before #1904's now-deleted `ActivityPanel` default briefly broke it), plus one golden per allowlisted CLI panel: `console-mission-status.txt`, `console-mission-status-all.txt` (the one-release `mission-status-all` alias, #1911 — folds into `mission-status`'s own `--all` opt), `console-machine-status.txt`, `console-flow-status.txt`, `console-role-list.txt`, `console-config-list.txt`, `console-lab-fixture-list.txt`, `console-run-list.txt`, `console-doctor-not-run.txt` (the manual-only "not yet run" placeholder — selecting the tab must never auto-fetch, #1286) and `console-doctor.txt` (after clicking "run"). Eight allowlisted panels total (`panel.rs::PANEL_IDS`'s own doctrine cap) — the pill row briefly carried two additional client-only entries ("activity"/"all activity") under #1904; #1905 step 3 deleted them after the operator rejected a ten-pill render on sight. |
 | runs | `#lens=runs` (`&kind=<all\|mission\|dispatch\|lab>`; legacy alias `#lens=lab`) | `runs.txt` (kind=all), `runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-kind-lab.txt` (all four filter chips, Packet 3), `runs-series.txt` (kind=lab + the `◧ series` toggle — the ONE thing `/lab/runs` actually feeds, see the correction below; Packet 3), `runs-lens-boot.txt` (a FRESH `#lens=runs` boot, exercising `boot()`'s own `lq` deep-link branch rather than a click-through — content is byte-identical to `runs.txt` by design, since both land on kind=all over the same corpus; the golden's value is proving the boot mechanism independently, Packet 3) |
 | machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
@@ -368,6 +368,63 @@ catalog below.
 a body-level sibling of `#stage`, never part of it — so the base extraction
 structurally can't see it. This is composed on TOP of the base extraction,
 not folded into it: only `catalog-open.txt` carries this section.
+
+## Which window does the savings hero actually load? (#2702)
+
+The fleet hero (`tokensOffMeter`, `ui/src/lenses/fleet/savings.ts`) is the
+product's headline number, so "which records reached it" is the first
+question any golden about it has to answer. It is NOT one window. Enumerated
+here rather than in a test comment because the list is the durable part —
+the gaps move as lenses are added.
+
+Every live boot fetches **two** days (`useFlowWindow`:
+`[prevDateUTC(today), today]`) and folds them through `buildFlowWindow`,
+which keeps `ts >= nowMs - LIVE_WINDOW_MS` (24h). That filter has **no upper
+bound** — the live playhead is `computeTMax(data)`, not `now` — so how much
+of YESTERDAY reaches the hero is a function of the wall clock alone. "The
+two-day window" is a family of inputs, not one input.
+
+| window the hero can be handed | how it is reached | golden |
+|---|---|---|
+| live rolling, LATE in the UTC day — yesterday almost entirely cut | bare `/index.html`, clock `2026-08-08T16:40:59Z` (`meta.frozen_clock_ms`); 963 records reach the hero, 935 of them today's, 28 of yesterday's 1,994 | `fleet.txt` |
+| live rolling, EARLY in the UTC day — the whole concatenation survives | bare `/index.html`, clock `2026-08-08T02:00:00Z` (earlier than this corpus's first yesterday record, 02:09:42Z); 2,943 records | `fleet-two-day.txt` (#2702) |
+| live rolling, any clock BETWEEN those two | bare `/index.html` at any other hour | **not graded** — the two rows above bracket the family; a middle clock is a strict subset of the second and a superset of the first |
+| playback, ONE day, playhead at that day's `tMax` | `#2026-08-07` | `playback-date.txt` |
+| playback, ONE day, playhead SCRUBBED back (`t < tMax`) | the sticky transport (`usePlaybackTransport`) | **not graded** — every golden captures a single playhead, and `FleetLens`'s `scopedData` (`ts <= playhead`) is exactly where a session's `dispatch.complete` can slide out from under its own telemetry. See `savings.ts`'s module doc on why that filter is load-bearing |
+| playback of `2026-08-08` (today) as a day page | `#2026-08-08` | **not graded** — only the yesterday date has a golden |
+| any daemon day page older than `captured_prev_date` | `#<older date>` | **not gradeable here** — this corpus recorded exactly two days (`/flow/<date>` 404s for anything else, `lib/mock-routes.js`) |
+| the STATIC build — one committed flow file answering every route | `docs/demo` (`route.ts`'s static branch resolves every route to playback) | **not graded by this harness** — `scripts/build-demo.sh` generates it; nothing here replays it |
+
+**Why a golden over the concatenation was worth adding, measured rather than
+argued.** Re-key `runKey` (`savings.ts`) to the bare `session_id` and replay
+this corpus at every playhead position:
+
+```
+one-day window (fleet.txt's clock) :    0 of   673 playhead positions move
+two-day window (fleet-two-day's)   : 1998 of 2,073 playhead positions move
+                                     LOCAL 600,113 -> 497,992
+                                     CLOUD 396,926 -> 499,047
+                                     DISPATCHES  52 -> 42
+```
+
+102,121 tokens move off the operator's own hardware onto the cloud tile with
+`fleet.txt` byte-identical. Red-proved directly: with that mutation applied
+and the bundle rebuilt, `next-parity`'s `fleet.txt` test PASSES and its
+`fleet-two-day.txt` test FAILS.
+
+**The non-vacuity guard is committed**, not a one-time check — see
+`next-parity.spec.ts`'s "the two-day golden is non-vacuous where fleet.txt is
+structurally blind". It stamps an `endpoint` onto one cross-day session's
+YESTERDAY completions and asserts BOTH halves of the claim: the two-day
+render moves, and `fleet.txt` stays byte-identical under the same mutation.
+
+**One thing this does NOT claim**, stated because #2702's wording invites the
+opposite reading: on the CURRENT lens there is no cross-day *interaction*
+left. `runKey` is `(session_id, mission_id)` since #2701/#2709, and ZERO run
+keys in this corpus span both days — 9 session IDs do (`task-review-*-task`,
+`task-list`, `task-__panel_args__`, `task-view`), but each day's records
+carry a different `mission_id`. What the two-day window catches, and the
+one-day window cannot, is any change that MERGES those keys back together.
 
 ## KNOWN COVERAGE GAPS
 
