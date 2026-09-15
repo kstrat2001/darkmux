@@ -10301,3 +10301,75 @@ fn mission_status_never_labels_a_same_machine_orphan_as_observed_on_the_fleet() 
         "a same-machine orphan must not spawn a fleet section at all:\n{text}"
     );
 }
+
+/// (#2678) A finished run records its own wall-clock in the envelope, so the
+/// number that decides whether a CI job's `timeout-minutes` needs raising is
+/// readable off the run's own artifact instead of inferred from workflow logs.
+///
+/// `procedural.noop` needs no model, network, or Docker — purely hermetic.
+///
+/// The assertion is that the field is PRESENT, which is the whole property:
+/// `wall_ms` is `skip_serializing_if = "Option::is_none"`, so a launcher that
+/// never stamps it writes no key at all and this goes red. A value assertion
+/// is not available — the real duration is whatever the machine took — so the
+/// bounds below only reject a value that could not be a measurement of this
+/// run (a stamped zero-that-means-unmeasured, or a clock-derived absurdity).
+#[test]
+fn mission_launch_records_the_run_wall_clock_in_the_envelope() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "wall-clock-test",
+        "name": "Wall Clock Test",
+        "schema_version": "3.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{ "id": "s1", "kind": "procedural.noop" }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("wall-clock-test.json"), config_json).unwrap();
+
+    darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args(["mission", "launch", "wall-clock-test"])
+        .assert()
+        .success();
+
+    let missions_dir = home.path().join("missions");
+    let mission_dir = fs::read_dir(&missions_dir)
+        .expect("missions/ must exist after a successful launch")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.join("envelope.json").is_file())
+        .expect("the launch must have persisted an envelope.json");
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mission_dir.join("envelope.json")).unwrap())
+            .expect("envelope.json must be JSON");
+
+    let wall_ms = envelope
+        .get("wall_ms")
+        .unwrap_or_else(|| panic!("envelope must record the run's wall-clock: {envelope}"))
+        .as_u64()
+        .unwrap_or_else(|| panic!("wall_ms must be a whole number of ms: {envelope}"));
+
+    // A real elapsed measurement of a process that started, loaded a config,
+    // ran a step and finalized. An hour would mean the clock, not the run.
+    assert!(
+        wall_ms < 3_600_000,
+        "wall_ms must be this run's duration, not a clock artifact: {wall_ms}"
+    );
+
+    assert_eq!(
+        envelope.get("schema_version").and_then(|v| v.as_str()),
+        Some("1.5"),
+        "adding wall_ms is an additive field ⇒ minor bump: {envelope}"
+    );
+}

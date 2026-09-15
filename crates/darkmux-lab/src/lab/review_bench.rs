@@ -12,9 +12,10 @@
 //! same substrate as `darkmux dispatch pr-reviewer` — so a bench run and a
 //! real CI review exercise the identical path.
 
-use crate::providers::prompt::extract_reply_text;
 // (#2685) The infra-vs-capability rule moved beside the schema it serves.
-use super::scores::{envelope_meta_with_exit, is_infra_failure, EnvelopeMeta};
+// (#2721) `envelope_reply_text` replaces a direct `prompt::extract_reply_text`
+// on the whole stdout — text and metrics now come off the same line.
+use super::scores::{envelope_meta_with_exit, envelope_reply_text, is_infra_failure, EnvelopeMeta};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::fs;
@@ -523,11 +524,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
             )
             .with_context(|| format!("dispatching case {}", c.id))?;
             meta.push(envelope_meta_with_exit(&stdout, exit_code));
-            let reply = extract_reply_text(&stdout);
-            match opts.mode {
-                BenchMode::Strict => parse_review(&reply),
-                _ => parse_freeform_review(&reply),
-            }
+            review_from_stdout(&stdout, opts.mode)
         };
         let s = score(&c.label, &review);
         println!(
@@ -692,9 +689,28 @@ fn build_prompt(c: &Case, mode: BenchMode) -> String {
     )
 }
 
+/// (#2721) One trial's stdout → its scored `Review`. Extracted from the
+/// trial loop so the bench's OWN stdout→verdict path is reachable from a test
+/// without a dispatch; inlined there, the only way to exercise it was to run
+/// the bench against a live model.
+///
+/// The text comes from [`envelope_reply_text`] — the same line
+/// [`envelope_meta_with_exit`] takes this trial's METRICS off, two statements
+/// up at the call site. Before #2721 this read `extract_reply_text(&stdout)`
+/// on the WHOLE stdout, so any noise line ahead of the envelope failed that
+/// parse and handed the review parser raw stdout while the metrics half kept
+/// isolating correctly — one trial, two different sources of truth.
+fn review_from_stdout(stdout: &str, mode: BenchMode) -> Review {
+    let reply = envelope_reply_text(stdout);
+    match mode {
+        BenchMode::Strict => parse_review(&reply),
+        _ => parse_freeform_review(&reply),
+    }
+}
+
 /// Dispatch one case (or one dialectic seat) through `role_id` on the
 /// internal runtime, returning the raw `--json` envelope stdout (parsed by
-/// `extract_reply_text`) alongside the dispatch's own exit code. `profile`
+/// [`envelope_reply_text`]) alongside the dispatch's own exit code. `profile`
 /// overrides `opts.profile_name` for this dispatch — the per-seat profile
 /// hook (#1222).
 ///

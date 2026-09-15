@@ -377,16 +377,18 @@ pub(crate) struct EnvelopeMeta {
 /// trimmed. The ONE place that decision is made, for every caller in the
 /// crate that isolates an envelope line at all.
 ///
-/// That qualifier is exact, not a hedge. Two other stdout readers do NOT
-/// isolate a line and are deliberately untouched here: `lab::review_bench`
-/// and `lab::dialectic`'s `run_debate` each take METRICS through
-/// [`envelope_meta`] (isolated, via this) and their TEXT through
-/// `providers::prompt::extract_reply_text` on the WHOLE stdout (not
-/// isolated). That is the same verdict-vs-metrics split #2719 fixes in
-/// `tool_bench`, in the opposite direction — ANY noise line, JSON-shaped or
-/// not, fails their whole-stdout parse and hands the parser raw stdout. It
-/// has no test and no demonstrated producer, and closing it changes what
-/// those two benches score, so it is named here rather than fixed in passing.
+/// That qualifier is exact, not a hedge, and it is narrower than "every
+/// reader of dispatch stdout in this crate". Read [`envelope_reply_text`]
+/// below for which callers isolate and which deliberately still do not.
+///
+/// (#2721) `lab::review_bench` and `lab::dialectic`'s `run_debate` USED to be
+/// the counter-examples named here: each took METRICS through
+/// [`envelope_meta`] (isolated, via this) and its TEXT through
+/// `providers::prompt::extract_reply_text` on the WHOLE stdout, so the two
+/// halves of one trial could come from different places. Both now go through
+/// [`envelope_reply_text`], so text and metrics come from the same line by
+/// construction, and one mutation of the selection below turns a guard red in
+/// EACH bench rather than in neither.
 ///
 /// It was two places until #2719: [`parse_envelope`] below and
 /// `providers::tool_bench::extract_reply` each carried their own copy of the
@@ -409,13 +411,51 @@ pub(crate) struct EnvelopeMeta {
 /// It is scoped to its own change on purpose. What unification buys is that
 /// such a change is now a one-line edit here rather than two edits that can
 /// disagree.
-pub(crate) fn envelope_candidate(stdout: &str) -> &str {
+pub fn envelope_candidate(stdout: &str) -> &str {
     stdout
         .lines()
         .rev()
         .find(|l| l.trim_start().starts_with('{'))
         .unwrap_or(stdout)
         .trim()
+}
+
+/// (#2721) The model's final message, read off the SAME line
+/// [`envelope_meta`] reads the metrics off. The one way a caller should turn
+/// a dispatch's stdout into text.
+///
+/// Callers: `providers::tool_bench`, `lab::review_bench`, `lab::dialectic`'s
+/// three seats, and the root crate's `notebook draft` (which is why this is
+/// `pub`). A mutation of [`envelope_candidate`] turns a guard red in each.
+///
+/// # This is for dispatch STDOUT, and only for dispatch stdout
+///
+/// The input must be what the internal runtime prints: `serde_json::to_string`
+/// (COMPACT) + `println!` (`runtime/src/main.rs:1110`, `:1216`), i.e. the
+/// envelope occupies exactly one line, possibly preceded by noise.
+///
+/// Do NOT route a stored, PRETTY-PRINTED artifact through this. The last line
+/// starting with `{` in a pretty-printed document is an inner array-element
+/// opener (`          {`), which is not parseable JSON on its own, so the
+/// result is the string `"{"` — the entire reply destroyed. That is measured,
+/// not feared: over the 181 recorded `qa-reply.json` artifacts on this
+/// machine, all 19 pretty-printed ones collapsed from up to 4698 bytes of
+/// reply to 1 byte, while all 142 in the real single-line dispatch-stdout
+/// shape were byte-identical before and after (#2721's before/after).
+///
+/// That is why two `extract_reply_text` callers are deliberately left reading
+/// the whole input and are NOT bugs:
+/// - `providers::prompt`'s reply-FILE path and the root crate's
+///   `notebook::build_run_data_summary` both read `qa-reply.json`, a
+///   pretty-printed artifact, not stdout.
+/// - `providers::prompt`'s and `providers::coding_task`'s own stdout reads are
+///   a genuine remaining instance of the split, left alone on purpose: they
+///   feed workload VERIFY outcomes rather than a bench score, so changing them
+///   changes what recorded lab runs verify to. Not in #2721's scope; named
+///   here so this doc stays true rather than implying a unification that did
+///   not happen.
+pub fn envelope_reply_text(stdout: &str) -> String {
+    crate::providers::prompt::extract_reply_text(envelope_candidate(stdout))
 }
 
 /// (#2685 frontier-QA) Was an envelope recovered at all, and if so what was
