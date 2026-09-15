@@ -13,7 +13,9 @@ import { FleetCoverageNotice } from "./FleetCoverageNotice";
 // on `FleetStrip`, and vanished when `FleetLens` replaced it on the route.
 // Nothing went red, because FleetStrip's own tests kept passing while it
 // stopped being mounted. The component's own assertions live here; that it is
-// still MOUNTED is `App.test.tsx`'s job (`presence coverage`).
+// still MOUNTED is `App.test.tsx`'s job (`presence coverage`). (#2725 deleted
+// `FleetStrip` outright, along with the third copy of this wording it still
+// carried.)
 
 function stub(fleetState: Record<string, unknown> | null) {
   vi.stubGlobal(

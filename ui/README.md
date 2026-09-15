@@ -79,8 +79,10 @@ moves here. An unrecognized route renders a named placeholder
 
 ## What's deliberately deferred to lens packets
 
-- Every lens except the fleet-machines strip (`FleetStrip`) is a
-  `LensPlaceholder` naming what still needs porting.
+- A lens that has not been ported yet renders a `LensPlaceholder` naming
+  what still needs porting. (This line used to name the scaffold's
+  `FleetStrip` as the one real region; `FleetLens` replaced it on the route
+  long ago, and #2725 deleted it.)
 - `PresenceBeat` (fleet/machines/live's real Rust type, in `darkmux-flow`)
   is hand-written, not ts-rs-derived — bridging it would mean adding ts-rs
   as a dependency of a crate consumed by production code, not just

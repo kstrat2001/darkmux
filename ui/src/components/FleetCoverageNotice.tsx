@@ -32,45 +32,30 @@
  * route, with nothing going red because FleetStrip's own tests kept passing
  * while it stopped being mounted. `FleetCoverage.test.tsx` covers the
  * component; `App.test.tsx` covers that it is still MOUNTED.
+ *
+ * (#2725) `FleetStrip` itself is now DELETED. It had carried a THIRD copy of
+ * the sentences below — diverged from both of the two this component merged —
+ * in a file nothing rendered, which is how a wording variant gets copied
+ * forward. Deleting it removes the copy AND the passing-but-unmounted test
+ * suite that made the original regression invisible.
  */
 import { useFleetCoverage } from "../hooks/useLiveMachines";
 import { getSource } from "../lib/source";
-import type { SourceState } from "../types/handwritten";
+import { degradedFleetSource, fleetCoverageMessage, type DegradedFleetSource } from "../lib/fleetCoverage";
 
-/** The fleet source state when it is worth warning about, `null` otherwise
- * (`ok`/`off`/nothing tracked/no answer yet). One predicate, so the masthead's
- * headline marker and the notice below can never disagree about whether
- * coverage is degraded. */
-export type DegradedFleetSource = Extract<SourceState, { state: "stale" } | { state: "unavailable" }>;
+/** (#2725) The predicate, the type and the sentence moved to
+ * `lib/fleetCoverage.ts` when `useLiveSessionIds` became a second reader of
+ * the same signal — see that module's own doc. Re-exported here because this
+ * component is where the app's readers already look for them. */
+export { fleetCoverageMessage, type DegradedFleetSource };
 
 /** `enabled` is the caller's live-vs-replay gate — see `useFleetCoverage`.
  * This hook SHARES `queryKeys.fleetMachinesLive` with `useLiveMachines`, so
  * it costs no extra request, and equally so a stray enabled observer would
- * re-open a poll a replay just gated off.
- *
- * Two different failures collapse onto the same `unavailable` state here,
- * deliberately, because they are the same fact to a reader: the daemon
- * reporting that IT could not read the fleet substrate, and this page not
- * being able to read the DAEMON (#2683 — a mid-session daemon death, where
- * `useLiveMachines` hands every consumer an empty map that is indistinguishable
- * from a genuinely empty fleet). Both mean "presence could not be read", which
- * is what the sentence says; splitting them would be a second vocabulary for
- * one operator-visible condition. */
+ * re-open a poll a replay just gated off. */
 export function useDegradedFleetSource(enabled: boolean): DegradedFleetSource | null {
   const { meta, unreadable } = useFleetCoverage(enabled && getSource().kind === "daemon");
-  if (unreadable) return { state: "unavailable", detail: "the presence read failed" };
-  const fleet = meta?.sources?.fleet;
-  if (!fleet || fleet.state === "ok" || fleet.state === "off") return null;
-  return fleet as DegradedFleetSource;
-}
-
-/** The one sentence this app says about degraded presence, in its two
- * shapes. Verbatim from #1729 — the headline's marker reuses it as its
- * `title` rather than paraphrasing. */
-export function fleetCoverageMessage(fleet: DegradedFleetSource): string {
-  return fleet.state === "stale"
-    ? `Fleet presence is stale${"age_ms" in fleet ? ` (${Math.round(fleet.age_ms / 1000)}s old)` : ""} — machines and run counts below may have moved on.`
-    : "Fleet presence could not be read — machines and run counts below cover THIS MACHINE only, and are not the whole fleet.";
+  return degradedFleetSource(meta, unreadable);
 }
 
 /** `historical` — a replay has no live coverage to report (see
