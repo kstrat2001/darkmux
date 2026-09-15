@@ -21,6 +21,41 @@
 use darkmux_flow::FlowSink as _;
 use std::os::unix::fs::PermissionsExt;
 
+// ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
+//
+// The only place this file names the darkmux binary. Both spawns below
+// go through `darkmux_cmd()`.
+//
+// Before #2710 each did `.env("HOME", …).env_remove("DARKMUX_HOME")` and
+// neutralized nothing else, so the other twelve state variables came
+// straight from the ambient shell — and every one of them OUTRANKS the
+// `HOME` this file pins. Measured at that head with the dir set exported
+// to sentinels and a fake `$HOME`: EXIT=101, and the run wrote
+// `fleet.json`, its lock, and `audit/2026-09-12.jsonl` carrying a
+// BLAKE3-chained `mission start` for the fabricated `test-mission-e11`,
+// stamped with the operator's real `machine_id` and `machine_uid`. A
+// chained record cannot be removed without breaking the chain.
+//
+// `DARKMUX_HOME` stays REMOVED, deliberately — these tests exercise
+// DEFAULT resolution off `$HOME`, which is the whole point of the file.
+// `neutralize_state_vars` removes it along with the rest, so the intent
+// is preserved and the twelve inherited siblings are closed with it.
+use darkmux_types::test_isolation::neutralize_state_vars;
+
+/// A `std::process::Command` for the darkmux binary, scoped to `home` and
+/// neutralized. Callers add `.args([...])` and `.output()`.
+///
+/// Neutralize FIRST, pin SECOND: `Command` applies `.env` and
+/// `.env_remove` in call order, so the `HOME` pin has to come after.
+fn darkmux_cmd(home: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"));
+    neutralize_state_vars(&mut cmd);
+    cmd.env("HOME", home);
+    cmd
+}
+
+// ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
+
 /// Run a closure with `HOME` overridden so any state writer rooted in
 /// `~/.darkmux` writes into our tmpdir.
 fn with_home<F: FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
@@ -116,11 +151,8 @@ fn fleet_roster_is_owner_only_mode() {
         // Build a roster and save it via the public API. We invoke the
         // binary so it picks up the same HOME we set above and resolves
         // its roster path through the production code path.
-        let bin = env!("CARGO_BIN_EXE_darkmux");
-        let out = std::process::Command::new(bin)
+        let out = darkmux_cmd(home)
             .args(["machine", "add", "test-node", "--address", "127.0.0.1:9999"])
-            .env("HOME", home)
-            .env_remove("DARKMUX_HOME")
             .output()
             .expect("running `darkmux fleet add`");
         assert!(
@@ -195,11 +227,8 @@ fn lifecycle_save_json_is_owner_only_mode() {
         );
 
         // Trigger save_json via mission start.
-        let bin = env!("CARGO_BIN_EXE_darkmux");
-        let out = std::process::Command::new(bin)
+        let out = darkmux_cmd(home)
             .args(["mission", "start", mission_id])
-            .env("HOME", home)
-            .env_remove("DARKMUX_HOME")
             .output()
             .expect("running `darkmux mission start`");
         // We don't insist on success — mission start may bail on

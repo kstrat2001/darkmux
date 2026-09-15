@@ -165,8 +165,28 @@ pub struct FleetNode {
     /// plain `cargo build` binary: with `DARKMUX_HOME` set to a tempdir,
     /// `darkmux machine add` still wrote `$HOME/.darkmux/fleet.json`.
     /// This node overrides two of those by name (`DARKMUX_FLEET_FILE`,
-    /// `DARKMUX_CREW_DIR`); `HOME` closes the rest at once, and keeps
-    /// closing the ones nobody has written yet.
+    /// `DARKMUX_CREW_DIR`).
+    ///
+    /// (#2710) This doc used to end "…`HOME` closes the rest at once, and
+    /// keeps closing the ones nobody has written yet." **That was false**,
+    /// and it is the identical claim #2704 spent two review rounds
+    /// disproving for the isolated-roots helper one file over. `HOME` is
+    /// the LAST tier of every resolver that has a `DARKMUX_*` override:
+    /// `crew::loader::user_state_root` consults `DARKMUX_CREW_DIR` first,
+    /// `config_access::audit_enabled` is true on the mere PRESENCE of
+    /// `DARKMUX_AUDIT_DIR`, and so on down the list in
+    /// `darkmux_types::test_isolation::PINNED_STATE_VARS`. An exported
+    /// override BEATS the `HOME` pinned here; it does not get closed by
+    /// it. Seven variables were pinned on every spawn and ten were left to
+    /// be inherited — on a binary that, per the module doc, carries no
+    /// `test`/`test-support` cfg, so none of the workspace's in-test
+    /// safety nets apply to it either.
+    ///
+    /// What `HOME` actually closes is the family of accessors that have NO
+    /// env override and reach `dirs::home_dir()` directly (the ones listed
+    /// above). That is a real and necessary job, and it is the only one it
+    /// does. Everything else is closed by
+    /// [`darkmux_release_cmd`]'s `neutralize_state_vars` call.
     pub process_home: PathBuf,
     pub flows_dir: PathBuf,
     pub fleet_file: PathBuf,
@@ -191,9 +211,19 @@ impl FleetNode {
     /// crawl-tracker during an ordinary `cargo test` sweep). Every env var
     /// this method sets lives HERE, in the one place every caller goes
     /// through, so a future one can't forget it.
+    ///
+    /// (#2710) The claim this doc used to make about `HOME` — that it
+    /// "closes the rest at once, and keeps closing the ones nobody has
+    /// written yet" — was FALSE, and is corrected on
+    /// [`FleetNode::process_home`]. `HOME` is the LAST tier of every
+    /// resolver that has a `DARKMUX_*` override, so an exported override
+    /// beats it. Seven variables were pinned here and ten were left to be
+    /// inherited, `DARKMUX_AUDIT_DIR` among them. The construction now
+    /// goes through [`darkmux_release_cmd`], which clears the whole set
+    /// first; the seven pins below then re-apply on top, which is the
+    /// documented `neutralize, then pin` order.
     pub fn cmd(&self) -> Command {
-        let binary = darkmux_release_binary();
-        let mut cmd = Command::new(binary);
+        let mut cmd = darkmux_release_cmd();
         cmd.env("HOME", &self.process_home)
             .env("DARKMUX_HOME", &self.home_dir)
             .env("DARKMUX_MACHINE_ID", &self.machine_id)
@@ -298,6 +328,54 @@ mod darkmux_home_isolation_tests {
              `hooks` rule there gets a real POST from every flow record the command \
              writes"
         );
+
+        // (#2710) The third half. `HOME` + `DARKMUX_HOME` + five named
+        // pins left TEN state variables to be inherited from whatever
+        // shell ran `cargo test`, and the doc on `process_home` used to
+        // claim `HOME` closed them. It does not: every one of them
+        // OUTRANKS `HOME` in its own resolver, and `DARKMUX_AUDIT_DIR`
+        // does not even name a destination — its presence turns the
+        // hash-chained sink on.
+        //
+        // Asserted off the two lists rather than written out, so a
+        // destination added to `test_isolation` later is covered here the
+        // moment it lands. A variable this node pins explicitly must be
+        // pinned UNDER the node dir; every other one must be an explicit
+        // removal, never an inherit.
+        use darkmux_types::test_isolation::{CLEARED_STATE_VARS, PINNED_STATE_VARS};
+        for (var, _) in PINNED_STATE_VARS {
+            let observed = cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(*var))
+                .map(|(_, v)| v);
+            match observed {
+                None => panic!(
+                    "{var} is a darkmux write destination and this harness spawns a plain \
+                     release binary with no test-support cfg, so leaving it to be inherited \
+                     points the child at whatever the ambient shell names — the operator's \
+                     own tree in an ordinary terminal. It must be removed or pinned under \
+                     the node dir (#2710)."
+                ),
+                Some(None) => {}
+                Some(Some(value)) => assert!(
+                    std::path::Path::new(value).starts_with(&node_dir),
+                    "{var} is pinned to {value:?}, which is outside this node's own dir {}",
+                    node_dir.display()
+                ),
+            }
+        }
+        for var in CLEARED_STATE_VARS {
+            assert_eq!(
+                cmd.get_envs()
+                    .find(|(k, _)| *k == std::ffi::OsStr::new(*var))
+                    .map(|(_, v)| v),
+                Some(None),
+                "{var}'s PRESENCE changes behavior, so an inherited value is not merely a \
+                 misplaced write. DARKMUX_AUDIT_DIR is the sharp one: it turns the \
+                 hash-chained audit sink on for a real release binary, and chained records \
+                 cannot be removed without breaking the chain (#2710)."
+            );
+        }
     }
 }
 
@@ -387,6 +465,24 @@ impl Drop for FleetHarness {
     }
 }
 
+// ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
+//
+// The only place this harness resolves and constructs a darkmux command.
+// `FleetNode::cmd()` and `spawn_daemon()` both come through
+// `darkmux_release_cmd()`, so neither can forget the neutralization.
+//
+// Load-bearing here in a way it is not elsewhere: this binary is a plain
+// `cargo build --release` artifact with NO `test` / `test-support` cfg
+// (see the module doc and `darkmux_home_isolation_tests`), so
+// `config_access::config()` reads the operator's real
+// `~/.darkmux/config.json` and none of the workspace's in-test guards
+// apply. That is not hypothetical — 2026-08-31, five flow records this
+// harness wrote reached a real crawl-tracker through a `hooks` rule in
+// that file.
+//
+// `DARKMUX_HOME` is cleared here like the rest and re-pinned by both
+// callers immediately after; see `neutralize_state_vars`'s ordering note.
+
 fn darkmux_release_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("DARKMUX_E2E_BIN") {
         return PathBuf::from(path);
@@ -394,6 +490,18 @@ fn darkmux_release_binary() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest).join("target/release/darkmux")
 }
+
+/// A `Command` for the release binary with every darkmux state variable
+/// stripped. Callers pin their node's own roots AFTER this returns —
+/// `Command` applies `.env` and `.env_remove` in call order, so a pin
+/// applied first would be erased.
+fn darkmux_release_cmd() -> Command {
+    let mut cmd = Command::new(darkmux_release_binary());
+    darkmux_types::test_isolation::neutralize_state_vars(&mut cmd);
+    cmd
+}
+
+// ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
 
 fn spawn_redis(workdir: &std::path::Path) -> Result<(Child, String), String> {
     std::fs::create_dir_all(workdir)
@@ -493,8 +601,10 @@ fn spawn_daemon(
         .port();
     drop(listener);
 
-    let binary = darkmux_release_binary();
-    let daemon = Command::new(&binary)
+    // (#2710) Through the one constructor, so the daemon — which is
+    // long-lived and writes flow records for the whole scenario — gets
+    // the same neutralization every `FleetNode::cmd()` child gets.
+    let daemon = darkmux_release_cmd()
         .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
         .env("HOME", &process_home)
         .env("DARKMUX_HOME", &home_dir)

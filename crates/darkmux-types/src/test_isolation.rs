@@ -289,6 +289,65 @@ impl Default for IsolatedState {
     }
 }
 
+/// (#2710) [`IsolatedState`]'s SUBPROCESS half: strip every darkmux state
+/// variable from a child's environment, so a spawned binary derives all of
+/// them from whatever root the caller pins next instead of inheriting the
+/// ambient shell's.
+///
+/// # Why this lives here and not in a test binary
+///
+/// It used to be a private `fn` inside the `tests/cli.rs` test BINARY. A
+/// test binary exports nothing, so every other integration target that
+/// spawns darkmux had the choice between copying it and doing nothing, and
+/// four of them did nothing — `state_files_owner_only_mode`,
+/// `fleet_concurrent_add_no_lost_writes`,
+/// `lab_concurrent_register_no_lost_writes` and `lab_init_idempotent`, each
+/// pinning `HOME`, removing `DARKMUX_HOME`, and neutralizing none of the
+/// other twelve. Measured at that head with the dir set exported to
+/// sentinels and a fake `$HOME`: `state_files_owner_only_mode` wrote
+/// `fleet.json`, its lock, and `audit/<today>.jsonl` holding a BLAKE3-
+/// chained `mission start` for a fabricated mission, stamped with the
+/// operator's real `machine_id` and `machine_uid`. Chained records cannot
+/// be removed without breaking the chain.
+///
+/// One copy per call site is the bug class #2697 named. This is the fix
+/// for it: one definition, in the crate every integration target already
+/// depends on.
+///
+/// # Ordering — call this FIRST, then pin
+///
+/// `std::process::Command` applies `.env` and `.env_remove` in call order.
+/// A `.env` AFTER this call wins; a `.env` BEFORE it is erased. So the one
+/// idiom everywhere is:
+///
+/// ```ignore
+/// let mut cmd = std::process::Command::new(bin);
+/// neutralize_state_vars(&mut cmd);                   // clear the whole set
+/// cmd.env("HOME", root).env("DARKMUX_HOME", root);   // then pin
+/// ```
+///
+/// # `DARKMUX_HOME` is cleared like the rest, deliberately
+///
+/// It gets no exception here. A caller that wants it pinned sets it after
+/// (`tests/cli.rs`'s `darkmux_std_cmd`); a caller whose whole point is to
+/// exercise DEFAULT resolution simply does not set it, and gets a removal
+/// rather than the ambient shell's value. That second shape is what the
+/// four targets above are for, and it is exactly what made them the most
+/// exposed of the set: they pinned `HOME` and then inherited a
+/// `DARKMUX_CREW_DIR` / `DARKMUX_AUDIT_DIR` that OUTRANKS it.
+///
+/// Taken from [`PINNED_STATE_VARS`] and [`CLEARED_STATE_VARS`] rather than
+/// written out, so a destination added to either list is covered at every
+/// spawn site the moment it lands.
+pub fn neutralize_state_vars(cmd: &mut std::process::Command) {
+    for (var, _) in PINNED_STATE_VARS {
+        cmd.env_remove(var);
+    }
+    for var in CLEARED_STATE_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 impl Drop for IsolatedState {
     fn drop(&mut self) {
         for (var, prev) in &self.prev {
@@ -373,6 +432,76 @@ mod tests {
                 None => std::env::remove_var(VAR),
             }
         }
+    }
+
+    /// (#2710) [`neutralize_state_vars`]'s contract, asserted the same way
+    /// `tests/cli.rs` asserts its spawn helper: by reading the `Command`
+    /// back, which needs no subprocess.
+    ///
+    /// Every variable either list knows about must come back as an
+    /// explicit REMOVAL — `Some(&None)` in `get_envs()` terms — with
+    /// nothing left to inherit. `DARKMUX_HOME` is included with no
+    /// exception, which is the difference from the private copy this
+    /// replaced: a caller that wants it pinned sets it AFTER the call, and
+    /// the four targets whose whole point is default resolution get the
+    /// removal they were writing by hand.
+    #[test]
+    fn neutralize_state_vars_removes_every_variable_in_both_lists() {
+        use std::ffi::OsStr;
+
+        let mut cmd = std::process::Command::new("/nonexistent-never-spawned");
+        // Pre-set one of each kind, so "removed" is a real observation
+        // rather than an artifact of the variable never having been named.
+        cmd.env("DARKMUX_HOME", "/darkmux-sentinel-home");
+        cmd.env("DARKMUX_AUDIT_DIR", "/darkmux-sentinel-audit");
+        neutralize_state_vars(&mut cmd);
+
+        let envs: std::collections::BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        for (var, _) in PINNED_STATE_VARS {
+            assert_eq!(
+                envs.get(OsStr::new(*var)),
+                Some(&None),
+                "{var} is a darkmux write destination; a spawn that leaves it to be inherited \
+                 points the child at whatever the ambient shell names — the operator's own \
+                 tree in an ordinary terminal"
+            );
+        }
+        for var in CLEARED_STATE_VARS {
+            assert_eq!(
+                envs.get(OsStr::new(*var)),
+                Some(&None),
+                "{var}'s PRESENCE changes behavior, so an inherited value is not merely a \
+                 misplaced write. DARKMUX_AUDIT_DIR is the sharp one: it turns the \
+                 hash-chained audit sink on, and chained records cannot be removed without \
+                 breaking the chain."
+            );
+        }
+    }
+
+    /// The ordering rule the doc states, asserted rather than trusted: a
+    /// `.env` AFTER the call must SURVIVE it.
+    ///
+    /// This is the half a caller gets wrong silently. `tests/cli.rs`
+    /// pins `DARKMUX_HOME` and the e2e harness pins six more; if
+    /// `neutralize_state_vars` were ever called after those pins instead of
+    /// before, every one would be erased and the child would fall back to
+    /// defaults under a `HOME` that may not be pinned either — with no
+    /// compile error and, for a passing test, no symptom.
+    #[test]
+    fn a_pin_applied_after_the_call_survives_it() {
+        use std::ffi::OsStr;
+
+        let mut cmd = std::process::Command::new("/nonexistent-never-spawned");
+        neutralize_state_vars(&mut cmd);
+        cmd.env("DARKMUX_HOME", "/pinned-after");
+
+        let envs: std::collections::BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("DARKMUX_HOME")),
+            Some(&Some(OsStr::new("/pinned-after"))),
+            "a pin applied after neutralize_state_vars must win — the documented idiom is \
+             `neutralize, then pin`, and it only works if Command applies calls in order"
+        );
     }
 
     /// The two lists must stay disjoint — a variable that is both pinned

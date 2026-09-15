@@ -24,6 +24,36 @@ fn redis_available() -> bool {
     true // not needed for this test — no Redis dependency
 }
 
+// ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
+//
+// The only place this file names the darkmux binary.
+//
+// Before #2710 the spawn below did `.env("HOME", …)
+// .env_remove("DARKMUX_HOME")` and neutralized nothing else. Measured at
+// that head with the dir set exported to sentinels and a fake `$HOME`:
+// EXIT=101, 1 failed, having written `fleet.json` and its lock into the
+// sentinel — because an inherited `DARKMUX_FLEET_FILE` OUTRANKS the
+// `HOME` this test pins, so all twelve concurrent `machine add`
+// invocations wrote through it instead of into the tempdir, and the test
+// then read back a roster nothing had written where it looked.
+//
+// `DARKMUX_HOME` stays REMOVED, deliberately: the assertion is on
+// `<tempdir>/.darkmux/fleet.json`, the DEFAULT resolution off `$HOME`.
+// `neutralize_state_vars` removes it along with the rest.
+use darkmux_types::test_isolation::neutralize_state_vars;
+
+/// A `std::process::Command` for the darkmux binary, scoped to `home` and
+/// neutralized. Neutralize FIRST, pin SECOND — `Command` applies `.env`
+/// and `.env_remove` in call order.
+fn darkmux_cmd(home: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"));
+    neutralize_state_vars(&mut cmd);
+    cmd.env("HOME", home);
+    cmd
+}
+
+// ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
+
 #[test]
 fn parallel_fleet_adds_keep_every_entry() {
     if !redis_available() {
@@ -31,7 +61,6 @@ fn parallel_fleet_adds_keep_every_entry() {
     }
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let bin = env!("CARGO_BIN_EXE_darkmux");
     let home = tmp.path().to_path_buf();
     let roster_path = home.join(".darkmux").join("fleet.json");
 
@@ -40,17 +69,14 @@ fn parallel_fleet_adds_keep_every_entry() {
     // entry will typically be lost to the load-then-save race.
     let mut handles = Vec::with_capacity(N_CONCURRENT);
     for i in 0..N_CONCURRENT {
-        let bin = bin.to_string();
         let home = home.clone();
         let id = format!("node-{i:02}");
         let handle = std::thread::spawn(move || {
-            std::process::Command::new(&bin)
+            darkmux_cmd(&home)
                 .args([
                     "machine", "add", &id,
                     "--address", &format!("127.0.0.1:{}", 10000 + i),
                 ])
-                .env("HOME", &home)
-                .env_remove("DARKMUX_HOME")
                 .output()
                 .expect("running `darkmux fleet add`")
         });
