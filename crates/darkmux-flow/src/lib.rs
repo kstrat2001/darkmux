@@ -3149,7 +3149,25 @@ mod tests {
         //           this same fix adds (`last_receiver_rejected_reasons`
         //           on `.last` and on `HookRuleStatus`) are NOT part of
         //           this constant's scope.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.48.0");
+        //   1.49.0 (#2690): the `dispatch.map` per-item
+        //           `telemetry.tokens` record gains additive `remote`
+        //           (bool) and `index` (u64) keys — the SEAT's own
+        //           hosted-or-local verdict and its position in the
+        //           fan-out. Sibling seats inside one task share both
+        //           `session_id` (`session_id::task`) and `mission_id`,
+        //           so the savings hero had no coordinate to separate
+        //           them and fell back to painting every token under the
+        //           key cloud whenever any bookend named an endpoint —
+        //           reporting local work as hosted spend. Both keys are
+        //           UNCONDITIONAL, so an absent `remote` means "a
+        //           different `telemetry.tokens` lineage" and the
+        //           consumer's per-key fallback needs no version check.
+        //           Minor, same "new optional payload key on an existing
+        //           action" bar as 1.44.0/1.48.0 above. See `schema.rs`'s
+        //           own history entry, including why ONE emitter is the
+        //           whole affected population and what live verification
+        //           is still owed.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.49.0");
     }
 
     #[test]
