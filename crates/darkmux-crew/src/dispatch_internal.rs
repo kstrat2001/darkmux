@@ -5810,6 +5810,35 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         opts.record_context.clone(),
     );
 
+    // (#2642) External, whole-`dispatch()`-level panic-injection hook for
+    // the process-survives thread-leak proof in
+    // `tests/dispatch_panic_thread_leak_proof.rs`. Gated on an env var so
+    // it is cold on every real operator dispatch — nobody sets this var
+    // by accident, the name says exactly what it does — but it is REAL,
+    // unconditional production code, not `#[cfg(test)]`: that integration
+    // test links this crate as an ordinary library dependency, which
+    // Cargo builds WITHOUT `cfg(test)` set, so a `#[cfg(test)]`-gated
+    // branch here would simply not exist in the binary the test actually
+    // calls into and would prove nothing.
+    //
+    // Lands HERE deliberately, not earlier and not later: every one of
+    // the three panic-safe `StopFlagGuard`s (`_tailer_stop_guard`,
+    // `_watchdog_abandon_guard`, `_sampler_stop_guard`) is armed and its
+    // real spawned thread is genuinely running by this point — panicking
+    // before any of them exist would prove nothing about guard behavior
+    // (no guard exists yet to catch it) — and NONE of `dispatch()`'s own
+    // explicit stop-and-join calls below (inside the `wait_with_output()`
+    // match arms) have run yet — panicking after one of those would only
+    // re-prove what the per-guard wiring tests in
+    // `dispatch_internal_tests.rs` already prove one function-call deep,
+    // not the whole-process property #2642 actually asks for.
+    if std::env::var_os("DARKMUX_TEST_PANIC_AFTER_GUARD_SPAWN").is_some() {
+        panic!(
+            "darkmux: #2642 test-injected panic between guard spawn and \
+             dispatch()'s own stop-and-join calls"
+        );
+    }
+
     let output = match child.wait_with_output() {
         Ok(o) => {
             // (#2131 review round 2, F1) Deregister HERE — right after

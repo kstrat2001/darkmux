@@ -14,7 +14,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, rosterOnlyEntries } from "./cards";
+import { buildFleetCard, rosterOnlyEntries, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -387,7 +387,16 @@ export function FleetLens({
   // the property true in the composed app rather than only in this lens's own
   // isolated test.
   const liveMachines = useLiveMachines(livePolling);
-  const liveSessionIds = useLiveSessionIds(livePolling);
+  // (#2725) `coverage` is deliberately NOT read here: this lens sits under
+  // the app-wide `FleetCoverageNotice` (`App.tsx` mounts it for every route),
+  // which already says the one sentence this app has about a degraded
+  // presence read — and it derives that from the machines half of the same
+  // substrate, so a sessions read that failed means the machines read failed
+  // too. A second marker on this page would be the duplicate wording #2683
+  // removed. Destructured explicitly rather than ignored implicitly so the
+  // choice is visible: the hook no longer discards the signal, this caller
+  // does, on the record, for a stated reason.
+  const { sessions: liveSessionIds } = useLiveSessionIds(livePolling);
   // (#1855) The operator's DECLARED roster, gated the same way as presence
   // above — a replay must not assert the CURRENT roster over a past day.
   // See `rosterOnlyEntries`'s own doc for how this is reconciled with the
@@ -664,7 +673,19 @@ export function FleetLens({
               </span>
               {card.name}
             </div>
-            <div className="spec">{card.spec ? card.spec : <span className="specdim">hardware not reported</span>}</div>
+            {/* (#1855) The dim fallback says WHICH kind of unknown this is —
+                a machine that beat and carried no hardware, vs one nothing
+                has ever been received from (a rostered-but-silent peer, the
+                cards this issue made visible in the first place). The
+                wording lives in `cards.ts::specUnknownLabel` so the card and
+                its tests read the same string. */}
+            <div className="spec">
+              {card.spec ? (
+                card.spec
+              ) : (
+                <span className="specdim">{specUnknownLabel(card.specUnknown ?? "not-reported")}</span>
+              )}
+            </div>
             <div className="stat">
               <span className="dot" />
               {card.stat}

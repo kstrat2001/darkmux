@@ -553,9 +553,30 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 ///   `runtime/tests/` and `examples/` are out of scope — nothing there
 ///   spawns darkmux today, and nothing prevents it tomorrow.
 ///
-/// These are filed as #2717 rather than patched here, because the durable
-/// answer is a structural chokepoint plus an execution-side check, not a
-/// longer token list.
+/// (#2717) None of these is closed by more tokens or a wider walk, so the
+/// durable answer was built beside this one rather than folded into it:
+/// `tests/state_leak_execution_guard.rs` runs each test unit under a
+/// sentinel state tree and asserts the file census is empty. That observes
+/// the EFFECT, so every shape above collapses into one check — and it
+/// reaches shapes this scan cannot see at all, including in-process
+/// writers that spawn nothing (#2718) and destinations in directories
+/// nobody thought to walk.
+///
+/// It is NOT a superset, and it shares the boundary named in the last
+/// bullet above: its units are the ROOT `tests/*.rs` plus `-p <member>
+/// --lib`, and `--lib` never builds a package's own integration targets,
+/// so `crates/*/tests/` is outside BOTH checks. Its own module doc
+/// carries the decoy measurement that proves it.
+///
+/// This scan is KEPT as the fast pre-check, because it earns its keep on
+/// one axis the execution check cannot reach: a text scan names the
+/// offending FILE AND LINE and costs milliseconds on every `cargo test`,
+/// where a file census can only name the target and has to re-run it.
+/// Measured against the same tree, with a new target spawning the binary
+/// off a path derived from `current_exe()` — a spelling none of the four
+/// tokens recognizes: this scan was EXIT=0, and the execution check named
+/// `cargo test --test w34a_decoy_spawn` with 2 leaked files
+/// (`fleet.json`, `fleet.json.lock`) while the child itself exited 0.
 #[test]
 fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
     // Split with `concat!` on purpose: written as one literal, these two
@@ -7892,6 +7913,314 @@ fn mission_status_stale_session_with_no_terminal_drifts_and_renders_for_a_human(
     );
 }
 
+// ── (#2682 round 4) the three row-groups this round closed, end-to-end ───
+//
+// Same discipline as the block above, for the same reason: every rule here
+// is ALSO covered by unit tests inside `src/mission_status.rs` /
+// `crates/darkmux-serve/src/runs.rs` that hand-build their inputs, and
+// #2689 measured that disconnecting `run()`'s own lookup entirely left 93
+// of those green. These go through the REAL subprocess. Each one asserts
+// the OTHER surface's reading first, so what follows measures a known
+// disagreement rather than an empty board.
+
+/// Writes `mission.json` + one `phases/<id>.json` per entry, at any mission
+/// status and any phase statuses — the general form of
+/// `write_running_mission` above. Pure static JSON: no `mission launch`, no
+/// dispatch, no container, no model, no network.
+fn write_mission_with_phases(
+    home: &std::path::Path,
+    mission_id: &str,
+    mission_status: &str,
+    phases: &[(&str, &str)],
+    started_ts: u64,
+) {
+    let mission_dir = home.join("missions").join(mission_id);
+    fs::create_dir_all(mission_dir.join("phases")).unwrap();
+    fs::write(
+        mission_dir.join("mission.json"),
+        serde_json::json!({
+            "id": mission_id,
+            "description": "round-4 e2e fixture",
+            "status": mission_status,
+            "phase_ids": phases.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "created_ts": started_ts,
+            "started_ts": started_ts,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for (phase_id, phase_status) in phases {
+        fs::write(
+            mission_dir.join("phases").join(format!("{phase_id}.json")),
+            serde_json::json!({
+                "id": phase_id,
+                "mission_id": mission_id,
+                "description": "round-4 e2e phase",
+                "status": phase_status,
+                "created_ts": started_ts,
+                "started_ts": started_ts,
+                "task_ids": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+}
+
+/// The `status` field of `darkmux run list --json --all`'s row for `id`.
+fn run_list_status(home: &std::path::Path, flows: &std::path::Path, id: &str) -> String {
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_FLOWS_DIR", flows)
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["run", "list", "--json", "--all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let runs: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    runs["runs"]
+        .as_array()
+        .expect("run list --json always emits a runs array")
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap_or_else(|| panic!("no run row for {id}: {runs}"))["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The drift `kind`s `darkmux mission status --json` renders for `id`.
+fn board_drift_kinds(home: &std::path::Path, flows: &std::path::Path, id: &str) -> Vec<String> {
+    let out = darkmux_cmd()
+        .env("DARKMUX_HOME", home)
+        .env("DARKMUX_FLOWS_DIR", flows)
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["mission", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let board: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    mission_drift(&board, id)["drift"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// (#2682 round 4) The one family where the BOARD was right and `darkmux
+/// run list` was wrong: a Paused mission whose dispatch session carried a
+/// `session.end`. #1642 already ruled that a paused mission must never
+/// decay into `Abandoned`, but its early-return sat BELOW the all-terminal
+/// branch, so the exemption leaked. The surfaces now agree.
+///
+/// NOT vacuous, and the second half is what proves it: the byte-identical
+/// fixture with `status: "active"` must still read `abandoned`. So the
+/// first half measures the pause exemption, not a fixture that was never
+/// near the boundary.
+#[test]
+fn run_list_does_not_call_a_paused_mission_abandoned_from_a_recorded_session_end() {
+    let write_end_record = |flows: &std::path::Path, mission_id: &str| {
+        let day = darkmux_flow::day_utc_now();
+        fs::write(
+            flows.join(format!("{day}.jsonl")),
+            serde_json::json!({
+                "ts": "2024-01-01T09:00:00Z",
+                "action": "session.end",
+                "session_id": format!("{mission_id}-sess"),
+                "mission_id": mission_id,
+                "handle": "coder",
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    write_mission_with_phases(
+        home.path(),
+        "paused-end-e2e",
+        "paused",
+        &[("p1", "running")],
+        now - 25 * 60,
+    );
+    write_end_record(flows.path(), "paused-end-e2e");
+    assert_eq!(
+        run_list_status(home.path(), flows.path(), "paused-end-e2e"),
+        "running",
+        "a paused mission must not read abandoned — `mission pause` never touches a process, so \
+         its dispatch not being alive is the expected state"
+    );
+    assert!(
+        board_drift_kinds(home.path(), flows.path(), "paused-end-e2e").is_empty(),
+        "and the board, which was already right, must not have gained a drift for it"
+    );
+
+    // The boundary control: the SAME records under an ACTIVE mission still
+    // read abandoned, and the board still names it. Without this the
+    // assertion above would pass with the whole recorded-end branch deleted.
+    let home2 = TempDir::new().unwrap();
+    let flows2 = TempDir::new().unwrap();
+    write_mission_with_phases(
+        home2.path(),
+        "paused-end-e2e",
+        "active",
+        &[("p1", "running")],
+        now - 25 * 60,
+    );
+    write_end_record(flows2.path(), "paused-end-e2e");
+    assert_eq!(
+        run_list_status(home2.path(), flows2.path(), "paused-end-e2e"),
+        "abandoned",
+        "the pause exemption must not disable the recorded-end verdict for an Active mission"
+    );
+    assert!(
+        board_drift_kinds(home2.path(), flows2.path(), "paused-end-e2e")
+            .iter()
+            .any(|k| k == "running-phase-session-dead"),
+        "…and #2689's rule must still fire there"
+    );
+}
+
+/// (#2682 round 4) A CLOSED mission still holding a `Running` phase — ten
+/// of the disagreement rows. `run list` reads it `abandoned`; the board used
+/// to say nothing, on #1463's "no longer a reachable state" claim, which is
+/// true of the happy path only (`reconcile_mission_phases_terminal` swallows
+/// every failure and the mission is saved `Finalized` regardless).
+#[test]
+fn mission_status_names_a_closed_mission_that_still_holds_an_open_phase() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap(); // no flow records needed
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_mission_with_phases(
+        home.path(),
+        "closed-open-phase-e2e",
+        "finalized",
+        &[("p1", "running")],
+        now - 25 * 60,
+    );
+
+    assert_eq!(
+        run_list_status(home.path(), flows.path(), "closed-open-phase-e2e"),
+        "abandoned",
+        "fixture premise: `run list` must genuinely disagree, or the board's new drift below \
+         proves nothing"
+    );
+    assert_eq!(
+        board_drift_kinds(home.path(), flows.path(), "closed-open-phase-e2e"),
+        vec!["mission-terminal-open-phase"],
+    );
+
+    // The human board, same fixture: the sentence AND the copy-pasteable
+    // per-phase reconcile command both have to reach it.
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{}", String::from_utf8_lossy(&human.stderr));
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_out.contains("never reached a terminal status"),
+        "the drift's own sentence must reach the human board:\n{human_out}"
+    );
+    assert!(
+        human_out.contains("darkmux mission abort closed-open-phase-e2e --phase p1"),
+        "the copy-pasteable reconcile command must reach the human board:\n{human_out}"
+    );
+
+    // The healthy neighbor, one field away: the same closed mission with its
+    // phase reconciled draws nothing at all.
+    let ok = TempDir::new().unwrap();
+    write_mission_with_phases(
+        ok.path(),
+        "closed-reconciled-e2e",
+        "finalized",
+        &[("p1", "complete")],
+        now - 25 * 60,
+    );
+    assert!(
+        board_drift_kinds(ok.path(), flows.path(), "closed-reconciled-e2e").is_empty(),
+        "a properly reconciled Finalized mission must stay clean"
+    );
+}
+
+/// (#2682 round 4) An ACTIVE mission whose phases are ALL terminal and none
+/// completed — three of the disagreement rows. `done-not-finalized`
+/// deliberately excludes it (its sentence is "the mission looks done", which
+/// this shape is not), so nothing said anything at all.
+#[test]
+fn mission_status_names_an_open_mission_whose_phases_all_ended_without_completing() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_mission_with_phases(
+        home.path(),
+        "nothing-complete-e2e",
+        "active",
+        &[("p1", "abandoned"), ("p2", "abandoned")],
+        now - 25 * 60,
+    );
+
+    assert_eq!(
+        run_list_status(home.path(), flows.path(), "nothing-complete-e2e"),
+        "abandoned",
+        "fixture premise: `run list` must genuinely disagree with the board's old silence"
+    );
+    assert_eq!(
+        board_drift_kinds(home.path(), flows.path(), "nothing-complete-e2e"),
+        vec!["all-phases-terminal-none-complete"],
+    );
+
+    let human = darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "60")
+        .args(["mission", "status", "--all"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{}", String::from_utf8_lossy(&human.stderr));
+    let human_out = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_out.contains("none completed (2 of 2 abandoned)"),
+        "the drift's own sentence must reach the human board:\n{human_out}"
+    );
+    assert!(
+        !human_out.contains("looks done"),
+        "and it must NOT borrow `done-not-finalized`'s wording:\n{human_out}"
+    );
+
+    // The healthy neighbor: ONE completed phase moves the mission to the
+    // rule whose sentence actually fits it, and the two never both fire.
+    let mixed = TempDir::new().unwrap();
+    write_mission_with_phases(
+        mixed.path(),
+        "mixed-outcome-e2e",
+        "active",
+        &[("p1", "abandoned"), ("p2", "complete")],
+        now - 25 * 60,
+    );
+    assert_eq!(
+        board_drift_kinds(mixed.path(), flows.path(), "mixed-outcome-e2e"),
+        vec!["done-not-finalized"],
+    );
+}
+
 // ── (#2300) growth: a step's OUTPUT grows tasks into the graph ───────────
 //
 // The invariant under test is the SEAM, not any one mission: phase 1 writes
@@ -10299,5 +10628,77 @@ fn mission_status_never_labels_a_same_machine_orphan_as_observed_on_the_fleet() 
     assert!(
         !text.contains("OBSERVED ON THE FLEET"),
         "a same-machine orphan must not spawn a fleet section at all:\n{text}"
+    );
+}
+
+/// (#2678) A finished run records its own wall-clock in the envelope, so the
+/// number that decides whether a CI job's `timeout-minutes` needs raising is
+/// readable off the run's own artifact instead of inferred from workflow logs.
+///
+/// `procedural.noop` needs no model, network, or Docker — purely hermetic.
+///
+/// The assertion is that the field is PRESENT, which is the whole property:
+/// `wall_ms` is `skip_serializing_if = "Option::is_none"`, so a launcher that
+/// never stamps it writes no key at all and this goes red. A value assertion
+/// is not available — the real duration is whatever the machine took — so the
+/// bounds below only reject a value that could not be a measurement of this
+/// run (a stamped zero-that-means-unmeasured, or a clock-derived absurdity).
+#[test]
+fn mission_launch_records_the_run_wall_clock_in_the_envelope() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "wall-clock-test",
+        "name": "Wall Clock Test",
+        "schema_version": "3.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{ "id": "s1", "kind": "procedural.noop" }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("wall-clock-test.json"), config_json).unwrap();
+
+    darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args(["mission", "launch", "wall-clock-test"])
+        .assert()
+        .success();
+
+    let missions_dir = home.path().join("missions");
+    let mission_dir = fs::read_dir(&missions_dir)
+        .expect("missions/ must exist after a successful launch")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.join("envelope.json").is_file())
+        .expect("the launch must have persisted an envelope.json");
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(mission_dir.join("envelope.json")).unwrap())
+            .expect("envelope.json must be JSON");
+
+    let wall_ms = envelope
+        .get("wall_ms")
+        .unwrap_or_else(|| panic!("envelope must record the run's wall-clock: {envelope}"))
+        .as_u64()
+        .unwrap_or_else(|| panic!("wall_ms must be a whole number of ms: {envelope}"));
+
+    // A real elapsed measurement of a process that started, loaded a config,
+    // ran a step and finalized. An hour would mean the clock, not the run.
+    assert!(
+        wall_ms < 3_600_000,
+        "wall_ms must be this run's duration, not a clock artifact: {wall_ms}"
+    );
+
+    assert_eq!(
+        envelope.get("schema_version").and_then(|v| v.as_str()),
+        Some("1.5"),
+        "adding wall_ms is an additive field ⇒ minor bump: {envelope}"
     );
 }

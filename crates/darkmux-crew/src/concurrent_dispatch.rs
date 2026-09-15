@@ -96,6 +96,7 @@ use darkmux_gestalt::{
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
 use darkmux_types::residency_lease;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -175,8 +176,74 @@ where
         .to_string();
     std::thread::Builder::new()
         .name(name)
-        .spawn(f)
+        .spawn(move || {
+            // (#2642) Counts itself in for exactly as long as this OS
+            // thread is alive — incremented as the very first statement
+            // the spawned thread runs (never at the CALL site, so a
+            // `Builder::spawn` failure below can't leak an increment with
+            // no thread to ever decrement it) and decremented by this
+            // guard's `Drop`, which Rust runs on the thread's ordinary
+            // return AND on an unwind, so a thread body that somehow
+            // panicked (none of `run_watchdog`/`run_tailer`/
+            // `run_telemetry_sampler` do today) still counts itself gone
+            // rather than leaving [`ACTIVE_DETACHED_THREADS`] stuck
+            // non-zero forever. See that static's own doc for why this
+            // exists and why it is unconditional production code.
+            let _counter_guard = DetachedThreadCounterGuard::new();
+            f()
+        })
         .expect("darkmux: failed to spawn worker thread")
+}
+
+/// (#2642) Process-wide count of OS threads currently alive that were
+/// spawned via [`spawn_detached_named`] — the tailer, watchdog, and
+/// telemetry-sampler threads `dispatch()` spawns are the only three
+/// production call sites (verified by grep across the workspace; nothing
+/// else reaches this function).
+///
+/// This is real, UNCONDITIONAL instrumentation — deliberately not
+/// `#[cfg(test)]` — because the external proof this exists for
+/// (`crates/darkmux-crew/tests/dispatch_panic_thread_leak_proof.rs`) is an
+/// ordinary integration test: it links `darkmux-crew` as a normal library
+/// dependency, which Cargo builds WITHOUT `cfg(test)` set. A
+/// `#[cfg(test)]`-gated counter would simply not exist in the binary that
+/// test calls into, and would prove nothing about the production control
+/// flow it is meant to pin. #2642's whole finding was that `dispatch()`
+/// hands no thread handle to its caller and joins everything internally on
+/// every ordinary exit path — so there was no external signal at all to
+/// assert "no thread survives a mid-dispatch panic" against. This static,
+/// plus [`active_detached_thread_count`] below, is that signal.
+static ACTIVE_DETACHED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// (#2642) RAII counter for [`ACTIVE_DETACHED_THREADS`]: increments on
+/// construction, decrements on `Drop`. Constructed as the first statement
+/// INSIDE the spawned closure (see `spawn_detached_named` above), never at
+/// the call site — so a thread that never actually started (an OS spawn
+/// failure) never increments the count either.
+struct DetachedThreadCounterGuard;
+
+impl DetachedThreadCounterGuard {
+    fn new() -> Self {
+        ACTIVE_DETACHED_THREADS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DetachedThreadCounterGuard {
+    fn drop(&mut self) {
+        ACTIVE_DETACHED_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// (#2642) Read-only external view of [`ACTIVE_DETACHED_THREADS`]. `pub`
+/// — not `pub(crate)` like every other item in this "detached" family —
+/// specifically so a `tests/*.rs` integration test, which only ever sees
+/// this crate's PUBLIC surface, can poll it from outside `dispatch()`'s own
+/// stack frame. The only cost of exposing this permanently is one relaxed
+/// atomic load; there is nothing here an operator could misuse — it counts,
+/// it does not control anything.
+pub fn active_detached_thread_count() -> usize {
+    ACTIVE_DETACHED_THREADS.load(Ordering::SeqCst)
 }
 
 /// One job queued for [`run_bounded`]. `index` is the CALLER's own

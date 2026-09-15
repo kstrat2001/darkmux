@@ -916,7 +916,6 @@ mod tests {
             schema_version: "1.0.0".to_string(),
             beat_ts_ms: darkmux_flow::presence::now_ms(),
             specs: None,
-            loaded_models: Vec::new(),
             darkmux_version: None,
         };
         darkmux_flow::presence::write_beat(&redis_client, &beat, 60).unwrap();

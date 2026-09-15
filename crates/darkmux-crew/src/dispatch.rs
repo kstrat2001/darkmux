@@ -1657,6 +1657,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn dispatch_internal_composes_the_resolved_mission_into_a_config_derived_session_id() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_CREW_DIR").ok();
         unsafe {

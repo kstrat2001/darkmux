@@ -564,20 +564,47 @@ mod tests {
     }
 
     /// Scopes `DARKMUX_HOME` for one test and restores the prior value.
-    struct HomeGuard(Option<String>);
+    struct HomeGuard {
+        /// Held, never read: the guard IS its `Drop`, which restores every
+        /// variable it displaced. `dead_code` reads that as a removable field.
+        _isolated: darkmux_types::test_isolation::IsolatedState,
+    }
     impl HomeGuard {
         fn set(p: &Path) -> Self {
-            let prior = std::env::var("DARKMUX_HOME").ok();
+            // (#2718) `IsolatedState` first — it pins EVERY darkmux write
+            // destination under one throwaway root and records what it
+            // displaced — then re-point the ones these fixtures stage at `p`.
+            //
+            // The `DARKMUX_HOME`-only version this replaces is the guard
+            // class #2693 retired in `darkmux-crew` for a measured reason, and
+            // it had the same consequence here: `DARKMUX_CREW_DIR` OUTRANKS
+            // `DARKMUX_HOME` in `user_state_root()` (and
+            // `DARKMUX_FINDINGS_DIR`/`DARKMUX_MODS_DIR` outrank it in their
+            // own accessors), so for anyone who has one exported these tests
+            // isolated nothing and shared one directory.
+            //
+            // Measured, `cargo test -p darkmux-lab --lib`, four cells:
+            //
+            //   guard        DARKMUX_CREW_DIR exported   result
+            //   home-only    yes                         15 failed / 681 passed
+            //   home-only    no                          696 passed
+            //   this one     yes                         696 passed
+            //   this one     no                          696 passed
+            //
+            // The failures are environmental — they are an ambient variable,
+            // not a defect in the code under test — which is exactly why they
+            // are worth removing: an operator who exports a scratch crew dir
+            // should not be handed fifteen red tests that have nothing to do
+            // with their change. Same finding as #2693, one package over.
+            //
+            // No `Drop` of its own: `IsolatedState` restores every variable it
+            // pinned, these three included.
+            let isolated = darkmux_types::test_isolation::IsolatedState::new();
             std::env::set_var("DARKMUX_HOME", p);
-            Self(prior)
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
+            std::env::set_var("DARKMUX_CREW_DIR", p);
+            std::env::set_var("DARKMUX_FINDINGS_DIR", p.join("findings"));
+            std::env::set_var("DARKMUX_MODS_DIR", p.join("mods"));
+            Self { _isolated: isolated }
         }
     }
 

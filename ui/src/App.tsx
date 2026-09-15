@@ -41,9 +41,11 @@ import type { Route } from "./lib/route";
  * The app shell. A `switch` over the parsed [[Route]] (see `lib/route.ts` for
  * the hash-grammar port) drives `#stage`; `fleet` (`FleetLens`, Packet 8 —
  * the savings hero + machine cards + activity timeline; supersedes the
- * scaffold's original `FleetStrip` presence-only proof region, still tested
- * standalone in `components/FleetStrip.test.tsx` but no longer mounted
- * here), `runs` (`RunsBoard`, Packet 3), and `machine` (`MachineLens`,
+ * scaffold's original `FleetStrip` presence-only proof region, DELETED in
+ * #2725 — it had been unmounted since this lens took the route, and an
+ * unmounted component with a passing test suite is what let the #1729
+ * coverage marker vanish unnoticed), `runs` (`RunsBoard`, Packet 3), and
+ * `machine` (`MachineLens`,
  * Packet 2) are real regions driven by `useQuery`; `mission`
  * (`MissionGraphLens`, #1868) is a real, self-contained region with its own
  * header/events pane; `session`/`playback` (Packet 4) do REAL fetches/

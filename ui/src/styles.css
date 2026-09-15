@@ -1728,104 +1728,6 @@ body {
   padding: 10px 2px;
 }
 
-/* Fleet strip — three visibly distinct data states. */
-.fleet-strip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-
-.fleet-strip--pending .fleet-skeleton {
-  width: 220px;
-  height: 64px;
-  border-radius: 8px;
-  background: linear-gradient(90deg, #1a1f2e 25%, #232941 37%, #1a1f2e 63%);
-  background-size: 400% 100%;
-  animation: shimmer 1.4s ease infinite;
-}
-
-@keyframes shimmer {
-  0% {
-    background-position: 100% 0;
-  }
-  100% {
-    background-position: -100% 0;
-  }
-}
-
-/* (U5-3) The one animation on this page that was missing the guard every
-   other one carries (`--beat`, `.masthead__refresh.spin`, `.labrunrow`'s
-   nudge, `.dialog`'s entrance). A loading skeleton is exactly the kind of
-   endless motion the preference exists to stop; the state still reads as
-   "pending" from its own placeholder shape. */
-@media (prefers-reduced-motion: reduce) {
-  .fleet-strip--pending .fleet-skeleton {
-    animation: none;
-  }
-}
-
-.fleet-strip--error {
-  border: 1px solid var(--error);
-  background: rgba(245, 101, 101, 0.08);
-  border-radius: 8px;
-  padding: 12px 16px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--error);
-}
-
-.fleet-strip--empty {
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  padding: 16px;
-  color: var(--dim);
-}
-
-/* "We couldn't look" (unavailable/stale), not "we looked and it's empty" —
-   `--warn`, not `--error`: a degraded presence read is a caution, not a
-   failure, matching `.fleetcov`'s own warn treatment for the same
-   distinction on the mounted FleetLens variant of this marker. */
-.fleet-strip--degraded {
-  border: 1px solid var(--warn);
-  background: rgba(240, 180, 90, 0.08);
-  border-radius: 8px;
-  padding: 12px 16px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--warn);
-}
-
-.fleet-strip__icon {
-  flex: none;
-}
-
-.fleet-strip__count {
-  color: var(--dim);
-  font-size: calc(12px * var(--fs-scale));
-}
-
-.fleet-strip--data .fleet-card {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 16px;
-  min-width: 200px;
-  background: var(--panel-2);
-}
-
-.fleet-card__name {
-  font-weight: 600;
-  color: var(--accent);
-}
-
-.fleet-card__specs,
-.fleet-card__models {
-  font-size: calc(12px * var(--fs-scale));
-  color: var(--dim);
-  margin-top: 4px;
-}
-
 .lens-placeholder {
   border: 1px dashed var(--border);
   border-radius: 8px;
@@ -2073,7 +1975,7 @@ body {
 .wstatus.is-running { color: var(--accent); border-color: var(--accent); }
 .wstatus.is-done { color: var(--good); border-color: var(--good); }
 .wstatus.is-error { color: var(--bad); border-color: var(--bad); }
-/* (#2406) Same `--warn` token `.is-stopped` and `.fleet-strip--degraded`
+/* (#2406) Same `--warn` token `.is-stopped` and `.fleetcov`
    already use for "a caution, not a failure" — a mixed terminal is a
    caution, not a failure, same as an operator/budget stop. Reusing the
    existing warn palette on purpose (no new color for an existing concept);
@@ -3311,7 +3213,14 @@ body {
 /* (#1729) Fleet-coverage marker — shown ONLY when the presence substrate
    could not be read (or is stale). An unconfigured fleet is not a
    degradation, so a standalone machine never sees this. (#2683: it mounts
-   app-wide now, not just on the default view.) */
+   app-wide now, not just on the default view.)
+
+   `--warn`, not `--error`: "we could not look" is a caution, not a failure —
+   we are missing an answer, not reporting a broken one. (#2725: this
+   rationale used to live on `.fleet-strip--degraded`, the unmounted
+   scaffold strip's own copy of this marker, and moved here when that
+   component and its styles were deleted. It is the reason `.wstatus.
+   is-degraded` and `.is-stopped` cite for reusing the same token.) */
 .fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 calc(12px * var(--fs-scale))/1.4 var(--font-mono)}
 .fleetcov__icon{flex:none}
 /* (#2683) The app-wide mount needs the horizontal padding the lens's own

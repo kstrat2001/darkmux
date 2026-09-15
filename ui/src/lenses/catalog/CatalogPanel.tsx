@@ -29,7 +29,8 @@ import { CATALOG_MISSION_CAP, daySummary, missionSummary, missionsHeader, todayU
  *     (post-first-review, must-fix): the module doc HERE used to call this
  *     an improvement "for a destination /next already owns" — that overstates
  *     it. `/next`'s default route OWNS THE ROUTE, not the render: today it's
- *     `FleetStrip` (a `/fleet/machines/live` presence strip), while legacy's
+ *     `FleetLens` (Packet 8; when this comment was written it was the
+ *     scaffold's `FleetStrip` presence strip, deleted in #2725), while legacy's
  *     `fleet.txt` goldens show a full dispatch/token hero + activity timeline
  *     that `/next` doesn't reproduce yet (`PlaybackLens.tsx`'s own doc names
  *     the same gap: the fleet-hero pipeline is Packet 5's territory). So this

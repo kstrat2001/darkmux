@@ -3,7 +3,7 @@ import { renderHook, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useRouteRecords } from "./useRouteRecords";
-import { TERMINAL_GRACE_MS } from "./useSessionLiveness";
+import { TERMINAL_GRACE_MS, useSessionLiveness } from "./useSessionLiveness";
 import { PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
 import type { FlowWindowResult } from "./useFlowWindow";
@@ -39,9 +39,17 @@ import type { FlowWindowResult } from "./useFlowWindow";
  * record is, for a moment, invisible to a live-gated poll by construction.
  */
 
-const h = vi.hoisted(() => ({ liveIds: new Set<string>() }));
+const h = vi.hoisted(() => ({
+  liveIds: new Set<string>(),
+  coverage: null as { state: "unavailable" | "stale"; detail?: string } | null,
+}));
+// (#2725) The hook returns `{ sessions, coverage }` now — the coverage half
+// is what `useSessionLiveness` consults before claiming a disappearance was
+// the run ending. `coverage` stays `null` (healthy presence) for every test
+// in this file except the block that names it.
 vi.mock("./useLiveSessionIds", () => ({
-  useLiveSessionIds: (enabled = true) => (enabled ? h.liveIds : new Set<string>()),
+  useLiveSessionIds: (enabled = true) =>
+    enabled ? { sessions: h.liveIds, coverage: h.coverage } : { sessions: new Set<string>(), coverage: null },
 }));
 
 const LIVE: FlowWindowResult = {
@@ -91,6 +99,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   h.liveIds = new Set<string>();
+  h.coverage = null;
 });
 
 describe("the live → done transition on a session route (#2011)", () => {
@@ -169,5 +178,74 @@ describe("the live → done transition on a session route (#2011)", () => {
       await vi.advanceTimersByTimeAsync(10 * PRESENCE_POLL_MS);
     });
     expect(sliceFetches()).toBe(settled);
+  });
+});
+
+/**
+ * (#2725) `endedByPresence` is an AFFIRMATIVE claim, and it was being made
+ * from reads that never happened.
+ *
+ * `SessionReplay` consumes it as direct evidence that a run stopped — it
+ * stops the live clock on it, deliberately overriding the quiet-threshold
+ * heuristic that otherwise governs. `useLiveSessionIds` used to hand back
+ * only the session `Set`, discarding the `meta.sources.fleet` coverage the
+ * same response carries. So a failed presence read (`fetchJson` returns
+ * `ok:false` on a daemon that died mid-run) produced an EMPTY set, which is
+ * byte-identical to "presence says nothing is running", the live → not-live
+ * edge fired for every open session at once, and the page reported a running
+ * dispatch as finished.
+ *
+ * These drive the hook directly rather than through `useRouteRecords`:
+ * `endedByPresence` is not observable through that hook's return, and the
+ * defect is in the claim, not in the polling.
+ */
+describe("endedByPresence under degraded fleet coverage (#2725)", () => {
+  it("does NOT claim the run ended when the disappearance was seen through a failed read", async () => {
+    const { result, rerender } = renderHook(() => useSessionLiveness(SID), { wrapper: wrapper() });
+    h.liveIds = new Set([SID]);
+    rerender();
+    await waitFor(() => expect(result.current.isLive).toBe(true));
+
+    // The daemon dies. The read fails, the set empties, coverage says so.
+    h.liveIds = new Set<string>();
+    h.coverage = { state: "unavailable", detail: "the presence read failed" };
+    rerender();
+
+    await waitFor(() => expect(result.current.isLive).toBe(false));
+    expect(result.current.endedByPresence).toBe(false);
+    // The bounded grace window still opens — a refetch of the slice is the
+    // right move either way, and it is what recovers the terminal record if
+    // the run really did end.
+    expect(result.current.shouldPoll).toBe(true);
+    // The caveat is carried, not swallowed.
+    expect(result.current.coverage).toEqual({ state: "unavailable", detail: "the presence read failed" });
+  });
+
+  it("DOES claim the run ended when the same disappearance is seen through a healthy read", async () => {
+    // The inverted case, and the one that matters most: a guard that withheld
+    // `endedByPresence` unconditionally would pass the test above while
+    // breaking the #2011 behavior it exists beside — every finished run would
+    // spend ten minutes climbing to the watchdog timeout before admitting it
+    // had stopped.
+    const { result, rerender } = renderHook(() => useSessionLiveness(SID), { wrapper: wrapper() });
+    h.liveIds = new Set([SID]);
+    rerender();
+    await waitFor(() => expect(result.current.isLive).toBe(true));
+
+    h.liveIds = new Set<string>();
+    h.coverage = null;
+    rerender();
+
+    await waitFor(() => expect(result.current.endedByPresence).toBe(true));
+    expect(result.current.coverage).toBeNull();
+  });
+
+  it("stays quiet on a healthy fleet that simply never listed the session", async () => {
+    // The other inverted case: absence on its own is not evidence, and a
+    // healthy read must not start reporting coverage where there is none.
+    const { result } = renderHook(() => useSessionLiveness(SID), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.isLive).toBe(false));
+    expect(result.current.endedByPresence).toBe(false);
+    expect(result.current.coverage).toBeNull();
   });
 });

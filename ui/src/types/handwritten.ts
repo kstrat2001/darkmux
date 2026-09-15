@@ -101,7 +101,6 @@ export interface PresenceBeat {
   schema_version: string;
   beat_ts_ms: number;
   specs?: string;
-  loaded_models?: string[];
 }
 
 /** `GET /machine/specs`. Source:

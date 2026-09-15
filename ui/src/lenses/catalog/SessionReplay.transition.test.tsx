@@ -22,8 +22,10 @@ import { SessionReplay } from "./SessionReplay";
  */
 
 const h = vi.hoisted(() => ({ liveIds: new Set<string>() }));
+// (#2725) `{ sessions, coverage }` — see `useSessionLiveness.test.tsx`.
 vi.mock("../../hooks/useLiveSessionIds", () => ({
-  useLiveSessionIds: (enabled = true) => (enabled ? h.liveIds : new Set<string>()),
+  useLiveSessionIds: (enabled = true) =>
+    enabled ? { sessions: h.liveIds, coverage: null } : { sessions: new Set<string>(), coverage: null },
 }));
 
 const SID = "s-live";

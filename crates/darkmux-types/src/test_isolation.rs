@@ -348,6 +348,281 @@ pub fn neutralize_state_vars(cmd: &mut std::process::Command) {
     }
 }
 
+
+/// (#2717) [`IsolatedState`]'s EXECUTION-SIDE counterpart: a throwaway
+/// state tree a whole test target can be run under, plus a census of
+/// everything that landed in it.
+///
+/// # Why this exists, when a text scan already does
+///
+/// `tests/cli.rs`'s
+/// `every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper`
+/// scans SOURCE for four recognized spellings inside a marker fence. Four
+/// escapes were demonstrated against it, each leaving it at EXIT=0 while
+/// files leaked:
+///
+/// * a resolver named anything other than the one recognized function
+///   name is invisible, and so is a `PATH`-resolved
+///   `Command::new("darkmux")`;
+/// * deleting the single token that caught four of the five original
+///   offenders leaves the guard green, because the `>= 2` anti-vacuity
+///   floor is still met by the remaining fences;
+/// * a fenced block that spawns darkmux raw while calling the neutralizer
+///   on a DECOY `Command` passes both assertions;
+/// * the scan checks that the call APPEARS on a non-`//` line, never that
+///   it RUNS — so a block comment (`/* … */`, which `is_code` does not
+///   exclude and which is what an editor produces when a selection is
+///   commented out), a string literal, or a `#[cfg(any())]` item all
+///   satisfy it.
+///
+/// Adding tokens loses to the next spelling; widening the walk loses to
+/// the decoy. This observes the EFFECT instead: run the target under a
+/// tree nothing legitimate should touch, then count. That catches every
+/// shape at once — unknown spellings, decoys, grandchildren spawned
+/// through a shell, in-process writes that never spawn anything at all,
+/// and destinations in directories nobody thought to walk. It is also the
+/// measurement that found every leak on record here (#2693, #2697, #2708,
+/// #2710, #2718); none was found by reading code.
+///
+/// # What it pins, and why BOTH halves are counted
+///
+/// Two failure shapes, so two destinations:
+///
+/// * a write that HONORS the state variables lands under [`root`]; and
+/// * a write that ignores them and re-derives from `$HOME` — which is
+///   what an ordinary developer machine looks like, since almost nobody
+///   exports these — lands under `<home>/.darkmux`.
+///
+/// [`census`] counts both. Counting only the convenient one is a measured
+/// failure mode: one sweep counted mission directories and missed flow
+/// records entirely; another counted two directories and missed 8,263
+/// temp directories (#2707).
+///
+/// # It PINS the root and CLEARS everything else, and that asymmetry is
+/// the whole design
+///
+/// **A variable that outranks the root is the right thing to CLEAR and the
+/// wrong thing to PIN.** `DARKMUX_CREW_DIR` outranks `DARKMUX_HOME` in
+/// `user_state_root()`; `DARKMUX_LAB_DIR`, `DARKMUX_FINDINGS_DIR` and
+/// `DARKMUX_MODS_DIR` outrank it in their own accessors. Pinning one of
+/// those to a single scratch path does not isolate the target — it
+/// OVERRIDES every per-test guard inside it with one shared value, so
+/// tests that isolate themselves correctly are forced onto one directory
+/// and collide. Measured on `darkmux-lab`: with `DARKMUX_CREW_DIR` pinned,
+/// 31 crawl tests fail on the shared directory (a rename hits `ENOENT`
+/// after a sibling's cleanup); with the pin removed, 2,416 of 2,416 pass.
+/// Same binary, same diff — the failures were the harness, not the code.
+///
+/// Clearing has neither problem: each test's own isolation applies
+/// normally, and anything that isolates NOTHING falls through to the
+/// pinned root or to `$HOME`, where the census sees it. So the sentinel
+/// pins exactly one variable — `DARKMUX_HOME`, the root, which every
+/// default derives from and which any test's own pin overrides — and
+/// removes the rest. It is the same asymmetry [`IsolatedState`] makes for
+/// the same reason, one layer out.
+///
+/// # The audit chain: counted, not forced, and the gap is named
+///
+/// `DARKMUX_AUDIT_DIR` is CLEARED like the rest, even though its presence
+/// is what enables the hash-chained sink. Pinning it would turn the audit
+/// destination on — which is the destination that matters most, since an
+/// append-only chained record cannot be removed without breaking the chain
+/// (#2697) — but it is also a variable that outranks the root, so the rule
+/// above applies to it unchanged, and pinning it binds the whole binary's
+/// memoized default sink before any test runs (#2730).
+///
+/// [`census`] still WALKS both `audit/` directories and sizes them by
+/// record, so a write that reaches one is reported. What the check cannot
+/// do is make one happen: with the variable unset and `config()` empty in
+/// test builds, the sink is off, which is exactly what an ordinary
+/// developer machine looks like. The operator who has turned it on is
+/// covered by #2730 rather than by this harness.
+///
+/// [`root`]: StateLeakSentinel::root
+/// [`census`]: StateLeakSentinel::census
+pub struct StateLeakSentinel {
+    tmp: tempfile::TempDir,
+}
+
+/// What [`StateLeakSentinel::census`] found. Files, never exit codes.
+///
+/// The exit code is deliberately NOT part of the verdict. In #2710's own
+/// measurements three of four targets went red under leak conditions but
+/// ALL FOUR leaked, and one stayed green while leaking — so a check that
+/// keys on the status observes the wrong thing, in the direction that
+/// misses defects.
+#[derive(Debug, Default)]
+pub struct LeakCensus {
+    /// Every regular file under the sentinel root, relative to it.
+    pub under_root: Vec<PathBuf>,
+    /// Every regular file under `<home>/.darkmux`, relative to that.
+    pub under_home: Vec<PathBuf>,
+    /// `(path, record count)` for each audit-chain file, so a chained
+    /// append is reported by SIZE and not merely by existence.
+    pub audit_records: Vec<(PathBuf, usize)>,
+    /// Orphaned temp directories left in the sentinel's `TMPDIR`.
+    /// REPORTED, never asserted on: a `TempDir` legitimately leaks its
+    /// directory when a test panics, so a non-zero count here is a lead
+    /// (#2707's 8,263) rather than a finding.
+    pub orphan_tempdirs: usize,
+}
+
+impl LeakCensus {
+    /// The number the assertion is made on: files that reached a darkmux
+    /// state destination.
+    pub fn leaked_files(&self) -> usize {
+        self.under_root.len() + self.under_home.len()
+    }
+
+    /// A human-readable census, listing at most `cap` paths per
+    /// destination so one badly-behaved target cannot bury the rest.
+    pub fn report(&self, cap: usize) -> String {
+        let mut out = String::new();
+        let mut section = |label: &str, files: &[PathBuf]| {
+            out.push_str(&format!("    {label}: {} file(s)\n", files.len()));
+            for f in files.iter().take(cap) {
+                out.push_str(&format!("      {}\n", f.display()));
+            }
+            if files.len() > cap {
+                out.push_str(&format!("      … and {} more\n", files.len() - cap));
+            }
+        };
+        section("under the pinned state root", &self.under_root);
+        section("under <sentinel home>/.darkmux", &self.under_home);
+        if !self.audit_records.is_empty() {
+            out.push_str("    hash-chained audit records (cannot be removed without \
+                          breaking the chain):\n");
+            for (p, n) in &self.audit_records {
+                out.push_str(&format!("      {n} record(s) in {}\n", p.display()));
+            }
+        }
+        if self.orphan_tempdirs > 0 {
+            out.push_str(&format!(
+                "    (reported, not asserted) {} orphaned temp director(ies)\n",
+                self.orphan_tempdirs
+            ));
+        }
+        out
+    }
+}
+
+impl StateLeakSentinel {
+    /// Create the tree. Nothing is written into it by this call, so a
+    /// census taken immediately after is empty by construction.
+    pub fn new() -> Self {
+        let tmp =
+            tempfile::TempDir::new().expect("StateLeakSentinel: could not create a temp root");
+        for sub in ["home", "root", "tmp"] {
+            std::fs::create_dir_all(tmp.path().join(sub))
+                .expect("StateLeakSentinel: could not create the sentinel tree");
+        }
+        Self { tmp }
+    }
+
+    /// The stand-in `$HOME`. Verified to be what `dirs::home_dir()`
+    /// returns while it is applied — see
+    /// `the_sentinel_home_is_what_dirs_home_dir_resolves_to`, which is the
+    /// check that makes every `under_home` count meaningful rather than
+    /// assumed.
+    pub fn home(&self) -> PathBuf {
+        self.tmp.path().join("home")
+    }
+
+    /// The pinned darkmux root. Every `DARKMUX_*` destination points at or
+    /// under it.
+    pub fn root(&self) -> PathBuf {
+        self.tmp.path().join("root")
+    }
+
+    /// Point a child process at the sentinel: redirect `$HOME`, pin
+    /// `DARKMUX_HOME` to [`root`](Self::root), and REMOVE every other
+    /// darkmux state variable.
+    ///
+    /// One pin, and it is the root. See the type doc for why every
+    /// variable that outranks the root is cleared instead — pinning one
+    /// overrides the per-test isolation inside the target and manufactures
+    /// failures that look like defects.
+    ///
+    /// `CARGO_HOME` / `RUSTUP_HOME` are re-pinned to whatever the parent
+    /// resolved, because moving `$HOME` would otherwise send cargo's own
+    /// registry and toolchain into the sentinel and drown the census in
+    /// build artifacts.
+    pub fn apply(&self, cmd: &mut std::process::Command) {
+        cmd.env("HOME", self.home());
+        cmd.env("TMPDIR", self.tmp.path().join("tmp"));
+        cmd.env("DARKMUX_HOME", self.root());
+        for (var, _) in PINNED_STATE_VARS.iter().filter(|(v, _)| *v != "DARKMUX_HOME") {
+            cmd.env_remove(var);
+        }
+        for var in CLEARED_STATE_VARS {
+            cmd.env_remove(var);
+        }
+        for var in ["CARGO_HOME", "RUSTUP_HOME"] {
+            if let Some(v) = std::env::var_os(var) {
+                cmd.env(var, v);
+            } else if let Some(home) = dirs::home_dir() {
+                let fallback = match var {
+                    "CARGO_HOME" => home.join(".cargo"),
+                    _ => home.join(".rustup"),
+                };
+                cmd.env(var, fallback);
+            }
+        }
+    }
+
+    /// Count everything that landed. See [`LeakCensus`].
+    pub fn census(&self) -> LeakCensus {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => walk(&path, base, out),
+                    Ok(_) => out.push(path.strip_prefix(base).unwrap_or(&path).to_path_buf()),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let mut census = LeakCensus::default();
+        let root = self.root();
+        walk(&root, &root, &mut census.under_root);
+        census.under_root.sort();
+
+        let home_state = self.home().join(".darkmux");
+        walk(&home_state, &home_state, &mut census.under_home);
+        census.under_home.sort();
+
+        for audit_dir in [root.join("audit"), home_state.join("audit")] {
+            let Ok(entries) = std::fs::read_dir(&audit_dir) else { continue };
+            let mut found: Vec<(PathBuf, usize)> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .map(|p| {
+                    let n = std::fs::read_to_string(&p)
+                        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                        .unwrap_or(0);
+                    (p, n)
+                })
+                .collect();
+            found.sort();
+            census.audit_records.extend(found);
+        }
+
+        census.orphan_tempdirs = std::fs::read_dir(self.tmp.path().join("tmp"))
+            .map(|e| e.flatten().count())
+            .unwrap_or(0);
+        census
+    }
+}
+
+impl Default for StateLeakSentinel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for IsolatedState {
     fn drop(&mut self) {
         for (var, prev) in &self.prev {
@@ -885,6 +1160,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// (#2717) The claim every `under_home` count rests on: while the
+    /// sentinel's `HOME` is applied, `dirs::home_dir()` returns it.
+    ///
+    /// Asserted rather than assumed because the whole execution-side check
+    /// is built on it — if `dirs::home_dir()` consulted something else
+    /// (`getpwuid`, a platform API), every default-tier write would land
+    /// in the OPERATOR's tree during a leak check and be counted as zero.
+    /// A measurement that reports clean because it is looking at the wrong
+    /// directory is worse than no measurement.
+    #[test]
+    #[serial_test::serial]
+    fn the_sentinel_home_is_what_dirs_home_dir_resolves_to() {
+        let sentinel = StateLeakSentinel::new();
+        let prev = std::env::var_os("HOME");
+        // SAFETY: #[serial].
+        unsafe { std::env::set_var("HOME", sentinel.home()) };
+        let observed = dirs::home_dir();
+        // SAFETY: #[serial]. Restore before asserting, so a failure does
+        // not leave every later test in this process under the sentinel.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(
+            observed.as_deref(),
+            Some(sentinel.home().as_path()),
+            "dirs::home_dir() must follow $HOME; the execution-side leak check counts \
+             <home>/.darkmux, and if home_dir() resolved elsewhere that count would be \
+             structurally zero while the operator's real tree took the writes"
+        );
+    }
+
+    /// Anti-vacuity for the assertion the whole check makes: a sentinel
+    /// nothing has run against censuses as EMPTY. Without this, a census
+    /// that always returned zero — a wrong base path, an unreadable
+    /// directory — would read as "every target is clean".
+    #[test]
+    fn an_untouched_sentinel_censuses_as_empty() {
+        let sentinel = StateLeakSentinel::new();
+        let census = sentinel.census();
+        assert_eq!(census.leaked_files(), 0, "a fresh sentinel must start empty");
+        assert!(census.audit_records.is_empty());
+    }
+
+    /// The census must see BOTH destinations and must size the audit chain
+    /// by RECORD, not by file. A write that honors the pinned variables
+    /// lands under the root; one that re-derives from `$HOME` — the shape
+    /// an ordinary developer machine produces, since almost nobody exports
+    /// these — lands under `<home>/.darkmux`. Counting only the convenient
+    /// one is the measured failure mode this type's doc names.
+    #[test]
+    fn the_census_counts_both_destinations_and_sizes_the_audit_chain() {
+        let sentinel = StateLeakSentinel::new();
+        let root = sentinel.root();
+        std::fs::create_dir_all(root.join("flows")).unwrap();
+        std::fs::write(root.join("flows/2026-01-01.jsonl"), "a\nb\n").unwrap();
+        std::fs::create_dir_all(root.join("findings/sess/1")).unwrap();
+        std::fs::write(root.join("findings/sess/1/finding.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("audit")).unwrap();
+        std::fs::write(root.join("audit/2026-01-01.jsonl"), "r1\nr2\nr3\n").unwrap();
+        let home_state = sentinel.home().join(".darkmux");
+        std::fs::create_dir_all(&home_state).unwrap();
+        std::fs::write(home_state.join("fleet.json"), "{}").unwrap();
+
+        let census = sentinel.census();
+        assert_eq!(
+            census.under_root.len(),
+            3,
+            "the root half of the census missed a file: {:?}",
+            census.under_root
+        );
+        assert_eq!(
+            census.under_home,
+            vec![PathBuf::from("fleet.json")],
+            "the $HOME half of the census is the one that catches a write which ignores \
+             the pinned variables entirely"
+        );
+        assert_eq!(census.leaked_files(), 4);
+        assert_eq!(
+            census.audit_records.iter().map(|(_, n)| *n).sum::<usize>(),
+            3,
+            "the audit chain is reported by RECORD count — it is append-only and chained, \
+             so a fabricated record cannot be removed without breaking the chain"
+        );
+        assert!(census.report(10).contains("fleet.json"));
+    }
+
+    /// `apply` pins exactly ONE variable — the root — and REMOVES every
+    /// other darkmux state variable, including `DARKMUX_AUDIT_DIR`.
+    ///
+    /// This is the assertion that keeps the harness from manufacturing its
+    /// own failures. A variable that outranks the root (`DARKMUX_CREW_DIR`
+    /// in `user_state_root()`, `DARKMUX_LAB_DIR`/`DARKMUX_FINDINGS_DIR`/
+    /// `DARKMUX_MODS_DIR` in their accessors) pinned to one scratch path
+    /// overrides every per-test guard in the target and forces them onto a
+    /// shared directory: measured on `darkmux-lab`, 31 crawl tests fail
+    /// that way and 2,416 of 2,416 pass with the pin removed.
+    ///
+    /// The `CARGO_HOME` half is not hygiene either: moving `$HOME` without
+    /// it sends cargo's registry and target cache into the sentinel, and
+    /// the census then reports thousands of files for every target, which
+    /// makes the real signal unreadable.
+    #[test]
+    fn apply_pins_only_the_root_and_clears_every_variable_that_outranks_it() {
+        use std::ffi::OsStr;
+
+        let sentinel = StateLeakSentinel::new();
+        let mut cmd = std::process::Command::new("/nonexistent-never-spawned");
+        // Pre-set the sharp ones, so "removed" is a real observation and
+        // not an artifact of the variable never having been named.
+        cmd.env("DARKMUX_CREW_DIR", "/darkmux-sentinel-crew");
+        cmd.env("DARKMUX_AUDIT_DIR", "/darkmux-sentinel-audit");
+        sentinel.apply(&mut cmd);
+        let envs: std::collections::BTreeMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+
+        assert_eq!(
+            envs.get(OsStr::new("HOME")).copied().flatten(),
+            Some(sentinel.home().as_os_str()),
+            "the census counts <home>/.darkmux, so $HOME has to move"
+        );
+        assert_eq!(
+            envs.get(OsStr::new("DARKMUX_HOME")).copied().flatten(),
+            Some(sentinel.root().as_os_str()),
+            "the root is the ONE pin — every default derives from it, and a test's own \
+             pin still overrides it"
+        );
+        for (var, _) in PINNED_STATE_VARS.iter().filter(|(v, _)| *v != "DARKMUX_HOME") {
+            assert_eq!(
+                envs.get(OsStr::new(*var)),
+                Some(&None),
+                "{var} outranks the root or derives from it; pinning it would override \
+                 every per-test guard in the target with one shared value and make \
+                 correctly-isolated tests collide"
+            );
+        }
+        for var in CLEARED_STATE_VARS {
+            assert_eq!(
+                envs.get(OsStr::new(*var)),
+                Some(&None),
+                "{var} must be removed. DARKMUX_AUDIT_DIR is the one worth stating: its \
+                 presence enables the hash-chained sink, and pinning it would bind the \
+                 whole binary's memoized default sink before any test runs (#2730)"
+            );
+        }
+        assert!(
+            envs.get(OsStr::new("CARGO_HOME")).copied().flatten().is_some(),
+            "CARGO_HOME must be re-pinned outside the sentinel, or cargo's own registry \
+             lands in the census and buries the signal"
+        );
     }
 
     // ─── (#2707) process_scratch_dir ──────────────────────────────────
