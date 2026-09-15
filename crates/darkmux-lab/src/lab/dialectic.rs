@@ -928,7 +928,8 @@ pub fn run_debate(
     workdir: Option<&Path>,
     mut dispatch: impl FnMut(Seat, &str) -> Result<String>,
 ) -> Result<(Review, DebateEnvelope)> {
-    use super::review_bench::envelope_meta;
+    // (#2685) The envelope parser moved beside the scores schema it feeds.
+    use super::scores::envelope_meta;
     use crate::providers::prompt::extract_reply_text;
 
     let mut env = DebateEnvelope {
