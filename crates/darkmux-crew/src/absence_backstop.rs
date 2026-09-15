@@ -762,21 +762,49 @@ mod tests {
 
     // ── resolve_source_tree + run_backstop: the pipeline-wiring seam ───
 
-    struct HomeGuard(Option<String>);
-    impl HomeGuard {
-        fn set(p: &std::path::Path) -> Self {
-            let prior = std::env::var("DARKMUX_HOME").ok();
-            std::env::set_var("DARKMUX_HOME", p);
-            Self(prior)
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
+    /// (#2693) The state guard for the `resolve_source_tree` +
+    /// `run_backstop` tests below, which write `missions/<id>/plan/
+    /// <rule>.json` fixtures through `loader::missions_dir()`.
+    ///
+    /// Same defect, same fix as
+    /// `step_kinds::records_gather::tests::IsolatedState`: the
+    /// module-local `HomeGuard` this replaces pinned `DARKMUX_HOME` only,
+    /// and `user_state_root()` reads `DARKMUX_CREW_DIR` FIRST — so for
+    /// anyone who had exported one, these four tests wrote their `m-1`
+    /// and `m-2` plan fixtures straight into it and left them there. They
+    /// were not among the failures (their mission ids do not collide with
+    /// each other), but the leak is identical and a colliding id added
+    /// later would make it one.
+    ///
+    /// Every test holding one must stay `#[serial_test::serial]`.
+    type IsolatedState = darkmux_types::test_isolation::IsolatedState;
+
+    /// (#2693) The same conformance assertion `records_gather` holds,
+    /// over THIS module's guard and THIS module's fixture writer.
+    ///
+    /// Added because the first cut of the fix left this half unasserted,
+    /// and unasserted is indistinguishable from unfixed by anything CI
+    /// runs: reverting the alias above to a `DARKMUX_HOME`-only guard
+    /// left `cargo test -p darkmux-crew --lib` at EXIT=0, 1705 passed,
+    /// 0 failed, while two plan fixtures leaked into the pinned crew dir.
+    /// That is precisely the erosion mode the assertion exists to stop,
+    /// reintroduced in the module the fix had just touched.
+    #[test]
+    #[serial_test::serial] // the conformance assertion mutates process-global env
+    fn the_guard_isolates_crew_state_even_when_a_crew_dir_is_already_pinned() {
+        crate::test_guard_conformance::assert_guard_isolates_crew_state(|| {
+            let tmp = IsolatedState::new();
+            let tree = tmp.path().join("checkout").join("app");
+            std::fs::create_dir_all(&tree).unwrap();
+            write_plan_with_source("m-1", "swallowed-error", "app", &tree);
+            let written =
+                crate::loader::missions_dir().join("m-1").join("plan").join("swallowed-error.json");
+            crate::test_guard_conformance::GuardProbe {
+                root: tmp.path().to_path_buf(),
+                written_exists: written.is_file(),
+                written,
             }
-        }
+        });
     }
 
     fn write_plan_with_source(mission_id: &str, rule_id: &str, source_id: &str, tree: &std::path::Path) {
@@ -799,10 +827,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn resolve_source_tree_finds_the_matching_source() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         let tree = tmp.path().join("checkout").join("app");
         std::fs::create_dir_all(&tree).unwrap();
         write_plan_with_source("m-1", "swallowed-error", "app", &tree);
@@ -812,10 +839,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn resolve_source_tree_is_none_when_nothing_was_ever_planned() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         assert_eq!(resolve_source_tree("no-such-mission", "swallowed-error", "app"), None);
     }
 
@@ -833,10 +859,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn run_backstop_flags_only_the_contradicted_finding_in_a_mixed_batch() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         let tree = tmp.path().join("checkout").join("app");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("a.ts"), "export function foo() { return 1; }\n").unwrap();
@@ -879,10 +904,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn run_backstop_abstains_and_returns_nothing_when_the_tree_cannot_be_resolved() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         // No plan file written for this mission at all — the tree cannot
         // be resolved, so the check cannot evaluate the claim. This must
         // not be an error and must not remove the finding from anything

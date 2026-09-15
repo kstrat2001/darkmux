@@ -32,6 +32,12 @@
 // `//!` header first, or split it so nothing there is depended on for
 // its own scope.
 pub mod absence_backstop;
+// (#2693) The conformance assertion for this crate's module-local state
+// guards — test-only, so it never reaches the release binary. See its own
+// module doc for why the assertion exists and what it deliberately cannot
+// catch.
+#[cfg(test)]
+mod test_guard_conformance;
 // (#1230 Packet 1) Bounded concurrent-dispatch executor over gestalt's
 // `plan_waves` — see the module doc. No production caller in this packet;
 // Packet 2's `run_step_graph` scheduler is the intended first consumer.

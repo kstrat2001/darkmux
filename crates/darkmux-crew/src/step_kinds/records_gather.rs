@@ -704,30 +704,79 @@ mod tests {
     use crate::mods::{ForFinding, ModContext, ModRecord};
     use crate::types::{NodeStatus, Phase, PhaseStatus};
     use serde_json::json;
-    use tempfile::TempDir;
 
-    /// Scopes `DARKMUX_HOME` for one test and restores the prior value —
-    /// same pattern `crawl::unit_step_tests::HomeGuard` uses, duplicated
-    /// here because this crate has no dependency on that one.
-    struct HomeGuard(Option<String>);
-    impl HomeGuard {
-        fn set(p: &std::path::Path) -> Self {
-            let prior = std::env::var("DARKMUX_HOME").ok();
-            std::env::set_var("DARKMUX_HOME", p);
-            Self(prior)
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                None => std::env::remove_var("DARKMUX_HOME"),
-            }
-        }
-    }
+    /// (#2693) The state guard for every test in this module.
+    ///
+    /// This used to be a module-local `HomeGuard` that pinned
+    /// `DARKMUX_HOME` and nothing else. Every fixture here is written
+    /// through `loader::missions_dir()`, which resolves
+    /// `user_state_root()` — and that reads
+    /// `env(DARKMUX_CREW_DIR) > config.dirs.crew > <DARKMUX_HOME root>`.
+    /// `DARKMUX_CREW_DIR` OUTRANKS the pinned root, so for anyone who had
+    /// exported one (the careful thing to do when running this suite), the
+    /// guard isolated nothing: all 22 tests wrote their `missions/
+    /// review-2310/{steps,phases,plan}/*.json` fixtures into ONE shared
+    /// directory, and `scan_unit_and_plan_steps` — which scans that whole
+    /// directory — read the union. Measured: 5–11 failures per run of this
+    /// module alone, a different set each time, and still red (stable at
+    /// 10) under `--test-threads=1`, which is the tell that it is leaked
+    /// state rather than concurrency. The fixtures also outlived the
+    /// process, so the next run started on the previous run's residue.
+    ///
+    /// It broke BOTH directions, which is worth naming because the second
+    /// is easy to miss when reconstructing this from the first. Where a
+    /// test's own step ids did not collide with an earlier test's, the
+    /// scan returned MORE than the test planted — `errored: ["plan
+    /// `plan-step-1` (Error)", "unit `unit-step-2` (Error)", …]` in tests
+    /// that planted neither. Where they DID collide, the earlier test's
+    /// record won the filename and the scan returned LESS: one assertion
+    /// expecting two window names got an empty list, another expecting 2
+    /// got 0. About six of the ten deterministic failures are the first
+    /// shape; at least four are the second.
+    ///
+    /// [`IsolatedState`](darkmux_types::test_isolation::IsolatedState)
+    /// pins the WHOLE set — `DARKMUX_CREW_DIR` included — under one
+    /// throwaway root per test, and restores the previous environment on
+    /// drop. It exposes `path()`, so the scratch-file sites below
+    /// (`tmp.path().join("d.diff")`) are unchanged.
+    ///
+    /// Every test holding one must stay `#[serial_test::serial]`: the
+    /// guard mutates process-global environment. The guard is held to that
+    /// claim by `the_guard_isolates_crew_state_even_when_a_crew_dir_is_already_pinned`
+    /// below, whose two documented limits live in
+    /// `crate::test_guard_conformance`.
+    type IsolatedState = darkmux_types::test_isolation::IsolatedState;
 
     const MISSION: &str = "review-2310";
     const PHASE: &str = "review-2310-deliver";
+
+    /// (#2693) The guard above is only worth its comment if a future
+    /// author cannot quietly narrow it back to a single variable, so the
+    /// isolation property gets an ASSERTION rather than a paragraph.
+    ///
+    /// The assertion itself — including the two things it deliberately
+    /// cannot catch — lives in `crate::test_guard_conformance`, shared
+    /// with `absence_backstop`, which carried a byte-identical guard.
+    /// What is module-local is the probe: this module's OWN alias, this
+    /// module's OWN fixture writer, through the production resolver.
+    ///
+    /// Red-proved by reverting the alias above to a `DARKMUX_HOME`-only
+    /// guard: this fails naming the sentinel path it wrote into, and the
+    /// rest of the module returns to failing by luck of ordering.
+    #[test]
+    #[serial_test::serial] // the conformance assertion mutates process-global env
+    fn the_guard_isolates_crew_state_even_when_a_crew_dir_is_already_pinned() {
+        crate::test_guard_conformance::assert_guard_isolates_crew_state(|| {
+            let state = IsolatedState::new();
+            save_phase();
+            let written = crate::lifecycle::phase_path(MISSION, PHASE);
+            crate::test_guard_conformance::GuardProbe {
+                root: state.path().to_path_buf(),
+                written_exists: written.is_file(),
+                written,
+            }
+        });
+    }
 
     fn save_phase() {
         crate::lifecycle::save_phase(&Phase {
@@ -864,10 +913,9 @@ mod tests {
     /// is the only surviving record of the prune, and the config snapshot
     /// is the only thing that can map its task ids back to rule ids.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn rules_pruned_before_the_mint_are_named_as_not_attempted() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         save_snapshot_and_prune_report(
             &["intent-vs-diff", "test-gap", "union-vs-enum", "swallowed-error"],
@@ -901,10 +949,9 @@ mod tests {
     /// contribute: a pruned task with no `rule` key (the crawl's own
     /// `summary`) must not put a TASK id into a sentence about rules.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_pruned_task_that_names_no_rule_contributes_nothing() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         save_snapshot_and_prune_report(&["intent-vs-diff"], &[("summarize", "disabled")]);
 
@@ -929,10 +976,9 @@ mod tests {
     /// Red-proved by restoring `rules_total: declared.len()`: this asserts
     /// 2 instead of 1.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn two_tasks_declaring_one_rule_count_as_one_rule() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         // The real shape: a plan task and a unit template, distinct task
         // ids, the SAME rule.
@@ -964,10 +1010,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn gathers_only_this_missions_findings_and_mods() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
 
         findings::materialize(&findings::findings_dir(), &a_finding("sess-a", 1, Some(MISSION))).unwrap();
@@ -985,10 +1030,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn reads_the_diff_file_and_counts_its_hunks_as_hunks_total() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
         let diff_path = tmp.path().join("d.diff");
         std::fs::write(
@@ -1007,10 +1051,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn gate_failed_mods_are_never_counted_as_refused() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
 
         findings::materialize(&findings::findings_dir(), &a_finding("sess-a", 1, Some(MISSION))).unwrap();
@@ -1054,10 +1097,9 @@ mod tests {
     /// records, generically as JSON (never `darkmux-lab`'s typed
     /// `UnitOutcome`).
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn refused_sums_findings_rejected_from_this_missions_unit_steps() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         let unit_output = crate::step_output::Output::wrap(
             "crawl.unit-outcome",
@@ -1153,10 +1195,9 @@ mod tests {
     /// errored four are already named in `errored`, so nothing is hidden by
     /// counting honestly here.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn coverage_counts_only_rules_and_hunks_whose_unit_completed() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
@@ -1198,10 +1239,9 @@ mod tests {
     /// completed-only rule: two rules whose COMPLETED units plan the same
     /// window count that window ONCE.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn completed_units_across_two_rules_still_dedup_the_same_window() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
@@ -1229,10 +1269,9 @@ mod tests {
     /// at, which is the exact false claim #2361 item 2 exists to prevent,
     /// arriving through a new door.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_thermally_skipped_unit_does_not_count_as_reviewed_coverage() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
@@ -1304,10 +1343,9 @@ mod tests {
     /// rules (3 + 2) — a sum-based count would read `min(5, 4) = 4`; the
     /// correct distinct count is `3`. Mutation-killed below.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn hunks_covered_counts_distinct_windows_not_the_sum_across_rules() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
@@ -1342,10 +1380,9 @@ mod tests {
     /// (3 distinct windows, only 2 hunks in the diff) — the cap must win.
     /// Mutation-killed below (deleting `.min(hunks_total)` reads 3, not 2).
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn hunks_covered_is_capped_when_plans_find_more_windows_than_the_diff_has_hunks() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
         let plan_dir = crate::loader::missions_dir().join(MISSION).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
@@ -1370,25 +1407,23 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_task_naming_an_unrecorded_phase_is_refused_by_name() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         // No `save_phase()` call — the phase record does not exist.
         let err = RecordsGatherStepKind.run(&step(json!({})), &task(), &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains(PHASE), "{err}");
     }
 
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn deliver_github_review_reads_a_records_gather_step_as_its_own_task_predecessor() {
         // (#2310 P4c-2b) The wiring this packet adds: `records.gather` and
         // `deliver.github_review` as two steps of ONE task, the SAME
         // same-task-predecessor `input` entry `scheduler::gather_inputs`
         // already threads to every multi-step task — no `step.config`
         // literal `findings`/`mods`/`diff`/`scope` at all.
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         findings::materialize(&findings::findings_dir(), &a_finding("sess-a", 1, Some(MISSION))).unwrap();
 
@@ -1428,10 +1463,9 @@ mod tests {
     /// path `deliver_github_review_reads_a_records_gather_step_as_its_own_task_predecessor`
     /// above exercises for `findings`/`mods`/`diff`/`scope`).
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn the_absence_backstop_flows_from_records_gather_through_to_the_posted_comment() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let tmp = IsolatedState::new();
         save_phase();
 
         // The checked-out source tree `plan.sites` would have written —
@@ -1531,10 +1565,9 @@ mod tests {
     /// by reverting the `other =>` arm to `_ => {}`: this test then fails
     /// because `scope.errored` no longer names `weird-step-1`.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn an_unrecognized_kind_that_errored_is_named_not_swallowed() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         crate::lifecycle::save_step(
             MISSION,
@@ -1571,10 +1604,9 @@ mod tests {
     /// `Complete` is not a failure, and must not appear in `errored` —
     /// only genuinely troubled steps of unknown kinds get named.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn an_unrecognized_kind_that_completed_is_not_named_as_errored() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         crate::lifecycle::save_step(
             MISSION,
@@ -1616,10 +1648,9 @@ mod tests {
     /// `records-gather-step` (Running)" on every single comment — the
     /// clean path could never be taken.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn the_gathers_own_in_flight_task_siblings_are_never_named_as_errored() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         // The gather step ITSELF, persisted `Running` — it hasn't
         // returned at scan time, same task id `task()` names.
@@ -1677,10 +1708,9 @@ mod tests {
     /// fails because both statuses here ARE `Error`/`Abandoned`, so the
     /// narrowing alone would still name them.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_stale_errored_record_for_the_gathers_own_task_is_still_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         crate::lifecycle::save_step(
             MISSION,
@@ -1738,10 +1768,9 @@ mod tests {
     /// rule/unit convention of its own — never in `not_attempted`, so
     /// this test's `not_attempted` assertion goes red.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_crawl_plan_step_that_errored_names_its_rule_as_not_attempted() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         crate::lifecycle::save_step(
             MISSION,
@@ -1782,10 +1811,9 @@ mod tests {
     /// `resolve_output_doc` match back to the `let-else`: this test then
     /// fails because `unreadable` is empty.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn a_units_unparseable_output_is_named_unreadable_not_counted_as_clean() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         crate::lifecycle::save_step(
             MISSION,
@@ -1828,10 +1856,9 @@ mod tests {
     /// invisible to the scan, no different from a phase with nothing to
     /// report. Now named on `GatherOutput::unreadable`.
     #[test]
-    #[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+    #[serial_test::serial] // IsolatedState mutates process-global env
     fn an_unreadable_phase_step_directory_is_named_unreadable() {
-        let tmp = TempDir::new().unwrap();
-        let _home = HomeGuard::set(tmp.path());
+        let _tmp = IsolatedState::new();
         save_phase();
         let steps_dir = crate::lifecycle::steps_dir(MISSION, PHASE);
         std::fs::create_dir_all(&steps_dir).unwrap();
