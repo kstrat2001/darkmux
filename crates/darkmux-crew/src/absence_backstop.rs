@@ -105,7 +105,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Below this length a token is too likely to be a common substring
-/// (`id`, `Ok`, `run`) for a bare `contains()` hit to mean anything.
+/// (`id`, `Ok`, `fs`) for a bare `contains()` hit to mean anything.
+///
+/// The bound is inclusive at 3: a three-character token IS searched.
+/// (#2724 — this line used to offer `run` as an example of what the
+/// constant excludes, which is three characters and therefore searched.
+/// The module doc above uses that same `run` as its worked example of a
+/// short token this lint DOES search and can false-positive on, so the
+/// two readings contradicted each other; the module doc is the correct
+/// one, and `three_characters_is_the_shortest_token_the_backstop_will_
+/// search_for` now pins the boundary rather than leaving it to prose.)
 pub const MIN_TOKEN_LEN: usize = 3;
 
 /// One phrase this lint recognizes as claiming something is absent.
@@ -341,6 +350,21 @@ fn find_line(whole_file: &str, token: &str) -> Option<u32> {
 /// what it is). 4 MiB comfortably covers any real source file a review
 /// would ever check; a candidate this large is itself a signal the lint
 /// should abstain on, not a limit worth raising.
+///
+/// (#2724) **This bound is not pinned by any test, deliberately left so.**
+/// A mutation sweep can lower it to 5 KiB or 1 MiB with the whole suite
+/// still green, and pinning it needs a decision nobody has made yet:
+/// [`check_absence_claim_against_file`]'s own doc says a file that is
+/// "too large" yields `Inconclusive`, but [`read_bounded`] does not
+/// abstain on one — `take(N).read_to_string` TRUNCATES and returns
+/// `Some`, so an oversized file is searched up to the bound and a token
+/// living past it reports as `Confirmed`: the backstop agreeing that a
+/// present symbol is absent, on the strength of an excerpt. That is the
+/// #1748 shape this module exists to catch, one layer down. Which
+/// behavior is correct — abstain on oversize (what the doc claims) or
+/// search the prefix (what the code does) — decides what the test should
+/// assert, so the test waits on that call rather than blessing whichever
+/// one is currently compiled.
 const MAX_FILE_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Resolve `file` against `tree_root`, refusing to leave the tree.
@@ -552,6 +576,114 @@ mod tests {
         assert_eq!(detect_absence_claim("There is no `.` in this file."), None);
     }
 
+    #[test]
+    fn three_characters_is_the_shortest_token_the_backstop_will_search_for() {
+        // (#2724) The test above uses a ONE-character token, which is two
+        // characters clear of `MIN_TOKEN_LEN` and so says nothing about
+        // where the line actually falls — it passes unchanged if the check
+        // is `<`, `<=`, or anything else in the neighborhood. This one
+        // straddles the boundary, because both sides of it are a real
+        // operator outcome:
+        //
+        //   - two characters is NOT searched: a bare `contains("fs")` hits
+        //     inside "offset" and half the prose in any file, so the
+        //     backstop abstains and the finding is delivered untouched.
+        //   - three characters IS searched, and the module doc above says
+        //     so explicitly — "does not call `run` anywhere" is its own
+        //     worked example of a short token this lint does search for and
+        //     can false-positive on (against `rerun`). That cost was
+        //     accepted deliberately; tightening the bound to 4 would
+        //     silently stop checking every three-character claim instead.
+        //
+        // Both spans are plain alphanumerics, so `looks_like_identifier_span`
+        // accepts both and length is the only thing separating them.
+        assert_eq!(
+            detect_absence_claim("This handler does not call `fs` anywhere."),
+            None,
+            "a two-character token is below the search floor",
+        );
+        assert_eq!(
+            detect_absence_claim("This handler does not call `run` anywhere."),
+            Some("run".to_string()),
+            "a three-character token is exactly at the floor and is searched",
+        );
+    }
+
+    #[test]
+    fn a_span_carrying_a_newline_is_not_an_identifier_span() {
+        // (#2724) `looks_like_identifier_span` refuses a multi-line span,
+        // and until now nothing tested that clause on its own: the existing
+        // whole-sentence test is refused for containing SPACES, so the
+        // newline clause could be deleted with every test still green.
+        //
+        // The shape this guards against is a model quoting two symbols on
+        // two lines inside one pair of backticks. Neither half is what the
+        // claim is about, and searching the concatenation as a literal
+        // substring can never hit — so the backstop abstains and the
+        // finding is delivered untouched, rather than spending its one
+        // signal on a string that is not in the file by construction.
+        let claim = "This router does not call `handleRequest\nhandleResponse` at all.";
+        assert_eq!(detect_absence_claim(claim), None);
+    }
+
+    #[test]
+    fn a_span_that_is_not_identifier_shaped_is_refused_even_with_no_whitespace() {
+        // (#2724) The other untested clause: the character-set check. A
+        // path is the everyday example — no spaces, no newline, long
+        // enough, and still not an identifier/call/member-access span, so
+        // `looks_like_identifier_span`'s allowed set (alphanumerics plus
+        // `._$()[]->:<>!#`, which has no `/`) refuses it.
+        //
+        // Operator-visible difference: "there is no `src/main.rs`" is a
+        // claim about a FILE, not about a symbol inside the file this
+        // backstop reads. Searching that literal inside the reviewed file's
+        // text would answer a question nobody asked, so the check abstains.
+        assert_eq!(
+            detect_absence_claim("There is no `src/main.rs` in this crate."),
+            None,
+        );
+        // The comparison case: same length, same lack of whitespace, but
+        // genuinely identifier-shaped — this one IS searched.
+        assert_eq!(
+            detect_absence_claim("There is no `src.main.rs` in this crate."),
+            Some("src.main.rs".to_string()),
+        );
+    }
+
+    #[test]
+    fn backtick_spans_reports_raw_offsets_and_never_reopens_on_a_closing_backtick() {
+        // (#2724) Two properties of this scanner that no test reached.
+        //
+        // 1. The END offset. The doc above states the tuple as (opening
+        //    backtick's byte offset, the byte offset JUST PAST the closing
+        //    backtick, the trimmed content). No caller can currently tell
+        //    that offset from the closing backtick's own index —
+        //    `extract_directional_token` only compares it `<=` against the
+        //    start of a recognized absence phrase, and no phrase can begin
+        //    at a backtick byte, so an end that is one too small is
+        //    invisible from every entry point this module exposes. It is
+        //    still wrong, and the first consumer to slice
+        //    `&text[start..end]` for the span INCLUDING its backticks
+        //    inherits an off-by-one that nothing here would report.
+        //
+        // 2. Where the cursor resumes. It must resume PAST the closing
+        //    backtick. Resuming ON it re-reads that backtick as an OPENING
+        //    one, so the prose BETWEEN two quoted tokens is reported as a
+        //    quoted token of its own — "`a` and `b`" grows a phantom `and`
+        //    span sitting between the two real ones. That is a live bug,
+        //    not a contract detail: a phantom span can win the
+        //    nearest-in-direction pick and bind an absence claim to prose
+        //    the model never quoted.
+        assert_eq!(backtick_spans("`a` and `b`"), vec![(0, 3, "a"), (8, 11, "b")]);
+        // The offsets are the RAW span, backtick to just-past-backtick;
+        // only the CONTENT is trimmed.
+        assert_eq!(backtick_spans("` spaced `"), vec![(0, 10, "spaced")]);
+        // An unterminated trailing backtick yields no span for itself —
+        // there is nothing to pair it with.
+        assert_eq!(backtick_spans("`a` and `b"), vec![(0, 3, "a")]);
+        assert!(backtick_spans("plain prose with no spans").is_empty());
+    }
+
     // ── RED-PROVE, review MUST FIX 4: binds to the phrase's OBJECT, ────
     // never its SUBJECT. Both examples are the reviewer's own — the
     // failure mode was `detect_absence_claim` taking the FIRST backtick
@@ -726,6 +858,44 @@ mod tests {
             outcome,
             AbsenceCheckOutcome::Inconclusive,
             "a `..`-bearing `file` must be rejected before any read, never joined-and-escaped"
+        );
+    }
+
+    #[test]
+    fn a_parent_dir_file_is_refused_even_when_it_resolves_back_inside_the_tree() {
+        // (#2724) The two tests above both name a target OUTSIDE the tree,
+        // so the downstream containment check (`starts_with(canon_root)`)
+        // rejects them on its own — which means the early
+        // `is_absolute() || has ..` guard could be weakened to `&&`, or
+        // deleted, with both of them still green. It was.
+        //
+        // This fixture separates the two layers: `../app/a.ts` resolved
+        // from `<tmp>/checkout/app` canonicalizes straight back to
+        // `<tmp>/checkout/app/a.ts` — inside the tree, readable, and
+        // containing the very token the claim calls absent. The
+        // containment check would ALLOW it; only the `..` clause refuses
+        // it, and it refuses before any join or `canonicalize` touches a
+        // model-authored path.
+        //
+        // The operator-visible difference is the outcome on that finding:
+        // refused means Inconclusive and the finding ships untouched;
+        // allowed means the backstop follows a traversal expression it
+        // was written to reject and then flags the finding on what it
+        // read there.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tree = tmp.path().join("checkout").join("app");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("a.ts"), "export function foo() { return 1; }\n").unwrap();
+
+        let outcome = check_absence_claim_against_file(
+            "This does not call `foo()` anywhere.",
+            &tree,
+            "../app/a.ts",
+        );
+        assert_eq!(
+            outcome,
+            AbsenceCheckOutcome::Inconclusive,
+            "a `..` component is refused outright, not merely because of where it happens to land"
         );
     }
 
