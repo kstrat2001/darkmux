@@ -585,30 +585,45 @@ mod tests {
         }
     }
 
-    /// RAII guard for `DARKMUX_HOME`: sets it for the test's duration and
-    /// restores the PRIOR value (or removes it) on drop, for the same
-    /// red-proof-must-still-clean-up reason as `CwdGuard`. Mirrors
-    /// `crawl::unit_step_tests::HomeGuard`.
+    /// RAII guard for the darkmux state root, for the same
+    /// red-proof-must-still-clean-up reason as `CwdGuard`.
+    ///
+    /// (#2718) Backed by
+    /// [`darkmux_types::test_isolation::IsolatedState`], which pins EVERY
+    /// darkmux write destination under one throwaway root — then re-points
+    /// the ones this fixture stages at `dir`.
+    ///
+    /// The `DARKMUX_HOME`-only version this replaces was the guard class
+    /// #2693 retired in `darkmux-crew` and left standing here: correct
+    /// about its one variable and silent about the other twelve. It is
+    /// insufficient in BOTH directions. `lab_dir()` reads
+    /// `env(DARKMUX_LAB_DIR) > config.dirs.runs > <root>/runs`, so an
+    /// operator with `DARKMUX_LAB_DIR` exported had `list_runs` scan THAT
+    /// directory rather than the fixture — the same shape as the ambient
+    /// `DARKMUX_HOME` failure the old doc comment describes, one variable
+    /// over. And in the other direction, every destination the test never
+    /// names stayed pointed at the operator's real tree.
+    ///
+    /// No `Drop` of its own: `IsolatedState` recorded the pre-guard value
+    /// of each variable at construction, including the three re-pointed
+    /// below, so its own restore hands all of them back exactly.
     struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
+        _isolated: darkmux_types::test_isolation::IsolatedState,
     }
 
     impl HomeGuard {
         fn set(dir: &Path) -> Self {
-            let prev = std::env::var_os("DARKMUX_HOME");
-            unsafe { std::env::set_var("DARKMUX_HOME", dir) };
-            Self { prev }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
+            let isolated = darkmux_types::test_isolation::IsolatedState::new();
+            // SAFETY: every caller holds `#[serial_test::serial]`.
             unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                    None => std::env::remove_var("DARKMUX_HOME"),
-                }
+                std::env::set_var("DARKMUX_HOME", dir);
+                // OUTRANKS `DARKMUX_HOME` in `user_state_root()`.
+                std::env::set_var("DARKMUX_CREW_DIR", dir);
+                // OUTRANKS it in `lab_dir()`, which is what `list_runs`
+                // and `run` actually resolve through.
+                std::env::set_var("DARKMUX_LAB_DIR", dir.join("runs"));
             }
+            Self { _isolated: isolated }
         }
     }
 

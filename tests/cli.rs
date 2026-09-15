@@ -553,9 +553,30 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 ///   `runtime/tests/` and `examples/` are out of scope — nothing there
 ///   spawns darkmux today, and nothing prevents it tomorrow.
 ///
-/// These are filed as #2717 rather than patched here, because the durable
-/// answer is a structural chokepoint plus an execution-side check, not a
-/// longer token list.
+/// (#2717) None of these is closed by more tokens or a wider walk, so the
+/// durable answer was built beside this one rather than folded into it:
+/// `tests/state_leak_execution_guard.rs` runs each test unit under a
+/// sentinel state tree and asserts the file census is empty. That observes
+/// the EFFECT, so every shape above collapses into one check — and it
+/// reaches shapes this scan cannot see at all, including in-process
+/// writers that spawn nothing (#2718) and destinations in directories
+/// nobody thought to walk.
+///
+/// It is NOT a superset, and it shares the boundary named in the last
+/// bullet above: its units are the ROOT `tests/*.rs` plus `-p <member>
+/// --lib`, and `--lib` never builds a package's own integration targets,
+/// so `crates/*/tests/` is outside BOTH checks. Its own module doc
+/// carries the decoy measurement that proves it.
+///
+/// This scan is KEPT as the fast pre-check, because it earns its keep on
+/// one axis the execution check cannot reach: a text scan names the
+/// offending FILE AND LINE and costs milliseconds on every `cargo test`,
+/// where a file census can only name the target and has to re-run it.
+/// Measured against the same tree, with a new target spawning the binary
+/// off a path derived from `current_exe()` — a spelling none of the four
+/// tokens recognizes: this scan was EXIT=0, and the execution check named
+/// `cargo test --test w34a_decoy_spawn` with 2 leaked files
+/// (`fleet.json`, `fleet.json.lock`) while the child itself exited 0.
 #[test]
 fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
     // Split with `concat!` on purpose: written as one literal, these two
