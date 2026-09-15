@@ -130,8 +130,7 @@ fn build_darkmux_release_uncached() -> Result<(), String> {
 /// use, rather than a fifth hand-rolled copy.
 #[cfg(unix)]
 fn run_release_build_locked() -> Result<(), String> {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let lock_path = PathBuf::from(manifest).join("target/.e2e-release-build.lock");
+    let lock_path = resolved_target_dir().join(".e2e-release-build.lock");
     darkmux_types::flock::with_locked_file(&lock_path, |_file| {
         // Under the lock: whichever binary gets here first pays the real
         // compile; the other five block on flock, then run a fast no-op
@@ -395,7 +394,29 @@ mod darkmux_home_isolation_tests {
                 ),
             }
         }
+        // (#2736 item 2) `DARKMUX_REDIS_URL` is a genuine exception to the
+        // loop below, found live while landing that item: `CLEARED_STATE_
+        // VARS` says "never re-set" for every OTHER entry, but this
+        // harness's whole method is running each simulated fleet node
+        // against its OWN ephemeral Redis instance — `cmd()` explicitly
+        // re-pins it to `self.redis_url` immediately after
+        // `darkmux_release_cmd()` clears it, the same shape as the
+        // PINNED_STATE_VARS loop above (an explicit, node-scoped re-pin),
+        // just not a path so it cannot share that loop's `starts_with`
+        // check. Asserted directly instead of folded into either loop.
+        assert_eq!(
+            env_var("DARKMUX_REDIS_URL"),
+            Some(std::ffi::OsString::from(&node.redis_url)),
+            "FleetNode::cmd() must re-pin DARKMUX_REDIS_URL to THIS node's own ephemeral \
+             test Redis instance after darkmux_release_cmd() clears it — without the \
+             re-pin every node would either inherit the ambient shell's value or, worse, \
+             silently share one node's Redis with every other node in the fleet (#2736 \
+             item 2)"
+        );
         for var in CLEARED_STATE_VARS {
+            if *var == "DARKMUX_REDIS_URL" {
+                continue; // asserted separately above — this harness deliberately re-pins it
+            }
             assert_eq!(
                 cmd.get_envs()
                     .find(|(k, _)| *k == std::ffi::OsStr::new(*var))
@@ -560,12 +581,31 @@ impl Drop for FleetHarness {
 // `DARKMUX_HOME` is cleared here like the rest and re-pinned by both
 // callers immediately after; see `neutralize_state_vars`'s ordering note.
 
+/// The workspace's target directory, honoring `CARGO_TARGET_DIR` exactly
+/// the way `cargo build` itself does. (#2735) `run_cargo_build_release`
+/// shells out to `cargo`, which reads this env var live — so a build made
+/// under an override lands at `$CARGO_TARGET_DIR/release/darkmux`, not
+/// `<manifest>/target/release/darkmux`. Every caller that needs "the
+/// target dir this test run's build actually used" (the binary path, the
+/// cross-process build lock) goes through this one function so the two
+/// can never drift apart again.
+///
+/// `scripts/test-lane.sh` sets this for every lane, and CLAUDE.md
+/// documents lanes as the recommended way to background a test run — so
+/// the previous hardcoded path was wrong for exactly the sweep it needed
+/// to be right for.
+fn resolved_target_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")
+}
+
 fn darkmux_release_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("DARKMUX_E2E_BIN") {
         return PathBuf::from(path);
     }
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest).join("target/release/darkmux")
+    resolved_target_dir().join("release/darkmux")
 }
 
 /// A `Command` for the release binary with every darkmux state variable

@@ -153,11 +153,43 @@ pub const PINNED_STATE_VARS: &[(&str, &str)] = &[
 ///   PREPENDS (read side, not write). An ambient value would have a
 ///   guarded test reading the operator's real templates/skills; removing
 ///   it leaves only the root-derived candidates.
+/// * `DARKMUX_REDIS_URL` (#2736 item 2) — a live, NETWORK-ADDRESSED
+///   destination, not a path under any root this guard controls. Pinning
+///   it to nothing meaningful would be no isolation at all; removing it
+///   is what actually stops a guarded test's flow writes from reaching a
+///   real Redis. Measured before this entry existed: neither
+///   [`neutralize_state_vars`] nor [`StateLeakSentinel::apply`] touched
+///   it, so both left it exactly as ambient as an unguarded spawn.
+///   `darkmux_flow::isolate_test_env_once()` scrubs it too, in-process
+///   and lazily, for the same reason from the flow crate's side — this
+///   entry is what makes EVERY guard here do the same thing, spawn or
+///   no.
+/// * `DARKMUX_FLEET_SNAPSHOT_FILE` (#2736 item 2) — names a handoff file
+///   `darkmux-serve` writes for a spawned CLI panel to read INSTEAD OF a
+///   live fleet read (`fleet_records_for_runs`). An ambient value here
+///   would have a guarded test silently reading someone else's snapshot
+///   rather than the live path it thinks it is exercising; removing it
+///   restores the live path, the same shape as `DARKMUX_PROFILES` above.
+///
+/// **`DARKMUX_ENV_AUDIT_LOG` is deliberately NOT here.** It looks like it
+/// belongs — `still set` is exactly the shape the two entries above
+/// closed — but it is INSTRUMENTATION CONFIG, not a state destination: it
+/// tells `env_audit::audit_env_read` where to log which `DARKMUX_*` keys
+/// get READ, and at least one existing test
+/// (`darkmux-doctor`'s `the_guards_variable_list_covers_every_destination_
+/// the_resolvers_read`) sets it BEFORE constructing [`IsolatedState`]
+/// specifically so every read the guard's OWN construction performs is
+/// captured. Clearing it here would silently blind that test the moment
+/// the guard runs — measured, not assumed, before this doc paragraph was
+/// written. Out of scope by construction, the same way a non-file
+/// destination is (see [`StateLeakSentinel`]'s doc).
 pub const CLEARED_STATE_VARS: &[&str] = &[
     "DARKMUX_AUDIT_DIR",
     "DARKMUX_PROFILES",
     "DARKMUX_TEMPLATES_DIR",
     "DARKMUX_SKILLS_DIR",
+    "DARKMUX_REDIS_URL",
+    "DARKMUX_FLEET_SNAPSHOT_FILE",
 ];
 
 /// (#2698) RAII pin for the runtime inactivity budget —
@@ -437,6 +469,24 @@ pub fn neutralize_state_vars(cmd: &mut std::process::Command) {
 /// test builds, the sink is off, which is exactly what an ordinary
 /// developer machine looks like. The operator who has turned it on is
 /// covered by #2730 rather than by this harness.
+///
+/// # The census is FILE-ONLY, stated so this check is never over-trusted
+/// (#2736 item 2)
+///
+/// [`census`] walks two directory trees on disk and sizes what it finds
+/// there. That is a complete answer for every destination this workspace
+/// resolves to a PATH — which is every entry in [`PINNED_STATE_VARS`] —
+/// but it is structurally no answer at all for a destination that is
+/// never a path in the first place. `DARKMUX_REDIS_URL` names a live
+/// network endpoint, not a file; a write that reached one would leave
+/// nothing on disk for [`census`] to find, clean or not. `CLEARED_STATE_
+/// VARS` closes the REALISTIC exposure by removing the variable so the
+/// guarded process cannot address a Redis at all — but that is a
+/// mitigation at the CONFIGURATION layer, not a capability this census
+/// gained. A future non-file destination (another network sink, a
+/// message queue) is out of scope for [`census`] BY CONSTRUCTION, not by
+/// oversight one entry away from being fixed; closing that gap needs a
+/// different instrument, not one more directory in this walk.
 ///
 /// [`root`]: StateLeakSentinel::root
 /// [`census`]: StateLeakSentinel::census
@@ -1089,6 +1139,52 @@ mod tests {
                     Some(v) => std::env::set_var(var, v),
                     None => std::env::remove_var(var),
                 }
+            }
+        }
+    }
+
+    /// (#2736 item 2) The test above iterates `CLEARED_STATE_VARS` itself,
+    /// so it is tautological in exactly the dimension that matters: a
+    /// destination variable missing from the list is invisible to it, by
+    /// construction, forever. This test names the two real destinations
+    /// #2736 measured as `still set` — `DARKMUX_REDIS_URL` (a live
+    /// network endpoint) and `DARKMUX_FLEET_SNAPSHOT_FILE` (a read-side
+    /// handoff override) — as LITERAL strings, never through the const, so
+    /// it stays red-provable: deleting either from `CLEARED_STATE_VARS`
+    /// turns THIS test red without needing to also remember to update it.
+    #[test]
+    #[serial_test::serial]
+    fn the_isolation_guard_clears_redis_url_and_fleet_snapshot_file() {
+        let saved_redis = std::env::var_os("DARKMUX_REDIS_URL");
+        let saved_snapshot = std::env::var_os("DARKMUX_FLEET_SNAPSHOT_FILE");
+        // SAFETY: #[serial].
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:6379/0");
+            std::env::set_var("DARKMUX_FLEET_SNAPSHOT_FILE", "/tmp/darkmux-sentinel-snapshot.json");
+        }
+        {
+            let _state = IsolatedState::new();
+            assert!(
+                std::env::var_os("DARKMUX_REDIS_URL").is_none(),
+                "DARKMUX_REDIS_URL survived the guard — a guarded test/process can still \
+                 address a real, live Redis instance (#2736 item 2)"
+            );
+            assert!(
+                std::env::var_os("DARKMUX_FLEET_SNAPSHOT_FILE").is_none(),
+                "DARKMUX_FLEET_SNAPSHOT_FILE survived the guard — a guarded process can still \
+                 read a stale or foreign fleet-snapshot handoff instead of the live path it \
+                 thinks it is exercising (#2736 item 2)"
+            );
+        }
+        // SAFETY: #[serial].
+        unsafe {
+            match saved_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+            match saved_snapshot {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_SNAPSHOT_FILE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_SNAPSHOT_FILE"),
             }
         }
     }
