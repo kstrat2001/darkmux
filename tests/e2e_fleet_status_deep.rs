@@ -87,11 +87,15 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![
-        NodeSpec::new("node-a"),
-        NodeSpec::new("node-b"),
-    ])
-    .expect("FleetHarness::boot");
+    // (#2727) Shares this binary's one redis-server (see harness.rs's
+    // `boot_sharing_redis` doc for why this file is a safe candidate:
+    // pure roster + `--deep` HTTP fetch, no presence, no dispatch
+    // fan-out).
+    let harness = FleetHarness::boot_sharing_redis(
+        vec![NodeSpec::new("node-a"), NodeSpec::new("node-b")],
+        "fleet_status_deep_aggregates_specs_from_reachable_peers",
+    )
+    .expect("FleetHarness::boot_sharing_redis");
 
     let node_a = harness.node("node-a").expect("node-a");
     let node_b = harness.node("node-b").expect("node-b");
@@ -142,8 +146,13 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
-        .expect("FleetHarness::boot");
+    // (#2727) See the aggregates-from-reachable-peers test above for why
+    // this file shares its redis.
+    let harness = FleetHarness::boot_sharing_redis(
+        vec![NodeSpec::new("node-a")],
+        "fleet_status_deep_degrades_gracefully_for_unreachable_peers",
+    )
+    .expect("FleetHarness::boot_sharing_redis");
     let node_a = harness.node("node-a").expect("node-a");
 
     // Register a real peer + a synthetic unreachable peer (port 1 is
@@ -194,8 +203,13 @@ fn fleet_status_default_unchanged_without_deep_flag() {
         return;
     }
 
-    let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
-        .expect("FleetHarness::boot");
+    // (#2727) See the aggregates-from-reachable-peers test above for why
+    // this file shares its redis.
+    let harness = FleetHarness::boot_sharing_redis(
+        vec![NodeSpec::new("node-a")],
+        "fleet_status_default_unchanged_without_deep_flag",
+    )
+    .expect("FleetHarness::boot_sharing_redis");
     let node_a = harness.node("node-a").expect("node-a");
     populate_roster_via_cli(node_a, &[node_a]);
 
