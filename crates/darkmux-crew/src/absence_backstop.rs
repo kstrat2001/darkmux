@@ -335,12 +335,25 @@ fn find_line(whole_file: &str, token: &str) -> Option<u32> {
 /// ([`run_backstop`]'s own doc) — on a public-PR review it is exactly as
 /// attacker-influenced as any other finding field. Before this bound
 /// existed, a `file` naming a device node (`/dev/zero`) made
-/// [`read_bounded`]'s predecessor (a bare `std::fs::read_to_string`) read
-/// forever, growing memory without limit and wedging the host process
+/// [`read_bounded_with_cap`]'s predecessor (a bare `std::fs::read_to_string`)
+/// read forever, growing memory without limit and wedging the host process
 /// this check runs on (never a container — see this module's own doc on
 /// what it is). 4 MiB comfortably covers any real source file a review
 /// would ever check; a candidate this large is itself a signal the lint
 /// should abstain on, not a limit worth raising.
+///
+/// **Settled (#2743): a candidate over this bound ABSTAINS.** It is not
+/// searched as a truncated prefix. [`read_bounded_with_cap`] reads one
+/// byte past its cap and treats that extra byte's presence as proof
+/// there was more file beyond the bound — see its own doc for the
+/// mechanism, and the boundary tests beside it (`a_file_exactly_at_the_
+/// cap_is_read_and_searched_not_abstained_on` /
+/// `a_file_past_the_cap_abstains_instead_of_searching_a_prefix`)
+/// for the fencepost this constant sits on. The alternative — search the
+/// prefix and let a token past the bound report `Confirmed` — was
+/// rejected: the backstop's whole purpose is refusing to confirm an
+/// absence it cannot see, and a silent prefix search is exactly that
+/// failure one layer down.
 const MAX_FILE_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Resolve `file` against `tree_root`, refusing to leave the tree.
@@ -380,17 +393,36 @@ fn resolve_within_tree(tree_root: &Path, file: &str) -> Option<PathBuf> {
     }
 }
 
-/// Read at most [`MAX_FILE_READ_BYTES`] of `path` as UTF-8.
+/// Read at most `cap` bytes of `path` as UTF-8. The production path
+/// always calls this with [`MAX_FILE_READ_BYTES`]
+/// ([`check_absence_claim_against_file`]); the cap is a parameter so the
+/// abstain-on-oversize boundary can be proven against fixtures small
+/// enough to build without writing a multi-megabyte file to disk on
+/// every test run (see the boundary tests beside [`MAX_FILE_READ_BYTES`]).
 ///
-/// `None` on any I/O failure OR when the byte cap lands mid-codepoint (a
-/// truncated multi-byte UTF-8 sequence at the boundary) — both collapse to
-/// the same "abstain" outcome the caller already applies to every other
-/// unreadable-file case, never an error.
-fn read_bounded(path: &Path) -> Option<String> {
+/// `None` on any I/O failure, when the byte cap lands mid-codepoint (a
+/// truncated multi-byte UTF-8 sequence at the boundary), OR when the file
+/// is larger than `cap` — all three collapse to the same "abstain"
+/// outcome the caller already applies to every other unreadable-file
+/// case, never an error.
+///
+/// **The oversize check (#2743).** This reads `cap + 1` bytes, one past
+/// the cap. If that extra byte actually came back (`buf.len() > cap`),
+/// there was more file beyond the cap, so this abstains instead of
+/// returning the `cap`-byte prefix it already has — searching that
+/// prefix would let a token living past the cap report `Confirmed`
+/// (present) when it might just as well be absent from the part that
+/// was never read. A file of exactly `cap` bytes has no extra byte to
+/// read (`take` stops at EOF), so `buf.len() == cap` and it is returned
+/// whole, not abstained on.
+fn read_bounded_with_cap(path: &Path, cap: u64) -> Option<String> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let mut buf = String::new();
-    file.take(MAX_FILE_READ_BYTES).read_to_string(&mut buf).ok()?;
+    file.take(cap + 1).read_to_string(&mut buf).ok()?;
+    if buf.len() as u64 > cap {
+        return None;
+    }
     Some(buf)
 }
 
@@ -400,25 +432,38 @@ fn read_bounded(path: &Path) -> Option<String> {
 /// `claim_text` alone (no disk access) — a finding whose `why` carries no
 /// recognized absence phrasing never touches the filesystem at all, which
 /// both saves the read for the common case and caps the blast radius of
-/// `resolve_within_tree`/`read_bounded` (both private — see this
+/// `resolve_within_tree`/`read_bounded_with_cap` (both private — see this
 /// module's own source) to findings that could actually be flagged.
 ///
 /// Returns [`AbsenceCheckOutcome::Inconclusive`] — never an error — when
 /// no claim is detected, when `file` cannot be resolved inside
 /// `tree_root` (`resolve_within_tree`), or when the file cannot be read
-/// (moved, deleted, not valid UTF-8, too large — `read_bounded`): the
-/// caller's rule is to leave a finding untouched on any outcome that
-/// isn't `Contradicted`, so every one of these behaves exactly like "no
-/// claim detected" from the caller's point of view. This is the ONE place
-/// this module touches disk.
+/// (moved, deleted, not valid UTF-8, larger than [`MAX_FILE_READ_BYTES`]
+/// — `read_bounded_with_cap`): the caller's rule is to leave a finding
+/// untouched on any outcome that isn't `Contradicted`, so every one of
+/// these behaves exactly like "no claim detected" from the caller's
+/// point of view. This is the ONE place this module touches disk.
 pub fn check_absence_claim_against_file(claim_text: &str, tree_root: &Path, file: &str) -> AbsenceCheckOutcome {
+    check_absence_claim_against_file_with_cap(claim_text, tree_root, file, MAX_FILE_READ_BYTES)
+}
+
+/// [`check_absence_claim_against_file`], parameterized on the read cap —
+/// the production entry point above always calls this with
+/// [`MAX_FILE_READ_BYTES`]; tests inject a small cap to prove the
+/// abstain-on-oversize boundary without a multi-megabyte fixture.
+fn check_absence_claim_against_file_with_cap(
+    claim_text: &str,
+    tree_root: &Path,
+    file: &str,
+    read_cap: u64,
+) -> AbsenceCheckOutcome {
     let Some(token) = detect_absence_claim(claim_text) else {
         return AbsenceCheckOutcome::Inconclusive;
     };
     let Some(path) = resolve_within_tree(tree_root, file) else {
         return AbsenceCheckOutcome::Inconclusive;
     };
-    let Some(whole_file) = read_bounded(&path) else {
+    let Some(whole_file) = read_bounded_with_cap(&path, read_cap) else {
         return AbsenceCheckOutcome::Inconclusive;
     };
     check_token_against_whole_file(token, &whole_file)
@@ -681,6 +726,99 @@ mod tests {
         assert_eq!(outcome, AbsenceCheckOutcome::Contradicted { token: "foo()".to_string(), line: Some(1) });
     }
 
+    // ── #2743: oversize abstains, it does not search a truncated prefix ──
+    //
+    // `MAX_FILE_READ_BYTES` stays 4 MiB in production (pinned below), but
+    // the boundary itself is proven against a tiny injected cap — writing
+    // a real 4 MiB fixture on every test run would be wasteful, and the
+    // byte-for-byte behavior at the boundary doesn't depend on the cap's
+    // magnitude.
+
+    #[test]
+    fn max_file_read_bytes_default_is_unchanged_at_4_mib() {
+        // The cap is injectable for tests (see the tests below); this
+        // pins the PRODUCTION default so making it injectable never
+        // silently drifts what a real dispatch reads.
+        assert_eq!(MAX_FILE_READ_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_cap_is_read_and_searched_not_abstained_on() {
+        // The boundary's "must still work" half: a file of EXACTLY `cap`
+        // bytes is the largest file this check can still read whole, and
+        // it must be searched, not abstained on. The claimed-absent
+        // token is the file's LAST 3 bytes, so a fencepost error that
+        // reads even one byte short would miss it and this would wrongly
+        // assert `Inconclusive` instead of `Contradicted`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cap: u64 = 32;
+        let content = format!("{}xyz", "a".repeat(cap as usize - 3));
+        assert_eq!(content.len() as u64, cap);
+        std::fs::write(tmp.path().join("a.ts"), &content).unwrap();
+
+        let outcome = check_absence_claim_against_file_with_cap(
+            "This does not call `xyz` anywhere.",
+            tmp.path(),
+            "a.ts",
+            cap,
+        );
+        assert_eq!(
+            outcome,
+            AbsenceCheckOutcome::Contradicted { token: "xyz".to_string(), line: Some(1) },
+            "a file of exactly the cap must be read whole, not abstained on"
+        );
+    }
+
+    #[test]
+    fn a_file_past_the_cap_abstains_instead_of_searching_a_prefix() {
+        // The boundary's other half, and the one #2743 is about: a file
+        // larger than the cap must abstain (Inconclusive), never report
+        // `Confirmed` on the strength of a truncated prefix search.
+        //
+        // The claimed-absent token sits entirely PAST the first `cap`
+        // bytes (all filler up to `cap`, `xyz` appended after) — chosen
+        // so a regression that reverts to searching only the `cap`-byte
+        // prefix would not find it there and would (wrongly) report
+        // `Confirmed`, the exact false-positive #2743 is about.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cap: u64 = 32;
+        let content = format!("{}xyz", "a".repeat(cap as usize));
+        assert!(content.len() as u64 > cap);
+        std::fs::write(tmp.path().join("a.ts"), &content).unwrap();
+
+        let outcome = check_absence_claim_against_file_with_cap(
+            "This does not call `xyz` anywhere.",
+            tmp.path(),
+            "a.ts",
+            cap,
+        );
+        assert_eq!(
+            outcome,
+            AbsenceCheckOutcome::Inconclusive,
+            "a file past the cap must abstain, not be searched as a truncated prefix"
+        );
+    }
+
+    #[test]
+    fn read_bounded_with_cap_returns_some_at_the_cap_and_none_past_it() {
+        // The unit-level twin of the two outcome-level tests above,
+        // isolating `read_bounded_with_cap` itself from claim detection
+        // and the file-search step.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cap: u64 = 16;
+        let at_cap = tmp.path().join("at_cap.txt");
+        let past_cap = tmp.path().join("past_cap.txt");
+        std::fs::write(&at_cap, "a".repeat(cap as usize)).unwrap();
+        std::fs::write(&past_cap, "a".repeat((cap + 1) as usize)).unwrap();
+
+        assert_eq!(read_bounded_with_cap(&at_cap, cap), Some("a".repeat(cap as usize)));
+        assert_eq!(
+            read_bounded_with_cap(&past_cap, cap),
+            None,
+            "one byte past the cap must abstain, not return a truncated Some"
+        );
+    }
+
     // ── check_absence_claim_against_file: path containment (RED-PROVE, review MUST FIX 3) ──
     //
     // `file` is model-authored and unvalidated. Before `resolve_within_tree`
@@ -754,9 +892,12 @@ mod tests {
             "reading a device file must be bounded by MAX_FILE_READ_BYTES, not block indefinitely"
         );
         // The read completed within the bound; the specific verdict
-        // doesn't matter here (NUL bytes are valid UTF-8, so this likely
-        // reads MAX_FILE_READ_BYTES of them and lands on Confirmed) — the
-        // property under test is boundedness, not this outcome.
+        // doesn't matter here for THIS test (the property under test is
+        // boundedness, not the outcome) — though as of #2743 it is in
+        // fact deterministic: `/dev/zero` never reaches EOF, so
+        // `read_bounded_with_cap` always reads past `MAX_FILE_READ_BYTES`
+        // and abstains (`Inconclusive`), never `Confirmed` on a
+        // truncated prefix of NUL bytes.
         let _ = handle.join().unwrap();
     }
 
