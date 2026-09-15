@@ -18,6 +18,20 @@
 //!
 //! `Drop` impl tears everything down (kills child processes).
 //!
+//! ### Why `Drop` is not the whole story (#2716)
+//!
+//! The `Drop` impls below cover the case where a test FINISHES. They
+//! covered nothing else, and the runs that leak are precisely the runs
+//! where `Drop` never executes — a `Ctrl-C` on `cargo test`, a `SIGKILL`ed
+//! runner, an aborting harness. Measured before the fix: 63 `redis-server`
+//! processes on one developer machine, 60 orphaned on ephemeral ports, the
+//! oldest 76 days old. Every fixture this module spawns now also goes
+//! through [`FixtureGroup`], which makes the children die with the parent
+//! (a pipe-EOF watchdog owning their process group) and reaps anything
+//! that still got through at the NEXT startup. See
+//! [`crate::e2e::fixture_reaper`]'s module doc for the mechanism, and for
+//! why its sweep cannot reach a server the harness did not start.
+//!
 //! ## Requirements
 //!
 //! - `redis-server` on PATH (the harness spawns a fresh instance per test)
@@ -61,6 +75,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::e2e::fixture_reaper::FixtureGroup;
 use crate::e2e::mock_lmstudio::MockLmStudio;
 
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -240,12 +255,28 @@ impl FleetNode {
     pub fn is_alive(&mut self) -> bool {
         matches!(self.daemon.try_wait(), Ok(None))
     }
+
+    /// This node's daemon pid, for the fixture registry and for the
+    /// hard-kill regression test (#2716).
+    pub fn daemon_pid(&self) -> u32 {
+        self.daemon.id()
+    }
+
+    /// (#2716) Kill the daemon now rather than at field-drop time.
+    /// `FleetHarness::drop` calls this for every node BEFORE it stands the
+    /// watchdog down, so the window in which the harness has disarmed its
+    /// own die-with-parent guard but not yet killed its children is empty.
+    /// Field drop still runs `Drop` below; a second `kill` on an already
+    /// reaped child is a no-op error this discards.
+    pub fn kill_daemon(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
 }
 
 impl Drop for FleetNode {
     fn drop(&mut self) {
-        let _ = self.daemon.kill();
-        let _ = self.daemon.wait();
+        self.kill_daemon();
     }
 }
 
@@ -387,6 +418,11 @@ pub struct FleetHarness {
     pub mock_lmstudio: MockLmStudio,
     redis: Child,
     redis_url: String,
+    /// (#2716) Owns the pipe-EOF watchdog and the process group every
+    /// fixture below is spawned into, plus this run's registry file.
+    /// Armed BEFORE the first fixture starts so nothing can be spawned
+    /// outside the guard.
+    fixtures: FixtureGroup,
     /// Held to keep the tempdir alive for the harness's lifetime —
     /// daemon flow + fleet files live under here.
     _tempdir: tempfile::TempDir,
@@ -417,7 +453,20 @@ impl FleetHarness {
         let tempdir =
             tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
 
-        let (redis, redis_url) = spawn_redis(&tempdir.path().join("redis"))?;
+        // (#2716) Armed first: it sweeps whatever a dead previous run left
+        // behind, and every fixture spawned after this point is placed in
+        // its process group and written into its registry. Anything
+        // spawned before it would be outside both halves of the guard.
+        let mut fixtures = FixtureGroup::arm();
+
+        // (#2716) Every `?` from here on is an ERROR PATH that leaves a
+        // spawned fixture behind: `redis` below is a plain
+        // `std::process::Child`, which has no killing `Drop`. What reaps it
+        // is `fixtures` dropping WITHOUT a stand-down — the watchdog sees
+        // EOF and TERMs the group. That is why `FixtureGroup` deliberately
+        // has no `Drop` impl; see the comment in `fixture_reaper.rs`.
+        let (redis, redis_url) =
+            spawn_redis(&tempdir.path().join("redis"), &mut fixtures)?;
         wait_for_redis(&redis_url)?;
 
         let mock_lmstudio = MockLmStudio::spawn()
@@ -431,6 +480,7 @@ impl FleetHarness {
                 tempdir.path(),
                 &redis_url,
                 &lmstudio_base_url,
+                &mut fixtures,
             )?;
             nodes.push(node);
         }
@@ -443,8 +493,26 @@ impl FleetHarness {
             mock_lmstudio,
             redis,
             redis_url,
+            fixtures,
             _tempdir: tempdir,
         })
+    }
+
+    /// (#2716) This run's fixture registry file — the startup-sweep half
+    /// of the guard. Exposed for the test that asserts every fixture
+    /// actually reaches it.
+    pub fn registry_path(&self) -> &std::path::Path {
+        self.fixtures.registry_path()
+    }
+
+    /// (#2716) Every OS process this harness owns: the redis fixture and
+    /// one daemon per node. Used by the hard-kill regression test, which
+    /// has to assert from OUTSIDE this process that none of them survived
+    /// it.
+    pub fn fixture_pids(&self) -> Vec<u32> {
+        let mut pids = vec![self.redis.id()];
+        pids.extend(self.nodes.iter().map(FleetNode::daemon_pid));
+        pids
     }
 
     pub fn redis_url(&self) -> &str {
@@ -459,9 +527,18 @@ impl FleetHarness {
 
 impl Drop for FleetHarness {
     fn drop(&mut self) {
-        // Nodes drop themselves; redis we kill explicitly.
+        // (#2716) Order matters. Kill every child FIRST — the nodes
+        // explicitly rather than leaving them to field-drop, which runs
+        // after this body — and only then stand the watchdog down. Standing
+        // down first would open a window where the die-with-parent guard is
+        // disarmed and the children are still running, which is the exact
+        // state this issue is about.
+        for node in &mut self.nodes {
+            node.kill_daemon();
+        }
         let _ = self.redis.kill();
         let _ = self.redis.wait();
+        self.fixtures.stand_down();
     }
 }
 
@@ -503,7 +580,10 @@ fn darkmux_release_cmd() -> Command {
 
 // ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
 
-fn spawn_redis(workdir: &std::path::Path) -> Result<(Child, String), String> {
+fn spawn_redis(
+    workdir: &std::path::Path,
+    fixtures: &mut FixtureGroup,
+) -> Result<(Child, String), String> {
     std::fs::create_dir_all(workdir)
         .map_err(|e| format!("creating redis workdir: {e}"))?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -514,8 +594,10 @@ fn spawn_redis(workdir: &std::path::Path) -> Result<(Child, String), String> {
         .port();
     drop(listener); // release for redis-server to bind
 
-    let child = Command::new("redis-server")
-        .arg("--port")
+    // (#2716) Built rather than chained so the fixture group can place it
+    // in the watchdog's process group before it is spawned.
+    let mut cmd = Command::new("redis-server");
+    cmd.arg("--port")
         .arg(port.to_string())
         .arg("--save")
         .arg("") // disable RDB persistence (test ephemeral)
@@ -528,11 +610,12 @@ fn spawn_redis(workdir: &std::path::Path) -> Result<(Child, String), String> {
         .arg("--protected-mode")
         .arg("no")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!(
-            "spawning redis-server (is `redis-server` on PATH? `brew install redis`): {e}"
-        ))?;
+        .stderr(Stdio::null());
+    fixtures.place(&mut cmd);
+    let child = cmd.spawn().map_err(|e| {
+        format!("spawning redis-server (is `redis-server` on PATH? `brew install redis`): {e}")
+    })?;
+    fixtures.register(&child)?;
 
     let url = format!("redis://127.0.0.1:{port}");
     Ok((child, url))
@@ -565,6 +648,7 @@ fn spawn_daemon(
     tempdir_root: &std::path::Path,
     redis_url: &str,
     lmstudio_base_url: &str,
+    fixtures: &mut FixtureGroup,
 ) -> Result<FleetNode, String> {
     let node_dir = tempdir_root.join(&spec.machine_id);
     std::fs::create_dir_all(&node_dir)
@@ -604,7 +688,8 @@ fn spawn_daemon(
     // (#2710) Through the one constructor, so the daemon — which is
     // long-lived and writes flow records for the whole scenario — gets
     // the same neutralization every `FleetNode::cmd()` child gets.
-    let daemon = darkmux_release_cmd()
+    let mut daemon_cmd = darkmux_release_cmd();
+    daemon_cmd
         .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
         .env("HOME", &process_home)
         .env("DARKMUX_HOME", &home_dir)
@@ -617,9 +702,15 @@ fn spawn_daemon(
         .env("OPENAI_BASE_URL", lmstudio_base_url)
         .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // (#2716) The daemon is the SECOND child with the leaked-orphan shape,
+    // not just redis — same `Drop`-only teardown, same outcome under a hard
+    // kill. It goes through the same guard.
+    fixtures.place(&mut daemon_cmd);
+    let daemon = daemon_cmd
         .spawn()
         .map_err(|e| format!("spawning darkmux serve for {}: {e}", spec.machine_id))?;
+    fixtures.register(&daemon)?;
 
     Ok(FleetNode {
         machine_id: spec.machine_id.clone(),

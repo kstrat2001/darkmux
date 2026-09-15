@@ -190,7 +190,12 @@ use serde::{Deserialize, Serialize};
 /// (below). Genuinely a MINOR bump either way (new variant + new
 /// catch-all are both additive), not major — no existing field renamed or
 /// retyped.
-pub const MISSION_ENVELOPE_SCHEMA: &str = "1.4";
+///
+/// (#2678) 1.4 -> 1.5: added the optional [`MissionEnvelope::wall_ms`]
+/// run wall-clock. Additive + `Option` + `skip_serializing_if` ⇒ MINOR by
+/// the documented rule; an older reader ignores the field, and an older
+/// envelope deserializes with `wall_ms: None`.
+pub const MISSION_ENVELOPE_SCHEMA: &str = "1.5";
 
 /// The overall outcome a mission's run reached — see the module doc's
 /// "Status decision" section for how each value is decided and consumed.
@@ -440,6 +445,30 @@ pub struct MissionEnvelope {
     /// saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub records_emitted: Option<crate::records_emitted::RecordsEmitted>,
+    /// (#2678, schema 1.5) This run's own wall-clock in MILLISECONDS,
+    /// measured by the launcher with a monotonic [`std::time::Instant`] from
+    /// entry to finalization.
+    ///
+    /// **Why here, when the timestamps already bracket a run.**
+    /// `Mission.started_ts`/`finalized_ts` make a duration *derivable* — at
+    /// whole-SECOND granularity, which the scheduler's own step timing calls
+    /// too coarse for a duration. And deriving it means reading a second
+    /// document and knowing to subtract. The number that decides whether a CI
+    /// job's `timeout-minutes` needs raising should be readable straight off
+    /// the run's own artifact, where a series can compare it.
+    ///
+    /// This is measurement data, so it follows the convention the other
+    /// self-timing surfaces here already use (`ModelLedger::gather_ms`, the
+    /// serve panel's `gather_ms`): an `Instant` taken at entry, stamped as
+    /// whole milliseconds into the artifact rather than recomputed by a
+    /// reader.
+    ///
+    /// `None` means "not measured", never "zero" — an envelope written before
+    /// this field existed, or one from a path with no completed run to time
+    /// (the coder-phase branch stops at an operator sign-off gate with the
+    /// mission still `Active`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_ms: Option<u64>,
 }
 
 impl MissionEnvelope {
@@ -470,6 +499,9 @@ impl MissionEnvelope {
             remote_budgets: Vec::new(),
             payload: serde_json::Value::Null,
             records_emitted: None,
+            // (#2678) Not measured at construction — the launcher stamps it
+            // from its own `Instant` once the run has actually finished.
+            wall_ms: None,
         }
     }
 
