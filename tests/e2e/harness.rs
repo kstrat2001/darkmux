@@ -457,10 +457,16 @@ impl FleetHarness {
         // behind, and every fixture spawned after this point is placed in
         // its process group and written into its registry. Anything
         // spawned before it would be outside both halves of the guard.
-        let fixtures = FixtureGroup::arm();
+        let mut fixtures = FixtureGroup::arm();
 
+        // (#2716) Every `?` from here on is an ERROR PATH that leaves a
+        // spawned fixture behind: `redis` below is a plain
+        // `std::process::Child`, which has no killing `Drop`. What reaps it
+        // is `fixtures` dropping WITHOUT a stand-down — the watchdog sees
+        // EOF and TERMs the group. That is why `FixtureGroup` deliberately
+        // has no `Drop` impl; see the comment in `fixture_reaper.rs`.
         let (redis, redis_url) =
-            spawn_redis(&tempdir.path().join("redis"), &fixtures)?;
+            spawn_redis(&tempdir.path().join("redis"), &mut fixtures)?;
         wait_for_redis(&redis_url)?;
 
         let mock_lmstudio = MockLmStudio::spawn()
@@ -474,7 +480,7 @@ impl FleetHarness {
                 tempdir.path(),
                 &redis_url,
                 &lmstudio_base_url,
-                &fixtures,
+                &mut fixtures,
             )?;
             nodes.push(node);
         }
@@ -576,7 +582,7 @@ fn darkmux_release_cmd() -> Command {
 
 fn spawn_redis(
     workdir: &std::path::Path,
-    fixtures: &FixtureGroup,
+    fixtures: &mut FixtureGroup,
 ) -> Result<(Child, String), String> {
     std::fs::create_dir_all(workdir)
         .map_err(|e| format!("creating redis workdir: {e}"))?;
@@ -609,7 +615,7 @@ fn spawn_redis(
     let child = cmd.spawn().map_err(|e| {
         format!("spawning redis-server (is `redis-server` on PATH? `brew install redis`): {e}")
     })?;
-    fixtures.register(&child);
+    fixtures.register(&child)?;
 
     let url = format!("redis://127.0.0.1:{port}");
     Ok((child, url))
@@ -642,7 +648,7 @@ fn spawn_daemon(
     tempdir_root: &std::path::Path,
     redis_url: &str,
     lmstudio_base_url: &str,
-    fixtures: &FixtureGroup,
+    fixtures: &mut FixtureGroup,
 ) -> Result<FleetNode, String> {
     let node_dir = tempdir_root.join(&spec.machine_id);
     std::fs::create_dir_all(&node_dir)
@@ -704,7 +710,7 @@ fn spawn_daemon(
     let daemon = daemon_cmd
         .spawn()
         .map_err(|e| format!("spawning darkmux serve for {}: {e}", spec.machine_id))?;
-    fixtures.register(&daemon);
+    fixtures.register(&daemon)?;
 
     Ok(FleetNode {
         machine_id: spec.machine_id.clone(),

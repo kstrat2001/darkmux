@@ -63,9 +63,20 @@
 //!   second, what was recorded when it was spawned.
 //!
 //! A process the harness never spawned is never in a registry file, so no
-//! rule can reach it. The third condition is what defeats pid reuse: a
-//! process wearing a recycled pid necessarily started AFTER the one that
-//! released it, so its start time differs and it is left alone.
+//! rule can reach it. And an owner we cannot identify at all is treated as
+//! "unknown", not as "dead" — see the fail-closed comment in
+//! [`sweep_stale_registries_in`].
+//!
+//! The third condition is what defeats pid reuse, and it is worth being
+//! precise about how strongly: `lstart` is ABSOLUTE WALL-CLOCK, so the
+//! defense is structural, not probabilistic. A process wearing a recycled
+//! pid necessarily started after the one that released it, and therefore
+//! renders a strictly later timestamp than a record written in the past.
+//! It is not that a collision is unlikely; under a monotonic wall clock it
+//! is unreachable. The residual holes are all clock discontinuities — a DST
+//! fall-back hour, an NTP step backwards, a VM snapshot restore — and each
+//! would additionally need a full pid wraparound landing on the same number
+//! inside that same window.
 //!
 //! ### Why the recorded COMMAND is not part of the match
 //!
@@ -116,6 +127,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// The `/bin/sh` watchdog. Reads lines from its stdin, which is the read
@@ -129,9 +141,17 @@ use std::sync::OnceLock;
 ///   group leader at spawn, is also the group id.
 ///
 /// `SIGTERM` only, deliberately: `redis-server` and `darkmux serve` both
-/// terminate on it, escalating would need a `sleep` that is itself in the
-/// group being signaled, and anything that somehow survives is exactly
-/// what the startup sweep exists to catch.
+/// terminate on it, and escalating here would need a `sleep` that is
+/// itself in the group being signaled, so it would be cut short by the
+/// very TERM it is waiting out.
+///
+/// That leaves survivors to the startup sweep, and the sweep has to
+/// actually be able to catch one — which is why [`reap_confirmed`] waits
+/// for the process to go, escalates to `KILL`, and KEEPS the registry
+/// entry when it cannot confirm. An earlier cut signalled TERM and deleted
+/// the record unconditionally, which made this sentence false: a fixture
+/// that ignored TERM outlived both the group signal and the sweep, and was
+/// then unreachable forever.
 const WATCHDOG_SCRIPT: &str = r#"
 while IFS= read -r line; do
   if [ "$line" = "stand-down" ]; then
@@ -168,10 +188,7 @@ pub struct ProcId {
 /// what happened. That is not hypothetical: it silently passed a mutation
 /// of `stand_down` that should have been caught (#2716).
 pub fn identify(pid: u32) -> Option<ProcId> {
-    let out = Command::new("ps")
-        .args(["-o", "state=,lstart=,command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let out = ps_query(pid).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -181,6 +198,26 @@ pub fn identify(pid: u32) -> Option<ProcId> {
         started,
         command,
     })
+}
+
+/// The `ps` invocation behind [`identify`], built separately so a test can
+/// assert its environment rather than infer it.
+///
+/// `LC_ALL=C` is load-bearing, not hygiene. `lstart` renders through the
+/// locale, and only C / en_US produce the 24-character `asctime(3)` shape
+/// [`split_lstart`] slices at — measured: `de_DE` 25, `fr_FR` 27, `ja_JP`
+/// multibyte. The field is padded to 28 so a wrong width cannot bleed into
+/// the command and mis-identify a process, i.e. this is NOT a wrongful-kill
+/// vector. What it breaks is quieter: the recorded command is mangled, and
+/// a locale that CHANGES between the run that wrote a record and the run
+/// that reads it makes every record unmatchable, disabling the sweep with
+/// no signal at all. Pinning the locale also makes the 24 true by
+/// construction instead of true by assumption.
+fn ps_query(pid: u32) -> Command {
+    let mut cmd = Command::new("ps");
+    cmd.args(["-o", "state=,lstart=,command=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C");
+    cmd
 }
 
 /// Parse one `ps -o state=,lstart=,command=` line into `(started,
@@ -260,6 +297,28 @@ pub fn registry_entries(path: &Path) -> Vec<(String, ProcId)> {
     body.lines().filter_map(ProcId::from_line).collect()
 }
 
+/// Name this run's registry file.
+///
+/// The sequence number is load-bearing, not decoration. `pid` plus a
+/// timestamp looks unique and is not: `SystemTime` resolves to
+/// MICROseconds on macOS despite `as_nanos`, and libtest runs a binary's
+/// tests on concurrent threads, so two `FixtureGroup::arm()` calls in one
+/// process land on the same name whenever they fall in the same
+/// microsecond. Both runs then share a registry file and either can delete
+/// the other's — which is the live-run-unregistered failure in person.
+///
+/// Observed, not theorized: `29482-1789477487883790000.fixtures` (note the
+/// trailing zeroes) was created by one test and removed by a concurrent
+/// one, and the boot failed with "opening the fixture registry … No such
+/// file or directory". It only failed loudly because `register` had just
+/// been made loud; before that it was a silent unregistration for the whole
+/// run.
+fn registry_file_name(owner_pid: u32, nanos: u128) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{owner_pid}-{nanos}-{seq}.fixtures")
+}
+
 /// Where registry files live: under the workspace's `target/`, which is
 /// already gitignored and is where the e2e harness keeps its other
 /// cross-process state (the release-build `flock` file). Deliberately the
@@ -303,32 +362,132 @@ pub fn sweep_stale_registries_in(dir: &Path) -> usize {
                 _ => {}
             }
         }
-        // A live owner is a CONCURRENT run, not an orphan. The six e2e
-        // binaries run in parallel under one `cargo test`, so without this
-        // the first one to boot would reap a sibling's live redis out from
-        // under it. Skip the file whole and leave it for that run to
-        // remove on its own way out.
-        if owner.as_ref().is_some_and(ProcId::still_running) {
+        // FAIL CLOSED on both readings of the owner line.
+        //
+        // A live owner is a CONCURRENT run, not an orphan — the e2e
+        // binaries can run in parallel, so without this the first one to
+        // boot reaps a sibling's live redis out from under it.
+        //
+        // And `None` — no owner line, or one that did not parse — does not
+        // mean "the owner is dead", it means WE CANNOT TELL WHOSE RUN THIS
+        // IS. Reading that as authorization to kill every child named in
+        // the file is the one shape that turns an unlucky write into a
+        // wrongful kill: `arm` writes the owner line first, so a torn or
+        // truncated write (ENOSPC, a full tmpfs) leaves a first line that
+        // fails to parse while the `child` lines behind it parse fine. A
+        // run has one redis plus one daemon per node, so "two or more
+        // children" is the normal case, not an edge one. Unknown owner =>
+        // touch nothing, and leave the file rather than deleting evidence
+        // we could not act on.
+        if owner.as_ref().is_none_or(ProcId::still_running) {
             continue;
         }
+        let mut unconfirmed: Vec<ProcId> = Vec::new();
         for child in &children {
-            if child.still_running() {
-                signal_term(child.pid);
+            if !child.still_running() {
+                continue;
+            }
+            if reap_confirmed(child) {
                 reaped += 1;
+            } else {
+                unconfirmed.push(child.clone());
             }
         }
-        let _ = std::fs::remove_file(&path);
+        // Only now is the record disposable. Removing it before confirming
+        // the kill would destroy the only handle anything has on a fixture
+        // that ignored the signal — and the watchdog's TERM-only design is
+        // justified by "the startup sweep catches survivors", which is only
+        // true if the sweep keeps its own record of one.
+        rewrite_or_remove(&path, owner.as_ref(), &unconfirmed);
     }
     reaped
+}
+
+/// How long to wait for a signalled fixture to actually go away before
+/// escalating, and then before giving up on it. Short: the fixtures are a
+/// `redis-server` and a `darkmux serve`, both of which exit on TERM in
+/// milliseconds. This only costs wall clock when something is wedged.
+const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Signal a fixture and CONFIRM it is gone, escalating TERM -> KILL.
+/// Returns false when it is still running after both, which is the caller's
+/// cue to keep the record rather than delete it.
+fn reap_confirmed(child: &ProcId) -> bool {
+    signal_term(child.pid);
+    if wait_until_gone(child, SIGNAL_GRACE) {
+        return true;
+    }
+    signal_kill(child.pid);
+    wait_until_gone(child, SIGNAL_GRACE)
+}
+
+fn wait_until_gone(child: &ProcId, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if !child.still_running() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Dispose of a swept registry file: delete it when every fixture it named
+/// is confirmed gone, otherwise rewrite it holding just the survivors so a
+/// later sweep still knows they exist.
+///
+/// Split out from the sweep because the survivor branch cannot be reached
+/// from a test — it needs a process that ignores both TERM and KILL, and
+/// KILL cannot be ignored — so the behavior is asserted here directly.
+fn rewrite_or_remove(path: &Path, owner: Option<&ProcId>, unconfirmed: &[ProcId]) {
+    if unconfirmed.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let mut body = String::new();
+    if let Some(owner) = owner {
+        body.push_str(&owner.to_line("owner"));
+    }
+    for child in unconfirmed {
+        body.push_str(&child.to_line("child"));
+    }
+    let _ = write_atomic(path, &body);
+}
+
+/// Write a registry file so no reader can ever observe it half-built.
+///
+/// `fs::write` creates-and-truncates, which leaves a window where the file
+/// exists and is EMPTY. A sibling run sweeping the shared directory in that
+/// window reads no owner and no children, and — before the fail-closed gate
+/// above — would have deleted it, silently unregistering a live run's
+/// fixtures for the rest of its life. Temp-file-plus-rename makes the file
+/// go from absent to complete in one step.
+fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("fixtures.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// `kill -TERM` via the shell builtin — `kill(2)` would mean taking a
 /// `libc` dependency this workspace deliberately does not have, and the
 /// dep set here is kept small on purpose.
 fn signal_term(pid: u32) {
+    signal(pid, "TERM");
+}
+
+/// The escalation. A fixture is ours by construction here — it is named in
+/// a registry file this harness wrote and its start time still matches — so
+/// there is no question of whose process this is by the time we get here.
+fn signal_kill(pid: u32) {
+    signal(pid, "KILL");
+}
+
+fn signal(pid: u32, name: &str) {
     let _ = Command::new("/bin/sh")
         .arg("-c")
-        .arg(format!("kill -TERM {pid} 2>/dev/null"))
+        .arg(format!("kill -{name} {pid} 2>/dev/null"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -356,30 +515,60 @@ impl FixtureGroup {
     /// Sweep anything a dead previous run left behind, then arm the
     /// watchdog for this run. Never fails the harness: a watchdog that
     /// could not be spawned leaves the registry half doing its job, which
-    /// is strictly better than refusing to run tests.
+    /// is strictly better than refusing to run tests — but it SAYS SO on
+    /// stderr rather than proceeding with a guard silently absent.
     pub fn arm() -> Self {
         sweep_stale_registries();
 
         let dir = registry_dir();
         let _ = std::fs::create_dir_all(&dir);
         let owner_pid = std::process::id();
-        let registry = dir.join(format!(
-            "{owner_pid}-{}.fixtures",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let registry = dir.join(registry_file_name(owner_pid, nanos));
         if let Some(owner) = identify(owner_pid) {
-            let _ = std::fs::write(&registry, owner.to_line("owner"));
+            // Atomic: see `write_atomic`. A sibling must never see this
+            // file in a state where the owner line is missing.
+            if let Err(e) = write_atomic(&registry, &owner.to_line("owner")) {
+                eprintln!(
+                    "[fixture-reaper] could not write the fixture registry at {}: {e}. \
+                     This run's fixtures will not be reapable by a later run's startup \
+                     sweep; the die-with-parent watchdog is still armed (#2716)",
+                    registry.display()
+                );
+            }
         }
 
         let (watchdog, pgid) = Self::spawn_watchdog();
+        if watchdog.is_none() {
+            eprintln!(
+                "[fixture-reaper] could not spawn the watchdog, so `place` is a no-op and \
+                 nothing will reap this run's fixtures if it is killed. The startup-sweep \
+                 half still applies on the NEXT run (#2716)"
+            );
+        }
         Self {
             watchdog,
             pgid,
             registry,
             stood_down: false,
+        }
+    }
+
+    /// True once the watchdog has exited — which, on a live run, means the
+    /// die-with-parent guard is gone and nobody said so. Checked on every
+    /// [`register`], because a run that proceeds with a silently absent
+    /// guard is the original defect one layer up.
+    ///
+    /// [`register`]: FixtureGroup::register
+    pub fn watchdog_lost(&mut self) -> bool {
+        match self.watchdog.as_mut() {
+            // `stood_down` means we asked it to exit; that is not a loss.
+            Some(_) if self.stood_down => false,
+            Some(watchdog) => matches!(watchdog.try_wait(), Ok(Some(_))),
+            None => true,
         }
     }
 
@@ -437,16 +626,40 @@ impl FixtureGroup {
 
     /// Record a spawned fixture in this run's registry file, so a future
     /// run can reap it if this process dies without ever tearing it down.
-    pub fn register(&self, child: &Child) {
-        let Some(proc) = identify(child.id()) else {
-            return;
-        };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    ///
+    /// Returns `Err` rather than swallowing, and the callers propagate it
+    /// into `FleetHarness::boot`'s error. A silently-failed registration is
+    /// the guard's second half quietly absent for the whole run, with no
+    /// signal — which is exactly the shape that let 60 orphans accumulate
+    /// unnoticed, one level up. Failing the boot is loud, and now safe:
+    /// `boot`'s error path drops this group without standing the watchdog
+    /// down, so the fixture already spawned is reaped on the way out.
+    pub fn register(&mut self, child: &Child) -> Result<(), String> {
+        if self.watchdog_lost() {
+            eprintln!(
+                "[fixture-reaper] the watchdog is gone; this run's fixtures will not die \
+                 with it. The registry half still applies (#2716)"
+            );
+        }
+        let pid = child.id();
+        let proc = identify(pid).ok_or_else(|| {
+            format!("fixture pid {pid} was already gone when it was registered")
+        })?;
+        let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.registry)
-        {
-            let _ = f.write_all(proc.to_line("child").as_bytes());
-        }
+            .map_err(|e| {
+                format!(
+                    "opening the fixture registry {} to record pid {pid}: {e}",
+                    self.registry.display()
+                )
+            })?;
+        f.write_all(proc.to_line("child").as_bytes()).map_err(|e| {
+            format!(
+                "recording pid {pid} in the fixture registry {}: {e}",
+                self.registry.display()
+            )
+        })
     }
 
     /// Orderly teardown: tell the watchdog NOT to signal the group (the
@@ -463,8 +676,12 @@ impl FixtureGroup {
                 let _ = stdin.write_all(b"stand-down\n");
                 let _ = stdin.flush();
             }
-            // Dropping the pipe releases the watchdog's `read` even if the
-            // write above failed; either way it exits without signaling.
+            // The token above is what makes it exit QUIETLY. Dropping the
+            // pipe is EOF, and EOF is precisely what makes the read loop
+            // fall through to the group TERM — so if the write failed, the
+            // watchdog signals the group on its way out. That is harmless
+            // where this is reached (`FleetHarness::drop` has already
+            // killed every child), and is the safe direction to fail in.
             drop(watchdog.stdin.take());
             let _ = watchdog.wait();
         }
@@ -472,11 +689,32 @@ impl FixtureGroup {
     }
 }
 
-impl Drop for FixtureGroup {
-    fn drop(&mut self) {
-        self.stand_down();
-    }
-}
+// DELIBERATELY NO `impl Drop for FixtureGroup` (#2716).
+//
+// A `Drop` here reads like tidiness and is the opposite. `stand_down` tells
+// the watchdog NOT to signal the group and deletes this run's registry
+// file, so running it automatically disarms BOTH halves of the guard at
+// every scope exit — including the ones where the fixtures are still alive.
+//
+// `FleetHarness::boot` is the case that matters. It arms the group, spawns
+// redis through it, and then has four fallible steps before it returns:
+// `wait_for_redis`, `MockLmStudio::spawn`, `spawn_daemon`, and a
+// 15-second `wait_for_daemon_health` TCP poll. On `?` from any of them the
+// nodes' own `Drop` kills the daemons, but `redis: Child` drops to NOTHING
+// — `std::process::Child` has no killing `Drop` — and a `Drop` here would
+// then tell the watchdog to stand down and delete the record. The redis
+// would survive with the die-with-parent guard told not to fire and its
+// only registry entry removed: a permanent orphan, on the ordinary
+// contended-machine timeout path rather than an exotic one.
+//
+// Without a `Drop`, the field drop closes the watchdog's stdin, the
+// watchdog sees EOF, and it TERMs the group — the fixture dies. The
+// registry file is left behind for a later sweep, which is the correct
+// direction for a run that ended badly.
+//
+// The success path is unaffected: `FleetHarness::drop` calls `stand_down`
+// EXPLICITLY, after killing its children (`harness.rs`), and `stood_down`
+// keeps that idempotent.
 
 #[cfg(test)]
 mod tests {
@@ -512,6 +750,327 @@ mod tests {
     /// assertion in this module about a fixture being gone rests on this,
     /// and one of them silently passed a mutation because of it. Deleting
     /// the `Z` branch in `parse_ps_line` makes this fail.
+    /// (#2716) MUST-FIX 1. `FleetHarness::boot` arms the group, spawns
+    /// redis through it, and then has four fallible steps — two timed
+    /// waits among them — before it returns. This reproduces that error
+    /// path exactly: a fixture is spawned and registered, then BOTH the
+    /// group and the `Child` handle go out of scope with no teardown,
+    /// which is what `?` does.
+    ///
+    /// A `Drop for FixtureGroup` calling `stand_down` makes this fail in
+    /// both directions at once: the fixture survives (the watchdog was
+    /// told not to signal) AND the registry file is deleted (so no later
+    /// sweep can find it). Restoring that impl is the mutation.
+    #[cfg(unix)]
+    #[test]
+    fn boot_s_error_path_reaps_its_fixture_rather_than_disarming_both_guards() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60").stdout(Stdio::null()).stderr(Stdio::null());
+
+        let (pid, registry) = {
+            let mut group = FixtureGroup::arm();
+            group.place(&mut cmd);
+            let child = cmd.spawn().expect("spawning the stand-in fixture");
+            let pid = child.id();
+            group.register(&child).expect("registering the fixture");
+            let registry = group.registry_path().to_path_buf();
+            // `std::process::Child` has no killing `Drop`, so letting it
+            // fall out of scope here is byte-for-byte what `boot`'s `?`
+            // does to `redis`.
+            std::mem::forget(child);
+            (pid, registry)
+            // `group` drops here: the early return.
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while identify(pid).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let survived = identify(pid).is_some();
+        if survived {
+            // Never leave the probe's own orphan behind, whatever the
+            // assertion decides.
+            signal_kill(pid);
+        }
+        assert!(
+            !survived,
+            "the fixture outlived a harness that errored out after spawning it. `boot` has \
+             four fallible steps after `spawn_redis`, two of them timeouts on a contended \
+             machine, and `redis: Child` has no killing `Drop` — so if the group also \
+             stands the watchdog down on the way out, nothing reaps it and the registry \
+             entry that would have let a later sweep find it is deleted too (#2716)"
+        );
+        assert!(
+            registry.exists(),
+            "a run that ended badly must LEAVE its registry file behind — that record is \
+             the only thing a later startup sweep can act on (#2716)"
+        );
+        let _ = std::fs::remove_file(&registry);
+    }
+
+    /// (#2716) MUST-FIX 2. An owner line that does not parse means the
+    /// owner is UNKNOWN, not dead. `arm` writes that line first, so a torn
+    /// write leaves exactly this shape: no usable owner, and `child` lines
+    /// behind it that parse fine. Reading it as authorization to kill is
+    /// the only path by which a process the harness did not start gets
+    /// signaled. Flipping the gate back to `is_some_and` kills the
+    /// stranger here.
+    #[test]
+    fn an_ownerless_registry_authorizes_nothing_and_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stranger = spawn_stranger();
+        let pid = stranger.id();
+        let child = identify(pid).expect("child must be identifiable");
+        // A REAL, current identity on the child line — so the only thing
+        // standing between the sweep and this process is the owner gate.
+        let path = write_registry(
+            tmp.path(),
+            "torn-owner-write",
+            &format!("owner\tnot-a-pid\ttruncated\n{}", child.to_line("child")),
+        );
+
+        let reaped = sweep_stale_registries_in(tmp.path());
+
+        assert_eq!(reaped, 0, "an unidentifiable owner must authorize no kills");
+        assert!(
+            alive(pid),
+            "the sweep killed a process named in a registry file whose owner it could not \
+             identify. `None` there means 'we cannot tell whose run this is', and the only \
+             safe reading of that is to touch nothing (#2716)"
+        );
+        assert!(
+            path.exists(),
+            "a file the sweep could not act on must be left in place, not deleted — \
+             removing evidence we declined to act on is how the next reader loses the \
+             ability to act on it either (#2716)"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+    }
+
+    /// (#2716) The sweep must CONFIRM a kill, not assume one. A fixture
+    /// that ignores TERM is reaped by the escalation to KILL. Deleting the
+    /// `signal_kill` escalation in `reap_confirmed` leaves this process
+    /// alive and the count at zero.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_escalates_to_kill_when_a_fixture_ignores_term() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stubborn = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning a TERM-immune fixture");
+        let pid = stubborn.id();
+        let child = identify(pid).expect("child must be identifiable");
+        write_registry(
+            tmp.path(),
+            "stubborn",
+            &format!(
+                "owner\t0\tThu Jan  1 00:00:00 1970\t/nonexistent/owner\n{}",
+                child.to_line("child")
+            ),
+        );
+
+        let reaped = sweep_stale_registries_in(tmp.path());
+        let gone = !alive(pid);
+        // Take the readings BEFORE cleaning up, then clean up
+        // unconditionally. `stubborn` ignores TERM, so a bare `wait()`
+        // here blocks FOREVER whenever the escalation under test is
+        // absent — which is exactly the mutation this test exists to
+        // catch. Measured: it wedged a run for ten minutes and left the
+        // fixture behind. A test that probes for a missing kill must not
+        // depend on that kill having happened.
+        if !gone {
+            signal_kill(pid);
+        }
+        let _ = stubborn.wait();
+
+        assert_eq!(
+            reaped, 1,
+            "a fixture that ignores TERM must still be reaped — the watchdog sends TERM only, \
+             and its own justification for that is that the startup sweep catches survivors \
+             (#2716)"
+        );
+        assert!(gone, "the TERM-immune fixture survived the sweep");
+    }
+
+    /// (#2716) The other half of confirmation: a fixture the sweep could
+    /// NOT confirm keeps its registry entry, so a later sweep still has a
+    /// handle on it. Unreachable through `sweep_stale_registries_in`
+    /// itself — it would need a process that ignores KILL, which does not
+    /// exist — so the disposal step is asserted directly.
+    #[test]
+    fn an_unconfirmed_fixture_keeps_its_record_instead_of_losing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = ProcId {
+            pid: 4242,
+            started: "Thu Jan  1 00:00:00 1970".to_string(),
+            command: "/nonexistent/owner".to_string(),
+        };
+        let survivor = ProcId {
+            pid: 4243,
+            started: "Thu Jan  1 00:00:01 1970".to_string(),
+            command: "redis-server --port 1".to_string(),
+        };
+        let path = tmp.path().join("kept.fixtures");
+
+        rewrite_or_remove(&path, Some(&owner), std::slice::from_ref(&survivor));
+        let kept = registry_entries(&path);
+        assert_eq!(
+            kept,
+            vec![
+                ("owner".to_string(), owner.clone()),
+                ("child".to_string(), survivor),
+            ],
+            "a fixture that survived both signals must stay in the registry, with its owner \
+             line intact so a later sweep still reads the file as orphaned (#2716)"
+        );
+
+        rewrite_or_remove(&path, Some(&owner), &[]);
+        assert!(
+            !path.exists(),
+            "with every fixture confirmed gone the record is disposable and should go"
+        );
+    }
+
+    /// (#2716) A registry file must never be observable half-built. A
+    /// sibling run sweeping the shared directory in the window `fs::write`
+    /// opens — created, truncated, not yet filled — reads no owner and no
+    /// children.
+    ///
+    /// Asserting "the content is right afterwards" would NOT catch that:
+    /// `fs::write` gets there too, just via an observable empty state. So
+    /// this asserts the distinguishing fact instead — that the file is
+    /// REPLACED rather than mutated in place. A handle opened before the
+    /// write still sees the old bytes after a rename, because it holds the
+    /// old inode; a truncate-in-place would have changed the bytes under
+    /// it. Swapping `write_atomic`'s body for `fs::write` fails here.
+    #[test]
+    fn the_registry_is_replaced_not_truncated_in_place() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("atomic.fixtures");
+        let before = "owner\t1\tstale\told\n";
+        std::fs::write(&path, before).unwrap();
+        let mut held_open = std::fs::File::open(&path).expect("holding the pre-write inode");
+
+        write_atomic(&path, "owner\t2\tfresh\tnew-and-rather-longer\n").expect("write");
+
+        let mut seen_through_the_old_handle = String::new();
+        held_open
+            .read_to_string(&mut seen_through_the_old_handle)
+            .expect("reading through the pre-write handle");
+        assert_eq!(
+            seen_through_the_old_handle, before,
+            "the registry was mutated in place rather than replaced, so a reader that opened \
+             it a moment earlier had the bytes changed underneath it — which is the same \
+             window in which a sibling run sees an owner-less, child-less file (#2716)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "owner\t2\tfresh\tnew-and-rather-longer\n",
+            "a fresh reader must see the complete new content"
+        );
+        assert!(
+            !tmp.path().join("atomic.fixtures.tmp").exists(),
+            "the temp file must be renamed away, not left beside the registry"
+        );
+    }
+
+    /// (#2716) Two runs in one process must never share a registry file.
+    /// `pid` + `SystemTime` is not unique — macOS resolves to microseconds
+    /// and libtest runs tests concurrently — and two groups on one path
+    /// means either can delete the other's record while it is live.
+    /// Asserted at the same timestamp on purpose, since that is exactly
+    /// the case a wall-clock-only name gets wrong. Dropping the sequence
+    /// number makes these equal.
+    #[test]
+    fn two_registry_names_at_the_same_instant_still_differ() {
+        assert_ne!(
+            registry_file_name(4242, 1_789_477_487_883_790_000),
+            registry_file_name(4242, 1_789_477_487_883_790_000),
+            "two FixtureGroups armed in the same microsecond of the same process got the same \
+             registry path, so each can delete the other's live record (#2716)"
+        );
+    }
+
+    /// (#2716) A failed registration must be LOUD. It opens with `append`
+    /// and no `create`, so a sibling that deleted the file (or any other
+    /// write failure) leaves this run's fixtures unregistered for its whole
+    /// lifetime. Swallowing that in an `if let Ok` is the repo's
+    /// no-silent-wrong-key rule inverted.
+    #[test]
+    fn register_reports_a_failure_instead_of_swallowing_it() {
+        let mut group = FixtureGroup::arm();
+        std::fs::remove_file(group.registry_path()).expect("removing the registry");
+        let mut child = spawn_stranger();
+
+        let err = group
+            .register(&child)
+            .expect_err("registering into a missing registry file must fail");
+        assert!(
+            err.contains("fixture registry"),
+            "the error must name what could not be recorded; got {err:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        group.stand_down();
+    }
+
+    /// (#2716) A watchdog that died takes the die-with-parent half of the
+    /// guard with it, and nothing noticed. Deleting the `try_wait` arm
+    /// makes this report a live watchdog forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_watchdog_is_detected_rather_than_assumed_alive() {
+        let mut group = FixtureGroup::arm();
+        assert!(
+            !group.watchdog_lost(),
+            "a freshly armed group has a live watchdog"
+        );
+
+        let pgid = group.pgid.expect("watchdog must have spawned");
+        // A positive pid signals the watchdog ALONE, not its group.
+        signal_kill(pgid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !group.watchdog_lost() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(
+            group.watchdog_lost(),
+            "the watchdog exited and the group still reports it alive, so a run would carry \
+             on with the guard silently absent (#2716)"
+        );
+        group.stand_down();
+    }
+
+    /// (#2716) `lstart` renders through the locale and only C / en_US give
+    /// the 24-character shape `split_lstart` slices at. Dropping the
+    /// `LC_ALL` pin makes the width an assumption about the developer's
+    /// environment instead of a fact about the command.
+    #[test]
+    fn the_ps_query_pins_the_locale() {
+        let cmd = ps_query(std::process::id());
+        let lc_all = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("LC_ALL"))
+            .and_then(|(_, v)| v);
+        assert_eq!(
+            lc_all,
+            Some(std::ffi::OsStr::new("C")),
+            "`ps -o lstart=` is locale-formatted — de_DE renders 25 characters, fr_FR 27, \
+             ja_JP multibyte. Unpinned, a locale change between the run that writes a record \
+             and the run that reads it makes every record unmatchable and disables the sweep \
+             with no signal (#2716)"
+        );
+    }
+
     #[test]
     fn a_zombie_reads_as_gone_not_as_running() {
         assert_eq!(
@@ -713,7 +1272,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn place_puts_a_child_in_the_watchdog_group() {
-        let group = FixtureGroup::arm();
+        let mut group = FixtureGroup::arm();
         let pgid = group.pgid.expect("watchdog must have spawned");
 
         let mut cmd = Command::new("sleep");
@@ -739,6 +1298,9 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+        // Explicit, because `FixtureGroup` has no `Drop`: without this the
+        // probe leaves its own registry file for a later run to sweep.
+        group.stand_down();
     }
 
     /// (#2716) An orderly teardown must NOT let the watchdog signal the
