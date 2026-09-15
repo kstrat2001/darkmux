@@ -18,8 +18,8 @@
  *   degraded — a MIXED terminal (#2406): real output was produced, some of
  *              it was not — a phase with some tasks complete and some
  *              errored/abandoned. Warn color, same as `stopped` (a caution,
- *              not a failure — see `.fleet-strip--degraded`'s own comment
- *              in `styles.css` for the same color choice at a different
+ *              not a failure — see `.fleetcov`'s own comment in
+ *              `styles.css` for the same color choice at a different
  *              scope), but its OWN kind: `degraded` and `stopped` are
  *              different facts (a mix that shipped real output vs. an
  *              operator/budget kill) and must stay distinguishable by the

@@ -100,8 +100,8 @@ describe("App", () => {
     expect(document.getElementById("stage")).toBeTruthy();
     // Packet 8: the default route is `FleetLens` (the savings hero +
     // machine cards + activity timeline), superseding the scaffold's
-    // original `FleetStrip` presence-only region — see that component's
-    // own doc. With every endpoint answering a blank `[]`, the hero still
+    // original `FleetStrip` presence-only region (deleted in #2725). With
+    // every endpoint answering a blank `[]`, the hero still
     // renders (always-render-even-at-zero, per its own doc) and the
     // timeline falls to its empty-fleet branch.
     await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());

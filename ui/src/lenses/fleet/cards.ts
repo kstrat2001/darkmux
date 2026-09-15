@@ -270,11 +270,43 @@ export function rosterOnlyEntries(
   });
 }
 
+/** (#1855) WHY a card has no hardware line. `""` from `specOf` is not one
+ * fact, and the single legacy string said it was:
+ *
+ * - `not-reported` — a beat (or a static build's committed snapshot entry)
+ *   EXISTS for this machine and carries no `specs`. The machine answered and
+ *   told us nothing about its hardware, which is what every peer running a
+ *   build older than #2083 does: that fix stopped the emitter hardcoding
+ *   `specs: None`, so a peer only starts sending hardware once it upgrades
+ *   past it. "hardware not reported" is the honest sentence for that, and it
+ *   is unchanged.
+ * - `not-seen` — there is NO beat and no snapshot entry at all. Nothing was
+ *   ever received from this machine, so there is nothing that could have
+ *   reported anything. This is the state #1855's roster cards land in: a
+ *   machine the operator declared with `darkmux machine add` that is down or
+ *   has never started its daemon now renders (it used to vanish entirely),
+ *   and the old string made its card assert that the machine had answered
+ *   and withheld its hardware.
+ *
+ * The distinction is the same one the fleet-coverage notice draws one level
+ * up, and the same one `specOf`'s `unknown`-uid branch already draws for
+ * identity: "we looked and it said nothing" is not "we could not look". */
+export type SpecUnknownReason = "not-reported" | "not-seen";
+
+/** The one sentence per reason, so the card and its tests cannot drift
+ * apart. `not-reported` is verbatim the legacy string (viewer.html's
+ * `specdim` fallback). */
+export function specUnknownLabel(reason: SpecUnknownReason): string {
+  return reason === "not-seen" ? "hardware unknown — nothing received" : "hardware not reported";
+}
+
 export interface FleetCard {
   uid: string;
   name: string;
-  /** "" means legacy's `specdim` fallback ("hardware not reported"). */
+  /** "" means the `specdim` fallback — `specUnknown` below says which one. */
   spec: string;
+  /** (#1855) `null` iff `spec` is non-empty. See `SpecUnknownReason`. */
+  specUnknown: SpecUnknownReason | null;
   active: boolean;
   absent: boolean;
   stat: string;
@@ -382,10 +414,17 @@ export function buildFleetCard(
   // above is unchanged for now; that collapse is a follow-up to this
   // card specifically, not a producer-side gap any more.
   const runsCount = liveMode ? Math.max(runningSessionIds.length, labRunning) : all.length;
+  const spec = specOf(data, liveMachines, specs, m, specBeats);
+  // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
+  // machine's hardware line, so "was there anything to read" is exactly
+  // "does that map hold an entry for this uid" — not a second, parallel
+  // notion of presence that could disagree with the one the spec came from.
+  const specUnknown: SpecUnknownReason | null = spec ? null : specBeats.has(m) ? "not-reported" : "not-seen";
   return {
     uid: m,
     name: nameOf(data, liveMachines, m),
-    spec: specOf(data, liveMachines, specs, m, specBeats),
+    spec,
+    specUnknown,
     active,
     absent: machAbsent,
     stat,

@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useLiveSessionIds } from "./useLiveSessionIds";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import { getSource } from "../lib/source";
+import type { DegradedFleetSource } from "../lib/fleetCoverage";
 
 /**
  * (#2011) Is THIS session running, and should its slice keep being fetched?
@@ -69,16 +70,45 @@ export interface SessionLiveness {
    *  (a replay, a run that ended last month, or a machine with no Redis at
    *  all — see `fleet_sessions_live_handler`, which returns an empty set
    *  when presence is off). Only the affirmative transition is evidence that
-   *  the run has stopped; absence on its own is not. */
+   *  the run has stopped; absence on its own is not.
+   *
+   *  (#2725) And a disappearance seen through a FAILED read is not the
+   *  affirmative transition either — see `coverage` below. */
   endedByPresence: boolean;
+  /** (#2725) Degraded fleet coverage on the presence read this liveness was
+   *  derived from, in the shared vocabulary (`lib/fleetCoverage.ts`), or
+   *  `null` when presence is healthy, switched off, or has not answered.
+   *
+   *  `useLiveSessionIds` used to discard this. It matters HERE because
+   *  `endedByPresence` is consumed as direct evidence that a run stopped —
+   *  `SessionReplay` stops the live clock on it, deliberately overriding its
+   *  own quiet-threshold heuristic. When the presence READ fails (the daemon
+   *  dies mid-run, Redis becomes unreachable), `fetchJson` returns
+   *  `ok:false`, the live set empties, and the live → not-live edge fires
+   *  for every session at once: the page would then report a running
+   *  dispatch as finished, on the strength of a read that never happened.
+   *  That is the #2683 defect one hook over, and the guard in the effect
+   *  below is what closes it — the run may well have ended, but we did not
+   *  see it, and the honest state is the one the quiet-threshold heuristic
+   *  already handles.
+   *
+   *  Exposed, not merely consumed internally, so a surface that renders
+   *  `isLive` has the same caveat available at the point of its own claim. */
+  coverage: DegradedFleetSource | null;
 }
 
 export function useSessionLiveness(sessionId: string | null): SessionLiveness {
   // The `enabled` gate #1800 P2 added: a replay must not poll live presence.
   // Passing the result away is not enough — the query still fires and still
   // describes NOW.
-  const liveSessions = useLiveSessionIds(sessionId !== null && getSource().kind === "daemon");
+  const { sessions: liveSessions, coverage } = useLiveSessionIds(sessionId !== null && getSource().kind === "daemon");
   const isLive = sessionId !== null && liveSessions.has(sessionId);
+  // (#2725) The presence read that produced `liveSessions` could not see the
+  // fleet. Held in a ref so the effect below reads it WITHOUT re-running when
+  // it changes: coverage recovering is not itself an edge, and re-running on
+  // it would re-arm a window the effect had already decided about.
+  const coverageRef = useRef(coverage);
+  coverageRef.current = coverage;
 
   const queryClient = useQueryClient();
   // The session id presence last reported LIVE — not a boolean, so that
@@ -107,7 +137,17 @@ export function useSessionLiveness(sessionId: string | null): SessionLiveness {
     if (sessionId === null || lastLiveSid.current !== sessionId) return;
     lastLiveSid.current = null;
     setGraceFor(sessionId);
-    setEndedFor(sessionId);
+    // (#2725) `endedByPresence` is an AFFIRMATIVE claim — `SessionReplay`
+    // stops its live clock on it, overriding the quiet-threshold heuristic
+    // that otherwise governs. A session vanishing from a read that FAILED is
+    // not evidence the run stopped; it is evidence we stopped being able to
+    // look, and every session on the machine vanishes at once when it
+    // happens. So the ended flag is withheld while coverage is degraded, and
+    // the page falls back to the heuristic it already has. The grace window
+    // above is NOT withheld: a bounded refetch of the session slice is the
+    // right thing to do either way, and it is what recovers the terminal
+    // record if the run really did end.
+    if (coverageRef.current === null) setEndedFor(sessionId);
     // Fetch immediately as well as polling: in the common case the terminal
     // record is already written, and waiting out a poll interval to show it
     // is a visible pause on the one page whose job is watching this run end.
@@ -120,5 +160,6 @@ export function useSessionLiveness(sessionId: string | null): SessionLiveness {
     isLive,
     shouldPoll: isLive || (graceFor !== null && graceFor === sessionId),
     endedByPresence: endedFor !== null && endedFor === sessionId,
+    coverage,
   };
 }

@@ -39,10 +39,22 @@ pub const DEFAULT_TTL_SECS: u64 = 15;
 
 /// What a live machine publishes each heartbeat. Kept small (refreshed every
 /// few seconds). The identity key is `machine_uid` (stable hardware id);
-/// `display_name` is the mutable operator label. `specs` and `loaded_models`
-/// are best-effort enrichment for the machine cards, omitted from the wire
-/// when empty (forward-compatible — a later phase populates them without a
-/// format change).
+/// `display_name` is the mutable operator label. `specs` is best-effort
+/// enrichment for the machine cards, omitted from the wire when absent.
+///
+/// (#1855) There used to be a `loaded_models: Vec<String>` beside it, with
+/// this doc promising both were "forward-compatible — a later phase
+/// populates them without a format change". For `specs` that phase arrived
+/// (#2083). For `loaded_models` it never did: every beat hardcoded
+/// `Vec::new()`, `skip_serializing_if` meant it was never once on the wire,
+/// and its only reader was an unmounted component (deleted in #2725). A
+/// field that promises enrichment and ships empty forever is the same
+/// confidently-wrong shape this issue is about, one layer down, so it is
+/// gone rather than re-promised. The richer per-model data already has a
+/// home: `/machine/specs` carries `loaded_models` as structured
+/// `LoadedModel` rows, on demand, instead of restating it every few seconds
+/// on a heartbeat. Re-adding it here means populating it in the same
+/// commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresenceBeat {
     /// Stable hardware identity (`darkmux_hardware::machine_uid`) — the key
@@ -67,9 +79,6 @@ pub struct PresenceBeat {
     /// never parsed, never keyed on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub specs: Option<String>,
-    /// LMStudio loaded-model ids, best-effort (may be empty / omitted).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub loaded_models: Vec<String>,
     /// (#1580) The darkmux version this daemon's binary is. `None` from a peer
     /// running a build that predates this field.
     ///
@@ -173,7 +182,6 @@ fn build_beat(machine_uid: &str, display_name: &str, schema_version: &str, spec_
         schema_version: schema_version.to_string(),
         beat_ts_ms: now_ms(),
         specs: spec_summary,
-        loaded_models: Vec::new(),
         darkmux_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     }
 }
@@ -337,7 +345,6 @@ mod tests {
             schema_version: "1.10.0".into(),
             beat_ts_ms: 1_780_000_000_000,
             specs: Some("Apple Silicon · 128 GB".into()),
-            loaded_models: vec!["qwen3.6-35b".into()],
             darkmux_version: Some("2.8.0".into()),
         }
     }
@@ -356,8 +363,8 @@ mod tests {
     }
 
     /// A peer on a build that predates this field still parses — the reader
-    /// must degrade to "unknown", never fail. Same leniency `specs` and
-    /// `loaded_models` already have.
+    /// must degrade to "unknown", never fail. Same leniency `specs` already
+    /// has.
     #[test]
     fn a_beat_from_an_older_peer_without_the_field_still_parses() {
         let old = r#"{"machine_uid":"U","display_name":"studio","schema_version":"1.19.0","beat_ts_ms":1}"#;
@@ -423,11 +430,9 @@ mod tests {
             beat_ts_ms: 1,
             specs: None,
             darkmux_version: None,
-            loaded_models: vec![],
         };
         let json = serde_json::to_string(&beat).unwrap();
         assert!(!json.contains("specs"), "None specs should be omitted: {json}");
-        assert!(!json.contains("loaded_models"), "empty loaded_models should be omitted: {json}");
         let back: PresenceBeat = serde_json::from_str(&json).unwrap();
         assert_eq!(beat, back);
     }
@@ -441,7 +446,6 @@ mod tests {
         assert_eq!(beat.machine_uid, "UID-3");
         assert_eq!(beat.display_name, "studio");
         assert_eq!(beat.specs, None);
-        assert!(beat.loaded_models.is_empty());
     }
 
     /// On-demand integration check against a live Redis. `#[ignore]` so CI
@@ -469,7 +473,6 @@ mod tests {
             beat_ts_ms: now_ms(),
             specs: None,
             darkmux_version: None,
-            loaded_models: Vec::new(),
         };
         write_beat(&client, &beat, DEFAULT_TTL_SECS).expect("write_beat");
         let live = read_live(&client).expect("read_live");
