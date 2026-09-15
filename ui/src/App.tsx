@@ -28,6 +28,7 @@ import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
+import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { T, asRecordArray, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
@@ -449,6 +450,11 @@ export function App() {
   // live-mode-only polls, and a replay starts NONE of them. Anything added
   // here that describes NOW belongs in that list.
   const liveMachines = useLiveMachines(isLiveRoute(route));
+  // (#2683) Whether that map can be believed. Same query key as the line
+  // above — one request answers both — gated identically, so this adds no
+  // poll a replay had just switched off. Feeds the headline's own marker;
+  // `FleetCoverageNotice` below renders the full sentence off the same hook.
+  const fleetCoverage = useDegradedFleetSource(isLiveRoute(route));
   // Gated for the SAME reason, and via the same two-sided rule: `/machine/specs`
   // is live-only (viewer.html:2696 — "playback mode never starts that poll"),
   // and an ungated observer here would keep the shared cache warm for
@@ -527,14 +533,23 @@ export function App() {
       ? { ...route, date: firstRecordDate(routeRecords.records) ?? todayUTC() }
       : route;
 
+  // (#2683) `!ready && fleetCoverage` renders NOTHING rather than
+  // `computeMetaLines`' idle line. With no machines in the map, that line is
+  // "○ waiting for a machine" — a statement that presence answered and
+  // nobody is there. Under degraded coverage presence did NOT answer (or
+  // answered from a snapshot too old to trust), so the sentence is a claim
+  // this page cannot back up. The `FleetCoverageNotice` below the masthead
+  // says what is actually known; saying nothing here is the honest
+  // alternative, the same call `staticIdle` already makes for a build with
+  // no daemon to wait for.
   const metaLines = useMemo(
     () =>
       replayMeta
         ? replayMetaLines(replayMeta, displayRoute.kind === "playback" ? (displayRoute.date ?? "") : "")
-        : staticIdle
+        : staticIdle || (!ready && fleetCoverage)
           ? []
           : computeMetaLines(flowWindow.data, liveMachines, nowMs),
-    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs, staticIdle],
+    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs, staticIdle, ready, fleetCoverage],
   );
 
   // `logscope` is no longer SHOWN — the outer UI owns context (see
@@ -745,7 +760,7 @@ export function App() {
                 it verbatim is simpler and more robust than reproducing the
                 icon-boundary quirk with a real (empty) element. */}
             {ready && !staticIdle ? (
-              <div><ReadyHeadline n={ready.n} ago={ready.ago} /></div>
+              <div><ReadyHeadline n={ready.n} ago={ready.ago} coverage={fleetCoverage} /></div>
             ) : replayParts ? (
               /* (#2073) Same text as `metaLines[0]`; the source + span sit in
                  their own span so the narrow stylesheet can drop what the chip
@@ -791,6 +806,20 @@ export function App() {
           phones so the lens above gets the full height" requirement — the
           lens in `#stage` is no longer followed by a full-width event-log
           section pushing the page's scroll further down. */}
+      {/* (#2683) Presence coverage, once, for the whole app. Every surface on
+          this page that counts machines or calls work "running" reads the
+          same presence substrate — the masthead headline right above this,
+          `MachineLens`, `RunsBoard`, and `FleetLens` — so the caveat belongs
+          where all four are covered by it, not in the one lens that happened
+          to get it first (#1729). Deliberately OUTSIDE `#meta`: that region
+          is parity-extracted by `innerText`, and it is a right-aligned corner
+          of the sticky tab row with no room for a sentence.
+
+          `:empty` on the wrapper is what keeps a healthy page from paying a
+          padded row for a notice that renders nothing — see `styles.css`. */}
+      <div className="app-shell__notices">
+        <FleetCoverageNotice historical={!isLiveRoute(route)} />
+      </div>
       <div className="app-shell__content">
         <main className="app-shell__stage" id="stage">
           {/* (#2027) There was no error boundary anywhere in this app, so ANY

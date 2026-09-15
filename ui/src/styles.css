@@ -3308,11 +3308,18 @@ body {
   }
 }
 
-/* (#1729) Fleet-coverage marker on the default view — shown ONLY when the
-   presence substrate could not be read (or is stale). An unconfigured fleet
-   is not a degradation, so a standalone machine never sees this. */
+/* (#1729) Fleet-coverage marker — shown ONLY when the presence substrate
+   could not be read (or is stale). An unconfigured fleet is not a
+   degradation, so a standalone machine never sees this. (#2683: it mounts
+   app-wide now, not just on the default view.) */
 .fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 calc(12px * var(--fs-scale))/1.4 var(--font-mono)}
 .fleetcov__icon{flex:none}
+/* (#2683) The app-wide mount needs the horizontal padding the lens's own
+   `.app-shell__stage` used to give it. `:empty` is load-bearing: the notice
+   renders `null` on a healthy fleet, and without this every page would carry
+   a dead padded row for a warning that isn't there. */
+.app-shell__notices{padding:12px 16px 0}
+.app-shell__notices:empty{display:none}
 
 /* ── Record view — a flow record rendered for a person (see RecordView.tsx
    for why this is name/type-driven rather than 26 per-action templates). */
@@ -3412,6 +3419,13 @@ body {
 .rdot.ok { color: var(--good); }
 .mco { white-space: nowrap; }
 .mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim); }
+/* (#2683) The count is presence-derived; when presence is stale or
+   unreadable it is a claim the page can't back up, so it wears the same
+   `--warn` the full `.fleetcov` sentence below the masthead does. Same
+   treatment for both degraded states — the distinction is in the sentence,
+   not in two shades of warning. */
+.mco[data-coverage] { color: var(--warn); }
+.mco[data-coverage] svg { color: var(--warn); }
 
 
 
