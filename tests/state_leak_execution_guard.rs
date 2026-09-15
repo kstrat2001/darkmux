@@ -27,10 +27,27 @@
 //! issue's own harm through the mechanism built to prevent it.
 //!
 //! None of the four is closed by more tokens or a wider walk. This target
-//! observes the EFFECT instead — and catches a superset: unknown
-//! spellings, decoys, grandchildren spawned through a shell, in-process
-//! writes that never spawn anything at all, and destinations nobody
-//! thought to walk.
+//! observes the EFFECT instead, so all four collapse into one check — and
+//! it reaches shapes the scan cannot see at all: unknown spellings,
+//! decoys, grandchildren spawned through a shell, in-process writes that
+//! never spawn anything at all, and destinations nobody thought to walk.
+//!
+//! It is NOT a superset of the text scan, and an earlier draft of this
+//! paragraph said it was. `enumerate_units` walks the ROOT `tests/*.rs`
+//! plus `-p <member> --lib`, and `--lib` neither builds nor runs a
+//! package's own integration targets — so the eleven under
+//! `crates/darkmux-{crew,fleet,gestalt,lab,profiles,types}/tests/` are
+//! outside this check, the same boundary `crates/*/tests/` already sits
+//! outside for the text scan. Proven with a decoy at
+//! `crates/darkmux-crew/tests/rev2733_decoy_leak.rs` writing into both
+//! the real home and the state root: text scan EXIT=0, enumeration
+//! EXIT=0, gated check EXIT=0 reporting `clean`, files present. All
+//! eleven real targets census clean today, so this is a coverage hole and
+//! not a live defect — widening the enumeration is a follow-up, because
+//! eleven more units is a change to the CI budget (210s of margin) and
+//! needs its own measurement. The boundary is stated here for the reason
+//! `tests/cli.rs` states its own: a guard that overclaims is how the next
+//! reader skips the check.
 //!
 //! # The two assertions, and why one of them is free
 //!

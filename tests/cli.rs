@@ -472,8 +472,15 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
 /// `tests/state_leak_execution_guard.rs` runs each test unit under a
 /// sentinel state tree and asserts the file census is empty. That observes
 /// the EFFECT, so every shape above collapses into one check — and it
-/// catches a superset, including in-process writers that spawn nothing at
-/// all (#2718) and destinations in directories nobody thought to walk.
+/// reaches shapes this scan cannot see at all, including in-process
+/// writers that spawn nothing (#2718) and destinations in directories
+/// nobody thought to walk.
+///
+/// It is NOT a superset, and it shares the boundary named in the last
+/// bullet above: its units are the ROOT `tests/*.rs` plus `-p <member>
+/// --lib`, and `--lib` never builds a package's own integration targets,
+/// so `crates/*/tests/` is outside BOTH checks. Its own module doc
+/// carries the decoy measurement that proves it.
 ///
 /// This scan is KEPT as the fast pre-check, because it earns its keep on
 /// one axis the execution check cannot reach: a text scan names the

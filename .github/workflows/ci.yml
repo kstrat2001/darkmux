@@ -131,15 +131,19 @@ jobs:
       # Gated behind DARKMUX_LEAK_CHECK because it re-runs the suite, and
       # deliberately placed AFTER the workspace test step — as a STEP in
       # this job rather than a job of its own — so it reuses that step's
-      # warm `target/`. A separate job would pay a cold build and cost more
-      # metered minutes, not fewer.
+      # warm `target/`. The reason is WALL CLOCK against this job's cap,
+      # not cost: the repository is public, so Actions minutes are not
+      # billed. A separate job would pay a cold build and blow the budget
+      # below.
       #
-      # The cost, stated rather than discovered on the bill: this is
-      # roughly one extra full-suite run (~12 min warm on an M5 Max;
-      # expect more on a hosted runner). If that proves too expensive for
-      # every PR, the move is to the nightly workflow — the trade is that
-      # a leak then lands on main and is caught the next morning instead
-      # of at the gate.
+      # The cost, measured on this step's own first run (34977555381,
+      # macos-latest) rather than estimated: workspace tests 215s, this
+      # check 419s, clippy 24s — 690s of a 900s cap, leaving 210s of
+      # margin (23%). Re-measure before adding units here; widening the
+      # enumeration is a change to that number, not a free one. If the
+      # margin goes, the move is to the nightly workflow — the trade is
+      # that a leak then lands on main and is caught the next morning
+      # instead of at the gate.
       #
       # `continue-on-error` is NOT set: the whole point is that a green
       # child proves nothing (measured — three of four leaking targets went
