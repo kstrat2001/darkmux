@@ -379,4 +379,211 @@ mod tests {
             other => panic!("expected Skipped on unparseable size, got {other:?}"),
         }
     }
+
+    // ─── Headroom arithmetic (#2724) ───────────────────────────────────
+    //
+    // The estimate below is what `darkmux doctor` tells the operator about
+    // whether the currently-loaded models still fit. Every term in it used
+    // to be unpinned: `/`, `*`, `+` and `+=` in `eval_memory_headroom` were
+    // each swappable with no test noticing, so a wrong operator there would
+    // have shipped as a confident, wrong "you're fine" (or a confident,
+    // wrong warning). The fixtures here sit ON the 80%-of-unified-memory
+    // decision boundary rather than at absurd numbers, because a fixture far
+    // from the boundary keeps returning the same verdict under a swapped
+    // operator and therefore proves nothing.
+    //
+    // The formula under test: per loaded model, `size_gb + 0.5 * ctx /
+    // 32_768`; summed across models; fired when the sum exceeds 80% of
+    // unified memory. `0.5 * ctx / 32_768` means "half a GB of KV per 32K of
+    // configured context", so 128K of context costs 2 GB and 256K costs 4.
+
+    fn loaded(identifier: &str, size: &str, context: u64) -> darkmux_types::LoadedModel {
+        darkmux_types::LoadedModel {
+            identifier: identifier.into(),
+            model: identifier.into(),
+            status: "idle".into(),
+            size: size.into(),
+            context,
+        }
+    }
+
+    fn ctx_with(total_ram_gb: u32, loaded_models: Vec<darkmux_types::LoadedModel>) -> Context {
+        Context {
+            loaded_models,
+            available_models: None,
+            total_ram_gb,
+        }
+    }
+
+    /// Assert Fire and return the rendered message, so the percentage the
+    /// operator actually reads is pinned too — not just the branch taken.
+    fn expect_fire(v: Verdict) -> String {
+        match v {
+            Verdict::Fire { severity, message } => {
+                assert_eq!(severity, Severity::Warn, "headroom fires as a warning");
+                message
+            }
+            other => panic!("expected Fire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_headroom_fires_just_over_the_threshold() {
+        // 24 GB of weights + 128K of context (2 GB of KV) = 26 GB of a
+        // 32 GB machine — 81.25%, just past the 80% line. An operator with
+        // this loaded is told their next heavy dispatch may OOM.
+        //
+        // Every arithmetic mutation that makes the estimate SMALLER lands
+        // this fixture back under 80% and silently reports all-clear:
+        // dropping the `0.5 *` (kv -> ~0), turning the KV `/` into `%`
+        // (65536 % 32768 = 0), turning `size + kv` into `size - kv` (22 GB),
+        // turning the `+=` accumulator into `-=` or `*=` (a negative or zero
+        // total), dividing instead of multiplying by 100, or flipping `>`
+        // to `<`/`==`.
+        let ctx = ctx_with(32, vec![loaded("primary", "24 GB", 131_072)]);
+        let msg = expect_fire(eval_memory_headroom(&ctx));
+        assert!(msg.contains("~26.0 GB"), "estimate in message: {msg}");
+        assert!(msg.contains("32 GB unified"), "budget in message: {msg}");
+        assert!(msg.contains("(81%)"), "percentage in message: {msg}");
+    }
+
+    #[test]
+    fn memory_headroom_passes_just_under_the_threshold_even_at_long_context() {
+        // 21 GB of weights + 256K of context (4 GB of KV) = 25 GB of a
+        // 32 GB machine — 78.1%, just under the line. Nothing is said.
+        //
+        // This is the fixture that catches over-estimation, which fails the
+        // other way: a spurious "you may OOM" on a machine that is fine.
+        // The tightest such mutation is `0.5 * ctx` becoming `0.5 + ctx`,
+        // which roughly DOUBLES the KV term (4 GB -> 8 GB) and pushes this
+        // to 90%. The long context is deliberate: at 32K the doubling is
+        // 0.5 GB and would not cross any boundary, so a short-context
+        // fixture here would prove nothing.
+        let ctx = ctx_with(32, vec![loaded("primary", "21 GB", 262_144)]);
+        match eval_memory_headroom(&ctx) {
+            Verdict::Pass => {}
+            other => panic!("expected Pass at 78% of unified memory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_headroom_does_not_fire_exactly_at_the_threshold() {
+        // 30 GB of weights + 128K of context (2 GB of KV) = exactly 32 GB
+        // of a 40 GB machine — exactly 80.0%. The rule fires ABOVE 80%, not
+        // AT it, so this operator is not warned. Chosen so the percentage is
+        // exactly representable in f64: (32.0 / 40.0) * 100.0 == 80.0.
+        //
+        // This is the only fixture that separates `>` from `>=`, and the
+        // difference is a real one — at `>=` the warning fires on a machine
+        // sitting precisely on its stated budget.
+        let ctx = ctx_with(40, vec![loaded("primary", "30 GB", 131_072)]);
+        match eval_memory_headroom(&ctx) {
+            Verdict::Pass => {}
+            other => panic!("expected Pass at exactly 80.0%, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_headroom_sums_across_loaded_models() {
+        // Two models, each comfortably fine alone (14 GB = 44%, 13 GB =
+        // 41% of 32 GB), together 27 GB = 84%. The warning is about the
+        // WORKING SET, so it has to accumulate across everything resident —
+        // an accumulator that subtracted, or multiplied into a 0.0 seed,
+        // would report each machine-filling pair as healthy.
+        let both = ctx_with(
+            32,
+            vec![
+                loaded("primary", "12 GB", 131_072),
+                loaded("compactor", "11 GB", 131_072),
+            ],
+        );
+        let msg = expect_fire(eval_memory_headroom(&both));
+        assert!(msg.contains("~27.0 GB"), "summed estimate: {msg}");
+
+        for one in [
+            loaded("primary", "12 GB", 131_072),
+            loaded("compactor", "11 GB", 131_072),
+        ] {
+            let id = one.identifier.clone();
+            match eval_memory_headroom(&ctx_with(32, vec![one])) {
+                Verdict::Pass => {}
+                other => panic!("expected Pass for `{id}` alone, got {other:?}"),
+            }
+        }
+    }
+
+    // ─── Rule-table plumbing (#2724) ───────────────────────────────────
+
+    #[test]
+    fn all_rules_contains_the_memory_headroom_rule() {
+        // `all_rules_have_unique_ids` and `rules_payload_serializes` both
+        // pass vacuously on an empty table, so neither notices a rule set
+        // that has silently gone empty — which an operator experiences as
+        // `darkmux doctor` quietly omitting the check rather than reporting
+        // anything wrong.
+        let rules = all_rules();
+        assert!(!rules.is_empty(), "the rule table must not be empty");
+        let r = rules
+            .iter()
+            .find(|r| r.id == "memory-headroom-tight")
+            .expect("memory-headroom-tight must be in the rule table");
+        assert_eq!(r.kind, RuleKind::MemoryHeadroomTight);
+        assert_eq!(r.category, "resource_pressure");
+        assert_eq!(r.severity, Severity::Warn);
+        assert!(!r.name.is_empty(), "rules render a display label");
+        assert!(!r.fix_hint.is_empty(), "a firing rule points at the fix");
+    }
+
+    #[test]
+    fn evaluate_all_returns_a_verdict_for_every_rule() {
+        // Same vacuity, one layer up: an empty verdict list is how doctor
+        // shows no eureka findings at all, which is indistinguishable from
+        // "all clear" on the surface the operator reads.
+        let ctx = ctx_with(32, vec![loaded("primary", "24 GB", 131_072)]);
+        let verdicts = evaluate_all(&ctx);
+        let defs = all_rules();
+        assert_eq!(
+            verdicts.len(),
+            defs.len(),
+            "one verdict per rule, in rule order"
+        );
+        let ids: Vec<&str> = verdicts.iter().map(|(d, _)| d.id.as_str()).collect();
+        let expected: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, expected);
+
+        let (_, verdict) = verdicts
+            .iter()
+            .find(|(d, _)| d.kind == RuleKind::MemoryHeadroomTight)
+            .expect("headroom rule evaluated");
+        // Same context as the fires-just-over fixture, so the dispatcher is
+        // pinned to the real evaluator rather than to a constant.
+        expect_fire(verdict.clone());
+    }
+
+    #[test]
+    fn as_meta_fields_carries_the_version_and_the_rules() {
+        // This map IS the rules `meta` payload a consumer reads to learn
+        // which rules exist and whether it can trust their shape. An empty
+        // map reads as "no rules, no schema version" — not as an error.
+        let fields = RulesPayload::current()
+            .as_meta_fields()
+            .expect("meta fields serialize");
+        assert_eq!(
+            fields.get("rules_schema_version").and_then(|v| v.as_str()),
+            Some(RULES_SCHEMA_VERSION),
+        );
+        let rules = fields
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .expect("`rules` must be an array");
+        assert_eq!(rules.len(), all_rules().len());
+        let ids: Vec<&str> = rules
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            ids.contains(&"memory-headroom-tight"),
+            "rule ids in payload: {ids:?}"
+        );
+    }
 }
