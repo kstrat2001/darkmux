@@ -360,6 +360,13 @@ pub fn launch(
     // any other observable output; a hang there is exactly the
     // pre-flow-init black-box class the floor exists for).
     darkmux_types::dispatch_liveness::liveness("process-start");
+    // (#2678) This run's wall-clock starts HERE — at launch entry, before the
+    // config load — so the recorded duration covers the whole run a CI job's
+    // `timeout-minutes` is actually waiting on, not just the scheduled part
+    // of it. Monotonic, so a clock adjustment mid-run cannot produce the
+    // negative or wildly wrong duration that subtracting the mission's two
+    // wall-clock timestamps could.
+    let run_started = std::time::Instant::now();
     fleet::validate_identifier("config_id", config_id)?;
 
     // (#2301) `crawl` used to be routed by literal id to a bespoke
@@ -1778,7 +1785,15 @@ pub fn launch(
     // Gate-less generic graph (Tier-1-only kinds) — the standard
     // MissionEnvelope finalization applies: every run reaches a terminal
     // phase/mission status (Packet 2's own doctrine for gate-free work).
-    let envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps);
+    let mut envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps);
+    // (#2678) Stamp the run's own wall-clock before finalization, so the
+    // number that decides whether a CI job's `timeout-minutes` needs raising
+    // rides the run's artifact instead of being inferred from workflow logs
+    // nobody opens. Stamped at the CALL SITE rather than inside
+    // `build_envelope` because only this path has a finished run to time: the
+    // coder-phase branch returns above with the mission still `Active` at an
+    // operator sign-off gate, where a duration would name nothing.
+    envelope.wall_ms = Some(run_started.elapsed().as_millis() as u64);
     let status = envelope.status;
     // (#2301) A run's own numbers ride the `mission close` payload — the
     // home the retired crawl launcher used, kept for every generic graph

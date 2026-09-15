@@ -230,7 +230,16 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
             result.stderr.trim()
         );
     }
-    Ok(extract_reply_text(&result.stdout))
+    // (#2721) Dispatch STDOUT — isolate the envelope line first, the same way
+    // every bench in `darkmux-lab` now does. Without this, one noise line
+    // ahead of the compact `--json` envelope (image-pull progress on a cold
+    // run) failed the whole-stdout parse and made the drafted notebook entry
+    // the raw stdout, envelope JSON and all. Note this isolates at the CALL
+    // SITE, not inside `extract_reply_text` below — the other caller reads a
+    // pretty-printed file, where isolating would be destructive.
+    Ok(extract_reply_text(
+        darkmux_lab::lab::scores::envelope_candidate(&result.stdout),
+    ))
 }
 
 fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
@@ -321,6 +330,15 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
     let reply_path = run_dir.join("qa-reply.json");
     if reply_path.exists() {
         if let Ok(raw) = fs::read_to_string(&reply_path) {
+            // (#2721) DELIBERATELY the whole-input parse — do NOT "finish the
+            // unification" by wrapping this in `envelope_candidate` the way
+            // the stdout caller above is. `qa-reply.json` is a stored,
+            // PRETTY-PRINTED artifact, so its last `{`-starting line is an
+            // inner array-element opener; isolating it yields the string "{".
+            // Measured over the 181 recorded run artifacts on the author's
+            // machine: 19 are pretty-printed, and every one collapsed from up
+            // to 4698 bytes of reply to 1 byte. Pinned by
+            // `reply_preview_of_a_pretty_printed_artifact_keeps_the_whole_reply`.
             let preview = extract_reply_text(&raw);
             if !preview.is_empty() {
                 let truncated: String = preview.chars().take(800).collect();
@@ -897,5 +915,60 @@ mod tests {
                 None => env::remove_var("DARKMUX_MACHINE_ID"),
             }
         }
+    }
+
+    /// (#2721) The reply-preview path must keep reading the WHOLE file.
+    ///
+    /// `qa-reply.json` is a stored, PRETTY-PRINTED artifact, so its last
+    /// `{`-starting line is an inner array-element opener. Routing it through
+    /// `envelope_candidate` — the isolation the dispatch-STDOUT caller
+    /// correctly uses — selects that fragment and yields the string "{",
+    /// destroying the reply. Measured over the 181 recorded run artifacts on
+    /// the author's machine: all 19 pretty-printed ones collapsed from up to
+    /// 4698 bytes to 1 byte, while all 142 in the single-line dispatch-stdout
+    /// shape were byte-identical either way.
+    ///
+    /// Two things make this non-vacuous, both learned the hard way:
+    /// - It drives `build_run_data_summary`, the real CALL SITE. An earlier
+    ///   draft asserted on `extract_reply_text` directly and stayed GREEN when
+    ///   the call site was mutated to isolate — it was testing the function
+    ///   nobody was going to change.
+    /// - The fixture's JSON nests an ARRAY OF OBJECTS. A pretty-printed object
+    ///   with no nested object has no inner `{`-starting line, so isolating it
+    ///   would be harmless and the fixture would prove nothing. The assertion
+    ///   below pins that the hazard is live for this input before relying on
+    ///   the summary to have avoided it.
+    #[test]
+    fn reply_preview_of_a_pretty_printed_artifact_keeps_the_whole_reply() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path();
+
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "result": "stop",
+            "final_assistant": "the whole reply survives",
+            "trajectory": [ { "turn": 1 }, { "turn": 2 } ]
+        }))
+        .unwrap();
+        // The hazard is live for THIS fixture: isolating picks an inner line.
+        assert_eq!(
+            darkmux_lab::lab::scores::envelope_candidate(&pretty),
+            "{",
+            "fixture must actually trip the pretty-printed hazard, or this test proves nothing",
+        );
+        fs::write(run_dir.join("qa-reply.json"), &pretty).unwrap();
+
+        let manifest_json = serde_json::json!({
+            "workload": "quick-q",
+            "provider": "prompt",
+            "profile": "scribe",
+            "session_id": "s",
+            "duration_ms": 5000,
+            "ok": true
+        });
+        let summary = build_run_data_summary(run_dir, &manifest_json).unwrap();
+        assert!(
+            summary.contains("the whole reply survives"),
+            "reply preview must survive a pretty-printed artifact; got:\n{summary}",
+        );
     }
 }
