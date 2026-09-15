@@ -176,9 +176,12 @@ import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../l
  *   carries a ROLE handle. Measured anyway, and it fails harder than the
  *   others: ZERO keys whose telemetry spans more than one handle, and 163
  *   of the 364 two-day telemetry records (45%) carry a handle matching no
- *   bookend handle under their own key — the review pipeline's own
- *   `telemetry.tokens` emitter uses `review` while its bookends use the
- *   seat names. Keying on it would move 45% of the corpus's telemetry into
+ *   bookend handle under their own key. The live structural reason is the
+ *   map-item emitter passing `&step.id` as its `role_id` argument
+ *   (`builtins.rs:2012`), so the handle is a STEP id there, not a role. (162
+ *   of those 163 records carry handle `review`, from the bespoke review
+ *   launcher deleted in #2310 P4d — the corpus predates that deletion, so
+ *   read those as history, not as a current producer.) Keying on it would move 45% of the corpus's telemetry into
  *   `unknown`, including the 144,638-token Azure run, which is the one
  *   direction this function may never take.
  *
@@ -193,8 +196,10 @@ import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../l
  * population (the container and review paths emit no item record), and the
  * join available today is a three-field heuristic on a SECOND-precision
  * timestamp whose collision case — k identical draws of one prompt closing
- * in the same second — is the normal shape of a probe stage, not a remote
- * one. The clean version is a producer change (carry the item's own
+ * in the same second — is the normal shape of a probe stage. That second
+ * reason is a HAZARD, not a measurement: zero `(session_id, ts)` buckets in
+ * any committed corpus hold more than one per-item record, so the collision
+ * is plausible and undemonstrated. Reason one decides on its own. The clean version is a producer change (carry the item's own
  * `remote`/`index` into `map_item_token_payload`, a flow-schema minor bump)
  * and belongs with a live dispatch to verify it, not in a viewer lens.
  * Nothing committed exercises any of it: ZERO run keys in either corpus
@@ -725,12 +730,16 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // counted them. Measured cost of that skew: 4,000 tokens counted twice on
   // the ordinary shape, and GAP C's 9,999 becoming 19,998.
   //
-  // Checked, not assumed. All three live `telemetry.tokens` producers take
+  // Checked, not assumed. BOTH live `telemetry.tokens` producers take
   // `mission_id` from the same dispatch-scoped value that the terminal
   // bookend takes it from — the container tailer's `self.mission_id`
-  // (`dispatch_internal.rs`, used by `emit` and `emit_telemetry` alike),
-  // `dispatch_remote`, and the map-item emitter (which passes `None` for
-  // BOTH, so both land under the same empty mission). And on the corpora:
+  // (`dispatch_internal.rs:8539`, used by `emit` and `emit_telemetry`
+  // alike), and the map-item emitter (`builtins.rs:2011`, which passes
+  // `None` for BOTH, so both land under the same empty mission).
+  // `dispatch_remote` builds telemetry records but none with
+  // `source: "tokens"`, so it is not a producer of this kind — an
+  // enumeration is only worth its exhaustiveness claim if every entry
+  // in it is real. And on the corpora:
   // ZERO sessions where a telemetry mission id matches no completion
   // mission id of the same session, in either the two-day corpus or the
   // demo replay.
