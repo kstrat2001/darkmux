@@ -56,32 +56,72 @@ fn darkmux_cmd(home: &std::path::Path) -> std::process::Command {
 
 // ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
 
-/// Run a closure with `HOME` overridden so any state writer rooted in
-/// `~/.darkmux` writes into our tmpdir.
+/// (#2715) Hand a closure a throwaway directory to treat as a home root.
+///
+/// It used to also MUTATE the process-global `HOME` (and remove
+/// `DARKMUX_HOME`) for the duration, with no `#[serial_test::serial]`
+/// annotation, while the twelve tests in this binary run concurrently.
+///
+/// The annotation was deliberately NOT the fix. `serial_test::serial`
+/// coordinates only among ANNOTATED tests, so a guarded writer racing an
+/// unguarded reader is still a race — every test in the binary that reads
+/// a path derived from `HOME` is a participant whether or not it knows it.
+///
+/// So the read path was instrumented instead of read. Every production
+/// `dirs::home_dir()` call site across `darkmux-types`, `darkmux-flow`,
+/// `darkmux-crew`, `darkmux-profiles`, `darkmux-lab`, `darkmux-doctor` and
+/// `src/` — 38 of them, and `dirs::home_dir()` is the only production
+/// reader of `HOME`, unified there by `workdir.rs` — was wrapped to log the
+/// observing thread and the value returned. A full run of this target
+/// under a redirected `$HOME` with no `DARKMUX_*` exported produced **four
+/// observations, all of them on a thread named `main`**: the spawned
+/// `darkmux` CHILD processes, which take their `HOME` from
+/// `darkmux_cmd`'s per-spawn `.env("HOME", …)` and never consult the
+/// parent's. **Zero observations came from this process.**
+///
+/// Nothing observed the mutated value, so the mutation bought nothing and
+/// risked a race. Removing it is therefore strictly better than
+/// documenting it as safe: a per-spawn environment on the `Command`
+/// reaches the child without the parent touching its own state at all,
+/// which is what every spawn site here already does, and the four
+/// in-process callers only ever used the path as a path.
 fn with_home<F: FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // Override both possible home env vars — saver code paths read
-    // `HOME` on Unix; CI matrices sometimes set `XDG_*` variants.
-    let prev_home = std::env::var_os("HOME");
-    let prev_dmx_home = std::env::var_os("DARKMUX_HOME");
-    // SAFETY: these tests run #[serial] in their own crate; no other
-    // test mutates HOME concurrently.
-    unsafe {
-        std::env::set_var("HOME", tmp.path());
-        std::env::remove_var("DARKMUX_HOME");
-    }
-    let result = f(tmp.path());
-    unsafe {
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_dmx_home {
-            Some(v) => std::env::set_var("DARKMUX_HOME", v),
-            None => std::env::remove_var("DARKMUX_HOME"),
-        }
-    }
-    result
+    f(tmp.path())
+}
+
+/// The guard that keeps the mutation from coming back.
+///
+/// Without it, re-adding `set_var("HOME", …)` inside `with_home` is a
+/// silent, fully-green change — which is how it got there. Red-proved by
+/// doing exactly that: this test goes to EXIT=101 while the other eleven
+/// stay green, which is also the measurement showing why the old shape was
+/// invisible.
+///
+/// Deliberately NOT `#[serial]`: the claim is that this binary contains no
+/// writer of `HOME` at all, and a serial annotation here would only
+/// coordinate with other annotated tests — the exact insufficiency that
+/// made annotating the helper the wrong fix.
+#[test]
+fn with_home_never_mutates_the_process_global_home() {
+    let before = std::env::var_os("HOME");
+    let observed_inside = with_home(|home| {
+        assert!(home.is_dir(), "the closure must still receive a usable directory");
+        std::env::var_os("HOME")
+    });
+    assert_eq!(
+        observed_inside, before,
+        "with_home must not touch this process's HOME. Twelve tests in this binary run \
+         concurrently, so a writer here races every reader — and serializing the writer \
+         would not help, because `serial_test::serial` coordinates only among annotated \
+         tests. A child that needs a different HOME gets it from `.env(\"HOME\", …)` on its \
+         own Command."
+    );
+    assert_eq!(
+        std::env::var_os("HOME"),
+        before,
+        "with_home must leave HOME exactly as it found it"
+    );
 }
 
 fn mode_bits(p: &std::path::Path) -> u32 {

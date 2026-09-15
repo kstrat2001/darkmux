@@ -3313,6 +3313,13 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn dispatch_internal_resume_precheck_refuses_a_missing_checkpoint() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let resume_from = TempDir::new().unwrap(); // no checkpoint.json written
         let s = step(
             "s1",
@@ -3358,6 +3365,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn dispatch_internal_resume_precheck_names_the_remote_single_shot_path_not_the_checkpoint() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let home = TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };

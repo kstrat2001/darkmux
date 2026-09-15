@@ -866,6 +866,13 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn build_graph_step_config_carries_the_cli_flags() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let mut opts = test_opts("coder", "hello there");
         opts.timeout_seconds = 120;
         opts.skip_preflight = true;
@@ -1010,6 +1017,13 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn resume_precheck_refuses_through_the_real_graph_builder_and_the_real_registry() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let resume_from = tempfile::TempDir::new().unwrap(); // no checkpoint.json written
         let mut opts = test_opts("coder", "resume please");
         opts.resume_from = Some(resume_from.path().to_path_buf());

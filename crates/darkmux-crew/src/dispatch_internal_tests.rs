@@ -80,6 +80,13 @@
     #[test]
     #[serial]
     fn resolve_endpoint_secret_prefers_key_env_over_keychain_and_never_spawns_security() {
+        // (#2718) `resolve_endpoint_secret` emits a `credential-read`
+        // liveness heartbeat, which resolves off the darkmux root — so with
+        // nothing pinned it appends to the operator's real
+        // `~/.darkmux/liveness`. Measured: this was the one file still
+        // reaching a pinned sentinel root after every findings/flows/audit
+        // writer in this crate had been isolated.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         // key_env names a set env var → its value is used and `security` is NEVER
         // spawned (the headless-runner root fix — a locked keychain can't hang
         // what isn't read). The keychain item is a clearly-fake name that no real
@@ -108,6 +115,13 @@
     #[test]
     #[serial]
     fn resolve_endpoint_secret_bails_when_no_source_configured() {
+        // (#2718) `resolve_endpoint_secret` emits a `credential-read`
+        // liveness heartbeat, which resolves off the darkmux root — so with
+        // nothing pinned it appends to the operator's real
+        // `~/.darkmux/liveness`. Measured: this was the one file still
+        // reaching a pinned sentinel root after every findings/flows/audit
+        // writer in this crate had been isolated.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         // key_env's var absent AND no keychain → a loud "no credential" error,
         // naming the declared var so the operator knows what to export.
         let var = "DARKMUX_TEST_ENDPOINT_KEY_ABSENT_1312";
@@ -6093,6 +6107,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_compaction_event_resets_inactivity_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6164,6 +6185,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_non_progress_events_do_not_reset_inactivity_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6231,6 +6259,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_tool_completed_event_resets_inactivity_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6289,6 +6324,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_failed_tool_completed_does_not_reset_inactivity_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6485,6 +6527,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_tool_completed_without_ok_field_resets_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6528,6 +6577,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_multiple_proof_of_work_events_advance_to_latest() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6581,6 +6637,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_model_partial_resets_the_inactivity_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6631,6 +6694,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record()
     fn tailer_runtime_rest_event_resets_inactivity_deadline() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         use std::io::Write;
 
         let tmp = TempDir::new().unwrap();
@@ -6900,6 +6970,13 @@
     #[test]
     #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
     fn a_tool_completed_emission_rides_the_dispatch_tool_record_whole() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let tmp = TempDir::new().unwrap();
         let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
@@ -8098,6 +8175,13 @@
     #[test]
     #[serial] // reaches emit_telemetry() -> darkmux_flow::record() via poll_and_emit()
     fn handle_event_malformed_tool_names_and_tool_failure_accumulate_separately() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("trajectory.jsonl");
         let mut state = fixture_state(path.clone());
@@ -8136,6 +8220,13 @@
     #[test]
     #[serial]
     fn handle_event_ungranted_and_not_a_tool_reasons_accumulate_separately() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("trajectory.jsonl");
         let mut state = fixture_state(path.clone());
@@ -9260,6 +9351,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record()
     fn handle_event_model_completed_saturates_rather_than_wraps_a_u64_usage_field_beyond_u32_max() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let tmp = TempDir::new().unwrap();
         let traj_path = tmp.path().join("trajectory.jsonl");
         let mut state = TailerState::new_for_test(
@@ -10148,6 +10246,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn tailer_state_carries_partial_line_across_polls() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         // Write the first half of a line, poll, write the second half,
         // poll again — the state's pending buffer must stitch them together
         // and only dispatch the event once the newline arrives.
@@ -10239,6 +10344,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn tailer_state_dispatches_event_after_multibyte_split() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("trajectory.jsonl");
         let mut state = fixture_state(path.clone());
@@ -10296,6 +10408,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn tailer_skips_malformed_lines() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         // A non-JSON line in the trajectory must not crash the tailer or
         // stop later events from being processed.
         let tmp = TempDir::new().unwrap();
@@ -10314,6 +10433,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn heartbeat_first_partial_emits() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         // The very first model.partial should produce a heartbeat (no
         // prior last_heartbeat_at).
         let tmp = TempDir::new().unwrap();
@@ -10330,6 +10456,13 @@
     #[test]
     #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn heartbeat_rate_limits_consecutive_partials() {
+        // (#2718) Every darkmux write destination, pinned for this test.
+        // Measured before this line existed: a full `-p darkmux-crew --lib`
+        // run with all twelve state variables exported to a fresh root still
+        // wrote a findings file, 29 flow records across 12 (action, source,
+        // session) groups, 214 hash-chained audit records and a liveness log
+        // into that root — the operator's real tree in an ordinary shell.
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
         // Two model.partial events back-to-back (under the 2s window)
         // should produce exactly one heartbeat.
         let tmp = TempDir::new().unwrap();
