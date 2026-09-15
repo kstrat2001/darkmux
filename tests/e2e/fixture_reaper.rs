@@ -1170,6 +1170,96 @@ mod tests {
         let _ = stranger.wait();
     }
 
+    /// Return `started` with its seconds field moved by exactly one,
+    /// staying inside the same minute and therefore the same calendar day.
+    /// `asctime(3)` is fixed-shape — `Www Mmm dd hh:mm:ss yyyy` — so the
+    /// seconds live at bytes 17..19.
+    fn one_second_off(started: &str) -> String {
+        let secs: u32 = started[17..19]
+            .parse()
+            .unwrap_or_else(|e| panic!("seconds field of {started:?}: {e}"));
+        let shifted = if secs == 59 { 58 } else { secs + 1 };
+        format!("{}{shifted:02}{}", &started[..17], &started[19..])
+    }
+
+    /// (#2716) Gate 3 is the entire pid-reuse defense, and it is a
+    /// SECOND-resolution rule. Nothing pinned that.
+    ///
+    /// Every other start-time test here records `Thu Jan  1 00:00:00
+    /// 1970`, which is fifty-six years off the live value. That pins "a
+    /// wildly wrong timestamp is rejected" and nothing finer: weakening
+    /// `ProcId::still_running` from full-string equality to a date-only
+    /// comparison — two applied lines — left the whole suite at EXIT=0,
+    /// 18 passed. A day-granularity rule is precisely the weakening that
+    /// would matter on a machine cycling its pid space fast enough to
+    /// wrap within a day, and it shipped green.
+    ///
+    /// So this probe is deliberately the smallest difference the rule is
+    /// supposed to see: a real live process, recorded at a time one second
+    /// from its actual start, on the same day, in the same minute. Shipped,
+    /// that reaps nothing. Date-only, it reaps and kills.
+    #[test]
+    fn sweep_leaves_a_process_recorded_one_second_off_on_the_same_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stranger = spawn_stranger();
+        let pid = stranger.id();
+        let live = identify(pid).expect("the stranger must be identifiable");
+        let recorded = ProcId {
+            started: one_second_off(&live.started),
+            ..live.clone()
+        };
+
+        // Self-checks on the PROBE, so a mistake in the shift cannot leave
+        // this test passing for the wrong reason. The two timestamps must
+        // differ ONLY in the seconds — a date-granularity rule then cannot
+        // tell them apart, and a second-granularity one must.
+        assert_ne!(
+            recorded.started, live.started,
+            "the probe must actually differ from the live start time"
+        );
+        assert_eq!(
+            recorded.started[..17],
+            live.started[..17],
+            "the probe must keep the same day, hour and minute — otherwise it is not \
+             testing second resolution"
+        );
+        assert_eq!(
+            recorded.started[19..],
+            live.started[19..],
+            "the probe must keep the same year"
+        );
+
+        write_registry(
+            tmp.path(),
+            "one-second-off",
+            &format!(
+                "owner\t0\tThu Jan  1 00:00:00 1970\t/nonexistent/owner\n{}",
+                recorded.to_line("child")
+            ),
+        );
+
+        let reaped = sweep_stale_registries_in(tmp.path());
+        let survived = alive(pid);
+        // Readings taken; clean up before asserting so a failure cannot
+        // leave the probe's own process behind either way.
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+
+        assert_eq!(
+            reaped, 0,
+            "the sweep acted on a record whose start time is one second off the live \
+             process. Gate 3 is second-resolution: it is what makes a recycled pid \
+             unmatchable, since the process wearing the number started strictly later \
+             than the record. A coarser comparison is a real widening of the only rule \
+             standing between the sweep and a stranger (#2716)"
+        );
+        assert!(
+            survived,
+            "the sweep KILLED a live process recorded one second off, on the same day, in \
+             the same minute (#2716)"
+        );
+    }
+
     /// (#2716) A process that is in NO registry file is unreachable by
     /// the sweep, whatever it is called or which port it holds. This is
     /// the property that makes "sweep on startup" safe to do at all.
