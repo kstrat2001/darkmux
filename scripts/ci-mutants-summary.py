@@ -1249,6 +1249,133 @@ def load_planned_total(out_dir: Path | None) -> int | None:
     return len(data)
 
 
+def sum_shard_outcomes(candidate_dirs: list[str]) -> tuple[int, list[tuple[str, int | None]]]:
+    """(#2734) Sum `n_total` across every shard's own downloaded artifact
+    directory.
+
+    Each entry in `candidate_dirs` is a SHARD's own artifact root (what
+    `actions/download-artifact` writes it at, one directory per shard) — not
+    the `mutants.out` directory itself. Tries the SAME two candidate
+    suffixes `main()`'s own diff-mode branch already tries for a single
+    invocation (`mutants-out/mutants.out`, then `mutants.out`) via
+    `find_out_dir`, then reads that directory's total the same way `main()`
+    does: `outcomes.json` first, falling back to the four `.txt` line
+    counts.
+
+    Returns `(total, per_shard)` where `per_shard` is `[(dir, n_or_None)]`
+    in the same order as `candidate_dirs` — `None` means no output
+    directory was found there at all (that shard's own upload never landed,
+    or its job never ran), reported as a real absence rather than folded
+    into the total as a silent 0."""
+    total = 0
+    per_shard: list[tuple[str, int | None]] = []
+    for d in candidate_dirs:
+        out_dir = find_out_dir([f"{d}/mutants-out/mutants.out", f"{d}/mutants.out"])
+        if out_dir is None:
+            per_shard.append((d, None))
+            continue
+        totals = load_outcomes_totals(out_dir)
+        if totals is not None:
+            n = totals.get(
+                "total_mutants",
+                totals.get("missed", 0)
+                + totals.get("caught", 0)
+                + totals.get("timeout", 0)
+                + totals.get("unviable", 0),
+            )
+        else:
+            n = (
+                line_count(out_dir / "missed.txt")
+                + line_count(out_dir / "caught.txt")
+                + line_count(out_dir / "timeout.txt")
+                + line_count(out_dir / "unviable.txt")
+            )
+        per_shard.append((d, n))
+        total += n
+    return total, per_shard
+
+
+def floor_check_main(args: list[str]) -> int:
+    """`--floor-check <changed_lines> <title> [shard_dir ...]`: the
+    AGGREGATE half of the diff-mode zero-mutants floor (#2734).
+
+    Sharding the root `--workspace --in-diff` invocation across N parallel
+    jobs (to fit a large diff's mutation-testing time under this job's own
+    `timeout-minutes`, see quality.yml's own comment on the root job) means
+    no SINGLE shard can safely assert "the whole diff should have produced
+    at least one mutant" — a small diff spread across N shards legitimately
+    leaves some of them empty (fewer real mutants than shards), and that is
+    NOT the wiring defect the floor exists to catch (`--in-diff` paths not
+    resolving against the checked-out tree, the diff being unparseable, the
+    package scope excluding the crate that changed). Each shard's own
+    "Report survivors" step therefore passes `--changed-lines 0` to `main()`
+    to disarm ONLY that specific check in its diff-mode branch — every
+    OTHER integrity check there (exit code correctness, exit-code/count
+    contradictions, cancellation handling) stays fully armed per shard,
+    completely unchanged by this function's existence.
+
+    This runs ONCE, after every shard has reported, against the SUM of
+    every shard's own mutant total (`sum_shard_outcomes`, above) — the same
+    place the original assertion held before sharding existed, just
+    computed from N directories instead of one.
+
+    `changed_lines` is the SAME independent, non-circular heuristic
+    `main()`'s diff-mode branch already uses (git diff structure plus
+    `added_line_is_countable`, narrowed by the #2605 file-reachability
+    listing) — recomputed once in the workflow, exactly as it always was;
+    this function only ever receives the resulting integer, the same way
+    `main()` already does via its own `--changed-lines` flag."""
+    i = args.index("--floor-check")
+    rest = args[i + 1 :]
+    if len(rest) < 2:
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        changed_lines = int(rest[0])
+    except ValueError:
+        print(
+            f"--floor-check requires an integer changed-lines value, got {rest[0]!r}",
+            file=sys.stderr,
+        )
+        return 2
+    title = rest[1]
+    shard_dirs = rest[2:]
+
+    total, per_shard = sum_shard_outcomes(shard_dirs)
+
+    lines = [f"## {title}", ""]
+    lines.append(
+        f"{len(shard_dirs)} shard artifact director{'y' if len(shard_dirs) == 1 else 'ies'} "
+        f"checked; **{total} mutant(s) evaluated in total.**"
+    )
+    lines.append("")
+    for d, n in per_shard:
+        lines.append(f"- `{d}`: " + (f"{n} evaluated" if n is not None else "no output directory found"))
+
+    if changed_lines > 0 and total == 0:
+        lines += [
+            "",
+            "**This PR changed Rust code but the sharded root invocation evaluated ZERO "
+            "mutants across every shard — this is not a pass.**",
+            "",
+            f"{changed_lines} added Rust line(s) in the diff could plausibly have produced a "
+            "mutant, and every shard above reported nothing. Each shard's own Report step "
+            "already disarms the single-shard version of this check (a small diff can "
+            "legitimately leave individual shards empty) — this aggregate check is the one "
+            "place it stays armed. Causes seen in this repo for the unsharded version of this "
+            "same check, in order of likelihood: the `--in-diff` file's paths don't resolve "
+            "against the checked-out tree (cargo-mutants logs `No mutants to filter` and exits "
+            "0), the diff is unparseable (`Diff file is empty`, also exit 0), or the package "
+            "scope excludes the crate that changed. Read the raw shard job logs before "
+            "assuming which. See #2734.",
+        ]
+        print("\n".join(lines))
+        return 1
+
+    print("\n".join(lines))
+    return 0
+
+
 def main(
     exit_code: int,
     mode: str,
@@ -3074,6 +3201,120 @@ def count_self_test() -> list[str]:
     return failures
 
 
+# (#2734) `--floor-check` cases. Unlike `SELF_TEST_CASES`/`COUNT_SELF_TEST_CASES`
+# these build synthetic SHARD DIRECTORIES rather than diffs or `mutants.out`
+# trees — each entry in a case's `shards` list is either `{"outcomes": {...}}`
+# (a shard whose `mutants-out/mutants.out/outcomes.json` carries those totals),
+# `{"txt": {...}}` (the same, via the four `.txt` line-count fallback instead
+# of `outcomes.json`), or `{"missing": True}` (a shard whose artifact directory
+# was never created at all — the "job never ran / upload never landed" shape).
+# The case marked #2734 below is the load-bearing one: it is the exact
+# regression this function exists to prevent — a small diff, spread across
+# more shards than it has real mutants, must NOT read as the wiring-broken
+# shape just because SOME shards are legitimately empty.
+FLOOR_CHECK_SELF_TEST_CASES = [
+    {
+        "name": "all shards report real mutants — passes, no ZERO-mutants wording",
+        "changed_lines": 42,
+        "shards": [
+            {"outcomes": {"total_mutants": 14, "missed": 2, "caught": 12, "timeout": 0, "unviable": 0}},
+            {"outcomes": {"total_mutants": 14, "missed": 0, "caught": 14, "timeout": 0, "unviable": 0}},
+        ],
+        "expect_exit": 0,
+        "must_contain": ["28 mutant(s) evaluated in total"],
+        "must_not_contain": ["ZERO mutants"],
+    },
+    {
+        "name": (
+            "#2734: a small diff spread thin — one shard legitimately empty, another real — "
+            "MUST NOT false-fail"
+        ),
+        "changed_lines": 3,
+        "shards": [
+            {"outcomes": {"total_mutants": 2, "missed": 0, "caught": 2, "timeout": 0, "unviable": 0}},
+            {"missing": True},
+            {"missing": True},
+        ],
+        "expect_exit": 0,
+        "must_contain": ["2 mutant(s) evaluated in total", "no output directory found"],
+        "must_not_contain": ["ZERO mutants"],
+    },
+    {
+        "name": "every shard genuinely missing, diff added code — fails, the wiring-broken shape",
+        "changed_lines": 42,
+        "shards": [{"missing": True}, {"missing": True}, {"missing": True}],
+        "expect_exit": 1,
+        "must_contain": ["ZERO mutants across every shard"],
+        "must_not_contain": [],
+    },
+    {
+        "name": "every shard ran and reported zero via the .txt fallback, diff added code — fails",
+        "changed_lines": 10,
+        "shards": [
+            {"txt": {"missed": 0, "caught": 0, "timeout": 0, "unviable": 0}},
+            {"txt": {"missed": 0, "caught": 0, "timeout": 0, "unviable": 0}},
+        ],
+        "expect_exit": 1,
+        "must_contain": ["ZERO mutants across every shard"],
+        "must_not_contain": [],
+    },
+    {
+        "name": "no countable Rust lines in the diff, all shards missing — legitimate clean diff, passes",
+        "changed_lines": 0,
+        "shards": [{"missing": True}, {"missing": True}],
+        "expect_exit": 0,
+        "must_contain": ["0 mutant(s) evaluated in total"],
+        "must_not_contain": ["ZERO mutants across every shard"],
+    },
+]
+
+
+def floor_check_self_test() -> list[str]:
+    failures = []
+    for case in FLOOR_CHECK_SELF_TEST_CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            shard_dirs = []
+            for idx, shard in enumerate(case["shards"]):
+                d = tmp_path / f"shard{idx}"
+                shard_dirs.append(str(d))
+                if shard.get("missing"):
+                    continue
+                out_dir = d / "mutants-out" / "mutants.out"
+                out_dir.mkdir(parents=True)
+                if "outcomes" in shard:
+                    (out_dir / "outcomes.json").write_text(json.dumps(shard["outcomes"]))
+                elif "txt" in shard:
+                    for name, n in shard["txt"].items():
+                        (out_dir / f"{name}.txt").write_text(
+                            "\n".join(f"line{k}" for k in range(n))
+                        )
+
+            argv = ["--floor-check", str(case["changed_lines"]), "T", *shard_dirs]
+            proc = _run_self(argv, cwd=tmp_path)
+            problems = []
+            if proc.returncode != case["expect_exit"]:
+                problems.append(
+                    f"exited {proc.returncode}, expected {case['expect_exit']}: "
+                    f"{proc.stderr.strip()}"
+                )
+            blob = proc.stdout
+            for needle in case.get("must_contain", []):
+                if needle not in blob:
+                    problems.append(f"output is missing {needle!r}")
+            for needle in case.get("must_not_contain", []):
+                if needle in blob:
+                    problems.append(f"output wrongly contains {needle!r}")
+            if problems:
+                failures.append(
+                    f"  [floor-check] {case['name']}\n"
+                    + "".join(f"    - {p}\n" for p in problems)
+                    + "    --- output ---\n"
+                    + "".join(f"    | {ln}\n" for ln in blob.splitlines())
+                )
+    return failures
+
+
 def self_test() -> int:
     failures = []
     for case in SELF_TEST_CASES:
@@ -3111,10 +3352,11 @@ def self_test() -> int:
                     + "".join(f"    | {ln}\n" for ln in blob.splitlines())
                 )
     failures += count_self_test()
+    failures += floor_check_self_test()
     if failures:
         print("ci-mutants-summary self-test FAILED:\n" + "\n".join(failures))
         return 1
-    total = len(SELF_TEST_CASES) + len(COUNT_SELF_TEST_CASES)
+    total = len(SELF_TEST_CASES) + len(COUNT_SELF_TEST_CASES) + len(FLOOR_CHECK_SELF_TEST_CASES)
     print(f"ci-mutants-summary self-test passed: {total} cases")
     return 0
 
@@ -3125,6 +3367,8 @@ USAGE = (
     "[out_dir_candidate ...]\n"
     "       ci-mutants-summary.py --count-changed-lines <unified.diff> "
     "[--manifest-path <Cargo.toml>] [--mutants-list <list.json>]\n"
+    "       ci-mutants-summary.py --floor-check <changed_lines> <title> "
+    "[shard_dir ...]\n"
     "       ci-mutants-summary.py --self-test"
 )
 
@@ -3134,6 +3378,8 @@ if __name__ == "__main__":
         sys.exit(self_test())
     if "--count-changed-lines" in sys.argv:
         sys.exit(count_changed_lines_main(sys.argv[1:]))
+    if "--floor-check" in sys.argv:
+        sys.exit(floor_check_main(sys.argv[1:]))
 
     args = sys.argv[1:]
 
