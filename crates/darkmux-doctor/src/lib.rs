@@ -137,6 +137,8 @@ pub fn run() -> DoctorReport {
         check_build_info(),
         check_profile_registry(),
         check_crews_residue(),
+        // (#2707) Read-only: counts what darkmux left in the temp root.
+        check_temp_residue(),
         check_mission_config_registry(),
         check_lms_binary(),
         check_docker_runtime(),
@@ -5038,6 +5040,169 @@ fn check_crews_residue() -> Check {
     }
 }
 
+/// (#2707) The point at which an accumulated temp-root population stops
+/// being background noise and becomes worth naming.
+///
+/// Not tuned against anything — it is a round number chosen so an ordinary
+/// machine with a handful of live dispatch out-dirs stays quiet while the
+/// shape this check exists to describe (thousands, grown one test process
+/// at a time) is impossible to miss. The measured machine that prompted
+/// this carried 9,108.
+const TEMP_RESIDUE_WARN_AT: usize = 100;
+
+/// An upper bound on how many entries the scan will read.
+///
+/// A temp root is somebody else's directory and can be arbitrarily large;
+/// `doctor` is not entitled to an unbounded walk of it. On a truncated
+/// scan the check says so rather than reporting a count it knows is
+/// short — an undercount presented as a total is the kind of number an
+/// operator would act on.
+const TEMP_RESIDUE_SCAN_CAP: usize = 50_000;
+
+/// What [`summarize_temp_residue`] found: a total, the per-family
+/// breakdown sorted largest-first, and whether the scan hit its cap.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TempResidue {
+    total: usize,
+    families: Vec<(String, usize)>,
+    truncated: bool,
+}
+
+/// The stable part of a temp directory's name — the name with every
+/// all-digit segment dropped.
+///
+/// Every darkmux temp directory is `<something>-<pid>`,
+/// `<something>-<unix_micros>` or `<something>-<pid>-<nanos>-<counter>`,
+/// so dropping the numeric segments collapses a population back to the
+/// call site that produced it: `darkmux-out-pr-reviewer-1725000000000000`
+/// and `darkmux-flow-test-8261` become `darkmux-out-pr-reviewer` and
+/// `darkmux-flow-test`. A name with no numeric segment at all is its own
+/// family, unchanged.
+fn temp_residue_family(name: &str) -> String {
+    let kept: Vec<&str> = name
+        .split('-')
+        .filter(|seg| !seg.is_empty() && !seg.bytes().all(|b| b.is_ascii_digit()))
+        .collect();
+    if kept.is_empty() {
+        name.to_string()
+    } else {
+        kept.join("-")
+    }
+}
+
+/// Count the darkmux-namespaced DIRECTORIES directly under `dir`.
+///
+/// Scope is the namespace contract, and it is the whole of the claim this
+/// check makes. Only entries whose name begins with `darkmux-` or `dmx-`
+/// are looked at: those are the ones darkmux itself created and can
+/// therefore describe. Everything else in the temp root belongs to some
+/// other tool or to the operator, and is neither counted nor mentioned —
+/// reporting on a directory darkmux did not make would be adjudicating
+/// somebody else's tree.
+///
+/// Directories only. The temp-root residue darkmux leaves as FILES (a
+/// hosted dispatch's `curl` config, for instance) is written and removed
+/// within one call and does not accumulate.
+fn summarize_temp_residue(dir: &std::path::Path) -> TempResidue {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return TempResidue::default();
+    };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut total = 0usize;
+    let mut seen = 0usize;
+    let mut truncated = false;
+    for entry in entries.flatten() {
+        seen += 1;
+        if seen > TEMP_RESIDUE_SCAN_CAP {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("darkmux-") && !name.starts_with("dmx-") {
+            continue;
+        }
+        // `file_type()` comes straight off the directory entry on the
+        // platforms darkmux runs on, so this is not a stat per entry.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        total += 1;
+        *counts.entry(temp_residue_family(name)).or_default() += 1;
+    }
+    let mut families: Vec<(String, usize)> = counts.into_iter().collect();
+    // Largest first; ties by name so the report is stable run to run.
+    families.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    TempResidue { total, families, truncated }
+}
+
+/// (#2707) Abandoned darkmux directories in the system temp root.
+///
+/// A describable fact, not a verdict: "there are N of these, here is what
+/// each family is". Read-only — `doctor` never removes anything here, and
+/// two of the three families it can report are not residue at all.
+///
+/// # Why this exists alongside the creation-path fix
+///
+/// #2707's fix made the test-scratch directories self-collecting, which
+/// bounds the population going forward and drains the backlog for the
+/// prefixes that fix owns. It does nothing for two other cases, and those
+/// are the ones this check is actually for:
+///
+/// * A machine carrying a backlog from a family nothing sweeps — chiefly
+///   `darkmux-out-<role>-<micros>` and `darkmux-dispatch-<role>-<micros>`,
+///   a real dispatch's out-dir and workspace. Those are KEPT ON PURPOSE:
+///   the out-dir holds that run's prompt, trajectory and checkpoint, which
+///   is exactly what an operator goes looking for afterward. Deliberate
+///   retention with no expiry still accumulates, and the operator is the
+///   only one who can say which runs they are done with.
+/// * A future call site written the old way. This check keys on the
+///   NAMESPACE rather than on a source pattern, so it sees a directory
+///   nobody has taught it about — which is the property a text scan for
+///   "creates a temp dir and abandons it" could not have.
+fn check_temp_residue() -> Check {
+    let tmp = std::env::temp_dir();
+    let residue = summarize_temp_residue(&tmp);
+    let name = "temp residue".to_string();
+
+    if residue.total < TEMP_RESIDUE_WARN_AT {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: format!("{} darkmux director(ies) under {}", residue.total, tmp.display()),
+            hint: None,
+        };
+    }
+
+    let breakdown = residue
+        .families
+        .iter()
+        .take(5)
+        .map(|(family, n)| format!("{family} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let scope = if residue.truncated { "at least " } else { "" };
+
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{scope}{} darkmux director(ies) under {} ({breakdown})",
+            residue.total,
+            tmp.display()
+        ),
+        hint: Some(format!(
+            "each one is a directory darkmux created and left. `darkmux-out-*` and \
+             `darkmux-dispatch-*` are a dispatch's out-dir and workspace — they hold that \
+             run's prompt, trajectory and checkpoint, so they are kept deliberately and \
+             removing one discards that run's record. The rest are test scratch, which a \
+             test process now collects on its own (#2707); any still here predate that. \
+             Nothing here is removed for you: review {} and delete what you are done with.",
+            tmp.display()
+        )),
+    }
+}
+
 /// Parse a `"MAJOR.MINOR"` schema string into its two components — `None`
 /// for anything that doesn't fit that shape (extra segments beyond the
 /// second are tolerated and ignored, matching `mission_config`'s own
@@ -6604,6 +6769,127 @@ mod tests {
             }
         }
         out
+    }
+
+    // ─── (#2707) temp residue ─────────────────────────────────────────
+
+    /// Build a temp root with a known population, so the counting is
+    /// asserted against something the test controls rather than against
+    /// whatever the machine happens to have.
+    fn temp_root_with(dirs: &[&str], files: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::TempDir::new().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+        for f in files {
+            std::fs::write(root.path().join(f), b"x").unwrap();
+        }
+        root
+    }
+
+    /// The namespace contract, which is the whole of this check's claim:
+    /// darkmux's own directories are counted, and nothing else in the
+    /// temp root is looked at.
+    #[test]
+    fn the_scan_counts_only_darkmux_namespaced_directories() {
+        let root = temp_root_with(
+            &[
+                "darkmux-flow-test-1",
+                "darkmux-flow-test-2",
+                "dmx-dialectic-test-3",
+                // Not ours: another tool's, and the operator's own.
+                "tmp.AbCdEf",
+                "com.apple.something",
+                "my-darkmux-notes",
+            ],
+            // A FILE in the namespace is not residue — darkmux's temp
+            // files are written and removed inside one call.
+            &["darkmux-remote-1-0.curl"],
+        );
+
+        let residue = summarize_temp_residue(root.path());
+
+        assert_eq!(residue.total, 3, "only the three darkmux directories: {residue:?}");
+        assert_eq!(
+            residue.families,
+            vec![("darkmux-flow-test".to_string(), 2), ("dmx-dialectic-test".to_string(), 1)],
+            "families collapse the numeric segments and sort largest-first"
+        );
+        assert!(!residue.truncated);
+    }
+
+    /// Family collapsing, against the real name shapes in the tree: a
+    /// pid, a unix-micros timestamp, and a pid+nanos+counter triple.
+    #[test]
+    fn a_family_is_the_name_with_its_numeric_segments_dropped() {
+        assert_eq!(temp_residue_family("darkmux-flow-test-8261"), "darkmux-flow-test");
+        assert_eq!(
+            temp_residue_family("darkmux-out-pr-reviewer-1725000000000000"),
+            "darkmux-out-pr-reviewer"
+        );
+        assert_eq!(
+            temp_residue_family("darkmux-runtime-test-out-412-99-3"),
+            "darkmux-runtime-test-out"
+        );
+        assert_eq!(
+            temp_residue_family("darkmux-412-99-review"),
+            "darkmux-review",
+            "a numeric segment in the MIDDLE collapses too — acp_panel's name puts the pid \
+             and the nanos before the word"
+        );
+        assert_eq!(
+            temp_residue_family("darkmux-test-isolated"),
+            "darkmux-test-isolated",
+            "a name with no numeric segment is its own family, unchanged"
+        );
+    }
+
+    /// The threshold, both sides. A handful of live dispatch out-dirs is
+    /// an ordinary machine and must stay quiet; the shape this check
+    /// exists to describe must not.
+    #[test]
+    fn the_check_stays_quiet_below_the_threshold_and_names_the_families_above_it() {
+        let quiet: Vec<String> =
+            (0..3).map(|n| format!("darkmux-out-coder-{n}")).collect();
+        let quiet: Vec<&str> = quiet.iter().map(|s| s.as_str()).collect();
+        let root = temp_root_with(&quiet, &[]);
+        let residue = summarize_temp_residue(root.path());
+        assert!(
+            residue.total < TEMP_RESIDUE_WARN_AT,
+            "sanity: three dirs must be under the threshold"
+        );
+
+        let many: Vec<String> = (0..TEMP_RESIDUE_WARN_AT)
+            .map(|n| format!("darkmux-flow-test-{n}"))
+            .collect();
+        let many: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let root = temp_root_with(&many, &[]);
+        let residue = summarize_temp_residue(root.path());
+        assert_eq!(residue.total, TEMP_RESIDUE_WARN_AT);
+        assert_eq!(residue.families, vec![("darkmux-flow-test".to_string(), TEMP_RESIDUE_WARN_AT)]);
+    }
+
+    /// An unreadable or absent temp root reports nothing rather than
+    /// failing the whole doctor run — and reports a real zero, not a
+    /// count it could not take.
+    #[test]
+    fn an_unreadable_temp_root_reports_nothing() {
+        let residue = summarize_temp_residue(std::path::Path::new("/nonexistent-temp-root-2707"));
+        assert_eq!(residue, TempResidue::default());
+    }
+
+    /// The live check, against the real temp root. It must never Fail
+    /// (this is a description, not a health verdict) and must always name
+    /// the directory it looked at, so the number is attributable.
+    #[test]
+    fn the_live_check_describes_rather_than_adjudicates() {
+        let check = check_temp_residue();
+        assert_ne!(check.status, Status::Fail, "temp residue is a fact, never a failure");
+        assert!(
+            check.message.contains(&std::env::temp_dir().display().to_string()),
+            "the message must name the directory the count came from: {}",
+            check.message
+        );
     }
 
     #[test]
@@ -10030,9 +10316,15 @@ mod tests {
         // colliding-file rebase needs its literal counts re-derived, not
         // just its prose reconciled. Same lesson, same fix, one more time.
         //
+        // (#2707) 59, not 58: `check_temp_residue` joined the static array
+        // above. Re-derived the same way the note above prescribes rather
+        // than incremented on faith — `grep -c '^        check_' ` inside
+        // the `let checks = vec![...]` block returns 58, plus the one
+        // `check_hooks()` always contributes.
+        //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 58 + darkmux_eureka::all_rules().len();
+        let expected = 59 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

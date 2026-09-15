@@ -1452,8 +1452,13 @@ fn render_summary(trials: &[Trial<'_>], k: u32, scores_path: &Path) -> String {
 /// reads the nonce out of) while `envelope_meta` decides the SAME trial's
 /// METRICS off the same stdout, and a bench reading those off different
 /// lines scores a capability zero for a model that answered correctly.
+///
+/// (#2721) The composition itself — `extract_reply_text(envelope_candidate(…))`
+/// — is now [`scores::envelope_reply_text`], because `review_bench` and
+/// `dialectic` needed the identical pair and spelling it out a third time is
+/// how the `.rev().find(…)` duplicate got here in the first place.
 fn extract_reply(stdout: &str) -> String {
-    super::prompt::extract_reply_text(scores::envelope_candidate(stdout))
+    scores::envelope_reply_text(stdout)
 }
 
 /// Dispatch one task via the internal runtime. Same shape as the coding-task

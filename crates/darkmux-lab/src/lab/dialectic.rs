@@ -929,8 +929,13 @@ pub fn run_debate(
     mut dispatch: impl FnMut(Seat, &str) -> Result<String>,
 ) -> Result<(Review, DebateEnvelope)> {
     // (#2685) The envelope parser moved beside the scores schema it feeds.
-    use super::scores::envelope_meta;
-    use crate::providers::prompt::extract_reply_text;
+    // (#2721) Both halves of a seat now come off the SAME stdout line:
+    // `envelope_meta` for its metrics, `envelope_reply_text` for its text.
+    // This used to be `prompt::extract_reply_text` on the WHOLE stdout, so one
+    // noise line ahead of the envelope fed `parse_charges`/`parse_rebuttals`/
+    // `parse_rulings` raw stdout while the seat's metrics row kept isolating
+    // correctly — one seat, two disagreeing sources of truth.
+    use super::scores::{envelope_meta, envelope_reply_text};
 
     let mut env = DebateEnvelope {
         case_id: case.id.clone(),
@@ -949,7 +954,7 @@ pub fn run_debate(
     let p_out = dispatch(Seat::Prosecutor, &prosecutor_prompt(case))
         .with_context(|| format!("dispatching {} for case {}", Seat::Prosecutor.label(), case.id))?;
     env.prosecutor = seat_record(Seat::Prosecutor, &p_out);
-    let mut sheet = parse_charges(&extract_reply_text(&p_out));
+    let mut sheet = parse_charges(&envelope_reply_text(&p_out));
     if !sheet.parsed {
         // Empty reply — the #1113 degenerate class; never a silent pass.
         env.prosecutor_closing = Some(Closing::Missing);
@@ -984,7 +989,7 @@ pub fn run_debate(
     let d_out = dispatch(Seat::Defender, &defender_prompt(case, &sheet.charges))
         .with_context(|| format!("dispatching {} for case {}", Seat::Defender.label(), case.id))?;
     env.defender = Some(seat_record(Seat::Defender, &d_out));
-    let mut answers = parse_rebuttals(&extract_reply_text(&d_out));
+    let mut answers = parse_rebuttals(&envelope_reply_text(&d_out));
     // A defense that produced nothing usable doesn't abort the case: the
     // judge is told every charge stands unanswered and weighs them alone.
     let defense_degenerate = !answers.parsed || answers.rebuttals.is_empty();
@@ -1000,7 +1005,7 @@ pub fn run_debate(
     )
     .with_context(|| format!("dispatching {} for case {}", Seat::Judge.label(), case.id))?;
     env.judge = Some(seat_record(Seat::Judge, &j_out));
-    let rulings = parse_rulings(&extract_reply_text(&j_out));
+    let rulings = parse_rulings(&envelope_reply_text(&j_out));
 
     env.rebuttals = answers.rebuttals;
     let review = match rulings {
@@ -1252,7 +1257,17 @@ mod tests {
 
     #[test]
     fn rebuttal_quote_verified_against_workdir_file_or_voided() {
-        let root = std::env::temp_dir().join(format!("dmx-dialectic-test-{}", std::process::id()));
+        // (#2707) These three tests each built `$TMPDIR/<name>-<pid>` by
+        // hand and removed it on the LAST LINE of the test — which is a
+        // cleanup that runs only when everything passed. A failing
+        // assertion, or nextest's `terminate-after` killing the process,
+        // left the directory behind. The helper owns the same path
+        // instead: one directory per prefix per process, removed at exit
+        // however the test ended, and swept by the next process if this
+        // one was killed before it could. The trailing `remove_dir_all`
+        // is gone rather than kept alongside — two owners for one path is
+        // how a memoized handle ends up pointing at something deleted.
+        let root = darkmux_types::test_isolation::process_scratch_dir("dmx-dialectic-test");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
             root.join("src/intake.ts"),
@@ -1293,7 +1308,6 @@ mod tests {
         let mut again = rebuttals.clone();
         again.iter_mut().for_each(|r| r.voided = false);
         assert_eq!(validate_rebuttal_quotes(&mut again, &charges, DIFF, None), 0);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── excerpts ──────────────────────────────────────────────────────
@@ -1398,8 +1412,8 @@ mod tests {
             body: "b".into(),
             struck: false,
         }];
-        let root = std::env::temp_dir().join(format!("dmx-fence-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // (#2707) Owned by the helper — see the sibling call above.
+        let root = darkmux_types::test_isolation::process_scratch_dir("dmx-fence-test");
         // Honest: one real inline span (verbatim from the diff) + a folded
         // fenced block whose content is NOT a verbatim line anywhere.
         let mut rebuttals = vec![
@@ -1428,7 +1442,6 @@ mod tests {
             "fence content must not manufacture unverifiable spans"
         );
         assert!(rebuttals[1].voided);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Shakedown-1+3 regression (#1222): defenders write the file reference
@@ -1446,8 +1459,8 @@ mod tests {
             body: "b".into(),
             struck: false,
         }];
-        let root = std::env::temp_dir().join(format!("dmx-path-span-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // (#2707) Owned by the helper — see the sibling call above.
+        let root = darkmux_types::test_isolation::process_scratch_dir("dmx-path-span");
         let mut rebuttals = vec![Rebuttal {
             charge: 1,
             stance: Stance::Refute,
@@ -1464,7 +1477,6 @@ mod tests {
              real citation validates"
         );
         assert!(!rebuttals[0].voided);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── synthesis + the full chain ────────────────────────────────────
@@ -1566,6 +1578,66 @@ mod tests {
         assert_eq!(env.prosecutor.model.as_deref(), Some("test-35b"));
         assert_eq!(env.prosecutor_closing, Some(Closing::Rested));
         assert!(env.unruled_charges.is_empty());
+    }
+
+    /// A cold run writes image-pull progress on stdout AHEAD of the compact
+    /// envelope. Every seat here gets that shape, so all three parse paths
+    /// (`parse_charges` / `parse_rebuttals` / `parse_rulings`) are covered.
+    ///
+    /// (#2721) The noise line is JSON-SHAPED on purpose, and that is the whole
+    /// point of the fixture rather than incidental realism. The selection this
+    /// guards is `envelope_candidate`'s `.lines().rev().find(starts_with('{'))`.
+    /// With PLAIN-TEXT noise, `.rev()` is unobservable — the envelope would be
+    /// the only `{`-line, so `.find(…)` and `.rev().find(…)` return it alike
+    /// and this test would stay green through the mutation it exists to catch.
+    /// A JSON-shaped noise line is a SECOND `{`-line, so dropping `.rev()`
+    /// selects the NOISE, whose object carries no `final_assistant` — the text
+    /// goes empty, the prosecutor reads as degenerate, and this goes red.
+    ///
+    /// It is also #2721's own before/after: reading text off the WHOLE stdout
+    /// (the pre-fix behavior) fails that parse and hands `parse_charges` raw
+    /// stdout, where no line begins with `CHARGE` — degenerate as well.
+    #[test]
+    fn a_noise_line_ahead_of_the_envelope_does_not_defeat_any_seat() {
+        const PULL_NOISE: &str = r#"{"status":"Pulling fs layer","id":"a1b2c3"}"#;
+        // Pinned: the noise alone parses as an object carrying no reply field,
+        // so selecting it yields EMPTY text. That is what makes the mutation
+        // observable rather than merely different.
+        assert_eq!(crate::lab::scores::envelope_reply_text(PULL_NOISE), "");
+
+        let noisy = |reply: &str| format!("{PULL_NOISE}\n{}", fake_envelope(reply));
+
+        let case = tiny_case(DIFF);
+        let (review, env) = run_debate(&case, None, |seat, _| {
+            Ok(match seat {
+                Seat::Prosecutor => noisy(
+                    "CHARGE 1 [billing.ts] `const total = base * rate`\n\
+                     Rate is per-day but base is per-month.\nCASE: rested\n",
+                ),
+                Seat::Defender => {
+                    noisy("REBUTTAL 1: concede\nThe units disagree.\nDEFENSE: rests\n")
+                }
+                Seat::Judge => noisy(
+                    "```json\n{\"summary\":\"units bug\",\"verdicts\":[{\"charge\":1,\"ruling\":\"sustained\",\"severity\":\"high\",\"decisive_evidence\":\"conceded\",\"reasoning\":\"defense concedes\"}]}\n```",
+                ),
+            })
+        })
+        .expect("debate runs");
+
+        // Every seat's TEXT survived the noise.
+        assert!(review.parsed, "prosecutor's charges must parse past noise");
+        assert_eq!(review.verdict, "flag");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.findings[0].anchor, "const total = base * rate");
+        assert_eq!(env.charges.len(), 1);
+        assert_eq!(env.rebuttals.len(), 1, "defender's text must parse too");
+        assert_eq!(env.verdicts.len(), 1, "judge's text must parse too");
+        assert_eq!(env.sustained, 1);
+
+        // ...and the METRICS came off that SAME line, which is the actual
+        // #2721 claim: not "the text parses" but "text and metrics agree".
+        assert_eq!(env.prosecutor.model.as_deref(), Some("test-35b"));
+        assert_eq!(env.prosecutor.total_tokens, Some(42));
     }
 
     #[test]
