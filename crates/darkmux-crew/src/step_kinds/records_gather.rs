@@ -704,7 +704,6 @@ mod tests {
     use crate::mods::{ForFinding, ModContext, ModRecord};
     use crate::types::{NodeStatus, Phase, PhaseStatus};
     use serde_json::json;
-    use tempfile::TempDir;
 
     /// (#2693) The state guard for every test in this module.
     ///
@@ -716,14 +715,24 @@ mod tests {
     /// `DARKMUX_CREW_DIR` OUTRANKS the pinned root, so for anyone who had
     /// exported one (the careful thing to do when running this suite), the
     /// guard isolated nothing: all 22 tests wrote their `missions/
-    /// review-2310/steps/review-2310-deliver/*.json` fixtures into ONE
-    /// shared directory, and `scan_unit_and_plan_steps` — which scans that
-    /// whole directory — saw every earlier test's steps as if they
-    /// belonged to its own run. Measured: 5–11 failures per run of this
+    /// review-2310/{steps,phases,plan}/*.json` fixtures into ONE shared
+    /// directory, and `scan_unit_and_plan_steps` — which scans that whole
+    /// directory — read the union. Measured: 5–11 failures per run of this
     /// module alone, a different set each time, and still red (stable at
     /// 10) under `--test-threads=1`, which is the tell that it is leaked
     /// state rather than concurrency. The fixtures also outlived the
     /// process, so the next run started on the previous run's residue.
+    ///
+    /// It broke BOTH directions, which is worth naming because the second
+    /// is easy to miss when reconstructing this from the first. Where a
+    /// test's own step ids did not collide with an earlier test's, the
+    /// scan returned MORE than the test planted — `errored: ["plan
+    /// `plan-step-1` (Error)", "unit `unit-step-2` (Error)", …]` in tests
+    /// that planted neither. Where they DID collide, the earlier test's
+    /// record won the filename and the scan returned LESS: one assertion
+    /// expecting two window names got an empty list, another expecting 2
+    /// got 0. About six of the ten deterministic failures are the first
+    /// shape; at least four are the second.
     ///
     /// [`IsolatedState`](darkmux_types::test_isolation::IsolatedState)
     /// pins the WHOLE set — `DARKMUX_CREW_DIR` included — under one
@@ -732,7 +741,10 @@ mod tests {
     /// (`tmp.path().join("d.diff")`) are unchanged.
     ///
     /// Every test holding one must stay `#[serial_test::serial]`: the
-    /// guard mutates process-global environment.
+    /// guard mutates process-global environment. The guard is held to that
+    /// claim by `the_guard_isolates_crew_state_even_when_a_crew_dir_is_already_pinned`
+    /// below, whose two documented limits live in
+    /// `crate::test_guard_conformance`.
     type IsolatedState = darkmux_types::test_isolation::IsolatedState;
 
     const MISSION: &str = "review-2310";
@@ -742,63 +754,28 @@ mod tests {
     /// author cannot quietly narrow it back to a single variable, so the
     /// isolation property gets an ASSERTION rather than a paragraph.
     ///
-    /// The assertion has to bring its own `DARKMUX_CREW_DIR`. That is the
-    /// whole point: the defect this replaces was invisible to anyone
-    /// whose environment did not have one set, and visible — as 5–11
-    /// failures — to anyone whose did. A guard test that inherits the
-    /// ambient environment inherits that same blind spot, which is
-    /// exactly backwards from what a guard test is for. So it exports a
-    /// sentinel first, and then asserts the fixture write lands under the
-    /// guard's root and NOT under the sentinel.
+    /// The assertion itself — including the two things it deliberately
+    /// cannot catch — lives in `crate::test_guard_conformance`, shared
+    /// with `absence_backstop`, which carried a byte-identical guard.
+    /// What is module-local is the probe: this module's OWN alias, this
+    /// module's OWN fixture writer, through the production resolver.
     ///
-    /// Red-proved by reverting `IsolatedState` to a `DARKMUX_HOME`-only
-    /// guard: this test then writes `review-2310`'s phase JSON into the
-    /// sentinel directory and fails on the second assertion, with the
-    /// rest of the module still passing or failing by luck of ordering.
+    /// Red-proved by reverting the alias above to a `DARKMUX_HOME`-only
+    /// guard: this fails naming the sentinel path it wrote into, and the
+    /// rest of the module returns to failing by luck of ordering.
     #[test]
-    #[serial_test::serial] // mutates DARKMUX_CREW_DIR, a process-global
+    #[serial_test::serial] // the conformance assertion mutates process-global env
     fn the_guard_isolates_crew_state_even_when_a_crew_dir_is_already_pinned() {
-        const VAR: &str = "DARKMUX_CREW_DIR";
-        let ambient = std::env::var_os(VAR);
-        let sentinel = TempDir::new().unwrap();
-        // SAFETY: #[serial]. Stand in for the operator who ran this suite
-        // with a scratch crew dir exported — the environment in which the
-        // module was red.
-        unsafe { std::env::set_var(VAR, sentinel.path()) };
-
-        {
+        crate::test_guard_conformance::assert_guard_isolates_crew_state(|| {
             let state = IsolatedState::new();
             save_phase();
             let written = crate::lifecycle::phase_path(MISSION, PHASE);
-            assert!(
-                written.starts_with(state.path()),
-                "a fixture write must land under the guard's own root, got {}",
-                written.display()
-            );
-            assert!(
-                !written.starts_with(sentinel.path()),
-                "a fixture write reached the pinned DARKMUX_CREW_DIR at {} — every test in \
-                 this module then shares one mission directory and reads the others' steps",
-                written.display()
-            );
-            assert!(written.is_file(), "the phase JSON must actually exist where it was resolved");
-        }
-
-        // The guard must hand the sentinel back, not leave its own root
-        // behind for the next test in this process.
-        assert_eq!(
-            std::env::var_os(VAR).as_deref(),
-            Some(sentinel.path().as_os_str()),
-            "the guard must restore the DARKMUX_CREW_DIR it displaced"
-        );
-
-        // SAFETY: #[serial].
-        unsafe {
-            match ambient {
-                Some(v) => std::env::set_var(VAR, v),
-                None => std::env::remove_var(VAR),
+            crate::test_guard_conformance::GuardProbe {
+                root: state.path().to_path_buf(),
+                written_exists: written.is_file(),
+                written,
             }
-        }
+        });
     }
 
     fn save_phase() {

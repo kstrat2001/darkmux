@@ -779,6 +779,34 @@ mod tests {
     /// Every test holding one must stay `#[serial_test::serial]`.
     type IsolatedState = darkmux_types::test_isolation::IsolatedState;
 
+    /// (#2693) The same conformance assertion `records_gather` holds,
+    /// over THIS module's guard and THIS module's fixture writer.
+    ///
+    /// Added because the first cut of the fix left this half unasserted,
+    /// and unasserted is indistinguishable from unfixed by anything CI
+    /// runs: reverting the alias above to a `DARKMUX_HOME`-only guard
+    /// left `cargo test -p darkmux-crew --lib` at EXIT=0, 1705 passed,
+    /// 0 failed, while two plan fixtures leaked into the pinned crew dir.
+    /// That is precisely the erosion mode the assertion exists to stop,
+    /// reintroduced in the module the fix had just touched.
+    #[test]
+    #[serial_test::serial] // the conformance assertion mutates process-global env
+    fn the_guard_isolates_crew_state_even_when_a_crew_dir_is_already_pinned() {
+        crate::test_guard_conformance::assert_guard_isolates_crew_state(|| {
+            let tmp = IsolatedState::new();
+            let tree = tmp.path().join("checkout").join("app");
+            std::fs::create_dir_all(&tree).unwrap();
+            write_plan_with_source("m-1", "swallowed-error", "app", &tree);
+            let written =
+                crate::loader::missions_dir().join("m-1").join("plan").join("swallowed-error.json");
+            crate::test_guard_conformance::GuardProbe {
+                root: tmp.path().to_path_buf(),
+                written_exists: written.is_file(),
+                written,
+            }
+        });
+    }
+
     fn write_plan_with_source(mission_id: &str, rule_id: &str, source_id: &str, tree: &std::path::Path) {
         let plan_dir = crate::loader::missions_dir().join(mission_id).join("plan");
         std::fs::create_dir_all(&plan_dir).unwrap();
