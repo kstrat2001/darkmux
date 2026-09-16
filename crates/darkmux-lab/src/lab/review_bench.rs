@@ -167,6 +167,16 @@ pub struct CaseScore {
     /// flag verdict with an empty findings array — contract violation
     /// (the gpt-oss under-flag failure mode), distinct from a true pass.
     pub empty_flag: bool,
+    /// (#1085) `verdict: pass` while `findings` carries a `high`-severity
+    /// entry — the mirror-image contract violation to `empty_flag`. The
+    /// role prompt already states the rule (`verdict` is `flag` iff any
+    /// finding is `high`); this is the pipeline catching the small model's
+    /// slip mechanically rather than trusting the field. Deliberately NOT
+    /// used to overwrite `verdict` before scoring — a `pass` alongside a
+    /// matching bug finding stays "not recalled" (see `score_multi`'s
+    /// recall comment): the model's own contradiction is real signal about
+    /// its calibration, not noise to paper over.
+    pub verdict_severity_mismatch: bool,
     /// matched the expectation for its kind.
     pub correct: bool,
     // ── multi-finding tallies (#1119) — feed corpus-wide recall + precision ──
@@ -943,6 +953,10 @@ pub fn score(label: &Label, r: &Review) -> CaseScore {
     }
     // ── legacy single-anchor path (behavior unchanged) ──
     let high = r.findings.iter().filter(|f| f.severity == "high").count();
+    // (#1085) Envelope-level check, independent of label kind or ground
+    // truth: a `pass` verdict carrying a `high` finding contradicts the
+    // role's own contract.
+    s.verdict_severity_mismatch = r.verdict == "pass" && high > 0;
     if label.kind == "bug" {
         let anchor_ok = label
             .anchor_contains
@@ -972,6 +986,12 @@ pub fn score(label: &Label, r: &Review) -> CaseScore {
 /// labels).
 fn score_multi(label: &Label, r: &Review, mut s: CaseScore) -> CaseScore {
     let expected = &label.expected;
+
+    // (#1085) Same envelope-level contract check as the legacy path — a
+    // `pass` verdict carrying a `high` finding is internally inconsistent
+    // regardless of how the finding matches (or doesn't) any expected bug.
+    let high = r.findings.iter().filter(|f| f.severity == "high").count();
+    s.verdict_severity_mismatch = r.verdict == "pass" && high > 0;
 
     // Recall is scored over the REQUIRED (must-catch) subset only.
     s.expected_bugs = expected.iter().filter(|e| e.required).count();
@@ -1113,9 +1133,17 @@ fn describe(label: &Label, s: &CaseScore) -> String {
         if s.empty_flag {
             bits.push("EMPTY-FLAG (flag w/ 0 findings — contract violation)".to_string());
         }
+        if s.verdict_severity_mismatch {
+            bits.push("VERDICT-MISMATCH (pass w/ a HIGH finding — contract violation, #1085)".to_string());
+        }
         bits.join(" ")
     } else if s.fp == 0 && s.correct {
         "clean-pass".to_string()
+    } else if s.verdict_severity_mismatch {
+        format!(
+            "{} false-positive(s) — VERDICT-MISMATCH (pass w/ a HIGH finding, #1085)",
+            s.fp
+        )
     } else {
         format!("{} false-positive(s)", s.fp)
     }
@@ -1178,9 +1206,23 @@ fn print_summary(scored: &[(&Case, CaseScore)], meta: &[EnvelopeMeta], opts: &Re
     // aggregate line.
     let degenerate = capability.iter().filter(|(_, s)| s.degenerate && !s.partial).count();
     let partial = capability.iter().filter(|(_, s)| s.degenerate && s.partial).count();
+    // (#1085) Corpus-wide count of the pass+HIGH contract violation, across
+    // both clean and bug cases — surfaced alongside the other structural
+    // failure modes (degenerate/partial/infra) rather than folded silently
+    // into fp/recall.
+    let verdict_mismatch = capability
+        .iter()
+        .filter(|(_, s)| s.verdict_severity_mismatch)
+        .count();
     println!("\n── summary ({}) ──", opts.profile_name.as_deref().unwrap_or("default"));
     println!("clean: {}/{} pass · {} false positives", clean_pass, clean.len(), fp_total);
     println!("bug:   {}/{} recall · {}/{} correct anchor", recall, bugs.len(), anchor, bugs.len());
+    if verdict_mismatch > 0 {
+        println!(
+            "verdict-mismatch: {} (pass verdict carrying a HIGH finding — contract violation, #1085)",
+            verdict_mismatch
+        );
+    }
     if degenerate > 0 {
         println!("degenerate: {} (empty/unparseable — model unfit for this role)", degenerate);
     }
