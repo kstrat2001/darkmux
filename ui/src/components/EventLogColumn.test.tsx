@@ -95,9 +95,10 @@ describe("EventLogColumn", () => {
     const records = [rec({ session_id: "s-alpha" }), rec({ session_id: "s-beta" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
-    // (#2417 round 3) The one non-matching record is also "hidden" by the
-    // active search — same `hiddenSuffix` the no-search chip carries.
-    expect(document.getElementById("qcount")?.textContent).toBe("1 match · 1 hidden");
+    // (#2417 round 3, revised #2770) The one non-matching record is also
+    // "hidden" by the active search — same `hiddenSuffix` the no-search
+    // chip carries, now naming the cause since search is the sole one here.
+    expect(document.getElementById("qcount")?.textContent).toBe("1 match · 1 hidden by search");
   });
 
   it("shows a plural match count for more than one match", () => {
@@ -108,9 +109,10 @@ describe("EventLogColumn", () => {
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
-    // (#2417 round 3) The one non-matching record is also "hidden" by the
-    // active search — same `hiddenSuffix` the no-search chip carries.
-    expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden");
+    // (#2417 round 3, revised #2770) The one non-matching record is also
+    // "hidden" by the active search — same `hiddenSuffix` the no-search
+    // chip carries, now naming the cause since search is the sole one here.
+    expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden by search");
   });
 
   it("appends the LOG_CAP disclosure once the match count exceeds what's shown", () => {

@@ -10,6 +10,7 @@ import {
   DEFAULT_ACTIVITIES,
   defaultFilterState,
   groupActivitiesBySections,
+  hiddenCauseLabel,
   matchesFilters,
   MODEL_ACTIVITIES,
   activeFilterCount,
@@ -671,6 +672,91 @@ describe("#2512 — the act default never turns on nothing for a corpus that has
     const facets = computeFacets([]);
     const filters = defaultFilterState(facets);
     expect(filters.act.size).toBe(0);
+  });
+});
+
+// ── #2770 — the #2512 backstop was gated on a GLOBAL "has the operator ever
+// recorded any pick for this facet" check, which is wrong: an operator who
+// once excluded a value that has since scrolled out of the window (or was
+// never part of this corpus at all) carries a non-empty `picks.exclude`
+// forever, so the backstop never re-fires the next time a busy corpus's
+// activity values are ALL non-default. Live report: "0 EVENTS · 887 HIDDEN",
+// "no events match your filters", filter badge "16", empty search box. ────
+describe("#2770 — event log blanks when no offered activity is default-on AND the operator has unrelated history", () => {
+  // The exact action kinds #2770 measured off a live busy fleet — none of
+  // them map to a DEFAULT_ACTIVITIES value and none is failure-shaped.
+  const BUSY_NON_DEFAULT_ACTIONS = ["machine.telemetry", "dispatch.turn.heartbeat", "step start", "dispatch.start", "phase begin"];
+
+  it("LOAD-BEARING: a fixture whose activity values are ALL non-default still renders events (fresh session, no history)", () => {
+    const records = BUSY_NON_DEFAULT_ACTIONS.map((action) => rec({ action }));
+    const facets = computeFacets(records);
+    // Sanity per the requirement: a fixture containing even one default-on
+    // value would pass against the bug and prove nothing.
+    for (const v of facets.act) {
+      expect(DEFAULT_ACTIVITIES.has(v)).toBe(false);
+    }
+    const filters = defaultFilterState(facets);
+    const visible = records.filter((r) => matchesFilters(r, filters));
+    expect(visible.length).toBe(records.length);
+  });
+
+  it("still renders events when the operator has a stored exclude for a value NOT in this corpus", () => {
+    // The actual #2770 shape: the operator excluded `note` at some earlier,
+    // calmer point in the session. That pick is real, but it is an opinion
+    // about a value this window does not even offer — it must not suppress
+    // the backstop for an UNRELATED empty result.
+    const records = BUSY_NON_DEFAULT_ACTIONS.map((action) => rec({ action }));
+    const facets = computeFacets(records);
+    expect(facets.act.includes("note")).toBe(false); // sanity: not offered this window
+    const picks = createStoredPicks();
+    picks.act.exclude.add("note");
+    const state = applyStoredPicks(picks, facets);
+    expect(state.act.size).toBe(facets.act.length);
+    const visible = records.filter((r) => matchesFilters(r, state));
+    expect(visible.length).toBe(records.length);
+  });
+
+  it("does NOT show everything when the operator explicitly excluded a value this corpus DOES offer", () => {
+    // The crux the fix must not break: an opinion about a currently-offered
+    // value is a deliberate choice, not "no opinion", even if it alone
+    // empties the act set.
+    const records = BUSY_NON_DEFAULT_ACTIONS.map((action) => rec({ action }));
+    const facets = computeFacets(records);
+    const picks = createStoredPicks();
+    for (const v of facets.act) picks.act.exclude.add(v); // excludes every offered value
+    const state = applyStoredPicks(picks, facets);
+    expect(state.act.size).toBe(0);
+    const visible = records.filter((r) => matchesFilters(r, state));
+    expect(visible.length).toBe(0);
+  });
+});
+
+describe("hiddenCauseLabel — names the control responsible for a nonzero hidden count (#2770)", () => {
+  it("names the activity filter when act alone is narrowed and the query is empty", () => {
+    // "host telemetry" is not in DEFAULT_ACTIVITIES, so `defaultFilterState`
+    // narrows act to the other three; cat/tier stay fully selected.
+    const facets: Facets = { act: ["reasoning", "tool call", "turn", "host telemetry"], cat: ["work"], tier: ["local"], src: [] };
+    const filters = defaultFilterState(facets);
+    expect(filters.act.size).toBe(3);
+    expect(hiddenCauseLabel(filters, facets)).toBe("activity filter");
+  });
+
+  it("names search when only the free-text query is narrowing", () => {
+    const facets: Facets = { act: ["reasoning"], cat: [], tier: [], src: [] };
+    const filters = { ...defaultFilterState(facets), q: "foo" };
+    expect(hiddenCauseLabel(filters, facets)).toBe("search");
+  });
+
+  it("returns null (mixed cause) when a facet AND the query are both narrowing", () => {
+    const facets: Facets = { act: ["reasoning", "tool call"], cat: [], tier: [], src: [] };
+    const filters = { act: new Set(["reasoning"]), cat: new Set<string>(), tier: new Set<string>(), src: new Set<string>(), q: "foo" };
+    expect(hiddenCauseLabel(filters, facets)).toBeNull();
+  });
+
+  it("returns null when nothing is narrowed (no hidden cause to name)", () => {
+    const facets: Facets = { act: ["reasoning"], cat: [], tier: [], src: [] };
+    const filters = defaultFilterState(facets);
+    expect(hiddenCauseLabel(filters, facets)).toBeNull();
   });
 });
 

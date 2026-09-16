@@ -11,6 +11,7 @@ import {
   computeFacets,
   createFacetSeen,
   createStoredPicks,
+  hiddenCauseLabel,
   matchesFilters,
   type Facets,
   type FacetSeen,
@@ -601,7 +602,13 @@ export function EventLogColumn({
   // LOG_CAP are rendered" disclosure. Omitted from the chip entirely when
   // zero, so a pane with nothing filtered reads exactly as it did before.
   const hiddenByFilters = records.length - filtered.length;
-  const hiddenSuffix = hiddenByFilters > 0 ? ` · ${hiddenByFilters} hidden` : "";
+  // (#2770) Name the control responsible when there's exactly one — "887
+  // hidden by activity filter" points at the checkbox that did it, instead
+  // of a bare count that, beside an empty search box, reads as a rendering
+  // fault rather than a filter. Falls back to the bare count when the cause
+  // is mixed (`hiddenCauseLabel` returns null) rather than misattribute.
+  const hiddenCause = hiddenByFilters > 0 ? hiddenCauseLabel(filters, facets) : null;
+  const hiddenSuffix = hiddenByFilters > 0 ? ` · ${hiddenByFilters} hidden${hiddenCause ? ` by ${hiddenCause}` : ""}` : "";
 
   const q = filters.q.length > 0;
   const qcountText = q

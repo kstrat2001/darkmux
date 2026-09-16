@@ -152,22 +152,39 @@ function isDefaultOn(key: keyof Facets, value: string): boolean {
  * the set empty while the corpus actually has activity values, fall back
  * to showing all of them.
  *
- * This only fires when the operator has NO opinion at all recorded for
- * this facet (`picks.include` and `picks.exclude` both empty) — the literal
- * "never touched it" state, true both for `defaultFilterState` (which never
- * sees stored picks) and for a from-scratch session's `applyStoredPicks`
- * call (`createStoredPicks()`'s picks). An operator who has explicitly
- * recorded even one include/exclude for `act` gets no override here — this
- * function's job is "what does the DEFAULT alone produce," not "second-
- * guess a deliberate choice." */
+ * This only fires when the operator has NO opinion recorded on any value
+ * THIS CALL OFFERS (#2770 — scoped to `values`, not to `picks` as a whole).
+ * An earlier revision (#2512) gated the fallback on `picks.include.size ===
+ * 0 && picks.exclude.size === 0` — "has the operator EVER recorded a pick
+ * for this facet, for ANY value, in ANY session" — which reintroduced the
+ * exact blank-log defect one layer up: an operator who once excluded a
+ * value that ISN'T even part of the current corpus (a `heartbeat` toggled
+ * off during a calm stretch, long since scrolled out of the window) carries
+ * a non-empty `picks.exclude` forever, so the backstop never re-fires the
+ * next time a storm of unnamed activity kinds shows up with none of them
+ * default-on — precisely the live #2770 report ("16" filter badge, "0
+ * events", an empty search box). The fix is to ask the narrower question
+ * the fallback actually needs answered: does the operator have an opinion
+ * about anything CURRENTLY on offer? A pick recorded against a value this
+ * corpus doesn't contain is not an opinion about this emptiness.
+ *
+ * An operator who has explicitly included or excluded even one value this
+ * call DOES offer gets no override — that is a deliberate choice about the
+ * present corpus (see `does not override a deliberate operator choice to
+ * exclude everything` in eventFilters.test.ts), not a default gone wrong,
+ * and this function's job stays "what does the DEFAULT alone produce," not
+ * "second-guess a deliberate choice." */
 function resolveActivitySet(values: string[], picks: { include: Set<string>; exclude: Set<string> }): Set<string> {
   const out = new Set<string>();
   for (const v of values) {
     if (picks.exclude.has(v)) continue;
     if (picks.include.has(v) || isDefaultOn("act", v)) out.add(v);
   }
-  if (out.size === 0 && values.length > 0 && picks.include.size === 0 && picks.exclude.size === 0) {
-    for (const v of values) out.add(v);
+  if (out.size === 0 && values.length > 0) {
+    const hasOpinionOnOffered = values.some((v) => picks.include.has(v) || picks.exclude.has(v));
+    if (!hasOpinionOnOffered) {
+      for (const v of values) out.add(v);
+    }
   }
   return out;
 }
@@ -561,6 +578,37 @@ export function matchesFilters(r: FlowRecord, filters: FilterState): boolean {
     if (q && !JSON.stringify(r).toLowerCase().includes(q)) return false;
   }
   return true;
+}
+
+/** Friendly names for `FACET_KEYS`, for `hiddenCauseLabel` below. */
+const FACET_LABELS: Record<(typeof FACET_KEYS)[number], string> = {
+  act: "activity",
+  cat: "category",
+  tier: "tier",
+  src: "source",
+};
+
+/** (#2770) Names the control responsible for a nonzero hidden count, so
+ * `EventLogColumn`'s "N hidden" chip can read "887 hidden by activity
+ * filter" instead of a bare number. A bare count beside an empty search box
+ * reads as a rendering fault — the operator's own words on the live report
+ * this closes were "event filters seem broken" — and a bare number gives no
+ * way to tell a filter from a bug.
+ *
+ * Returns a facet's label when exactly one facet is narrower than
+ * "everything on offer" and the free-text query is empty — the common case,
+ * and precisely the #2770 shape (only `act` narrowed, by the curated
+ * default or by an operator pick). Returns `"search"` when only the query
+ * is narrowing. Returns `null` when the cause is mixed (more than one facet
+ * narrowed, or a facet AND the query both narrowing) — naming just one of
+ * several causes would misattribute, so the caller falls back to the bare
+ * count rather than guess. */
+export function hiddenCauseLabel(filters: FilterState, facets: Facets): string | null {
+  const narrowed = FACET_KEYS.filter((k) => filters[k].size < facets[k].length);
+  const hasQuery = filters.q.trim() !== "";
+  if (narrowed.length === 1 && !hasQuery) return `${FACET_LABELS[narrowed[0]]} filter`;
+  if (narrowed.length === 0 && hasQuery) return "search";
+  return null;
 }
 
 /** (#2018, revised #2416) `sessionStorage` key for the operator's event-log
