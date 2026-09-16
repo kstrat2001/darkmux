@@ -745,6 +745,23 @@ pub fn launch(
     // `LaunchFinalizeGuard`.
     crate::launch_guard::arm();
 
+    // (#2678) The run-level wall-clock bound — orthogonal to `arm()`
+    // above, but deliberately built ON TOP of the same interrupt flag
+    // rather than a new mechanism of its own: at expiry, the watchdog
+    // calls the SAME `darkmux_types::interrupt::mark_interrupted()` a
+    // real SIGTERM would, so a bound-triggered stop renders through the
+    // identical graceful-abort path this function already has for a real
+    // operator signal (see `launch_guard::spawn_wall_clock_watchdog`'s own
+    // doc). Armed here — right after `arm()`, well before the mint below —
+    // so the bound covers config-load/interpret time too, not just the
+    // dispatch loop; `mission_wall_clock_timeout_seconds() == 0` (the
+    // default) makes this a no-op, spawning no thread at all, so an
+    // operator who never opts in pays no per-run cost. `_wall_clock_guard`
+    // must live for the rest of this function — its `Drop` stops the
+    // watchdog thread once THIS run reaches any exit, normal or aborted.
+    let wall_clock_bound_seconds = darkmux_types::config_access::mission_wall_clock_timeout_seconds();
+    let _wall_clock_guard = crate::launch_guard::spawn_wall_clock_watchdog(run_started, wall_clock_bound_seconds);
+
     // Run id: minted fresh for THIS launch, never derived from inputs
     // (#1503). AI work is non-deterministic, so two launches of the same
     // config with the same inputs are two DIFFERENT runs, not one to
@@ -988,28 +1005,41 @@ pub fn launch(
     // nothing was dispatched to abandon) — arming before those would wrongly
     // abort a mission neither return path intends to touch.
     //
-    // The abort writer mirrors the existing pre-mint strand-window fallback
-    // this function already uses (`reconcile_and_finalize_on_error(...,
-    // &[], &mut no_steps, ...)`, e.g. the config-snapshot-write failure just
-    // above) — an aborted run's real `tasks`/`steps` state either isn't
-    // known yet (a panic before dispatch starts) or can't be trusted (a
-    // signal caught mid-dispatch, with the underlying call's children
-    // killed out from under it — see the watchdog below), so this always
-    // reconciles against an empty step set rather than guessing at partial
-    // progress.
+    // (#2678) The abort writer used to reconcile against an EXPLICITLY
+    // EMPTY step set unconditionally — `tasks`/`steps` at this point in the
+    // function are still the pre-phase-loop, statically-declared graph
+    // (nothing has run yet), and this closure captures its own copies at
+    // CONSTRUCTION time, so they could never reflect whatever the phase
+    // loop below goes on to actually do. That made every Drop-path abort
+    // (a real signal, a panic, an early return this function's authors
+    // didn't give its own `guard.close()`) render a mission with zero
+    // completed steps, regardless of how much real work had already
+    // finished and been durably persisted to disk (every step this
+    // launcher runs is saved at MINT and at every status TRANSITION — see
+    // the mint-time persist loop above and the scheduler's own `persist`
+    // callback). `reconcile_and_finalize_on_abort` (below) fixes this by
+    // LOADING the real tasks/steps back from disk instead of assuming
+    // nothing happened — see its own doc.
+    // (#2678) This writer always builds an `Error`-status/generic-"aborted"
+    // record — the SAME verdict every earlier revision reported for a
+    // Drop-path exit. `reconcile_and_finalize_on_abort` -> `finalize_
+    // reconciled_mission` applies the ONE wall-clock override
+    // (`apply_wall_clock_bound_outcome`, shared with the happy path below)
+    // uniformly, so this closure does not need its own branch on
+    // `wall_clock_exceeded()` — a real signal/panic/unexpected-early-return
+    // keeps this `Error` status unchanged; only a bound that actually fired
+    // upgrades it to `Degraded` with an honest reason naming the bound.
     let abort_mission_id = mission_id.clone();
     let abort_config = config_owned.clone();
     let abort_phase_ids = real_phase_ids.clone();
     let abort_config_id = config_id.to_string();
     let mut guard = crate::launch_guard::LaunchFinalizeGuard::new(move || {
-        let mut no_steps = BTreeMap::new();
-        reconcile_and_finalize_on_error(
+        reconcile_and_finalize_on_abort(
             &abort_mission_id,
             &abort_config,
             &abort_phase_ids,
-            &[],
-            &mut no_steps,
-            &anyhow!(
+            crew::envelope::MissionOutcomeStatus::Error,
+            format!(
                 "mission launch {abort_config_id}: mission aborted — the launcher exited before \
                  a terminal outcome was recorded (a signal, a panic, or an early return this \
                  guard did not expect)"
@@ -1794,6 +1824,17 @@ pub fn launch(
     // coder-phase branch returns above with the mission still `Active` at an
     // operator sign-off gate, where a duration would name nothing.
     envelope.wall_ms = Some(run_started.elapsed().as_millis() as u64);
+    // (#2678) A wall-clock-bound interrupt kills the in-flight dispatch the
+    // SAME way a real SIGTERM does (see `launch_guard::
+    // spawn_wall_clock_watchdog`'s doc) — which means the MOST COMMON case
+    // (one or a handful of steps in flight) reaches this ordinary happy
+    // path with a per-step "interrupted by an operator signal" error,
+    // never the Drop-path abort writer at all. `build_envelope` alone has
+    // no way to know the interruption was self-inflicted and honest rather
+    // than a real failure, so the override runs HERE too — not only in
+    // `finalize_reconciled_mission` — to cover the run shape that
+    // actually reaches this branch.
+    apply_wall_clock_bound_outcome(&mut envelope);
     let status = envelope.status;
     // (#2301) A run's own numbers ride the `mission close` payload — the
     // home the retired crawl launcher used, kept for every generic graph
@@ -4228,6 +4269,33 @@ fn build_envelope(
     envelope
 }
 
+/// (#2678) Applied at every terminal-writing point in `launch` that can be
+/// reached by an interrupted run: if THIS run's own wall-clock bound
+/// actually fired (`launch_guard::wall_clock_exceeded`), the real outcome
+/// is a genuine, honest partial result the operator opted into (or left
+/// at its unbounded default) — never a failure. Overrides `status` to
+/// `Degraded` and `reason` to name the bound, replacing whatever verdict
+/// the interrupted dispatch's own per-step error text would otherwise
+/// produce (typically `Error`, since a killed dispatch reports
+/// "interrupted by an operator signal" — the wall-clock watchdog
+/// deliberately triggers via the SAME `darkmux_types::interrupt` flag a
+/// real SIGTERM does, see `launch_guard::spawn_wall_clock_watchdog`'s own
+/// doc, so it is indistinguishable at that layer). darkmux describes,
+/// never adjudicates: this never asserts WHY the run was slow, only that
+/// the bound was reached. A no-op when the bound never fired (the common
+/// case, and every in-time run).
+fn apply_wall_clock_bound_outcome(envelope: &mut crew::envelope::MissionEnvelope) {
+    if !crate::launch_guard::wall_clock_exceeded() {
+        return;
+    }
+    let bound_seconds = darkmux_types::config_access::mission_wall_clock_timeout_seconds();
+    envelope.status = crew::envelope::MissionOutcomeStatus::Degraded;
+    envelope.reason = Some(format!(
+        "mission wall-clock bound of {bound_seconds}s reached before the run finished — \
+         rendering the findings that had already materialized rather than discarding them"
+    ));
+}
+
 /// (#1406, F4) Error-path reconcile. A scheduler-level `Err` mid-run (a step
 /// kind lookup failure, a `run_bounded` failure) propagates through
 /// `run_step_graph`'s `?` BEFORE the normal finalize runs, leaving steps
@@ -4264,7 +4332,100 @@ fn reconcile_and_finalize_on_error(
     steps: &mut BTreeMap<String, crew::types::Step>,
     err: &anyhow::Error,
 ) {
-    use crew::envelope::{MissionEnvelope, MissionOutcomeStatus};
+    finalize_reconciled_mission(
+        mission_id,
+        config,
+        real_phase_ids,
+        tasks,
+        steps,
+        crew::envelope::MissionOutcomeStatus::Error,
+        format!("mission launch errored mid-run: {err:#}"),
+    );
+}
+
+/// (#2678) The `LaunchFinalizeGuard` Drop-path counterpart to
+/// [`reconcile_and_finalize_on_error`] — used ONLY from that guard's abort
+/// writer, which (unlike every OTHER call site of
+/// `reconcile_and_finalize_on_error`) has no live `tasks`/`steps` of its
+/// own to hand in: those were captured, as EMPTY collections, once, at
+/// guard-CONSTRUCTION time, before the phase loop that actually runs the
+/// mission even begins. By the time `Drop` fires, whatever progress the
+/// run made lives only on disk — every step this launcher runs is
+/// persisted at MINT and at every status TRANSITION (see the mint-time
+/// persist loop in `launch`, and the scheduler's own `persist` callback) —
+/// not in any variable the closure closed over. This function loads that
+/// real state back from disk, across every phase the run actually minted,
+/// rather than assuming (as every earlier revision of this guard did)
+/// that nothing happened. That is the entire fix: an aborted run's
+/// terminal record now describes what the run actually did, not an empty
+/// mission that never ran anything.
+///
+/// `status`/`reason` are the caller's to choose. `launch`'s ONE abort
+/// writer always passes `Error` with a generic "aborted" reason — the SAME
+/// verdict every earlier revision of this guard reported (unchanged by
+/// this fix; only the DATA changed, not the verdict) — and relies on
+/// [`finalize_reconciled_mission`]'s call to `apply_wall_clock_bound_
+/// outcome` to upgrade that to `Degraded` with an honest bound-naming
+/// reason when the run's own wall-clock bound is what actually caused the
+/// interruption. A future caller with its own known reason may still pass
+/// something else here directly.
+///
+/// A load failure for one phase is best-effort and non-fatal, matching
+/// [`finalize_reconciled_mission`]'s own discipline throughout: it warns
+/// and contributes nothing for that phase rather than aborting the
+/// abort-render itself, since a `Drop` is already the last-resort path
+/// and has nowhere further to propagate an error to.
+fn reconcile_and_finalize_on_abort(
+    mission_id: &str,
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    status: crew::envelope::MissionOutcomeStatus,
+    reason: String,
+) {
+    let mut tasks: Vec<crew::types::Task> = Vec::new();
+    let mut steps: BTreeMap<String, crew::types::Step> = BTreeMap::new();
+    for real_phase_id in real_phase_ids.values() {
+        match crew::lifecycle::load_tasks_for_phase(mission_id, real_phase_id) {
+            Ok(loaded) => tasks.extend(loaded),
+            Err(e) => {
+                eprintln!("{}", style::dim(&format!("mission launch: abort-render task load warning: {e:#}")))
+            }
+        }
+        match crew::lifecycle::load_steps_for_phase(mission_id, real_phase_id) {
+            Ok(loaded) => {
+                for step in loaded {
+                    steps.insert(step.id.clone(), step);
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", style::dim(&format!("mission launch: abort-render step load warning: {e:#}")))
+            }
+        }
+    }
+    finalize_reconciled_mission(mission_id, config, real_phase_ids, &tasks, &mut steps, status, reason);
+}
+
+/// Shared envelope-building tail for [`reconcile_and_finalize_on_error`]
+/// and [`reconcile_and_finalize_on_abort`]: flip every still-`Running` step
+/// to `Error` (persisting it), then finalize the mission with a `status`-
+/// tagged envelope whose PER-PHASE outcomes come from each phase's own
+/// steps ([`derive_phase_outcomes`]), so a phase that fully completed
+/// before the interruption still reads `Complete`; everything the
+/// interruption cut off or never reached abandons.
+///
+/// Best-effort throughout, matching [`crew::envelope::finalize_mission`]'s
+/// own discipline: a persistence hiccup here degrades only the
+/// mission-board VIEW, never masks the caller's own outcome.
+fn finalize_reconciled_mission(
+    mission_id: &str,
+    config: &MissionConfig,
+    real_phase_ids: &BTreeMap<String, String>,
+    tasks: &[crew::types::Task],
+    steps: &mut BTreeMap<String, crew::types::Step>,
+    status: crew::envelope::MissionOutcomeStatus,
+    reason: String,
+) {
+    use crew::envelope::MissionEnvelope;
 
     // step id → owning phase id, so a flipped step persists under the right
     // phase directory.
@@ -4292,9 +4453,15 @@ fn reconcile_and_finalize_on_error(
         }
     }
 
-    let mut envelope = MissionEnvelope::new(mission_id, MissionOutcomeStatus::Error, &[]);
+    let mut envelope = MissionEnvelope::new(mission_id, status, &[]);
     envelope.phases = derive_phase_outcomes(config, real_phase_ids, tasks, steps);
-    envelope.reason = Some(format!("mission launch errored mid-run: {err:#}"));
+    envelope.reason = Some(reason);
+    // (#2678) Shared with the happy path (`build_envelope`'s own call site
+    // in `launch`) — a run interrupted by its own wall-clock bound gets
+    // the SAME honest override regardless of which of this function's
+    // THREE callers (the Drop-path abort writer, the scheduler-error
+    // path, the coder-phase pre-gate-failure path) happened to catch it.
+    apply_wall_clock_bound_outcome(&mut envelope);
     if reconciled > 0 {
         envelope.warnings =
             vec![format!("{reconciled} running step(s) reconciled to error on the failure path")];
@@ -8041,6 +8208,89 @@ mod tests {
             "the error-path envelope must carry the never-ran warning: {:?}",
             persisted.warnings
         );
+    }
+
+    /// (#2678) `reconcile_and_finalize_on_abort` — the `LaunchFinalizeGuard`
+    /// Drop-path counterpart to `reconcile_and_finalize_on_error` — must
+    /// render whatever the run actually did, loaded back from disk, rather
+    /// than the empty step set every earlier revision of the abort writer
+    /// passed unconditionally.
+    ///
+    /// **Mutation self-check for this test**: replacing the `for
+    /// real_phase_id in real_phase_ids.values() { ... }` load loop inside
+    /// `reconcile_and_finalize_on_abort` with the pre-fix `Vec::new()` /
+    /// `BTreeMap::new()` (i.e. reverting to the old empty-set behavior)
+    /// turns every assertion below RED: `completed_steps`/`errored_steps`/
+    /// `abandoned_steps` all come back empty, and the phase outcomes all
+    /// read `Abandoned` regardless of what actually ran. Verified by hand
+    /// during development; the assertions here are the automated proof.
+    #[test]
+    #[serial_test::serial]
+    fn reconcile_and_finalize_on_abort_renders_disk_state_not_an_empty_set() {
+        let _guard = LaunchTestGuard::new();
+        let config: MissionConfig = serde_json::from_str(GEN3_CONFIG).unwrap();
+        let mid = "gen3abort";
+        let real = derive_phase_ids(mid, &config);
+        let (rp1, rp2, rp3) = (real["p1"].clone(), real["p2"].clone(), real["p3"].clone());
+
+        // Same shape as the sibling `reconcile_and_finalize_on_error` tests
+        // above (p1 done, p2 mid-dispatch when the abort fired, p3 never
+        // reached) — but here the tasks/steps are PERSISTED to disk, never
+        // passed in-memory, because that is the one thing the Drop-path
+        // abort writer genuinely cannot do (see the function's own doc).
+        seed_mission_with_phases(
+            mid,
+            &[(&rp1, PhaseStatus::Running), (&rp2, PhaseStatus::Running), (&rp3, PhaseStatus::Planned)],
+        );
+        let tasks =
+            vec![task_with_step(&rp1, "p1-step"), task_with_step(&rp2, "p2-step"), task_with_step(&rp3, "p3-step")];
+        for task in &tasks {
+            crew::lifecycle::save_task(mid, task).unwrap();
+        }
+        crew::lifecycle::save_step(mid, &rp1, &scripted_step("p1-step", NodeStatus::Complete)).unwrap();
+        crew::lifecycle::save_step(mid, &rp2, &scripted_step("p2-step", NodeStatus::Running)).unwrap();
+        crew::lifecycle::save_step(mid, &rp3, &scripted_step("p3-step", NodeStatus::Planned)).unwrap();
+
+        use crew::envelope::MissionOutcomeStatus;
+        reconcile_and_finalize_on_abort(
+            mid,
+            &config,
+            &real,
+            MissionOutcomeStatus::Degraded,
+            "mission wall-clock bound of 1s reached before the run finished".to_string(),
+        );
+
+        // The mid-dispatch Running step flips to Error on disk, same as the
+        // in-memory reconcile path — no step is stranded Running.
+        assert_eq!(
+            crew::lifecycle::load_step(mid, &rp2, "p2-step").unwrap().status,
+            NodeStatus::Error,
+            "the abort-render must flip the mid-dispatch step to Error, loaded from disk"
+        );
+
+        assert_eq!(mission_status_on_disk(mid), MissionStatus::Finalized);
+        assert_eq!(phase_status_on_disk(mid, &rp1), PhaseStatus::Complete, "p1 finished before the abort — must read Complete, not Abandoned");
+        assert_eq!(phase_status_on_disk(mid, &rp2), PhaseStatus::Abandoned);
+        assert_eq!(phase_status_on_disk(mid, &rp3), PhaseStatus::Abandoned);
+
+        let persisted = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
+        assert_eq!(persisted.status, MissionOutcomeStatus::Degraded, "a bound-triggered abort reports Degraded, not Error");
+        assert_eq!(
+            persisted.reason.as_deref(),
+            Some("mission wall-clock bound of 1s reached before the run finished"),
+            "the reason must name the bound, never assert why the run was slow"
+        );
+        let payload = persisted.payload;
+        let ids = |k: &str| -> Vec<String> {
+            payload[k].as_array().unwrap().iter().filter_map(|v| v.as_str()).map(String::from).collect()
+        };
+        assert_eq!(
+            ids("completed_steps"),
+            vec!["p1-step".to_string()],
+            "p1's real completed step must render, not an empty set: {payload}"
+        );
+        assert_eq!(ids("errored_steps"), vec!["p2-step".to_string()], "{payload}");
+        assert_eq!(ids("abandoned_steps"), vec!["p3-step".to_string()], "{payload}");
     }
 
     /// (F2, from #2374's review) The warning names only the halves that
