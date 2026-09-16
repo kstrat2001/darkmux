@@ -257,17 +257,47 @@ export function rosterOnlyEntries(
    * every pre-existing call site keeps behaving exactly as before. */
   specs: MachineSpecs | null = null,
 ): RosterMachineEntry[] {
+  const knownUids = new Set(machineUids(data, liveMachines));
   const knownNames = new Set<string>();
-  for (const uid of machineUids(data, liveMachines)) {
+  for (const uid of knownUids) {
     for (const name of machineNames(data, liveMachines, uid)) knownNames.add(name);
   }
   if (specs?.machine_id) knownNames.add(specs.machine_id);
 
   const normalizedKnown = new Set([...knownNames].map(normalizeMachineAlias));
   return roster.filter((entry) => {
+    // (#2768) A roster entry that DECLARES a hardware identity — resolved at
+    // `machine add` time, or hand-set — and that identity IS one of the
+    // uids currently known (beating, or with flow history) is, by
+    // construction, that exact machine, no matter what name either side
+    // happens to carry. This is what closes the gap the name-based checks
+    // below cannot: three generations of rename (`laptop` →
+    // `MacBook-Pro.local` → `MacBook-Pro`) share no substring for
+    // `normalizeMachineAlias` to fold on, but the uid never changed. See
+    // `MachineEntry::machine_uid`'s own doc for why an ABSENT uid must
+    // never take this branch — that stays exactly the name-matching logic
+    // below, unchanged.
+    if (entry.machine_uid && knownUids.has(entry.machine_uid)) return false;
     if (knownNames.has(entry.id)) return false;
     return !normalizedKnown.has(normalizeMachineAlias(entry.id));
   });
+}
+
+/** (#2768) The operator-declared LABEL for a currently-known uid, when the
+ * roster has a resolved identity for it — either `machine add`'s
+ * self-registration path (`darkmux_hardware::machine_uid()`) or a
+ * hand-edited roster entry (`FleetRoster`'s own doc: hand-edits are a
+ * supported way to set this file). This is what turns the SAME uid match
+ * `rosterOnlyEntries` uses to suppress a second card into the positive half
+ * of #2768's fix: rather than drawing a duplicate "offline" card for a
+ * renamed machine, the machine's real, live card is relabeled with the name
+ * the operator actually declared for it — which may be neither `nameOf`'s
+ * most-recently-seen flow alias nor the live beat's `display_name`.
+ *
+ * Returns `undefined` when no roster entry names this uid — callers keep
+ * whatever name they already derived; this never invents one. */
+export function rosterLabelFor(uid: string, roster: RosterMachineEntry[]): string | undefined {
+  return roster.find((entry) => entry.machine_uid === uid)?.id;
 }
 
 /** (#1855) WHY a card has no hardware line. `""` from `specOf` is not one

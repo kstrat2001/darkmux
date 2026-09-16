@@ -980,6 +980,58 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(document.querySelector(".mach")!.className).not.toContain("absent");
   });
 
+  // (#2768) THE THREE-GENERATIONS-OF-RENAME DUPLICATE: the exact shape
+  // #1855 follow-up F2's mDNS-suffix fix above does NOT reach. `laptop` and
+  // `MacBook-Pro` share no substring at all — no case fold, no `.local`
+  // strip, no whitespace trim closes that gap — so a roster entry with a
+  // matching `machine_uid` but a wholly different `id` used to render as a
+  // SECOND, phantom "offline" card beside the machine's real, live one
+  // (measured live: one machine wearing `laptop` → `MacBook-Pro.local` →
+  // `MacBook-Pro` over time rendered FOUR cards for two machines). A
+  // same-name fixture (the test just above) would pass against this bug —
+  // only the uid join can catch it.
+  it("a roster entry whose machine_uid matches a live beat under a wholly different name does not duplicate its card, and relabels it", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      roster: [{ id: "laptop", address: "127.0.0.1:8765", added_unix_ms: 1000, machine_uid: "F9ACF59C-UID" }],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    await waitForFleetQueriesSettled(queryClient);
+    // One card, not two.
+    expect(document.querySelectorAll(".mach").length).toBe(1);
+    const card = document.querySelector(".mach")!;
+    expect(card.className).not.toContain("absent");
+    // Relabeled to the roster's declared name, not the beat's display_name.
+    // Scoped to the CARD's own name element: the activity timeline lane
+    // below still legitimately labels its lane from `nameOf` (flow-derived,
+    // untouched by this override — it is a separate question from the
+    // card's label), so "MacBook-Pro" is still on the page elsewhere.
+    expect(card.querySelector(".name")!.textContent).toContain("laptop");
+    expect(card.querySelector(".name")!.textContent).not.toContain("MacBook-Pro");
+  });
+
+  // The inverted case: a roster `machine_uid` that matches NOTHING
+  // currently known is a genuinely separate, silent machine and must still
+  // render its own "rostered, never seen" card — the uid join narrows,
+  // it never widens into "any roster entry with a uid is accounted for."
+  it("a roster entry with a machine_uid matching no known machine still renders its own offline card", async () => {
+    mockFleetFetch({
+      machines: [{ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
+      roster: [{ id: "mini-1", address: "100.64.1.9:8765", added_unix_ms: 1000, machine_uid: "NEVER-SEEN-UID" }],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThanOrEqual(2));
+    await waitForFleetQueriesSettled(queryClient);
+    const cards = document.querySelectorAll(".mach");
+    expect(cards.length).toBe(2);
+    const names = [...cards].map((c) => c.querySelector(".name")!.textContent);
+    expect(names.some((n) => n?.includes("MacBook-Pro"))).toBe(true);
+    expect(names.some((n) => n?.includes("mini-1"))).toBe(true);
+  });
+
   // (#1855 follow-up, CONSIDER 4) A present-but-corrupt roster file used to
   // be indistinguishable from a genuinely empty one: `useFleetRoster`
   // dropped `error` entirely, so every previously-visible rostered card

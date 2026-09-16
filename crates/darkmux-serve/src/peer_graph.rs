@@ -463,6 +463,7 @@ mod tests {
                 address: address.to_string(),
                 description: None,
                 added_unix_ms: 0,
+                machine_uid: None,
             },
         );
         roster
@@ -905,7 +906,7 @@ mod tests {
             std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
         }
         darkmux_fleet::mutate_roster(|roster| {
-            darkmux_fleet::add_machine(roster, PEER, &addr, None)?;
+            darkmux_fleet::add_machine(roster, PEER, &addr, None, None)?;
             Ok(())
         })
         .unwrap();

@@ -1173,6 +1173,18 @@ pub(crate) enum MachineCmd {
     /// `fleet add`). Idempotent — calling again with the same `<id>` updates
     /// fields but preserves the original `added_unix_ms` so the fleet-age
     /// signal stays honest.
+    ///
+    /// (#2768) When `--address` is a loopback literal (`127.0.0.1`, `::1` —
+    /// the self-registration recipe both the always-on-hub guide and the
+    /// add-machine skill give for registering the machine you're standing
+    /// at), this also resolves THIS host's stable hardware identity
+    /// (`IOPlatformUUID`) and stores it on the entry. That is what lets the
+    /// fleet viewer join this roster entry to its live flow-derived card
+    /// even after `<id>` and the machine's actual `machine_id` have drifted
+    /// apart (a rename, a hostname change). A non-loopback `--address` (the
+    /// ordinary shape for registering a peer) cannot be resolved from here —
+    /// `machine add` never makes a network call — so that entry's identity
+    /// stays unknown until it is resolved on the peer's own host.
     Add {
         /// Logical machine id (what flow records carry as `machine_id`).
         /// Example: `studio`, `laptop`, `mini-1`.
