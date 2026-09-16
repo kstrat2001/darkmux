@@ -290,6 +290,113 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
   }
 }
 
+/** (#2759) The utility/sub-execution role family CLAUDE.md's "Role families"
+ *  section names — compactor / scribe / estimator / mission-compiler — plus
+ *  the generic `utility` tag `telemetry.lms` records already use
+ *  (`isUtilitySeat` above, for the SAME family at the load-track level).
+ *  Never rolled into a run's MODEL total: contract 8 requires a sub-
+ *  execution keep its own role/model attribution, and blending a 4B
+ *  compactor's tokens into a specialist's total is exactly the violation
+ *  that rule exists to stop. */
+function isUtilityRoleHandle(handle: string | null | undefined): boolean {
+  if (!handle) return false;
+  const bare = String(handle).replace(/^darkmux\//, "").toLowerCase();
+  return bare === "compactor" || bare === "scribe" || bare === "estimator" || bare === "mission-compiler" || bare === "utility";
+}
+
+interface MissionModelRollup {
+  hasEvidence: boolean;
+  turns: number | null;
+  tokIn: number | null;
+  tokOut: number | null;
+  ctxPeak: number;
+  ctxNow: number;
+  nctx: number;
+  loadLines: string[];
+}
+
+/** (#2759) A run's OWN top-level session — the run-grain trio of
+ *  `dispatch start`/`dispatch complete`/`mission.grow`, the shape a crawl
+ *  mission's own top-level bookend mints — carries no MODEL telemetry at
+ *  all: every turn, token and context record lives on the mission's INNER
+ *  role executions, each minted under its own `session_id` (contract 8: a
+ *  step contains zero or more role executions, and the run's own session is
+ *  not one of them). Reading only `sid`'s own records for the MODEL pane is
+ *  only ever correct for the degenerate `RunKind::Dispatch` shape — a
+ *  crew-of-one graph where the run IS the one execution — and silently
+ *  empty for any mission with real work inside it.
+ *
+ *  This walks every OTHER `session_id` present in `data` that shares this
+ *  run's `mission_id`, and sums the MODEL-scoped numbers off each one that
+ *  did real model work — skipping a utility role's sub-execution so its
+ *  tokens never fold into a specialist's total.
+ *
+ *  KNOWN NARROWING, named rather than hidden: this walks by `session_id`,
+ *  not by role EXECUTION. `session_id::task` is task-scoped, so a
+ *  `dispatch.map` fan-out mints ONE session_id shared by every sibling
+ *  seat — this reads them as a single execution and sums their records
+ *  together, the same simplification `runRegions`'s own single-session path
+ *  already makes for a session carrying more than one `dispatch.start`
+ *  (only the LATEST is treated as "the" attempt). Separating siblings would
+ *  need the `index`/`remote` keys #2690 put on those records; not attempted
+ *  here — this fix targets the reported defect (a run session with zero
+ *  telemetry finding real numbers on its inner sessions), not per-seat
+ *  breakdown. */
+function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSid: string): MissionModelRollup {
+  const candidateSids = new Set<string>();
+  for (const r of data) {
+    if (r.mission_id === missionId && r.session_id && r.session_id !== excludeSid) candidateSids.add(r.session_id);
+  }
+  let turns: number | null = null;
+  let tokIn: number | null = null;
+  let tokOut: number | null = null;
+  let ctxPeak = 0;
+  let ctxNow = 0;
+  let nctx = 0;
+  const loadLines: string[] = [];
+  let hasEvidence = false;
+  for (const csid of candidateSids) {
+    const own = data.filter((r) => r.session_id === csid);
+    const cStart = own.find((r) => r.action === "dispatch.start") ?? null;
+    if (isUtilityRoleHandle(cStart?.handle)) continue; // sub-execution — never blended in
+    const tel = own.filter((r) => r.category === "telemetry");
+    const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
+    const toks = tel.filter((r) => r.source === "tokens");
+    const cx = tel
+      .filter((r) => r.source === "context")
+      .slice()
+      .sort((a, b) => T(a.ts) - T(b.ts));
+    const loads = tel.filter(
+      (r) => r.source === "lms" && (r.fields as Record<string, unknown> | undefined)?.event === "load",
+    );
+    const cTurns = rt ? Number((rt.fields as Record<string, unknown>).turns) : null;
+    const cTokIn = toks.length
+      ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.prompt_tokens) || 0), 0)
+      : null;
+    const cTokOut = toks.length
+      ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.completion_tokens) || 0), 0)
+      : null;
+    const cCx0Max = cx.length ? Number((cx[0].fields as Record<string, unknown>)?.max) : NaN;
+    const cNctx = cx.length && Number.isFinite(cCx0Max) && cCx0Max > 0 ? cCx0Max : 0;
+    const cCtxPeak = cx.length ? Math.max(...cx.map((r) => Number((r.fields as Record<string, unknown>)?.used) || 0)) : 0;
+    const cCtxNow = cx.length ? Number((cx[cx.length - 1].fields as Record<string, unknown>)?.used) || 0 : 0;
+    const csHasEvidence = loads.length > 0 || cTurns != null || cTokIn != null || cTokOut != null || cx.length > 0;
+    if (!csHasEvidence) continue;
+    hasEvidence = true;
+    if (cTurns != null) turns = (turns ?? 0) + cTurns;
+    if (cTokIn != null) tokIn = (tokIn ?? 0) + cTokIn;
+    if (cTokOut != null) tokOut = (tokOut ?? 0) + cTokOut;
+    ctxPeak = Math.max(ctxPeak, cCtxPeak);
+    ctxNow = Math.max(ctxNow, cCtxNow);
+    nctx = Math.max(nctx, cNctx);
+    for (const l of loads) {
+      const f = l.fields as Record<string, unknown>;
+      loadLines.push(`${f.model} · ${f.gb ?? "?"}GB`);
+    }
+  }
+  return { hasEvidence, turns, tokIn, tokOut, ctxPeak, ctxNow, nctx, loadLines };
+}
+
 /** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
  * (see this module's own top doc). `data` should already be scoped to ONE
  * session (the `/flow-session/<id>` response, through `flowToRenderModel`
@@ -576,6 +683,30 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const briefLines: BriefEntry[] =
     briefRows.length || promptLines.length ? [...briefRows, ...promptLines] : [];
 
+  // (#2759) EVIDENCE of model work on THIS session alone — the same
+  // predicate `hasModelWork` below uses, minus its `d != null` clause (a
+  // session with a `dispatch.start` and nothing else is "started, no
+  // telemetry yet" for a live dispatch, but it is ALSO exactly the run-grain
+  // session's shape: `d` exists, every other field is empty). Gating the
+  // mission-wide rollup on `d != null` would never fire for the one case it
+  // exists to fix, so this checks for actual numbers instead.
+  const ownHasTelemetryEvidence =
+    loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+  const missionIdForRollup = d?.mission_id ?? firstSessRec?.mission_id ?? null;
+  const rollup =
+    !ownHasTelemetryEvidence && missionIdForRollup ? rollUpMissionModelWork(data, missionIdForRollup, sid) : null;
+  // Only the four MODEL-pane numbers roll up (contract 8's own scope for
+  // this fix — see the run-detail issue's "Direction"). WALL CLOCK and
+  // COMPACTIONS stay scoped to this session's own attempt window below,
+  // deliberately: they are HARNESS metrics about running THIS bookend pair,
+  // not about the model's work inside it.
+  const effTurnsValue = ownHasTelemetryEvidence ? turnsValue : (rollup?.turns ?? turnsValue);
+  const effTokIn = ownHasTelemetryEvidence ? tokIn : (rollup?.tokIn ?? tokIn);
+  const effTokOut = ownHasTelemetryEvidence ? tokOut : (rollup?.tokOut ?? tokOut);
+  const effCtxPeak = ownHasTelemetryEvidence || !rollup?.hasEvidence ? ctxPeak : rollup.ctxPeak;
+  const effCtxNow = ownHasTelemetryEvidence || !rollup?.hasEvidence ? ctxNow : rollup.ctxNow;
+  const effNctx = ownHasTelemetryEvidence || !rollup?.hasEvidence ? nctx : rollup.nctx;
+
   // ── metrics ────────────────────────────────────────────────────────
   // (operator, 2026-09-05) This used to be ONE string that did the whole
   // tile's talking — `CTX PEAK 19K / 262.144K WINDOW` — printed as the
@@ -593,9 +724,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // which both fixes the format and gets the casing that formatter uses
   // (`262k`, not `262.144K`) — matching TOKENS IN/OUT rather than the
   // uppercase `K` this tile used to invent on its own.
-  const ctxHeadline = done ? ctxPeak : ctxNow;
-  const ctxLabel = !nctx ? "CONTEXT" : done ? "CTX PEAK" : "CTX NOW";
-  const ctxSub = !nctx ? undefined : done ? `of ${fmtC(nctx)}` : `peak ${fmtC(ctxPeak)} · of ${fmtC(nctx)}`;
+  const ctxHeadline = done ? effCtxPeak : effCtxNow;
+  const ctxLabel = !effNctx ? "CONTEXT" : done ? "CTX PEAK" : "CTX NOW";
+  const ctxSub = !effNctx ? undefined : done ? `of ${fmtC(effNctx)}` : `peak ${fmtC(effCtxPeak)} · of ${fmtC(effNctx)}`;
 
   // (#1973) Did this unit do MODEL work at all?
   //
@@ -612,6 +743,14 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // no model metrics until its first turn landed, and then grow a pane.
   const hasModelWork =
     d != null || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+  // (#2759) The MODEL pane's own gate. Own-session evidence keeps the
+  // existing behavior byte-for-byte (including the `d != null` "started, no
+  // telemetry yet" case); otherwise a rolled-up execution elsewhere in the
+  // mission turns the pane on. Kept SEPARATE from `hasModelWork` above,
+  // which still gates COMPACTIONS/HOST — those are this session's own
+  // harness measurements and must not flip on just because a sibling
+  // session did model work.
+  const effHasModelWork = hasModelWork || !!rollup?.hasEvidence;
 
   // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
   // `const procs = ...` followed by `void procs` to silence the unused
@@ -675,10 +814,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     into.push(metrics.length);
     metrics.push({ value, label, hint, hintTitle, sub });
   };
-  push(modelIdx, turnsValue != null ? String(turnsValue) : "—", "TURNS");
-  push(modelIdx, tokIn != null ? fmtC(tokIn) : "—", "TOKENS IN");
-  push(modelIdx, tokOut != null ? fmtC(tokOut) : "—", "TOKENS OUT");
-  push(modelIdx, nctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub);
+  push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
+  push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
+  push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
+  push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub);
   // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
   // the model's work, and the gate — while this tile is the dispatch's own
   // `wall_ms`, the runtime's measure of the execution alone. On a real
@@ -741,7 +880,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // but it is counted here because what the operator is reading is "what
   // happened to this model's context", which is exactly what a compaction did.
 
-  const metricScope = { model: hasModelWork ? modelIdx : [], system: systemIdx };
+  const metricScope = { model: effHasModelWork ? modelIdx : [], system: systemIdx };
 
   // ── model track ────────────────────────────────────────────────────
   // (#1973) Was `model (lms)`, which named the SUBSYSTEM rather than the
@@ -763,6 +902,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // guessing by size or load order would not be.
   const primaryModel = d?.model ?? null;
   const modelTrackLabel = ep ? "remote model" : "loaded models";
+  // (#2759) When THIS session loaded nothing itself, fall back to whatever
+  // the mission-wide rollup found on its inner executions — the same data
+  // that just turned TURNS/TOKENS/CONTEXT on above. Unlabeled (no primary/
+  // also-loaded tag): those tags read `d?.model` against `f.model`, both of
+  // which are THIS session's own fields and mean nothing for a load that
+  // happened on a different session entirely.
   const modelTrackLines = ep
     ? [`${model || "unknown"} · served off-fleet — no local model (see route above)`]
     : loads.length
@@ -772,7 +917,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
           const tag = primaryModel == null ? "" : isPrimary ? " · primary" : " · also loaded";
           return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
         })
-      : ["no telemetry yet"];
+      : rollup && rollup.loadLines.length
+        ? rollup.loadLines
+        : ["no telemetry yet"];
 
   // ── signals ────────────────────────────────────────────────────────
   //
@@ -1018,7 +1165,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     metricScope,
     modelTrackLabel,
     modelTrackLines,
-    hasModelWork,
+    // (#2759) Gates the "loaded models" track's own visibility
+    // (`SessionReplay.tsx`'s `view.hasModelWork &&` render guard) — a rolled-
+    // up mission execution must open that track the same as an own-session
+    // one would, or `modelTrackLines`'s rollup fallback above is computed
+    // and never shown.
+    hasModelWork: effHasModelWork,
     live: !done,
     lastBeatMs,
     signalsLabel,
