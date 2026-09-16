@@ -1082,7 +1082,7 @@ mod tests {
     use darkmux_gestalt::{mock::MockHost, Budget, FixedEstimator, ResidentFact};
     use std::collections::BTreeMap;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
@@ -1182,6 +1182,55 @@ mod tests {
             marker.fetch_add(1, Ordering::SeqCst);
             Ok((index, vec![]))
         })
+    }
+
+    /// (#2772 follow-up — CI review, 2026-09-17) A high-water-mark
+    /// concurrency tracker: measures the PROPERTY (how many jobs were
+    /// genuinely in flight at once) directly, instead of inferring it from
+    /// wall-clock elapsed time. The original #2772 tests asserted "N jobs
+    /// must take >= Xms" / "must finish in < Yms" as a proxy for
+    /// serialization/overlap — that proxy flaked under both the `coverage`
+    /// job (`cargo llvm-cov` instrumentation slows every call, so a fast-
+    /// finish assertion can miss real overlap) and the `mutation` job (the
+    /// suite runs repeatedly under load, stretching every timing window —
+    /// the same failure shape #2762 already named: "a tolerance that needs
+    /// widening twice is hiding a mechanism"). Elapsed time is evidence
+    /// ABOUT concurrency; this tracker IS concurrency, read directly off
+    /// the thing that matters — how many `enter()` calls were
+    /// simultaneously un-`Drop`ped.
+    ///
+    /// `enter()` increments `current` and folds the new value into `max`
+    /// via `fetch_max` — so `max` only ever grows, and always reflects the
+    /// highest number of guards that were alive AT ONCE, regardless of how
+    /// slow or fast the machine running the test is. The returned
+    /// [`ConcurrencyGuard`] decrements `current` on `Drop`, RAII-style, so
+    /// a panicking job body still releases its slot — the count can never
+    /// be skewed by an early return or an unwind.
+    #[derive(Default)]
+    struct Concurrency {
+        current: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    impl Concurrency {
+        fn enter(self: &Arc<Self>) -> ConcurrencyGuard {
+            let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(now, Ordering::SeqCst);
+            ConcurrencyGuard { tracker: self.clone() }
+        }
+        fn max_observed(&self) -> usize {
+            self.max.load(Ordering::SeqCst)
+        }
+    }
+
+    struct ConcurrencyGuard {
+        tracker: Arc<Concurrency>,
+    }
+
+    impl Drop for ConcurrencyGuard {
+        fn drop(&mut self) {
+            self.tracker.current.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// (#1442 ship-2b, reproduced live on the first seats x k validation
@@ -2930,10 +2979,10 @@ mod tests {
     /// nothing (a single job cannot exhibit contention) — N=4 sharing ONE
     /// identifier is the smallest fan-out that can.
     ///
-    /// Timed like this file's existing cap tests
-    /// (`the_dispatch_free_cap_actually_bounds`): four 150ms jobs against a
-    /// resident declaring `parallel: 1` must take ~600ms (serialized), never
-    /// ~150ms (which would mean the cap did nothing).
+    /// Asserts the high-water mark directly (see [`Concurrency`]'s doc):
+    /// four jobs against a resident declaring `parallel: 1` must never have
+    /// more than 1 alive at once, machine speed and instrumentation load
+    /// notwithstanding.
     #[serial_test::serial]
     #[test]
     fn local_dispatch_respects_declared_parallel_of_one() {
@@ -2959,40 +3008,46 @@ mod tests {
             Box::new(host)
         }
         let marker = Arc::new(AtomicU32::new(0));
+        let tracker = Arc::new(Concurrency::default());
         let jobs = (0..4)
             .map(|i| QueuedJob {
                 index: i,
                 seat: SeatClaim::LocalModel(placement("m", 8_000)),
                 job: {
                     let marker = marker.clone();
+                    let tracker = tracker.clone();
                     Box::new(move || {
-                        std::thread::sleep(Duration::from_millis(150));
+                        let _guard = tracker.enter();
+                        // Short — just enough to give a real overlap window
+                        // for the tracker to catch, if one exists. Never
+                        // asserted on: see `Concurrency`'s doc for why.
+                        std::thread::sleep(Duration::from_millis(30));
                         marker.fetch_add(1, Ordering::SeqCst);
                         Ok((i, vec![]))
                     })
                 },
             })
             .collect();
-        let t0 = std::time::Instant::now();
         let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_parallel_one)
             .expect("planning never fails under Auto");
-        let elapsed = t0.elapsed();
         assert_eq!(results.len(), 4);
         assert_eq!(marker.load(Ordering::SeqCst), 4, "every job still completes — starved, not lost");
-        assert!(
-            elapsed >= Duration::from_millis(500),
-            "PARALLEL: 1 must serialize all four 150ms jobs against their shared resident \
-             (~600ms) — an unbounded local track (today's #2772 bug) would finish in ~150ms; \
-             got {elapsed:?}"
+        assert_eq!(
+            tracker.max_observed(),
+            1,
+            "PARALLEL: 1 must never let more than 1 of these four jobs be in flight at once — \
+             an unbounded local track (today's #2772 bug) would let all 4 overlap"
         );
     }
 
     /// (#2772) The declared cap is the resident's OWN number, not a
     /// hardcoded 1 — a change that capped every local seat at 1 regardless
     /// of what the instance declares would pass the test above but silently
-    /// under-utilize an operator's higher-parallelism instance. A resident
-    /// declaring `parallel: 4` must let four 150ms jobs overlap and finish
-    /// in ~150ms, not serialize to ~600ms.
+    /// under-utilize an operator's higher-parallelism instance. Asserts BOTH
+    /// halves directly off the high-water mark: `<= 4` (the declared ceiling
+    /// is honored, never exceeded) AND `> 1` (it did not collapse to serial
+    /// — the half a pure upper-bound assertion alone would miss, since a
+    /// hardcoded-1 cap also satisfies "<= 4").
     #[serial_test::serial]
     #[test]
     fn local_dispatch_honors_a_higher_declared_parallel() {
@@ -3015,39 +3070,54 @@ mod tests {
             Box::new(host)
         }
         let marker = Arc::new(AtomicU32::new(0));
+        let tracker = Arc::new(Concurrency::default());
+        // (#2772 follow-up) A short sleep gives a genuine overlap window —
+        // `run_capped_batches` chunks all 4 jobs into ONE batch (cap=4) and
+        // spawns every thread in that batch back-to-back before any of them
+        // can finish, so `tracker.enter()` for all 4 lands within a tiny
+        // window and the sleep below keeps them alive long enough for the
+        // high-water mark to actually register the overlap — no barrier
+        // needed, and (importantly) no risk of the deadlock a barrier would
+        // introduce if this ever ran under a wrongly-serializing cap.
         let jobs = (0..4)
             .map(|i| QueuedJob {
                 index: i,
                 seat: SeatClaim::LocalModel(placement("m", 8_000)),
                 job: {
                     let marker = marker.clone();
+                    let tracker = tracker.clone();
                     Box::new(move || {
-                        std::thread::sleep(Duration::from_millis(150));
+                        let _guard = tracker.enter();
+                        std::thread::sleep(Duration::from_millis(30));
                         marker.fetch_add(1, Ordering::SeqCst);
                         Ok((i, vec![]))
                     })
                 },
             })
             .collect();
-        let t0 = std::time::Instant::now();
         let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_parallel_four)
             .expect("planning never fails under Auto");
-        let elapsed = t0.elapsed();
         assert_eq!(results.len(), 4);
         assert_eq!(marker.load(Ordering::SeqCst), 4);
+        let observed = tracker.max_observed();
+        assert!(observed <= 4, "parallel: 4 must never admit more than 4 at once — observed {observed}");
         assert!(
-            elapsed < Duration::from_millis(450),
-            "parallel: 4 must let all four 150ms jobs overlap (~150ms) — a cap hardcoded to 1 \
-             regardless of the declared value would serialize to ~600ms; got {elapsed:?}"
+            observed > 1,
+            "parallel: 4 must let more than 1 job be in flight at once — a cap hardcoded to 1 \
+             regardless of the declared value would also pass \"<= 4\" while never exceeding 1; \
+             observed {observed}"
         );
     }
 
     /// (#2772) Two DIFFERENT resident identifiers in one wave must NOT
     /// contend with each other — only same-identifier jobs share a cap.
-    /// Each declares `parallel: 1`; one job apiece, each sleeping 150ms.
-    /// Grouping by identifier wrong (e.g. one global cap across the whole
-    /// wave) would serialize these to ~300ms; genuinely independent
-    /// resident instances must overlap and finish in ~150ms.
+    /// Each declares `parallel: 1`; one job apiece. Asserts the property
+    /// directly with THREE high-water marks: a GLOBAL tracker shared by
+    /// both jobs must exceed 1 (proving genuine overlap ACROSS identifiers
+    /// — a wrong single-global-cap implementation would hold this at 1),
+    /// while each identifier's OWN tracker must stay at its own cap of 1
+    /// (proving grouping-by-identifier is still real, not merely "some
+    /// concurrency exists somewhere").
     #[serial_test::serial]
     #[test]
     fn local_dispatch_across_different_identifiers_does_not_serialize() {
@@ -3084,14 +3154,27 @@ mod tests {
             Box::new(host)
         }
         let marker = Arc::new(AtomicU32::new(0));
+        // Global tracker: entered by BOTH jobs, regardless of identifier —
+        // this is what proves cross-identifier overlap. Per-identifier
+        // trackers: entered only by that identifier's own job(s) — with one
+        // job apiece here they trivially stay at 1, but naming them keeps
+        // this test symmetric with what a k>1-per-identifier version would
+        // need to assert, and documents which mark proves which half.
+        let global = Arc::new(Concurrency::default());
+        let tracker_a = Arc::new(Concurrency::default());
+        let tracker_b = Arc::new(Concurrency::default());
         let jobs = vec![
             QueuedJob {
                 index: 0,
                 seat: SeatClaim::LocalModel(placement("a", 8_000)),
                 job: {
                     let marker = marker.clone();
+                    let global = global.clone();
+                    let tracker_a = tracker_a.clone();
                     Box::new(move || {
-                        std::thread::sleep(Duration::from_millis(150));
+                        let _g = global.enter();
+                        let _a = tracker_a.enter();
+                        std::thread::sleep(Duration::from_millis(30));
                         marker.fetch_add(1, Ordering::SeqCst);
                         Ok((0usize, vec![]))
                     })
@@ -3102,24 +3185,34 @@ mod tests {
                 seat: SeatClaim::LocalModel(placement("b", 8_000)),
                 job: {
                     let marker = marker.clone();
+                    let global = global.clone();
+                    let tracker_b = tracker_b.clone();
                     Box::new(move || {
-                        std::thread::sleep(Duration::from_millis(150));
+                        let _g = global.enter();
+                        let _b = tracker_b.enter();
+                        std::thread::sleep(Duration::from_millis(30));
                         marker.fetch_add(1, Ordering::SeqCst);
                         Ok((1usize, vec![]))
                     })
                 },
             },
         ];
-        let t0 = std::time::Instant::now();
         let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_two_residents)
             .expect("planning never fails under Auto");
-        let elapsed = t0.elapsed();
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 2);
         assert!(
-            elapsed < Duration::from_millis(300),
-            "two DIFFERENT resident instances (each parallel: 1) must run interleaved, not \
-             serialize behind each other — got {elapsed:?}"
+            global.max_observed() > 1,
+            "two DIFFERENT resident instances (each parallel: 1) must genuinely overlap — a \
+             wrong single-global-cap implementation would hold this at 1; observed {}",
+            global.max_observed()
+        );
+        assert!(
+            tracker_a.max_observed() <= 1 && tracker_b.max_observed() <= 1,
+            "each identifier's OWN cap (parallel: 1) must still hold even while the two \
+             identifiers overlap with each other — a={}, b={}",
+            tracker_a.max_observed(),
+            tracker_b.max_observed()
         );
     }
 
