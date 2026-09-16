@@ -616,6 +616,18 @@ pub fn step_command_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.step_command_timeout_seconds);
     pick_parsed("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
 }
+/// (#2678) Wall-clock bound, in seconds, on ONE `darkmux mission launch`
+/// run — see `RuntimeBehaviorConfig::mission_wall_clock_timeout_seconds`'s
+/// own doc for what this bounds and why `0` (the default) means unbounded.
+/// Consumed by `mission_launch.rs::launch`, which spawns a background
+/// watchdog (`crate` here is `darkmux-types`; the watchdog itself lives in
+/// the `darkmux` binary crate's `launch_guard` module) ONLY when this reads
+/// non-zero — a `0` reading adds no per-run background thread at all, so
+/// the default configuration costs nothing.
+pub fn mission_wall_clock_timeout_seconds() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.mission_wall_clock_timeout_seconds);
+    pick_parsed("DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS", cfg, Some(0)).unwrap()
+}
 /// (#2394) How many DISPATCH-FREE steps `darkmux_crew::
 /// concurrent_dispatch::run_bounded` runs at once — every step whose
 /// `StepKind::seat` claims `SeatClaim::NoModel` (`procedural.shell`,
@@ -2276,6 +2288,30 @@ mod tests {
         assert_eq!(step_command_timeout_seconds(), 2, "env wins live");
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(step_command_timeout_seconds(), 600);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── mission_wall_clock_timeout_seconds (#2678): env > config > `0`
+    //    (UNBOUNDED) default, mirroring step_command_timeout_seconds'
+    //    resolution exactly except for the default value itself — this
+    //    knob must default to unbounded, never a surprise new limit on an
+    //    existing mission ──
+    #[serial_test::serial]
+    #[test]
+    fn mission_wall_clock_timeout_env_overrides_then_unbounded_default() {
+        let k = "DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(mission_wall_clock_timeout_seconds(), 0, "no env + no config = unbounded");
+        unsafe { std::env::set_var(k, "3600") };
+        assert_eq!(mission_wall_clock_timeout_seconds(), 3600, "env wins live");
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(mission_wall_clock_timeout_seconds(), 0, "an unparseable env value falls through to unbounded");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

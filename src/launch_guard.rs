@@ -291,6 +291,124 @@ impl<A: FnMut()> Drop for LaunchFinalizeGuard<A> {
     }
 }
 
+/// (#2678) Set once a run-level wall-clock bound (`darkmux_types::
+/// config_access::mission_wall_clock_timeout_seconds`) has actually fired
+/// in THIS process — distinct from `darkmux_types::interrupt::is_set()`
+/// (which [`spawn_wall_clock_watchdog`]'s thread ALSO sets, via
+/// `mark_interrupted`, once its deadline passes). `is_set()` alone cannot
+/// tell "the run's own bound expired" apart from "an operator actually
+/// sent a signal" — both look identical to every existing `is_set()`
+/// consumer, which is the point (a bound-triggered stop reuses the exact
+/// same graceful-abort machinery a real SIGTERM already drives, rather
+/// than duplicating it). This flag is the one extra bit
+/// `mission_launch.rs`'s abort writer reads so it can report the honest,
+/// specific reason — darkmux describes, never adjudicates — instead of
+/// collapsing both causes into a generic "aborted".
+///
+/// Never resets in production, matching `interrupt::is_set()`'s own
+/// never-cleared contract (darkmux's CLI is one-shot-per-invocation).
+static WALL_CLOCK_EXCEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`spawn_wall_clock_watchdog`]'s deadline has fired. See
+/// [`WALL_CLOCK_EXCEEDED`]'s own doc.
+pub(crate) fn wall_clock_exceeded() -> bool {
+    WALL_CLOCK_EXCEEDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Test-only: reset [`WALL_CLOCK_EXCEEDED`] between tests in the same
+/// process — mirrors `darkmux_types::interrupt::reset_for_test`'s own
+/// reasoning (a process-wide flag would otherwise contaminate whichever
+/// test runs next in the same binary).
+#[cfg(test)]
+pub(crate) fn reset_wall_clock_exceeded_for_test() {
+    WALL_CLOCK_EXCEEDED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test-only: flip [`WALL_CLOCK_EXCEEDED`] without spawning a real
+/// watchdog thread or waiting out a real deadline — the production twin
+/// of `darkmux_types::interrupt::simulate_sigterm_for_test`, for a test
+/// that wants to exercise "the bound already fired" without a multi-
+/// second sleep.
+#[cfg(test)]
+pub(crate) fn mark_wall_clock_exceeded_for_test() {
+    WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// RAII stop-flag for [`spawn_wall_clock_watchdog`]'s background thread.
+/// Same shape as [`WatchdogStopGuard`] but kept as its own type — the two
+/// guard genuinely different threads with different exit conditions (a
+/// fixed deadline here vs. the reap-loop's own `interrupt::is_set()`
+/// poll), and collapsing them would make one `Drop` silently stop a
+/// thread its own doc isn't describing.
+pub(crate) struct WallClockStopGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WallClockStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// (#2678) Run-level wall-clock bound for `darkmux mission launch` — see
+/// `darkmux_types::config_access::mission_wall_clock_timeout_seconds`'s own
+/// doc for what this bounds and why `0` means unbounded. Call ONCE, right
+/// after [`arm`], from `mission_launch.rs::launch`; hold the returned
+/// guard for the scope of that call so a normal (or already-aborted)
+/// completion stops the thread instead of leaving it sleeping out its
+/// deadline in a process that's already exiting.
+///
+/// **Deliberately does NOT introduce a new "stop" signal of its own.** At
+/// expiry it calls `darkmux_types::interrupt::mark_interrupted()` — the
+/// SAME production API a long-lived host (`darkmux acp`/`darkmux serve`)
+/// calls when ITS OWN shutdown detection fires (see that function's own
+/// doc) — so a bound-triggered stop is, to every existing `is_set()`
+/// consumer (the docker trajectory tailer, the hosted-curl post-wait
+/// reclassification, this SAME launcher's own reap-on-signal backstop),
+/// indistinguishable from a real SIGTERM. It inherits the launcher's
+/// entire graceful-abort path for free rather than duplicating it.
+/// [`wall_clock_exceeded`] is the one extra bit for a caller that needs to
+/// know WHY.
+///
+/// Returns `None` (spawns nothing) when `bound_seconds` is `0` — the
+/// default, unbounded reading every other darkmux zero-knob has; the
+/// default configuration therefore adds no per-run background thread at
+/// all. `started` is the caller's own run-start `Instant`
+/// (`mission_launch.rs`'s `run_started` — the SAME clock
+/// `MissionEnvelope.wall_ms` is stamped from at finalize) rather than a
+/// fresh `Instant::now()` taken here, so the configured bound and the
+/// recorded wall-clock duration are measured from the identical instant.
+///
+/// Skipped entirely under `cfg(test)` — same discipline as
+/// [`spawn_reap_watchdog`]: no unit test needs a real background thread or
+/// a real sleep; a live end-to-end proof spawns the compiled binary as a
+/// subprocess, where `cfg!(test)` is false regardless of how it was built.
+pub(crate) fn spawn_wall_clock_watchdog(started: std::time::Instant, bound_seconds: u64) -> Option<WallClockStopGuard> {
+    if bound_seconds == 0 {
+        return None;
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = WallClockStopGuard(std::sync::Arc::clone(&stop));
+    if !cfg!(test) {
+        let deadline = started + std::time::Duration::from_secs(bound_seconds);
+        std::thread::spawn(move || {
+            loop {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            WALL_CLOCK_EXCEEDED.store(true, std::sync::atomic::Ordering::SeqCst);
+            darkmux_types::interrupt::mark_interrupted();
+        });
+    }
+    Some(guard)
+}
+
 // (#2310 P4d) Test-only since the bespoke review launcher — its last
 // production caller — retired.
 #[cfg(test)]
@@ -336,6 +454,48 @@ mod tests {
         }
         assert_eq!(*close_calls.borrow(), 1, "close's writer must run exactly once");
         assert_eq!(*abort_calls.borrow(), 0, "a disarmed guard must never invoke the abort writer on Drop");
+    }
+
+    /// (#2678) `0` is the documented UNBOUNDED reading every other darkmux
+    /// zero-knob has — this must spawn nothing at all, so an operator who
+    /// never opts in pays no per-run background thread.
+    #[test]
+    fn spawn_wall_clock_watchdog_with_zero_bound_spawns_nothing() {
+        assert!(
+            spawn_wall_clock_watchdog(std::time::Instant::now(), 0).is_none(),
+            "a `0` bound must be a documented no-op, never a real (or instant) deadline"
+        );
+    }
+
+    /// A non-zero bound engages the watchdog (returns a live guard) —
+    /// proven structurally rather than by waiting out a real deadline,
+    /// since the real thread body is skipped under `cfg(test)` (see the
+    /// function's own doc): this test would still fail if the `0`-check
+    /// above were accidentally written to swallow every value.
+    #[test]
+    fn spawn_wall_clock_watchdog_with_nonzero_bound_engages() {
+        assert!(
+            spawn_wall_clock_watchdog(std::time::Instant::now(), 3600).is_some(),
+            "a non-zero bound must return a live guard, not the zero-bound no-op"
+        );
+    }
+
+    /// (#2678) `wall_clock_exceeded` is the one extra bit that lets a
+    /// caller tell "the run's own bound expired" apart from "an operator
+    /// sent a real signal" — both set `darkmux_types::interrupt::is_set()`
+    /// identically, by design (see `spawn_wall_clock_watchdog`'s own doc),
+    /// so this flag is the ONLY place that distinction is observable.
+    /// `#[serial_test::serial]`: `WALL_CLOCK_EXCEEDED` is a process-wide
+    /// static, same reasoning as `darkmux_types::interrupt`'s own tests.
+    #[test]
+    #[serial_test::serial]
+    fn wall_clock_exceeded_reflects_the_test_only_flag() {
+        reset_wall_clock_exceeded_for_test();
+        assert!(!wall_clock_exceeded(), "must start clear");
+        mark_wall_clock_exceeded_for_test();
+        assert!(wall_clock_exceeded(), "must flip once the bound is marked exceeded");
+        reset_wall_clock_exceeded_for_test();
+        assert!(!wall_clock_exceeded(), "must clear for the next test in this process");
     }
 
     /// (#2671 follow-up) Must be `#[serial_test::serial]` — this is the ONE

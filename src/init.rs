@@ -755,6 +755,13 @@ mod tests {
             cfg.runtime.as_ref().and_then(|r| r.model_load_timeout_seconds),
             Some(600)
         );
+        // (#2678) The run-level wall-clock bound ships visible too, at its
+        // unbounded (`0`) default — an existing mission's behavior must not
+        // change until an operator opts in.
+        assert_eq!(
+            cfg.runtime.as_ref().and_then(|r| r.mission_wall_clock_timeout_seconds),
+            Some(0)
+        );
         // (#2107, #1833) The daemon host-sampler cadence ships visible too.
         assert_eq!(
             cfg.runtime.as_ref().and_then(|r| r.host_sampler_interval_ms),
