@@ -13914,6 +13914,7 @@ fn planner_reuses_a_slash_bearing_resident() {
         model_key: row.model.clone(),
         ctx: row.context,
         est_bytes: Some(16_081_678_492),
+        parallel: 0,
     };
     let placement = darkmux_gestalt::Placement {
         model_key: "qwen/qwen3.8-27b".to_string(),

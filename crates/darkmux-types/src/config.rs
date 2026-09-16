@@ -200,7 +200,18 @@ use std::path::Path;
 //           behavior is unchanged until an operator opts in.
 //           `Option<u64>`, lenient-on-read: an older binary ignores the
 //           field and keeps its old (never-bounded) behavior.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.24";
+//   1.25 (#2772): additive `runtime.local_dispatch_concurrency` — an
+//           explicit override for the per-resident-instance LOCAL model
+//           dispatch concurrency cap (`darkmux_crew::concurrent_dispatch::
+//           run_local_waves`). Absent by default and NOT written by
+//           `init`, unlike 1.23's `power{}` block: the built-in default
+//           here is derived live per instance from that instance's own
+//           declared `PARALLEL` (`lms ps --json`), so a written literal
+//           would freeze a value meant to track whatever model is
+//           resident — same reasoning `max_turns` etc. already document.
+//           `Option<u32>`, lenient-on-read: an older binary ignores the
+//           field and keeps deriving the cap from the live declaration.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.25";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -422,6 +433,21 @@ pub struct RuntimeBehaviorConfig {
     /// mod, and each such step is individually bounded by
     /// `step_command_timeout_seconds` above, not by anything global.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub dispatch_free_concurrency: Option<u32>,
+    /// (#2772) Explicit override for how many LOCAL-MODEL dispatches run
+    /// at once against ONE resident instance — its own ceiling, distinct
+    /// from `dispatch_free_concurrency` above (that one bounds steps that
+    /// consume no model at all) and from `remote.concurrent_cap` (a hosted
+    /// endpoint's rate limit). Absent = the runtime derives it PER
+    /// INSTANCE, per WAVE, from that resident's own declared `PARALLEL` as
+    /// `lms ps --json` reports it, falling back to 1 (never unbounded)
+    /// when that can't be read — see
+    /// `config_access::local_dispatch_concurrency`'s own doc for the full
+    /// measured reasoning. Deliberately absent, not a written literal: a
+    /// fixed number here would freeze a value that is supposed to track
+    /// whichever model happens to be resident, so — same reasoning as
+    /// `max_turns`/`max_tokens`/`max_stall_recoveries` above — `init`
+    /// never writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub local_dispatch_concurrency: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens: Option<u32>,
     /// (#1221) Per-CALL completion-token cap (reasoning + content of one
@@ -1179,6 +1205,11 @@ impl DarkmuxConfig {
     ///   `generation_checkpoint_interval_tokens`/`max_stall_recoveries`), `default_role`,
     ///   `daemon_cors_origins` — absent is a real behavior (uncapped / the
     ///   runtime's built-in per-call default), not a value to default.
+    /// - `local_dispatch_concurrency` (#2772) — absent means "derive it live
+    ///   from the resident instance's own declared `PARALLEL`"; a written
+    ///   literal would freeze that derivation to whatever happened to be
+    ///   resident at `init` time, which is exactly the class of wrong-literal
+    ///   `dirs` avoids above.
     ///
     /// Single source of truth for the written defaults: `init` writes this and
     /// `config.example.json` is asserted equal to its pretty form (a drift
@@ -1214,6 +1245,7 @@ impl DarkmuxConfig {
                 // from a real bound.
                 mission_wall_clock_timeout_seconds: Some(0),
                 dispatch_free_concurrency: Some(8),
+                local_dispatch_concurrency: None,
                 max_turns: None,
                 max_tokens: None,
                 max_tokens_per_call: None,

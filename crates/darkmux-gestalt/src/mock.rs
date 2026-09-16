@@ -46,6 +46,11 @@ impl MockHost {
     }
 
     /// Builder: seed one resident (host-reported order = call order).
+    /// `parallel` defaults to `0` ("unknown" — the same reading a real
+    /// `lms ps` row without the field gets, #2772); a test asserting the
+    /// per-instance dispatch cap sets `residents[i].parallel` directly
+    /// after building (the field is `pub`) rather than growing this
+    /// builder's already-long parameter list for one test's needs.
     pub fn resident(
         mut self,
         identifier: &str,
@@ -58,6 +63,7 @@ impl MockHost {
             model_key: model_key.to_string(),
             ctx,
             est_bytes,
+            parallel: 0,
         });
         self
     }
@@ -116,6 +122,7 @@ impl ModelHost for MockHost {
             model_key: model_key.to_string(),
             ctx: u64::from(min_ctx),
             est_bytes: None,
+            parallel: 0,
         });
         Ok(LoadReport { resolved_ctx: Some(u64::from(min_ctx)), ..Default::default() })
     }
@@ -175,6 +182,7 @@ mod tests {
                 model_key: "m".into(),
                 ctx: 8_000,
                 est_bytes: None,
+                parallel: 0,
             }],
             "a follow-up list_resident sees the new resident — multi-step executor tests see state evolve"
         );

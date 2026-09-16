@@ -6057,6 +6057,7 @@ mod tests {
                 model_key: model_key.to_string(),
                 ctx: u64::from(min_ctx),
                 est_bytes: None,
+                parallel: 0,
             });
             Ok(darkmux_gestalt::LoadReport { resolved_ctx: Some(u64::from(min_ctx)), ..Default::default() })
         }
