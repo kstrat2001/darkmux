@@ -315,6 +315,126 @@ describe("SessionReplay", () => {
     expect(system?.textContent).toContain("WALL CLOCK");
   });
 
+  it("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry", async () => {
+    // The defect: a mission mints a run-grain session (`dispatch start` /
+    // `dispatch complete` / `mission.grow` — bookends only) distinct from its
+    // inner role-execution session, which carries the real turns/tokens/
+    // context. Run detail opens the RUN's own session and finds nothing —
+    // "TURNS —, TOKENS IN —, TOKENS OUT —, CONTEXT —" / "loaded models: no
+    // telemetry yet" — while a SIBLING session under the SAME mission has it
+    // all. MORE THAN ONE session under the run is load-bearing here: a
+    // single-session fixture reproduces the degenerate `RunKind::Dispatch`
+    // shape where the pre-fix code (which only ever reads `sid`'s own
+    // records) is accidentally correct, and would pass against the bug.
+    const missionId = "crawl-1789536644-7a9d8e";
+    const unitSid = "crawl-crawl-1789536644-7a9d8e-swallowed-error-u-0001";
+    const allRecords = [
+      // The run's OWN session — the id `renderReplay` below opens. Bookends
+      // only, exactly the shape #2759 measured on a real run.
+      {
+        ts: "2026-09-16T05:30:44Z",
+        action: "dispatch.start",
+        session_id: missionId,
+        mission_id: missionId,
+        machine_id: "M",
+        handle: "darkmux/crawler",
+        payload: {},
+      },
+      { ts: "2026-09-16T05:31:00Z", action: "mission.grow", session_id: missionId, mission_id: missionId, machine_id: "M", payload: {} },
+      {
+        ts: "2026-09-16T05:31:41Z",
+        action: "dispatch.complete",
+        session_id: missionId,
+        mission_id: missionId,
+        machine_id: "M",
+        payload: { wall_ms: 57_000 },
+      },
+      // A SIBLING session under the SAME mission — the crawl unit's own
+      // dispatch, carrying the real telemetry.
+      {
+        ts: "2026-09-16T05:30:50Z",
+        action: "dispatch.start",
+        session_id: unitSid,
+        mission_id: missionId,
+        machine_id: "M",
+        handle: "darkmux/crawler",
+        model: "qwen3.6-35b-a3b-turboquant-mlx",
+        payload: {},
+      },
+      { ts: "2026-09-16T05:31:10Z", action: "dispatch.turn", session_id: unitSid, mission_id: missionId, machine_id: "M", payload: { turn_seq: 3 } },
+      {
+        ts: "2026-09-16T05:31:20Z",
+        category: "telemetry",
+        source: "tokens",
+        action: "telemetry.tokens",
+        session_id: unitSid,
+        mission_id: missionId,
+        machine_id: "M",
+        payload: { prompt_tokens: 8000, completion_tokens: 3000 },
+      },
+      {
+        ts: "2026-09-16T05:31:25Z",
+        category: "telemetry",
+        source: "context",
+        action: "telemetry.context",
+        session_id: unitSid,
+        mission_id: missionId,
+        machine_id: "M",
+        payload: { used: 8000, max: 262144 },
+      },
+      {
+        ts: "2026-09-16T05:31:30Z",
+        category: "telemetry",
+        source: "lms",
+        action: "telemetry.lms",
+        session_id: unitSid,
+        mission_id: missionId,
+        machine_id: "M",
+        payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
+      },
+      { ts: "2026-09-16T05:31:35Z", action: "dispatch.complete", session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+    ];
+    const fetchMock = vi.fn((url: string) => {
+      if (url.startsWith("/fleet/sessions/live")) {
+        return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: {} }), { status: 200 }));
+      }
+      const body = url.startsWith("/flow-mission/")
+        ? { records: allRecords, count: allRecords.length, truncated: false, generated_at_ms: 0 }
+        : {
+            // `/flow-session/<id>` — the run's OWN records ONLY, matching the
+            // real daemon's per-session scoping.
+            records: allRecords.filter((r) => r.session_id === missionId),
+            count: allRecords.filter((r) => r.session_id === missionId).length,
+            truncated: false,
+            generated_at_ms: 0,
+          };
+      return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderReplay(missionId);
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    // The rollup is a SECOND fetch, resolving after the first render — wait
+    // for the real numbers rather than asserting against the first paint.
+    await waitFor(() => expect(fetchMock.mock.calls.map((c) => c[0])).toContain(`/flow-mission/${encodeURIComponent(missionId)}`));
+
+    const tileValue = (label: string) => {
+      const tile = [...document.querySelectorAll(".met")].find((t) => t.querySelector(".ml")?.textContent === label);
+      return { tile, value: tile?.querySelector(".mv")?.textContent, sub: tile?.querySelector(".msub")?.textContent };
+    };
+    await waitFor(() => expect(tileValue("TURNS").value).not.toBe("—"));
+    expect(tileValue("TURNS").value).toBe("3");
+    expect(tileValue("TOKENS IN").value).toBe("8k");
+    expect(tileValue("TOKENS OUT").value).toBe("3k");
+    // The run's own attempt is `done` (its own `dispatch.complete` is in
+    // view), so this is CTX PEAK, not CTX NOW.
+    expect(tileValue("CTX PEAK").value).toBe("8k");
+    expect(tileValue("CTX PEAK").sub).toBe("of 262k");
+
+    // The "loaded models" track: real data, not the own-session placeholder.
+    expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();
+    expect(document.querySelector(".session-run")?.textContent).toContain("qwen3.6-35b-a3b-turboquant-mlx · 20GB");
+  });
+
   it("(#1973) keeps the two metric panes ADJACENT, so text order still matches the legacy golden", async () => {
     // CI caught what the screen did not. The first version of the pane split
     // rendered HARNESS *below* the model track, which sandwiched
@@ -416,6 +536,77 @@ describe("SessionReplay", () => {
       vi.advanceTimersByTime(5000);
     });
     expect(readWall()).not.toBe(before);
+    vi.useRealTimers();
+  });
+
+  it("(#2757) WALL CLOCK honors a PARKED playhead instead of real time, and stops at the run's own end rather than climbing past it", async () => {
+    // The defect: `ticking`'s condition (this file) predates the shell's
+    // playhead transport (#2071) and was never widened for it — so once a
+    // dispatch read as "plausibly running" from the RECORDS currently in
+    // view, the tile fed real `Date.now()` into `runRegions` regardless of
+    // where the operator had scrubbed to. Measured live: a run whose
+    // terminal record fell just after a parked playhead read "1:21 so far",
+    // then "2:25 so far" — the OPERATOR'S wall-clock time elapsing while
+    // watching, not the run's.
+    //
+    // Two playhead positions, not one — per the operator's own warning: a
+    // fix that merely clamps the number to `wall_ms` (so it never overshoots)
+    // could still ignore every position BEFORE the run's own end, jumping
+    // straight to the final total rather than showing what was true partway
+    // through. Position A pins "reads the SCRUB point, not the wall clock";
+    // position B pins "reads the run's fixed total once the terminal record
+    // is in view, and does not keep counting real seconds past it".
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    // "Now" is two full minutes after the run started — real time that has
+    // NOTHING to do with the scrubbed playhead below. A clock reading real
+    // time here reads "2:00 so far"; the correct, playhead-honoring reading
+    // is "0:20 so far" (the last record at-or-before the parked playhead).
+    vi.setSystemTime(t0 + 120_000);
+    const records = [
+      { ts: new Date(t0).toISOString(), action: "dispatch.start", session_id: "s-parked", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 + 20_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-parked", machine_id: "M", payload: {} },
+      { ts: new Date(t0 + 60_000).toISOString(), action: "dispatch.complete", session_id: "s-parked", machine_id: "M", payload: { wall_ms: 60_000 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    const readWall = () =>
+      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId="s-parked" playhead={t0 + 30_000} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    // ── Position A: playhead BEFORE the run's own terminal record ──
+    const parked = readWall();
+    expect(parked).toContain("so far");
+    expect(parked).toContain("0:20"); // the scrubbed instant's own elapsed
+    expect(parked).not.toContain("2:00"); // NOT real Date.now() - start
+
+    // Real time passes; the playhead does not move. Before the fix, this is
+    // exactly what made the tile keep climbing while parked.
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(readWall()).toBe(parked);
+
+    // ── Position B: playhead AT/PAST the run's own terminal record ──
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId="s-parked" playhead={t0 + 90_000} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(readWall()).toContain("1:00"));
+    const ended = readWall();
+    expect(ended).not.toContain("so far"); // a FIXED total, not still counting
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(readWall()).toBe(ended); // does not keep climbing past wall_ms
+
     vi.useRealTimers();
   });
 

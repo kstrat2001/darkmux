@@ -160,6 +160,55 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   const session: FetchResult<FlowRecordsResponse> | undefined =
     flowSrc === null ? query.data : staticSlice === null ? undefined : { ok: true, data: staticSlice };
 
+  // (#2759) A run's OWN top-level session (the run-grain `dispatch start`/
+  // `dispatch complete`/`mission.grow` trio a mission mints for itself)
+  // carries no model telemetry — every turn, token and context record lives
+  // on the mission's INNER role-execution sessions instead. This session's
+  // OWN fetch can never see those; only a mission-wide fetch can. So: look
+  // at what THIS session's own records already show, and only reach for the
+  // wider set when they are silent — the common case (opening a specialist's
+  // own dispatch directly) already has real telemetry and never pays for the
+  // extra fetch.
+  //
+  // Checked on RAW records (pre-`flowToRenderModel`): `category` is a
+  // first-class wire field on a real telemetry record, not something the
+  // frontend normalization pass invents (`flowToRenderModel` only fills in a
+  // DEFAULT when the field is absent) — so this reads reliably before that
+  // pass runs.
+  const ownRaw = session?.ok ? session.data.records : null;
+  const ownMissionId = useMemo(() => {
+    if (!ownRaw) return null;
+    const start = ownRaw.find((r) => r.session_id === sessionId && r.action === "dispatch.start");
+    return start?.mission_id ?? null;
+  }, [ownRaw, sessionId]);
+  const ownHasTelemetry = useMemo(
+    () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === "telemetry") : false),
+    [ownRaw, sessionId],
+  );
+  const missionQuery = useQuery({
+    queryKey: queryKeys.flowMission(ownMissionId ?? ""),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-mission/${encodeURIComponent(ownMissionId ?? "")}`),
+    enabled: flowSrc === null && ownMissionId != null && !ownHasTelemetry,
+    refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
+  });
+  // `/flow-mission/<id>` is a SUPERSET of `/flow-session/<id>` — every record
+  // under a mission carries that mission's `mission_id`, including the run's
+  // own bookend records — so this REPLACES rather than merges. Merging the
+  // two raw arrays would double-count every record `ownRaw` and the mission
+  // fetch both return (this session's own dispatch.start/complete), which
+  // for a plain sum (TOKENS IN/OUT) is silently wrong, not just redundant.
+  //
+  // Static builds get the same enrichment from the day's own committed file
+  // (below, `staticMissionSlice`) rather than this query, which never runs
+  // there (`enabled: flowSrc === null`).
+  const missionRaw = missionQuery.data?.ok ? missionQuery.data.data.records : null;
+  const staticMissionSlice = useMemo(() => {
+    if (flowSrc === null || day.raw === null || ownHasTelemetry || ownMissionId == null) return null;
+    const recs = day.raw.filter((r) => r.mission_id === ownMissionId);
+    return recs.length ? recs : null;
+  }, [flowSrc, day.raw, ownHasTelemetry, ownMissionId]);
+  const enrichedRaw = missionRaw ?? staticMissionSlice ?? ownRaw;
+
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
   // hooks per render, so calling `useNowMs` after the loading/error/empty
   // guards below meant the first render called fewer hooks than the second —
@@ -178,7 +227,9 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // that instant, so scrubbing a run detail replays the run rather than
   // narrowing only the event log beside a finished stage. `null` (a live
   // daemon route, no transport) renders the whole slice as before.
-  const all = session?.ok ? session.data.records : null;
+  // (#2759) `enrichedRaw` is `ownRaw` (this session's own fetch) unless a
+  // mission-wide fetch found MORE — see that computation's own doc above.
+  const all = enrichedRaw;
   const records = all && playhead !== null ? all.filter((r) => !(T(r.ts) > playhead)) : all;
   const data = records ? flowToRenderModel(records) : [];
   const base = records && records.length ? runRegions(data, sessionId) : null;
@@ -216,7 +267,27 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // the run's last sign of life is a fact, and the seconds since are not.
   const quietMs = base?.lastBeatMs != null ? Date.now() - base.lastBeatMs : Infinity;
   const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
-  const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null;
+  // (#2757) `playhead === null` — added here, everything else on this line
+  // predates it. A non-null playhead means the operator has actively parked
+  // the shell's transport away from the live edge (`App.tsx`'s
+  // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
+  // at the live edge `playhead` is `null`). Without this guard, `ticking`
+  // fed `nowMs` from `useNowMs` — the real `Date.now()` clock — into
+  // `runRegions` regardless of where the playhead sat, so WALL CLOCK climbed
+  // in real time even while every OTHER pane on the page (derived from
+  // `data`, itself cut to `playhead` above) stayed frozen at the scrubbed
+  // instant. Measured live (#2757): a run whose terminal record fell just
+  // after the parked playhead read "1:21 so far", then "2:25 so far" — the
+  // OPERATOR'S OWN wall-clock time elapsed while watching, not the run's.
+  //
+  // `playhead === null` is also what makes this correct at the live tip:
+  // unscrubbed, `playhead` is `null` and ticking behaves exactly as #1972
+  // designed it to (advance live so a stalled dispatch's clock doesn't
+  // freeze). Once the playhead reaches or passes the run's own terminal
+  // record, `data` already contains it, `base`'s own `done`/`runWallMs`
+  // computation (`sessionRun.ts`) takes over unticked, and the tile shows
+  // the run's fixed total instead of climbing past it.
+  const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
   const nowMs = useNowMs(ticking);
 
   if (!session) {
