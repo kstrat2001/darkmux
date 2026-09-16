@@ -153,12 +153,36 @@ use std::sync::OnceLock;
 /// that ignored TERM outlived both the group signal and the sweep, and was
 /// then unreachable forever.
 const WATCHDOG_SCRIPT: &str = r#"
+REGISTRY="$1"
+TAB=$(printf '\t')
 while IFS= read -r line; do
   if [ "$line" = "stand-down" ]; then
     exit 0
   fi
 done
-kill -TERM -$$ 2>/dev/null
+# EOF on stdin: the harness died, for any reason including SIGKILL.
+#
+# (#2751) Reap by REGISTRY, not by process group. This watchdog is in its
+# OWN SESSION, so it cannot share a process group with the fixtures --
+# `setpgid` is refused across a session boundary. `kill` is NOT: signalling
+# a process GROUP from another session is permitted, and each fixture is
+# its own group leader, so `kill -TERM -$pid` still reaches anything the
+# fixture itself spawned. Verified before this was written: a process in a
+# fresh session TERMs another session's group and the target reaches state
+# Z.
+#
+# The `lstart` equality is the same defence the startup sweep uses. It is
+# what makes signalling a recorded pid safe against pid reuse: a recycled
+# pid necessarily started later than the record, so its `lstart` differs.
+[ -n "$REGISTRY" ] && [ -f "$REGISTRY" ] || exit 0
+while IFS="$TAB" read -r role pid started command; do
+  [ "$role" = "child" ] || continue
+  [ -n "$pid" ] || continue
+  now=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$now" ] || continue
+  [ "$now" = "$started" ] || continue
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+done < "$REGISTRY"
 exit 0
 "#;
 
@@ -511,6 +535,16 @@ pub struct FixtureGroup {
     stood_down: bool,
 }
 
+// `setsid(2)`. Declared inline rather than adding a `libc` dependency:
+// the root crate does not depend on `libc`, this is the only call site,
+// and CLAUDE.md prefers a small inline declaration to a crate for a
+// one-off need. The signature is stable POSIX.
+#[cfg(unix)]
+extern "C" {
+    fn setsid() -> i32;
+    fn getsid(pid: i32) -> i32;
+}
+
 impl FixtureGroup {
     /// Sweep anything a dead previous run left behind, then arm the
     /// watchdog for this run. Never fails the harness: a watchdog that
@@ -541,7 +575,7 @@ impl FixtureGroup {
             }
         }
 
-        let (watchdog, pgid) = Self::spawn_watchdog();
+        let (watchdog, pgid) = Self::spawn_watchdog(&registry);
         if watchdog.is_none() {
             eprintln!(
                 "[fixture-reaper] could not spawn the watchdog, so `place` is a no-op and \
@@ -573,18 +607,47 @@ impl FixtureGroup {
     }
 
     #[cfg(unix)]
-    fn spawn_watchdog() -> (Option<Child>, Option<u32>) {
+    fn spawn_watchdog(registry: &Path) -> (Option<Child>, Option<u32>) {
         use std::os::unix::process::CommandExt;
-        let spawned = Command::new("/bin/sh")
-            .arg("-c")
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
             .arg(WATCHDOG_SCRIPT)
+            // `$0` for the shell, then `$1` = the registry this watchdog
+            // reaps from on EOF.
+            .arg("darkmux-fixture-watchdog")
+            .arg(registry)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // Group LEADER: its own pid becomes the group id, and the
-            // group therefore cannot be recycled while it is alive.
-            .process_group(0)
-            .spawn();
+            .stderr(Stdio::null());
+        // SAFETY: `setsid` is async-signal-safe and touches only the
+        // freshly-forked child, which is all `pre_exec` may do. Same shape
+        // as `darkmux-crew`'s `bounded_command`, which calls `setpgid`
+        // here for the same reason.
+        //
+        // (#2751) This is what the whole registry rewrite above buys. The
+        // watchdog already led its own GROUP, so a group-directed kill
+        // never reached it -- but it stayed in the harness's SESSION, so a
+        // session-wide or tree-walking kill (a CI runner timeout, an IDE
+        // stop button) took the die-with-parent guard down together with
+        // the harness. Measured 2026-09-16: 12 `redis-server` fixtures
+        // orphaned at `ppid=1`, reaped only when a later run's startup
+        // sweep happened along.
+        //
+        // `setsid` makes the child a leader of both a new session and a
+        // new process group, so it REPLACES `.process_group(0)` rather
+        // than joining it -- a process std has already made a group leader
+        // gets EPERM from `setsid`, which would silently leave the session
+        // unchanged.
+        unsafe {
+            cmd.pre_exec(|| {
+                // A failure is not fatal: the watchdog still reaps, it is
+                // merely still in the caller's session. Failing the spawn
+                // would lose the guard entirely, which is strictly worse.
+                setsid();
+                Ok(())
+            });
+        }
+        let spawned = cmd.spawn();
         match spawned {
             Ok(child) => {
                 let pgid = child.id();
@@ -595,7 +658,7 @@ impl FixtureGroup {
     }
 
     #[cfg(not(unix))]
-    fn spawn_watchdog() -> (Option<Child>, Option<u32>) {
+    fn spawn_watchdog(_registry: &Path) -> (Option<Child>, Option<u32>) {
         (None, None)
     }
 
@@ -606,9 +669,17 @@ impl FixtureGroup {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            if let Some(pgid) = self.pgid {
-                cmd.process_group(pgid as i32);
-            }
+            // (#2751) The fixture leads its OWN group rather than joining
+            // the watchdog's. The watchdog now lives in a separate SESSION
+            // so that a session-wide or tree-walking kill cannot take it
+            // down with the harness, and `setpgid` cannot cross a session
+            // boundary -- joining its group would fail EPERM. Leading its
+            // own group keeps the property that actually mattered: the
+            // watchdog's `kill -TERM -$pid` still reaches every process the
+            // fixture spawned, because `kill` on a group IS permitted
+            // across sessions.
+            let _ = self.pgid;
+            cmd.process_group(0);
         }
         #[cfg(not(unix))]
         {
@@ -718,6 +789,54 @@ impl FixtureGroup {
 
 #[cfg(test)]
 mod tests {
+    /// (#2751) The watchdog must leave the harness's SESSION, which is the
+    /// entire point of reaping by registry instead of by shared group.
+    ///
+    /// Leading its own GROUP already made it immune to a group-directed
+    /// kill. It was not immune to a session-wide or tree-walking kill — a
+    /// CI runner timeout, an IDE stop button — because it stayed a
+    /// descendant of the test process. Measured 2026-09-16: a harness
+    /// killed that way left 12 `redis-server` fixtures orphaned at
+    /// `ppid=1`, reaped only when a later run's startup sweep came along.
+    ///
+    /// Asserted on the session id rather than by actually killing a
+    /// process tree, because a test that SIGKILLs a tree cannot bound its
+    /// own blast radius inside a shared runner. The sid is the property
+    /// the survival depends on, and it is checkable directly.
+    ///
+    /// `getsid(2)` and not `ps -o sess=`: macOS's `ps` prints a kernel
+    /// pointer there, which reads as a constant `0` for every process.
+    /// Measured while writing this — it made both sides of the comparison
+    /// equal and the assertion vacuous in the one direction that matters.
+    #[cfg(unix)]
+    #[test]
+    fn the_watchdog_leaves_the_harness_session() {
+        let mut group = FixtureGroup::arm();
+        let watchdog_pid = match group.pgid {
+            Some(p) => p,
+            // Spawn failed; there is no watchdog to make a claim about.
+            None => return,
+        };
+
+        // SAFETY: `getsid` only reads kernel state for a pid.
+        let ours = unsafe { getsid(0) };
+        let theirs = unsafe { getsid(watchdog_pid as i32) };
+        group.stand_down();
+
+        assert!(ours > 0, "getsid(0) failed for this process");
+        assert!(
+            theirs > 0,
+            "getsid failed for the watchdog (pid {watchdog_pid}); it must be alive here"
+        );
+        assert_ne!(
+            theirs, ours,
+            "the watchdog is still in this process's session ({ours}), so a session-wide or \
+             tree-walking kill reaches it and takes the die-with-parent guard down together \
+             with the harness — leaving every fixture orphaned until some later run's \
+             startup sweep happens along (#2751)"
+        );
+    }
+
     use super::*;
 
     /// A stand-in fixture: a real child process this test owns, spawned
@@ -1361,29 +1480,45 @@ mod tests {
     /// `FixtureGroup::place` makes this fail.
     #[cfg(unix)]
     #[test]
-    fn place_puts_a_child_in_the_watchdog_group() {
+    fn place_makes_a_fixture_its_own_group_leader() {
         let mut group = FixtureGroup::arm();
-        let pgid = group.pgid.expect("watchdog must have spawned");
+        let watchdog_pgid = group.pgid.expect("watchdog must have spawned");
 
         let mut cmd = Command::new("sleep");
         cmd.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
         group.place(&mut cmd);
         let mut child = cmd.spawn().expect("spawning a placed child");
 
-        let out = Command::new("ps")
-            .args(["-o", "pgid=", "-p", &child.id().to_string()])
-            .output()
-            .expect("ps");
-        let observed: u32 = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("ps should report a numeric pgid");
+        let pgid_of = |pid: u32| -> u32 {
+            let out = Command::new("ps")
+                .args(["-o", "pgid=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .expect("ps should report a numeric pgid")
+        };
 
+        let observed = pgid_of(child.id());
+
+        // (#2751) The fixture leads its OWN group. It deliberately does
+        // NOT join the watchdog's: the watchdog lives in a separate
+        // session now, and `setpgid` is refused across a session boundary,
+        // so joining would fail EPERM at spawn.
         assert_eq!(
-            observed, pgid,
-            "a fixture spawned through FixtureGroup must land in the watchdog's process group \
-             — the watchdog signals the GROUP on parent death, so a child outside it is a \
-             child nothing reaps (#2716)"
+            observed,
+            child.id(),
+            "a fixture spawned through FixtureGroup must lead its own process group — the \
+             watchdog reaps by `kill -TERM -<pid>` per registry entry, which only reaches \
+             what the fixture spawned if the fixture is that group's leader (#2751)"
+        );
+        assert_ne!(
+            observed, watchdog_pgid,
+            "a fixture must NOT be in the watchdog's group: the watchdog is in its own \
+             session, and a cross-session `setpgid` is EPERM — if this ever passes again, \
+             the watchdog has silently rejoined the harness's session and lost its \
+             immunity to a session-wide kill (#2751)"
         );
 
         let _ = child.kill();
