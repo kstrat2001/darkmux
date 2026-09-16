@@ -192,7 +192,15 @@ use std::path::Path;
 //           feature block: the two boolean policies ARE the gates, one
 //           per decision, and a master switch would make "off"
 //           expressible two ways.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.23";
+//   1.24 (#2678): additive `runtime.mission_wall_clock_timeout_seconds` —
+//           the run-level wall-clock bound on `darkmux mission launch`
+//           (see the field's own doc for the mechanism). Written VISIBLY
+//           by `init` at its default of `0` (UNBOUNDED, the same reading
+//           every other darkmux zero-knob has), so an existing mission's
+//           behavior is unchanged until an operator opts in.
+//           `Option<u64>`, lenient-on-read: an older binary ignores the
+//           field and keeps its old (never-bounded) behavior.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.24";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -383,6 +391,27 @@ pub struct RuntimeBehaviorConfig {
     /// it. Sibling of `model_load_timeout_seconds`, which bounds a host
     /// model load the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub step_command_timeout_seconds: Option<u64>,
+    /// (#2678) Wall-clock bound, in seconds, on ONE `darkmux mission
+    /// launch` run as a WHOLE — distinct from `inactivity_timeout_seconds`
+    /// (per-dispatch, resets on activity) and `step_command_timeout_seconds`
+    /// (per shell command): this one bounds the RUN's total elapsed time
+    /// regardless of how much progress any individual dispatch is making.
+    /// Nothing in the scheduler enforced this before #2678 — a grinding
+    /// `mission launch review` was stopped only by the CI job's own
+    /// `timeout-minutes`, which kills the whole process tree with nothing
+    /// rendered. `0` (the default) means UNBOUNDED, the same reading every
+    /// other darkmux zero-knob has (see `step_command_timeout_seconds`
+    /// above) — this must never become a surprise new limit on an existing
+    /// mission. Enforced by a background watchdog `mission_launch.rs::
+    /// launch` spawns right after arming its signal handlers
+    /// (`launch_guard::spawn_wall_clock_watchdog`, a no-op when this reads
+    /// `0`): at expiry it calls the SAME `darkmux_types::interrupt::
+    /// mark_interrupted()` a real SIGTERM would, so a bound-triggered stop
+    /// renders through the identical graceful-abort path a real operator
+    /// signal already uses (`launch_guard::wall_clock_exceeded` is the one
+    /// extra bit that lets the abort writer report the honest, specific
+    /// reason instead of collapsing both into "aborted").
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub mission_wall_clock_timeout_seconds: Option<u64>,
     /// (#2394) How many DISPATCH-FREE steps the scheduler runs
     /// concurrently — `procedural.shell`, `procedural.noop`, `mods.gate`,
     /// `records.gather`, `deliver.github_review`, every step whose
@@ -1180,6 +1209,10 @@ impl DarkmuxConfig {
                 inactivity_timeout_seconds: Some(600),
                 model_load_timeout_seconds: Some(600),
                 step_command_timeout_seconds: Some(600),
+                // (#2678) Visible `0` — UNBOUNDED, the pre-existing
+                // no-run-level-deadline behavior, discoverable and one edit
+                // from a real bound.
+                mission_wall_clock_timeout_seconds: Some(0),
                 dispatch_free_concurrency: Some(8),
                 max_turns: None,
                 max_tokens: None,

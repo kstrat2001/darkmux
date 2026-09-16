@@ -203,25 +203,40 @@ body {
    longer holds. */
 .app-shell__sticky {
   position: sticky;
-  /* (#2264) `top: 0` IS the status-bar band under `viewport-fit=cover` +
+  /* (#2264, corrected by #2758 — read both, the second is the current
+     mechanism) `top: 0` IS the status-bar band under `viewport-fit=cover` +
      `apple-mobile-web-app-status-bar-style: black-translucent` (index.html).
-     The masthead pads for the inset but SCROLLS AWAY — what replaces it at
-     the top of the viewport is this row, and its tabs are tap targets, so a
-     scrolled page put FLEET/CONSOLE/RUNS/MACHINE under the clock and the
-     Dynamic Island. Measured at 390x844 with a simulated 47px inset before
-     the fix: after `scrollTo(0, 400)` this row's top was 0.
-     Only the STUCK position moves: `top` on a sticky element does nothing
-     until the element would otherwise scroll past that threshold, so at rest
-     the row still sits flush under the masthead with no gap (asserted in
-     catalog.spec.js, both with and without an inset), and the inset is 0 on
-     every non-notched viewport, making this a no-op there. */
-  top: env(safe-area-inset-top, 0px);
+     The masthead pads for the inset but SCROLLS AWAY, and #2264 made this
+     row `top: env(safe-area-inset-top, 0px)` so its STUCK box started below
+     the band — correct for keeping the tabs (tap targets) off the clock and
+     the Dynamic Island, but it left the band ITSELF, y=[0, inset), covered
+     by nothing: no box's top edge was ever positioned there, stuck or not.
+     The masthead is normal flow, not fixed — scrolling carries its child
+     content (wordmark, LIVE pill, run title) up through that uncovered band
+     on its way off-screen, and it painted there, torn mid-glyph against the
+     clock (#2758, reported from a live run: a clipped `RUNNING CRAWL (...)`
+     strip visible above a correctly-stuck tab row).
+     #2758's fix: `top: 0`, so this row's STUCK box starts at the true
+     viewport top and its OWN opaque `background: var(--bg)` occludes
+     whatever the masthead scrolled behind it — then `padding-top` absorbs
+     the inset so the tabs still land at the same on-screen y they did under
+     the old `top: env(inset)` (verified in catalog.spec.js: `stickyTop`
+     scrolled is now 0, not the inset, and the tabs' own screen position is
+     unchanged). This DOES make the row `inset` pixels taller everywhere,
+     including at rest, not only while stuck — sticky's box doesn't change
+     shape between the two states, and `--chrome-h` (App.tsx) reads the
+     box's real measured height either way, so `.stage`'s
+     `top: var(--chrome-h)` grows to match automatically. The inset is 0 on
+     every non-notched viewport, making all of this a no-op there — desktop
+     and Android are unaffected. */
+  top: 0;
   z-index: 30;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 14px;
   padding: 8px 16px;
+  padding-top: calc(8px + env(safe-area-inset-top, 0px));
   background: var(--bg);
   border-bottom: 1px solid var(--border);
 }
@@ -1027,6 +1042,13 @@ body {
   .app-shell__sticky {
     gap: 6px 8px;
     padding: 6px 12px;
+    /* (#2758) This breakpoint's own `padding` shorthand resets padding-top
+       to a flat 6px, wiping the base rule's inset-absorbing override above
+       (source order: this block sits later in the file, so at <=768px —
+       exactly where a real notch/inset applies — it wins). Phones are the
+       ENTIRE reason for this override, so it has to be restated here at
+       this breakpoint's own 6px base, not just at the base rule's 8px. */
+    padding-top: calc(6px + env(safe-area-inset-top, 0px));
   }
   .app-shell__sticky .scrub {
     flex-basis: 100%;

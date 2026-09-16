@@ -3975,6 +3975,126 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
     assert!(saw_a_phase, "the mint must have produced at least one phase to check");
 }
 
+/// (#2678) `runtime.mission_wall_clock_timeout_seconds` (here set via its
+/// `DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS` env override) must stop a
+/// grinding `mission launch <generic-graph-config>` on ITS OWN, with NO
+/// external signal ever sent — the exact scenario #2678 exists for: a CI
+/// job's `timeout-minutes` killing the whole process tree with nothing
+/// rendered. Bound to an explicit deadline throughout (this test sends no
+/// real signal and starts no thread of its own that could hang the suite).
+///
+/// Distinguishes itself from
+/// `mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl`
+/// (above) in the one place that matters: a REAL operator signal still
+/// finalizes `error`, but the run's OWN bound must finalize `degraded`
+/// with a reason naming the bound — an honest partial outcome the
+/// operator opted into, not a failure (darkmux describes, never
+/// adjudicates: it never asserts why the run was slow).
+#[test]
+fn mission_launch_wall_clock_bound_self_terminates_and_renders_degraded() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_json = r#"{
+        "id": "wall-clock-generic-test",
+        "name": "Wall Clock Generic Test",
+        "schema_version": "2.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "dispatch.internal",
+                    "config": { "role_id": "dialectic-judge", "message": "hang please" }
+                }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("wall-clock-generic-test.json"), config_json).unwrap();
+
+    let mut child = darkmux_std_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        // (#2678) The bound under test — deliberately short so the test
+        // stays fast, and deliberately shorter than `--timeout` below so
+        // the WALL-CLOCK bound is what fires, not the per-dispatch
+        // inactivity cap.
+        .env("DARKMUX_MISSION_WALL_CLOCK_TIMEOUT_SECONDS", "1")
+        .args(["mission", "launch", "wall-clock-generic-test", "--timeout", "60"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux mission launch wall-clock-generic-test");
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the generic-graph dispatch never reached a dispatch call to the stub server within 20s"
+    );
+
+    // NO signal is ever sent here — the process must stop itself.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mission launch did not self-terminate within 15s of its 1s wall-clock bound (#2678 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a wall-clock-bound-interrupted run must not exit 0");
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — the wall-clock watchdog \
+         must reap it the same way a real signal's watchdog does (#2678 regression)"
+    );
+
+    assert_no_surviving_remote_curl(child.id(), "wall-clock");
+
+    let missions_dir = home.path().join("missions");
+    let mission_id = fs::read_dir(&missions_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one mission must have been minted");
+
+    let envelope_path = missions_dir.join(&mission_id).join("envelope.json");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&envelope_path).unwrap_or_else(|e| {
+            panic!("reading {}: {e}", envelope_path.display())
+        }))
+        .unwrap();
+    assert_eq!(
+        envelope["status"], "degraded",
+        "a wall-clock-bound abort is a real, honest partial outcome, not an error: {envelope}"
+    );
+    let reason = envelope["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("wall-clock bound"),
+        "the reason must name the bound, never assert why the run was slow: {envelope}"
+    );
+
+    let mission_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missions_dir.join(&mission_id).join("mission.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        mission_json["status"], "finalized",
+        "a wall-clock-bound run must reach a terminal mission status, never stay active: {mission_json}"
+    );
+}
+
 /// (#2262) `kill <pid>` (SIGTERM) on a plain `darkmux dispatch <role>`
 /// blocked mid-dispatch (a real `curl` call to an endpoint that never
 /// answers) must: exit within 5s, leave a terminal `dispatch.error`
