@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, rosterOnlyEntries, specUnknownLabel } from "./cards";
+import { machActive, specOf, buildFleetCard, rosterOnlyEntries, rosterLabelFor, specUnknownLabel } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 
@@ -502,6 +502,73 @@ describe("rosterOnlyEntries", () => {
     const roster = [rosterEntry({ id: "mini-1" })];
     const live = new Map([["u1", beat({ machine_uid: "u1", display_name: "studio" })]]);
     expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
+  });
+
+  // (#2768) THE defect this closes: three generations of rename share no
+  // substring at all — `laptop` and `MacBook-Pro` fail every name-based
+  // check above (exact, case-fold, `.local`-strip, whitespace-trim). A
+  // same-name fixture would pass against the bug this is meant to catch;
+  // this one is deliberately shaped so ONLY the uid join can exclude it.
+  it("excludes a roster entry whose machine_uid matches a live beat reporting under a WHOLLY DIFFERENT name", () => {
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
+    const live = new Map([["F9ACF59C-UID", beat({ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual([]);
+  });
+
+  // Same shape, via flow history under the new name rather than a live beat
+  // — the uid join must work off `machineUids`'s flow-derived half too, not
+  // only the presence-beat half.
+  it("excludes a roster entry whose machine_uid matches flow history under a different name", () => {
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
+    const data: FlowRecord[] = [rec({ machine_uid: "F9ACF59C-UID", machine_id: "MacBook-Pro" })];
+    expect(rosterOnlyEntries(data, new Map(), roster)).toEqual([]);
+  });
+
+  // The inverted case, red-proving the join is keyed on the VALUE, not
+  // merely on the field's presence: a roster entry CARRYING a machine_uid
+  // that does not match anything currently known is still a genuinely
+  // silent machine and must still be reported — "rostered, never seen"
+  // stays a real, renderable state (issue #2768's own constraint).
+  it("still reports a roster entry with a machine_uid that matches no known uid", () => {
+    const roster = [rosterEntry({ id: "mini-1", machine_uid: "UNSEEN-UID" })];
+    const live = new Map([["F9ACF59C-UID", beat({ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro" })]]);
+    expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
+  });
+
+  // An entry with NO machine_uid at all (every pre-#2768 roster, and every
+  // remote peer added by network address) behaves exactly as before — the
+  // uid branch never fires, so the pre-existing name-based checks are the
+  // only thing that can exclude it. Constraint 1 from #2768: absence must
+  // never fall back to a uid guess.
+  it("a roster entry with no machine_uid falls through to the pre-existing name-matching behavior unchanged", () => {
+    const roster = [rosterEntry({ id: "laptop" })];
+    const live = new Map([["F9ACF59C-UID", beat({ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro" })]]);
+    // No uid to join on, and the names share nothing — still reported.
+    expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
+  });
+});
+
+describe("rosterLabelFor", () => {
+  // (#2768) The positive half of the fix: a roster entry's declared `id`
+  // becomes the LABEL for the uid it names, rather than the flow-derived
+  // `nameOf` guess — this is what a caller applies to the card built for
+  // that uid so a renamed machine shows the operator's chosen name, not
+  // whatever `machine_id` its most recent record happened to carry.
+  it("returns the roster id declared for a matching uid", () => {
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
+    expect(rosterLabelFor("F9ACF59C-UID", roster)).toBe("laptop");
+  });
+
+  // Inverted case: no roster entry names this uid — never invent a label.
+  it("returns undefined when no roster entry names this uid", () => {
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
+    expect(rosterLabelFor("some-other-uid", roster)).toBeUndefined();
+  });
+
+  // An entry with no machine_uid at all never matches any uid.
+  it("returns undefined for a roster with no resolved uids", () => {
+    const roster = [rosterEntry({ id: "laptop" })];
+    expect(rosterLabelFor("F9ACF59C-UID", roster)).toBeUndefined();
   });
 });
 

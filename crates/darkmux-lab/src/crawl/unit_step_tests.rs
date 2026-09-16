@@ -2274,6 +2274,175 @@ fn two_units_and_a_summary_run_through_the_real_scheduler() {
     assert!(bad.reason.as_deref().is_some_and(|r| r.contains("u-0002")), "{bad:?}");
 }
 
+// ── (#2593) a dispatch failure that coincides with an operator interrupt ──
+//
+// Confirmed by a live `mission launch crawl` interrupted with a real
+// SIGINT (not simulated): the steps read `crawl.plan -> complete`,
+// `crawl.unit -> error` (the SIGINT landed there), `crawl.summary ->
+// complete`. A step kind's `Err` return ALWAYS lands the step at
+// `NodeStatus::Error` (`apply_step_terminal`), never `Abandoned` — so
+// `errored_row` could not tell a signal-killed unit from an ordinary one
+// before this fix, and `stopped_by: "interrupted"` never fired on a real
+// operator interrupt. These two tests reproduce that shape through the
+// REAL scheduler + real `summarize_mission`, not a hand-built `Step`, and
+// pin BOTH directions: an interrupt-coincident failure reads
+// `"interrupted"`, and an ordinary one — same dispatch-Err shape, same
+// scheduler — still reads `"error"`.
+
+/// Shared scaffolding: ONE `crawl.unit` step whose dispatch always fails,
+/// run through `run_step_graph` (the unit task, then the summary task in
+/// its own phase-boundary call, exactly as `two_units_and_a_summary_run_
+/// through_the_real_scheduler` above does), then read back through the
+/// real `crawl.summary` step's own `summarize_mission` output.
+fn run_one_failing_unit_through_the_real_scheduler(
+    plan: &Path,
+    dispatch: UnitDispatchFn,
+) -> (BTreeMap<String, Step>, CrawlSummary) {
+    let kind = CrawlUnitStepKind::with_dispatch(dispatch);
+    let registry = StepKindRegistry::with_builtins();
+    registry.register(Arc::new(kind)).unwrap();
+    registry.register(Arc::new(CrawlSummaryStepKind)).unwrap();
+
+    let tasks: Vec<Task> =
+        vec![graph_task("unit-a", "unit-a-step", &[]), graph_task("summary", "summary-step", &[])];
+    let mut steps: BTreeMap<String, Step> = [
+        graph_step(
+            "unit-a-step",
+            "unit-a",
+            CRAWL_UNIT_KIND,
+            serde_json::json!({"plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"}),
+        ),
+        graph_step("summary-step", "summary", CRAWL_SUMMARY_KIND, serde_json::json!({})),
+    ]
+    .into_iter()
+    .map(|s| (s.id.clone(), s))
+    .collect();
+    let tasks_by_id: BTreeMap<String, Task> = tasks.into_iter().map(|t| (t.id.clone(), t)).collect();
+
+    let shared_host = Arc::new(std::sync::Mutex::new(
+        darkmux_gestalt::mock::MockHost::new().resident("darkmux:m-local", "m-local", 8192, Some(1 << 30)),
+    ));
+    let facts = shared_host.lock().unwrap().facts(Default::default(), Default::default());
+    let host_for_factory = shared_host.clone();
+    let host_factory = move || -> Box<dyn darkmux_gestalt::ModelHost> { Box::new(SharedHost(host_for_factory.clone())) };
+    let est = darkmux_gestalt::FixedEstimator(Default::default());
+
+    let run_phase = |steps: &mut BTreeMap<String, Step>| {
+        darkmux_crew::scheduler::run_step_graph(
+            steps,
+            &tasks_by_id,
+            &registry,
+            &facts,
+            &est,
+            1,
+            &host_factory,
+            &mut |_record| {},
+            &mut |step| {
+                let _ = darkmux_crew::lifecycle::save_step(MISSION, PHASE, step);
+            },
+            None,
+            None,
+            &[],
+        )
+        .expect("the graph run itself completes — a failed STEP is not a failed run");
+    };
+    let summary_step_only = steps.remove("summary-step").expect("seeded above");
+    run_phase(&mut steps);
+    steps.insert("summary-step".into(), summary_step_only);
+    run_phase(&mut steps);
+
+    let summary_step = &steps["summary-step"];
+    assert_eq!(summary_step.status, NodeStatus::Complete, "output: {:?}", summary_step.output);
+    let summary = darkmux_crew::step_output::Output::<CrawlSummary>::read(
+        summary_step.output.as_deref().expect("the summary produced output"),
+        CRAWL_SUMMARY_OUTPUT_KIND,
+    )
+    .expect("the summary's own output is a typed CrawlSummary")
+    .body;
+    (steps, summary)
+}
+
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME + the process-global interrupt flag
+fn an_interrupt_coincident_dispatch_failure_reads_interrupted_through_the_real_scheduler() {
+    darkmux_types::interrupt::reset_for_test();
+
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"1".repeat(40));
+
+    // The same shape a real SIGINT produces at either of `dispatch_internal
+    // .rs`'s two call sites: the dispatch returns `Err`, and
+    // `interrupt::is_set()` is ALREADY true by the time it does — set here
+    // BEFORE the dispatch fails, mirroring a signal arriving mid-dispatch.
+    darkmux_types::interrupt::simulate_sigint_for_test();
+    assert!(darkmux_types::interrupt::is_set(), "the simulated SIGINT must set the flag");
+
+    let (steps, summary) = run_one_failing_unit_through_the_real_scheduler(
+        &plan,
+        Arc::new(|_| Err(anyhow!("darkmux-runtime container dispatch interrupted by an operator signal"))),
+    );
+
+    // Same observed shape as the confirmed live run: the unit step still
+    // ends in `NodeStatus::Error`, never `Abandoned` — this fix does not
+    // touch the scheduler's terminal-status mapping, only how the summary
+    // reads an `Error` step's own persisted text.
+    let unit_a = &steps["unit-a-step"];
+    assert_eq!(unit_a.status, NodeStatus::Error, "a step kind's Err always lands here, signal or not");
+    let text = unit_a.output.as_deref().expect("the scheduler records the error text as the output");
+    assert!(text.contains(INTERRUPTED_MARKER), "the interrupted label must ride in the persisted text: {text}");
+
+    assert_eq!(summary.units_interrupted, 1, "the SIGINT-coincident unit must count as interrupted, not errored");
+    assert_eq!(summary.units_errored, 0, "it must not ALSO be double-counted as an ordinary error");
+    assert_eq!(summary.stopped_by, "interrupted", "#2588's branch now fires on a real operator interrupt");
+    let row = summary.units.iter().find(|u| u.unit == "u-0001").expect("the failed unit has a row");
+    assert_eq!(row.result, "interrupted");
+
+    darkmux_types::interrupt::reset_for_test();
+}
+
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME + the process-global interrupt flag
+fn an_ordinary_dispatch_failure_still_reads_error_through_the_real_scheduler() {
+    // The negative counterpart, one door down: the EXACT same
+    // dispatch-returns-`Err` shape and the SAME real scheduler as the test
+    // above, but no interrupt observed. Getting #2593's fix backwards
+    // (labeling every dispatch `Err` "interrupted") would silently
+    // reclassify — and stop counting as errors — every genuine crawl
+    // failure, which is exactly the regression this test exists to catch.
+    darkmux_types::interrupt::reset_for_test();
+    assert!(!darkmux_types::interrupt::is_set(), "must start clean");
+
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"2".repeat(40));
+
+    let (steps, summary) = run_one_failing_unit_through_the_real_scheduler(
+        &plan,
+        Arc::new(|_| Err(anyhow!("container refused"))),
+    );
+
+    let unit_a = &steps["unit-a-step"];
+    assert_eq!(unit_a.status, NodeStatus::Error);
+    let text = unit_a.output.as_deref().expect("the scheduler records the error text as the output");
+    assert!(
+        !text.contains(INTERRUPTED_MARKER),
+        "no interrupt was ever observed, so the text must not carry the interrupted marker: {text}"
+    );
+
+    assert_eq!(summary.units_interrupted, 0);
+    assert_eq!(summary.units_errored, 1, "an ordinary failure keeps reading error");
+    assert_eq!(summary.stopped_by, "error");
+    let row = summary.units.iter().find(|u| u.unit == "u-0001").expect("the failed unit has a row");
+    assert_eq!(row.result, "error");
+
+    darkmux_types::interrupt::reset_for_test();
+}
+
 // ── (#2302) the outcome NAMES its findings ───────────────────────────────
 
 /// A unit's outcome carries one [`FindingRef`] per accepted finding, keyed

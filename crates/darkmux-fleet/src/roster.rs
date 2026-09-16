@@ -51,6 +51,33 @@ pub struct MachineEntry {
     /// Unix-millis when this entry was added. Set on first add; preserved
     /// on subsequent edits. Used by `fleet status` to show fleet age.
     pub added_unix_ms: u64,
+
+    /// Stable per-machine hardware identity (#2768) —
+    /// `darkmux_hardware::machine_uid()`'s `IOPlatformUUID`, resolved at
+    /// `machine add` time. This is the FLEET ROSTER's own copy of the same
+    /// identity flow records carry as `machine_uid` (schema 1.11,
+    /// `crates/darkmux-flow/src/schema.rs`) — the field that lets the
+    /// viewer join a roster entry to the flow-derived card for the machine
+    /// it actually describes, instead of the two rendering as separate
+    /// cards the moment the operator's declared `id` and the machine's
+    /// current `machine_id` diverge (a rename, a hostname change, three
+    /// generations of both — the exact shape #2768 was filed from).
+    ///
+    /// `None` means *unknown identity*, never *equal to some name* — same
+    /// rule the flow-record field's own doc states, and for the same
+    /// reason: a consumer joining on this field must never fall back to
+    /// comparing `id` strings when it is absent, which would reintroduce
+    /// the unprovable-name guess the uid exists to replace. A `None` here
+    /// is a legitimate, permanent state for many entries, not a gap to
+    /// paper over — see `add_machine`'s own doc for exactly when a `None`
+    /// stays a `None`.
+    ///
+    /// Absent on every roster entry saved before #2768. Lenient-on-read via
+    /// `#[serde(default)]` (the roster's whole hand-edited-JSON contract,
+    /// `FleetRoster`'s own doc) — an old entry loads exactly like a fresh
+    /// one with no resolved identity, never an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_uid: Option<String>,
 }
 
 /// The full roster — operator's declared fleet topology. Lives at
@@ -285,11 +312,33 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 /// Add or replace a machine entry in the roster. Idempotent — calling
 /// twice with the same id updates the existing entry (preserving
 /// `added_unix_ms`) rather than failing.
+///
+/// `uid` (#2768) — the machine's stable hardware identity, when the CALLER
+/// was able to resolve one. There is exactly one case that can:
+/// self-registration, where `cmd_machine_add` recognizes the address as
+/// loopback (`address_host_is_loopback`) and reads
+/// `darkmux_hardware::machine_uid()` on the SAME host this process is
+/// running on. A remote peer's hardware cannot be probed from here —
+/// `machine add` performs no network call — so that caller always passes
+/// `None`.
+///
+/// The merge rule mirrors `added_unix_ms`'s "don't clobber what a plain
+/// re-add didn't recompute": a `Some` always WINS (self-registration
+/// re-resolves fresh on every call — this host's own identity cannot go
+/// stale between calls, so there is nothing to preserve over). A `None`
+/// PRESERVES whatever this entry already carried, rather than erasing it:
+/// a prior successful resolution, or an operator's hand-edit of the roster
+/// JSON (a documented, supported way to set this file — `FleetRoster`'s
+/// own doc). Without this preservation rule, updating a peer's
+/// `--description` after hand-setting its `machine_uid` would silently
+/// wipe the join back out, reintroducing the exact two-card defect #2768
+/// exists to fix.
 pub fn add_machine(
     roster: &mut FleetRoster,
     id: &str,
     address: &str,
     description: Option<&str>,
+    uid: Option<&str>,
 ) -> Result<()> {
     if id.trim().is_empty() {
         return Err(anyhow!("machine id must be non-empty"));
@@ -306,12 +355,15 @@ pub fn add_machine(
             eprintln!("darkmux: system clock is before the Unix epoch — stamping added_unix_ms=0");
             0
         });
-    let existing_added_at = roster.machines.get(id).map(|m| m.added_unix_ms);
+    let existing = roster.machines.get(id);
+    let existing_added_at = existing.map(|m| m.added_unix_ms);
+    let existing_uid = existing.and_then(|m| m.machine_uid.clone());
     let entry = MachineEntry {
         id: id.to_string(),
         address: address.to_string(),
         description: description.map(String::from),
         added_unix_ms: existing_added_at.unwrap_or(now),
+        machine_uid: uid.map(String::from).or(existing_uid),
     };
     roster.machines.insert(id.to_string(), entry);
     Ok(())
@@ -404,6 +456,57 @@ pub fn address_host_is_bare_ip(address: &str) -> bool {
             let host = host.strip_suffix('.').unwrap_or(host);
             host.parse::<std::net::IpAddr>()
                 .map(|ip| !ip.is_loopback())
+                .unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
+/// True when `address`'s host portion is a loopback literal
+/// (`127.0.0.0/8`, `::1`), with or without an explicit `:port` suffix or a
+/// `scheme://` prefix. (#2768) This is the shape `machine add <id>
+/// --address 127.0.0.1:8765` uses for SELF-registration — the always-on-hub
+/// guide's Step 6 and the `darkmux-add-machine` skill's Step 7 both give
+/// this exact recipe for registering the machine the operator is standing
+/// at, because loopback is the one address guaranteed to reach this host's
+/// own daemon regardless of its tailnet/DNS setup (the same fact
+/// `address_host_is_bare_ip`'s doc names from the other side). `machine
+/// add` uses this predicate to decide whether it may resolve
+/// `darkmux_hardware::machine_uid()` for the new entry — see that
+/// function's own doc and `add_machine`'s `uid` parameter.
+///
+/// A DNS name — including `localhost`, deliberately NOT special-cased, since
+/// the documented recipe is the literal IP, not the name that happens to
+/// resolve to it — answers `false`, same as any real peer address. Sibling
+/// implementation to `address_host_is_bare_ip` (this file already carries
+/// one other near-duplicate host-parse, `parse_address`'s own as-is/DNS
+/// branches, for the same reason: each predicate answers a different
+/// question about the same string and a shared parser would have to thread
+/// both answers back out through one signature).
+pub fn address_host_is_loopback(address: &str) -> bool {
+    let trimmed = address.trim();
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let without_scheme = without_scheme.trim_end_matches('/');
+    let unbracketed = without_scheme
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(without_scheme);
+    let unbracketed = unbracketed.strip_suffix('.').unwrap_or(unbracketed);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    match without_scheme.rsplit_once(':') {
+        Some((host, _port)) => {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(host);
+            let host = host.strip_suffix('.').unwrap_or(host);
+            host.parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
                 .unwrap_or(false)
         }
         None => false,
@@ -659,5 +762,55 @@ mod address_host_is_bare_ip_tests {
     fn trailing_dot_ip_is_still_a_bare_ip() {
         assert!(address_host_is_bare_ip("100.64.0.2."));
         assert!(address_host_is_bare_ip("100.64.0.2.:8765"));
+    }
+}
+
+#[cfg(test)]
+mod address_host_is_loopback_tests {
+    use super::*;
+
+    // (#2768) The documented self-registration recipe, exactly as both the
+    // always-on-hub guide and the add-machine skill give it.
+    #[test]
+    fn bare_loopback_v4_is_loopback() {
+        assert!(address_host_is_loopback("127.0.0.1"));
+        assert!(address_host_is_loopback("127.0.0.1:8765"));
+        assert!(address_host_is_loopback("http://127.0.0.1:8765"));
+        // The whole 127.0.0.0/8 range is loopback, not just 127.0.0.1.
+        assert!(address_host_is_loopback("127.5.5.5:8765"));
+    }
+
+    #[test]
+    fn loopback_v6_is_loopback() {
+        assert!(address_host_is_loopback("::1"));
+        assert!(address_host_is_loopback("[::1]:8765"));
+    }
+
+    // Inverted case (red-prove requirement): a real, non-loopback peer
+    // address — the shape every OTHER `machine add` call uses — must never
+    // read as loopback, with or without a port or scheme.
+    #[test]
+    fn non_loopback_bare_ip_is_not_loopback() {
+        assert!(!address_host_is_loopback("100.64.0.5"));
+        assert!(!address_host_is_loopback("100.64.0.5:8765"));
+        assert!(!address_host_is_loopback("fd7a:115c:a1e0::1234"));
+    }
+
+    // A DNS name is never loopback by this predicate, even `localhost` —
+    // the documented recipe is the literal IP, not a name that happens to
+    // resolve to it, so `machine add <id> --address localhost:8765` does
+    // NOT get treated as self-registration.
+    #[test]
+    fn dns_name_including_localhost_is_not_loopback() {
+        assert!(!address_host_is_loopback("studio"));
+        assert!(!address_host_is_loopback("studio.tailnet.ts.net:8765"));
+        assert!(!address_host_is_loopback("localhost"));
+        assert!(!address_host_is_loopback("localhost:8765"));
+    }
+
+    #[test]
+    fn trailing_dot_loopback_ip_is_still_loopback() {
+        assert!(address_host_is_loopback("127.0.0.1."));
+        assert!(address_host_is_loopback("127.0.0.1.:8765"));
     }
 }
