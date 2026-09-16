@@ -60,6 +60,20 @@ env:
   # or lint regression fails CI rather than accumulating silently.
   RUSTFLAGS: "-D warnings"
 
+# (#2744) One in-flight run per PR per workflow. Without this, every re-push
+# left its predecessor QUEUED against the same macOS runner quota rather than
+# superseding it: measured 2026-09-15 with 26 runs queued and ZERO in progress,
+# 7 of them testing commits that were no longer any branch's head and whose
+# results could not have gated anything.
+#
+# `cancel-in-progress` is deliberately PR-ONLY. A push to main gates releases
+# and the nightly sweep is the full-workspace mutation run — neither may be
+# killed by a later one, so both queue instead. The event name is in the group
+# key so a schedule and a main push do not serialize against each other either.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-test-lint:
     name: build + test + lint (macos-latest)
