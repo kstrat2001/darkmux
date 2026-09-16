@@ -1377,9 +1377,82 @@ fn mission_run_status_and_evidence(
                 // error` still reads `Error` below — a recorded FAILURE, not
                 // an abandonment inference, and suppressing it would lose
                 // real signal the operator has no other way to see here.
-                if mission.status != MissionStatus::Paused
-                    && sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Abandoned))
-                {
+                //
+                // (#2748) `any()` used to decide this off the mission's
+                // WHOLE session history, so one abandoned dispatch anywhere
+                // outranked every LATER success, permanently. The fix is
+                // recency, not scope: the verdict comes from whichever
+                // session's TERMINAL landed MOST RECENTLY (`terminal_ts`,
+                // ISO-8601 — a plain string compare sorts it correctly, the
+                // same property `last_activity_ts` relies on above), not
+                // from whether an `Abandoned` shows up anywhere in the set.
+                //
+                // Two shapes were considered and rejected in favor of this
+                // one — both because they need to know which SESSIONS
+                // belong to the SAME step, and that isn't available here:
+                // `SessionAgg` carries no step/task identity field, and
+                // `darkmux_types::session_id`'s own module doc is explicit
+                // that the id string is "a producer-side convention, never
+                // a parse contract" — every consumer treats it OPAQUELY.
+                // Parsing a step out of it would violate that contract for
+                // an attribution this function has no other way to make.
+                //
+                // - "Scope the `any` to sessions still live for their step"
+                //   and "keep `any` but require no later session for the
+                //   SAME STEP reached non-abandoned" both need that same
+                //   step attribution, so both are unavailable for the same
+                //   reason.
+                // - Per-step scoping would also get the mission's OWN
+                //   headline scenario backwards: "a multi-phase mission
+                //   whose early phase died and every later phase succeeded"
+                //   needs a LATER, DIFFERENT step's success to supersede an
+                //   earlier step's abandonment — which is cross-step by
+                //   definition. A same-step-only rule would leave that
+                //   early abandonment unsuperseded forever, i.e. no fix at
+                //   all for the case #2741 actually measured (3 live rows).
+                //
+                // What this does NOT fix, named rather than silently
+                // dropped: two dispatches of the exact same task within the
+                // exact same mission (not two different missions — a fresh
+                // `mission launch` mints a new mission id every time,
+                // #1503) collide on the SAME `session_id`
+                // (`session_id::task`/`step` carry no per-attempt identity,
+                // only `scope_to_run`'s per-MISSION disambiguator), so both
+                // attempts fold into ONE `SessionAgg` in
+                // `build_flow_session_index` — whose fold deliberately
+                // keeps only the FIRST terminal it sees. A same-session-id
+                // retry's later success is erased before it ever reaches
+                // this function; no ranking rule computed HERE can recover
+                // data that was already discarded upstream. That is a
+                // separate defect in the aggregation layer, not this
+                // predicate, and nothing in the current scheduler/launcher
+                // actually re-dispatches the same task under the same
+                // mission id today (no automatic step retry, no verb that
+                // resumes an existing mission in place) — so this is a
+                // named gap for if/when such a path is added, not a live
+                // one.
+                let most_recent_terminal_is_abandoned = sessions
+                    .iter()
+                    .filter(|s| s.terminal_status.is_some())
+                    .max_by(|a, b| {
+                        let ts_cmp = a
+                            .terminal_ts
+                            .as_deref()
+                            .unwrap_or("")
+                            .cmp(b.terminal_ts.as_deref().unwrap_or(""));
+                        // Tie-break toward `Abandoned` on an exact-same-
+                        // instant terminal: this arm only ever fires on
+                        // real evidence, never silence, so the safer
+                        // reading of an ambiguous tie is "don't hide a
+                        // recorded abandonment", not "assume it recovered".
+                        ts_cmp.then_with(|| {
+                            let a_abandoned = a.terminal_status == Some(RunStatus::Abandoned);
+                            let b_abandoned = b.terminal_status == Some(RunStatus::Abandoned);
+                            a_abandoned.cmp(&b_abandoned)
+                        })
+                    })
+                    .is_some_and(|s| s.terminal_status == Some(RunStatus::Abandoned));
+                if mission.status != MissionStatus::Paused && most_recent_terminal_is_abandoned {
                     // A `session.end` terminal really did land — darkmux
                     // OBSERVED this session stop (see
                     // `terminal_status_for_action`), never a guess from
@@ -3256,6 +3329,68 @@ mod tests {
 
         let errored = SessionAgg { terminal_status: Some(RunStatus::Error), ..Default::default() };
         assert_eq!(mission_run_status(&m, &[&errored], now_ms), RunStatus::Error);
+    }
+
+    #[test]
+    fn mission_run_status_a_later_success_supersedes_an_earlier_abandonment() {
+        // (#2748) The precedence bug: `sessions.iter().any(Abandoned)` used
+        // to decide Abandoned off the mission's WHOLE session history, with
+        // no recency rule — so one abandoned dispatch outranked every LATER
+        // success, permanently (a killed-then-rerun step, or a multi-phase
+        // mission whose early phase died while every later phase
+        // succeeded). This pins the fix: the verdict is decided by the
+        // MOST RECENT terminal session (by `terminal_ts`), not by whether
+        // an abandonment shows up ANYWHERE. Here the later session finished
+        // cleanly, so the mission must NOT read Abandoned — it reads
+        // `Running`, same as `..._all_complete_stays_running...` above,
+        // because the all-terminal branch never fabricates `Complete`
+        // (that would claim a `mission finalize` that never happened).
+        let m = minimal_mission("m5h", vec![], None);
+        let now_ms = now_unix() * 1_000;
+        let abandoned_early = SessionAgg {
+            terminal_status: Some(RunStatus::Abandoned),
+            terminal_ts: Some("2026-01-01T09:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let succeeded_later = SessionAgg {
+            terminal_status: Some(RunStatus::Complete),
+            terminal_ts: Some("2026-01-01T10:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            mission_run_status(&m, &[&abandoned_early, &succeeded_later], now_ms),
+            RunStatus::Running,
+            "a session that finished AFTER the abandoned one must supersede it"
+        );
+    }
+
+    #[test]
+    fn mission_run_status_a_later_abandonment_after_an_earlier_success_still_abandons() {
+        // (#2748) The inverse of the test above, pinned so a fix that
+        // over-corrects (e.g. "recovered if ANY success exists anywhere")
+        // is caught too: a session that abandons AFTER an earlier success
+        // is genuine new evidence of a crash, not something the earlier
+        // success gets to erase. The MOST RECENT terminal session is still
+        // the one that decides the verdict, and here it is the abandoned
+        // one.
+        let m = minimal_mission("m5i", vec![], None);
+        let now_ms = now_unix() * 1_000;
+        let succeeded_early = SessionAgg {
+            terminal_status: Some(RunStatus::Complete),
+            terminal_ts: Some("2026-01-01T09:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let abandoned_later = SessionAgg {
+            terminal_status: Some(RunStatus::Abandoned),
+            terminal_ts: Some("2026-01-01T10:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            mission_run_status(&m, &[&succeeded_early, &abandoned_later], now_ms),
+            RunStatus::Abandoned,
+            "a session that abandoned AFTER an earlier success is genuine new evidence, \
+             not something the earlier success gets to erase"
+        );
     }
 
     #[test]
