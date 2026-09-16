@@ -472,6 +472,10 @@ fn model_residency(
                     model_key: m.model.clone(),
                     ctx: m.context,
                     est_bytes: None,
+                    // `mission config show`'s display-only residency
+                    // decision doesn't need PARALLEL — `LoadedModel` (this
+                    // command's `lms ps` source) doesn't carry it either.
+                    parallel: 0,
                 })
                 .collect();
             let placement = Placement {

@@ -908,6 +908,7 @@ mod tests {
             model_key: model_key.to_string(),
             ctx,
             est_bytes,
+            parallel: 0,
         }
     }
 

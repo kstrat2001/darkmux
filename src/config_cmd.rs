@@ -117,6 +117,12 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2394) How many dispatch-free steps run at once — its own ceiling,
     // never the hosted-endpoint cap.
     ("runtime.dispatch_free_concurrency", Ty::Uint),
+    // (#2772) Override for the per-resident-instance LOCAL model dispatch
+    // cap — absent means "derive it live from the instance's own declared
+    // PARALLEL" (see `config_access::local_dispatch_concurrency`'s doc).
+    // #2195's caution again: a new runtime knob missing from THIS registry
+    // is settable nowhere.
+    ("runtime.local_dispatch_concurrency", Ty::Uint),
     ("runtime.max_turns", Ty::Uint),
     ("runtime.max_tokens", Ty::Uint),
     ("runtime.max_tokens_per_call", Ty::Uint),

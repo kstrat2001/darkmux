@@ -651,6 +651,52 @@ pub fn dispatch_free_concurrency() -> u32 {
     let cfg = config().runtime.as_ref().and_then(|r| r.dispatch_free_concurrency);
     pick_parsed("DARKMUX_DISPATCH_FREE_CONCURRENCY", cfg, Some(8)).unwrap().max(1)
 }
+/// (#2772) How many LOCAL-MODEL dispatches
+/// `darkmux_crew::concurrent_dispatch::run_local_waves` runs at once against
+/// ONE resident instance — every step whose `StepKind::seat` claims
+/// `SeatClaim::LocalModel`. Resolves
+/// `env(DARKMUX_LOCAL_DISPATCH_CONCURRENCY) >
+/// config.runtime.local_dispatch_concurrency > declared_parallel` — the
+/// SAME `env` then `config.json` then built-in-default tier every other cap
+/// in this file uses, with one deliberate difference: the built-in default is not a
+/// literal written here. It is `declared_parallel`, the CALLER-supplied
+/// value this accessor takes as its argument — the resident instance's own
+/// `PARALLEL` as `lms ps --json` reports it
+/// ([`crate::LoadedModel`]/[`darkmux_gestalt`]'s `ResidentFact::parallel`,
+/// read fresh per wave by the caller). That is why `init` never writes
+/// `runtime.local_dispatch_concurrency` — the same reasoning
+/// `DarkmuxConfig::with_defaults`'s doc gives for `max_turns` and friends
+/// (absent is a real behavior), and here a WRITTEN literal would freeze a
+/// value that is supposed to track whatever model happens to be resident.
+///
+/// **Why this cap exists at all, measured (kstrat2001/darkmux#2772):** a
+/// 37-unit crawl started 38 local dispatches inside a 13-second window
+/// against one LMStudio instance; `lms ps --json` on that same machine
+/// reported `"parallel":1` on every resident — LMStudio serves exactly ONE
+/// request at a time per instance — so 1 dispatch was served and the other
+/// 36 queued until 22 of them crossed the inactivity deadline and timed out.
+/// Before this accessor existed, nothing bounded how many `SeatClaim::
+/// LocalModel` jobs sharing one identifier `run_local_waves` fired at once
+/// (see that function's own #2772 comments) — the gap `remote_concurrent_cap`
+/// and `dispatch_free_concurrency` each cover their own seat class but never
+/// reached.
+///
+/// Clamped to >= 1 the same way its siblings are (a literal `0` would mean
+/// "run nothing, forever") — this is ALSO the answer when `declared_parallel`
+/// itself is `0` ("unknown": an unreadable `lms ps`, an older `lms` that
+/// doesn't emit the field, or a resident this accessor's caller couldn't
+/// find at all): the direction of caution is always "assume 1", never
+/// "assume unbounded". An operator running an instance that genuinely
+/// serves more than 1 request opts into raising this past the declared
+/// value the ordinary way — `darkmux config set
+/// runtime.local_dispatch_concurrency <n>` or the env var — same operator-
+/// sovereignty shape every other cap in this file already has.
+pub fn local_dispatch_concurrency(declared_parallel: u32) -> u32 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.local_dispatch_concurrency);
+    pick_parsed("DARKMUX_LOCAL_DISPATCH_CONCURRENCY", cfg, Some(declared_parallel))
+        .unwrap()
+        .max(1)
+}
 pub fn max_turns() -> Option<u32> {
     max_turns_with_source().0
 }
@@ -2336,6 +2382,54 @@ mod tests {
         // A 0 would mean "run nothing, forever" — clamped, never honored.
         unsafe { std::env::set_var(k, "0") };
         assert_eq!(dispatch_free_concurrency(), 1, "0 is clamped to 1, not taken literally");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── local_dispatch_concurrency (#2772): env > config > the CALLER's
+    //    declared_parallel argument — the one cap in this file whose
+    //    built-in default isn't a literal ──
+    #[serial_test::serial]
+    #[test]
+    fn local_dispatch_concurrency_defaults_to_the_declared_parallel_argument() {
+        let k = "DARKMUX_LOCAL_DISPATCH_CONCURRENCY";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + no config → whatever the CALLER says the instance
+        // declared, not a fixed literal — measured live #2772: both
+        // resident instances on the reporting machine declared 1.
+        assert_eq!(local_dispatch_concurrency(1), 1, "PARALLEL: 1 stays 1");
+        assert_eq!(local_dispatch_concurrency(4), 4, "a different declared value passes straight through");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn local_dispatch_concurrency_env_overrides_the_declared_value() {
+        let k = "DARKMUX_LOCAL_DISPATCH_CONCURRENCY";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "3") };
+        assert_eq!(local_dispatch_concurrency(1), 3, "env wins live, even over a resident declaring 1");
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(
+            local_dispatch_concurrency(1),
+            1,
+            "an unparseable env value falls through to the declared default, never panics"
+        );
+        // A 0 declaration (unknown — an unreadable `lms ps`) must clamp to
+        // the safe default of 1, never "run nothing, forever" and never
+        // "unbounded" — the #2772 direction of caution.
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(local_dispatch_concurrency(0), 1, "an unknown (0) declared parallel clamps to 1, never 0");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

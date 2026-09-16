@@ -41,13 +41,18 @@
 //! # Local waves vs the remote batch
 //!
 //! Local jobs execute wave-by-wave: each wave IS the gestalt-computed "safe
-//! to co-reside" set, run concurrently via a nested `thread::scope`: then
-//! the executor moves to the next wave. Remote/hosted jobs aren't RAM-bound
-//! (the #1177/#1260 residency-free design — a remote seat consumes zero
-//! local pool), so they run in their OWN `remote_cap`-bounded batch,
-//! **interleaved with the local wave track rather than blocked behind it**:
-//! both tracks are spawned as sibling scoped threads inside one outer
-//! `thread::scope`, so their wall-clock windows genuinely overlap.
+//! to co-reside" set. Within a wave, jobs are further grouped by resident
+//! IDENTIFIER and each identifier group runs on its own thread, genuinely
+//! interleaved with its sibling identifiers (see the "Open item" section
+//! below, now CLOSED) — but capped, per identifier, at that resident
+//! instance's own declared concurrency (#2772). Only once every job in a
+//! wave has finished does the executor move to the next wave. Remote/hosted
+//! jobs aren't RAM-bound (the #1177/#1260 residency-free design — a remote
+//! seat consumes zero local pool), so they run in their OWN
+//! `remote_cap`-bounded batch, **interleaved with the local wave track
+//! rather than blocked behind it**: both tracks are spawned as sibling
+//! scoped threads inside one outer `thread::scope`, so their wall-clock
+//! windows genuinely overlap.
 //!
 //! # Flow-record ordering under concurrency
 //!
@@ -69,21 +74,28 @@
 //! itself shipped as a fully-tested, uncalled crate ahead of its own
 //! cutover.
 //!
-//! # Open item — `same_local_model` concurrent-request safety
+//! # Open item — `same_local_model` concurrent-request safety — CLOSED (#2772)
 //!
-//! Whether ONE resident LMStudio/llama.cpp model can safely serve two
-//! concurrent chat-completion requests is genuinely unknown (no evidence
-//! either way has been gathered). `plan_waves` governs which MODELS are
-//! resident, not how many concurrent requests one resident model may
-//! safely take — that is orthogonal and out of scope here. Until an
-//! empirical check runs, callers of this module should serialize requests
-//! against the same resident model themselves (e.g. a mutex/counter keyed
-//! by model identifier) rather than relying on this executor for that
-//! guarantee; a wave with two placements that happen to share one
-//! identifier still schedules both of that identifier's jobs into the SAME
-//! wave (their `Placement`s collapse to one `Reuse` decision — see
-//! `desired::ingest`'s dedup precedent) and this executor runs them
-//! concurrently against it.
+//! This used to read: whether ONE resident LMStudio/llama.cpp model can
+//! safely serve two concurrent chat-completion requests was genuinely
+//! unknown, and this executor ran every job sharing one identifier fully
+//! concurrently regardless. It is no longer unknown, and no longer
+//! unbounded: `lms ps --json` DECLARES it (`"parallel"`,
+//! [`darkmux_gestalt::ResidentFact::parallel`]) — live-measured `PARALLEL:
+//! 1` on both instances on the machine that filed
+//! kstrat2001/darkmux#2772, meaning LMStudio serves exactly one request at a
+//! time per instance today. `plan_waves` still governs which MODELS are
+//! resident and still collapses same-identifier placements into one `Reuse`
+//! decision (`desired::ingest`'s dedup precedent) — that part is unchanged.
+//! What changed is EXECUTION: `run_local_waves` now reads each wave's fresh
+//! resident list right after it loads, groups that wave's jobs by
+//! identifier, and runs each identifier's group through [`run_capped_batches`]
+//! at that identifier's own declared `parallel` (env/config-overridable via
+//! `local_dispatch_concurrency`, falling back to 1 — never unbounded — when
+//! the declaration can't be read). The 37-unit crawl that motivated this
+//! (38 dispatch starts inside 13 seconds against one instance, 22 timeouts)
+//! is exactly the shape this closes: those 38 jobs now queue at most 1
+//! deep per resident instance instead of firing at once.
 
 use anyhow::{anyhow, bail, Result};
 use crate::step_kinds::SeatClaim;
@@ -490,16 +502,59 @@ fn run_local_waves<T: Send + 'static>(
             }
             continue;
         }
+        // (#2772) A fresh residency read, taken right after this wave's
+        // load just succeeded — the resident instance(s) this wave's jobs
+        // are about to dispatch against are now genuinely known, WITH their
+        // LMStudio-declared `PARALLEL` (`ResidentFact::parallel`). This is
+        // the earliest point that fact is knowable: `plan_waves`/`Placement`
+        // only decide WHICH placements are safe to co-reside, never how
+        // many concurrent requests any of them may take once loaded, so a
+        // cap resolved before `ensure_wave_loaded` would be guessing. A read
+        // failure degrades to an EMPTY resident list, which the cap lookup
+        // below reads as "unknown" and falls back to 1 for every identifier
+        // in the wave — never unbounded, the #2772 direction of caution.
+        let residents = host.list_resident().unwrap_or_default();
+        // Group this wave's ready jobs by resident IDENTIFIER — the same
+        // instance the #2772 cap is keyed on. Same-identifier duplicates
+        // (the seats-x-k fan-out, #1442 ship-2b) already collapsed to ONE
+        // `ensure_wave_loaded` call above; they are about to hit the SAME
+        // resident instance, so they now also share ONE dispatch-
+        // concurrency ceiling. Two DIFFERENT identifiers in one wave are
+        // two different resident instances and genuinely do not contend
+        // (this module doc's now-CLOSED "Open item" above) — each gets its
+        // own thread, interleaved with its siblings; only same-identifier
+        // jobs serialize past their cap.
+        let mut by_identifier: HashMap<String, Vec<(usize, DispatchJob<T>)>> = HashMap::new();
+        for placement in wave {
+            let Some(pair) = by_seat.remove(&placement.seat) else { continue };
+            by_identifier.entry(placement.identifier.clone()).or_default().push(pair);
+        }
         std::thread::scope(|wave_scope| {
-            for placement in wave {
-                let Some((index, job)) = by_seat.remove(&placement.seat) else { continue };
+            for (identifier, id_jobs) in by_identifier {
+                let cap = local_seat_cap(&residents, &identifier);
                 spawn_scoped_named(wave_scope, move || {
-                    let outcome = job();
-                    results.lock().expect("results mutex poisoned").push((index, outcome));
+                    run_capped_batches(id_jobs, cap, results);
                 });
             }
         });
     }
+}
+
+/// (#2772) `env(DARKMUX_LOCAL_DISPATCH_CONCURRENCY) > config.json >
+/// this instance's own declared PARALLEL` — see
+/// `darkmux_types::config_access::local_dispatch_concurrency`'s own doc for
+/// the full resolution order. `residents` not carrying `identifier` at all
+/// (an unreadable `lms ps`, or a wave whose load raced a concurrent
+/// eviction) reads the same as a `parallel: 0` row: unknown, never
+/// unbounded, so this always falls back to the safe default of 1.
+fn local_seat_cap(residents: &[darkmux_gestalt::ResidentFact], identifier: &str) -> usize {
+    let declared = residents
+        .iter()
+        .find(|r| r.identifier == identifier)
+        .map(|r| r.parallel)
+        .filter(|p| *p > 0)
+        .unwrap_or(1);
+    darkmux_types::config_access::local_dispatch_concurrency(declared).max(1) as usize
 }
 
 /// (#1487 PR2) Bounded retry-hold for a wave blocked ONLY by a CONCURRENT
@@ -1952,6 +2007,7 @@ mod tests {
             model_key: model_key.to_string(),
             ctx,
             est_bytes: Some(1_000),
+            parallel: 0,
         }
     }
 
@@ -2833,10 +2889,13 @@ mod tests {
 
     /// Two jobs that want the SAME identifier collapse to one `Reuse`
     /// decision inside `plan_waves` (gestalt's own dedup/reuse semantics),
-    /// and this executor still runs BOTH job bodies — the open
-    /// `same_local_model` concurrency question the module doc names is
-    /// exactly this shape; today the executor does not serialize them
-    /// itself, matching the documented open item.
+    /// and this executor still runs BOTH job bodies. Historically this was
+    /// the open `same_local_model` concurrency question the module doc
+    /// named — before #2772 they ran genuinely unbounded-concurrent against
+    /// the one resident. That question is now CLOSED by the per-instance
+    /// cap (see `local_dispatch_respects_declared_parallel_of_one` below for
+    /// the timing proof); this test only pins the coarser, non-timing-
+    /// dependent fact that both jobs still complete either way.
     #[serial_test::serial]
     #[test]
     fn run_bounded_runs_both_jobs_sharing_one_resident_placement() {
@@ -2848,6 +2907,7 @@ mod tests {
                 model_key: "shared".to_string(),
                 ctx: 32_000,
                 est_bytes: Some(1_000),
+                parallel: 0,
             }],
             ..Default::default()
         };
@@ -2859,6 +2919,208 @@ mod tests {
         let results = run_bounded(jobs, &facts, &est, 4, 4, &mock_host_factory).expect("planning never fails under Auto");
         assert_eq!(results.len(), 2);
         assert_eq!(marker.load(Ordering::SeqCst), 2, "both jobs ran despite sharing one resident placement");
+    }
+
+    /// (#2772) THE LOAD-BEARING TEST. Measured live on 2026-09-16: a
+    /// 37-unit crawl started 38 local dispatches inside 13 seconds against
+    /// ONE resident LMStudio instance declaring `PARALLEL: 1` (`lms ps
+    /// --json`'s `"parallel"` field, live-verified 2026-09-17 on this same
+    /// machine — both a 4B and a 35B resident reported `"parallel":1`); 22
+    /// timed out. N=1 here would pass against the unbounded bug and prove
+    /// nothing (a single job cannot exhibit contention) — N=4 sharing ONE
+    /// identifier is the smallest fan-out that can.
+    ///
+    /// Timed like this file's existing cap tests
+    /// (`the_dispatch_free_cap_actually_bounds`): four 150ms jobs against a
+    /// resident declaring `parallel: 1` must take ~600ms (serialized), never
+    /// ~150ms (which would mean the cap did nothing).
+    #[serial_test::serial]
+    #[test]
+    fn local_dispatch_respects_declared_parallel_of_one() {
+        let _env = LeaseTestEnv::new();
+        // A clean read of the override env var — this test's whole point is
+        // the BUILT-IN default derived from the resident's own declared
+        // `parallel`, not an operator override.
+        unsafe { std::env::remove_var("DARKMUX_LOCAL_DISPATCH_CONCURRENCY") };
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let facts = Facts {
+            residents: vec![ResidentFact {
+                identifier: "darkmux:m".to_string(),
+                model_key: "m".to_string(),
+                ctx: 32_000,
+                est_bytes: Some(1_000),
+                parallel: 1,
+            }],
+            ..Default::default()
+        };
+        fn host_factory_parallel_one() -> Box<dyn ModelHost> {
+            let mut host = MockHost::new().resident("darkmux:m", "m", 32_000, Some(1_000)).cataloged("m", 1_000);
+            host.residents[0].parallel = 1;
+            Box::new(host)
+        }
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = (0..4)
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::LocalModel(placement("m", 8_000)),
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(150));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((i, vec![]))
+                    })
+                },
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_parallel_one)
+            .expect("planning never fails under Auto");
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 4);
+        assert_eq!(marker.load(Ordering::SeqCst), 4, "every job still completes — starved, not lost");
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "PARALLEL: 1 must serialize all four 150ms jobs against their shared resident \
+             (~600ms) — an unbounded local track (today's #2772 bug) would finish in ~150ms; \
+             got {elapsed:?}"
+        );
+    }
+
+    /// (#2772) The declared cap is the resident's OWN number, not a
+    /// hardcoded 1 — a change that capped every local seat at 1 regardless
+    /// of what the instance declares would pass the test above but silently
+    /// under-utilize an operator's higher-parallelism instance. A resident
+    /// declaring `parallel: 4` must let four 150ms jobs overlap and finish
+    /// in ~150ms, not serialize to ~600ms.
+    #[serial_test::serial]
+    #[test]
+    fn local_dispatch_honors_a_higher_declared_parallel() {
+        let _env = LeaseTestEnv::new();
+        unsafe { std::env::remove_var("DARKMUX_LOCAL_DISPATCH_CONCURRENCY") };
+        let est = FixedEstimator(BTreeMap::from([("m".to_string(), 1_000u64)]));
+        let facts = Facts {
+            residents: vec![ResidentFact {
+                identifier: "darkmux:m".to_string(),
+                model_key: "m".to_string(),
+                ctx: 32_000,
+                est_bytes: Some(1_000),
+                parallel: 4,
+            }],
+            ..Default::default()
+        };
+        fn host_factory_parallel_four() -> Box<dyn ModelHost> {
+            let mut host = MockHost::new().resident("darkmux:m", "m", 32_000, Some(1_000)).cataloged("m", 1_000);
+            host.residents[0].parallel = 4;
+            Box::new(host)
+        }
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = (0..4)
+            .map(|i| QueuedJob {
+                index: i,
+                seat: SeatClaim::LocalModel(placement("m", 8_000)),
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(150));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((i, vec![]))
+                    })
+                },
+            })
+            .collect();
+        let t0 = std::time::Instant::now();
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_parallel_four)
+            .expect("planning never fails under Auto");
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 4);
+        assert_eq!(marker.load(Ordering::SeqCst), 4);
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "parallel: 4 must let all four 150ms jobs overlap (~150ms) — a cap hardcoded to 1 \
+             regardless of the declared value would serialize to ~600ms; got {elapsed:?}"
+        );
+    }
+
+    /// (#2772) Two DIFFERENT resident identifiers in one wave must NOT
+    /// contend with each other — only same-identifier jobs share a cap.
+    /// Each declares `parallel: 1`; one job apiece, each sleeping 150ms.
+    /// Grouping by identifier wrong (e.g. one global cap across the whole
+    /// wave) would serialize these to ~300ms; genuinely independent
+    /// resident instances must overlap and finish in ~150ms.
+    #[serial_test::serial]
+    #[test]
+    fn local_dispatch_across_different_identifiers_does_not_serialize() {
+        let _env = LeaseTestEnv::new();
+        unsafe { std::env::remove_var("DARKMUX_LOCAL_DISPATCH_CONCURRENCY") };
+        let est = FixedEstimator(BTreeMap::from([("a".to_string(), 1_000u64), ("b".to_string(), 1_000u64)]));
+        let facts = Facts {
+            residents: vec![
+                ResidentFact {
+                    identifier: "darkmux:a".to_string(),
+                    model_key: "a".to_string(),
+                    ctx: 32_000,
+                    est_bytes: Some(1_000),
+                    parallel: 1,
+                },
+                ResidentFact {
+                    identifier: "darkmux:b".to_string(),
+                    model_key: "b".to_string(),
+                    ctx: 32_000,
+                    est_bytes: Some(1_000),
+                    parallel: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        fn host_factory_two_residents() -> Box<dyn ModelHost> {
+            let mut host = MockHost::new()
+                .resident("darkmux:a", "a", 32_000, Some(1_000))
+                .resident("darkmux:b", "b", 32_000, Some(1_000))
+                .cataloged("a", 1_000)
+                .cataloged("b", 1_000);
+            host.residents[0].parallel = 1;
+            host.residents[1].parallel = 1;
+            Box::new(host)
+        }
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = vec![
+            QueuedJob {
+                index: 0,
+                seat: SeatClaim::LocalModel(placement("a", 8_000)),
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(150));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((0usize, vec![]))
+                    })
+                },
+            },
+            QueuedJob {
+                index: 1,
+                seat: SeatClaim::LocalModel(placement("b", 8_000)),
+                job: {
+                    let marker = marker.clone();
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(150));
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        Ok((1usize, vec![]))
+                    })
+                },
+            },
+        ];
+        let t0 = std::time::Instant::now();
+        let results = run_bounded(jobs, &facts, &est, 4, 4, &host_factory_two_residents)
+            .expect("planning never fails under Auto");
+        let elapsed = t0.elapsed();
+        assert_eq!(results.len(), 2);
+        assert_eq!(marker.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "two DIFFERENT resident instances (each parallel: 1) must run interleaved, not \
+             serialize behind each other — got {elapsed:?}"
+        );
     }
 
     /// Remote jobs never touch `plan_waves`'s local-model arithmetic at

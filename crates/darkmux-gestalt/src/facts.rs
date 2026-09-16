@@ -32,6 +32,17 @@ pub struct ResidentFact {
     /// degradation, never a panic). `LoadedModel.size` is a DISPLAY string
     /// today; the packet-2 adapter reads raw `sizeBytes` where available.
     pub est_bytes: Option<u64>,
+    /// (#2772) How many requests THIS instance serves concurrently, as
+    /// LMStudio itself declares it (`lms ps --json`'s `"parallel"` field —
+    /// live-verified `PARALLEL: 1` on both instances in the crawl that
+    /// starved 22 of 37 dispatches, kstrat2001/darkmux#2772). `0` = unknown
+    /// (an older `lms` that doesn't emit the field, or a row this adapter
+    /// otherwise couldn't parse) — same convention as `ctx: 0 = unknown`
+    /// above, and read the same way by the caller: never trusted as
+    /// "unbounded", only ever as "fall back to the safe default of 1"
+    /// (`darkmux_crew::concurrent_dispatch`'s per-instance dispatch cap is
+    /// the one consumer today).
+    pub parallel: u32,
 }
 
 /// One catalog entry (packet-2 adapter source: `lms ls --json`). The

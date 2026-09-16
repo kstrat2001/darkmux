@@ -106,6 +106,7 @@ mod tests {
             model_key: model_key.to_string(),
             ctx,
             est_bytes: Some(14_000_000_000),
+            parallel: 0,
         }
     }
 

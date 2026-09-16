@@ -235,6 +235,11 @@ impl ModelHost for LmsHost {
 /// `crate::lms::model_from_json` (`identifier`|`id`; `modelKey`|`model`|`id`;
 /// `contextLength`|`context`), but `est_bytes` reads the RAW `sizeBytes`
 /// integer — the display-string `size` field is never parsed back to bytes.
+///
+/// (#2772) `parallel` reads the row's `"parallel"` integer directly — no
+/// fallback key; live-verified present on every real `lms ps --json` row
+/// (`lms` 0.x as of 2026-09) with no legacy alias. Missing/non-numeric
+/// parses to `0` ("unknown"), same as every other numeric field here.
 fn resident_fact_from_json(v: &serde_json::Value) -> ResidentFact {
     let identifier = v
         .get("identifier")
@@ -255,7 +260,8 @@ fn resident_fact_from_json(v: &serde_json::Value) -> ResidentFact {
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
     let est_bytes = v.get("sizeBytes").and_then(|x| x.as_u64());
-    ResidentFact { identifier, model_key, ctx, est_bytes }
+    let parallel = v.get("parallel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    ResidentFact { identifier, model_key, ctx, est_bytes, parallel }
 }
 
 /// One `lms ls --json` row → [`CatalogFact`]. `modelKey` is required (a row
@@ -608,6 +614,27 @@ mod tests {
         assert_eq!(resident_fact_from_json(&fallback).ctx, 4096);
         let absent = json!({"identifier": "a", "modelKey": "a"});
         assert_eq!(resident_fact_from_json(&absent).ctx, 0, "unknown ctx compares as tiny (#1135 caution)");
+    }
+
+    #[test]
+    fn resident_fact_parallel_reads_live_field_shape() {
+        // (#2772) The real `lms ps --json` row shape, live-verified
+        // 2026-09-17: `"parallel":1` on both a 4B and a 35B resident. No
+        // fallback key — a row missing it (older `lms`) parses to the
+        // documented "unknown" (0), never a fabricated 1.
+        let v = json!({
+            "identifier": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+            "modelKey": "qwen3.6-35b-a3b-turboquant-mlx",
+            "contextLength": 262144,
+            "parallel": 1
+        });
+        assert_eq!(resident_fact_from_json(&v).parallel, 1);
+        let absent = json!({"identifier": "a", "modelKey": "a"});
+        assert_eq!(
+            resident_fact_from_json(&absent).parallel,
+            0,
+            "missing parallel is unknown (0), not fabricated"
+        );
     }
 
     #[test]
@@ -1092,18 +1119,21 @@ esac"#,
                     model_key: "zeta-model".into(),
                     ctx: 3000,
                     est_bytes: Some(300),
+                    parallel: 0,
                 },
                 ResidentFact {
                     identifier: "darkmux:alpha".into(),
                     model_key: "alpha-model".into(),
                     ctx: 1000,
                     est_bytes: Some(100),
+                    parallel: 0,
                 },
                 ResidentFact {
                     identifier: "mid".into(),
                     model_key: "mid-model".into(),
                     ctx: 2000,
                     est_bytes: None,
+                    parallel: 0,
                 },
             ],
             "host-reported order preserved; raw sizeBytes carried; missing bytes = None"
