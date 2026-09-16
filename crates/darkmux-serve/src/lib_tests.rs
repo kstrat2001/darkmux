@@ -669,6 +669,53 @@
         assert_eq!(machines.len(), 1, "the rostered-but-never-beaten machine must still appear: {body}");
         assert_eq!(machines[0]["id"], "studio");
         assert_eq!(machines[0]["address"], "100.64.1.2:8765");
+        // (#2768) This fixture's raw JSON predates `machine_uid` entirely (no
+        // key in the literal above) — the lenient-on-read contract
+        // (`#[serde(default)]`) must load it without error and answer with
+        // an explicit `null`, never omit the key or synthesize a value. A
+        // consumer checking "is this identity known" must see `null`, not
+        // have to distinguish "absent key" from "known-empty".
+        assert!(
+            machines[0]["machine_uid"].is_null(),
+            "a pre-#2768 roster entry must surface machine_uid as null, not omit or fabricate it: {body}"
+        );
+    }
+
+    /// (#2768) The other half: a roster entry that DOES carry a resolved
+    /// `machine_uid` — either `machine add`'s self-registration path or an
+    /// operator hand-edit — round-trips it over the wire unchanged, so the
+    /// viewer's uid join has something real to match against.
+    #[tokio::test]
+    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+    async fn fleet_roster_reports_a_resolved_machine_uid_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let roster_path = tmp.path().join("fleet.json");
+        fs::write(
+            &roster_path,
+            r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"127.0.0.1:8765","added_unix_ms":1000,"machine_uid":"F9ACF59C-UID"}}}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+        }
+
+        let machines = body["machines"].as_array().expect("machines must be an array");
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0]["id"], "laptop");
+        assert_eq!(machines[0]["machine_uid"], "F9ACF59C-UID");
     }
 
     /// The inverted case: no roster file at all (the fresh-install/

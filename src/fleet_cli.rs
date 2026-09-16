@@ -11,15 +11,36 @@ use crate::fleet;
 use crate::flow;
 
 pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
+    // (#2768) Resolve THIS host's own hardware identity only when the
+    // entry being added describes THIS host — the documented
+    // self-registration shape (`machine add <id> --address
+    // 127.0.0.1:8765`, always-on-hub guide Step 6 / add-machine skill Step
+    // 7). A peer added by its real tailnet/DNS address is, by
+    // construction, not this process's own hardware — `machine add`
+    // performs no network call, so there is nothing here that could ever
+    // resolve a REMOTE peer's uid. That entry's `machine_uid` therefore
+    // stays whatever `add_machine` already had for it: `None` on a fresh
+    // add (legitimately "unknown identity" — see `MachineEntry::machine_uid`'s
+    // own doc), or a previously-resolved/hand-edited value preserved
+    // across this update (see `add_machine`'s own doc for why `None` here
+    // never clobbers it).
+    let uid = if fleet::address_host_is_loopback(address) {
+        darkmux_hardware::machine_uid()
+    } else {
+        None
+    };
     let was_present = fleet::mutate_roster(|roster| {
         let was_present = roster.machines.contains_key(id);
-        fleet::add_machine(roster, id, address, description)?;
+        fleet::add_machine(roster, id, address, description, uid)?;
         Ok(was_present)
     })?;
     let verb = if was_present { "updated" } else { "added" };
     println!("machine: {verb} {id} (address={address})");
     if let Some(d) = description {
         println!("  description: {d}");
+    }
+    if let Some(u) = uid {
+        println!("  machine_uid: {u} (resolved locally — self-registration)");
     }
     println!("  roster: {}", fleet::roster_path().display());
     Ok(0)
@@ -199,6 +220,10 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                     "address": m.address,
                     "description": m.description,
                     "added_unix_ms": m.added_unix_ms,
+                    // (#2768) `null` for a remote peer or a pre-#2768 entry —
+                    // "unknown identity", never "same machine as another
+                    // null entry". See `MachineEntry::machine_uid`'s own doc.
+                    "machine_uid": m.machine_uid,
                     "reachable": p.reachable,
                     "resolved_address": p.resolved_address,
                     "probe_ms": p.elapsed_ms,
@@ -486,6 +511,76 @@ mod tests {
         );
     }
 
+    // ── cmd_machine_add uid resolution (#2768) ──────────────────────────
+    //
+    // `cmd_machine_add` is the one call site that decides WHETHER to
+    // resolve `darkmux_hardware::machine_uid()` at all — `add_machine`
+    // itself just stores whatever it's handed. These tests exercise that
+    // decision through the real CLI entry point, not `fleet::add_machine`
+    // directly (already covered in `darkmux-fleet`'s own test suite).
+
+    #[serial_test::serial]
+    #[test]
+    fn cmd_machine_add_remote_address_never_resolves_a_uid() {
+        // (#2768 "decide and document") The non-loopback shape every
+        // ordinary peer registration uses. Deterministic regardless of
+        // platform: `cmd_machine_add` never calls `machine_uid()` at all
+        // on this branch, so there is nothing for the host's own hardware
+        // to affect.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
+        cmd_machine_add("peer1", "100.64.0.2:8765", None).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        assert_eq!(roster.machines.get("peer1").unwrap().machine_uid, None);
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn cmd_machine_add_loopback_address_resolves_this_hosts_uid() {
+        // (#2768) The documented self-registration recipe. Asserted
+        // against `darkmux_hardware::machine_uid()`'s OWN live answer for
+        // this host, never a hardcoded `Some(...)` — `None` off macOS (or
+        // wherever `ioreg` is unavailable) is the correct outcome there
+        // too, and hardcoding `Some` would make this test platform-
+        // dependent instead of testing that `cmd_machine_add` reaches the
+        // exact same resolver.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
+        cmd_machine_add("self", "127.0.0.1:8765", None).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        let entry_uid = roster.machines.get("self").unwrap().machine_uid.clone();
+        assert_eq!(entry_uid.as_deref(), darkmux_hardware::machine_uid());
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn cmd_machine_add_re_add_over_loopback_does_not_erase_a_resolved_uid() {
+        // Idempotency, #2768-specific: re-running the documented
+        // self-registration command (e.g. to update a description) must
+        // not toggle the resolved identity on and off — `add_machine`'s
+        // `Some` always wins here (loopback re-resolves fresh every time),
+        // so a legitimately-resolved uid never regresses to `None` on this
+        // path. (The OTHER preservation direction — a `None` from a
+        // remote-address call never erasing a prior resolution — is
+        // covered at the `add_machine` level in `darkmux-fleet`'s own
+        // suite; this test is the loopback side, through the real CLI
+        // entry point.)
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fleet.json");
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
+        cmd_machine_add("self", "127.0.0.1:8765", None).unwrap();
+        cmd_machine_add("self", "127.0.0.1:8765", Some("updated")).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        let entry = roster.machines.get("self").unwrap();
+        assert_eq!(entry.machine_uid.as_deref(), darkmux_hardware::machine_uid());
+        assert_eq!(entry.description.as_deref(), Some("updated"));
+        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
     // ── fetch_peer_json error shapes (#1426) ────────────────────────────
     //
     // Each test isolates the roster via DARKMUX_FLEET_FILE (read live per
@@ -501,7 +596,7 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
         for (id, addr) in entries {
             fleet::mutate_roster(|roster| {
-                fleet::add_machine(roster, id, addr, None)?;
+                fleet::add_machine(roster, id, addr, None, None)?;
                 Ok(())
             })
             .unwrap();

@@ -14,7 +14,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, rosterOnlyEntries, specUnknownLabel } from "./cards";
+import { buildFleetCard, rosterOnlyEntries, rosterLabelFor, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -536,8 +536,8 @@ export function FleetLens({
 
   const cards = useMemo(
     () => [
-      ...uids.map((m) =>
-        buildFleetCard(
+      ...uids.map((m) => {
+        const card = buildFleetCard(
           flowWindow.data,
           liveMachines,
           specs,
@@ -551,8 +551,14 @@ export function FleetLens({
           // carries only a display NAME (`runsForMachine`'s own doc), same
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
-        ),
-      ),
+        );
+        // (#2768) A roster entry whose declared hardware identity matches
+        // this uid updates the card's LABEL rather than drawing a second
+        // card — `rosterOnlyEntries` (below) is what keeps that same
+        // roster entry from ALSO rendering its own "offline" card.
+        const rosterLabel = rosterLabelFor(m, roster);
+        return rosterLabel ? { ...card, name: rosterLabel } : card;
+      }),
       // (#1855) A rostered entry with no known identity is, by definition,
       // not currently beating — `machAbsent` is forced `true` rather than
       // derived through `machPresent` (which would answer `null`/"unknown"
@@ -579,7 +585,7 @@ export function FleetLens({
         ),
       ),
     ],
-    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs],
+    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster],
   );
 
   const timeline = useMemo(

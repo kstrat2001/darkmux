@@ -64,13 +64,25 @@ export interface FleetSessionsLiveResponse {
 
 /** One machine in the operator's DECLARED fleet roster — `darkmux machine
  * add`'s `fleet.json`, keyed by the operator-chosen `id` (what flow records
- * carry as `machine_id`), not a hardware uid. Source:
- * `crates/darkmux-fleet/src/roster.rs::MachineEntry`. */
+ * carry as `machine_id`). Source:
+ * `crates/darkmux-fleet/src/roster.rs::MachineEntry`.
+ *
+ * (#2768) `machine_uid` is the roster's own copy of the same stable hardware
+ * identity flow records carry (`FlowRecord.machine_uid`) — resolved at
+ * `machine add` time for a SELF-registered entry (loopback address), absent
+ * for a remote peer (this host cannot probe a peer's hardware) and for every
+ * entry saved before this field existed. `undefined`/`null` means *unknown
+ * identity*, never "same as no other machine" — a consumer joining on this
+ * field must never fall back to comparing `id` against a flow-derived name
+ * when it's absent (see `cards.ts::rosterOnlyEntries`'s own doc for where
+ * that name-based fallback already exists, on purpose, for entries WITHOUT a
+ * uid, and why the two don't contradict each other). */
 export interface RosterMachineEntry {
   id: string;
   address: string;
   description?: string | null;
   added_unix_ms: number;
+  machine_uid?: string | null;
 }
 
 /** `GET /fleet/roster` (#1855) — the declared topology, independent of
