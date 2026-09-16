@@ -358,6 +358,17 @@ async function readStickyGeometry(page) {
       // At rest the row's top and the masthead's bottom are the same edge —
       // any daylight here is a margin-shaped double-pad.
       gapUnderMasthead: sticky.top - masthead.bottom,
+      // (#2763) The measurement that actually matches what a person SEES.
+      // `gapUnderMasthead` above compares BORDER BOXES, and #2758's first
+      // fix put its inset in the row's own `padding-top` — inside that box.
+      // So the box stayed flush (gap 0, assertion green) while the row grew
+      // ~47px taller with empty space at its top and the tabs pushed down
+      // it. The shipped page had a visible gap and this suite was green.
+      // Measuring the TABS pins the thing the requirement is about: where
+      // the controls land, not where the box edge is.
+      gapAboveTabs: (document.querySelector('.app-shell__navtabs')
+        ?? document.querySelector('.nav-tab'))
+        .getBoundingClientRect().top - masthead.bottom,
       // And the padding-shaped one, which the border-box measurement above
       // structurally CANNOT see (padding moves the row's content, not its top
       // edge): the same un-inset control the masthead tests use. (#2758) This
@@ -389,7 +400,16 @@ async function bandOwnership(page, insetPx) {
     const misses = [];
     for (let y = 0; y < inset; y += 4) {
       const hit = document.elementFromPoint(x, y);
-      const ownedBySticky = !!(hit && hit.closest('.app-shell__sticky'));
+      // (#2763) The band may be owned by the sticky row OR by the fixed
+      // overlay that paints it (`.app-shell::before`). A pseudo-element
+      // hit-tests AS ITS ORIGINATING ELEMENT, so a covered band reads back
+      // as `.app-shell` itself — and crucially NOT as the content beneath,
+      // which is the whole point of the probe. Accepting `.app-shell` only
+      // when the hit IS that element (not a descendant of it) keeps the
+      // check honest: every real page element is a descendant, so content
+      // showing through still fails.
+      const ownedBySticky = !!(hit && hit.closest('.app-shell__sticky'))
+        || (hit && hit.classList && hit.classList.contains('app-shell'));
       if (!ownedBySticky) {
         misses.push({ y, tag: hit ? hit.tagName : null, cls: hit ? String(hit.className) : null });
       }
@@ -409,7 +429,12 @@ test('the sticky tab row covers the iOS safe-area-inset-top band once the page s
   const rest = await readStickyGeometry(page);
   expect(rest.inset, `env(safe-area-inset-top) resolved to ${rest.inset}px — the CDP override never reached the page`).toBe(47);
   expect(rest.gapUnderMasthead, `a ${rest.gapUnderMasthead}px gap opened between the masthead and the tab row at rest — the sticky inset must move only the STUCK position`).toBeCloseTo(0, 1);
-  expect(rest.paddingTop, `sticky row padding-top ${rest.paddingTop}px vs its ${rest.paddingBottom}px base + its ${rest.inset}px inset — the row must absorb the inset a second time so its stuck box covers the band the masthead leaves uncovered`).toBeCloseTo(rest.paddingBottom + rest.inset, 1);
+  // (#2763) NOT a padding assertion. The previous version of this line
+  // required `paddingTop === paddingBottom + inset`, which is precisely the
+  // shape that broke the page at rest — it made the bug the specification,
+  // so the suite defended it. What the requirement actually says is that the
+  // TABS sit flush under the masthead at rest, however that is achieved.
+  expect(rest.gapAboveTabs, `the tabs sit ${rest.gapAboveTabs}px below the masthead at rest — with a ${rest.inset}px inset this must stay at the row's own base padding, not absorb the inset a second time (#2763)`).toBeCloseTo(rest.paddingBottom, 1);
 
   await page.evaluate(() => window.scrollTo(0, 400));
   await page.waitForTimeout(200);
@@ -417,14 +442,20 @@ test('the sticky tab row covers the iOS safe-area-inset-top band once the page s
   // A short page would leave scrollY at 0 and make every assertion below
   // vacuously true against an unstuck row.
   expect(scrolled.scrollY, 'the page never scrolled — this test cannot say anything about the STUCK position').toBeGreaterThan(0);
-  expect(scrolled.stickyTop, `sticky row stuck at ${scrolled.stickyTop}px — its own box must start at the TRUE viewport top so nothing can paint above it in the ${scrolled.inset}px status-bar band`).toBeCloseTo(0, 1);
+  // (#2763) The row's STUCK top is the inset, deliberately — that is #2264's
+  // tap-target guard and it must survive. The band above it is covered by a
+  // FIXED overlay (`.app-shell::before`) rather than by the row's own box,
+  // which is what lets both states be right at once: #2758's first fix made
+  // this assertion `toBeCloseTo(0)` by pulling the row's box up, and paid for
+  // it with a visible gap at rest on every phone.
+  expect(scrolled.stickyTop, `sticky row stuck at ${scrolled.stickyTop}px — it must stay at the ${scrolled.inset}px inset so its tap targets clear the Dynamic Island (#2264); the band above it is the overlay's job, asserted below`).toBeCloseTo(scrolled.inset, 1);
 
   // The load-bearing check (#2758): with the row's top pinned at 0, walk the
   // whole band it now claims to cover and confirm the row itself — not the
   // scrolled-away masthead, not whatever content sits behind it — is what
   // the browser actually paints there.
   const misses = await bandOwnership(page, scrolled.inset);
-  expect(misses, `content painted through the status-bar band, not covered by the sticky row: ${JSON.stringify(misses)}`).toEqual([]);
+  expect(misses, `content painted through the status-bar band — neither the sticky row nor the overlay covers it: ${JSON.stringify(misses)}`).toEqual([]);
 });
 
 // The same row on a phone with NO inset (Android, an iPhone SE, a plain

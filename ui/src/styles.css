@@ -201,6 +201,51 @@ body {
    original 32px jump the route-independence was written to prevent —
    flagged here rather than silently left describing behavior that no
    longer holds. */
+/* (#2763) Paint the status-bar band, WITHOUT costing any layout.
+   Background on this one, because #2758's first fix got it wrong and the
+   wrong version shipped: it moved the inset from the sticky row's `top`
+   into its `padding-top`. That covered the band when scrolled and broke
+   the page at REST — `top` on a sticky element applies only once the
+   element would scroll past its threshold, but `padding` applies always,
+   so every phone got a ~47px empty gap between the masthead and the tab
+   row on first paint. #2264's own comment had already stated the
+   requirement being violated: at rest the row must sit "flush under the
+   masthead with no gap".
+   A fixed overlay is what satisfies both states at once. It is not in
+   flow, so it changes no box's size or position in either state; it
+   simply owns the band. The row keeps `top: env(safe-area-inset-top)`,
+   which is what keeps its tap targets clear of the Dynamic Island when
+   stuck (#2264), and nothing paints above it because this overlay is
+   there first.
+   Hiding nothing at rest is a property, not luck: `.masthead` pads for
+   the same inset (see its own rule), so its content already begins BELOW
+   this band. The band is empty page under `viewport-fit=cover` — that is
+   precisely why scrolled content showed through it.
+   `env(safe-area-inset-top)` is 0 on every non-notched viewport, so this
+   collapses to a zero-height no-op on desktop rather than needing a
+   media query. */
+.app-shell::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: env(safe-area-inset-top, 0px);
+  background: var(--bg);
+  /* Above the sticky row's 30 — it is the row's own content scrolling
+     under the band that must not show through. */
+  z-index: 40;
+  /* Deliberately hit-testable, NOT `pointer-events: none`. Two reasons,
+     and the second is why this is a feature rather than a concession:
+     1. Content scrolling under the status bar is invisible, so a tap
+        landing on it is always accidental. The band should absorb it.
+     2. `pointer-events: none` would make this overlay invisible to
+        `elementFromPoint`, which is how the band-coverage test probes —
+        the overlay would cover the band visually while the suite reported
+        content still painting through it. A guard that cannot be observed
+        by the check that exists for it is not a guard. */
+}
+
 .app-shell__sticky {
   position: sticky;
   /* (#2264, corrected by #2758 — read both, the second is the current
@@ -229,14 +274,13 @@ body {
      `top: var(--chrome-h)` grows to match automatically. The inset is 0 on
      every non-notched viewport, making all of this a no-op there — desktop
      and Android are unaffected. */
-  top: 0;
+  top: env(safe-area-inset-top, 0px);
   z-index: 30;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 14px;
   padding: 8px 16px;
-  padding-top: calc(8px + env(safe-area-inset-top, 0px));
   background: var(--bg);
   border-bottom: 1px solid var(--border);
 }
@@ -1042,13 +1086,6 @@ body {
   .app-shell__sticky {
     gap: 6px 8px;
     padding: 6px 12px;
-    /* (#2758) This breakpoint's own `padding` shorthand resets padding-top
-       to a flat 6px, wiping the base rule's inset-absorbing override above
-       (source order: this block sits later in the file, so at <=768px —
-       exactly where a real notch/inset applies — it wins). Phones are the
-       ENTIRE reason for this override, so it has to be restated here at
-       this breakpoint's own 6px base, not just at the base rule's 8px. */
-    padding-top: calc(6px + env(safe-area-inset-top, 0px));
   }
   .app-shell__sticky .scrub {
     flex-basis: 100%;
