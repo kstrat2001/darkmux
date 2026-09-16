@@ -33,21 +33,25 @@
 //! never spawn anything at all, and destinations nobody thought to walk.
 //!
 //! It is NOT a superset of the text scan, and an earlier draft of this
-//! paragraph said it was. `enumerate_units` walks the ROOT `tests/*.rs`
-//! plus `-p <member> --lib`, and `--lib` neither builds nor runs a
-//! package's own integration targets — so the eleven under
-//! `crates/darkmux-{crew,fleet,gestalt,lab,profiles,types}/tests/` are
-//! outside this check, the same boundary `crates/*/tests/` already sits
+//! paragraph said it was. `enumerate_units` used to walk only the ROOT
+//! `tests/*.rs` plus `-p <member> --lib`, and `--lib` neither builds nor
+//! runs a package's own integration targets — so the eleven (now twelve)
+//! under `crates/darkmux-{crew,fleet,gestalt,lab,profiles,types}/tests/`
+//! sat outside this check, the same boundary `crates/*/tests/` still sits
 //! outside for the text scan. Proven with a decoy at
 //! `crates/darkmux-crew/tests/rev2733_decoy_leak.rs` writing into both
 //! the real home and the state root: text scan EXIT=0, enumeration
-//! EXIT=0, gated check EXIT=0 reporting `clean`, files present. All
-//! eleven real targets census clean today, so this is a coverage hole and
-//! not a live defect — widening the enumeration is a follow-up, because
-//! eleven more units is a change to the CI budget (210s of margin) and
-//! needs its own measurement. The boundary is stated here for the reason
-//! `tests/cli.rs` states its own: a guard that overclaims is how the next
-//! reader skips the check.
+//! EXIT=0, gated check EXIT=0 reporting `clean`, files present.
+//!
+//! **(#2736 item 1) Closed.** `Unit::PackageTest` now walks every workspace
+//! member's own `tests/*.rs` the same way the root walk does. All twelve
+//! targets censused clean before this landed, so this closes a coverage
+//! hole rather than a live defect. Measured cost: the twelve added units
+//! run in ~49s wall-clock sequentially (2026-09-16, this machine) against
+//! the ~210s of CI margin #2736 measured — comfortably inside it. If a
+//! future addition to `crates/*/tests/` ever pushes this sweep close to
+//! the step's budget, re-measure before adding more rather than assuming
+//! the old headroom still holds.
 //!
 //! # The two assertions, and why one of them is free
 //!
@@ -120,6 +124,16 @@ enum Unit {
     /// `#[cfg(test)]` modules. The `ran_tests` floor below is the general
     /// fix; this variant is the specific one.
     PackageBins(String),
+    /// (#2736 item 1) An integration target under a WORKSPACE MEMBER's own
+    /// `tests/`, e.g. `crates/darkmux-crew/tests/mock_dispatch_proof.rs`.
+    /// `-p <member> --lib` neither builds nor runs these — `--lib` is
+    /// scoped to the package's library crate, and an integration target is
+    /// its own separate binary — so they sat outside every unit above,
+    /// the same boundary the root `tests/*.rs` walk sits outside of for
+    /// `-p darkmux --lib`. Twelve exist today; all twelve census clean, so
+    /// this closes a coverage hole rather than a live defect. `(package,
+    /// target)`.
+    PackageTest(String, String),
 }
 
 impl Unit {
@@ -128,6 +142,7 @@ impl Unit {
             Unit::IntegrationTarget(t) => format!("test --test {t}"),
             Unit::PackageLib(p) => format!("test -p {p} --lib"),
             Unit::PackageBins(p) => format!("test -p {p} --bins"),
+            Unit::PackageTest(p, t) => format!("test -p {p} --test {t}"),
         }
     }
 
@@ -149,6 +164,15 @@ impl Unit {
                 "-p".into(),
                 p.clone(),
                 "--bins".into(),
+                "--".into(),
+                "--test-threads=4".into(),
+            ],
+            Unit::PackageTest(p, t) => vec![
+                "test".into(),
+                "-p".into(),
+                p.clone(),
+                "--test".into(),
+                t.clone(),
                 "--".into(),
                 "--test-threads=4".into(),
             ],
@@ -204,13 +228,70 @@ fn enumerate_units() -> Vec<Unit> {
         if path.is_empty() || path == "." {
             continue;
         }
-        let name = path.rsplit('/').next().unwrap_or("");
-        if !name.is_empty() {
-            units.push(Unit::PackageLib(name.to_string()));
+        let member_dir = manifest_dir.join(path);
+
+        // (#2736 item 4) The package's REAL name, read from ITS OWN
+        // Cargo.toml rather than assumed from the directory basename. The
+        // two disagree for nothing in this workspace today, but assuming
+        // they always will is exactly the class of thing this whole file
+        // exists to stop doing — a member directory renamed independently
+        // of its package (or vice versa) would otherwise resolve to a
+        // package name that does not exist, and `cargo test -p <that>`
+        // fails with "package ID specification did not match any
+        // packages", a message that points at the manifest, not at
+        // vacuity, but which the OLD code could never produce because it
+        // never looked.
+        let member_manifest = std::fs::read_to_string(member_dir.join("Cargo.toml")).ok();
+        let pkg_name = member_manifest
+            .as_deref()
+            .and_then(|m| {
+                m.lines().find_map(|l| {
+                    let (key, value) = l.split_once('=')?;
+                    (key.trim() == "name").then(|| value.trim().trim_matches('"').to_string())
+                })
+            })
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or("").to_string());
+        if pkg_name.is_empty() {
+            continue;
+        }
+
+        // (#2736 item 4) Which unit-test invocation actually builds and
+        // runs this member's `#[cfg(test)]` modules depends on whether it
+        // HAS a library target. `-p <pkg> --lib` on a bin-only member
+        // fails with "no library targets found in package `<pkg>`" — a
+        // message that (like the manifest-mismatch case above) points the
+        // reader at vacuity rather than at the real cause. Every member
+        // in this workspace today has a `src/lib.rs`; this branch exists
+        // so a FUTURE bin-only member gets `--bins` automatically instead
+        // of silently failing loudly for the wrong stated reason.
+        if member_dir.join("src/lib.rs").exists() {
+            units.push(Unit::PackageLib(pkg_name.clone()));
+        } else {
+            units.push(Unit::PackageBins(pkg_name.clone()));
+        }
+
+        // (#2736 item 1) The member's OWN `tests/*.rs` — integration
+        // targets `-p <member> --lib`/`--bins` above never builds or
+        // runs, because `--lib`/`--bins` are scoped to the package's
+        // library/binary crate and an integration target is its own
+        // separate binary. Reuses the `pkg_name` just resolved above
+        // rather than re-deriving it from the directory a second time.
+        if let Ok(entries) = std::fs::read_dir(member_dir.join("tests")) {
+            for entry in entries.flatten() {
+                let test_path = entry.path();
+                if !test_path.extension().is_some_and(|e| e == "rs") {
+                    continue;
+                }
+                if let Some(stem) = test_path.file_stem().and_then(|s| s.to_str()) {
+                    units.push(Unit::PackageTest(pkg_name.clone(), stem.to_string()));
+                }
+            }
         }
     }
     // The root package itself: `members` names it as ".", which carries no
-    // crate name. It is bin-only, so its unit tests are `--bins`.
+    // crate name and is skipped by the loop above. It is bin-only, so its
+    // unit tests are `--bins`.
     units.push(Unit::PackageBins("darkmux".to_string()));
 
     units.sort();
@@ -272,6 +353,13 @@ fn every_test_unit_the_leak_check_would_run_is_enumerated_from_disk() {
             _ => None,
         })
         .collect();
+    let package_tests: Vec<(&String, &String)> = units
+        .iter()
+        .filter_map(|u| match u {
+            Unit::PackageTest(p, t) => Some((p, t)),
+            _ => None,
+        })
+        .collect();
 
     for (label, _, _) in KNOWN_UNISOLATED_UNITS {
         assert!(
@@ -309,6 +397,168 @@ fn every_test_unit_the_leak_check_would_run_is_enumerated_from_disk() {
          run was measured writing a findings file, 29 flow records and a liveness log into \
          a pinned root (#2718)"
     );
+    // (#2736 item 1) Twelve integration targets live under `crates/*/tests/`
+    // today (`-p <member> --lib` never touches them). The floor is looser
+    // than the measured count on purpose — it exists to catch the walk
+    // going BLIND (a renamed `tests/` dir, a `members` scrape break), not
+    // to pin an exact number every new target has to bump.
+    assert!(
+        package_tests.len() >= 10,
+        "only {} package-scoped integration target(s) enumerated under crates/*/tests/; the \
+         walk is looking at an empty or wrong set of member directories and its green proves \
+         nothing: {package_tests:?}",
+        package_tests.len()
+    );
+    assert!(
+        package_tests.iter().any(|(p, _)| **p == "darkmux-crew"),
+        "no `crates/darkmux-crew/tests/*.rs` target was enumerated; that member's own \
+         integration tests are exactly what `-p darkmux-crew --lib` never runs (#2736 item 1)"
+    );
+}
+
+/// What one child's libtest summary line(s) reported, summed across every
+/// such line found in either stream — a `--bins` invocation covering more
+/// than one bin target can print more than one `test result:` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LibtestSummary {
+    passed: usize,
+    failed: usize,
+    ignored: usize,
+}
+
+/// (#2735, #2736 item 3) Parse libtest's own `test result: ok|FAILED. N
+/// passed; M failed; K ignored; ...` summary line(s) out of a child's
+/// captured stdout+stderr. Returns `None` when no such line appears at all
+/// anywhere in either stream — proof no test binary ever ran a libtest
+/// harness to completion.
+///
+/// Split out as its own pure function, with its own tests below, because
+/// the boolean it used to back (`saw_summary`, a bare `"test result:"`
+/// substring match) had no test of its own: `grep -rn saw_summary` finds
+/// only its own three lines, so deleting the floor it backed left every
+/// always-on suite green (#2736 item 3). And the boolean itself proved
+/// less than it looked like it proved: seven e2e units under a
+/// `CARGO_TARGET_DIR` override failed `FleetHarness::boot()` inside
+/// EVERY `#[test]` fn, so libtest still printed its own summary —
+/// `test result: FAILED. 0 passed; 7 failed; …` — a real, non-empty
+/// `"test result:"` line that satisfied the old floor while every one of
+/// those units ran zero test bodies to completion (#2735).
+///
+/// `passed == 0` alone is not quite the whole story either, found while
+/// landing #2736 item 1: `darkmux-crew/tests/{dispatch_panic_thread_leak_
+/// proof,mock_dispatch_proof}.rs` are ENTIRELY `#[ignore]`d Docker-gated
+/// proofs, so they legitimately print `0 passed; 0 failed; N ignored`
+/// every time, by design, forever. Reporting `failed`/`ignored` alongside
+/// `passed` (rather than collapsing straight to a bool) is what lets the
+/// caller tell that KNOWN, intentional shape apart from the #2735 vacuity
+/// bug it would otherwise be indistinguishable from — both look like
+/// "zero completed" from `passed` alone.
+fn parse_libtest_summary(stdout: &str, stderr: &str) -> Option<LibtestSummary> {
+    fn field_before(tokens: &[&str], marker: &str) -> Option<usize> {
+        let pos = tokens.iter().position(|t| t.starts_with(marker))?;
+        tokens.get(pos.checked_sub(1)?)?.parse::<usize>().ok()
+    }
+
+    let mut total: Option<LibtestSummary> = None;
+    for text in [stdout, stderr] {
+        for line in text.lines() {
+            if !line.contains("test result:") {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let acc = total.get_or_insert_with(LibtestSummary::default);
+            acc.passed += field_before(&tokens, "passed").unwrap_or(0);
+            acc.failed += field_before(&tokens, "failed").unwrap_or(0);
+            acc.ignored += field_before(&tokens, "ignored").unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// The red-prove for `parse_libtest_summary`'s `None` case, and (paired
+/// with the tests below) the thing #2736 item 3 says has never existed: a
+/// test that drives the anti-vacuity floor with a deliberately
+/// non-executing invocation, with no `cargo` spawn required. Delete the
+/// `summary.is_some()` assertion in `no_test_unit_writes_into_a_sentinel_
+/// state_tree` and this one still passes — it is scoped to the parser, not
+/// the caller — but deleting `parse_libtest_summary` itself (or hardcoding
+/// its result) turns this red immediately, along with the tests below.
+#[test]
+fn parse_libtest_summary_reports_none_when_no_summary_line_ever_printed() {
+    // A binary that never reached libtest's own harness at all — killed,
+    // or failed to link — prints no `test result:` line in either stream.
+    assert_eq!(
+        parse_libtest_summary("", "error: linking with `cc` failed: exit status: 1"),
+        None
+    );
+}
+
+/// The exact shape #2735 measured: the binary starts, every `#[test]` fn
+/// fails during FIXTURE SETUP (not the behavior under test), and libtest
+/// still prints its own honest `FAILED` summary. `saw_summary` alone
+/// called this `clean`; the caller must be able to tell "ran and stayed
+/// clean" from "ran and proved nothing" apart, and `passed == 0, failed >
+/// 0` is exactly that signal.
+#[test]
+fn parse_libtest_summary_reports_zero_passed_for_the_2735_all_tests_failed_shape() {
+    let stdout = "running 7 tests\n\
+                  test fleet_status_deep_reports_all_nodes ... FAILED\n\
+                  test harness_smoke ... FAILED\n\n\
+                  failures:\n\n\
+                  ---- fleet_status_deep_reports_all_nodes stdout ----\n\
+                  thread 'fleet_status_deep_reports_all_nodes' panicked at 'spawning darkmux: \
+                  No such file or directory (os error 2)'\n\n\
+                  test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; \
+                  finished in 0.31s\n\n";
+    assert_eq!(
+        parse_libtest_summary(stdout, ""),
+        Some(LibtestSummary { passed: 0, failed: 7, ignored: 0 })
+    );
+}
+
+/// The OTHER zero-passed shape, found live while landing #2736 item 1: a
+/// target whose entire suite is `#[ignore]`d (Docker-gated), which prints
+/// `0 passed; 0 failed; N ignored` by design. `failed == 0 && ignored > 0`
+/// is what the caller uses to tell this apart from the #2735 shape above —
+/// both have `passed == 0`, and only this field trio distinguishes them.
+#[test]
+fn parse_libtest_summary_reports_zero_passed_zero_failed_for_an_all_ignored_target() {
+    let stdout = "running 4 tests\n\
+                  test dispatch_i2596_forwards_the_cli_timeout_override_into_the_container ... \
+                  ignored, requires Docker + a local darkmux-runtime:latest image\n\n\
+                  test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; \
+                  finished in 0.00s\n";
+    assert_eq!(
+        parse_libtest_summary(stdout, ""),
+        Some(LibtestSummary { passed: 0, failed: 0, ignored: 4 })
+    );
+}
+
+/// `--bins` can build and run more than one bin target in one invocation,
+/// each printing its own `test result:` line — every field must be summed
+/// across lines, not just taken from the first.
+#[test]
+fn parse_libtest_summary_sums_every_summary_line_present() {
+    let stdout = "test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; \
+                  finished in 0.01s\n\n\
+                  test result: ok. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+                  finished in 0.02s\n";
+    assert_eq!(
+        parse_libtest_summary(stdout, ""),
+        Some(LibtestSummary { passed: 5, failed: 1, ignored: 1 })
+    );
+}
+
+/// The check reads both streams — a summary line in stderr must count the
+/// same as one in stdout.
+#[test]
+fn parse_libtest_summary_finds_a_summary_line_in_stderr_too() {
+    let stderr = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                  finished in 0.00s\n";
+    assert_eq!(
+        parse_libtest_summary("", stderr),
+        Some(LibtestSummary { passed: 1, failed: 0, ignored: 0 })
+    );
 }
 
 /// The measurement. Gated, because it re-runs the suite.
@@ -343,6 +593,7 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
     );
 
     let mut offenders: Vec<String> = Vec::new();
+    let mut inconclusive: Vec<String> = Vec::new();
     let mut clean = 0usize;
     for unit in &units {
         let sentinel = StateLeakSentinel::new();
@@ -360,6 +611,8 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
 
         let out = cmd.output().unwrap_or_else(|e| panic!("spawning `cargo {}`: {e}", unit.label()));
         let census = sentinel.census();
+        let stdout_text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr_text = String::from_utf8_lossy(&out.stderr).into_owned();
 
         // A unit that ran NOTHING censuses as zero and would report clean
         // — the verdict is a file count, and no files is exactly what an
@@ -368,17 +621,63 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
         // which exits 101 with "no library targets found in package
         // `darkmux`" having run no test binary at all, and the sweep
         // called it clean for eleven minutes. `test result:` is libtest's
-        // own summary line, so its presence is proof a test binary ran.
-        let saw_summary = String::from_utf8_lossy(&out.stdout).contains("test result:")
-            || String::from_utf8_lossy(&out.stderr).contains("test result:");
+        // own summary line, so its presence is proof a test binary STARTED
+        // — but not proof any test in it ran to completion (#2735: seven
+        // e2e units failed `FleetHarness::boot()` in every `#[test]` fn
+        // under a `CARGO_TARGET_DIR` override and still printed a `FAILED`
+        // summary). `parse_libtest_summary` is `None` for the former case;
+        // the latter, and the OTHER zero-passed shape found while landing
+        // #2736 item 1, are both handled below.
+        let summary = parse_libtest_summary(&stdout_text, &stderr_text);
         assert!(
-            saw_summary,
+            summary.is_some(),
             "`cargo {}` produced no libtest summary line, so no test binary ran and its \
              empty census proves nothing. A unit that cannot execute must fail loudly, \
              not pass quietly.\nstderr:\n{}",
             unit.label(),
-            String::from_utf8_lossy(&out.stderr).chars().take(2000).collect::<String>(),
+            stderr_text.chars().take(2000).collect::<String>(),
         );
+        let summary = summary.expect("checked above");
+
+        if summary.passed == 0 {
+            if summary.failed == 0 && summary.ignored > 0 {
+                // (#2736 item 1 follow-up) The ENTIRE suite is `#[ignore]`d
+                // — e.g. `darkmux-crew`'s Docker-gated dispatch proofs,
+                // which print `0 passed; 0 failed; N ignored` every time
+                // BY DESIGN, forever. This is not the #2735 vacuity bug
+                // (nothing failed either — libtest is reporting its own
+                // honest "administratively skipped", not a broken fixture)
+                // but it is not evidence of cleanliness either: nothing
+                // executed, so it earns no `clean` credit and is reported
+                // separately rather than silently inflating either count.
+                // Known limitation, named rather than guarded against: a
+                // test that genuinely started leaking and was then marked
+                // `#[ignore]` to dodge this check would look identical.
+                eprintln!(
+                    "skipped (all {} test(s) #[ignore]d, none ran): cargo {}",
+                    summary.ignored,
+                    unit.label()
+                );
+                continue;
+            }
+            // (#2735) A test binary that ran but completed ZERO tests
+            // (and did not merely skip them all) proves nothing about
+            // leaks either way — its empty census is not evidence of
+            // cleanliness, it is evidence the unit never reached its own
+            // test bodies. Reported as its own category so it cannot
+            // silently inflate `clean`.
+            inconclusive.push(format!(
+                "  cargo {} — ran (child exit {:?}) but 0 tests passed to completion ({} \
+                 failed, {} ignored); an empty census from a unit that never executed its own \
+                 tests is INCONCLUSIVE, not clean\n{}",
+                unit.label(),
+                out.status.code(),
+                summary.failed,
+                summary.ignored,
+                stderr_text.chars().take(2000).collect::<String>(),
+            ));
+            continue;
+        }
 
         // The status is CONTEXT, never the verdict. Three of four targets
         // went red under #2710's leak conditions but all four leaked, and
@@ -419,6 +718,24 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
         ));
     }
 
+    // The message below names the e2e harness's release-binary resolver in
+    // PROSE rather than by its symbol. `cli.rs`'s spawn guard is a scan over
+    // an allowlist of SPELLINGS whose only exclusion is a leading `//`, so the
+    // symbol appearing inside this string literal reads to it as a spawn site
+    // and fails the guard. This file spawns `cargo`, never darkmux. Do not
+    // "restore" the symbol name here.
+    assert!(
+        inconclusive.is_empty(),
+        "(#2735) {} of {} test unit(s) printed a libtest summary but completed ZERO tests, so \
+         their empty census is INCONCLUSIVE rather than evidence of cleanliness — a unit whose \
+         tests never reach their own bodies cannot report `clean`. The known cause is a harness \
+         that ignores `CARGO_TARGET_DIR` while `run_cargo_build_release` honors it (fixed in \
+         the e2e harness's release-binary resolver), but treat this as \"investigate \
+         why\", not \"assume that\":\n{}",
+        inconclusive.len(),
+        units.len(),
+        inconclusive.join("\n"),
+    );
     assert!(
         offenders.is_empty(),
         "(#2717) {} of {} test unit(s) wrote darkmux state outside their own fixtures. \

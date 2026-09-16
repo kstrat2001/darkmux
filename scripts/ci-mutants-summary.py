@@ -345,6 +345,24 @@ EXIT_MEANING = {
 # `)`, `],`, `};`.
 _STRUCTURE_ONLY_CHARS = set("{}()[];,")
 
+# (#2750) A bare string-literal COLLECTION ELEMENT: `"DARKMUX_REDIS_URL",`.
+#
+# The trailing comma is REQUIRED by this pattern and is the whole reason it
+# is safe. A bare `"foo"` with no comma may be a function's tail expression,
+# which cargo-mutants DOES mutate (it replaces return values), so excluding
+# that would under-count and weaken the floor. A trailing comma cannot
+# appear on a tail expression — it is a syntax error outside a collection —
+# so `"foo",` is certainly data, and data is exactly what cargo-mutants
+# generates nothing from.
+#
+# Found on #2750, whose only non-test production change was two entries
+# added to the `CLEARED_STATE_VARS` const array. `cargo mutants --in-diff
+# --list` reports "No mutants to filter" for that diff, while the floor
+# counted the two literals as code and failed the PR — the same false-red
+# shape as #2514 and #2606 before it.
+_BARE_LITERAL_ELEMENT = re.compile(r'"(?:[^"\\]|\\.)*"\s*,\Z')
+
+
 
 def added_line_is_countable(text: str) -> bool:
     """Could this added line (the diff's leading `+` already stripped)
@@ -366,6 +384,8 @@ def added_line_is_countable(text: str) -> bool:
         return False  # a block comment that opens and closes on one line
     if (s.startswith("#[") or s.startswith("#![")) and s.endswith("]") and s.count("[") == s.count("]"):
         return False  # a single-line attribute; an unbalanced one counts as code
+    if _BARE_LITERAL_ELEMENT.fullmatch(s):
+        return False  # `"FOO",` — a collection element, never a tail expression
     return True
 
 
@@ -2227,6 +2247,25 @@ _DIFF_STACKED_ATTR_MOD = (
     "+mod budget_request_tests;\n"
 )
 
+_DIFF_CONST_ARRAY_ELEMENTS = (
+    "--- a/crates/fake/src/lib.rs\n"
+    "+++ b/crates/fake/src/lib.rs\n"
+    "@@ -1,4 +1,6 @@\n"
+    " pub const CLEARED: &[&str] = &[\n"
+    '     "DARKMUX_HOME",\n'
+    '+    "DARKMUX_REDIS_URL",\n'
+    '+    "DARKMUX_FLEET_SNAPSHOT_FILE",\n'
+    " ];\n"
+)
+
+_CONST_ARRAY_SOURCE = (
+    "pub const CLEARED: &[&str] = &[\n"
+    '    "DARKMUX_HOME",\n'
+    '    "DARKMUX_REDIS_URL",\n'
+    '    "DARKMUX_FLEET_SNAPSHOT_FILE",\n'
+    "];\n"
+)
+
 TEST_MODULE_SELF_TEST_CASES = [
     {
         # This is the reproduction of #2582 / PR #2579 itself: a diff whose
@@ -2310,6 +2349,23 @@ TEST_MODULE_SELF_TEST_CASES = [
         "name": "#2606: a stacked #[cfg(test)] + #[path] mod declaration counts zero",
         "diff": _DIFF_STACKED_ATTR_MOD,
         "source_files": {"crates/fake/src/lib.rs": _STACKED_ATTR_MOD_SOURCE},
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        # (#2750) Entries added to a const array are DATA. `cargo mutants
+        # --in-diff --list` reports "No mutants to filter" for exactly this
+        # shape — measured on #2750, whose only non-test production change
+        # was two entries added to `CLEARED_STATE_VARS`. The floor counted
+        # them as code and failed the PR.
+        #
+        # The trailing comma is what makes the exclusion safe: a bare
+        # `"foo"` with no comma can be a function's tail expression, which
+        # cargo-mutants DOES mutate, so it must keep counting. See
+        # `_BARE_LITERAL_ELEMENT`.
+        "name": "#2750: bare string elements added to a const array count zero",
+        "diff": _DIFF_CONST_ARRAY_ELEMENTS,
+        "source_files": {"crates/fake/src/lib.rs": _CONST_ARRAY_SOURCE},
         "expect_count": 0,
         "expect_gate": 0,
     },
