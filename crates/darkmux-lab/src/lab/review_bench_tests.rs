@@ -278,6 +278,20 @@
         let s = score(&lbl("clean", None), &r);
         assert_eq!(s.fp, 1);
         assert!(!s.correct); // a finding on a clean diff is wrong even if verdict=pass
+        // (#1085) The contract check is HIGH-specific (matching the prompt's own
+        // rule: `flag` iff any finding is `high`) — a medium finding under a
+        // `pass` verdict is a plain false positive, not the #1085 contradiction.
+        assert!(!s.verdict_severity_mismatch);
+    }
+
+    #[test]
+    fn score_clean_pass_with_high_finding_is_contract_violation() {
+        // (#1085) The over-emission failure mode this issue is about: a clean
+        // diff, `verdict: pass`, but a HIGH-severity finding present anyway.
+        let r = Review { verdict: "pass".into(), findings: vec![Finding { severity: "high".into(), ..Default::default() }], parsed: true, partial: false };
+        let s = score(&lbl("clean", None), &r);
+        assert!(s.verdict_severity_mismatch);
+        assert!(!s.correct);
     }
 
     #[test]
@@ -304,6 +318,19 @@
         let s = score(&lbl("bug", Some("format!")), &r);
         assert!(s.empty_flag);
         assert!(!s.recall);
+        assert!(!s.correct);
+        assert!(!s.verdict_severity_mismatch, "no findings at all — the mirror-image violation can't fire");
+    }
+
+    #[test]
+    fn score_bug_pass_with_high_finding_is_contract_violation() {
+        // (#1085) Mirror image of the empty-flag case: verdict=pass while a
+        // HIGH finding is present — the pipeline catches this mechanically
+        // regardless of whether the finding matches the labeled bug.
+        let r = Review { verdict: "pass".into(), findings: vec![Finding { severity: "high".into(), anchor: "wrong line".into(), title: "unrelated".into() }], parsed: true, partial: false };
+        let s = score(&lbl("bug", Some("format!")), &r);
+        assert!(s.verdict_severity_mismatch);
+        assert!(!s.recall); // pass verdict still doesn't credit recall
         assert!(!s.correct);
     }
 
@@ -431,6 +458,10 @@
         assert_eq!(s.bugs_caught, 0, "pass verdict: not flagged");
         assert!(!s.recall);
         assert_eq!(s.tp, 1, "the finding still matches a real bug");
+        // (#1085) The mechanical contract check fires independently of matching:
+        // `pass` + a `high` finding is a contradiction the pipeline can catch
+        // without needing to know whether the finding is a real bug at all.
+        assert!(s.verdict_severity_mismatch);
     }
 
     #[test]
