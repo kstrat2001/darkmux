@@ -13451,7 +13451,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     #[test]
     fn build_machine_scoped_telemetry_record_carries_full_payload_and_interval_no_session_fields() {
         use crate::host_probe::{
-            build_machine_scoped_telemetry_record, CpuCluster, HostSampleFull, PowerSample, ThermalSample,
+            build_machine_scoped_telemetry_record, BatterySample, CpuCluster, HostSampleFull, PowerSample,
+            ThermalSample,
         };
         let sample = HostSampleFull {
             cost_ms: 7,
@@ -13468,6 +13469,15 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             gpu_mem_bytes: Some(1_000_000),
             thermal: Some(ThermalSample { state: "fair".into(), cpu_speed_limit_pct: 90 }),
             power: Some(PowerSample { cpu_mw: 800.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+            // (#2705) The charge half of the machine-scoped telemetry
+            // payload — asserted below alongside every other field, so the
+            // record's full shape stays pinned in one place.
+            battery: Some(BatterySample {
+                charge_pct: 64,
+                on_ac: false,
+                charging: false,
+                minutes_to_empty: Some(121),
+            }),
         };
         let rec = build_machine_scoped_telemetry_record(&sample, 12_345, 5000);
         assert_eq!(rec.action, "machine.telemetry");
@@ -13491,6 +13501,16 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["thermal"]["cpu_speed_limit_pct"], 90);
         assert_eq!(payload["power_mw"]["total"], 900);
         assert_eq!(payload["cpu_clusters"][0]["name"], "Super");
+        // (#2705) The charge half. HEALTH is deliberately absent from this
+        // record: it moves over weeks and rides its own hourly
+        // `machine.battery_health` record, never the telemetry curve.
+        assert_eq!(payload["battery"]["charge_pct"], 64);
+        assert_eq!(payload["battery"]["on_ac"], false);
+        assert_eq!(payload["battery"]["minutes_to_empty"], 121);
+        assert!(
+            payload.get("battery_health").is_none(),
+            "health must not ride the 2s telemetry cadence: {payload}"
+        );
         assert!(payload.get("context").is_none(), "no record_context merge — this record has no dispatch to key to");
     }
 

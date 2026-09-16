@@ -387,6 +387,7 @@ darkmux's canonical config surface is **`~/.darkmux/config.json`** (#661), writt
   "audit":   { "enabled": false, "dir": "~/.darkmux/audit" },
   "runtime": { "inactivity_timeout_seconds": 600, "strict_selection": false, "feedback_injection": true, "check_updates": true },
   "remote":  { "max_tokens_per_execution": 500000 },
+  "power":   { "min_battery_pct": 50, "refuse_start_below_min": true, "pause_running_below_min": true },
   "fleet":   { "mode": "standalone" }
 }
 ```
@@ -424,6 +425,19 @@ Two rules worth carrying without looking anything up:
   `config.json` field** via `darkmux config set <key> <value>` — do not reach
   for an env var as the primary mechanism. Env is for per-shell, CI, and test
   overrides.
+- **The battery gate is INERT on a machine with no battery (#2706).**
+  `power.min_battery_pct` / `.refuse_start_below_min` / `.pause_running_below_min`
+  gate whether a run starts and whether one already going pauses. A desktop
+  reports no battery at all, and absence is `None` all the way down — not
+  "treated as 0%", not "treated as 100%", not defaulted either way. In this
+  fleet the always-on hub is a desktop and the battery-bearing laptop is the
+  inference peer, so getting that wrong would either block the hub
+  permanently or silently disable the gate on the one machine it protects.
+  The start policy and the in-flight policy are two config items rather than
+  one mode, because refusing to start and interrupting work in progress are
+  different decisions with different costs. Every refusal names the charge,
+  the floor and the config field that decided — darkmux enforces a threshold
+  the OPERATOR wrote and never advises about battery health.
 - **A `0` on a darkmux bound means UNBOUNDED, never "instantly".** It reads
   that way for `redis.maxlen`, and (#2361/#2310) for
   `DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS` → `runtime.step_command_timeout_seconds`

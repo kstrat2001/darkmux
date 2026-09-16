@@ -3155,6 +3155,19 @@ mod tests {
         //           this same fix adds (`last_receiver_rejected_reasons`
         //           on `.last` and on `HookRuleStatus`) are NOT part of
         //           this constant's scope.
+        //   1.50.0 (#2705/#2706): `machine.telemetry`'s payload gains an
+        //           additive `battery` object, and two new actions land —
+        //           `machine.battery` (charge TRANSITIONS, edge-triggered
+        //           like `machine.thermal`) and `machine.battery_health`
+        //           (the slow MACHINE RECORD: cycle count, both capacity
+        //           ratios labeled by source, condition, and the pack's own
+        //           cumulative time-at-state-of-charge counters, polled
+        //           hourly and emitted only on change). Minor, same
+        //           "additive action / additive payload key" bar as
+        //           1.21.0/1.25.0/1.29.0/1.32.0/1.33.0/1.36.0/1.48.0. See
+        //           `schema.rs`'s own entry for the full explanation,
+        //           including why `dispatch.rest` gaining a `reason` of
+        //           `"battery"` is a new VALUE rather than a shape change.
         //   1.49.0 (#2690): the `dispatch.map` per-item
         //           `telemetry.tokens` record gains additive `remote`
         //           (bool) and `index` (u64) keys — the SEAT's own
@@ -3173,7 +3186,7 @@ mod tests {
         //           own history entry, including why ONE emitter is the
         //           whole affected population and what live verification
         //           is still owed.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.49.0");
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.50.0");
     }
 
     #[test]

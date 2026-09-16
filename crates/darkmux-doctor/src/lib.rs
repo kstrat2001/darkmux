@@ -3357,6 +3357,10 @@ fn describe_host_probe(
         ("freq-tables", src.freq_tables),
         ("thermal", src.thermal),
         ("ioreg-gpu", src.ioreg_gpu),
+        // (#2705) Named like every other source, so a desktop's "no
+        // battery" reads as a PROPERTY OF THE HOST rather than as a gap —
+        // the same distinction this check exists to draw for `ioreport`.
+        ("battery", src.battery),
     ];
     let resolved: Vec<&str> = all.iter().filter_map(|(n, ok)| ok.then_some(*n)).collect();
     let missing: Vec<&str> = all.iter().filter_map(|(n, ok)| (!ok).then_some(*n)).collect();
@@ -8258,6 +8262,7 @@ mod tests {
             freq_tables: false,
             thermal: true,
             ioreg_gpu: true,
+            battery: true,
         };
         let check = describe_host_probe(src, 3);
         assert_eq!(
@@ -8273,6 +8278,30 @@ mod tests {
         );
         assert!(check.message.contains("mach"), "{}", check.message);
         assert!(check.hint.is_some(), "a missing source comes with an explanation");
+    }
+
+    #[test]
+    fn describe_host_probe_names_a_desktops_absent_battery_without_calling_it_a_fault() {
+        // (#2705/#2706) A Mac Studio/mini/Pro has no battery, and that is a
+        // PROPERTY OF THE HOST, not a gap. It must be NAMED (so an operator
+        // can tell "this Mac has no battery" from "darkmux forgot to read
+        // it" — the exact distinction #2706's inert gate turns on) and it
+        // must not downgrade the check.
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: true,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+            battery: false,
+        };
+        let check = describe_host_probe(src, 7);
+        assert_eq!(check.status, Status::Pass, "a desktop is healthy: {}", check.message);
+        assert!(
+            check.message.contains("unavailable: battery"),
+            "the absence must be named, not silently omitted: {}",
+            check.message
+        );
     }
 
     #[test]
@@ -8292,6 +8321,7 @@ mod tests {
             freq_tables: true,
             thermal: true,
             ioreg_gpu: true,
+            battery: true,
         };
         let check = describe_host_probe(src, 4);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
@@ -8306,6 +8336,7 @@ mod tests {
             freq_tables: true,
             thermal: true,
             ioreg_gpu: true,
+            battery: true,
         };
         let check = describe_host_probe(src, 9);
         assert_eq!(check.status, Status::Pass);

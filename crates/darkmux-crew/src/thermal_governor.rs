@@ -59,9 +59,8 @@
 
 use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
-use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
 /// Severity rank of a thermal state name. An unrecognized name (a future
 /// macOS state this build doesn't know) ranks WORSE than `critical` —
@@ -71,66 +70,22 @@ fn severity(state: &str) -> usize {
     THERMAL_STATES.iter().position(|s| *s == state).unwrap_or(THERMAL_STATES.len())
 }
 
-/// `<host_out>/pace.json` — mounted into the container at
-/// `/darkmux-out/pace.json`. MUST match the runtime-side join in
-/// `runtime/src/pace.rs`'s `pace_file_path`
-/// (`out_dir.join("pace.json")`) — `pace_file_path_matches_runtime_out_base`
-/// below is the conformance test that keeps the two in sync.
-pub fn pace_file_path(host_out: &Path) -> PathBuf {
-    host_out.join("pace.json")
-}
+/// `<host_out>/pace.json`, re-exported from [`crate::pace_file`] — this
+/// module was the pace file's only writer until #2706 added the battery
+/// governor, at which point the path formula, the wire shape and the
+/// atomic write moved to a module both can share. Re-exported rather than
+/// relocated at every call site so the name this module has always
+/// published (`thermal_governor::pace_file_path`) keeps resolving, and the
+/// conformance test below keeps testing the literal the runtime joins.
+pub use crate::pace_file::path as pace_file_path;
 
-/// Shape written to the pace file. Mirrors `runtime/src/pace.rs`'s
-/// `PaceFile` fields (`pause`/`reason`/`state`/`written_at_ms`) exactly —
-/// there is deliberately no `expires` field: #2114's cf1b1993 replaced
-/// that flag with a pure heartbeat contract (see this module's doc), so
-/// writing an `expires` key here would be dead data the runtime no longer
-/// reads. The runtime-side reader tolerates unknown/extra fields on
-/// deserialize (no `deny_unknown_fields`), so this stays forward-compatible
-/// regardless.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct GovernorPaceFile {
-    pause: bool,
-    reason: &'static str,
-    state: String,
-    written_at_ms: u64,
-}
 
-fn now_epoch_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-/// (#2110/#2109 review nit) Atomic write: a temp file in the SAME
-/// directory (so the rename is same-filesystem, hence atomic on both APFS
-/// and common Linux filesystems) followed by `rename` onto the real path.
-/// Without this, the runtime's poll (`PaceReader::read`, on its own ~2s
-/// cadence, fully independent of this writer's cadence) could observe a
-/// truncated or half-written JSON file mid-write and treat it as
-/// malformed — logged once, harmless, but a needless false alarm on every
-/// governor tick if the two cadences ever raced. `write` + `rename` is the
-/// same pattern `checkpoint.rs` already uses for its own pace-adjacent
-/// out-dir writes.
+/// Write the pace file for a THERMAL reason. A thin alias over
+/// [`crate::pace_file::write`] kept so this module's nine call sites read
+/// unchanged; the atomicity, the heartbeat stamp and the wire shape all
+/// live in that module now (see its doc for why sharing them is the point).
 fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &str) {
-    let pace =
-        GovernorPaceFile { pause, reason, state: state.to_string(), written_at_ms: now_epoch_ms() };
-    // Best-effort — a failed write is observability/pacing, never fatal to
-    // the dispatch itself (mirrors every other sampler-adjacent write in
-    // `dispatch_internal.rs`).
-    let _ = std::fs::create_dir_all(host_out);
-    let Ok(json) = serde_json::to_string(&pace) else { return };
-    let final_path = pace_file_path(host_out);
-    // Unique per-write tmp name (pid + epoch-ns) — the sampler thread is
-    // the only writer for a given dispatch, but a unique name means a
-    // failed/aborted write from an EARLIER tick can never collide with
-    // this one's tmp file if cleanup ever slips.
-    let tmp_path = host_out.join(format!(
-        ".pace.json.tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-    ));
-    if std::fs::write(&tmp_path, &json).is_ok() {
-        let _ = std::fs::rename(&tmp_path, &final_path);
-    }
+    crate::pace_file::write(host_out, pause, reason, state)
 }
 
 /// (#2109) Best-effort derivation of a crawl mission's `STOP` file path
@@ -622,6 +577,18 @@ impl ThermalGovernor {
             stop_owner: None,
             last_stop_write_error: None,
         }
+    }
+
+    /// (#2706) Whether this governor is currently holding the pace file —
+    /// `Paused` or the terminal `Broken`, i.e. anything but `Idle`.
+    ///
+    /// Exists because the pace file has a SECOND writer as of #2706 (the
+    /// battery governor) and one file's precedence has to be decided rather
+    /// than raced. Thermal wins: `power_policy::BatteryGovernor::on_sample`
+    /// takes this value and stands down while it is true. See that type's
+    /// own doc for why, and for how it re-asserts afterwards.
+    pub fn is_pacing(&self) -> bool {
+        self.state != State::Idle
     }
 
     /// (#2456) See the field's own doc.

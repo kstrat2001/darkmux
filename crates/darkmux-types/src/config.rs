@@ -177,7 +177,22 @@ use std::path::Path;
 //           into `extras` harmlessly, and a binary at this version never
 //           reads it. `darkmux doctor` names it and tells the operator to
 //           delete it, same as the `review{}` block above.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.22";
+//   1.23 (#2706): additive top-level `power{}` block —
+//           `min_battery_pct` / `refuse_start_below_min` /
+//           `pause_running_below_min`, the battery-charge gate on run
+//           START and on in-flight CONTINUATION. Top-level rather than
+//           under `runtime` because it governs whether work starts at
+//           all, not how the runtime behaves once it has. Written
+//           VISIBLY by `init` with all three defaults populated (50 /
+//           true / true), per the visible-defaults doctrine: the surface
+//           is discoverable and one edit from changed. `Option`-typed
+//           and lenient-on-read as always — an older binary ignores the
+//           block into `extras` and simply does not gate, which is
+//           exactly its pre-#2706 behavior. NOT an `enabled`-gated
+//           feature block: the two boolean policies ARE the gates, one
+//           per decision, and a master switch would make "off"
+//           expressible two ways.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.23";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -210,6 +225,11 @@ pub struct DarkmuxConfig {
     pub fleet: Option<FleetConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
+    /// (#2706) The battery-charge policy gate — see [`PowerConfig`]'s own
+    /// doc. Top-level rather than under `runtime` because it governs
+    /// whether work STARTS at all, not how the runtime behaves once it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerConfig>,
     // Serde field name stays `mission` — only the Rust type was renamed
     // MissionConfig -> MissionBoardConfig (#1284; see that struct's doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +617,74 @@ pub struct ThermalConfig {
     /// not a sustained condition. Does NOT apply to the `critical` state
     /// check, which still trips immediately. Default `3`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub speed_limit_hold_samples: Option<u32>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2706) **The battery-charge policy** — three knobs, and the start
+/// policy is deliberately separate from the in-flight policy.
+///
+/// ```json
+/// "power": {
+///   "min_battery_pct": 50,
+///   "refuse_start_below_min": true,
+///   "pause_running_below_min": true
+/// }
+/// ```
+///
+/// Refusing to START and interrupting work IN PROGRESS are different
+/// decisions with different costs — an operator may reasonably want one
+/// without the other — so they are two config items rather than one mode.
+/// Written visibly by `darkmux init` with its defaults populated, so the
+/// surface is discoverable and one edit from changed.
+///
+/// **A machine with no battery is never gated.** This is the sharpest
+/// correctness requirement of the feature and it is enforced at the
+/// POLICY, not here: `power_policy::start_decision` and
+/// `power_policy::BatteryGovernor` are inert on an absent reading — not
+/// "treated as 0%", not "treated as 100%", not defaulted either way. In
+/// this fleet the always-on hub is a desktop and the battery-bearing
+/// laptop is the inference peer, so a gate that misread absence would
+/// either block the hub permanently or silently disable itself on the one
+/// machine it exists to protect.
+///
+/// **Describing versus adjudicating.** A gate is an ACTION, so this stays
+/// inside darkmux's describe-don't-adjudicate posture only under a strict
+/// reading: darkmux enforces a threshold THE OPERATOR WROTE and never
+/// invents a policy of its own. Every refusal names what was observed, the
+/// floor, and the config field that produced the decision — so the
+/// operator never has to wonder where it came from. It does not say the
+/// battery is unhealthy, does not recommend a charge policy, and does not
+/// suggest a different threshold.
+///
+/// Deliberately NOT an `enabled`-gated feature block like `redis`/`audit`:
+/// `refuse_start_below_min` and `pause_running_below_min` ARE the gates,
+/// one per policy, and a third master switch would make "off" expressible
+/// two ways.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PowerConfig {
+    /// The charge floor, in percent. Default `50`.
+    ///
+    /// `u64`, not `u8`, matching `runtime.thermal.min_cpu_speed_limit_pct`:
+    /// the lenient-read contract says a hand-written out-of-range value must
+    /// never fail the whole-config parse (which would brick every other
+    /// setting). A `u8` field would reject `"min_battery_pct": 300` at
+    /// DESERIALIZE time; the wide type accepts it and
+    /// `config_access::power_min_battery_pct` clamps it at RESOLUTION time,
+    /// which is where semantic validation belongs (config-leniency
+    /// contract 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub min_battery_pct: Option<u64>,
+    /// A new run will not start below the floor. Default `true`; set
+    /// `false` to allow runs under the threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub refuse_start_below_min: Option<bool>,
+    /// A run already in flight PAUSES when charge crosses the floor.
+    /// Default `true`; set `false` to let it run to completion.
+    ///
+    /// Pausing means pausing: it composes with #2114's pace-file
+    /// contract — checkpoint and resume, never a hard stop. A run type
+    /// whose pause cannot be resumed refuses to pause and says so rather
+    /// than pausing into a state it cannot leave (see
+    /// `power_policy::BatteryEvent::PauseUnsupported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub pause_running_below_min: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1148,6 +1236,18 @@ impl DarkmuxConfig {
                 // concurrent_cap`'s own doc for why this moved down from
                 // the old placeholder `4`.
                 concurrent_cap: Some(1),
+                extras: Default::default(),
+            }),
+            // (#2706) Visible block with every default populated — the
+            // config philosophy's "init writes the knobs the operator
+            // would otherwise have to know to add by hand". Both policies
+            // ship ON: the operator's stated intent is that a laptop below
+            // half charge neither starts nor continues sustained local
+            // inference.
+            power: Some(PowerConfig {
+                min_battery_pct: Some(50),
+                refuse_start_below_min: Some(true),
+                pause_running_below_min: Some(true),
                 extras: Default::default(),
             }),
             mission: Some(MissionBoardConfig {

@@ -5364,6 +5364,88 @@ mod tests {
         assert_eq!(rest_events[0]["reason"], "thermal", "the pace file's reason is stamped on the event");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn a_battery_pause_parks_the_dispatch_and_it_resumes_with_nothing_lost() {
+        // (#2706) The end-to-end pause-and-resume proof for the BATTERY
+        // reason, driven through the real loop rather than asserted about
+        // it. The runtime treats `reason` as opaque text
+        // (`PaceFile::reason_or_default`), so a battery pause must be
+        // honored exactly as a thermal one is — and, decisively, the
+        // dispatch must still run to completion with the SAME turn count
+        // once the pause lifts. "Nothing lost" is not a claim here; it is
+        // `outcome.turns == 3`.
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        register_three_turn_tool_then_stop_script(&server);
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("battery-pause").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        // Exactly what `darkmux_crew::power_policy::BatteryGovernor` writes
+        // when charge crosses the operator's floor — reason and state
+        // spelled the way that governor spells them.
+        std::fs::write(
+            pace::pace_file_path(tmp.path()),
+            r#"{"pause": true, "reason": "battery", "state": "38%"}"#,
+        )
+        .unwrap();
+
+        let sleeper = PaceFlippingSleeper {
+            calls: std::cell::RefCell::new(Vec::new()),
+            out_dir: tmp.path().to_path_buf(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &sleeper,
+        )
+        .expect("the dispatch completes once power returns");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(
+            outcome.turns, 3,
+            "a battery pause is a REST, not a stop: every turn the dispatch would have run still \
+             runs once the pause lifts"
+        );
+        assert_eq!(
+            sleeper.calls.borrow().as_slice(),
+            [2_000],
+            "the pause is honored in bounded ≤2s increments, so a flip back to `pause: false` is \
+             picked up within one increment rather than after a long sleep"
+        );
+
+        drop(traj);
+        let body =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let rest_events: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["type"] == "runtime.rest")
+            .collect();
+        assert_eq!(rest_events.len(), 1);
+        assert_eq!(
+            rest_events[0]["reason"], "battery",
+            "the run's own artifact must say WHY it rested, not merely that it did"
+        );
+        assert_eq!(
+            rest_events[0]["state"], "38%",
+            "and how much charge was left — the governor stamps the reading its decision was \
+             made on, and the runtime echoes it verbatim"
+        );
+    }
+
     /// (#2114 finding 1) A sleeper that, on its FIRST call — i.e. while the
     /// loop is INSIDE the pace-wait poll, still parked at the boundary —
     /// reads `checkpoint.json` and asserts it already reflects THIS

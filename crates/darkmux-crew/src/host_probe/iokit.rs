@@ -36,6 +36,13 @@ extern "C" {
     fn CFStringGetTypeID() -> usize;
     fn CFNumberGetTypeID() -> usize;
     fn CFDataGetTypeID() -> usize;
+    /// (#2705) `ExternalConnected`/`IsCharging`/`BatteryInstalled` on the
+    /// `AppleSmartBattery` node are CFBooleans, NOT CFNumbers — reading one
+    /// through [`dict_i64`] yields `None` (the type check rejects it), which
+    /// is why [`dict_bool`] exists rather than the battery probe coercing a
+    /// number.
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(b: *const c_void) -> bool;
     fn CFDictionaryGetValue(d: CFDictionaryRef, key: *const c_void) -> *const c_void;
     fn CFDictionaryGetCount(d: CFDictionaryRef) -> isize;
     fn CFDictionaryCreateMutableCopy(
@@ -157,6 +164,30 @@ pub unsafe fn dict_i64(d: CFDictionaryRef, key: &str) -> Option<i64> {
     let mut out: i64 = 0;
     CFNumberGetValue(v, K_CF_NUMBER_SINT64, &mut out as *mut i64 as *mut c_void)
         .then_some(out)
+}
+
+/// (#2705) `key` as a bool, when it is present AND actually a CFBoolean.
+///
+/// Deliberately does NOT fall back to [`dict_i64`]'s `!= 0` reading: a key
+/// that changed type across a macOS release should surface as an absent
+/// field (the module doc's rule), not as a silently coerced `false`.
+///
+/// # Safety
+/// `d` must be null or a valid CFDictionary.
+pub unsafe fn dict_bool(d: CFDictionaryRef, key: &str) -> Option<bool> {
+    let v = dict_get(d, key)?;
+    if CFGetTypeID(v) != CFBooleanGetTypeID() {
+        return None;
+    }
+    Some(CFBooleanGetValue(v))
+}
+
+/// (#2705) `key` as a `String`, when it is present AND actually a CFString.
+///
+/// # Safety
+/// `d` must be null or a valid CFDictionary.
+pub unsafe fn dict_string(d: CFDictionaryRef, key: &str) -> Option<String> {
+    cfstring_to_string(dict_get(d, key)?)
 }
 
 /// `key` as a nested CFDictionary (borrowed).
