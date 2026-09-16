@@ -86,6 +86,39 @@ describe("EventLogColumn", () => {
     expect(screen.getByText("no match")).toBeInTheDocument();
   });
 
+  // (#2770) The count chip's VISIBLE text stays a bare "N hidden" (the
+  // desktop header's short-chip layout contract requires it — see
+  // EventLogColumn.tsx's own doc), so the cause the operator's live report
+  // needed lives in the EMPTY-STATE body message instead: the screen that
+  // was actually indistinguishable from a broken viewer was "0 EVENTS" with
+  // nothing in the UI to blame, not a nonzero chip reading "887 hidden".
+  describe("the empty-state message names the responsible filter", () => {
+    it("names the activity filter when unchecking the only present activity value empties the log", () => {
+      const records = [rec({ action: "dispatch.reasoning" })];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      fireEvent.click(document.getElementById("fbtn")!);
+      // Same gesture as "the modal's checkbox grid filters by
+      // category/tier/source" above — the label is the facet value text.
+      fireEvent.click(screen.getByLabelText("reasoning"));
+      expect(screen.getByText("no events match your activity filter")).toBeInTheDocument();
+    });
+
+    it("names search when only the free-text query empties the log", () => {
+      render(<EventLogColumn scopeLabel="fleet" records={[rec({})]} visible />);
+      fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "nothing-matches-this" } });
+      expect(screen.getByText("no events match your search")).toBeInTheDocument();
+    });
+
+    it("stays generic when a facet AND the query are both narrowing (mixed cause)", () => {
+      const records = [rec({ action: "dispatch.reasoning", session_id: "s-alpha" })];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      fireEvent.click(document.getElementById("fbtn")!);
+      fireEvent.click(screen.getByLabelText("reasoning"));
+      fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
+      expect(screen.getByText("no events match your filters")).toBeInTheDocument();
+    });
+  });
+
   // (#1891) The entire nonzero-match branch of `qcountText` had exactly
   // zero coverage before this — only the zero-match "no match" case above
   // was ever exercised. These four pin the grammar, the cap disclosure,
@@ -97,6 +130,10 @@ describe("EventLogColumn", () => {
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     // (#2417 round 3) The one non-matching record is also "hidden" by the
     // active search — same `hiddenSuffix` the no-search chip carries.
+    // (#2770 kept this chip's VISIBLE text plain — the cause label moved to
+    // the empty-state message instead, see EventLogColumn.tsx's own doc on
+    // why: naming it here widened the chip past the desktop header's
+    // <180px short-form layout contract.)
     expect(document.getElementById("qcount")?.textContent).toBe("1 match · 1 hidden");
   });
 
@@ -110,6 +147,8 @@ describe("EventLogColumn", () => {
     fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     // (#2417 round 3) The one non-matching record is also "hidden" by the
     // active search — same `hiddenSuffix` the no-search chip carries.
+    // (#2770 kept this chip's VISIBLE text plain — see the sibling test
+    // above for why.)
     expect(document.getElementById("qcount")?.textContent).toBe("2 matches · 1 hidden");
   });
 

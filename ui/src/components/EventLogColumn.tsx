@@ -11,6 +11,7 @@ import {
   computeFacets,
   createFacetSeen,
   createStoredPicks,
+  hiddenCauseLabel,
   matchesFilters,
   type Facets,
   type FacetSeen,
@@ -601,6 +602,24 @@ export function EventLogColumn({
   // LOG_CAP are rendered" disclosure. Omitted from the chip entirely when
   // zero, so a pane with nothing filtered reads exactly as it did before.
   const hiddenByFilters = records.length - filtered.length;
+  // (#2770, revised same day — CI caught the cost) An earlier revision put
+  // the responsible control's name INTO this suffix ("887 hidden by
+  // activity filter"), which is right in spirit — a bare count beside an
+  // empty search box reads as a rendering fault — but wrong in placement:
+  // `event-log-desktop-header.spec.js`'s "a SHORT count chip shares line 1
+  // with the buttons" test measured the chip at 303px against its own
+  // <180px short-form contract, and three more e2e specs pinned the exact
+  // "hidden$"/"[\d.]+k? hidden$" suffix shape this widened past matching.
+  // Those assertions are the layout contract, not stale expectations — see
+  // this file's own doc on why the count pill has to stay short enough to
+  // share line 1 (2026-09-06, desktop header). So the chip's VISIBLE text
+  // goes back to the plain count. `hiddenCause` is still computed here and
+  // used where it actually answers the operator's complaint: the EMPTY-
+  // STATE message ("no events match your filters" → "no events match your
+  // activity filter") below, when `filtered.length` is zero — that screen,
+  // not a nonzero-but-narrowed chip reading "887 hidden", was the one
+  // indistinguishable from a broken viewer.
+  const hiddenCause = hiddenByFilters > 0 ? hiddenCauseLabel(filters, facets) : null;
   const hiddenSuffix = hiddenByFilters > 0 ? ` · ${hiddenByFilters} hidden` : "";
 
   const q = filters.q.length > 0;
@@ -1027,8 +1046,18 @@ export function EventLogColumn({
                     // unchecked facet, not just the text search — the two
                     // are indistinguishable from here, so the message
                     // covers both honestly rather than naming only search.
+                    //
+                    // (#2770) This is the screen the operator's live report
+                    // was actually about — "0 EVENTS" with an empty search
+                    // box and nothing in the UI to blame reads as a broken
+                    // viewer, not a filter. `hiddenCause` names the one
+                    // control responsible when it's unambiguous ("no events
+                    // match your activity filter"); when the cause is mixed
+                    // (more than one facet narrowed, or a facet AND the
+                    // query both narrowing) it stays the generic message
+                    // rather than misattribute to just one of several.
                     records.length > 0
-                    ? "no events match your filters"
+                    ? `no events match your${hiddenCause ? ` ${hiddenCause}` : " filters"}`
                     : "no events yet"}
             </div>
           )}
