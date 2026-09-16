@@ -4774,9 +4774,19 @@ mod tests {
         // the peer's machine id.
         with_isolated_darkmux_home(|| {
             let flows = tempfile::tempdir().unwrap();
+            // (#2754) GENUINELY RECENT, not a literal. `peer_mission_runs`
+            // filters flow records against a rolling
+            // `RUNS_FLOW_SCAN_WINDOW_DAYS` (14) window computed from the
+            // real wall clock, so a hardcoded date is a time bomb: this
+            // test's old `2026-09-01` fixtures passed every day until
+            // 2026-09-15 and failed every day after, because the fixture
+            // aged out of the window while the code never changed. Same
+            // fix, and the same reason, as #1642's `orphan_ts` in
+            // `darkmux-serve`'s own suite.
+            let ts = darkmux_flow::ts_utc_now();
             let fleet = vec![
-                flow_record("review-peer-1", "hub", "mission start", "2026-09-01T00:00:00Z", "s1"),
-                flow_record("review-peer-1", "hub", "mission close", "2026-09-01T00:05:00Z", "s1"),
+                flow_record("review-peer-1", "hub", "mission start", &ts, "s1"),
+                flow_record("review-peer-1", "hub", "mission close", &ts, "s1"),
             ];
             let known = std::collections::HashSet::new();
             let peer = peer_mission_runs(flows.path(), &fleet, &known);
@@ -4843,13 +4853,16 @@ mod tests {
         // point `mission status` actually calls.
         with_isolated_darkmux_home(|| {
             let flows = tempfile::tempdir().unwrap();
-            let fleet = vec![flow_record(
-                "review-local-1",
-                "hub",
-                "mission start",
-                "2026-09-01T00:00:00Z",
-                "s1",
-            )];
+            // (#2754) Recent for the same reason as the test above — and
+            // here the stale literal was worse than a failure. This test
+            // asserts the list is EMPTY, so once the fixture aged past the
+            // scan window the record was dropped before the
+            // `known_mission_ids` filter ever ran: it passed while proving
+            // nothing, and deleting the filter it names would have left it
+            // green. A recent ts is what makes the assertion load-bearing
+            // again.
+            let ts = darkmux_flow::ts_utc_now();
+            let fleet = vec![flow_record("review-local-1", "hub", "mission start", &ts, "s1")];
             let mut known = std::collections::HashSet::new();
             known.insert("review-local-1".to_string());
             let peer = peer_mission_runs(flows.path(), &fleet, &known);
