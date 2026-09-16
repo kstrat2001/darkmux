@@ -207,6 +207,15 @@ pub struct FleetNode {
     pub fleet_file: PathBuf,
     pub crew_root: PathBuf,
     pub redis_url: String,
+    /// (#2727) `Some` only when this node's harness was booted via
+    /// [`FleetHarness::boot_sharing_redis`] — several harnesses' worth of
+    /// nodes then share ONE physical `redis-server`, and this is what
+    /// keeps their flow records apart: each harness's nodes write into
+    /// their OWN stream (`DARKMUX_REDIS_STREAM`) rather than the shared
+    /// default `darkmux:flow`. `None` (the `boot()` path) leaves the env
+    /// var unset, so a dedicated-redis node's behavior is byte-identical
+    /// to before this field existed.
+    pub redis_stream: Option<String>,
     #[allow(dead_code)] // consumed by Wave-E.2+ scenarios
     pub lmstudio_base_url: String,
     daemon: Child,
@@ -246,6 +255,15 @@ impl FleetNode {
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
             .env("DARKMUX_FLEET_FILE", &self.fleet_file)
             .env("DARKMUX_CREW_DIR", &self.crew_root);
+        // (#2727) Must match whatever the daemon itself is running under
+        // (`spawn_daemon` sets the identical var from the identical
+        // field) — a one-shot CLI command's flow record and the daemon's
+        // own records have to land in the SAME stream, or the two halves
+        // of one node's own state disagree with each other, isolation
+        // question aside.
+        if let Some(stream) = &self.redis_stream {
+            cmd.env("DARKMUX_REDIS_STREAM", stream);
+        }
         cmd
     }
 
@@ -322,6 +340,7 @@ mod darkmux_home_isolation_tests {
             fleet_file: node_dir.join("fleet.json"),
             crew_root: node_dir.join("crew"),
             redis_url: "redis://127.0.0.1:0".to_string(),
+            redis_stream: None,
             lmstudio_base_url: "http://127.0.0.1:0".to_string(),
             daemon,
         };
@@ -410,13 +429,30 @@ mod darkmux_home_isolation_tests {
     }
 }
 
+/// (#2727) Who is responsible for this harness's redis-server.
+///
+/// `Owned` is the original, still-default shape: this harness spawned its
+/// own dedicated `redis-server` and `Drop` kills it, same as always.
+///
+/// `Shared` is new: this harness's nodes were pointed at a `redis-server`
+/// that OUTLIVES this one harness — spawned once per test-binary PROCESS
+/// (see `shared_redis_url`) and reaped only when that whole process exits,
+/// by the same die-with-parent watchdog every fixture already uses. A
+/// `Shared` harness therefore must NOT kill it on `Drop`: a sibling test
+/// running concurrently in another thread of the same process (`cargo
+/// test`'s default) may still be using it.
+enum RedisOwnership {
+    Owned(Child),
+    Shared,
+}
+
 /// The full test harness — owns redis, mock-lmstudio, all daemon nodes,
 /// and the tempdir holding each node's per-node state. `Drop` tears
-/// everything down.
+/// everything down (except a `Shared` redis — see `RedisOwnership`).
 pub struct FleetHarness {
     pub nodes: Vec<FleetNode>,
     pub mock_lmstudio: MockLmStudio,
-    redis: Child,
+    redis: RedisOwnership,
     redis_url: String,
     /// (#2716) Owns the pipe-EOF watchdog and the process group every
     /// fixture below is spawned into, plus this run's registry file.
@@ -445,10 +481,47 @@ impl NodeSpec {
 }
 
 impl FleetHarness {
-    /// Boot a fresh harness: build darkmux, spawn redis on a free port,
-    /// spawn the mock LMStudio, then spawn one daemon per `NodeSpec`.
-    /// Waits for every daemon's `/health` endpoint before returning.
+    /// Boot a fresh harness: build darkmux, spawn a DEDICATED redis on a
+    /// free port, spawn the mock LMStudio, then spawn one daemon per
+    /// `NodeSpec`. Waits for every daemon's `/health` endpoint before
+    /// returning.
+    ///
+    /// This is the default and the right choice whenever a test's
+    /// assertions depend on anything OTHER than the flow stream living on
+    /// an isolated redis: presence beats (`darkmux:presence:<hw-uid>`,
+    /// keyed on real hardware identity, not on anything this harness
+    /// controls) and the fleet work-queue (`darkmux:work`, a fixed name —
+    /// see `darkmux-fleet::queue::WORK_STREAM`) are NOT namespaced per
+    /// test, so two harnesses on the SAME redis would collide on them.
+    /// `boot_sharing_redis` is for the narrower case where neither is in
+    /// play.
     pub fn boot(specs: Vec<NodeSpec>) -> Result<Self, String> {
+        Self::boot_inner(specs, RedisSource::Dedicated)
+    }
+
+    /// Boot a harness whose nodes share a per-TEST-BINARY-PROCESS redis
+    /// instead of spawning a dedicated one (#2727).
+    ///
+    /// `stream` becomes `DARKMUX_REDIS_STREAM` for every node this harness
+    /// spawns, so this harness's flow records live in their own stream on
+    /// the shared server — structurally unreachable from any sibling
+    /// harness using a different `stream` value, the same way two
+    /// dedicated redis instances are unreachable from each other today.
+    /// Pass something that cannot collide with a sibling test's own
+    /// `stream` argument — the enclosing test function's name is the
+    /// simplest thing that is guaranteed unique by the compiler (two
+    /// `#[test] fn`s in one module cannot share a name).
+    ///
+    /// **Only safe when the test's assertions never touch presence or the
+    /// fleet work-queue** — see `boot`'s doc for why those two are NOT
+    /// namespaced by stream. Every current call site of this constructor
+    /// is a validation-rejection or roster/`--deep` test that reaches
+    /// neither (verified by reading, not assumed — see PR description).
+    pub fn boot_sharing_redis(specs: Vec<NodeSpec>, stream: &str) -> Result<Self, String> {
+        Self::boot_inner(specs, RedisSource::Shared(stream.to_string()))
+    }
+
+    fn boot_inner(specs: Vec<NodeSpec>, redis_source: RedisSource) -> Result<Self, String> {
         build_darkmux_release()?;
         let tempdir =
             tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
@@ -465,9 +538,23 @@ impl FleetHarness {
         // is `fixtures` dropping WITHOUT a stand-down — the watchdog sees
         // EOF and TERMs the group. That is why `FixtureGroup` deliberately
         // has no `Drop` impl; see the comment in `fixture_reaper.rs`.
-        let (redis, redis_url) =
-            spawn_redis(&tempdir.path().join("redis"), &mut fixtures)?;
-        wait_for_redis(&redis_url)?;
+        //
+        // (#2727) In the `Shared` case there is nothing to spawn here at
+        // all — `shared_redis_url()` does that once per PROCESS, the
+        // first time any harness in this binary asks for it, and every
+        // later call (this one included) just reads back the same URL.
+        let (redis, redis_url, stream) = match redis_source {
+            RedisSource::Dedicated => {
+                let (redis, redis_url) =
+                    spawn_redis(&tempdir.path().join("redis"), &mut fixtures)?;
+                wait_for_redis(&redis_url)?;
+                (RedisOwnership::Owned(redis), redis_url, None)
+            }
+            RedisSource::Shared(stream) => {
+                let redis_url = shared_redis_url()?;
+                (RedisOwnership::Shared, redis_url, Some(stream))
+            }
+        };
 
         let mock_lmstudio = MockLmStudio::spawn()
             .map_err(|e| format!("spawn mock_lmstudio: {e}"))?;
@@ -479,6 +566,7 @@ impl FleetHarness {
                 &spec,
                 tempdir.path(),
                 &redis_url,
+                stream.as_deref(),
                 &lmstudio_base_url,
                 &mut fixtures,
             )?;
@@ -505,12 +593,16 @@ impl FleetHarness {
         self.fixtures.registry_path()
     }
 
-    /// (#2716) Every OS process this harness owns: the redis fixture and
-    /// one daemon per node. Used by the hard-kill regression test, which
-    /// has to assert from OUTSIDE this process that none of them survived
-    /// it.
+    /// (#2716) Every OS process this harness owns: the redis fixture
+    /// (when `Owned` — a `Shared` redis is NOT this harness's to claim;
+    /// see `RedisOwnership`) and one daemon per node. Used by the
+    /// hard-kill regression test, which has to assert from OUTSIDE this
+    /// process that none of them survived it.
     pub fn fixture_pids(&self) -> Vec<u32> {
-        let mut pids = vec![self.redis.id()];
+        let mut pids = Vec::new();
+        if let RedisOwnership::Owned(redis) = &self.redis {
+            pids.push(redis.id());
+        }
         pids.extend(self.nodes.iter().map(FleetNode::daemon_pid));
         pids
     }
@@ -536,10 +628,85 @@ impl Drop for FleetHarness {
         for node in &mut self.nodes {
             node.kill_daemon();
         }
-        let _ = self.redis.kill();
-        let _ = self.redis.wait();
+        // (#2727) A `Shared` redis outlives this one harness — a sibling
+        // test in another thread of this same process may still be using
+        // it. Only an `Owned` redis is this harness's to kill; the shared
+        // instance is reaped once, at PROCESS exit, by its own dedicated
+        // watchdog (see `shared_redis_url`).
+        if let RedisOwnership::Owned(redis) = &mut self.redis {
+            let _ = redis.kill();
+            let _ = redis.wait();
+        }
         self.fixtures.stand_down();
     }
+}
+
+/// (#2727) Which redis a harness should use — the argument to
+/// `FleetHarness::boot_inner`. Not `pub`: callers pick one of the two
+/// named constructors (`boot` / `boot_sharing_redis`) instead of
+/// constructing this directly.
+enum RedisSource {
+    Dedicated,
+    Shared(String),
+}
+
+/// (#2727) One `redis-server` per test-BINARY PROCESS, shared by every
+/// harness in that process that opts in via `boot_sharing_redis`.
+///
+/// Spawned at most once per process (`OnceLock::get_or_init` — the same
+/// one-shot-across-concurrent-callers guarantee `build_darkmux_release`
+/// already relies on) and never explicitly killed: unlike every other
+/// fixture this module spawns, whose `Drop` path kills it promptly, this
+/// one is deliberately allowed to outlive every individual harness that
+/// uses it, because `cargo test` runs a binary's tests as THREADS of one
+/// process (unlike nextest's process-per-test model) and a sibling test
+/// may still be mid-boot when another one's harness drops.
+///
+/// It still dies with the process, and by the SAME mechanism every other
+/// fixture uses: `FixtureGroup::arm()` below spawns this shared redis's
+/// own die-with-parent watchdog, which never gets `stand_down()`'d, so it
+/// stays armed for as long as the process lives. When this test-binary
+/// process exits — whether all its tests finished normally, or the whole
+/// `cargo test` run was `Ctrl-C`'d or `SIGKILL`ed — the pipe the watchdog
+/// is reading closes, exactly as it would for any other harness's
+/// watchdog, and it TERMs the group. There is deliberately no explicit
+/// "last user closes it" refcounting: refcounting to zero mid-run would
+/// mean whichever test happens to finish last (an ordering `cargo test`
+/// does not promise) tears down a fixture a NEW test could still be about
+/// to request, which reintroduces exactly the kind of timing-dependent
+/// fixture lifecycle #2716 exists to get away from. One spawn, one
+/// teardown, both at process boundaries.
+fn shared_redis_url() -> Result<String, String> {
+    struct SharedRedis {
+        url: String,
+        // Held only to keep the child and its tempdir alive for the
+        // process's lifetime — never explicitly killed (see doc above).
+        // `cargo` warns these fields are never read; that is the point.
+        #[allow(dead_code)]
+        child: Child,
+        #[allow(dead_code)]
+        workdir: tempfile::TempDir,
+    }
+    static SHARED: OnceLock<Result<SharedRedis, String>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let workdir = tempfile::tempdir().map_err(|e| format!("shared redis tempdir: {e}"))?;
+            let mut fixtures = FixtureGroup::arm();
+            let (child, url) = spawn_redis(&workdir.path().join("redis"), &mut fixtures)?;
+            wait_for_redis(&url)?;
+            // `fixtures` (and its watchdog) is intentionally leaked into
+            // this closure's return value having nowhere to go — it is
+            // NOT stored on `SharedRedis` because nothing ever needs to
+            // call a method on it again; keeping the watchdog `Child`
+            // alive is all that matters, and it stays alive because
+            // `fixtures` itself is never dropped (see `mem::forget`
+            // note below).
+            std::mem::forget(fixtures);
+            Ok(SharedRedis { url, child, workdir })
+        })
+        .as_ref()
+        .map(|s| s.url.clone())
+        .map_err(|e| e.clone())
 }
 
 // ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2710) ==========================
@@ -647,6 +814,7 @@ fn spawn_daemon(
     spec: &NodeSpec,
     tempdir_root: &std::path::Path,
     redis_url: &str,
+    redis_stream: Option<&str>,
     lmstudio_base_url: &str,
     fixtures: &mut FixtureGroup,
 ) -> Result<FleetNode, String> {
@@ -703,6 +871,12 @@ fn spawn_daemon(
         .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // (#2727) Only set for a `boot_sharing_redis` harness — see
+    // `FleetNode::cmd()`'s matching pin for why the daemon and this
+    // node's own one-shot CLI commands must agree on the same value.
+    if let Some(stream) = redis_stream {
+        daemon_cmd.env("DARKMUX_REDIS_STREAM", stream);
+    }
     // (#2716) The daemon is the SECOND child with the leaked-orphan shape,
     // not just redis — same `Drop`-only teardown, same outcome under a hard
     // kill. It goes through the same guard.
@@ -721,6 +895,7 @@ fn spawn_daemon(
         fleet_file,
         crew_root,
         redis_url: redis_url.to_string(),
+        redis_stream: redis_stream.map(str::to_string),
         lmstudio_base_url: lmstudio_base_url.to_string(),
         daemon,
     })
