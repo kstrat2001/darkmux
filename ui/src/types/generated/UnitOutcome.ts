@@ -24,7 +24,10 @@ rule: string | null, source: string,
  * this unit ever dispatched) — a `UnitOutcome` a unit's own dispatch
  * wrote. Plus three the SUMMARY builds itself for a step that
  * produced no `UnitOutcome` at all (see `errored_row`): `interrupted`
- * (the step's status was `Abandoned`), `not_run` (still `Planned`/
+ * (the step's status was `Abandoned` — `mission abort`/the
+ * phase-abandon backstop — OR `Error` with a dispatch failure that
+ * coincided with an observed operator interrupt, recovered from the
+ * step's own error text, #2593), `not_run` (still `Planned`/
  * `Running` at summary time — never settled), and `empty` (#2603 —
  * `Complete`, but recorded nothing; NOT `not_run`, because it did
  * run).

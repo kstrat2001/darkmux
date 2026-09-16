@@ -80,6 +80,36 @@ const UNIT_BUDGET_EXHAUSTED: &str = "unit_budget_exhausted";
 /// that, not as an unexplained pile of errors.
 pub const THERMAL_STOP: &str = "thermal_stop";
 
+/// (#2593) A draw's dispatch returned `Err` while `darkmux_types::interrupt::
+/// is_set()` was ALREADY true — the operator's own signal (SIGINT/SIGTERM/
+/// SIGHUP) killed it, mirroring the SAME `is_set() && !status.success()`
+/// gate `dispatch_internal.rs` already applies at both its container and
+/// hosted call sites before returning that same kind of `Err`. Checked at
+/// the moment THIS draw's dispatch fails, never later: `is_set()` is sticky
+/// (never resets — see that module's own doc), so an ordinary failure that
+/// happened BEFORE any interrupt must keep reading `error` even if the
+/// mission is interrupted afterward; only a failure that coincides with an
+/// already-observed interrupt earns this label.
+///
+/// A step kind's `Err` return always lands the STEP at `NodeStatus::Error`
+/// (`apply_step_terminal`, `darkmux-crew/src/scheduler.rs`) — nothing
+/// plumbs a distinct terminal status through for this. So this label alone,
+/// embedded in the `partial` `UnitOutcome` this fn returns Err with, is what
+/// [`errored_row`] recovers from the step's own persisted error text (via
+/// [`INTERRUPTED_MARKER`]) — `step.status` can't tell `"interrupted"` from
+/// an ordinary `"error"` on its own the way it can for `NodeStatus::
+/// Abandoned` (`mission abort`/the phase-abandon backstop).
+const INTERRUPTED_RESULT: &str = "interrupted";
+
+/// The exact JSON key/value the `partial` `UnitOutcome` in `run` serializes
+/// when `result == INTERRUPTED_RESULT` — [`errored_row`] greps a step's own
+/// persisted error TEXT for this literal substring (never a full JSON
+/// parse: the surrounding text is free-form anyhow prose, not guaranteed to
+/// parse as JSON on its own) to recover the label. Stable because both
+/// sides live in this module and `serde_json::to_string` is deterministic,
+/// compact (no whitespace) output for a fixed field order.
+const INTERRUPTED_MARKER: &str = "\"result\":\"interrupted\"";
+
 /// A rough multiple of turns per site — read the site, maybe grep around
 /// it, decide, call `create_finding` (or not). Deliberately generous: a
 /// unit needing fewer turns finishes early via `result: "stop"`; this
@@ -181,7 +211,10 @@ pub struct UnitOutcome {
     /// this unit ever dispatched) — a `UnitOutcome` a unit's own dispatch
     /// wrote. Plus three the SUMMARY builds itself for a step that
     /// produced no `UnitOutcome` at all (see `errored_row`): `interrupted`
-    /// (the step's status was `Abandoned`), `not_run` (still `Planned`/
+    /// (the step's status was `Abandoned` — `mission abort`/the
+    /// phase-abandon backstop — OR `Error` with a dispatch failure that
+    /// coincided with an observed operator interrupt, recovered from the
+    /// step's own error text, #2593), `not_run` (still `Planned`/
     /// `Running` at summary time — never settled), and `empty` (#2603 —
     /// `Complete`, but recorded nothing; NOT `not_run`, because it did
     /// run).
@@ -1541,6 +1574,14 @@ impl StepKind for CrawlUnitStepKind {
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let (mut result, wall_ms, prompt_tokens, completion_tokens, model, detections, rest_ms, host) =
                 match &outcome {
+                    // (#2593) Checked HERE, at the moment THIS draw's
+                    // dispatch failed — not deferred to the summary — so an
+                    // ordinary failure that happened before any interrupt
+                    // keeps reading `error` regardless of what the mission
+                    // does afterward. See `INTERRUPTED_RESULT`'s own doc.
+                    Err(_) if darkmux_types::interrupt::is_set() => {
+                        (INTERRUPTED_RESULT.to_string(), elapsed_ms, 0, 0, None, None, 0, None)
+                    }
                     Err(_) => ("error".to_string(), elapsed_ms, 0, 0, None, None, 0, None),
                     Ok(res) => interpret_dispatch_result(&ctx.unit_id, res),
                 };
@@ -1986,7 +2027,7 @@ pub fn summarize_mission(mission_id: &str) -> Result<CrawlSummary> {
     let (units_in_plan, est_tokens, sources, workspace) = plan_totals(&run_dir.join("plan"));
     let units_completed = count("stop");
     let units_budget_exhausted = count(UNIT_BUDGET_EXHAUSTED);
-    let units_interrupted = count("interrupted");
+    let units_interrupted = count(INTERRUPTED_RESULT);
     // (#2454) Counted in its OWN bucket, subtracted out of `units_errored`
     // below — a unit the thermal breaker skipped before it ever dispatched
     // did not "genuinely break" and must not read as one.
@@ -2174,8 +2215,20 @@ fn errored_row(step: &Step) -> UnitOutcome {
         rule,
         source: String::new(),
         result: match step.status {
-            darkmux_crew::types::NodeStatus::Abandoned => "interrupted".to_string(),
-            darkmux_crew::types::NodeStatus::Error => "error".to_string(),
+            darkmux_crew::types::NodeStatus::Abandoned => INTERRUPTED_RESULT.to_string(),
+            // (#2593) A step kind's `Err` return always lands here — the
+            // scheduler has no distinct terminal status for "failed while
+            // an operator interrupt was already observed" (see
+            // `INTERRUPTED_RESULT`'s own doc) — so an interrupt-coincident
+            // failure is recovered from the step's own persisted error
+            // text, and everything else genuinely reads `error`.
+            darkmux_crew::types::NodeStatus::Error => {
+                if step.output.as_deref().is_some_and(|o| o.contains(INTERRUPTED_MARKER)) {
+                    INTERRUPTED_RESULT.to_string()
+                } else {
+                    "error".to_string()
+                }
+            }
             // The step's kind ran to completion and recorded nothing — NOT
             // "never ran" (see this function's own doc). Falls into the
             // `units_errored` leftover in `summarize_mission`, same as
