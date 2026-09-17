@@ -1307,10 +1307,22 @@ impl ThermalGovernor {
     /// pause, well inside `max_pause_ms` so a normal sampler-cadence jitter
     /// (or one slow tick) can never accidentally cross the runtime's
     /// expiry ceiling between two real writes. `.max(1)` guards a
-    /// pathological `max_pause_ms` of 0..3 from producing a zero interval
+    /// pathological `max_pause_ms` of 1..3 from producing a zero interval
     /// (which would busy-restamp every tick — harmless but wasteful).
+    ///
+    /// (#2774 round-6 MF2) Derived from the STALENESS-CEILING reading of
+    /// `max_pause_ms`, not the raw one — `0` means an unbounded EPISODE,
+    /// and the cadence's whole job is to stay inside the window the
+    /// container actually enforces (which substitutes the default for `0`
+    /// for the reasons `thermal_pace_staleness_ceiling_ms` states). Reading
+    /// `0` here literally would restamp every single tick forever, on the
+    /// one config where the pause is meant to last longest.
     fn restamp_interval_ms(&self) -> u64 {
-        (self.config.max_pause_ms / 4).max(1)
+        let ceiling = match self.config.max_pause_ms {
+            0 => darkmux_types::config_access::THERMAL_MAX_PAUSE_MS_DEFAULT,
+            n => n,
+        };
+        (ceiling / 4).max(1)
     }
 
     /// Whether a reading counts as RECOVERY from an active pause.
@@ -1327,7 +1339,29 @@ impl ThermalGovernor {
     /// `false` when tier 3 is disarmed, which is vacuous rather than
     /// meaningful — `State::Paused` is unreachable without an entry band.
     fn is_recovery_reading(&self, reading: SoftReading) -> bool {
-        self.bands.pause().is_some_and(|p| p.recovery.contains(reading))
+        self.bands.pause().is_some_and(|p| p.recovery().contains(reading))
+    }
+
+    /// (#2774 round-6 MF2) Has THIS pause episode outlasted `max_pause_ms`,
+    /// the cap past which tier 3 hands off to the breaker?
+    ///
+    /// **`0` means UNBOUNDED — rest as long as it takes, never hand off.**
+    /// That is darkmux's stated convention for a `0` bound (`redis.maxlen`,
+    /// `runtime.step_command_timeout_seconds`, and this block's own
+    /// `episode_threshold` all read it that way), and the bare comparison
+    /// this replaces read it as the opposite: `pause_episode_ms >= 0` is a
+    /// TAUTOLOGY on the first sample, so an operator who set `0` to mean
+    /// "never escalate to the breaker" got the breaker on the sample after
+    /// the pause, plus a `STOP` file whose reason word (`thermal-critical`)
+    /// named a state the machine had never reported.
+    ///
+    /// Exists as a method rather than an inline clause because the test is
+    /// made in TWO places — here in `State::Paused`'s arm and again in the
+    /// `None`-thermal arm's `Paused` branch, which accumulates the same
+    /// episode across reading gaps. Those two read the same rule by
+    /// construction now instead of by a maintainer noticing the twin.
+    fn pause_episode_exhausted(&self) -> bool {
+        self.config.max_pause_ms != 0 && self.pause_episode_ms >= self.config.max_pause_ms
     }
 
     /// Feed one thermal sample. `elapsed_ms` is the wall time since the
@@ -1394,7 +1428,7 @@ impl ThermalGovernor {
                         self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
                         self.resume_hold_accum_ms = 0;
                         self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
-                        if self.pause_episode_ms >= self.config.max_pause_ms {
+                        if self.pause_episode_exhausted() {
                             self.state = State::Broken;
                             self.mark_stamped();
                             write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
@@ -1488,7 +1522,7 @@ impl ThermalGovernor {
 
         match self.state {
             State::Idle | State::DutyCycle => {
-                if self.bands.pause().is_some_and(|p| p.entry.contains(reading)) {
+                if self.bands.pause().is_some_and(|p| p.entry().contains(reading)) {
                     return self.enter_paused(&thermal.state, host_out, stop_file);
                 }
                 // (#2774 tier 2) `in_duty_band`: inside tier 2's duty band
@@ -1570,7 +1604,8 @@ impl ThermalGovernor {
             State::Paused => {
                 self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
                 self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
-                if self.is_recovery_reading(reading) {
+                let recovering = self.is_recovery_reading(reading);
+                if recovering {
                     self.resume_hold_accum_ms = self.resume_hold_accum_ms.saturating_add(elapsed_ms);
                 } else {
                     // Still hot enough to matter — hysteresis resets: only
@@ -1585,7 +1620,28 @@ impl ThermalGovernor {
                     // prevent.
                     self.resume_hold_accum_ms = 0;
                 }
-                if self.resume_hold_accum_ms >= self.config.resume_hold_ms {
+                // (#2774 round-6 MF1) Gated on the PREDICATE as well as the
+                // accumulator, the same shape the duty-cycle branch above
+                // uses (`in_duty_band && duty_hold_accum_ms >= …`). The
+                // accumulator alone encodes "a recovery reading was seen"
+                // only while `resume_hold_ms > 0`: at `0` the comparison
+                // `0 >= 0` is a TAUTOLOGY, so a machine reading `serious`
+                // every sample resumed at full speed on the tick after it
+                // paused — and, with the ratchet and the episode count
+                // both advancing on each of those phantom recoveries,
+                // reached tier 4's terminal operator-gated hold in three
+                // samples. `recovering` is the thing the hold was always
+                // measuring; the accumulator only says how LONG.
+                //
+                // This makes `resume_hold_ms = 0` mean "resume on the
+                // first recovery reading" — the same reading
+                // `speed_limit_hold_samples`'s `.max(1)` floor gives its
+                // own `0` — rather than "resume regardless of the
+                // reading." Correct at every value, not just zero, which
+                // is why the predicate is the fix and a floor on the knob
+                // would not have been: a floor leaves the tautology one
+                // edit away.
+                if recovering && self.resume_hold_accum_ms >= self.config.resume_hold_ms {
                     // (#2774 tier 3) The ratchet: applied on EVERY
                     // successful recovery, one-way for the life of this
                     // governor. Multiplied, never divided; nothing else in
@@ -1621,7 +1677,7 @@ impl ThermalGovernor {
                     }
                     return Some(ThermalEvent::Resumed { state: thermal.state.clone() });
                 }
-                if self.pause_episode_ms >= self.config.max_pause_ms {
+                if self.pause_episode_exhausted() {
                     self.state = State::Broken;
                     self.mark_stamped();
                     write_pace_file(host_out, true, "thermal-critical", &thermal.state);
@@ -3663,8 +3719,8 @@ mod tests {
                     resume_at: resume_at.to_string(),
                     ..cfg_tier4_disabled()
                 });
-                let hot = pause.entry.a_member().name();
-                let cool = pause.recovery.a_member().name();
+                let hot = pause.entry().a_member().name();
+                let cool = pause.recovery().a_member().name();
                 assert_eq!(
                     gov.on_sample(Some(&sample(hot, 100)), 2000, dir.path(), None),
                     Some(ThermalEvent::Paused { state: hot.to_string() }),
@@ -3686,6 +3742,355 @@ mod tests {
             }
         }
         assert!(exercised >= 3, "the sweep must exercise real armed bands, got {exercised}");
+    }
+
+    // ─── (#2774 round-6) The SAME defect shape on the TIME knobs ───
+    //
+    // Rounds 2-5 chased "a threshold comparison that degenerates at its
+    // knob's end value" through three SEVERITY predicates and ended that
+    // half structurally (`thermal_bands`). Round 6 found the identical
+    // shape alive on the two unfloored TIME knobs, where the degenerate
+    // value is `0` and the comparison is `accumulator >= knob`. The tests
+    // below are the executable half of that fix: MF1 and MF2 as direct
+    // regressions, then one sweep that enumerates every knob's boundary
+    // values rather than arguing about them.
+
+    /// MF1. `resume_hold_ms = 0` must not resume a machine that is still
+    /// reading `serious`.
+    ///
+    /// The transition used to be gated on the ACCUMULATOR alone, and
+    /// `accum >= 0` is a tautology — so the implication the code relied on
+    /// ("a positive accumulator means a recovery reading was seen") broke
+    /// at exactly this value. Observed before the fix, on nothing but the
+    /// shipped default plus `resume_hold_ms: 0`, feeding `serious` every
+    /// 2000ms: `t=2s Paused` -> `t=4s Resumed{serious}` (pace file
+    /// `{"pause":false}`, and the ratchet doubled on a recovery that never
+    /// happened) -> `t=6s OperatorHold{episode:2}` plus a crawl `STOP`
+    /// file. Three samples from "machine is hot" to the terminal,
+    /// operator-gated hold, with the machine told to run at full speed in
+    /// between.
+    #[test]
+    fn resume_hold_ms_zero_never_resumes_a_still_hot_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov =
+            ThermalGovernor::new(ThermalGovernorConfig { resume_hold_ms: 0, ..cfg() });
+
+        let mut events = Vec::new();
+        for _ in 0..12 {
+            if let Some(ev) =
+                gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), Some(&stop))
+            {
+                events.push(ev);
+            }
+        }
+
+        assert_eq!(
+            events,
+            vec![ThermalEvent::Paused { state: "serious".to_string() }],
+            "a machine that reads `serious` on every sample has never produced a recovery \
+             reading, so the ONLY event in 24s is the pause that started it"
+        );
+        let pace = read_pace(dir.path());
+        assert_eq!(
+            pace["pause"],
+            serde_json::json!(true),
+            "the pace file must still say PAUSED — a resumed one tells the runtime to run at \
+             full speed on a machine reporting `serious`"
+        );
+        assert!(
+            !stop.exists(),
+            "no STOP file: tier 4 is reached by COUNTING EPISODES, and one unbroken pause is \
+             one episode"
+        );
+        assert_eq!(gov.serious_episodes, 1, "one entry into `serious` is one episode");
+        assert_eq!(
+            gov.current_duty_delay_ms,
+            15_000,
+            "the ratchet is applied on RECOVERY; none happened, so the base delay stands"
+        );
+    }
+
+    /// MF1's other half — the fix must not turn `0` into "never resume."
+    /// `resume_hold_ms = 0` has a coherent meaning: resume on the FIRST
+    /// recovery reading, no sustained hold required. (The same reading
+    /// `speed_limit_hold_samples`'s `.max(1)` floor gives its own `0`.)
+    /// Asserted so a later "fix" that reaches for `.max(1)` on the knob
+    /// instead of the predicate has to change a test that states the
+    /// intent.
+    #[test]
+    fn resume_hold_ms_zero_resumes_on_the_first_recovery_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+            resume_hold_ms: 0,
+            ..cfg_tier4_disabled()
+        });
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Paused { state: "serious".to_string() })
+        );
+        assert_eq!(
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Resumed { state: "nominal".to_string() }),
+            "with no hold configured, the first genuinely cool reading clears the pause"
+        );
+    }
+
+    /// MF2. `max_pause_ms = 0` means UNBOUNDED — never hand off to the
+    /// breaker — matching every other `0` bound in darkmux
+    /// (`redis.maxlen`, `runtime.step_command_timeout_seconds`, and this
+    /// block's own `episode_threshold`).
+    ///
+    /// The comparison used to be the bare `pause_episode_ms >=
+    /// max_pause_ms`, i.e. `0 >= 0` on the first sample. Observed before
+    /// the fix, with the shipped default plus `max_pause_ms: 0`: sample 1
+    /// `Paused{serious}`, sample 2 `Breaker{serious}` with pace
+    /// `{"pause":true,"reason":"thermal-critical","state":"serious"}` and a
+    /// `thermal-critical` STOP file — on a machine that had never once
+    /// reported `critical`. So the operator who asked for "rest as long as
+    /// it takes" got the terminal breaker instead, under a reason word that
+    /// misnamed what the hardware said.
+    #[test]
+    fn max_pause_ms_zero_is_unbounded_not_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov =
+            ThermalGovernor::new(ThermalGovernorConfig { max_pause_ms: 0, ..cfg() });
+
+        let mut events = Vec::new();
+        for _ in 0..40 {
+            if let Some(ev) =
+                gov.on_sample(Some(&sample("serious", 100)), 60_000, dir.path(), Some(&stop))
+            {
+                events.push(ev);
+            }
+        }
+
+        assert_eq!(
+            events,
+            vec![ThermalEvent::Paused { state: "serious".to_string() }],
+            "40 minutes of `serious` under an UNBOUNDED cap is still one pause and no breaker"
+        );
+        assert!(!stop.exists(), "an unbounded pause writes no STOP file, ever");
+        assert_eq!(read_pace(dir.path())["reason"], serde_json::json!("thermal"));
+    }
+
+    /// MF2's twin, in the `None`-thermal arm — the branch that accumulates
+    /// the same pause episode across gaps in OS readings, and carried its
+    /// own copy of the bare comparison. Both now read
+    /// `pause_episode_exhausted`, so they cannot disagree about what `0`
+    /// means.
+    #[test]
+    fn max_pause_ms_zero_is_unbounded_across_reading_gaps_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov =
+            ThermalGovernor::new(ThermalGovernorConfig { max_pause_ms: 0, ..cfg() });
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), Some(&stop)),
+            Some(ThermalEvent::Paused { state: "serious".to_string() })
+        );
+        for _ in 0..40 {
+            assert_eq!(
+                gov.on_sample(None, 60_000, dir.path(), Some(&stop)),
+                None,
+                "a reading gap under an unbounded cap is time passing, not a breaker trip"
+            );
+        }
+        assert!(!stop.exists());
+        assert_eq!(read_pace(dir.path())["reason"], serde_json::json!("thermal"));
+    }
+
+    /// The BOUNDED reading is untouched: a real `max_pause_ms` still hands
+    /// off to the breaker on schedule. Without this, "make `0` unbounded"
+    /// could be satisfied by disabling the handoff outright.
+    #[test]
+    fn a_nonzero_max_pause_ms_still_hands_off_to_the_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+            max_pause_ms: 10_000,
+            ..cfg_tier4_disabled()
+        });
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), Some(&stop)),
+            Some(ThermalEvent::Paused { state: "serious".to_string() })
+        );
+        let mut breaker = None;
+        for _ in 0..10 {
+            if let Some(ev) =
+                gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), Some(&stop))
+            {
+                breaker = Some(ev);
+            }
+        }
+        assert_eq!(
+            breaker,
+            Some(ThermalEvent::Breaker { state: "serious".to_string() }),
+            "a FINITE cap must still hand off once the episode outlasts it"
+        );
+        assert!(stop.exists());
+    }
+
+    /// The class regression, stated as an ENUMERATION rather than an
+    /// argument: for every knob in `ThermalGovernorConfig`, at each of its
+    /// boundary values, two invariants that follow from the readings alone
+    /// must hold — no knob setting may manufacture a transition the
+    /// hardware never justified.
+    ///
+    /// - A machine reading `serious` on every sample has produced NO
+    ///   recovery reading, so it may never `Resume`, and (one unbroken
+    ///   pause being one episode) may never reach tier 4's
+    ///   `OperatorHold`. It MAY hit the breaker — but only where
+    ///   `max_pause_ms` is a finite cap the episode genuinely outlasted.
+    /// - A machine reading `nominal` on every sample is cold: no pause, no
+    ///   breaker, no hold, whatever the knobs say.
+    ///
+    /// This is the shape `thermal_bands` ended for the severity
+    /// comparisons, swept over the TIME and COUNT knobs instead: every
+    /// `accumulator >= knob` in the module is exercised at the knob value
+    /// where it degenerates. MF1 and MF2 each fail this sweep on their own
+    /// (verified by mutation), and so would a future knob that grows the
+    /// same shape.
+    #[test]
+    fn no_knob_boundary_value_manufactures_a_transition_the_readings_never_justified() {
+        // Each entry mutates ONE knob off the shipped default. `u64::MAX` /
+        // `u32::MAX` are in the list because the saturating arithmetic the
+        // accumulators use has a degenerate top end too, not only a zero.
+        type Mutate = (&'static str, fn(&mut ThermalGovernorConfig));
+        let knobs: Vec<Mutate> = vec![
+            ("resume_hold_ms=0", |c| c.resume_hold_ms = 0),
+            ("resume_hold_ms=1", |c| c.resume_hold_ms = 1),
+            ("resume_hold_ms=MAX", |c| c.resume_hold_ms = u64::MAX),
+            ("max_pause_ms=0", |c| c.max_pause_ms = 0),
+            ("max_pause_ms=1", |c| c.max_pause_ms = 1),
+            ("max_pause_ms=MAX", |c| c.max_pause_ms = u64::MAX),
+            ("duty_delay_ms=0", |c| c.duty_delay_ms = 0),
+            ("duty_delay_ms=MAX", |c| c.duty_delay_ms = u64::MAX),
+            ("ratchet_factor=0", |c| c.ratchet_factor = 0),
+            ("ratchet_factor=1", |c| c.ratchet_factor = 1),
+            ("ratchet_factor=MAX", |c| c.ratchet_factor = u32::MAX),
+            ("episode_threshold=0", |c| c.episode_threshold = 0),
+            ("episode_threshold=1", |c| c.episode_threshold = 1),
+            ("episode_threshold=MAX", |c| c.episode_threshold = u32::MAX),
+            ("speed_limit_hold_samples=0", |c| c.speed_limit_hold_samples = 0),
+            ("speed_limit_hold_samples=1", |c| c.speed_limit_hold_samples = 1),
+            ("speed_limit_hold_samples=MAX", |c| c.speed_limit_hold_samples = u32::MAX),
+            ("min_cpu_speed_limit_pct=0", |c| c.min_cpu_speed_limit_pct = 0),
+            ("min_cpu_speed_limit_pct=MAX", |c| c.min_cpu_speed_limit_pct = u64::MAX),
+        ];
+
+        const ELAPSED_MS: u64 = 2000;
+        const SAMPLES: usize = 24;
+
+        for (label, mutate) in knobs {
+            // ── A hot machine: `serious`, forever, at full clock speed. ──
+            let mut config = cfg();
+            mutate(&mut config);
+            // `cpu_speed_limit_pct` is held at 100 so the speed-limit
+            // breaker cannot fire on its own signal and confound the
+            // reading-driven invariants below. `min_cpu_speed_limit_pct=MAX`
+            // is the one entry where 100 is still "below the floor" — it is
+            // MEANT to trip the breaker, which the allowance handles.
+            let speed_floor_trips = 100 < config.min_cpu_speed_limit_pct;
+            let dir = tempfile::tempdir().unwrap();
+            let stop = dir.path().join("STOP");
+            let mut gov = ThermalGovernor::new(config.clone());
+            let mut events = Vec::new();
+            for _ in 0..SAMPLES {
+                if let Some(ev) =
+                    gov.on_sample(Some(&sample("serious", 100)), ELAPSED_MS, dir.path(), Some(&stop))
+                {
+                    events.push(ev);
+                }
+            }
+
+            assert!(
+                !events.iter().any(|e| matches!(e, ThermalEvent::Resumed { .. })),
+                "{label}: a machine that never read a recovery state must never RESUME — \
+                 that is MF1's shape. events={events:?}"
+            );
+            // One unbroken pause is ONE episode, at every knob setting.
+            // This is the crispest statement of MF1's defect: the phantom
+            // resumes it produced each minted a FRESH episode, which is
+            // what walked the run to tier 4 in three samples.
+            assert_eq!(
+                gov.serious_episodes, 1,
+                "{label}: the machine crossed into `serious` exactly once, so the episode \
+                 count may not exceed 1 — a higher count means a recovery was counted that \
+                 the readings never contained. events={events:?}"
+            );
+            // Tier 4 MAY fire here, but only as the operator configured it
+            // (`episode_threshold = 1`, escalate on the first episode) —
+            // and then only ever on episode 1. MF1's run reached it on a
+            // fabricated episode 2.
+            for ev in &events {
+                if let ThermalEvent::OperatorHold { episode, .. } = ev {
+                    assert_eq!(
+                        *episode, 1,
+                        "{label}: tier 4 on an episode past the first, from a single unbroken \
+                         pause — that is MF1's shape. events={events:?}"
+                    );
+                }
+            }
+            let hold_is_earned = config.tier4_enabled && config.episode_threshold == 1;
+            if !hold_is_earned {
+                assert!(
+                    !events.iter().any(|e| matches!(e, ThermalEvent::OperatorHold { .. })),
+                    "{label}: the configured episode threshold is not reachable from one \
+                     episode, so tier 4 must not fire. events={events:?}"
+                );
+            }
+            // The breaker IS allowed here, but only where the config asked
+            // for it: a finite `max_pause_ms` the episode outlasted, or a
+            // speed floor above the sampled 100%.
+            let elapsed_total = ELAPSED_MS * SAMPLES as u64;
+            let breaker_is_earned = speed_floor_trips
+                || (config.max_pause_ms != 0 && config.max_pause_ms <= elapsed_total);
+            if !breaker_is_earned {
+                assert!(
+                    !events.iter().any(|e| matches!(e, ThermalEvent::Breaker { .. })),
+                    "{label}: no finite cap elapsed and no speed floor tripped, so a breaker \
+                     here is manufactured — that is MF2's shape. events={events:?}"
+                );
+            }
+            if !breaker_is_earned && !hold_is_earned {
+                assert!(
+                    !stop.exists(),
+                    "{label}: neither terminal was earned, so nothing may drop a STOP file — \
+                     an unearned breaker's says `thermal-critical`, naming a state the \
+                     machine never reported"
+                );
+            }
+
+            // ── A cold machine: `nominal`, forever. Nothing may fire. ──
+            let dir = tempfile::tempdir().unwrap();
+            let stop = dir.path().join("STOP");
+            let mut gov = ThermalGovernor::new(config.clone());
+            let mut cold = Vec::new();
+            for _ in 0..SAMPLES {
+                if let Some(ev) = gov.on_sample(
+                    Some(&sample("nominal", 100)),
+                    ELAPSED_MS,
+                    dir.path(),
+                    Some(&stop),
+                ) {
+                    cold.push(ev);
+                }
+            }
+            if !speed_floor_trips {
+                assert!(
+                    cold.iter().all(|e| matches!(
+                        e,
+                        ThermalEvent::DutyCycleEntered { .. } | ThermalEvent::DutyCycleExited { .. }
+                    )),
+                    "{label}: a machine reading `nominal` on every sample is COLD — only tier \
+                     2's duty cycle may ever fire, never a pause, breaker or hold. \
+                     events={cold:?}"
+                );
+                assert!(!stop.exists(), "{label}: a cold machine never gets a STOP file");
+            }
+        }
     }
 
     /// The WIDE-gap case, which the round-2 predicate could also have got

@@ -1329,15 +1329,57 @@ pub fn thermal_resume_hold_ms() -> u64 {
     pick_parsed("DARKMUX_THERMAL_RESUME_HOLD_MS", cfg, Some(60_000)).unwrap()
 }
 
+/// The built-in `runtime.thermal.max_pause_ms` default — 15 minutes. Named
+/// rather than a repeated literal because [`thermal_max_pause_ms`] and
+/// [`thermal_pace_staleness_ceiling_ms`] must not be able to drift apart.
+pub const THERMAL_MAX_PAUSE_MS_DEFAULT: u64 = 900_000;
+
 /// Cap (ms) on one continuous pause episode before the governor hands off
 /// to the breaker. Default `900000` (15 minutes).
+///
+/// (#2774 round-6 MF2) **`0` means UNBOUNDED — rest as long as it takes,
+/// never hand off to the breaker** — darkmux's standing reading of a `0`
+/// bound (`redis.maxlen`, `runtime.step_command_timeout_seconds`, and this
+/// block's own `episode_threshold`). Deliberately NOT floored the way
+/// `speed_limit_hold_samples` and `ratchet_factor` are: there, `0` has no
+/// coherent meaning and a floor is the kindest reading; here it has the
+/// same defined meaning every other darkmux bound gives it.
+///
+/// Callers that need a POSITIVE ceiling rather than an episode cap —
+/// the pace-file heartbeat cadence, and the value forwarded to the
+/// container — want [`thermal_pace_staleness_ceiling_ms`] instead.
 pub fn thermal_max_pause_ms() -> u64 {
     let cfg = config()
         .runtime
         .as_ref()
         .and_then(|r| r.thermal.as_ref())
         .and_then(|t| t.max_pause_ms);
-    pick_parsed("DARKMUX_THERMAL_MAX_PAUSE_MS", cfg, Some(900_000)).unwrap()
+    pick_parsed("DARKMUX_THERMAL_MAX_PAUSE_MS", cfg, Some(THERMAL_MAX_PAUSE_MS_DEFAULT)).unwrap()
+}
+
+/// (#2774 round-6 MF2) The pace-file STALENESS ceiling — the same knob in
+/// its OTHER role, with `0`'s unbounded reading resolved to the built-in
+/// default rather than passed through.
+///
+/// `max_pause_ms` does two jobs. As an EPISODE CAP (host side) `0` means
+/// "never hand off to the breaker", which is coherent. As a FRESHNESS
+/// WINDOW (`runtime/src/pace.rs::is_expired`, and the restamp cadence that
+/// keeps a pause inside it) a literal `0` would mean "honor a pause for
+/// 0 ms" — every pause ignored, the runtime racing on a machine the host
+/// believes it has stopped. That is strictly worse than the tautology MF2
+/// fixed, so the unbounded reading does not leak into this role.
+///
+/// The substitute is the DEFAULT, not infinity, and that is deliberate:
+/// #2114's heartbeat contract says "indefinite" is expressed as an active
+/// writer re-stamping, never as an opt-out flag. A never-expiring pace file
+/// would be that flag under another name, and would let a DEAD writer's
+/// last pause hold a container forever. `0` buys an unbounded episode from
+/// a live governor; it does not buy immunity from the staleness rule.
+pub fn thermal_pace_staleness_ceiling_ms() -> u64 {
+    match thermal_max_pause_ms() {
+        0 => THERMAL_MAX_PAUSE_MS_DEFAULT,
+        n => n,
+    }
 }
 
 /// Breaker floor: `cpu_speed_limit_pct` below this triggers the breaker
@@ -4001,6 +4043,43 @@ mod tests {
             match prev_r {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
                 None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-6 MF2) `max_pause_ms = 0` means an UNBOUNDED episode on
+    /// the host side, and that reading must NOT leak into the pace-file
+    /// staleness window.
+    ///
+    /// The container computes `now - written_at > max_pause_ms`
+    /// (`runtime/src/pace.rs::is_expired`). Forwarding a literal `0` makes
+    /// every pause expire on the next poll — the runtime racing at full
+    /// speed on a machine the host believes it has stopped, which is
+    /// strictly worse than the tautology MF2 removed. So the unbounded
+    /// reading resolves to the built-in default HERE, while
+    /// `thermal_max_pause_ms` keeps returning the operator's `0` for the
+    /// episode cap that genuinely is unbounded.
+    #[serial_test::serial]
+    #[test]
+    fn an_unbounded_max_pause_still_yields_a_finite_staleness_ceiling() {
+        let prev = std::env::var("DARKMUX_THERMAL_MAX_PAUSE_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_MAX_PAUSE_MS", "0") };
+        assert_eq!(thermal_max_pause_ms(), 0, "the episode cap keeps the operator's 0");
+        assert_eq!(
+            thermal_pace_staleness_ceiling_ms(),
+            THERMAL_MAX_PAUSE_MS_DEFAULT,
+            "a 0-ms freshness window would mean every pause is ignored, not held forever"
+        );
+
+        // A real value passes through both readings unchanged.
+        unsafe { std::env::set_var("DARKMUX_THERMAL_MAX_PAUSE_MS", "120000") };
+        assert_eq!(thermal_max_pause_ms(), 120_000);
+        assert_eq!(thermal_pace_staleness_ceiling_ms(), 120_000);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_MAX_PAUSE_MS", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_MAX_PAUSE_MS"),
             }
         }
     }

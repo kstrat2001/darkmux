@@ -39,3 +39,13 @@ tempfile = { version = "3.10", optional = true }
 [dev-dependencies]
 tempfile = "3.10"
 serial_test = "3.1"
+# (#2774 round-6 C4) The self dev-dep every other member already uses to turn
+# `test-support` on for its own test build — here pointed at this crate.
+# Without it, `#[cfg(feature = "test-support")]` tests in THIS crate compile
+# OUT of a single-package run (`cargo nextest run -p darkmux-types -E
+# 'test(thermal)'` ran 1 test, not 2), and only exist when some dependent's
+# feature selection happens to unify the feature in — which
+# `cargo test --workspace` does and a targeted run does not. A test that
+# silently is not there on the loop a developer actually runs is worse than
+# no test.
+darkmux-types = { path = ".", features = ["test-support"] }

@@ -909,6 +909,7 @@ name = "darkmux-types"
 version = "3.7.1"
 dependencies = [
  "anyhow",
+ "darkmux-types",
  "dirs",
  "libc",
  "serde",

@@ -5627,7 +5627,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2110/#2109) Resolved through config_access now that
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
-        max_pause_ms_env: Some(darkmux_types::config_access::thermal_max_pause_ms()),
+        //
+        // (#2774 round-6 MF2) The STALENESS-CEILING reading of that knob,
+        // not the raw one: what the container does with this number is
+        // `now - written_at > n` (`runtime/src/pace.rs::is_expired`), and
+        // an unbounded episode (`max_pause_ms = 0`) forwarded literally
+        // would make every pause expire on the next poll — the runtime
+        // racing on a machine the host believes it stopped. See that
+        // accessor's own doc for why the substitute is the default rather
+        // than infinity.
+        max_pause_ms_env: Some(darkmux_types::config_access::thermal_pace_staleness_ceiling_ms()),
         // (#2114 follow-up / #2162) The trigger: `validate_resume_checkpoint`
         // (before model selection) and `write_staged_resume_checkpoint`
         // (once `host_out` exists) above already verified + staged the

@@ -1,10 +1,38 @@
-//! (#2774 round-4) Validated thermal severity bands — the value that makes
-//! an unsatisfiable or tautological thermal tier UNREPRESENTABLE.
+//! (#2774 round-4, scope narrowed round-6) Validated thermal SEVERITY bands
+//! — the value that makes an unsatisfiable or tautological thermal tier
+//! unrepresentable *in its severity comparisons*. That is one instance of a
+//! wider rule, stated next; the rest of the rule lives in
+//! [`crate::thermal_governor`] and is covered by tests rather than by types.
 //!
-//! ## The defect class this module exists to end
+//! ## The rule, stated first
 //!
-//! Four review rounds on #2774 found the SAME defect three times, each in a
-//! different predicate, each one introduced by the previous round's fix:
+//! **A threshold comparison must not degenerate at its knob's end value.**
+//!
+//! That is the shape six review rounds on #2774 kept finding. It is a rule
+//! about COMPARISONS, not about severities — a fact this module's own doc
+//! got wrong for one round, which is why the rule now leads.
+//!
+//! What "degenerate" means, in both directions:
+//!
+//! - **unsatisfiable** at some end value — no input can satisfy the
+//!   predicate, so the behavior it gates is dead;
+//! - **tautological** at some end value — every input satisfies it, so the
+//!   complement — the "when do we leave" half — is dead instead.
+//!
+//! Either way a control-flow edge silently disappears at one setting of one
+//! knob, while reading correctly at every value anyone tested.
+//!
+//! ## Where it has appeared, and what covers each
+//!
+//! The rule has two instances in this module's subject matter. This file
+//! ends the first one STRUCTURALLY; the second is a code rule with a test
+//! sweep behind it, and is named here so a reader takes away the rule
+//! rather than a settled claim.
+//!
+//! ### Instance 1 — SEVERITY comparisons (what this module makes unrepresentable)
+//!
+//! Found three times, each in a different predicate, each introduced by the
+//! previous round's fix:
 //!
 //! | round | the predicate | the shape |
 //! |---|---|---|
@@ -12,16 +40,48 @@
 //! | 3 | arming became `severity(pause_at) > severity(resume_at)` | a PAIR relationship that never checks either value against the enum's ENDS — so it caught the round-2 shape and nothing else |
 //! | 4 | tier 2's duty band `sev >= severity(resume_at)`, which for `resume_at = "nominal"` read `sev >= 0` | **tautological** — `!in_duty_band` unreachable, so `DutyCycle` could never be exited and a cold machine picked up a permanent, ratcheting turn delay |
 //!
-//! The root cause is one shape, not three bugs: **severity comparisons
-//! written ad hoc against raw `usize` ranks, with nothing guaranteeing that
-//! the resulting band is inhabited or that its complement is reachable.**
-//! Each fix patched one predicate and left the shape standing for the next
-//! round to fall into.
+//! The local cause was **severity comparisons written ad hoc against raw
+//! `usize` ranks, with nothing guaranteeing that the resulting band is
+//! inhabited or that its complement is reachable.** Each fix patched one
+//! predicate and left the shape standing for the next round to fall into,
+//! which is what "What replaces instance 1" below is a response to.
 //!
-//! ## What replaces it
+//! ### Instance 2 — TIME and COUNT comparisons (round 6, `thermal_governor`)
+//!
+//! The same shape on the module's `accumulator >= knob` comparisons, where
+//! the end value is `0`:
+//!
+//! | knob | the predicate | the shape |
+//! |---|---|---|
+//! | `resume_hold_ms = 0` | `resume_hold_accum_ms >= resume_hold_ms` | **tautological** — the accumulator stood in for "a recovery reading was seen", an implication that holds only while the knob is positive. A machine reading `serious` every sample resumed at FULL SPEED on the tick after it paused, and the phantom recoveries minted fresh episodes until tier 4's terminal operator-gated hold, three samples in |
+//! | `max_pause_ms = 0` | `pause_episode_ms >= max_pause_ms` | **tautological** — a `thermal-critical` breaker plus `STOP` file on the sample after the pause, on a machine that had never reported `critical`, for an operator whose `0` meant "rest as long as it takes" — darkmux's standing reading of a `0` bound, per the repo's own CLAUDE.md |
+//!
+//! Neither has a band to refuse, so the structural move this file makes
+//! does not apply. What covers them instead:
+//!
+//! - **the fix is the PREDICATE, not a floor on the knob.** `resume_hold_ms`
+//!   is now gated on `is_recovery_reading(reading) && accum >= hold` — the
+//!   shape the duty-cycle branch already used (`in_duty_band && …`). A
+//!   floor would have been correct at `0` and left the tautology one edit
+//!   away; a predicate is correct at every value. `max_pause_ms` reads its
+//!   `0` as UNBOUNDED, the meaning every other darkmux bound gives it.
+//! - **the sweep is the test.** `thermal_governor`'s
+//!   `no_knob_boundary_value_manufactures_a_transition_the_readings_never_justified`
+//!   enumerates every knob at its boundary values and asserts two
+//!   invariants that follow from the READINGS alone — a machine that never
+//!   read a recovery state never resumes; a cold machine never pauses. A
+//!   knob value cannot manufacture a transition the hardware did not
+//!   justify, which is what a degenerate comparison does.
+//!
+//! **When you add a knob to this module, go to that sweep first.** The
+//! question to answer is not "is my comparison right" — it read right in
+//! all six rounds — but "at each END of this knob's range, is the
+//! comparison still satisfiable AND still falsifiable."
+//!
+//! ## What replaces instance 1
 //!
 //! A band is a VALUE, built once, by a constructor that can refuse — and
-//! the two failure modes above are exactly its two refusal conditions:
+//! the two degenerate shapes are exactly its two refusal conditions:
 //!
 //! - **unsatisfiable**: no reading in the band's universe satisfies it;
 //! - **tautological**: every reading in that universe satisfies it, so the
@@ -186,14 +246,17 @@ impl Band {
 /// governor cycles, manufacturing a fresh `serious` EPISODE every
 /// `resume_hold_ms` and reaching tier 4's terminal operator-gated hold in
 /// about a minute on a machine that never got hot.
+///
+/// (#2774 round-6 C3) The fields are PRIVATE, for the same reason
+/// [`Band`]'s are: `pub` fields make the struct literal a second
+/// constructor, and `PauseBands { entry, recovery }` from any two `Band`s
+/// bypasses [`PauseBands::new`] and the disjointness check above. Nothing
+/// did that — but "the constructor is the only way in" is the whole
+/// mechanism, and a `pub` field leaves it true only by convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PauseBands {
-    /// At or above `pause_at`: enter tier 3's pause (or, at the episode
-    /// threshold, tier 4's hold).
-    pub entry: Band,
-    /// At or below `resume_at`: a reading that counts toward clearing an
-    /// active pause.
-    pub recovery: Band,
+    entry: Band,
+    recovery: Band,
 }
 
 impl PauseBands {
@@ -204,6 +267,18 @@ impl PauseBands {
             return None;
         }
         Some(Self { entry, recovery })
+    }
+
+    /// At or above `pause_at`: enter tier 3's pause (or, at the episode
+    /// threshold, tier 4's hold).
+    pub fn entry(self) -> Band {
+        self.entry
+    }
+
+    /// At or below `resume_at`: a reading that counts toward clearing an
+    /// active pause.
+    pub fn recovery(self) -> Band {
+        self.recovery
     }
 }
 
@@ -319,7 +394,7 @@ impl ThermalBands {
         // band is tested against stop one short of `pause_at`. When tier 3
         // is disarmed nothing returns first, and the ceiling is the soft
         // universe's own.
-        let duty_ceiling = pause.map_or(SOFT_MAX, |b| b.entry.a_non_member().0);
+        let duty_ceiling = pause.map_or(SOFT_MAX, |b| b.entry().a_non_member().0);
         let duty = Band::new(r, duty_ceiling, duty_ceiling);
         if duty.is_none() {
             notes.push(DisarmNote {
@@ -494,10 +569,10 @@ mod tests {
                     check(d, "the duty band");
                 }
                 if let Some(p) = bands.pause() {
-                    check(p.entry, "the pause-entry band");
-                    check(p.recovery, "the recovery band");
+                    check(p.entry(), "the pause-entry band");
+                    check(p.recovery(), "the recovery band");
                     assert!(
-                        !SoftReading::all().any(|r| p.entry.contains(r) && p.recovery.contains(r)),
+                        !SoftReading::all().any(|r| p.entry().contains(r) && p.recovery().contains(r)),
                         "{label}: a reading is both hot enough to pause and cool enough to resume"
                     );
                 }
@@ -548,15 +623,15 @@ mod tests {
         let f = SoftReading::of("fair").unwrap();
         let s = SoftReading::of("serious").unwrap();
         // tier 1: nominal, no delay.
-        assert!(!duty.contains(n) && !pause.entry.contains(n));
-        assert!(pause.recovery.contains(n));
+        assert!(!duty.contains(n) && !pause.entry().contains(n));
+        assert!(pause.recovery().contains(n));
         // tier 2: fair duty-cycles.
         assert!(duty.contains(f));
-        assert!(!pause.entry.contains(f));
-        assert!(pause.recovery.contains(f), "fair is also where a pause recovers to");
+        assert!(!pause.entry().contains(f));
+        assert!(pause.recovery().contains(f), "fair is also where a pause recovers to");
         // tiers 3/4: serious pauses, and is NOT a recovery.
-        assert!(pause.entry.contains(s));
-        assert!(!pause.recovery.contains(s));
+        assert!(pause.entry().contains(s));
+        assert!(!pause.recovery().contains(s));
         assert!(!duty.contains(s), "serious is tier 3's, not tier 2's");
     }
 

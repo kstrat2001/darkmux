@@ -3182,7 +3182,7 @@ fn check_thermal_governor() -> Check {
     // `THERMAL_STATES` exactly, so if `config_access`'s normalization ever
     // goes away, this warns (loud) instead of passing (silent).
     let bands = darkmux_crew::thermal_bands::ThermalBands::resolve(&pause_at, &resume_at);
-    if let Some(first) = bands.disarm_notes().first() {
+    if !bands.disarm_notes().is_empty() {
         return Check {
             name: name.into(),
             status: Status::Warn,
@@ -3203,7 +3203,24 @@ fn check_thermal_governor() -> Check {
                     .collect::<Vec<_>>()
                     .join(" Also: "),
             ),
-            hint: Some(first.remedy.clone()),
+            // (#2774 round-6 C2) EVERY note's remedy, not just the first.
+            // The message already concatenates every `why`; handing back
+            // one remedy for two problems sends the operator round the
+            // loop — on `pause_at = critical, resume_at = nominal` both
+            // tiers are disarmed for different reasons, so fixing the
+            // first and re-running doctor just produces the second
+            // warning. Deduped because two notes can legitimately share a
+            // remedy (one `config set` line resolving both), and printing
+            // it twice reads as two steps.
+            hint: Some({
+                let mut seen: Vec<&str> = Vec::new();
+                for note in bands.disarm_notes() {
+                    if !seen.contains(&note.remedy.as_str()) {
+                        seen.push(note.remedy.as_str());
+                    }
+                }
+                seen.join(" ")
+            }),
         };
     }
 
@@ -9680,6 +9697,57 @@ mod tests {
                 check.hint.as_deref().is_some_and(|h| h.contains("resume_at")),
                 "pause_at={pause_at}: the remedy must point at the knob that is wrong: {:?}",
                 check.hint
+            );
+        }
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-6 C2) When TWO things are wrong, the hint names both.
+    ///
+    /// The message already concatenates every disarm note's `why`; the
+    /// hint took only `disarm_notes().first()`. On `pause_at = critical,
+    /// resume_at = nominal` that sends the operator round the loop —
+    /// fix the one remedy shown, re-run doctor, get a second warning about
+    /// a knob that was already wrong when they ran it the first time.
+    #[test]
+    #[serial_test::serial]
+    fn a_doubly_broken_pair_gets_a_remedy_for_every_reason_it_is_broken() {
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "critical");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+        }
+
+        // Pre-check: this pair really does produce more than one note, so
+        // the assertion below is not vacuously satisfied by a single-note
+        // config that happens to mention both knobs.
+        let notes = darkmux_crew::thermal_bands::ThermalBands::resolve("critical", "nominal");
+        assert!(
+            notes.disarm_notes().len() > 1,
+            "this test needs a pair that is broken for two DIFFERENT reasons, got {:?}",
+            notes.disarm_notes()
+        );
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let hint = check.hint.clone().unwrap_or_default();
+        for note in notes.disarm_notes() {
+            assert!(
+                hint.contains(note.remedy.as_str()),
+                "every reason the ladder is disarmed needs its remedy in the hint — missing \
+                 {:?} from {hint:?}",
+                note.remedy
             );
         }
 
