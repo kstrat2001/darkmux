@@ -705,9 +705,10 @@ fn render_surface_block(surface: RadioSurface) -> String {
     match surface {
         RadioSurface::Cli => "Surface: command line (`darkmux radio`). There is no shell here \
              that runs `/anything` — a catalog command is invoked by radio itself, never typed \
-             by the user. Never write a bare `/id`. Name a catalog command as `darkmux mission \
-             launch <id>`, which runs that exact command directly; name any other darkmux verb \
-             as the full line from the command index below."
+             by the user. Never write a bare `/id`, and never name a catalog command by its id \
+             alone: `review` on its own is not something the user can run. Name a catalog \
+             command as `darkmux mission launch <id>`, which runs that exact command directly; \
+             name any other darkmux verb as the full line from the command index below."
             .to_string(),
         RadioSurface::Panel => "Surface: editor panel. A catalog command runs by its exact \
              slash id (e.g. `/pr-list`). Any other darkmux verb is a command the user types in \
@@ -726,9 +727,9 @@ fn render_surface_block(surface: RadioSurface) -> String {
 fn surface_instructions(surface: RadioSurface) -> String {
     match surface {
         RadioSurface::Cli => "on the command line, a catalog command is `darkmux mission launch \
-             <id>` — never a bare `/id`, since there is no shell here that runs `/anything`; \
-             any other darkmux verb is the full line from the command index (e.g. `darkmux \
-             machine status`)."
+             <id>` — never a bare `/id` and never the id on its own, since there is no shell \
+             here that runs `/anything` and no such subcommand either; any other darkmux verb \
+             is the full line from the command index (e.g. `darkmux machine status`)."
             .to_string(),
         RadioSurface::Panel => "in this panel, a catalog command runs by its exact slash id \
              (e.g. `/pr-list`); any other darkmux verb is a command the user types in a \
@@ -878,7 +879,7 @@ fn chunk_names_an_unrunnable_command(
         } else if let Some(rest) = part.strip_prefix("darkmux ") {
             !darkmux_reference_is_valid(rest, verb_index)
         } else {
-            false
+            is_a_bare_catalog_id(part, catalog)
         };
         if unrunnable {
             return true;
@@ -919,6 +920,48 @@ fn bare_slash_token_is_unrunnable(text: &str, catalog: &[CatalogEntry], surface:
         i = end;
     }
     false
+}
+
+/// `true` iff `span` is EXACTLY an advertised command id, with no
+/// `/` and no `darkmux ` in front of it (#2050, third measurement).
+///
+/// A bare id is runnable on NEITHER surface, so this needs no `surface`
+/// argument. The panel's own parser requires the slash
+/// (`acp_panel::parse_command` returns `None` without it) and the CLI has
+/// no such clap subcommand — `darkmux review` exits with `unrecognized
+/// subcommand 'review'` and helpfully suggests `serve`. The seat produced
+/// exactly this, measured live:
+///
+/// > ``Run `review` to execute the code review pipeline against your
+/// > current working-tree diff.``
+///
+/// which the detector passed, because a bare id is neither of the two
+/// shapes the persona instructs the seat to write, so nothing looked at
+/// it. The runnable forms are `darkmux mission launch review` and
+/// `/review`, and both are still accepted by the arms above.
+///
+/// **The one reading under which it is not wrong**, checked and rejected:
+/// `darkmux radio "review"` DOES route, so "say `review` to radio" would
+/// be true. But the sentence carries no such framing, the user is already
+/// talking to radio, and this project already picked the canonical CLI
+/// form in `render_surface_block`. So the text is wrong, not merely
+/// ambiguous.
+///
+/// **Deliberately requires the backticks.** Only a whole inline-code span
+/// is tested, never a word in prose — an id is frequently an ordinary
+/// English word (`review`), and the catalog is operator-authored, so
+/// scanning prose for ids would discard replies wholesale. "I'll review
+/// your diff" and "the review config" are untouched; only `` `review` ``
+/// is a claim about something to type.
+///
+/// The residual false positive, stated: a legitimate MENTION in backticks
+/// — "`review` takes no arguments" — is read as an instruction and costs
+/// the reply. Accepted on the same ordering as the rest of this module:
+/// the fallback is honest and unhelpful, and the alternative is telling a
+/// user to run something that errors.
+fn is_a_bare_catalog_id(span: &str, catalog: &[CatalogEntry]) -> bool {
+    let id = span.trim();
+    !id.is_empty() && catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
 }
 
 /// `true` iff `span` is SHAPED like a slash command rather than a path: a
@@ -2095,6 +2138,91 @@ mod tests {
         assert!(!detects("Like this:\n```\n/machine\n```\nThat is the shape.", RadioSurface::Cli));
     }
 
+    // ── (#2050, third measurement) a bare catalog id is not an invocation ──
+
+    #[test]
+    fn detects_a_bare_catalog_id_named_as_something_to_run() {
+        // Measured live on `355ebda8` for `run the review pipeline`:
+        //   "Run `review` to execute the code review pipeline against your
+        //    current working-tree diff. It will report any bugs it finds."
+        // followed by, in the operator's terminal:
+        //   $ darkmux review
+        //   error: unrecognized subcommand 'review'
+        //     tip: a similar subcommand exists: 'serve'
+        //
+        // A bare id is runnable on NEITHER surface: the panel's parser
+        // requires the slash, and there is no such clap subcommand.
+        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+            assert!(
+                detects("Run `review` to execute the code review pipeline.", surface),
+                "a bare catalog id is not an invocation on {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_the_runnable_forms_of_the_same_catalog_command() {
+        // The inverted case, and the one that matters most: if these were
+        // caught, the seat could never name the command CORRECTLY, and
+        // every reply about `review` would collapse to the fallback.
+        assert!(
+            !detects("Run `darkmux mission launch review` to start it.", RadioSurface::Cli),
+            "the CLI's own canonical form must pass"
+        );
+        assert!(
+            !detects("Run `/review` to start it.", RadioSurface::Panel),
+            "the panel's own canonical form must pass"
+        );
+    }
+
+    #[test]
+    fn leaves_a_catalog_id_alone_when_it_is_ordinary_prose() {
+        // The backticks are the whole signal. An id is often an ordinary
+        // English word and the catalog is operator-authored, so scanning
+        // prose for ids would discard replies wholesale.
+        for reply in [
+            "I'll review your working-tree diff for bugs.",
+            "The review config takes no arguments.",
+            "Your review ran twice yesterday.",
+        ] {
+            assert!(!detects(reply, RadioSurface::Cli), "prose must never trip the fallback: {reply}");
+        }
+    }
+
+    #[test]
+    fn leaves_a_backticked_span_that_is_not_a_catalog_id_alone() {
+        // Only an EXACT id is a candidate — a config key or a near-miss
+        // word must not be read as a command.
+        for reply in ["Set `reviewer` in your profile.", "Check `radio.humor` first."] {
+            assert!(!detects(reply, RadioSurface::Cli), "{reply}");
+        }
+    }
+
+    #[test]
+    fn answer_never_tells_a_cli_user_to_run_a_panel_only_command() {
+        // The end-to-end pin the operator asked for: a seat reply naming a
+        // panel-only command on the CLI surface must not reach the user as
+        // a bare shell instruction. It reaches them as the plain refusal
+        // plus the live listing instead.
+        let mut call = |_msg: &str| -> Result<String> {
+            Ok("Run `review` to execute the code review pipeline against your current \
+                working-tree diff. It will report any bugs it finds."
+                .to_string())
+        };
+        let shelf = ArtifactShelf::default();
+        let err = answer(
+            "run the review pipeline",
+            &fixture_catalog(),
+            &shelf,
+            Path::new("/tmp"),
+            GroundingScope::Full,
+            RadioSurface::Cli,
+            &mut call,
+        )
+        .expect_err("a bare panel-command name must not ship to a CLI user as something to type");
+        assert!(format!("{err:#}").contains("cannot be run on this surface"), "{err:#}");
+    }
+
     // ── (#2050, second measurement) no salvaged remainder, ever ──────────
 
     #[test]
@@ -2161,7 +2289,11 @@ mod tests {
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/templates/builtin/roles/radio-host.md"));
         assert!(SHIPPED_TEMPLATE.contains("{{surface_instructions}}"), "the template must still carry the placeholder");
         for (surface, needle) in
-            [(RadioSurface::Cli, "darkmux mission launch"), (RadioSurface::Panel, "exact slash id")]
+            // (#2050) The CLI needle is the BARE-ID clause, not just the
+            // canonical form: the instruction already named the canonical
+            // form and the seat still wrote a bare id, so what this pins
+            // is the sentence that closes that gap.
+            [(RadioSurface::Cli, "never the id on its own"), (RadioSurface::Panel, "exact slash id")]
         {
             let prompt = substitute_persona(SHIPPED_TEMPLATE, 40, surface);
             assert!(!prompt.contains("{{"), "no placeholder may reach the model ({surface:?}): {prompt}");
