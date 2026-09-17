@@ -4786,6 +4786,91 @@
         .expect("the hint darkmux prints must be a command darkmux accepts");
     }
 
+    /// (#2774 round-3 MF2) The F2 regression the round-2 fix did NOT
+    /// close, proven through the real gate: a dispatch that ran WITHOUT
+    /// `--workdir` gets `auto_workspace_path`, i.e.
+    /// `std::env::temp_dir().join(...)`, raw and un-canonicalized. On
+    /// macOS that is `/var/folders/...`; `/var` is a symlink to
+    /// `/private/var`, and the resume's `--workdir` goes through
+    /// `validate_workdir`, which canonicalizes. The two strings never
+    /// matched, so tier 4's hint was refused with RESUME WORKSPACE
+    /// MISMATCH for every no-`--workdir` dispatch — exactly the error F2
+    /// exists to eliminate.
+    ///
+    /// The round-2 tests miss it because they build the origin from
+    /// `TempDir::new()` and hand the SAME `Path` to both the writer and
+    /// the gate, so canonicalization is never exercised. This one puts the
+    /// workspace under `std::env::temp_dir()` the way production does and
+    /// runs the hint's `--workdir` through `validate_workdir` first.
+    #[test]
+    fn the_tier4_hint_survives_an_auto_tempdir_workspace_through_validate_workdir() {
+        let ws = std::env::temp_dir().join(format!(
+            "darkmux-dispatch-coder-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(ws.clone());
+
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_resume_origin_meta(prior.path(), &ws, false, None);
+
+        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        let args = parse_hint_args(&hint);
+        let workdir = flag_value(&args, "--workdir").expect("hint names --workdir").to_string();
+
+        // Production runs every `--workdir` through this before the gate
+        // ever sees it (`dispatch()`'s `validated_workdir`).
+        let validated = darkmux_types::workdir::validate_workdir(std::path::Path::new(&workdir))
+            .expect("the hint's workdir must validate");
+
+        validate_resume_checkpoint(prior.path(), "coder", &validated, false).unwrap_or_else(|e| {
+            panic!(
+                "the hint darkmux prints must be accepted after the SAME canonicalization \
+                 production applies to --workdir. hint workdir: {workdir}\n validated: {}\n \
+                 error: {e:#}",
+                validated.display()
+            )
+        });
+    }
+
+    /// The narrow half of the same fix, so a regression is attributable to
+    /// the WRITER rather than only to the end-to-end round trip.
+    #[test]
+    fn resume_origin_records_the_canonical_workspace_path() {
+        let ws = std::env::temp_dir().join(format!(
+            "darkmux-origin-canon-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        let prior = TempDir::new().unwrap();
+        write_resume_origin_meta(prior.path(), &ws, false, None);
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(prior.path().join(RESUME_ORIGIN_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["workspace"],
+            serde_json::json!(ws.canonicalize().unwrap().display().to_string()),
+            "the recorded workspace must be the CANONICAL path — the gate's other side has \
+             been through validate_workdir, which canonicalizes"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+
     /// The crawl-unit case, which needs BOTH the right `--workdir` and
     /// `--workspace-read-only`: a read-only origin resumed read-write is
     /// refused as a mount escalation.
@@ -4826,8 +4911,17 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         write_resume_origin_meta(prior.path(), workspace.path(), true, None);
 
-        let err = validate_resume_checkpoint(prior.path(), "coder", workspace.path(), false)
-            .unwrap_err();
+        // (#2774 round-3 MF2) `expected_workspace` is CANONICALIZED here
+        // because that is what production passes — `dispatch()`'s
+        // `validated_workdir` comes out of `validate_workdir`, which
+        // canonicalizes. Handing the gate a raw `TempDir` path (what this
+        // test did before) meant it never exercised the comparison the
+        // real gate performs, which is how MF2 survived F2's own fix. With
+        // the origin now recording the canonical path, a raw expected path
+        // fails on MISMATCH before reaching the escalation check this test
+        // is about.
+        let expected = workspace.path().canonicalize().unwrap();
+        let err = validate_resume_checkpoint(prior.path(), "coder", &expected, false).unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME WORKSPACE MOUNT ESCALATION"),
             "got: {err:#}"
@@ -4849,7 +4943,12 @@
         assert!(hint.contains("'"), "a path with a space must be quoted: {hint}");
         let args = parse_hint_args(&hint);
         let workdir = flag_value(&args, "--workdir").unwrap();
-        assert_eq!(workdir, workspace.display().to_string());
+        // (#2774 round-3 MF2) The hint names the CANONICAL path, because
+        // that is what the gate's other side has been through
+        // (`validate_workdir`). The space — the thing this test is about —
+        // survives either way.
+        assert_eq!(workdir, workspace.canonicalize().unwrap().display().to_string());
+        assert!(workdir.ends_with("My Projects"), "the space must survive: {workdir}");
         validate_resume_checkpoint(prior.path(), "coder", std::path::Path::new(workdir), false)
             .expect("a quoted path must still be the right path");
     }

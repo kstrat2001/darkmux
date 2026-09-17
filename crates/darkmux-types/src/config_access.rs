@@ -445,7 +445,13 @@ pub fn audit_enabled() -> bool {
 /// turned on. See `CmdConfig`'s own doc for the feature this gates.
 pub fn cmd_enabled() -> bool {
     if let Some(s) = env_str("DARKMUX_CMD_ENABLED") {
-        return matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        // (#2774 round-3 C7) One vocabulary, shared with the opt-OUT
+        // family and with `darkmux config set` — see `parse_bool_token`.
+        // `unwrap_or(false)` is what makes this the FAIL-CLOSED half:
+        // an unrecognized token leaves a gated feature off. Behavior is
+        // unchanged from the hand-rolled `matches!` this replaces (same
+        // truthy set, same case-insensitivity, same fallback).
+        return parse_bool_token(&s).unwrap_or(false);
     }
     config().cmd.as_ref().and_then(|g| g.enabled).unwrap_or(false)
 }
@@ -474,7 +480,13 @@ pub fn cmd_allowed(verb: &str) -> bool {
 /// whole.
 pub fn hooks_enabled() -> bool {
     if let Some(s) = env_str("DARKMUX_HOOKS_ENABLED") {
-        return matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        // (#2774 round-3 C7) One vocabulary, shared with the opt-OUT
+        // family and with `darkmux config set` — see `parse_bool_token`.
+        // `unwrap_or(false)` is what makes this the FAIL-CLOSED half:
+        // an unrecognized token leaves a gated feature off. Behavior is
+        // unchanged from the hand-rolled `matches!` this replaces (same
+        // truthy set, same case-insensitivity, same fallback).
+        return parse_bool_token(&s).unwrap_or(false);
     }
     config().hooks.as_ref().and_then(|h| h.enabled).unwrap_or(false)
 }
@@ -1024,7 +1036,13 @@ pub fn injected_context_fraction() -> f64 {
 /// a *string* parsed per this var's truthy set (config is already a typed bool).
 pub fn strict_selection() -> bool {
     if let Some(s) = env_str("DARKMUX_STRICT_SELECTION") {
-        return matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        // (#2774 round-3 C7) One vocabulary, shared with the opt-OUT
+        // family and with `darkmux config set` — see `parse_bool_token`.
+        // `unwrap_or(false)` is what makes this the FAIL-CLOSED half:
+        // an unrecognized token leaves a gated feature off. Behavior is
+        // unchanged from the hand-rolled `matches!` this replaces (same
+        // truthy set, same case-insensitivity, same fallback).
+        return parse_bool_token(&s).unwrap_or(false);
     }
     config().runtime.as_ref().and_then(|r| r.strict_selection).unwrap_or(false)
 }
@@ -1127,7 +1145,16 @@ pub fn feedback_injection() -> bool {
 /// (#2165) `feedback_injection` plus WHICH tier resolved it.
 pub fn feedback_injection_with_source() -> (bool, Source) {
     if let Some(s) = env_str("DARKMUX_FEEDBACK_INJECTION") {
-        return (!matches!(s.as_str(), "0" | "off" | "false" | "no"), Source::Env);
+        // (#2774 round-3 C7) Was the fourth boolean vocabulary in this
+        // file: the same opt-OUT shape as the five `unwrap_or(true)`
+        // accessors, but case-SENSITIVE — so `DARKMUX_FEEDBACK_INJECTION=OFF`
+        // resolved TRUE while `DARKMUX_THERMAL_ENABLED=OFF` resolved FALSE,
+        // two safety-adjacent knobs disagreeing about what a token means.
+        // Now `parse_bool_token`, like every other boolean here: `off`,
+        // `OFF`, `False`, `No` all disable, and `1`/`yes`/`on` are
+        // recognized as enabling rather than merely "not one of the four
+        // falsy literals."
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
     }
     match config().runtime.as_ref().and_then(|r| r.feedback_injection) {
         Some(v) => (v, Source::Config),
@@ -1237,31 +1264,56 @@ pub fn thermal_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// OS thermal state at or above which the governor pauses. Default `"serious"`.
+/// (#2774 round-3 C4) Normalize a thermal-state token at RESOLUTION —
+/// trimmed and lowercased, the same canonical form `darkmux config set`'s
+/// `Ty::ThermalState` already stores.
+///
+/// This closes a proven split. `darkmux doctor` validated `pause_at` by
+/// LOWERCASING it before comparing against `THERMAL_STATES`, while
+/// `thermal_governor::severity()` compared the RAW string, and nothing in
+/// between normalized. So `pause_at = "Serious"` — a hand-edited config,
+/// or one written before `config set` validated the token — reached a
+/// doctor **Pass** whose message affirmatively claimed tier 4 was enabled,
+/// while the governor scored it as an UNKNOWN state (ranked worse than
+/// `critical`, per `severity`'s own deliberate reasoning) and tiers 2/3/4
+/// were silently inert: a `serious` reading produced no event and no pace
+/// file at all. One normalization, at the single place the precedence
+/// chain resolves, and every consumer agrees.
+fn normalize_thermal_state(raw: String) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+/// OS thermal state at or above which the governor pauses. Default
+/// `"serious"`. Normalized — see [`normalize_thermal_state`].
 pub fn thermal_pause_at() -> String {
-    env_str("DARKMUX_THERMAL_PAUSE_AT")
-        .or_else(|| {
-            config()
-                .runtime
-                .as_ref()
-                .and_then(|r| r.thermal.as_ref())
-                .and_then(|t| t.pause_at.clone())
-        })
-        .unwrap_or_else(|| "serious".to_string())
+    normalize_thermal_state(
+        env_str("DARKMUX_THERMAL_PAUSE_AT")
+            .or_else(|| {
+                config()
+                    .runtime
+                    .as_ref()
+                    .and_then(|r| r.thermal.as_ref())
+                    .and_then(|t| t.pause_at.clone())
+            })
+            .unwrap_or_else(|| "serious".to_string()),
+    )
 }
 
 /// OS thermal state at or below which the governor is eligible to resume
-/// (after `thermal_resume_hold_ms`). Default `"fair"`.
+/// (after `thermal_resume_hold_ms`). Default `"fair"`. Normalized — see
+/// [`normalize_thermal_state`].
 pub fn thermal_resume_at() -> String {
-    env_str("DARKMUX_THERMAL_RESUME_AT")
-        .or_else(|| {
-            config()
-                .runtime
-                .as_ref()
-                .and_then(|r| r.thermal.as_ref())
-                .and_then(|t| t.resume_at.clone())
-        })
-        .unwrap_or_else(|| "fair".to_string())
+    normalize_thermal_state(
+        env_str("DARKMUX_THERMAL_RESUME_AT")
+            .or_else(|| {
+                config()
+                    .runtime
+                    .as_ref()
+                    .and_then(|r| r.thermal.as_ref())
+                    .and_then(|t| t.resume_at.clone())
+            })
+            .unwrap_or_else(|| "fair".to_string()),
+    )
 }
 
 /// How long (ms) the state must hold at/below `thermal_resume_at()` before
@@ -3750,6 +3802,139 @@ mod tests {
                 "KNOWN_GAPS claims `{base}` is unread (tracked at {issue}), but it now has a \
                  real caller — remove it from KNOWN_GAPS so this guard covers it again"
             );
+        }
+    }
+
+    // ── (#2774 round-3 C7) ONE boolean vocabulary, finished ──
+
+    /// Round 2's commit claimed "one vocabulary"; round 3 measured three
+    /// still in this file — the new `parse_bool_token(..).unwrap_or(true)`
+    /// opt-OUT family, a hand-rolled fail-CLOSED `matches!` family
+    /// (`cmd_enabled`, `hooks_enabled`, `strict_selection`), and
+    /// `feedback_injection_with_source`, which had the opt-out SHAPE but
+    /// was case-SENSITIVE. The proof was two knobs disagreeing on the same
+    /// token: `DARKMUX_FEEDBACK_INJECTION=OFF` resolved `true` while
+    /// `DARKMUX_THERMAL_ENABLED=OFF` resolved `false`.
+    ///
+    /// Behavioral, across both families, on the tokens that used to split.
+    #[serial_test::serial]
+    #[test]
+    fn every_boolean_env_knob_reads_the_same_token_vocabulary() {
+        let names = [
+            "DARKMUX_FEEDBACK_INJECTION",
+            "DARKMUX_THERMAL_ENABLED",
+            "DARKMUX_CHECK_UPDATES",
+            "DARKMUX_THERMAL_TIER4_ENABLED",
+            "DARKMUX_CMD_ENABLED",
+            "DARKMUX_HOOKS_ENABLED",
+            "DARKMUX_STRICT_SELECTION",
+        ];
+        let prev: Vec<_> = names.iter().map(|n| (*n, std::env::var(n).ok())).collect();
+
+        // Every FALSY spelling disables every knob in both families.
+        for token in ["0", "false", "FALSE", "False", "no", "No", "off", "OFF", " off "] {
+            unsafe {
+                for n in names {
+                    std::env::set_var(n, token);
+                }
+            }
+            assert!(!feedback_injection(), "feedback_injection({token})");
+            assert!(!thermal_enabled(), "thermal_enabled({token})");
+            assert!(!check_updates(), "check_updates({token})");
+            assert!(!thermal_tier4_enabled(), "thermal_tier4_enabled({token})");
+            assert!(!cmd_enabled(), "cmd_enabled({token})");
+            assert!(!hooks_enabled(), "hooks_enabled({token})");
+            assert!(!strict_selection(), "strict_selection({token})");
+        }
+        // Every TRUTHY spelling enables every knob in both families.
+        for token in ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " on "] {
+            unsafe {
+                for n in names {
+                    std::env::set_var(n, token);
+                }
+            }
+            assert!(feedback_injection(), "feedback_injection({token})");
+            assert!(thermal_enabled(), "thermal_enabled({token})");
+            assert!(cmd_enabled(), "cmd_enabled({token})");
+            assert!(strict_selection(), "strict_selection({token})");
+        }
+        // An UNRECOGNIZED token is where the two families legitimately
+        // differ, and the difference is the POINT: an opt-out must not be
+        // turned off by a typo, an opt-in must not be turned on by one.
+        unsafe {
+            for n in names {
+                std::env::set_var(n, "maybe");
+            }
+        }
+        assert!(feedback_injection(), "an opt-OUT stays on for an unrecognized token");
+        assert!(thermal_enabled(), "…same");
+        assert!(!cmd_enabled(), "an opt-IN stays off for an unrecognized token");
+        assert!(!hooks_enabled(), "…same");
+        assert!(!strict_selection(), "…same");
+
+        unsafe {
+            for (n, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
+        }
+    }
+
+    /// The source-level half, so a NEW hand-rolled boolean vocabulary
+    /// cannot be added without this going red. A behavioral test only
+    /// covers the accessors it happens to name; this covers the file.
+    #[test]
+    fn no_accessor_hand_rolls_its_own_boolean_token_set() {
+        let source = include_str!("config_access.rs");
+        // The two shapes round 3 found: a `matches!` over truthy literals
+        // and a `!matches!` over falsy ones. ASSEMBLED AT RUNTIME, never
+        // spelled as one literal — a literal here matches ITSELF in the
+        // included source, which is exactly how the first draft of this
+        // test went red against nothing but its own body.
+        let joined = |tokens: &[&str]| {
+            tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" | ")
+        };
+        for forbidden in [joined(&["1", "true", "yes", "on"]), joined(&["0", "off", "false", "no"])]
+        {
+            let hits: Vec<&str> = source
+                .lines()
+                .filter(|l| l.contains(&forbidden))
+                // `parse_bool_token` itself IS the one vocabulary.
+                .filter(|l| !l.contains("=> Some("))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "config_access.rs must route every boolean env token through \
+                 `parse_bool_token` (#2774 C7) — found a hand-rolled set:\n{hits:#?}"
+            );
+        }
+    }
+
+    /// (#2774 round-3 C4) Thermal-state tokens normalize at RESOLUTION, so
+    /// `thermal_governor::severity()`'s raw comparison and `darkmux
+    /// doctor`'s validation can never disagree about the same config.
+    #[serial_test::serial]
+    #[test]
+    fn thermal_state_tokens_normalize_at_resolution() {
+        let prev_p = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_r = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", " Serious ");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "FAIR");
+        }
+        assert_eq!(thermal_pause_at(), "serious");
+        assert_eq!(thermal_resume_at(), "fair");
+        unsafe {
+            match prev_p {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_r {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
         }
     }
 }

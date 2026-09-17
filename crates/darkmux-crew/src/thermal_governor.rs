@@ -99,6 +99,21 @@
 //! shares `Broken`'s heartbeat-forever mechanics (re-stamps on the same
 //! cadence, terminal for decisions) with its own `reason` string so a flow
 //! reader can tell "the count escalated" from "the machine got critical."
+//! (#2774 round-3 C8) That reason now also reaches the crawl `STOP` file
+//! tier 4 drops — the artifact an operator opens first, which used to say
+//! `thermal-critical` regardless, so the two artifacts of one event
+//! disagreed about what the event was.
+//!
+//! **The soft tiers need a coherent threshold pair, and refuse to run
+//! without one.** Tiers 2/3/4 all key off `pause_at`/`resume_at`, and the
+//! hysteresis model needs `pause_at` STRICTLY more severe than `resume_at`
+//! — otherwise one reading is at once "hot enough to pause" and "cool
+//! enough to resume", and there is no coherent answer to give.
+//! `ThermalGovernor::new` decides this once
+//! ([`ThermalGovernor::soft_tiers_armed`]) and an incoherent pair runs no
+//! soft tier at all; the BREAKER compares against its own thresholds and
+//! is unaffected. See that method's own doc for the two defects, in
+//! opposite directions, that produced this rule (#2774 round-3 MF1).
 
 use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
@@ -420,10 +435,20 @@ pub fn stop_unresolved_cause<'a>(
 /// `thermal.stop_unresolved` warning rather than let the crawl keep
 /// dispatching units past a tripped breaker with no trace of why the STOP
 /// never landed. See [`ThermalGovernor::last_stop_write_error`]'s own doc.
-fn write_stop_file(stop_file: &Path, owner: Option<&str>) -> Result<(), String> {
+///
+/// (#2774 round-3 C8) `reason` is a PARAMETER, not the fixed
+/// [`STOP_FILE_REASON`] this used to hard-code. The module doc's stated
+/// purpose for tier 4 carrying its own reason — "so a reader can tell a
+/// count-based escalation from a hardware-critical one" — was failing for
+/// the artifact an operator `cat`s FIRST: tier 4 wrote
+/// `reason: "thermal-episode-limit"` into the pace file and then a STOP
+/// file that said `thermal-critical`, i.e. the two artifacts of one event
+/// disagreed about what the event was. Pass the SAME string both writes
+/// use; see [`STOP_FILE_REASON_EPISODE_LIMIT`].
+fn write_stop_file(stop_file: &Path, owner: Option<&str>, reason: &str) -> Result<(), String> {
     crate::exclusive_fs::write_file_refusing_symlinks_0600(
         stop_file,
-        stop_file_body(owner).as_bytes(),
+        stop_file_body(owner, reason).as_bytes(),
     )
 }
 
@@ -445,19 +470,29 @@ fn write_stop_file(stop_file: &Path, owner: Option<&str>) -> Result<(), String> 
 /// `touch`, or one from a pre-#2454 binary) honored by everyone, since
 /// only a human can know what that one meant. See [`stop_hold_for_mission`]
 /// for the read side.
-fn stop_file_body(owner: Option<&str>) -> String {
+fn stop_file_body(owner: Option<&str>, reason: &str) -> String {
     match owner.map(str::trim).filter(|m| !m.is_empty()) {
         // Deliberately one greppable line rather than JSON: an operator
         // finding this file wants `cat` to answer "what is this and who
         // left it", and the reader below only needs the one field.
-        Some(mission) => format!("{STOP_FILE_REASON} mission={mission}\n"),
-        None => format!("{STOP_FILE_REASON}\n"),
+        Some(mission) => format!("{reason} mission={mission}\n"),
+        None => format!("{reason}\n"),
     }
 }
 
-/// The STOP file's reason word — the same string the pace file carries as
-/// `reason` on a breaker trip, so the two artifacts of one event read alike.
+/// The STOP file's reason word for a BREAKER trip — the same string the
+/// pace file carries as `reason` on that trip, so the two artifacts of one
+/// event read alike.
 pub const STOP_FILE_REASON: &str = "thermal-critical";
+
+/// (#2774 round-3 C8) The STOP file's reason word for a TIER-4 escalation
+/// — the same string the pace file carries as `reason` on that hold, for
+/// exactly the reason [`STOP_FILE_REASON`] exists. Tier 4 is a COUNT-based
+/// escalation ("this machine has had N `serious` episodes"), not a
+/// hardware-critical one; an operator reading `thermal-critical` in the
+/// STOP file of a machine that never reported `critical` would be reading
+/// the wrong story off the first artifact they open.
+pub const STOP_FILE_REASON_EPISODE_LIMIT: &str = "thermal-episode-limit";
 
 /// (#2454) Why a reader is honoring a STOP file it found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,8 +609,22 @@ pub struct ThermalLadderSummary {
 /// (no `mission_id`, e.g. a bare `darkmux dispatch`) can never match
 /// another unattributed run's leftovers, and degrades to the pre-F5
 /// per-dispatch scoping rather than to a wrong carry-forward.
+///
+/// (#2774 round-3 C10) Carries a `schema_version`, like every other
+/// darkmux persisted shape (CLAUDE.md cross-system contract 5). The reader
+/// is lenient — a file written before this field existed, or by a NEWER
+/// binary with a higher version, still seeds, because every field is
+/// optional-on-read and the shape has only ever grown. The version is here
+/// so a future BREAKING change (a retyped or removed field) has something
+/// to gate on; adding it while the reader is lenient costs nothing, and
+/// adding it after a breaking change is impossible without stranding every
+/// file already on disk.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedLadderState {
+    /// (#2774 round-3 C10) `LADDER_STATE_SCHEMA_VERSION` at write time;
+    /// `None` for a file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_version: Option<u32>,
     /// The mission that wrote this state (`ThermalGovernor::stop_owner`).
     #[serde(default)]
     owner: Option<String>,
@@ -583,6 +632,36 @@ struct PersistedLadderState {
     serious_episodes: u32,
     #[serde(default)]
     current_duty_delay_ms: u64,
+}
+
+/// (#2774 round-3 C10) The ladder-state file's data-shape version. Bump
+/// on a BREAKING change to [`PersistedLadderState`] (a field renamed,
+/// retyped or removed); a purely additive optional field does not need
+/// one, since the reader is lenient by construction.
+const LADDER_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// (#2774 round-3 C12) Read the ladder-state file, refusing to follow a
+/// SYMLINK at the final path component.
+///
+/// The threat model is the one `write_stop_file` already documents and
+/// #2456 already accepted for the STOP file next to this one: reaching it
+/// needs local write access to `<root>/crawl/<manifest>/` in the first
+/// place. It is closed anyway because it is one `symlink_metadata` call,
+/// and because the two files sit in the same directory with the same
+/// lifetime — leaving one guarded and the other not is the kind of
+/// asymmetry a later reader has to re-derive.
+///
+/// `None` for every not-a-regular-file case (absent, a symlink, a
+/// DIRECTORY, unreadable), which is exactly what both callers already
+/// treat as "no prior state."
+fn read_ladder_state_refusing_symlinks(path: &Path) -> Option<String> {
+    // `symlink_metadata` does NOT traverse the final component, so a
+    // symlink reports as a symlink rather than as whatever it points at.
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 /// Resolved thermal-governor tuning (`config_access::thermal_*`).
@@ -753,11 +832,24 @@ pub struct ThermalGovernor {
     /// derivation failure), which keeps the pre-F5 behavior: state scoped
     /// to this one governor's lifetime only.
     ladder_state_file: Option<PathBuf>,
+    /// (#2774 round-3 MF1) Whether the SOFT tiers (2 duty-cycle, 3
+    /// pause/resume, 4 operator hold) are armed at all — decided once at
+    /// construction. See [`ThermalGovernor::soft_tiers_armed`].
+    soft_tiers_armed: bool,
+    /// (#2774 round-3 C12) Set once a `persist_ladder_state` failure has
+    /// been reported, so a failure that repeats every episode (the ladder
+    /// path being a DIRECTORY, say) says so ONCE rather than either
+    /// staying silent for a whole mission or printing on every episode.
+    ladder_persist_error_reported: bool,
 }
 
 impl ThermalGovernor {
     pub fn new(config: ThermalGovernorConfig) -> Self {
         let current_duty_delay_ms = config.duty_delay_ms;
+        // (#2774 round-3 MF1) Decided ONCE, here, from the config alone —
+        // never re-derived per sample, so no sample-path predicate can
+        // disagree with the arming decision.
+        let soft_tiers_armed = severity(&config.pause_at) > severity(&config.resume_at);
         Self {
             config,
             state: State::Idle,
@@ -774,7 +866,54 @@ impl ThermalGovernor {
             stop_owner: None,
             last_stop_write_error: None,
             ladder_state_file: None,
+            soft_tiers_armed,
+            ladder_persist_error_reported: false,
         }
+    }
+
+    /// (#2774 round-3 MF1) Whether the SOFT tiers run at all on this
+    /// governor: tier 2 (duty-cycle), tier 3 (pause/resume) and tier 4
+    /// (operator hold). `false` when `pause_at` is not STRICTLY more
+    /// severe than `resume_at` — the one shape the ladder's hysteresis
+    /// model cannot express, because the two thresholds leave no band for
+    /// the entry and resume holds to occupy.
+    ///
+    /// **Why disarm rather than patch the predicate.** Two rounds of this
+    /// review each produced a defect from the same root, in opposite
+    /// directions, and both were a run DYING on a machine that was never
+    /// in trouble:
+    ///
+    /// - Round 1's shape: one unchanging reading satisfied BOTH "enter
+    ///   `pause_at`" and "resume to `resume_at`", so the governor cycled,
+    ///   manufacturing a fresh EPISODE every `resume_hold_ms` and reaching
+    ///   tier 4's terminal `OperatorHold` in about a minute.
+    /// - Round 2's fix added "and strictly milder than `pause_at`" to the
+    ///   recovery predicate, which for `pause_at = "nominal"` demanded
+    ///   `sev < 0` on a `usize` — unsatisfiable. Entry (`sev >= 0`) was
+    ///   always true. So the governor paused on its FIRST sample, could
+    ///   never leave, and handed off to the breaker at `max_pause_ms`:
+    ///   `pause: true, reason: "thermal-critical"` plus a crawl `STOP`
+    ///   file, after ~15 minutes of an unchanging `nominal` reading. Even
+    ///   for the `fair`/`fair` case that fix was written for, the end
+    ///   state became the BREAKER (labeled `thermal-critical` on evidence
+    ///   that only ever said `fair`) rather than the operator-gated hold.
+    ///
+    /// Both attempts tried to give an incoherent config some SAFE
+    /// behavior. There isn't one: every reading is simultaneously "hot
+    /// enough to pause" and "cool enough to resume", so whichever way the
+    /// tie is broken, the ladder is acting on evidence it does not have.
+    /// Disarming says that plainly — the soft tiers do nothing, the
+    /// operator is told, and `darkmux doctor` names the fix.
+    ///
+    /// **What stays armed: the breaker.** An OS-reported `critical` state
+    /// and the sustained `cpu_speed_limit_pct` floor are compared against
+    /// their OWN thresholds, not against `pause_at`/`resume_at`, so they
+    /// are unaffected by an incoherent pair and keep running. The machine
+    /// is not left unprotected against the hardware-danger signal; it
+    /// loses only the graduated soft response it could not have coherently
+    /// received anyway.
+    pub fn soft_tiers_armed(&self) -> bool {
+        self.soft_tiers_armed
     }
 
     /// (#2774 review F5) Seed `serious_episodes`/`current_duty_delay_ms`
@@ -809,7 +948,7 @@ impl ThermalGovernor {
     #[must_use]
     pub fn seeded_from_mission(mut self, ladder_state_file: Option<&Path>) -> Self {
         let Some(path) = ladder_state_file else { return self };
-        if let Ok(raw) = std::fs::read_to_string(path) {
+        if let Some(raw) = read_ladder_state_refusing_symlinks(path) {
             if let Ok(prior) = serde_json::from_str::<PersistedLadderState>(&raw) {
                 // Both sides must be `Some` and equal. `None == None` is
                 // deliberately NOT a match: see [`PersistedLadderState`].
@@ -839,38 +978,81 @@ impl ThermalGovernor {
     /// governor has one — called right after every mutation of either
     /// field so the NEXT unit's governor (`seeded_from_mission`) always
     /// reads a value at least as current as this dispatch's last state
-    /// change. Atomic (tmp file + rename, same pattern `pace_file`'s own
-    /// writer uses) so a reader mid-write never observes a truncated file.
+    /// change. Atomic (tmp file + rename, the pattern
+    /// `exclusive_fs::write_file_refusing_symlinks_0600` implements and
+    /// `pace_file`'s own writer shares) so a reader mid-write never
+    /// observes a truncated file.
     ///
     /// Best-effort like every other sampler-thread side effect in this
     /// crate: a write failure here loses cross-dispatch carry-forward for
-    /// this one change, never the dispatch itself. NOT a distributed
-    /// counter — two units racing through this at the same instant can
-    /// both read the same starting value and one write can clobber the
-    /// other's, same best-effort character the STOP file this pattern is
-    /// modeled on already has. Widen to a lock or a compare-and-swap if a
-    /// mission ever runs enough TRUE concurrency for that gap to matter in
-    /// practice; today's per-resident-instance dispatch cap (#2772) keeps
-    /// the realistic window narrow.
-    fn persist_ladder_state(&self) {
-        let Some(path) = &self.ladder_state_file else { return };
+    /// this one change, never the dispatch itself.
+    ///
+    /// (#2774 round-3 C6) **Read-modify-MAX, not blind overwrite.** An
+    /// earlier revision wrote an ABSOLUTE snapshot and described the
+    /// clobber window as "two units racing through this at the same
+    /// instant." That was wrong about the window, which is a LIFETIME, not
+    /// an instant: a governor seeds ONCE at construction and every later
+    /// write is absolute, so a second unit constructed early and still
+    /// alive would, on its FIRST episode, write `{episodes: 1, delay:
+    /// base}` over a first unit's `{episodes: 3, delay: 8x base}` — the
+    /// mission counter going BACKWARDS and the ratchet discarded. A crawl
+    /// with two rules on different model identifiers has exactly that
+    /// concurrency.
+    ///
+    /// Both persisted fields are MONOTONIC by their own definitions (an
+    /// episode count only counts up; the ratchet is one-way — "multiplied,
+    /// never divided" is `on_sample`'s own invariant), so taking the max
+    /// against whatever is on disk right now IS the correct merge, and it
+    /// makes the write order-independent. Still not a compare-and-swap:
+    /// two writers can interleave read/write and one max can be computed
+    /// against a stale read, which loses an INCREMENT at worst. It can no
+    /// longer go backwards, which is the failure that was observed.
+    ///
+    /// The write itself refuses a symlink at the final path
+    /// (`exclusive_fs::write_file_refusing_symlinks_0600`), the same guard
+    /// `write_stop_file` uses for the STOP file next to it.
+    fn persist_ladder_state(&mut self) {
+        let Some(path) = self.ladder_state_file.clone() else { return };
+        // Read-modify-max against whatever is on disk RIGHT NOW — but only
+        // against state this same mission wrote. A FOREIGN owner's file is
+        // "not my state" on the read side (`seeded_from_mission`), and
+        // must not raise our counters here either, or a stale file from
+        // last week's crawl would escalate this mission by the back door.
+        let prior = read_ladder_state_refusing_symlinks(&path)
+            .and_then(|raw| serde_json::from_str::<PersistedLadderState>(&raw).ok())
+            .filter(|prior| match (&self.stop_owner, &prior.owner) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => false,
+            });
+        let (prior_episodes, prior_delay) = prior
+            .map(|p| (p.serious_episodes, p.current_duty_delay_ms))
+            .unwrap_or((0, 0));
         let snapshot = PersistedLadderState {
+            schema_version: Some(LADDER_STATE_SCHEMA_VERSION),
             owner: self.stop_owner.clone(),
-            serious_episodes: self.serious_episodes,
-            current_duty_delay_ms: self.current_duty_delay_ms,
+            serious_episodes: self.serious_episodes.max(prior_episodes),
+            current_duty_delay_ms: self.current_duty_delay_ms.max(prior_delay),
         };
         let Ok(json) = serde_json::to_string(&snapshot) else { return };
-        let Some(parent) = path.parent() else { return };
-        let _ = std::fs::create_dir_all(parent);
-        let tmp_path = parent.join(format!(
-            ".thermal-ladder.json.tmp.{}.{}",
-            std::process::id(),
-            SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-        ));
-        if std::fs::write(&tmp_path, &json).is_ok() && std::fs::rename(&tmp_path, path).is_err() {
-            // Don't leave the scratch file behind in the operator's crawl
-            // dir — a failed rename repeating every episode would litter it.
-            let _ = std::fs::remove_file(&tmp_path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = crate::exclusive_fs::write_file_refusing_symlinks_0600(&path, json.as_bytes())
+        {
+            // (#2774 round-3 C12) Say it ONCE. A DIRECTORY at this path
+            // makes every episode's write fail, which silently turns
+            // cross-dispatch carry-forward off for a whole mission —
+            // exactly the kind of thing an operator must not have to infer
+            // from a ratchet that never grows.
+            if !self.ladder_persist_error_reported {
+                self.ladder_persist_error_reported = true;
+                eprintln!(
+                    "darkmux: ⚠ could not write the thermal ladder state at {} ({e}) — the \
+                     `serious` episode count and the duty-cycle ratchet will not carry \
+                     forward to this mission's later units",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -911,11 +1093,19 @@ impl ThermalGovernor {
     ///
     /// **NOT the value `power_policy::BatteryGovernor::on_sample` gates
     /// on** — see [`Self::is_pausing`] for that, and for the #2774 review
-    /// finding (F1) this split exists to fix. This getter is kept for
-    /// whatever OTHER caller wants "is this governor touching the file at
-    /// all" (there is none in this crate today, but the distinction from
-    /// `is_pausing` is real enough to keep both named rather than deleting
-    /// this one).
+    /// finding (F1) this split exists to fix.
+    ///
+    /// (#2774 round-3 C11) **`#[cfg(test)]`, deliberately.** It has zero
+    /// production callers and sits ONE CHARACTER from `is_pausing` on a
+    /// safety predicate — the exact shape of the F1 inversion. Gating it
+    /// out of the production build makes reinstating that inversion a
+    /// COMPILE error rather than a silent, still-green regression; the
+    /// distinction it names is real enough to keep testable, and the
+    /// source-level conformance test
+    /// `the_battery_governor_call_site_gates_on_is_pausing` pins the call
+    /// site itself. Un-gate it the day a production caller genuinely wants
+    /// "is this governor touching the file at all."
+    #[cfg(test)]
     pub fn is_pacing(&self) -> bool {
         self.state != State::Idle
     }
@@ -1007,31 +1197,22 @@ impl ThermalGovernor {
         (self.config.max_pause_ms / 4).max(1)
     }
 
-    /// (#2774 review F6) Whether a reading counts as RECOVERY from an
-    /// active pause: at/below `resume_at` **and** strictly milder than
-    /// `pause_at`.
+    /// Whether a reading counts as RECOVERY from an active pause: at or
+    /// below `resume_at`.
     ///
-    /// The second clause is a no-op for every sane config — `resume_at`
-    /// strictly milder than `pause_at` makes `sev <= resume_at` imply
-    /// `sev < pause_at` — and is load-bearing for exactly one case: the
-    /// two thresholds touching or inverted. There, a single unchanging
-    /// reading satisfies BOTH "enter `pause_at`" and "resume to
-    /// `resume_at`", so without this the governor resumes and re-enters
-    /// off the SAME sample, manufacturing a fresh `serious` EPISODE every
-    /// `resume_hold_ms` — and reaching tier 4's terminal, operator-gated
-    /// `OperatorHold` in roughly `episode_threshold * resume_hold_ms`
-    /// (about a minute on the defaults) from a machine that never got
-    /// worse. That falsifies this module's own stated invariant that an
-    /// episode is a TRANSITION, never a sample.
-    ///
-    /// The result is that a touching/inverted config pauses ONCE and holds
-    /// until the machine genuinely cools below `pause_at` — degraded, but
-    /// honest, and never escalating on manufactured evidence.
-    /// `darkmux doctor`'s `runtime.thermal` check warns about the config
-    /// itself so the operator can fix the cause rather than live with the
-    /// symptom; this guard is what makes the symptom survivable meanwhile.
+    /// (#2774 round-3 MF1) Round 2 carried a second clause here — "and
+    /// strictly milder than `pause_at`" — to keep a touching/inverted
+    /// threshold pair from resuming and re-entering off the SAME sample.
+    /// It is gone, and deliberately not replaced with a clamped variant:
+    /// [`ThermalGovernor::soft_tiers_armed`] now refuses to run the soft
+    /// tiers AT ALL for such a pair, so by the time any sample reaches
+    /// this predicate `severity(pause_at) > severity(resume_at)` holds by
+    /// construction and `sev <= resume_at` already implies
+    /// `sev < pause_at`. A second clause here would be dead code that
+    /// cannot be red-proven — and, as MF1 measured, one more place for the
+    /// two thresholds' relationship to be got wrong.
     fn is_recovery_reading(&self, sev: usize) -> bool {
-        sev <= severity(&self.config.resume_at) && sev < severity(&self.config.pause_at)
+        sev <= severity(&self.config.resume_at)
     }
 
     /// Feed one thermal sample. `elapsed_ms` is the wall time since the
@@ -1104,7 +1285,7 @@ impl ThermalGovernor {
                             write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
                             if let Some(stop) = stop_file {
                                 self.last_stop_write_error =
-                                    write_stop_file(stop, self.stop_owner.as_deref()).err();
+                                    write_stop_file(stop, self.stop_owner.as_deref(), STOP_FILE_REASON).err();
                             }
                             return Some(ThermalEvent::Breaker {
                                 state: self.last_known_state.clone(),
@@ -1162,9 +1343,19 @@ impl ThermalGovernor {
             self.mark_stamped();
             write_pace_file(host_out, true, "thermal-critical", &thermal.state);
             if let Some(stop) = stop_file {
-                self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref()).err();
+                self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref(), STOP_FILE_REASON).err();
             }
             return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
+        }
+
+        // (#2774 round-3 MF1) The soft tiers (2/3/4) only run when the two
+        // thresholds describe a real band. The breaker above is compared
+        // against its OWN thresholds and therefore ran already — disarming
+        // costs the graduated response, never the hardware-danger stop.
+        // See `soft_tiers_armed`'s own doc for why an incoherent pair has
+        // no safe soft behavior to fall back to.
+        if !self.soft_tiers_armed {
+            return None;
         }
 
         match self.state {
@@ -1297,7 +1488,7 @@ impl ThermalGovernor {
                     self.mark_stamped();
                     write_pace_file(host_out, true, "thermal-critical", &thermal.state);
                     if let Some(stop) = stop_file {
-                        self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref()).err();
+                        self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref(), STOP_FILE_REASON).err();
                     }
                     return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
                 }
@@ -1340,9 +1531,14 @@ impl ThermalGovernor {
         {
             self.state = State::OperatorHold;
             self.mark_stamped();
-            write_pace_file(host_out, true, "thermal-episode-limit", state);
+            write_pace_file(host_out, true, STOP_FILE_REASON_EPISODE_LIMIT, state);
             if let Some(stop) = stop_file {
-                self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref()).err();
+                // (#2774 round-3 C8) The SAME reason the pace file just
+                // got, not the breaker's `thermal-critical` — see
+                // `STOP_FILE_REASON_EPISODE_LIMIT`.
+                self.last_stop_write_error =
+                    write_stop_file(stop, self.stop_owner.as_deref(), STOP_FILE_REASON_EPISODE_LIMIT)
+                        .err();
             }
             return Some(ThermalEvent::OperatorHold {
                 state: state.to_string(),
@@ -1362,8 +1558,8 @@ impl ThermalGovernor {
     /// from a hardware-critical tier-5/legacy-breaker one.
     fn terminal_reason(&self) -> &'static str {
         match self.state {
-            State::OperatorHold => "thermal-episode-limit",
-            _ => "thermal-critical",
+            State::OperatorHold => STOP_FILE_REASON_EPISODE_LIMIT,
+            _ => STOP_FILE_REASON,
         }
     }
 }
@@ -1553,7 +1749,7 @@ mod tests {
 
     #[test]
     fn a_blank_owner_is_the_unattributed_shape_not_a_mission_named_empty() {
-        assert_eq!(stop_file_body(Some("   ")), "thermal-critical\n");
+        assert_eq!(stop_file_body(Some("   "), STOP_FILE_REASON), "thermal-critical\n");
         assert_eq!(stop_file_owner("thermal-critical mission=\n"), None);
         assert_eq!(stop_file_owner("thermal-critical mission=m-9\n"), Some("m-9"));
     }
@@ -2948,76 +3144,159 @@ mod tests {
         );
     }
 
-    // ── (#2774 review F6) A touching/inverted threshold pair must not
-    //    manufacture episodes out of one unchanging reading ──
+    // ── (#2774 round-3 MF1) An incoherent threshold pair disarms the soft
+    //    tiers outright — it does not get a patched predicate ──
+    //
+    //    Round 1 found that a touching/inverted pair manufactured a fresh
+    //    EPISODE out of one unchanging reading and reached tier 4's
+    //    terminal hold in about a minute. Round 2's fix added "strictly
+    //    milder than pause_at" to the recovery predicate, which for
+    //    `pause_at = "nominal"` became `sev < 0` on a `usize` —
+    //    unsatisfiable — so the governor paused on its FIRST sample, could
+    //    never recover, and handed off to the BREAKER at `max_pause_ms`
+    //    with `reason: "thermal-critical"` plus a crawl STOP file, on a
+    //    machine that read `nominal` the entire time. These tests pin the
+    //    third answer: such a pair runs no soft tier at all.
 
+    /// Every incoherent pair, every state, exhaustively — nothing in tiers
+    /// 2/3/4 may fire and nothing may be written to the pace file. This is
+    /// the 4x4 sweep the MF1 report ran by hand, committed.
     #[test]
-    fn equal_pause_and_resume_thresholds_never_manufacture_a_second_episode() {
-        // The proven repro: `pause_at == resume_at == "fair"` (exactly what
-        // an operator reaching for MORE caution would write) plus a
-        // CONSTANT `fair` reading. Entry is `sev >= pause_at` and resume is
-        // `sev <= resume_at`, so before the fix both fired on the same
-        // sample: resume, immediate re-entry, a fresh episode every
-        // `resume_hold_ms`, and tier 4's terminal OperatorHold in about a
-        // minute from a machine that never got hotter.
+    fn every_incoherent_threshold_pair_disarms_the_soft_tiers_entirely() {
+        for (pi, pause_at) in THERMAL_STATES.iter().enumerate() {
+            for (ri, resume_at) in THERMAL_STATES.iter().enumerate() {
+                if pi > ri {
+                    continue; // coherent — covered by the sane-gap tests below
+                }
+                let gov_cfg = ThermalGovernorConfig {
+                    pause_at: (*pause_at).to_string(),
+                    resume_at: (*resume_at).to_string(),
+                    ..cfg()
+                };
+                assert!(
+                    !ThermalGovernor::new(gov_cfg.clone()).soft_tiers_armed(),
+                    "pause_at={pause_at} / resume_at={resume_at} leaves no band for the holds \
+                     to occupy and must not arm the soft tiers"
+                );
+                // `nominal` and `fair` only: `serious`/`critical` are real
+                // thermal pressure and the breaker's own (threshold-
+                // independent) `critical` rule is asserted separately.
+                for reading in ["nominal", "fair"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut gov = ThermalGovernor::new(gov_cfg.clone());
+                    // 600 samples x 2000ms = 20 minutes, past the 900s
+                    // `max_pause_ms` that turned MF1's wedge into a breaker
+                    // trip.
+                    for _ in 0..600 {
+                        let ev = gov.on_sample(Some(&sample(reading, 100)), 2000, dir.path(), None);
+                        assert_eq!(
+                            ev, None,
+                            "pause_at={pause_at} resume_at={resume_at} reading={reading}: an \
+                             incoherent pair must produce no soft-tier event at all, got {ev:?}"
+                        );
+                    }
+                    assert_eq!(gov.serious_episodes(), 0);
+                    assert!(
+                        !pace_file_path(dir.path()).exists(),
+                        "pause_at={pause_at} resume_at={resume_at} reading={reading}: a disarmed \
+                         ladder must not write the pace file — it has no instruction to give"
+                    );
+                }
+            }
+        }
+    }
+
+    /// MF1's exact repro, kept as its own named case because it is the one
+    /// that ended at `reason: "thermal-critical"` + a crawl STOP file on a
+    /// machine that was cold the whole time.
+    #[test]
+    fn pause_at_nominal_never_pauses_and_never_reaches_the_breaker() {
         let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        for resume_at in THERMAL_STATES {
+            let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+                pause_at: "nominal".to_string(),
+                resume_at: resume_at.to_string(),
+                ..cfg()
+            });
+            for _ in 0..600 {
+                assert_eq!(
+                    gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), Some(&stop)),
+                    None,
+                    "resume_at={resume_at}: 20 minutes of `nominal` is not a thermal event"
+                );
+            }
+        }
+        assert!(
+            !stop.exists(),
+            "a machine reading `nominal` for 20 minutes must never have its crawl stopped"
+        );
+        assert!(!pace_file_path(dir.path()).exists(), "…nor its run paced");
+    }
+
+    /// The second-order half of MF1: with the round-2 predicate, the
+    /// `fair`/`fair` pair the F6 guard was actually written for ALSO ended
+    /// at the breaker, labeled `thermal-critical` on evidence that only
+    /// ever said `fair`.
+    #[test]
+    fn the_fair_fair_pair_no_longer_ends_at_a_thermal_critical_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
         let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
             pause_at: "fair".to_string(),
             resume_at: "fair".to_string(),
             ..cfg()
         });
-
-        let first = gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
-        assert_eq!(first, Some(ThermalEvent::Paused { state: "fair".to_string() }));
-
-        // Five minutes of the SAME reading — five times the 60s resume
-        // hold. Nothing further may fire, and the count must stay at one.
-        for _ in 0..150 {
-            let ev = gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
-            assert_eq!(ev, None, "an unchanging reading is not a transition: {ev:?}");
+        for _ in 0..600 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), Some(&stop));
         }
-        assert_eq!(
-            gov.serious_episodes(),
-            1,
-            "one entry, one episode — the sample never recovered, so nothing re-entered"
-        );
-        assert_eq!(
-            read_pace(dir.path())["reason"],
-            serde_json::json!("thermal"),
-            "still the ordinary tier-3 pause, NOT the tier-4 episode-limit hold"
-        );
-
-        // And a GENUINE recovery (strictly milder than pause_at) still
-        // resumes normally — the guard narrows nothing real.
-        for _ in 0..31 {
-            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None);
-        }
-        assert_eq!(gov.current_duty_delay_ms(), 30_000, "a real recovery still ratchets");
+        assert!(!stop.exists(), "`fair` is not a hardware-critical condition");
+        assert!(!pace_file_path(dir.path()).exists());
     }
 
+    /// Disarming the SOFT tiers must not disarm the breaker — the breaker
+    /// compares against its own thresholds (`critical`, and the
+    /// `cpu_speed_limit_pct` floor), never against `pause_at`/`resume_at`,
+    /// so an incoherent pair leaves the hardware-danger stop intact.
     #[test]
-    fn an_inverted_threshold_pair_is_equally_unable_to_manufacture_episodes() {
-        // pause_at MILDER than resume_at — the same class of mistake, worse.
-        let dir = tempfile::tempdir().unwrap();
-        let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
-            pause_at: "fair".to_string(),
-            resume_at: "serious".to_string(),
+    fn the_breaker_still_fires_while_the_soft_tiers_are_disarmed() {
+        let incoherent = || ThermalGovernorConfig {
+            pause_at: "nominal".to_string(),
+            resume_at: "critical".to_string(),
             ..cfg()
-        });
-        gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
-        for _ in 0..150 {
-            assert_eq!(gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None), None);
-        }
-        assert_eq!(gov.serious_episodes(), 1);
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(incoherent());
+        assert_eq!(
+            gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop)),
+            Some(ThermalEvent::Breaker { state: "critical".to_string() }),
+            "an OS-reported `critical` still trips the breaker"
+        );
+        assert!(stop.exists(), "and still stops the crawl");
+
+        // The speed-limit floor, the breaker's other (threshold-
+        // independent) signal — 3 consecutive samples under 50%.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut gov2 = ThermalGovernor::new(incoherent());
+        assert_eq!(gov2.on_sample(Some(&sample("nominal", 10)), 2000, dir2.path(), None), None);
+        assert_eq!(gov2.on_sample(Some(&sample("nominal", 10)), 2000, dir2.path(), None), None);
+        assert_eq!(
+            gov2.on_sample(Some(&sample("nominal", 10)), 2000, dir2.path(), None),
+            Some(ThermalEvent::Breaker { state: "nominal".to_string() }),
+            "the sustained speed-limit floor still trips the breaker"
+        );
     }
 
     #[test]
     fn a_sane_threshold_gap_resumes_exactly_as_before() {
-        // The no-op half of the F6 guard, pinned: with `resume_at` strictly
-        // milder than `pause_at`, `sev <= resume_at` already implies
-        // `sev < pause_at`, so the added clause changes nothing.
+        // The half of MF1 that matters most: the disarm must not wedge a
+        // LEGITIMATE recovery. With `resume_at` strictly milder than
+        // `pause_at`, everything runs as it always did.
         let dir = tempfile::tempdir().unwrap();
         let mut gov = ThermalGovernor::new(cfg_tier4_disabled()); // serious / fair
+        assert!(gov.soft_tiers_armed(), "a one-band gap is a coherent pair");
         gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
         let mut resumed = None;
         for _ in 0..31 {
@@ -3031,6 +3310,43 @@ mod tests {
             "a resume AT resume_at (fair, one band below pause_at) must still fire"
         );
         assert_eq!(gov.current_duty_delay_ms(), 30_000, "and still ratchets on the way out");
+    }
+
+    /// The WIDE-gap case, which the round-2 predicate could also have got
+    /// wrong in the other direction: `pause_at = serious`,
+    /// `resume_at = nominal` means `fair` is NOT a recovery, and `nominal`
+    /// is. Both halves asserted, so a future edit that makes recovery
+    /// either too eager or (MF1's failure) unreachable is caught here.
+    #[test]
+    fn a_two_band_gap_resumes_only_at_the_configured_resume_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+            pause_at: "serious".to_string(),
+            resume_at: "nominal".to_string(),
+            ..cfg_tier4_disabled()
+        });
+        assert!(gov.soft_tiers_armed());
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Paused { state: "serious".to_string() })
+        );
+        // Five minutes at `fair` — above `resume_at`, so NOT a recovery.
+        for _ in 0..150 {
+            let ev = gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+            assert_eq!(ev, None, "`fair` is above resume_at=nominal: {ev:?}");
+        }
+        // …and `nominal` held for `resume_hold_ms` IS.
+        let mut resumed = None;
+        for _ in 0..31 {
+            if let Some(ev) = gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None) {
+                resumed = Some(ev);
+            }
+        }
+        assert_eq!(
+            resumed,
+            Some(ThermalEvent::Resumed { state: "nominal".to_string() }),
+            "reaching resume_at must still recover — the disarm narrows nothing real"
+        );
     }
 
     // ── (#2774 review F5) Mission-scoped ladder state across dispatches ──
@@ -3301,5 +3617,276 @@ mod tests {
         let pace = read_pace(dir.path());
         assert_eq!(pace["pause"], serde_json::json!(false));
         assert_eq!(pace["turn_delay_ms"], serde_json::json!(15_000), "the instruction survives the gap");
+    }
+
+    // ── (#2774 round-3 MF3) The battery-governor call site, pinned at the
+    //    SOURCE — a unit test cannot reach it ──
+
+    /// Round 1's F1 finding was that `dispatch_internal.rs` gated the
+    /// battery governor's stand-down on `is_pacing()` (any non-`Idle`
+    /// state, including tier 2's `DutyCycle`, which writes `pause: false`)
+    /// instead of `is_pausing()`. Round 2 fixed the call site and added
+    /// `f1_regression_battery_governor_still_acts_while_thermal_duty_cycles`
+    /// — but that test RE-IMPLEMENTS the call site inside its own body, so
+    /// it pins the FUNCTION, not the WIRING. Proven in round 3: reverting
+    /// the argument at the call site left the whole crate green at
+    /// 1827/1827.
+    ///
+    /// The commit message claimed that naming the parameter
+    /// `thermal_pausing` meant "the call site cannot silently drift back."
+    /// Rust does not check argument NAMES, so that is a convention, not a
+    /// check. This is the check, in the shape this repo already uses for a
+    /// call site no unit test can reach (see
+    /// `duty_cycle_turn_delay_key_matches_the_runtime_reader` and
+    /// `pace_file_path_matches_runtime_out_base` above).
+    #[test]
+    fn the_battery_governor_call_site_gates_on_is_pausing() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir.join("src/dispatch_internal.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+        // Narrow to the `battery_governor.on_sample(...)` argument list, so
+        // the assertions below are about the ARGUMENT and not about the
+        // module's prose (which names both predicates, deliberately).
+        let call_start = source
+            .find("battery_governor.on_sample(")
+            .unwrap_or_else(|| panic!("{} no longer calls battery_governor.on_sample", path.display()));
+        let rest = &source[call_start..];
+        let call_end = rest
+            .find(") {")
+            .unwrap_or_else(|| panic!("could not find the end of the on_sample call in {}", path.display()));
+        let args = &rest[..call_end];
+
+        assert!(
+            args.contains("thermal_governor.is_pausing()"),
+            "dispatch_internal.rs must gate the battery governor's stand-down on the thermal \
+             governor's `is_pausing()` — `is_pacing()` also covers tier 2's DutyCycle, which \
+             writes `pause: false`, and gating on it silently drops a real battery-critical \
+             pause for the whole duration of a duty-cycle episode (#2774 F1). Argument list \
+             found:\n{args}"
+        );
+        assert!(
+            !args.contains("is_pacing()"),
+            "the battery-governor call site must not pass `is_pacing()` — see #2774 F1. \
+             Argument list found:\n{args}"
+        );
+    }
+
+    // ── (#2774 round-3 C8) One event, one reason word, in BOTH artifacts ──
+
+    #[test]
+    fn the_tier4_stop_file_says_episode_limit_not_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(ThermalGovernorConfig { episode_threshold: 1, ..cfg() })
+            .owned_by(Some("crawl-m-8"));
+        let ev = gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), Some(&stop));
+        assert!(matches!(ev, Some(ThermalEvent::OperatorHold { .. })), "{ev:?}");
+
+        let body = std::fs::read_to_string(&stop).unwrap();
+        assert!(
+            body.starts_with(STOP_FILE_REASON_EPISODE_LIMIT),
+            "the STOP file is the artifact an operator `cat`s first — it must name the SAME \
+             reason the pace file carries (`thermal-episode-limit`), not the breaker's \
+             `thermal-critical`, for a machine that never reported `critical`. Got: {body:?}"
+        );
+        assert_eq!(
+            read_pace(dir.path())["reason"],
+            serde_json::json!(STOP_FILE_REASON_EPISODE_LIMIT),
+            "…and the pace file must agree with it"
+        );
+        assert!(body.contains("mission=crawl-m-8"), "the owner line survives: {body:?}");
+    }
+
+    #[test]
+    fn the_breaker_stop_file_still_says_thermal_critical() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(cfg());
+        gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        let body = std::fs::read_to_string(&stop).unwrap();
+        assert!(
+            body.starts_with(STOP_FILE_REASON),
+            "a hardware-critical trip keeps its own word: {body:?}"
+        );
+    }
+
+    // ── (#2774 round-3 C6) The ladder file is a read-modify-MAX, so a
+    //    concurrent unit cannot walk the mission counter backwards ──
+
+    #[test]
+    fn a_concurrent_units_first_episode_cannot_lower_the_mission_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ladder = dir.path().join("thermal-ladder.json");
+
+        // Unit B is constructed (and seeds from an empty file) BEFORE unit
+        // A does any work, and stays alive — the real crawl shape when two
+        // rules run on different model identifiers. The clobber window is
+        // B's whole LIFETIME, not an instant.
+        let mut unit_b = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-9"))
+            .seeded_from_mission(Some(&ladder));
+
+        let mut unit_a = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-9"))
+            .seeded_from_mission(Some(&ladder));
+        for _ in 0..3 {
+            unit_a.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+            for _ in 0..31 {
+                unit_a.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None);
+            }
+        }
+        let after_a: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ladder).unwrap()).unwrap();
+        assert_eq!(after_a["serious_episodes"], serde_json::json!(3), "{after_a}");
+        assert_eq!(after_a["current_duty_delay_ms"], serde_json::json!(120_000), "{after_a}");
+
+        // B's FIRST episode. Its own counters are 1 and 15_000 — a blind
+        // absolute write would put those on disk and discard A's ratchet.
+        unit_b.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let after_b: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ladder).unwrap()).unwrap();
+        assert_eq!(
+            after_b["serious_episodes"],
+            serde_json::json!(3),
+            "the mission's episode count must never go backwards: {after_b}"
+        );
+        assert_eq!(
+            after_b["current_duty_delay_ms"],
+            serde_json::json!(120_000),
+            "…nor may a concurrent unit discard the mission's ratchet: {after_b}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_owners_ladder_file_is_overwritten_not_merged_into() {
+        // The max must not reach ACROSS missions: a stale file from last
+        // week's crawl of the same workspace would otherwise escalate this
+        // mission through the back door, which is the whole reason the
+        // owner is stamped in (#2454 / F5).
+        let dir = tempfile::tempdir().unwrap();
+        let ladder = dir.path().join("thermal-ladder.json");
+        std::fs::write(
+            &ladder,
+            serde_json::json!({
+                "owner": "crawl-LAST-WEEK",
+                "serious_episodes": 99,
+                "current_duty_delay_ms": 9_000_000u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-10"))
+            .seeded_from_mission(Some(&ladder));
+        assert_eq!(gov.serious_episodes(), 0, "a foreign owner's state is not mine");
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ladder).unwrap()).unwrap();
+        assert_eq!(after["serious_episodes"], serde_json::json!(1), "{after}");
+        assert_eq!(after["owner"], serde_json::json!("crawl-m-10"), "{after}");
+    }
+
+    // ── (#2774 round-3 C10) The persisted shape carries a schema version ──
+
+    #[test]
+    fn the_ladder_state_file_carries_a_schema_version_and_reads_one_without() {
+        let dir = tempfile::tempdir().unwrap();
+        let ladder = dir.path().join("thermal-ladder.json");
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-11"))
+            .seeded_from_mission(Some(&ladder));
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ladder).unwrap()).unwrap();
+        assert_eq!(
+            written["schema_version"],
+            serde_json::json!(LADDER_STATE_SCHEMA_VERSION),
+            "every darkmux persisted shape carries one (cross-system contract 5): {written}"
+        );
+
+        // Lenient on read: a pre-#2774-round-3 file has no version and
+        // must still seed, or upgrading the binary silently resets every
+        // in-flight mission's ladder.
+        let old = dir.path().join("old-ladder.json");
+        std::fs::write(
+            &old,
+            serde_json::json!({
+                "owner": "crawl-m-11",
+                "serious_episodes": 2,
+                "current_duty_delay_ms": 60_000u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let seeded = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-11"))
+            .seeded_from_mission(Some(&old));
+        assert_eq!(
+            seeded.ladder_summary(),
+            ThermalLadderSummary { serious_episodes: 2, current_duty_delay_ms: 60_000 },
+            "a version-less file must still carry forward"
+        );
+    }
+
+    // ── (#2774 round-3 C12) The ladder file's own filesystem hazards ──
+
+    #[test]
+    fn a_symlink_at_the_ladder_path_seeds_nothing_and_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("planted.json");
+        std::fs::write(
+            &elsewhere,
+            serde_json::json!({
+                "owner": "crawl-m-12",
+                "serious_episodes": 99,
+                "current_duty_delay_ms": 15_000u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ladder = dir.path().join("thermal-ladder.json");
+        std::os::unix::fs::symlink(&elsewhere, &ladder).unwrap();
+
+        let gov = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-12"))
+            .seeded_from_mission(Some(&ladder));
+        assert_eq!(
+            gov.serious_episodes(),
+            0,
+            "a symlink at the ladder path must not feed a planted episode count into the ladder"
+        );
+
+        // The WRITE refuses it too (the same guard the STOP file next to it
+        // uses), so the planted file's contents are left alone.
+        let mut gov = gov;
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let planted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&elsewhere).unwrap()).unwrap();
+        assert_eq!(
+            planted["serious_episodes"],
+            serde_json::json!(99),
+            "the write must not have followed the symlink either: {planted}"
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_ladder_path_does_not_wedge_the_governor() {
+        // It cannot carry state forward — but it must not panic, must not
+        // stop the dispatch, and (see `persist_ladder_state`) says so once.
+        let dir = tempfile::tempdir().unwrap();
+        let ladder = dir.path().join("thermal-ladder.json");
+        std::fs::create_dir_all(&ladder).unwrap();
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled())
+            .owned_by(Some("crawl-m-13"))
+            .seeded_from_mission(Some(&ladder));
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Paused { state: "serious".to_string() }),
+            "the governor's own decisions are unaffected by a broken ladder file"
+        );
+        assert!(ladder.is_dir(), "and the directory is left exactly as found");
     }
 }

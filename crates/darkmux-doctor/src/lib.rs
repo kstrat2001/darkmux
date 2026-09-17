@@ -3155,8 +3155,16 @@ fn check_thermal_governor() -> Check {
     // silently INVERTS the governor's intent rather than erroring, so this
     // is worth a loud Warn rather than folding into the Pass message above.
     let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
-    let bad_pause_at = !states.contains(&pause_at.to_ascii_lowercase().as_str());
-    let bad_resume_at = !states.contains(&resume_at.to_ascii_lowercase().as_str());
+    // (#2774 round-3 C4) Compared RAW, deliberately. These used to
+    // `.to_ascii_lowercase()` first, while `thermal_governor::severity()`
+    // compared the raw string — so `pause_at = "Serious"` passed doctor
+    // and was scored as an UNKNOWN state by the governor, silently
+    // inerting tiers 2/3/4. `config_access::thermal_pause_at` now
+    // normalizes at resolution, so these ARE lowercase by the time they
+    // arrive; comparing raw here means that if the normalization ever goes
+    // away, doctor warns (loud) instead of passing (silent).
+    let bad_pause_at = !states.contains(&pause_at.as_str());
+    let bad_resume_at = !states.contains(&resume_at.as_str());
     if bad_pause_at || bad_resume_at {
         let mut bad = Vec::new();
         if bad_pause_at {
@@ -3183,25 +3191,25 @@ fn check_thermal_governor() -> Check {
         };
     }
 
-    // (#2774 review F6) `pause_at` and `resume_at` are ordered severities
-    // (position in `THERMAL_STATES`), and the ladder's whole hysteresis
-    // model assumes `pause_at` is STRICTLY more severe than `resume_at` —
-    // a real gap for the entry/resume holds to occupy. When the two touch
-    // or invert, a single unchanging reading satisfies BOTH "enter
-    // serious" and "resume from serious" on the same sample: tier 3
-    // enters and, ~`resume_hold_ms` later, resumes STRAIGHT BACK into
-    // tier 3 on the next tick (landing in `DutyCycle` for exactly one
-    // tick before re-entering) — falsifying "an episode is a transition,
-    // never a sample" in practice, since each of those re-entries IS a
-    // fresh transition. With the default `episode_threshold: 2` this
-    // reaches a terminal, operator-gated `OperatorHold` in roughly
-    // `2 * resume_hold_ms` (about a minute at the 60s default) from a
-    // machine that never moved off one reading. This is exactly the
-    // config an operator reaching for MORE caution would pick
-    // (`pause_at = resume_at = "fair"`), so it is worth a loud Warn
-    // rather than silently reaching a Pass.
-    let pause_severity = states.iter().position(|s| *s == pause_at.to_ascii_lowercase().as_str());
-    let resume_severity = states.iter().position(|s| *s == resume_at.to_ascii_lowercase().as_str());
+    // (#2774 review F6; remedy text corrected round-3 C5) `pause_at` and
+    // `resume_at` are ordered severities (position in `THERMAL_STATES`),
+    // and the ladder's hysteresis model needs `pause_at` STRICTLY more
+    // severe than `resume_at` — a real band for the entry/resume holds to
+    // occupy. When the two touch or invert, every reading is at once "hot
+    // enough to pause" and "cool enough to resume", which is not a
+    // condition the ladder can act on coherently. So the governor now
+    // DISARMS its soft tiers for such a pair (#2774 round-3 MF1,
+    // `ThermalGovernor::soft_tiers_armed`) rather than picking a tie-break
+    // — two earlier attempts to pick one each shipped a defect, in
+    // opposite directions.
+    //
+    // (C5) This message previously described the PRE-guard behavior
+    // ("cycling straight back into a fresh `serious` episode every
+    // ~{resume_hold_ms}ms and reaching a terminal, operator-gated pause in
+    // roughly 2x that"), which the guard landing in the same commit had
+    // already falsified. It now says what actually happens.
+    let pause_severity = states.iter().position(|s| *s == pause_at.as_str());
+    let resume_severity = states.iter().position(|s| *s == resume_at.as_str());
     if let (Some(p), Some(r)) = (pause_severity, resume_severity) {
         if p <= r {
             return Check {
@@ -3209,18 +3217,40 @@ fn check_thermal_governor() -> Check {
                 status: Status::Warn,
                 message: format!(
                     "pause_at=`{pause_at}` is not strictly more severe than resume_at=`{resume_at}` \
-                     — the ladder needs a real gap between them for the entry/resume holds to \
-                     occupy. With these equal (or inverted), a single unchanging reading can \
-                     satisfy both \"enter serious\" and \"resume from serious\" on the same \
-                     sample, cycling straight back into a fresh `serious` episode every \
-                     ~{resume_hold_ms}ms and reaching a terminal, operator-gated pause in roughly \
-                     2x that — from a machine that never actually got worse."
+                     — the ladder needs a real band between them for the entry/resume holds to \
+                     occupy, so with these equal (or inverted) every reading would be both \"hot \
+                     enough to pause\" and \"cool enough to resume\" at once. The soft tiers are \
+                     therefore DISARMED: no duty-cycle, no pause/resume, no episode-count hold. \
+                     The breaker is unaffected and still runs — an OS-reported `critical` state, \
+                     and {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct \
+                     < {min_cpu}%."
                 ),
                 hint: Some(format!(
                     "darkmux config set runtime.thermal.resume_at <a state milder than {pause_at}> \
                      (valid: {})",
                     states.join("|")
                 )),
+            };
+        }
+        // (#2774 round-3 C4) `pause_at = "critical"` passes every check
+        // above and then never fires a soft tier either: the breaker's own
+        // `sev >= severity("critical")` rule is evaluated FIRST on every
+        // sample, so the reading that would enter tier 3 has already
+        // tripped the breaker. Saying "tier 4 enabled after N episodes" in
+        // a Pass message under that config is affirmatively wrong.
+        if p >= states.len() - 1 {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "pause_at=`{pause_at}` is the breaker's own threshold, so the soft tiers can \
+                     never run: a `{pause_at}` reading trips the breaker (pause + a crawl STOP \
+                     file) before anything would enter the duty-cycle/pause ladder. Set pause_at \
+                     to a milder state if you want a graduated response before the breaker."
+                ),
+                hint: Some(
+                    "darkmux config set runtime.thermal.pause_at serious".to_string(),
+                ),
             };
         }
     }
@@ -9506,6 +9536,115 @@ mod tests {
             match prev_resume {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
                 None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-3 C5) The touching/inverted remedy must describe what
+    /// NOW happens (the soft tiers are disarmed), not the pre-guard
+    /// cycling-to-a-terminal-hold behavior the guard already falsified.
+    #[test]
+    #[serial_test::serial]
+    fn the_touching_threshold_warning_describes_the_disarm_not_the_old_cycling() {
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
+        }
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let lower = check.message.to_ascii_lowercase();
+        assert!(
+            lower.contains("disarmed"),
+            "the remedy must say the soft tiers are disarmed: {}",
+            check.message
+        );
+        assert!(
+            !lower.contains("cycling"),
+            "the remedy must not still describe the pre-guard cycling behavior: {}",
+            check.message
+        );
+        assert!(
+            lower.contains("breaker"),
+            "…and must say what DOES still run, or the operator reads it as \"no thermal \
+             protection at all\": {}",
+            check.message
+        );
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-3 C4, first half) A mixed-case token must not reach a
+    /// Pass that claims tier 4 is enabled while the governor scores it as
+    /// an unknown state. Normalizing at resolution
+    /// (`config_access::thermal_pause_at`) is what closes it — this pins
+    /// the OUTCOME, so removing the normalization turns the silent Pass
+    /// into either a red test here or a Warn in the field, never a Pass.
+    #[test]
+    #[serial_test::serial]
+    fn a_mixed_case_pause_at_resolves_to_a_real_state_rather_than_passing_inert() {
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", " Serious ") };
+
+        assert_eq!(
+            darkmux_types::config_access::thermal_pause_at(),
+            "serious",
+            "the resolved value must be the canonical token the governor's severity() compares"
+        );
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("pause at `serious`"),
+            "doctor must report the value actually IN FORCE: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-3 C4, second half) `pause_at = "critical"` passed with
+    /// a message affirmatively claiming tier 4 was enabled, while the
+    /// breaker's own rule fires first on every such reading so tiers 2/3/4
+    /// could never run.
+    #[test]
+    #[serial_test::serial]
+    fn pause_at_critical_warns_that_the_breaker_preempts_the_soft_tiers() {
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "critical") };
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("breaker"),
+            "the operator must be told WHY the ladder never runs: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("tier 4"),
+            "and must not still claim tier 4 is enabled: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
             }
         }
     }

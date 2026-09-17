@@ -901,14 +901,34 @@ pub(crate) const RESUME_ORIGIN_FILENAME: &str = "resume_origin.json";
 /// rather than growing two more parameters on the telemetry sampler. Purely
 /// additive and lenient-on-read: `validate_resume_checkpoint` never looks
 /// at it, and a file written before this field existed reads as `None`.
+///
+/// (#2774 round-3 MF2) The recorded `workspace` is CANONICALIZED. The gate
+/// compares this string against a path that has been through
+/// `darkmux_types::workdir::validate_workdir`, which canonicalizes — so
+/// recording a non-canonical path guarantees a mismatch no matter what the
+/// operator types. A no-`--workdir` dispatch's workspace is
+/// [`auto_workspace_path`], `std::env::temp_dir().join(...)`, raw: on
+/// macOS that is `/var/folders/...`, `/var` being a symlink to
+/// `/private/var`, so the two strings NEVER matched and every such resume
+/// was refused with RESUME WORKSPACE MISMATCH — the exact error F2 was
+/// filed to eliminate, still reachable after F2's own fix (proven round 3
+/// through the real gate). Canonicalizing HERE fixes it for every producer
+/// of a workspace path rather than for one call site's derivation.
+///
+/// Falls back to the raw path when canonicalize fails (the dir was removed
+/// under us): recording something is strictly better than recording
+/// nothing, since the gate's failure mode for a missing field is
+/// RESUME ORIGIN UNKNOWN either way.
 pub(crate) fn write_resume_origin_meta(
     host_out: &Path,
     workspace: &Path,
     workspace_read_only: bool,
     image: Option<&str>,
 ) {
+    let recorded_workspace =
+        workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
     let body = serde_json::json!({
-        "workspace": workspace.display().to_string(),
+        "workspace": recorded_workspace.display().to_string(),
         "workspace_read_only": workspace_read_only,
         "image": image,
     });
@@ -8091,6 +8111,25 @@ fn run_telemetry_sampler(
         crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env())
             .owned_by(mission_id.as_deref())
             .seeded_from_mission(thermal_ladder_state_file.as_deref());
+    // (#2774 round-3 MF1) An incoherent `pause_at`/`resume_at` pair runs no
+    // soft tier at all. `darkmux doctor` warns about the config itself, but
+    // an operator who never ran doctor would otherwise watch a hot machine
+    // simply never pace and have no way to know why — the exact "never
+    // wonder where a decision came from" failure operator sovereignty (#44)
+    // exists to prevent. Says it at dispatch start, not per sample.
+    if darkmux_types::config_access::thermal_enabled() && !thermal_governor.soft_tiers_armed() {
+        eprintln!(
+            "darkmux: ⚠ thermal ladder DISARMED — runtime.thermal.pause_at \
+             (`{}`) is not strictly more severe than runtime.thermal.resume_at (`{}`), so \
+             there is no band for the entry/resume holds to occupy. Duty-cycle, pause/resume \
+             and the episode-count hold will not run this dispatch; the breaker (`critical`, \
+             and the sustained cpu_speed_limit floor) still will. Fix with: darkmux config set \
+             runtime.thermal.resume_at <a state milder than {}>",
+            darkmux_types::config_access::thermal_pause_at(),
+            darkmux_types::config_access::thermal_resume_at(),
+            darkmux_types::config_access::thermal_pause_at(),
+        );
+    }
     let thermal_stop_file =
         crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
     // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
@@ -8387,10 +8426,16 @@ fn run_telemetry_sampler(
                     // `resume_hint_from_origin`'s own doc.
                     let resume_hint =
                         resume_hint_from_origin(&host_out, &role_id, phase_id.as_deref());
+                    // (#2774 round-3 C9) "this mission", not "this run":
+                    // F5 made the episode count MISSION-scoped (seeded
+                    // across dispatches from the ladder-state file), so a
+                    // unit whose own governor saw exactly one episode
+                    // legitimately prints "2 time(s)". The old wording made
+                    // that read as a bug in the count.
                     eprintln!(
-                        "darkmux: this machine reached `serious` {episode} time(s) this run — pausing \
-                         indefinitely, no further turns until you say to. {checklist}. To continue: \
-                         {resume_hint}"
+                        "darkmux: this machine reached `serious` {episode} time(s) this mission — \
+                         pausing indefinitely, no further turns until you say to. {checklist}. \
+                         To continue: {resume_hint}"
                     );
                     emit_rest_with_extra(
                         darkmux_flow::Level::Warn,
