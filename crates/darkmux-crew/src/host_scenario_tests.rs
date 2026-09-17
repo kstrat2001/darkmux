@@ -771,13 +771,30 @@ fn a_lone_low_speed_sample_is_noise_and_a_sustained_one_trips_the_breaker() {
          SPEED-LIMIT signal and nothing else"
     );
 
-    // The lone low sample sits at ~20s; the sustained stretch starts at 62s.
+    // WHEN the breaker trips is the whole assertion, not just that it
+    // eventually does. The scenario's frames end at 20000 / 22000 / 62000 /
+    // 102000 and the driver ticks every 2000ms, so exactly one sample
+    // (at 20_000) reads low before the forty-second recovery, and the
+    // sustained stretch's samples land at 62_000, 64_000, 66_000, …
+    // `speed_limit_hold_samples` defaults to 3, so:
+    //
+    // | streak reset on a healthy sample | trips on |
+    // |---|---|
+    // | yes (the contract, frame 3's `note`) | the THIRD sustained sample, 66_000 |
+    // | no (the reset line deleted)          | the SECOND, 64_000 — the lone noise sample carried across forty seconds |
+    //
+    // A `> 60_000` bound is satisfied by BOTH, which is how deleting
+    // `else { self.speed_limit_low_streak = 0; }` left this whole scenario
+    // suite green. The window below excludes 64_000 on purpose: it is the
+    // only thing here that pins frame 3's stated invariant.
     let first_event_at = d.thermal_events().first().map(|(at, _)| *at);
     assert!(
-        first_event_at.is_none_or(|at| at > 60_000),
-        "a single sample below the floor is ordinary DVFS noise and must trip nothing — \
-         the streak has to be CONSECUTIVE, or low samples scattered across an hour would \
-         eventually add up to a breaker trip: first event at {first_event_at:?}"
+        matches!(first_event_at, Some(at) if (65_000..=67_000).contains(&at)),
+        "a single sample below the floor is ordinary DVFS noise and must trip nothing, AND \
+         the streak it left behind must RESET on the healthy samples that follow — otherwise \
+         low samples scattered across an hour add up to a breaker trip. Trip on the third \
+         CONSECUTIVE low sample (~66s), never the second (~64s): first event at \
+         {first_event_at:?}"
     );
     assert_eq!(
         thermal_event_names(&d),

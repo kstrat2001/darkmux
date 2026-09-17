@@ -285,10 +285,43 @@ pub fn build_machine_scoped_telemetry_record(
     sampled_at_ms: u64,
     interval_ms: u64,
 ) -> darkmux_flow::FlowRecord {
+    build_machine_scoped_telemetry_record_with(
+        sample,
+        sampled_at_ms,
+        interval_ms,
+        crate::host_source::provenance(),
+    )
+}
+
+/// (#2779) [`build_machine_scoped_telemetry_record`]'s body, with the host
+/// provenance passed in rather than read from the process-wide resolution.
+///
+/// Split for the reason [`crate::host_source::stamp_with`] is split from
+/// [`crate::host_source::stamp`]: the resolution is a `OnceLock` read of an
+/// env var, so a test calling the wrapper could only ever exercise whichever
+/// variant the test process happened to resolve — `Real`, always — and the
+/// branch that matters (a scripted run stamping `simulated_host_source`)
+/// would be pinned by nothing.
+///
+/// This record is the one that makes the stamp load-bearing rather than
+/// tidy: `thermal.state` and `battery.charge_pct` here come off the SAME
+/// `probe.sample()` the governor just decided on, a dispatch that holds
+/// `host_sampler_lock` is the machine's sole `machine.telemetry` emitter for
+/// its lifetime, and with Redis enabled these records ride the fleet stream
+/// to another machine's machine lens. An unstamped scripted reading there is
+/// a second machine being told this one hit `critical`, with nothing in the
+/// data saying otherwise.
+pub fn build_machine_scoped_telemetry_record_with(
+    sample: &HostSampleFull,
+    sampled_at_ms: u64,
+    interval_ms: u64,
+    provenance: &crate::host_source::Provenance,
+) -> darkmux_flow::FlowRecord {
     let mut payload = sample_full_json(sample, sampled_at_ms);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("interval_ms".into(), serde_json::json!(interval_ms));
     }
+    crate::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
@@ -704,10 +737,16 @@ impl HostProbe {
             gpu_mhz,
             gpu_mem_bytes: gpu.and_then(|g| g.1),
             // (#2779) Both halves come from the resolved source. This is
-            // the ONE call site that ADVANCES it, by the same real
-            // `interval_ms` the governor is fed as `elapsed_ms` — so a
-            // scenario's simulated clock and the governor's accounting
-            // come from one number and cannot disagree.
+            // the ONE call site that ADVANCES it, by this probe's own
+            // measured `interval_ms` — the same measured gap the governor
+            // is fed as `elapsed_ms`, so the scripted clock and the
+            // governor's accounting cannot DRIFT apart tick over tick.
+            // They are not literally one number: the sampler computes
+            // `elapsed_ms` from its own `started.elapsed()` reads taken
+            // AFTER this call returns, anchored at `0`, so iteration one
+            // carries a constant offset (see `host_source`'s module doc).
+            // Constant, established once, and no ladder invariant keys on
+            // the absolute value.
             thermal: host_reading.thermal,
             // (#2705) The fast half only — one IORegistry walk, ~1 ms. The
             // slow half (health) is NOT read here; see the field's doc.

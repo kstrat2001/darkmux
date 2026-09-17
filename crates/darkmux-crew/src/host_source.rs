@@ -38,8 +38,19 @@
 //! `HostProbe::sample` already computes the REAL elapsed since its own
 //! previous sample (`interval_ms`), and that is what it advances the
 //! scripted clock by — so the scenario's simulated time and the
-//! `elapsed_ms` the governor is fed come from the same number and can
-//! never disagree. A test driving the governors directly
+//! `elapsed_ms` the governor is fed advance by the same measured gap and
+//! cannot DRIFT apart tick over tick.
+//!
+//! They are not one number, and the difference is worth stating rather
+//! than rounding off. The sampler's own `thermal_elapsed_ms` is
+//! `at_ms - prev_thermal_at_ms` read AFTER `probe.sample()` returns, with
+//! `prev_thermal_at_ms` starting at `0`, while `interval_ms` is
+//! probe-t0 to probe-t0. So on iteration ONE the governor is fed
+//! everything since sampler start — including `lms_tracker.tick()`, which
+//! can stall ~30s — while the scripted cursor advances by `0`. That is a
+//! constant offset established once, not a cumulative divergence: every
+//! later tick moves both by the same measured amount, and no ladder
+//! invariant keys on the absolute value. A test driving the governors directly
 //! ([`crate::host_scenario::ScenarioDriver`]) advances by a fixed tick
 //! instead, which is what compresses a 40-minute escalation into
 //! microseconds.
@@ -54,9 +65,28 @@
 //!    scenario path (`describe_host_probe`).
 //! 2. The dispatch prints a warning line at sampler start, beside the
 //!    ladder's own disarm notes.
-//! 3. Every `dispatch.rest` / `machine.telemetry` payload carries
-//!    `simulated_host_source: "<path>"` ([`stamp`]).
-//! 4. The run artifact's `host_window` block carries the same field.
+//! 3. Every flow record whose payload carries a thermal or battery reading
+//!    carries `simulated_host_source: "<path>"` beside it ([`stamp`]).
+//!    That is four record builders, listed exhaustively because an
+//!    unstamped one is exactly the lie this surface exists to prevent:
+//!    the sampler's own `dispatch.rest` (its plain and its
+//!    extra-carrying emitter, in `run_telemetry_sampler`); the tailer's
+//!    `dispatch.rest` reporting the rest the run ACTUALLY took
+//!    (`dispatch_internal::runtime_rest_payload`); `machine.telemetry`
+//!    ([`crate::host_probe::build_machine_scoped_telemetry_record`] — the
+//!    builder BOTH possible singleton samplers share, a dispatch holding
+//!    `host_sampler_lock` and the serve daemon); and the daemon's
+//!    `machine.thermal` transition record
+//!    (`darkmux-serve::host_sampler::build_thermal_transition_record`).
+//!    The last two matter most: they are machine-SCOPED, so with Redis
+//!    enabled they ride the fleet stream to another machine's machine
+//!    lens, which would otherwise show this laptop hitting `critical`
+//!    with nothing in the data saying otherwise.
+//! 4. The run artifact's `host_window` block carries the same field — but
+//!    UNCONDITIONALLY (`null` on a real run), not absent-when-real like
+//!    the flow records. The two surfaces disagree on purpose; see
+//!    [`stamp`]'s own note for why, and do not learn the rule from one
+//!    surface and apply it to the other.
 //!
 //! A scenario file that is named but cannot be LOADED does not silently
 //! become a real read either: the resolution keeps [`RealSource`] (the safe
@@ -410,6 +440,16 @@ pub fn advance_and_read(source: &dyn HostSource, elapsed_ms: u64) -> HostReading
 /// Absent (never `false`, never `null`) on a real-hardware run, so the
 /// field's mere PRESENCE answers "were these readings real", the same
 /// shape `baseline` already uses on `telemetry.lms`.
+///
+/// **The run artifact deliberately does the opposite**, and a reader who
+/// learns the rule here must not carry it across: `host_window`'s
+/// `simulated_host_source` is serialized UNCONDITIONALLY, `null` on a real
+/// run (`dispatch_internal`'s `host_window` builder says so at the site).
+/// The asymmetry is intentional and follows the reader — a flow record is
+/// consumed by code scanning a high-volume stream, where an absent key is
+/// the cheapest possible "no"; an artifact is read by eye long after the
+/// run, where an explicit `null` is a stronger statement than a key that
+/// might merely have been forgotten.
 pub fn stamp(payload: &mut serde_json::Value) {
     stamp_with(provenance(), payload);
 }

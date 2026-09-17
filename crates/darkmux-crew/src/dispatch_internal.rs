@@ -8864,6 +8864,52 @@ struct TailerState {
     record_context: Option<serde_json::Value>,
 }
 
+/// (#2779) The `dispatch.rest` payload the `runtime.rest` tailer arm emits —
+/// the record reporting the rest a run ACTUALLY took, carrying the pace
+/// file's own `reason` and thermal `state` forward onto the flow stream.
+///
+/// Pulled out of the arm as a free function for the reason
+/// [`crate::host_source::stamp_with`] exists at all: the arm builds its
+/// payload inside a tailer thread against a process-wide `OnceLock`
+/// provenance, which in any test process resolves `Real` — so the branch
+/// that matters (a scripted run stamping `simulated_host_source`) would be
+/// reachable from no test. With `provenance` an argument it is a plain
+/// table-driven unit test.
+///
+/// This is the most pacing-ish record in the system, which is why leaving it
+/// unstamped falsified even the narrow reading of the contract ("every
+/// pacing flow record"): a scripted `thermal` rest here is indistinguishable
+/// on the wire from a real one.
+fn runtime_rest_payload(
+    event: &serde_json::Value,
+    ms: u64,
+    rest_ms: u64,
+    rests: u32,
+    reason: &str,
+    provenance: &crate::host_source::Provenance,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "ms": ms,
+        "turn": event.get("seq"),
+        "rest_ms": rest_ms,
+        "rests": rests,
+        "reason": reason,
+    });
+    // (2026-08-30 fleet-observability finding) The pace file's own `state`
+    // (an OS thermal-state name when the governor wrote the pause) —
+    // forwarded only when the runtime's event actually carries one (a plain
+    // turn-delay rest never does; an older runtime image predating this
+    // doesn't either), rather than stamping a `null` a reader has to learn
+    // means "not applicable."
+    if let Some(state) = event.get("state") {
+        if !state.is_null() {
+            payload["state"] = state.clone();
+        }
+    }
+    crate::host_source::stamp_with(provenance, &mut payload);
+    payload
+}
+
 impl TailerState {
     fn new(
         trajectory_path: PathBuf,
@@ -9499,25 +9545,14 @@ impl TailerState {
                         Instant::now() + Duration::from_secs(self.inactivity_secs);
                     *lock_deadline(deadline) = new_deadline;
                 }
-                let mut payload = serde_json::json!({
-                    "ms": ms,
-                    "turn": event.get("seq"),
-                    "rest_ms": self.summary.rest_ms,
-                    "rests": self.summary.rests,
-                    "reason": reason,
-                });
-                // (2026-08-30 fleet-observability finding) The pace file's
-                // own `state` (an OS thermal-state name when the governor
-                // wrote the pause) — forwarded only when the runtime's
-                // event actually carries one (a plain turn-delay rest never
-                // does; an older runtime image predating this doesn't
-                // either), rather than stamping a `null` a reader has to
-                // learn means "not applicable."
-                if let Some(state) = event.get("state") {
-                    if !state.is_null() {
-                        payload["state"] = state.clone();
-                    }
-                }
+                let payload = runtime_rest_payload(
+                    &event,
+                    ms,
+                    self.summary.rest_ms,
+                    self.summary.rests,
+                    reason,
+                    crate::host_source::provenance(),
+                );
                 self.emit("dispatch.rest", darkmux_flow::Level::Info, payload);
             }
             _ => {

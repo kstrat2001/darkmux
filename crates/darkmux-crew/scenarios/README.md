@@ -65,10 +65,32 @@ DARKMUX_HOST_SOURCE_SCRIPT=/path/to/your-scenario.jsonl darkmux dispatch <role> 
 
 darkmux then paces that dispatch against the scenario instead of this
 machine. It will say so, loudly, in four places — `darkmux doctor`, a
-warning line at dispatch start, every pacing flow record
-(`simulated_host_source`), and the run artifact. That is deliberate: a
-machine reporting `nominal` while it actually cooks is worse than no
-governor at all, so a simulated source is never allowed to be quiet.
+warning line at dispatch start, every flow record carrying a thermal or
+battery reading (`simulated_host_source`), and the run artifact. That is
+deliberate: a machine reporting `nominal` while it actually cooks is worse
+than no governor at all, so a simulated source is never allowed to be quiet.
+
+The flow-record half is four builders, and the two machine-scoped ones are
+why the list has to be exhaustive: a dispatch run this way acquires the
+machine's host-sampler lock and becomes its sole `machine.telemetry`
+emitter for the run's lifetime, so with Redis enabled those records ride
+the fleet stream to your OTHER machine. Unstamped, that machine's lens
+would show this laptop hitting `critical` with nothing in the data saying
+otherwise.
+
+| record | emitted by |
+|---|---|
+| `dispatch.rest` (pause / resume / duty cycle / breaker) | the dispatch's telemetry sampler |
+| `dispatch.rest` (the rest the run actually took) | the dispatch's trajectory tailer |
+| `machine.telemetry` | whichever process holds the host-sampler lock — a dispatch, or the serve daemon |
+| `machine.thermal` (state transition) | the serve daemon's host sampler |
+
+**One asymmetry to know before writing a consumer.** On a flow record the
+field is ABSENT on a real run, so its mere presence answers "were these
+readings real". In the run artifact's `host_window` block it is present
+either way — `null` on a real run — because an artifact is read by eye long
+after the run, where an explicit `null` says more than a missing key. Do
+not learn the rule from one surface and apply it to the other.
 
 It is an environment variable and **not** a `config.json` setting for the
 same reason — a simulation should live as long as the shell that asked for
