@@ -362,6 +362,23 @@ pub struct PanelConfig {
     /// hint text. `None` advertises the command with no input hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// (#2050) Whether this command takes any text after its name. `None`
+    /// and `Some(true)` are identical — the command accepts arguments,
+    /// which is every advertised config's behavior before this field
+    /// existed and stays the default for every operator config that never
+    /// sets it. `Some(false)` declares a command that takes none, and the
+    /// radio routing seat's output is held to that: trailing words the
+    /// model carried over are DROPPED rather than forwarded to a command
+    /// that has nowhere to put them (`src/radio.rs`'s
+    /// `validate_router_output`).
+    ///
+    /// **A structured field, deliberately not a reading of `hint`.** The
+    /// built-in `review` config's hint reads `"(no arguments)"`, and
+    /// matching on that string would make one config's prose a load-bearing
+    /// contract every other config would have to spell identically — a
+    /// magic string where a declaration belongs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_args: Option<bool>,
     /// Lenient-on-read overflow (contract 7) — a future sub-field on this
     /// block is safe to add without another schema bump.
     #[serde(flatten)]
@@ -3439,12 +3456,34 @@ mod tests {
         cfg.panel = Some(PanelConfig {
             description: Some("PR view".to_string()),
             hint: Some("<pr number>".to_string()),
+            accepts_args: Some(false),
             extras: BTreeMap::new(),
         });
         let json = serde_json::to_string(&cfg).unwrap();
         let back: MissionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
-        assert_eq!(back.panel.unwrap().hint.as_deref(), Some("<pr number>"));
+        let panel = back.panel.unwrap();
+        assert_eq!(panel.hint.as_deref(), Some("<pr number>"));
+        // (#2050) The declaration has to survive the wire in both
+        // directions, or `list_panel_commands` resolves a written `false`
+        // back to the permissive default and the enforcement is silently
+        // off for every config that asked for it.
+        assert_eq!(panel.accepts_args, Some(false));
+    }
+
+    #[test]
+    fn panel_with_no_accepts_args_parses_as_unset_rather_than_false() {
+        // (#2050) Unset must stay DISTINGUISHABLE from an explicit
+        // `false`: `src/acp_panel.rs` resolves unset to "accepts
+        // arguments", which is every pre-#2050 config's behavior. A
+        // `bool` here instead of `Option<bool>` would silently flip all of
+        // them to taking no arguments.
+        let json = r#"{"id":"x","name":"X","panel":{"description":"d"}}"#;
+        let cfg: MissionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.panel.as_ref().unwrap().accepts_args, None);
+        // And an unset field must not be written back out.
+        let out = serde_json::to_string(&cfg).unwrap();
+        assert!(!out.contains("accepts_args"), "an unset field must stay absent on write: {out}");
     }
 
     #[test]
@@ -3504,6 +3543,7 @@ mod tests {
         cfg.panel = Some(PanelConfig {
             description: Some("Short UI label".to_string()),
             hint: None,
+            accepts_args: None,
             extras: BTreeMap::new(),
         });
         let json = serde_json::to_string(&cfg).unwrap();

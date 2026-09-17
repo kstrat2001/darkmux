@@ -3,8 +3,9 @@
   "name": "Review",
   "description": "(#2310 P4d) The code review, built on the shared mission building blocks rather than a pipeline of its own — and, since P4d, the ONLY `review`: the bespoke funnel launcher and its ten Tier-3 `review.*` step kinds are deleted, so this document runs through the generic launcher with no bespoke launcher and no literal routing. `plan-<rule>` mints one `plan.sites` task per rule with `source: \"diff\"` (the DIFF-scoped strategy on the shared planning pattern — see plan_sites_step.rs; with no `workspace` but a `github` + `head_sha`, it derives its own one-source spec at that sha, which is how `.github/workflows/darkmux-review.yml` launches it from a runner with no operator-authored spec). `unit-<rule>` GROWS one `crawl.unit` dispatch per planned site, `role_id: \"reviewer\"`. `create-mods` waits, bounded, for the frontier-written mod one finding describes and gates it; `deliver` gathers this run's own finding/mod stores and renders a GitHub review payload. Two step `kind` ids below still carry a neighboring mission's vocabulary — `crawl.unit` and `crawl.summary` — because that is where the shared blocks live today; the vocabulary is the leftover, not the coupling, and a later packet folds both into mission-agnostic kinds. `outcome_from: \"deliver\"` names what this run DELIVERS rather than inheriting the positional 'last phase's last task' guess: the `mission close` payload is the deliver step's own DeliverOutcome, and a run whose delivery task itself errored exits 1 instead of 0.",
   "panel": {
-    "description": "Review a diff with darkmux's local-model review crew",
-    "hint": "(no arguments)"
+    "description": "Code review of the current code changes: this branch's uncommitted working-tree diff, reporting the bugs found",
+    "hint": "(no arguments)",
+    "accepts_args": false
   },
   "schema_version": "3.5",
   "outcome_from": "deliver",

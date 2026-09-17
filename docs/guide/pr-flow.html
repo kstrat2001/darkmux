@@ -120,7 +120,8 @@ darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
   "cmd": "pr-list",
   "panel": {
     "description": "List open pull requests in this repo",
-    "hint": "(no arguments)"
+    "hint": "(no arguments)",
+    "accepts_args": false
   },
   "phases": [
     {
@@ -138,7 +139,7 @@ darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
     }
   ]
 }</code></pre>
-    <p>No gate, no <code>reads</code>: listing is not a consequential act, so it only needs the allowlist. Live output looks like:</p>
+    <p>No gate, no <code>reads</code>: listing is not a consequential act, so it only needs the allowlist. <code>accepts_args: false</code> says the command takes no text after its name, and radio enforces it: trailing words the routing model carried over are dropped rather than handed to a command with nowhere to put them. Leave the field out (the default) for any verb that does read an argument. Live output looks like:</p>
     <pre><code>#1777  feat(acp): cancellation, session pruning, and the chunk-noise filter  [acp/1684-remainder]  @kstrat2001
 #1757  docs(guide): radio — full v2.6 surface  [docs/radio-guide] (draft)  @kstrat2001</code></pre>
 

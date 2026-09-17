@@ -74,6 +74,12 @@ pub struct PanelCommand {
     pub id: String,
     pub description: String,
     pub hint: Option<String>,
+    /// (#2050) [`PanelConfig::accepts_args`], resolved: an unset field
+    /// means `true`, so every config authored before that field existed
+    /// keeps advertising exactly as it did. `false` is a command that
+    /// takes no text after its name — see `crate::radio::CatalogEntry`'s
+    /// own field for the one consumer that acts on it.
+    pub accepts_args: bool,
 }
 
 /// Enumerate every mission config in the merged registry (built-ins +
@@ -107,6 +113,9 @@ pub fn list_panel_commands() -> Vec<PanelCommand> {
                 .clone()
                 .unwrap_or_else(|| loaded.config.name.clone()),
             hint: panel.hint.clone(),
+            // Unset means "accepts arguments" — the behavior of every
+            // advertised config before #2050 added the field.
+            accepts_args: panel.accepts_args.unwrap_or(true),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1215,7 +1224,8 @@ mod tests {
 
     #[test]
     fn route_command_returns_none_for_an_unadvertised_command() {
-        let advertised = vec![PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None }];
+        let advertised =
+            vec![PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None, accepts_args: true }];
         assert!(route_command(&advertised, "not-advertised").is_none());
     }
 
@@ -1254,7 +1264,7 @@ mod tests {
         // "/Pr-View", which `parse_command` lowercases to "pr-view" before
         // it ever reaches `route_command`.
         let advertised =
-            vec![PanelCommand { id: "Pr-View".to_string(), description: "View a PR".to_string(), hint: None }];
+            vec![PanelCommand { id: "Pr-View".to_string(), description: "View a PR".to_string(), hint: None, accepts_args: true }];
         let plan = route_command(&advertised, "pr-view").expect("a mixed-case filename must still be invocable");
         match plan {
             RoutePlan::Ephemeral(config) => {
@@ -1262,6 +1272,71 @@ mod tests {
             }
             _ => panic!("expected an Ephemeral route for a procedural-only fixture"),
         }
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    // ── (#2050) panel.accepts_args resolution ───────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn list_panel_commands_resolves_accepts_args_with_true_as_the_unset_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let dir = tmp.path().join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        // No `accepts_args` at all — the shape of every operator config
+        // authored before the field existed.
+        std::fs::write(
+            dir.join("legacy-cmd.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "legacy-cmd",
+                "name": "Legacy",
+                "panel": {"description": "Takes whatever you type"},
+                "phases": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // And one that declares it explicitly false.
+        std::fs::write(
+            dir.join("nullary-cmd.json"),
+            serde_json::to_string(&serde_json::json!({
+                "id": "nullary-cmd",
+                "name": "Nullary",
+                "panel": {"description": "Takes nothing", "accepts_args": false},
+                "phases": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let commands = list_panel_commands();
+        let find = |id: &str| {
+            commands
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("{id} must be advertised; got {:?}", commands.iter().map(|c| &c.id).collect::<Vec<_>>()))
+                .accepts_args
+        };
+        assert!(find("legacy-cmd"), "an unset `panel.accepts_args` must resolve to true, not false");
+        assert!(!find("nullary-cmd"), "an explicit `accepts_args: false` must survive the resolution");
+        // The SHIPPED built-in is the one this issue was filed about, and
+        // it merges into the same registry — so this asserts the actual
+        // artifact, not just the resolution rule.
+        assert!(
+            !find("review"),
+            "the built-in `review` config declares `panel.accepts_args: false` (#2050)"
+        );
 
         // SAFETY: this test is #[serial_test::serial].
         unsafe {
@@ -1327,8 +1402,8 @@ mod tests {
     #[test]
     fn not_a_command_message_lists_the_advertised_commands() {
         let advertised = vec![
-            PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None },
-            PanelCommand { id: "pr-list".to_string(), description: "d2".to_string(), hint: None },
+            PanelCommand { id: "review".to_string(), description: "d".to_string(), hint: None, accepts_args: true },
+            PanelCommand { id: "pr-list".to_string(), description: "d2".to_string(), hint: None, accepts_args: true },
         ];
         let msg = not_a_command_message(&advertised);
         assert!(msg.contains("/review"), "{msg}");
