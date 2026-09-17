@@ -135,6 +135,54 @@ pub fn not_a_command_message(commands: &[PanelCommand]) -> String {
     format!("darkmux acp doesn't recognize that as a command. {}", command_listing(commands))
 }
 
+/// (#2050 sweep) The args a command will ACTUALLY receive, plus the notice
+/// the operator is owed when text of theirs was dropped.
+///
+/// `panel.accepts_args: false` was enforced on exactly one of the two
+/// invocation surfaces. `crate::radio::decide_route` clears the args a
+/// routing seat carried over (`src/radio.rs`), because a model's claim is
+/// checked against the catalog rather than trusted. The DIRECT
+/// `/command args` path never consulted the field at all: [`route_command`]
+/// matches on the name alone, and `acp::execute_route_plan` forwarded
+/// whatever followed it — straight into `--param args=…` for a launch, or
+/// into the `__panel_args__` task for an ephemeral.
+///
+/// Two things that fixes, one live and one latent:
+///
+/// - **Live, and operator-visible.** Typing `/review please look closely at
+///   X` built an unused `--param args=…`, discarded the text, and said
+///   nothing — while `/review`'s own hint reads "(no arguments)". Input
+///   accepted and thrown away without acknowledgement. Hence the notice:
+///   silently dropping it is the same defect one step quieter.
+/// - **Latent.** `validate()` does not stop a config declaring BOTH
+///   `accepts_args: false` and a task that `reads: ["__panel_args__"]`. The
+///   one shipped config using the field (`review.json`) declares no such
+///   task, so `inject_panel_args_task_if_referenced` is a no-op today and
+///   the smuggled text goes nowhere — by accident, not by construction.
+///   Clearing at the surface closes it by construction, which is why this
+///   is preferred over a validation-time refusal of the combination: that
+///   would close only the future case and leave the silent discard.
+///
+/// An UNADVERTISED `cmd` keeps its args: this function judges only what the
+/// registry declares, and an unresolvable name is [`route_command`]'s
+/// problem, not this one.
+pub fn enforce_accepts_args(advertised: &[PanelCommand], cmd: &str, args: &str) -> (String, Option<String>) {
+    let Some(entry) = advertised.iter().find(|c| c.id.eq_ignore_ascii_case(cmd)) else {
+        return (args.to_string(), None);
+    };
+    if entry.accepts_args || args.trim().is_empty() {
+        return (args.to_string(), None);
+    }
+    // The registry's own casing, not what the operator typed — the same
+    // rule `route_command` follows for the id it actually loads.
+    let notice = format!(
+        "darkmux: /{} takes no arguments, so the text after it was not passed on. Running \
+         /{} on its own.",
+        entry.id, entry.id
+    );
+    (String::new(), Some(notice))
+}
+
 /// The bare "Available commands: …" listing, WITHOUT the didn't-recognize-
 /// that preamble (#1698 Packet B2 gate). The answering seat appends a
 /// listing after an answer that names a `/command`, where the full
@@ -1345,6 +1393,76 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_CREW_DIR"),
             }
         }
+    }
+
+    // ── (#2050 sweep) accepts_args on the DIRECT slash surface ──────────
+
+    fn nullary(id: &str) -> PanelCommand {
+        PanelCommand { id: id.to_string(), description: "d".to_string(), hint: None, accepts_args: false }
+    }
+
+    fn nary(id: &str) -> PanelCommand {
+        PanelCommand { id: id.to_string(), description: "d".to_string(), hint: None, accepts_args: true }
+    }
+
+    #[test]
+    fn a_nullary_command_does_not_receive_typed_args() {
+        // The live defect: `/review please look closely at X` built an
+        // unused `--param args=…` and discarded the text. Now the args are
+        // cleared BEFORE the plan executes, which is also what closes the
+        // latent `__panel_args__` case by construction.
+        let advertised = vec![nullary("review")];
+        let (args, notice) = enforce_accepts_args(&advertised, "review", "please look closely at X");
+        assert_eq!(args, "", "a command declaring `accepts_args: false` must receive nothing");
+        let notice = notice.expect("dropping the operator's text silently is the same defect, quieter");
+        assert!(notice.contains("/review"), "the notice must name the command: {notice}");
+        assert!(notice.contains("takes no arguments"), "{notice}");
+    }
+
+    #[test]
+    fn a_command_that_takes_args_keeps_them() {
+        // The inverted case: every config authored before the field
+        // existed resolves to `accepts_args: true`, and clearing THOSE
+        // would break every advertised command that reads its text.
+        let advertised = vec![nary("pr-view")];
+        let (args, notice) = enforce_accepts_args(&advertised, "pr-view", "1234");
+        assert_eq!(args, "1234");
+        assert!(notice.is_none(), "nothing was dropped, so nothing is announced");
+    }
+
+    #[test]
+    fn a_nullary_command_invoked_bare_says_nothing() {
+        // No text was typed, so no text was dropped — a notice here would
+        // be noise on every plain `/review`.
+        let advertised = vec![nullary("review")];
+        for typed in ["", "   ", "\n"] {
+            let (args, notice) = enforce_accepts_args(&advertised, "review", typed);
+            assert_eq!(args, typed, "empty args pass through unchanged: {typed:?}");
+            assert!(notice.is_none(), "an empty invocation must not be announced: {typed:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_args_is_matched_case_insensitively_and_reported_in_the_registrys_casing() {
+        // `parse_command` lowercases what the operator typed, while a
+        // registry key keeps the on-disk filename's case — the same
+        // mismatch `route_command`'s own doc guards against. A naive `==`
+        // here would let a mixed-case config smuggle args past the check.
+        let advertised = vec![nullary("Review-PR")];
+        let (args, notice) = enforce_accepts_args(&advertised, "review-pr", "some text");
+        assert_eq!(args, "");
+        assert!(notice.is_some_and(|n| n.contains("/Review-PR")), "the notice uses the registry's casing");
+    }
+
+    #[test]
+    fn an_unadvertised_command_keeps_its_args() {
+        // This function judges only what the registry declares; an
+        // unresolvable name is `route_command`'s problem, and it refuses
+        // the whole invocation a line later.
+        let advertised = vec![nullary("review")];
+        let (args, notice) = enforce_accepts_args(&advertised, "not-a-command", "some text");
+        assert_eq!(args, "some text");
+        assert!(notice.is_none());
     }
 
     // ── (#1684 QA finding — MUST-FIX 2/3) advertised id + description ──

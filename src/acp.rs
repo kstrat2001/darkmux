@@ -1048,10 +1048,21 @@ async fn serve(
                     let advertised = crate::acp_panel::list_panel_commands();
                     let route = crate::acp_panel::parse_command(&text)
                         .and_then(|(cmd, args)| {
-                            crate::acp_panel::route_command(&advertised, &cmd).map(|plan| (plan, args))
+                            // (#2050 sweep) `panel.accepts_args: false` was
+                            // enforced only on the ROUTED channel
+                            // (`radio::decide_route`); this direct
+                            // `/command args` path forwarded whatever the
+                            // operator typed. Decided here, where the
+                            // registry entry is in hand, and the notice is
+                            // sent below rather than dropping the text
+                            // silently. See `acp_panel::enforce_accepts_args`.
+                            let (args, notice) =
+                                crate::acp_panel::enforce_accepts_args(&advertised, &cmd, &args);
+                            crate::acp_panel::route_command(&advertised, &cmd)
+                                .map(|plan| (plan, args, notice))
                         });
 
-                    let Some((plan, args)) = route else {
+                    let Some((plan, args, args_notice)) = route else {
                         // Never hang, never bounce an error across the
                         // protocol boundary for an input we just don't support
                         // yet — reply plainly and end the turn. Lists the
@@ -1063,6 +1074,13 @@ async fn serve(
                         ));
                         return responder.respond(PromptResponse::new(StopReason::EndTurn));
                     };
+
+                    // Told BEFORE the command runs, so the operator reads
+                    // "your text was not passed on" next to the invocation
+                    // rather than after its output.
+                    if let Some(notice) = args_notice {
+                        let _ = cx.send_notification(agent_chunk(&session_id, notice));
+                    }
 
                     let Some(cwd) = session_cwd(&sessions_for_prompt, &session_id) else {
                         let _ = cx.send_notification(agent_chunk(&session_id, NO_CWD_MESSAGE));
