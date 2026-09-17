@@ -282,8 +282,15 @@ impl BatteryGovernor {
     /// `thermal_max_pause_ms()` resolves to on the machine running the
     /// suite (which would make the assertion depend on process env and on
     /// the operator's own config).
+    ///
+    /// (#2779) `pub` WITHIN the test build — still `#[cfg(test)]`, so the
+    /// release API is unchanged — because the scenario suite lives in
+    /// another module of this crate and needs the same pinned cadence for
+    /// the same reason: a scenario asserting WHEN this governor re-asserts
+    /// its pause must not pass or fail on whoever exported
+    /// `DARKMUX_THERMAL_MAX_PAUSE_MS`.
     #[cfg(test)]
-    fn with_restamp_interval_ms(mut self, ms: u64) -> Self {
+    pub fn with_restamp_interval_ms(mut self, ms: u64) -> Self {
         self.restamp_interval_ms = ms;
         self
     }

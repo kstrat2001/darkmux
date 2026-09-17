@@ -1,0 +1,2 @@
+{"hold_ms": 20000, "note": "#2779 scenario 2 — cool start, so the duty cycle has an Idle state to enter FROM.", "thermal": {"state": "nominal"}}
+{"hold_ms": 600000, "note": "Ten minutes at `fair`. Tier 2 engages once the entry hold (resume_hold_ms) is satisfied CONTINUOUSLY, and the pace file carries pause:false with a turn_delay_ms — the third pace-file state, which is what a turn actually rests on. Never a pause: `fair` is below pause_at.", "thermal": {"state": "fair"}}

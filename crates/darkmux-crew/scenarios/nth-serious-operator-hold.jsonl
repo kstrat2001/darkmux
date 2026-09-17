@@ -1,0 +1,5 @@
+{"hold_ms": 20000, "note": "#2779 scenario 4 — tier 4's terminal hold at the Nth episode (shipped default: the 2nd).", "thermal": {"state": "nominal"}}
+{"hold_ms": 120000, "note": "Episode 1 — an ordinary tier-3 pause.", "thermal": {"state": "serious"}}
+{"hold_ms": 120000, "note": "Recovery, so episode 2 is a genuine TRANSITION rather than more samples of episode 1.", "thermal": {"state": "fair"}}
+{"hold_ms": 120000, "note": "Episode 2 — straight to OperatorHold. No ratchet (there is no resume to ratchet on), its own pace reason, and its own STOP-file reason.", "thermal": {"state": "serious"}}
+{"hold_ms": 300000, "note": "Five minutes of a COOL machine. Nothing here may release the hold: tier 4 is terminal for decisions and resumes only on the operator's own --resume-from.", "thermal": {"state": "nominal"}}

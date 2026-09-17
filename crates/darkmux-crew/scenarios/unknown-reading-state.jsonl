@@ -1,0 +1,2 @@
+{"hold_ms": 20000, "note": "#2779 scenario 14 — a thermal state name this build does not know, which a future macOS can introduce at any time. Cool start.", "thermal": {"state": "nominal"}}
+{"hold_ms": 60000, "note": "An unrecognized state. It must be treated as BREAKER-CLASS — at least as severe as `critical` — never silently read as `nominal`. A state the code cannot rank is not evidence the machine is cool.", "thermal": {"state": "unknown-7"}}

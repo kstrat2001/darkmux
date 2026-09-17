@@ -1,0 +1,4 @@
+{"hold_ms": 20000, "note": "#2779 scenario 13 — the Nth episode reached from IDLE rather than from a duty cycle. Its sibling scenario recovers to `fair`, which lands the governor in the duty cycle, so the hold there is entered from DutyCycle; this one recovers all the way to `nominal` so the hold is entered from Idle. Both edges exist in the state machine and both have to be walked.", "thermal": {"state": "nominal"}}
+{"hold_ms": 120000, "note": "Episode 1.", "thermal": {"state": "serious"}}
+{"hold_ms": 120000, "note": "Full recovery to a cold machine — lands in Idle, not the duty cycle.", "thermal": {"state": "nominal"}}
+{"hold_ms": 120000, "note": "Episode 2, from Idle — terminal hold.", "thermal": {"state": "serious"}}

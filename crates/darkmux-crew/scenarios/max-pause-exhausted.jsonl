@@ -1,0 +1,2 @@
+{"hold_ms": 20000, "note": "#2779 scenario 12 — a pause that never recovers. Cool start.", "thermal": {"state": "nominal"}}
+{"hold_ms": 600000, "note": "Ten unbroken minutes at `serious`. Tier 3 pauses and waits. Past max_pause_ms the governor stops resting and hands off to the breaker instead of resting forever — a different exit from the same state than the `critical` one, and the one an overnight crawl actually meets.", "thermal": {"state": "serious"}}

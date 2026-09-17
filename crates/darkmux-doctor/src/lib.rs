@@ -3483,7 +3483,13 @@ fn check_host_probe() -> Check {
     let _seed = probe.sample();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let s = probe.sample();
-    describe_host_probe(probe.sources(), s.cost_ms)
+    // (#2779) The provenance is READ here and PASSED IN, not read inside
+    // the renderer — same split, and the same reason, as `src`/`cost_ms`:
+    // it resolves from a process-wide `OnceLock` over an env var, so a
+    // renderer that read it itself could only ever be tested in the variant
+    // the test process happened to resolve (`Real`, always), leaving the
+    // one branch that matters pinned by nothing.
+    describe_host_probe(probe.sources(), s.cost_ms, darkmux_crew::host_source::provenance().warning())
 }
 
 /// Render [`check_host_probe`]'s verdict from an already-taken reading.
@@ -3496,6 +3502,10 @@ fn check_host_probe() -> Check {
 fn describe_host_probe(
     src: darkmux_crew::host_probe::HostProbeSources,
     cost_ms: u64,
+    // (#2779) `Some` when the thermal + battery readings are NOT this
+    // machine's, or when a scenario was named and could not be loaded —
+    // `host_source::Provenance::warning()` verbatim.
+    simulated_warning: Option<String>,
 ) -> Check {
     let name = "host probe";
     let all = [
@@ -3509,6 +3519,24 @@ fn describe_host_probe(
         // the same distinction this check exists to draw for `ioreport`.
         ("battery", src.battery),
     ];
+    // (#2779) `simulated` QUALIFIES the two readings above rather than
+    // being an independent source: on a scripted run `thermal` and
+    // `battery` resolve because a scenario file supplied them, which on a
+    // host that genuinely has neither (a Linux CI box, a desktop with no
+    // battery) would otherwise read as "this machine has a thermal sensor".
+    // Naming them in the list is what stops `sources` being quietly wrong
+    // about the host while the warning below is right about the run.
+    let all: Vec<(&str, bool)> = all
+        .iter()
+        .map(|(n, ok)| {
+            let n = match (src.simulated, *n) {
+                (true, "thermal") => "thermal(scenario)",
+                (true, "battery") => "battery(scenario)",
+                _ => n,
+            };
+            (n, *ok)
+        })
+        .collect();
     let resolved: Vec<&str> = all.iter().filter_map(|(n, ok)| ok.then_some(*n)).collect();
     let missing: Vec<&str> = all.iter().filter_map(|(n, ok)| (!ok).then_some(*n)).collect();
 
@@ -3533,6 +3561,33 @@ fn describe_host_probe(
     } else {
         format!("{} ({cost}); unavailable: {}", resolved.join(" + "), missing.join(", "))
     };
+    // (#2779) A simulated host source OUTRANKS every other verdict this
+    // check can reach, including the healthy all-sources-resolved Pass. A
+    // machine reporting `nominal` while it actually cooks is strictly worse
+    // than no governor at all, so this is the loudest thing doctor can say
+    // about the probe, and it is said FIRST — before a reader gets as far
+    // as the source list, which on a scripted run describes a fiction.
+    //
+    // The message is `Provenance::warning()` verbatim, the same value the
+    // dispatch prints at sampler start, so the two surfaces cannot
+    // disagree — the shape the thermal ladder's own disarm notes already
+    // use. `ScriptedUnavailable` renders here too (nothing is simulated,
+    // but a named-and-unloadable scenario is not allowed to be silent
+    // either).
+    if let Some(warning) = simulated_warning {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!("{warning} (sources: {msg})"),
+            hint: Some(
+                "Unset DARKMUX_HOST_SOURCE_SCRIPT to read this machine's real thermal and \
+                 battery state. The scenario facade exists so the thermal escalation ladder \
+                 can be regression-tested against simulated hardware; it is not a runtime \
+                 setting."
+                    .into(),
+            ),
+        };
+    }
     // Anything short of mach is a real gap worth surfacing — without tick
     // counters there is no CPU figure at all. A missing IOReport is a
     // property of the host, reported without alarm but always NAMED.
@@ -8397,13 +8452,103 @@ mod tests {
         }
     }
 
+    // (#2779) A SIMULATED host source outranks every other verdict this
+    // check can reach. The two tests below are the doctor half of the
+    // facade's "never fake silently" contract; the three other surfaces
+    // (the dispatch's warning line, the flow-record stamp, the run
+    // artifact's field) are pinned in `darkmux-crew`.
+    #[test]
+    fn describe_host_probe_warns_loudly_when_the_readings_are_simulated() {
+        // A perfectly healthy probe — every source resolved, fast. Without
+        // the simulated branch this is an unqualified Pass, and an operator
+        // reading it would believe the governor was watching THIS machine.
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            simulated: true,
+            mach: true,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+            battery: true,
+        };
+        let warning = darkmux_crew::host_source::Provenance::Scripted {
+            path: "/tmp/hot.jsonl".into(),
+            frames: 4,
+            span_ms: 600_000,
+        }
+        .warning();
+        let check = describe_host_probe(src, 7, warning);
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a machine reporting `nominal` while it actually cooks is worse than no governor \
+             at all — a simulated source must never read as a healthy Pass: {}",
+            check.message
+        );
+        assert!(check.message.contains("SIMULATED"), "{}", check.message);
+        assert!(
+            check.message.contains("/tmp/hot.jsonl"),
+            "the check must NAME the file, or the operator cannot find what is lying to them: {}",
+            check.message
+        );
+        assert!(
+            check.hint.as_deref().is_some_and(|h| h.contains("DARKMUX_HOST_SOURCE_SCRIPT")),
+            "and the hint must name the knob that turns it off: {:?}",
+            check.hint
+        );
+        assert!(
+            check.message.contains("thermal(scenario)") && check.message.contains("battery(scenario)"),
+            "the source list must mark WHICH sources are scripted — on a host with no thermal \
+             sensor and no battery, an unqualified `thermal + battery` in this line is a \
+             claim about the HARDWARE that is simply false: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("mach(scenario)"),
+            "and must mark only the two the facade actually supplies — CPU, memory, GPU and \
+             power still come from the real probe: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn describe_host_probe_reports_a_scenario_that_could_not_be_loaded() {
+        // Nothing is simulated here — the process fell back to real
+        // hardware, which is the safe direction. It still must not be
+        // silent: an operator who believes a scenario is driving the run
+        // and is actually watching real readings will misread everything
+        // that follows.
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            simulated: false,
+            mach: true,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+            battery: true,
+        };
+        let warning = darkmux_crew::host_source::Provenance::ScriptedUnavailable {
+            path: "/nope.jsonl".into(),
+            error: "No such file or directory (os error 2)".into(),
+        }
+        .warning();
+        let check = describe_host_probe(src, 7, warning);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("/nope.jsonl"), "{}", check.message);
+        assert!(
+            check.message.contains("REAL hardware"),
+            "it must say which way the fallback went: {}",
+            check.message
+        );
+    }
+
     /// The degradation combinations the live probe cannot produce on a
     /// healthy Mac — and the ones most worth pinning, since a private
     /// framework whose path has already moved once will move again. Pure, so
     /// they run on every platform.
     #[test]
     fn describe_host_probe_names_a_missing_ioreport_rather_than_hiding_it() {
-        let src = darkmux_crew::host_probe::HostProbeSources {
+        let src = darkmux_crew::host_probe::HostProbeSources { simulated: false,
             mach: true,
             ioreport: false,
             freq_tables: false,
@@ -8411,7 +8556,7 @@ mod tests {
             ioreg_gpu: true,
             battery: true,
         };
-        let check = describe_host_probe(src, 3);
+        let check = describe_host_probe(src, 3, None);
         assert_eq!(
             check.status,
             Status::Pass,
@@ -8434,7 +8579,7 @@ mod tests {
         // can tell "this Mac has no battery" from "darkmux forgot to read
         // it" — the exact distinction #2706's inert gate turns on) and it
         // must not downgrade the check.
-        let src = darkmux_crew::host_probe::HostProbeSources {
+        let src = darkmux_crew::host_probe::HostProbeSources { simulated: false,
             mach: true,
             ioreport: true,
             freq_tables: true,
@@ -8442,7 +8587,7 @@ mod tests {
             ioreg_gpu: true,
             battery: false,
         };
-        let check = describe_host_probe(src, 7);
+        let check = describe_host_probe(src, 7, None);
         assert_eq!(check.status, Status::Pass, "a desktop is healthy: {}", check.message);
         assert!(
             check.message.contains("unavailable: battery"),
@@ -8453,7 +8598,7 @@ mod tests {
 
     #[test]
     fn describe_host_probe_warns_when_nothing_resolved() {
-        let check = describe_host_probe(darkmux_crew::host_probe::HostProbeSources::default(), 0);
+        let check = describe_host_probe(darkmux_crew::host_probe::HostProbeSources::default(), 0, None);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("no host sources resolved"), "{}", check.message);
     }
@@ -8462,7 +8607,7 @@ mod tests {
     fn describe_host_probe_warns_when_mach_itself_is_missing() {
         // Without tick counters there is no CPU figure at all — a real gap
         // even when every other source is fine.
-        let src = darkmux_crew::host_probe::HostProbeSources {
+        let src = darkmux_crew::host_probe::HostProbeSources { simulated: false,
             mach: false,
             ioreport: true,
             freq_tables: true,
@@ -8470,14 +8615,14 @@ mod tests {
             ioreg_gpu: true,
             battery: true,
         };
-        let check = describe_host_probe(src, 4);
+        let check = describe_host_probe(src, 4, None);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("unavailable: mach"), "{}", check.message);
     }
 
     #[test]
     fn describe_host_probe_omits_the_unavailable_clause_when_all_resolved() {
-        let src = darkmux_crew::host_probe::HostProbeSources {
+        let src = darkmux_crew::host_probe::HostProbeSources { simulated: false,
             mach: true,
             ioreport: true,
             freq_tables: true,
@@ -8485,7 +8630,7 @@ mod tests {
             ioreg_gpu: true,
             battery: true,
         };
-        let check = describe_host_probe(src, 9);
+        let check = describe_host_probe(src, 9, None);
         assert_eq!(check.status, Status::Pass);
         assert!(!check.message.contains("unavailable"), "{}", check.message);
         assert!(check.message.contains("9ms/sample"), "{}", check.message);

@@ -86,6 +86,17 @@ pub mod gate;
 // make. `telemetry_sampler::sample_host` still exists with the same
 // signature; it now reads THROUGH this probe.
 pub mod host_probe;
+// (#2779) The source facade `host_probe`'s thermal + battery reads resolve
+// through, so the escalation ladder can be driven from a scenario file
+// instead of from a machine somebody has to cook.
+pub mod host_source;
+// (#2779) The scenario driver + the shipped scenario library — one
+// `governor_tick::GovernorPair` tick per simulated interval, so a
+// 40-minute escalation regression-tests in microseconds.
+pub mod host_scenario;
+// (#2779) The per-tick governor seam both the live sampler and the
+// scenario driver call, so a scenario proves the REAL ordering.
+pub mod governor_tick;
 // (#2413) Singleton coordination lock for the ONE machine-scoped host
 // sampler — see the module doc.
 pub mod host_sampler_lock;

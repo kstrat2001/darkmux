@@ -1,0 +1,3 @@
+{"hold_ms": 20000, "note": "#2779 scenario 6 — the breaker. Cool start.", "thermal": {"state": "nominal"}}
+{"hold_ms": 60000, "note": "`critical` — the hardware's own worst-case report. The breaker owns this reading: it trips on the FIRST sample (no hold), writes the pace file with its own reason, and drops the crawl STOP file. It is not a `serious` episode and must not be counted as one.", "thermal": {"state": "critical"}}
+{"hold_ms": 120000, "note": "The machine cools. The breaker is terminal for decisions and must NOT release: resume is out-of-band, the operator's call.", "thermal": {"state": "nominal"}}

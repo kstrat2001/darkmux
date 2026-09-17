@@ -1,0 +1,671 @@
+//! (#2779) The source facade the thermal/power probes resolve through, so
+//! the escalation ladder can be regression-tested against simulated
+//! hardware instead of a machine somebody has to actually cook.
+//!
+//! # Why this exists
+//!
+//! #2774's escalation ladder shipped after five review rounds and thirteen
+//! MUST FIX findings, two of them safety inversions. Every one was proven
+//! by a hand-written throwaway probe that was deleted afterwards, because
+//! there was no way to put a machine into `serious` on demand. The live
+//! dogfood that followed could exercise only the duty-cycle WIRING: the
+//! machine stayed `nominal` through 33 containers and a 35B dispatch
+//! (`above_nominal_ms: 0`), so tiers 2 through 5 have never run on real
+//! hardware and cannot be forced — the obvious lever (`resume_at =
+//! nominal`) is exactly what the ladder now disarms by design.
+//!
+//! # The seam is one `cfg` branch, not a new parameter
+//!
+//! [`crate::host_probe::thermal::sample`] and
+//! [`crate::host_probe::battery::sample`] are free functions over IOKit
+//! that ALREADY substitute at compile time — on anything that is not
+//! macOS/aarch64 both return `None`. This module replaces that single
+//! branch with a RESOLVED source, so nothing threads a parameter through
+//! the call graph.
+//!
+//! # `read` and `advance` are separate on purpose
+//!
+//! A scripted source has a cursor, and three of the four call sites are
+//! one-shot reads that must not move it:
+//!
+//! | call site | calls |
+//! |---|---|
+//! | [`crate::host_probe::HostProbe::sample`] (the sampler's source) | `advance` then `read` |
+//! | [`crate::host_probe::HostProbe::new`]'s capability check | `read` |
+//! | `host_probe::power_posture` | `read` |
+//! | `preflight`'s battery floor gate | `read` |
+//!
+//! `HostProbe::sample` already computes the REAL elapsed since its own
+//! previous sample (`interval_ms`), and that is what it advances the
+//! scripted clock by — so the scenario's simulated time and the
+//! `elapsed_ms` the governor is fed come from the same number and can
+//! never disagree. A test driving the governors directly
+//! ([`crate::host_scenario::ScenarioDriver`]) advances by a fixed tick
+//! instead, which is what compresses a 40-minute escalation into
+//! microseconds.
+//!
+//! # Never fake silently
+//!
+//! A machine reporting `nominal` while it actually cooks is strictly worse
+//! than no governor at all, so a scripted source is announced on four
+//! surfaces, not one:
+//!
+//! 1. `darkmux doctor`'s `host probe` check goes **Warn** and names the
+//!    scenario path (`describe_host_probe`).
+//! 2. The dispatch prints a warning line at sampler start, beside the
+//!    ladder's own disarm notes.
+//! 3. Every `dispatch.rest` / `machine.telemetry` payload carries
+//!    `simulated_host_source: "<path>"` ([`stamp`]).
+//! 4. The run artifact's `host_window` block carries the same field.
+//!
+//! A scenario file that is named but cannot be LOADED does not silently
+//! become a real read either: the resolution keeps [`RealSource`] (the safe
+//! direction — the operator gets a working governor) and records the error
+//! in [`Provenance`], which doctor reports as a **Warn** naming the path and
+//! the load error, and which the dispatch prints. Nothing is simulated in
+//! that case, so nothing is stamped either — marking real readings as
+//! simulated would be its own lie. "No silent wrong key" applies to a path
+//! as much as to a name.
+
+use crate::host_probe::{battery, thermal, BatterySample, ThermalSample};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// One tick's worth of the two readings a governor consumes. Both halves
+/// are independently absent, exactly as the real probes are: a desktop has
+/// no battery, and the OS thermal read can come back `None` on its own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostReading {
+    pub thermal: Option<ThermalSample>,
+    pub battery: Option<BatterySample>,
+}
+
+/// Where the thermal + battery readings come from.
+///
+/// `Send + Sync` because the resolved source is a process-wide `&'static`
+/// read from the dispatch sampler thread, the daemon's host sampler, and
+/// `darkmux doctor` alike.
+pub trait HostSource: Send + Sync {
+    /// The reading as of the source's CURRENT position. Never advances.
+    fn read(&self) -> HostReading;
+
+    /// Move the source's own notion of time forward by `elapsed_ms`. A
+    /// no-op for every source that reads real hardware — real hardware
+    /// keeps its own time.
+    fn advance(&self, _elapsed_ms: u64) {}
+}
+
+/// Today's IOKit path, unchanged and untestable by construction — see the
+/// boundary this module's issue states: a simulated source proves the
+/// LADDER, never that an IOKit reading is interpreted correctly.
+pub struct RealSource;
+
+impl HostSource for RealSource {
+    fn read(&self) -> HostReading {
+        HostReading { thermal: thermal::sample(), battery: battery::sample() }
+    }
+}
+
+// ── The scenario file ────────────────────────────────────────────────────
+
+/// A scripted thermal reading. `state` is the OS vocabulary
+/// ([`thermal::THERMAL_STATES`]) and is NOT validated here — a scenario
+/// that wants to pin how an unrecognized state is handled (the breaker
+/// owns it) must be able to write one.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ScriptedThermal {
+    pub state: String,
+    /// Defaults to 100 — "no cap recorded", which is what a cool machine
+    /// reports and what every scenario that is not about the speed-limit
+    /// floor wants. See [`ThermalSample::cpu_speed_limit_pct`].
+    #[serde(default = "no_cap_recorded")]
+    pub cpu_speed_limit_pct: u64,
+}
+
+fn no_cap_recorded() -> u64 {
+    100
+}
+
+/// A scripted battery reading. Only `charge_pct` is required; the rest
+/// default to a discharging laptop with no estimate, which is the shape
+/// every battery scenario in the shipped library needs.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ScriptedBattery {
+    pub charge_pct: u8,
+    #[serde(default)]
+    pub on_ac: bool,
+    #[serde(default)]
+    pub charging: bool,
+    #[serde(default)]
+    pub minutes_to_empty: Option<u32>,
+}
+
+/// One line of a scenario file: a reading, and how long it holds.
+///
+/// An ABSENT `thermal` (or `battery`) is not a missing field to be
+/// defaulted — it is the `None` reading itself, the "time passed, no new
+/// information" case the governor has its own arm for. That is why both
+/// are `Option` rather than required.
+///
+/// Unknown fields are tolerated (`note` is the conventional one) so a
+/// fixture can explain what it pins on the line that pins it, and stay
+/// readable by `jq`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ScenarioFrame {
+    /// Simulated milliseconds this reading holds for. Must be > 0 — a
+    /// zero-length frame is unreachable and is almost always a typo.
+    pub hold_ms: u64,
+    #[serde(default)]
+    pub thermal: Option<ScriptedThermal>,
+    #[serde(default)]
+    pub battery: Option<ScriptedBattery>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl ScenarioFrame {
+    fn reading(&self) -> HostReading {
+        HostReading {
+            thermal: self.thermal.as_ref().map(|t| ThermalSample {
+                state: t.state.clone(),
+                cpu_speed_limit_pct: t.cpu_speed_limit_pct,
+            }),
+            battery: self.battery.as_ref().map(|b| BatterySample {
+                charge_pct: b.charge_pct,
+                on_ac: b.on_ac,
+                charging: b.charging,
+                minutes_to_empty: b.minutes_to_empty,
+            }),
+        }
+    }
+}
+
+/// Parse a scenario document: JSONL, one [`ScenarioFrame`] per line, blank
+/// lines skipped.
+///
+/// Every error names the 1-based LINE, because a scenario is a fixture an
+/// operator hand-edits and "expected `,` at 412" is not a usable answer.
+/// An EMPTY document is an error rather than a source that reads `None`
+/// forever — an empty scenario is indistinguishable from a truncated write
+/// and would quietly disarm every assertion built on it.
+pub fn parse_scenario(text: &str) -> Result<Vec<ScenarioFrame>, String> {
+    let mut frames = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let frame: ScenarioFrame = serde_json::from_str(line)
+            .map_err(|e| format!("line {}: {e}", i + 1))?;
+        if frame.hold_ms == 0 {
+            return Err(format!("line {}: hold_ms must be > 0 (a zero-length frame is never read)", i + 1));
+        }
+        frames.push(frame);
+    }
+    if frames.is_empty() {
+        return Err("no frames (an empty scenario would silently read as `None` forever)".to_string());
+    }
+    Ok(frames)
+}
+
+/// A source that replays a scenario against its own simulated clock.
+///
+/// **Past the last frame, the last frame holds forever.** A scenario
+/// describes a machine's condition, not the run's length: a run that
+/// outlasts its scenario is at the last stated condition, not suddenly
+/// unreadable. Writing the tail explicitly ("and then it stayed at
+/// `nominal`") is the scenario author's job, and every shipped fixture
+/// does it.
+pub struct ScriptedSource {
+    frames: Vec<ScenarioFrame>,
+    /// Cumulative end time of each frame, so a lookup is one scan over a
+    /// handful of entries rather than a running fold.
+    ends_ms: Vec<u64>,
+    now_ms: AtomicU64,
+    path: PathBuf,
+}
+
+impl ScriptedSource {
+    /// Build from already-parsed frames. `path` is carried only for
+    /// provenance messages.
+    pub fn new(frames: Vec<ScenarioFrame>, path: PathBuf) -> Self {
+        let mut ends_ms = Vec::with_capacity(frames.len());
+        let mut acc = 0u64;
+        for f in &frames {
+            acc = acc.saturating_add(f.hold_ms);
+            ends_ms.push(acc);
+        }
+        Self { frames, ends_ms, now_ms: AtomicU64::new(0), path }
+    }
+
+    /// Load and parse a scenario file.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let frames = parse_scenario(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self::new(frames, path.to_path_buf()))
+    }
+
+    /// The simulated clock's current position, in ms since the first tick.
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::SeqCst)
+    }
+
+    /// Total simulated span of the scenario — the point past which the last
+    /// frame holds forever.
+    pub fn span_ms(&self) -> u64 {
+        self.ends_ms.last().copied().unwrap_or(0)
+    }
+
+    /// The frame active at `sim_ms`. Never `None`: the constructor refuses
+    /// an empty frame list by only ever being fed [`parse_scenario`]'s
+    /// output, and the last frame holds past the end.
+    fn frame_at(&self, sim_ms: u64) -> &ScenarioFrame {
+        for (i, end) in self.ends_ms.iter().enumerate() {
+            if sim_ms < *end {
+                return &self.frames[i];
+            }
+        }
+        // Past the end: the last frame holds. `frames` is never empty.
+        &self.frames[self.frames.len() - 1]
+    }
+}
+
+impl HostSource for ScriptedSource {
+    fn read(&self) -> HostReading {
+        self.frame_at(self.now_ms()).reading()
+    }
+
+    fn advance(&self, elapsed_ms: u64) {
+        self.now_ms.fetch_add(elapsed_ms, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for ScriptedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedSource")
+            .field("path", &self.path)
+            .field("frames", &self.frames.len())
+            .field("span_ms", &self.span_ms())
+            .finish()
+    }
+}
+
+// ── Resolution + provenance ──────────────────────────────────────────────
+
+/// What the process's resolved source actually is — the value every
+/// provenance surface renders off, so they cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provenance {
+    /// The real IOKit reads.
+    Real,
+    /// A scenario file is driving the thermal + battery readings.
+    Scripted { path: String, frames: usize, span_ms: u64 },
+    /// A scenario file was NAMED and could not be loaded. The process is
+    /// reading real hardware (the safe direction), and says so loudly
+    /// rather than leaving the operator to infer it from a governor that
+    /// behaves unlike the scenario they thought they set.
+    ScriptedUnavailable { path: String, error: String },
+}
+
+impl Provenance {
+    /// `true` when the readings are NOT this machine's.
+    pub fn is_simulated(&self) -> bool {
+        matches!(self, Provenance::Scripted { .. })
+    }
+
+    /// The scenario path, when one is actually driving the readings.
+    pub fn simulated_path(&self) -> Option<&str> {
+        match self {
+            Provenance::Scripted { path, .. } => Some(path.as_str()),
+            _ => None,
+        }
+    }
+
+    /// One line an operator can act on, or `None` when the source is real
+    /// and there is nothing to say. Rendered verbatim by `darkmux doctor`
+    /// and by the dispatch's sampler-start warning, off this one value —
+    /// the same "two surfaces cannot disagree" shape the ladder's own
+    /// disarm notes use.
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Provenance::Real => None,
+            Provenance::Scripted { path, frames, span_ms } => Some(format!(
+                "SIMULATED host readings — thermal and battery come from the scenario file \
+                 {path} ({frames} frames, {span_ms}ms of simulated time), NOT from this \
+                 machine. The governor is pacing against a fiction. Unset \
+                 DARKMUX_HOST_SOURCE_SCRIPT to read real hardware."
+            )),
+            Provenance::ScriptedUnavailable { path, error } => Some(format!(
+                "DARKMUX_HOST_SOURCE_SCRIPT names {path}, which could not be loaded ({error}) \
+                 — reading REAL hardware instead. Nothing is simulated; fix the path or unset \
+                 the variable."
+            )),
+        }
+    }
+}
+
+struct Resolved {
+    source: Box<dyn HostSource>,
+    provenance: Provenance,
+}
+
+fn resolved() -> &'static Resolved {
+    static CELL: OnceLock<Resolved> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let Some(path) = darkmux_types::config_access::host_source_script() else {
+            return Resolved { source: Box::new(RealSource), provenance: Provenance::Real };
+        };
+        match ScriptedSource::load(&path) {
+            Ok(s) => {
+                let provenance = Provenance::Scripted {
+                    path: path.display().to_string(),
+                    frames: s.frames.len(),
+                    span_ms: s.span_ms(),
+                };
+                Resolved { source: Box::new(s), provenance }
+            }
+            Err(error) => Resolved {
+                source: Box::new(RealSource),
+                provenance: Provenance::ScriptedUnavailable { path: path.display().to_string(), error },
+            },
+        }
+    })
+}
+
+/// The process's resolved host source. Resolved ONCE, on first use —
+/// `env(DARKMUX_HOST_SOURCE_SCRIPT) > real`, through
+/// `config_access` like every other knob.
+pub fn current() -> &'static dyn HostSource {
+    resolved().source.as_ref()
+}
+
+/// The process's resolved provenance. Every surface that announces a
+/// simulated source renders off this.
+pub fn provenance() -> &'static Provenance {
+    &resolved().provenance
+}
+
+/// Advance a source by `elapsed_ms` and then read it — the ORDER
+/// [`crate::host_probe::HostProbe::sample`] needs, in one place both it and
+/// a test can call.
+///
+/// The order is the whole content of this function, and it is not
+/// arbitrary: advancing AFTER the read would hand every tick the PREVIOUS
+/// interval's reading, one tick stale, for the entire life of a run. And
+/// `elapsed_ms` must be the probe's own measured gap, never a constant —
+/// a sampler tick can block far longer than its nominal cadence (the `lms`
+/// probe alone can stall ~30s), and a scripted clock fed a constant would
+/// drift away from the `elapsed_ms` the governor is simultaneously being
+/// fed from the real one.
+pub fn advance_and_read(source: &dyn HostSource, elapsed_ms: u64) -> HostReading {
+    source.advance(elapsed_ms);
+    source.read()
+}
+
+/// Stamp `simulated_host_source` onto a flow-record payload when — and
+/// only when — the readings are simulated.
+///
+/// Absent (never `false`, never `null`) on a real-hardware run, so the
+/// field's mere PRESENCE answers "were these readings real", the same
+/// shape `baseline` already uses on `telemetry.lms`.
+pub fn stamp(payload: &mut serde_json::Value) {
+    stamp_with(provenance(), payload);
+}
+
+/// [`stamp`]'s decision, with the provenance passed in rather than read
+/// from the process-wide resolution.
+///
+/// Split out for the reason `darkmux-doctor`'s `describe_host_probe` is
+/// split from `check_host_probe`: the resolution is a `OnceLock` read of an
+/// env var, so a test driving `stamp` directly could only ever exercise
+/// whichever variant the test process happened to resolve — which is
+/// `Real`, always, and the branch that matters would be pinned by nothing.
+pub fn stamp_with(provenance: &Provenance, payload: &mut serde_json::Value) {
+    let Some(path) = provenance.simulated_path() else {
+        return;
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("simulated_host_source".to_string(), serde_json::json!(path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames(text: &str) -> Vec<ScenarioFrame> {
+        parse_scenario(text).expect("scenario parses")
+    }
+
+    #[test]
+    fn a_frame_holds_for_its_own_hold_ms_and_the_last_one_holds_forever() {
+        let src = ScriptedSource::new(
+            frames(
+                r#"{"hold_ms": 1000, "thermal": {"state": "nominal"}}
+{"hold_ms": 2000, "thermal": {"state": "fair"}}"#,
+            ),
+            PathBuf::from("<test>"),
+        );
+        assert_eq!(src.read().thermal.unwrap().state, "nominal");
+        src.advance(999);
+        assert_eq!(src.read().thermal.unwrap().state, "nominal", "999ms is still inside frame 1");
+        src.advance(1);
+        assert_eq!(src.read().thermal.unwrap().state, "fair", "1000ms is frame 2's first ms");
+        src.advance(2000);
+        assert_eq!(src.read().thermal.unwrap().state, "fair", "past the end, the last frame holds");
+        src.advance(10_000_000);
+        assert_eq!(src.read().thermal.unwrap().state, "fair");
+    }
+
+    #[test]
+    fn read_does_not_advance_the_cursor() {
+        let src = ScriptedSource::new(
+            frames(
+                r#"{"hold_ms": 100, "thermal": {"state": "nominal"}}
+{"hold_ms": 100, "thermal": {"state": "critical"}}"#,
+            ),
+            PathBuf::from("<test>"),
+        );
+        for _ in 0..50 {
+            assert_eq!(src.read().thermal.unwrap().state, "nominal");
+        }
+        assert_eq!(src.now_ms(), 0, "the three one-shot call sites must not move the cursor");
+    }
+
+    #[test]
+    fn an_absent_thermal_key_is_the_none_reading_not_a_default() {
+        let src = ScriptedSource::new(
+            frames(r#"{"hold_ms": 100, "battery": {"charge_pct": 40}}"#),
+            PathBuf::from("<test>"),
+        );
+        let r = src.read();
+        assert!(r.thermal.is_none(), "an absent thermal key is the governor's `None` arm");
+        assert_eq!(r.battery.unwrap().charge_pct, 40);
+    }
+
+    #[test]
+    fn cpu_speed_limit_defaults_to_no_cap_recorded() {
+        let src = ScriptedSource::new(
+            frames(r#"{"hold_ms": 100, "thermal": {"state": "fair"}}"#),
+            PathBuf::from("<test>"),
+        );
+        assert_eq!(
+            src.read().thermal.unwrap().cpu_speed_limit_pct,
+            100,
+            "100 is `no cap recorded`, what a cool machine reports"
+        );
+    }
+
+    #[test]
+    fn battery_defaults_are_a_discharging_laptop_with_no_estimate() {
+        let src = ScriptedSource::new(
+            frames(r#"{"hold_ms": 100, "battery": {"charge_pct": 12}}"#),
+            PathBuf::from("<test>"),
+        );
+        let b = src.read().battery.unwrap();
+        assert_eq!((b.charge_pct, b.on_ac, b.charging, b.minutes_to_empty), (12, false, false, None));
+    }
+
+    #[test]
+    fn a_parse_error_names_the_line() {
+        let err = parse_scenario("{\"hold_ms\": 1}\nnot json\n").unwrap_err();
+        assert!(err.starts_with("line 2:"), "got {err}");
+    }
+
+    #[test]
+    fn a_zero_length_frame_is_refused() {
+        let err = parse_scenario(r#"{"hold_ms": 0, "thermal": {"state": "fair"}}"#).unwrap_err();
+        assert!(err.contains("hold_ms must be > 0"), "got {err}");
+    }
+
+    #[test]
+    fn an_empty_scenario_is_refused_rather_than_reading_none_forever() {
+        assert!(parse_scenario("").is_err());
+        assert!(parse_scenario("\n\n   \n").is_err());
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_and_notes_are_tolerated() {
+        let f = frames(
+            "\n{\"hold_ms\": 5, \"note\": \"why this frame exists\", \"thermal\": {\"state\": \"serious\"}}\n\n",
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].note.as_deref(), Some("why this frame exists"));
+    }
+
+    // ── provenance ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_real_source_says_nothing_and_stamps_nothing() {
+        let p = Provenance::Real;
+        assert!(!p.is_simulated());
+        assert_eq!(p.simulated_path(), None);
+        assert_eq!(p.warning(), None);
+    }
+
+    #[test]
+    fn a_scripted_provenance_names_the_file_and_says_the_readings_are_not_this_machines() {
+        let p = Provenance::Scripted { path: "/tmp/hot.jsonl".into(), frames: 4, span_ms: 600_000 };
+        assert!(p.is_simulated());
+        assert_eq!(p.simulated_path(), Some("/tmp/hot.jsonl"));
+        let w = p.warning().expect("a simulated source must never be silent");
+        assert!(w.contains("SIMULATED"), "{w}");
+        assert!(w.contains("/tmp/hot.jsonl"), "{w}");
+        assert!(w.contains("NOT from this"), "{w}");
+        assert!(w.contains("DARKMUX_HOST_SOURCE_SCRIPT"), "the remedy must name the knob: {w}");
+    }
+
+    #[test]
+    fn an_unloadable_scenario_reads_real_hardware_and_says_so() {
+        let p = Provenance::ScriptedUnavailable {
+            path: "/nope.jsonl".into(),
+            error: "No such file or directory (os error 2)".into(),
+        };
+        assert!(!p.is_simulated(), "a failed load must not read as simulated");
+        assert_eq!(p.simulated_path(), None, "nothing may be stamped when nothing is simulated");
+        let w = p.warning().expect("a named-but-unloadable scenario must never be silent");
+        assert!(w.contains("/nope.jsonl"), "{w}");
+        assert!(w.contains("REAL hardware"), "{w}");
+    }
+
+    #[test]
+    fn stamp_is_absent_not_false_when_the_source_is_real() {
+        let mut payload = serde_json::json!({ "reason": "thermal" });
+        stamp_with(&Provenance::Real, &mut payload);
+        assert!(
+            payload.get("simulated_host_source").is_none(),
+            "a real run must carry no key at all, not `false` and not `null` — its mere \
+             PRESENCE is what answers `were these readings real`"
+        );
+
+        let mut payload = serde_json::json!({ "reason": "thermal" });
+        stamp_with(
+            &Provenance::ScriptedUnavailable { path: "/nope".into(), error: "boom".into() },
+            &mut payload,
+        );
+        assert!(
+            payload.get("simulated_host_source").is_none(),
+            "a scenario that failed to LOAD is reading real hardware, so nothing may be \
+             stamped — stamping the path here would mark real readings as simulated"
+        );
+    }
+
+    #[test]
+    fn stamp_names_the_scenario_on_every_simulated_payload() {
+        let mut payload = serde_json::json!({ "reason": "thermal", "state": "fair" });
+        stamp_with(
+            &Provenance::Scripted { path: "/s.jsonl".into(), frames: 1, span_ms: 1 },
+            &mut payload,
+        );
+        assert_eq!(
+            payload["simulated_host_source"],
+            serde_json::json!("/s.jsonl"),
+            "a pacing record made on scripted readings must say so — a flow stream that \
+             cannot distinguish a simulated pause from a real one is a flow stream that \
+             lies about the machine"
+        );
+        assert_eq!(payload["reason"], serde_json::json!("thermal"), "and must not disturb the rest");
+    }
+
+    #[test]
+    fn advance_and_read_advances_first_so_a_tick_never_reads_stale() {
+        let src = ScriptedSource::new(
+            frames(
+                r#"{"hold_ms": 1000, "thermal": {"state": "nominal"}}
+{"hold_ms": 1000, "thermal": {"state": "serious"}}"#,
+            ),
+            PathBuf::from("<test>"),
+        );
+        // A 1000ms tick lands exactly on frame 2's first ms. Reading BEFORE
+        // advancing would return `nominal` here and `serious` only on the
+        // tick after — every reading one tick stale, for the whole run.
+        let r = advance_and_read(&src, 1000);
+        assert_eq!(r.thermal.unwrap().state, "serious");
+    }
+
+    #[test]
+    fn advance_and_read_applies_the_elapsed_it_is_given() {
+        let src = ScriptedSource::new(
+            frames(
+                r#"{"hold_ms": 10000, "thermal": {"state": "nominal"}}
+{"hold_ms": 10000, "thermal": {"state": "fair"}}"#,
+            ),
+            PathBuf::from("<test>"),
+        );
+        // Five 1000ms ticks do not reach frame 2; one 10000ms tick does.
+        // A wiring that passed a constant (or zero) would freeze the
+        // scenario at frame 1 forever, and every scripted run would report
+        // a permanently cool machine — the exact failure the facade's
+        // provenance surfaces exist to make impossible to miss.
+        for _ in 0..5 {
+            assert_eq!(advance_and_read(&src, 1000).thermal.unwrap().state, "nominal");
+        }
+        assert_eq!(advance_and_read(&src, 10_000).thermal.unwrap().state, "fair");
+        assert_eq!(src.now_ms(), 15_000);
+    }
+
+    #[test]
+    fn the_host_probe_advances_the_source_by_its_own_measured_interval() {
+        // A wiring fact no in-process test can reach: `HostProbe::sample`
+        // reads the resolved source through a process-wide `OnceLock`, so a
+        // test could only ever drive whichever variant this process
+        // resolved (`Real`, always). Same posture as `preflight`'s own
+        // `the_pre_flight_calls_the_battery_gate_at_all`: a physical source
+        // check for wiring, not a comment that can drift.
+        let src = include_str!("host_probe/mod.rs");
+        assert!(
+            src.contains("advance_and_read(source, interval_ms)"),
+            "HostProbe::sample must advance the scripted clock by its OWN measured gap — a \
+             constant, or zero, freezes every scenario at its first frame and reports a \
+             permanently cool machine"
+        );
+    }
+
+    #[test]
+    fn load_reports_the_path_in_its_error() {
+        let err = ScriptedSource::load(Path::new("/definitely/not/here.jsonl")).unwrap_err();
+        assert!(err.contains("/definitely/not/here.jsonl"), "got {err}");
+    }
+}

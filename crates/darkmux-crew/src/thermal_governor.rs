@@ -4524,35 +4524,49 @@ mod tests {
     /// `pace_file_path_matches_runtime_out_base` above).
     #[test]
     fn the_battery_governor_call_site_gates_on_is_pausing() {
+        // (#2779) The call site MOVED — out of `dispatch_internal.rs`'s
+        // sampler loop and into `governor_tick::GovernorPair::tick`, the
+        // seam both the live sampler and the scenario driver now call. The
+        // gate is therefore also proven BEHAVIORALLY, which a source check
+        // cannot be: `host_scenario::tests::a_live_battery_pause_survives_a_
+        // thermal_duty_cycle` goes red when the predicate is swapped. This
+        // check is kept alongside it rather than deleted — it names the
+        // defect at the line, and it fails on a swap that a future scenario
+        // rewrite might stop covering.
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = manifest_dir.join("src/dispatch_internal.rs");
+        let path = manifest_dir.join("src/governor_tick.rs");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
 
-        // Narrow to the `battery_governor.on_sample(...)` argument list, so
-        // the assertions below are about the ARGUMENT and not about the
-        // module's prose (which names both predicates, deliberately).
-        let call_start = source
-            .find("battery_governor.on_sample(")
-            .unwrap_or_else(|| panic!("{} no longer calls battery_governor.on_sample", path.display()));
-        let rest = &source[call_start..];
-        let call_end = rest
-            .find(") {")
-            .unwrap_or_else(|| panic!("could not find the end of the on_sample call in {}", path.display()));
-        let args = &rest[..call_end];
+        // Narrow to the two CODE lines, so the assertions are about the
+        // gate and not about the module's prose (which names both
+        // predicates, deliberately, to say why one of them is wrong).
+        let gate = source
+            .lines()
+            .find(|l| l.trim_start().starts_with("let thermal_pausing ="))
+            .unwrap_or_else(|| panic!("{} no longer computes a thermal_pausing gate", path.display()));
+        let call = source
+            .lines()
+            .find(|l| l.contains("self.battery.on_sample("))
+            .unwrap_or_else(|| panic!("{} no longer calls the battery governor", path.display()));
 
         assert!(
-            args.contains("thermal_governor.is_pausing()"),
-            "dispatch_internal.rs must gate the battery governor's stand-down on the thermal \
+            gate.contains("is_pausing()"),
+            "governor_tick.rs must gate the battery governor's stand-down on the thermal \
              governor's `is_pausing()` — `is_pacing()` also covers tier 2's DutyCycle, which \
              writes `pause: false`, and gating on it silently drops a real battery-critical \
-             pause for the whole duration of a duty-cycle episode (#2774 F1). Argument list \
-             found:\n{args}"
+             pause for the whole duration of a duty-cycle episode (#2774 F1). Gate line \
+             found:\n{gate}"
         );
         assert!(
-            !args.contains("is_pacing()"),
-            "the battery-governor call site must not pass `is_pacing()` — see #2774 F1. \
-             Argument list found:\n{args}"
+            !gate.contains("is_pacing()"),
+            "the battery-governor gate must not read `is_pacing()` — see #2774 F1. Gate line \
+             found:\n{gate}"
+        );
+        assert!(
+            call.contains("thermal_pausing"),
+            "…and the gate must actually REACH the call — computing it and passing something \
+             else is the same outage. Call line found:\n{call}"
         );
     }
 

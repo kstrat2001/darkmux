@@ -7552,6 +7552,12 @@ fn host_window_json(
         // throttling at all".
         "thermal_serious_episodes": thermal_ladder.map(|l| l.serious_episodes),
         "thermal_duty_delay_ms": thermal_ladder.map(|l| l.current_duty_delay_ms),
+        // (#2779) The scenario file that produced every thermal/battery
+        // number in this block, when one did. Serialized UNCONDITIONALLY
+        // (`null` on a real run), unlike the flow-record stamp which omits
+        // the key: an artifact is read by eye long after the run, and an
+        // explicitly-null field is a stronger statement than an absent one.
+        "simulated_host_source": crate::host_source::provenance().simulated_path(),
         "power_mw_total": extras.power.as_ref().map(|p| serde_json::json!({
             "mean": p.total.mean_mw,
             "max": p.total.max_mw,
@@ -8116,7 +8122,7 @@ fn run_telemetry_sampler(
     // `serious` episode" would both silently reset every single unit.
     let thermal_ladder_state_file =
         crate::thermal_governor::ladder_state_file_path_from_record_context(record_context.as_ref());
-    let mut thermal_governor =
+    let thermal_governor =
         crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env())
             .owned_by(mission_id.as_deref())
             .seeded_from_mission(thermal_ladder_state_file.as_deref());
@@ -8166,10 +8172,27 @@ fn run_telemetry_sampler(
     // is allowed to pause. A run type that could not would pass `false`
     // and get `BatteryEvent::PauseUnsupported` instead of a park it could
     // not leave.
-    let mut battery_governor =
+    let battery_governor =
         crate::power_policy::BatteryGovernor::new(crate::power_policy::PowerPolicyConfig::from_env());
+    // (#2779) The two governors tick THROUGH the shared seam, not as two
+    // inline calls here. The order, the `is_pausing` gate and the one-clock
+    // rule live in `governor_tick::GovernorPair::tick` so a scenario test
+    // proves the REAL wiring rather than a reimplementation of it — see
+    // that module's doc for the F1 inversion it exists to keep proven.
+    let mut governors = crate::governor_tick::GovernorPair::new(thermal_governor, battery_governor);
+    // (#2779) A simulated host source is never silent. Same surface and
+    // same shape as the ladder's disarm notes above, rendered off
+    // `host_source::provenance()` so doctor and the dispatch cannot
+    // disagree about what is driving the readings.
+    if let Some(warning) = crate::host_source::provenance().warning() {
+        eprintln!("darkmux: ⚠ host source — {warning}");
+    }
     let emit_rest = |reason: &str, state: &str, pause: bool| {
         let mut payload = serde_json::json!({ "reason": reason, "state": state, "pause": pause });
+        // (#2779) `simulated_host_source` when — and only when — this
+        // decision was made on scenario readings. Absent on a real run, so
+        // its PRESENCE alone answers "were these readings real".
+        crate::host_source::stamp(&mut payload);
         merge_record_context(&mut payload, &record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
             darkmux_flow::Level::Info,
@@ -8209,6 +8232,8 @@ fn run_telemetry_sampler(
                     obj.insert(k.clone(), v.clone());
                 }
             }
+            // (#2779) See `emit_rest` above — same stamp, same reason.
+            crate::host_source::stamp(&mut payload);
             merge_record_context(&mut payload, &record_context);
             let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
                 level,
@@ -8299,15 +8324,22 @@ fn run_telemetry_sampler(
         // iteration's earlier work (the lms diff above) took.
         let thermal_elapsed_ms = at_ms.saturating_sub(prev_thermal_at_ms);
         prev_thermal_at_ms = at_ms;
-        // Every state change (pause/resume/breaker) is a
-        // `dispatch.rest`-family flow record, so a slowed or stopped run
-        // is attributable on the flow stream.
-        if let Some(event) = thermal_governor.on_sample(
-            sample.thermal.as_ref(),
+        // (#2779) BOTH governors decide here, through the shared seam — the
+        // order, the `is_pausing` gate and the one-clock rule are the
+        // seam's, not this loop's. This loop reports what they decided.
+        let tick_events = governors.tick(
+            &crate::host_source::HostReading {
+                thermal: sample.thermal.clone(),
+                battery: sample.battery,
+            },
             thermal_elapsed_ms,
             &host_out,
             thermal_stop_file.as_deref(),
-        ) {
+        );
+        // Every state change (pause/resume/breaker) is a
+        // `dispatch.rest`-family flow record, so a slowed or stopped run
+        // is attributable on the flow stream.
+        if let Some(event) = tick_events.thermal {
             match event {
                 crate::thermal_governor::ThermalEvent::Paused { state } => {
                     emit_rest("thermal", &state, true);
@@ -8347,7 +8379,7 @@ fn run_telemetry_sampler(
                     let unresolved = crate::thermal_governor::stop_unresolved_cause(
                         thermal_stop_file.as_deref(),
                         thermal_stop_unresolved_reason,
-                        thermal_governor.last_stop_write_error(),
+                        governors.thermal.last_stop_write_error(),
                     );
                     if let Some((cause, reason)) = unresolved {
                         // (N3, final re-check) Warn — this is an
@@ -8472,7 +8504,7 @@ fn run_telemetry_sampler(
                     let unresolved = crate::thermal_governor::stop_unresolved_cause(
                         thermal_stop_file.as_deref(),
                         thermal_stop_unresolved_reason,
-                        thermal_governor.last_stop_write_error(),
+                        governors.thermal.last_stop_write_error(),
                     );
                     if let Some((cause, reason)) = unresolved {
                         let mut payload = serde_json::json!({
@@ -8497,39 +8529,25 @@ fn run_telemetry_sampler(
                 }
             }
         }
-        // (#2706) The battery governor, fed the SAME tick's reading and
-        // the SAME measured `thermal_elapsed_ms` the thermal governor just
-        // used — one clock, so the two governors' heartbeat accounting can
-        // never disagree about how much time passed.
+        // (#2706) The battery governor's decision for this tick — made in
+        // `governors.tick` above, fed the SAME reading and the SAME
+        // measured `thermal_elapsed_ms` the thermal governor got (one
+        // clock, so their heartbeat accounting can never disagree), and
+        // gated on the thermal governor's POST-decision `is_pausing`.
         //
-        // `thermal_governor.is_pausing()` is read AFTER the thermal tick
-        // above, so this is the post-decision state: thermal owns the pace
-        // file this tick if it holds a GENUINE pause (`Paused`,
-        // `OperatorHold`, or `Broken`), and the battery governor stands
-        // down and re-asserts on the first free tick. See
-        // `power_policy::BatteryGovernor`'s own doc for that precedence.
+        // (#2774 review F1 / #2779) That gate is deliberately `is_pausing`,
+        // NOT `is_pacing` — and it now lives in
+        // `governor_tick::GovernorPair::tick` rather than inline here, so
+        // a scenario test can prove it. See that module's doc for what the
+        // `is_pacing` version cost: a live battery-critical pause rewritten
+        // to `pause: false` for the whole duration of a duty-cycle episode,
+        // the run still working, the battery still draining.
         //
-        // (#2774 review F1) Deliberately `is_pausing`, NOT `is_pacing` —
-        // `is_pacing` also covers tier 2's `DutyCycle`, which writes
-        // `pause: false`. Gating the battery governor's stand-down on that
-        // would silently drop a real battery-critical pause for the whole
-        // duration of a duty-cycle episode: the run keeps working, the
-        // battery keeps draining, and nothing is checking it. `is_pausing`
-        // stands the battery governor down only for a condition that
-        // ALREADY satisfies "stop the run" — see that method's own doc for
-        // why this is race-free given the two governors tick sequentially
-        // in this same loop, not just usually-right.
-        //
-        // A machine with NO battery reaches this line every tick and does
-        // nothing at all: `sample.battery` is `None` on a desktop, and the
-        // governor's first act is to return on that — before any config
-        // read, threshold comparison or file write.
-        if let Some(event) = battery_governor.on_sample(
-            sample.battery.as_ref(),
-            thermal_elapsed_ms,
-            &host_out,
-            thermal_governor.is_pausing(),
-        ) {
+        // A machine with NO battery decides nothing at all: `sample.battery`
+        // is `None` on a desktop, and the governor's first act is to return
+        // on that — before any config read, threshold comparison or file
+        // write.
+        if let Some(event) = tick_events.battery {
             match event {
                 // The `state` string carries BOTH numbers the decision was
                 // made on — the observation and the operator's floor — so
@@ -8717,7 +8735,7 @@ fn run_telemetry_sampler(
                 return (
                     reduce_host_stats(&raw),
                     reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
-                    thermal_governor.ladder_summary(),
+                    governors.thermal.ladder_summary(),
                 );
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
@@ -8728,7 +8746,7 @@ fn run_telemetry_sampler(
     (
         reduce_host_stats(&raw),
         reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
-        thermal_governor.ladder_summary(),
+        governors.thermal.ladder_summary(),
     )
 }
 

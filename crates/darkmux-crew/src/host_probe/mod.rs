@@ -134,6 +134,13 @@ pub struct HostProbeSources {
     pub battery: bool,
     /// The `IOAccelerator` IORegistry node (GPU utilization + memory).
     pub ioreg_gpu: bool,
+    /// (#2779) The `thermal` and `battery` readings above are coming from a
+    /// SCENARIO FILE, not from this machine. **`true` is never a healthy
+    /// steady state** — it is one of the four surfaces that keep a
+    /// simulated source from being silent (see
+    /// [`crate::host_source`]); `darkmux doctor` renders it as a Warn that
+    /// names the file.
+    pub simulated: bool,
 }
 
 /// (#2111) The current wall-clock, as UNIX epoch milliseconds. Shared by
@@ -549,11 +556,18 @@ impl HostProbe {
         // `sources.ioreport`/`sources.freq_tables` — on every other target
         // this binding is read-only, and a `mut` here would be a dead-code
         // warning under `-D warnings` on those targets (#2108 CI finding).
+        // (#2779) The capability check reads through the resolved source
+        // (`read`, which never advances the scripted cursor — see
+        // `host_source`'s module doc) so a scenario-driven process reports
+        // the sources it will ACTUALLY sample from, not a mix of real
+        // capabilities and simulated readings.
+        let capability_read = crate::host_source::current().read();
         let sources = HostProbeSources {
             mach: mach_cpu::per_core_ticks().is_some(),
-            thermal: thermal::sample().is_some(),
-            battery: battery::sample().is_some(),
+            thermal: capability_read.thermal.is_some(),
+            battery: capability_read.battery.is_some(),
             ioreg_gpu: platform::gpu_read().is_some(),
+            simulated: crate::host_source::provenance().is_simulated(),
             ..Default::default()
         };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -672,6 +686,13 @@ impl HostProbe {
         let gpu = platform::gpu_read();
         self.prev_at = Some(t0);
 
+        // (#2779) Advance the resolved source's own clock by the REAL gap
+        // since the previous sample, then read. `interval_ms` is `0` on the
+        // very first sample, so a scenario's first frame is what the first
+        // tick sees.
+        let source = crate::host_source::current();
+        let host_reading = crate::host_source::advance_and_read(source, interval_ms);
+
         HostSampleFull {
             // `elapsed()` from `t0`, which is also the interval anchor — so
             // the stamped cost is exactly the probe's own work.
@@ -682,10 +703,15 @@ impl HostProbe {
             gpu_pct: gpu.map(|g| g.0),
             gpu_mhz,
             gpu_mem_bytes: gpu.and_then(|g| g.1),
-            thermal: thermal::sample(),
+            // (#2779) Both halves come from the resolved source. This is
+            // the ONE call site that ADVANCES it, by the same real
+            // `interval_ms` the governor is fed as `elapsed_ms` — so a
+            // scenario's simulated clock and the governor's accounting
+            // come from one number and cannot disagree.
+            thermal: host_reading.thermal,
             // (#2705) The fast half only — one IORegistry walk, ~1 ms. The
             // slow half (health) is NOT read here; see the field's doc.
-            battery: battery::sample(),
+            battery: host_reading.battery,
             power,
         }
     }
