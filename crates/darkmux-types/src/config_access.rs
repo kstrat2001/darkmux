@@ -1065,14 +1065,43 @@ pub fn debug_logging() -> bool {
     log_level() == "debug"
 }
 
+/// (#2774 review C7) The ONE boolean-token vocabulary, shared by the env
+/// tier here and by `darkmux config set`'s `Ty::Bool` coercion.
+///
+/// They used to be two: env treated anything outside `0|false|no` as
+/// `true`, while `config set` accepted only the literals `true`/`false`.
+/// So `DARKMUX_THERMAL_TIER4_ENABLED=yes` worked and
+/// `darkmux config set runtime.thermal.tier4_enabled yes` was refused —
+/// for a knob that disables a safety tier, the operator's two ways of
+/// setting the same value disagreed about what a value even is. One
+/// function, one vocabulary, and a conformance test in `config_cmd` that
+/// keeps them from forking again.
+///
+/// Case-insensitive; surrounding whitespace trimmed. `None` for anything
+/// it does not recognize — each caller decides what an unrecognized token
+/// means for ITS knob, rather than this function guessing.
+#[must_use]
+pub fn parse_bool_token(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Whether `darkmux doctor` checks for a newer release. An **opt-out**:
-/// `env(DARKMUX_CHECK_UPDATES)` falsy (`0`/`false`/`no`) disables >
-/// `config.runtime.check_updates` > `true` (default on). Env match is
-/// case-sensitive (preserving the prior behavior); `env_str` trims surrounding
+/// `env(DARKMUX_CHECK_UPDATES)` falsy (`0`/`false`/`no`/`off`) disables >
+/// `config.runtime.check_updates` > `true` (default on). Token matching is
+/// case-INSENSITIVE as of #2774 review C7 (see [`parse_bool_token`], which
+/// this and `darkmux config set` now share); `env_str` trims surrounding
 /// whitespace.
 pub fn check_updates() -> bool {
     if let Some(s) = env_str("DARKMUX_CHECK_UPDATES") {
-        return !matches!(s.as_str(), "0" | "false" | "no");
+        // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
+        // every knob in this family: all five are opt-OUTs of a feature or
+        // a safety behavior, so a typo must not be the thing that turns
+        // one off. See `parse_bool_token`.
+        return parse_bool_token(&s).unwrap_or(true);
     }
     config().runtime.as_ref().and_then(|r| r.check_updates).unwrap_or(true)
 }
@@ -1194,7 +1223,11 @@ pub fn host_sampler_lock_path() -> std::path::PathBuf {
 /// Whether the thermal governor + breaker are active at all.
 pub fn thermal_enabled() -> bool {
     if let Some(s) = env_str("DARKMUX_THERMAL_ENABLED") {
-        return !matches!(s.as_str(), "0" | "false" | "no");
+        // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
+        // every knob in this family: all five are opt-OUTs of a feature or
+        // a safety behavior, so a typo must not be the thing that turns
+        // one off. See `parse_bool_token`.
+        return parse_bool_token(&s).unwrap_or(true);
     }
     config()
         .runtime
@@ -1354,7 +1387,11 @@ pub fn thermal_episode_threshold() -> u32 {
 /// Default `true`.
 pub fn thermal_tier4_enabled() -> bool {
     if let Some(s) = env_str("DARKMUX_THERMAL_TIER4_ENABLED") {
-        return !matches!(s.as_str(), "0" | "false" | "no");
+        // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
+        // every knob in this family: all five are opt-OUTs of a feature or
+        // a safety behavior, so a typo must not be the thing that turns
+        // one off. See `parse_bool_token`.
+        return parse_bool_token(&s).unwrap_or(true);
     }
     config()
         .runtime
@@ -1389,7 +1426,11 @@ pub fn power_min_battery_pct() -> u8 {
 /// Default `true`.
 pub fn power_refuse_start_below_min() -> bool {
     if let Some(s) = env_str("DARKMUX_POWER_REFUSE_START_BELOW_MIN") {
-        return !matches!(s.as_str(), "0" | "false" | "no");
+        // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
+        // every knob in this family: all five are opt-OUTs of a feature or
+        // a safety behavior, so a typo must not be the thing that turns
+        // one off. See `parse_bool_token`.
+        return parse_bool_token(&s).unwrap_or(true);
     }
     config().power.as_ref().and_then(|p| p.refuse_start_below_min).unwrap_or(true)
 }
@@ -1398,7 +1439,11 @@ pub fn power_refuse_start_below_min() -> bool {
 /// [`power_min_battery_pct`]. Default `true`.
 pub fn power_pause_running_below_min() -> bool {
     if let Some(s) = env_str("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN") {
-        return !matches!(s.as_str(), "0" | "false" | "no");
+        // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
+        // every knob in this family: all five are opt-OUTs of a feature or
+        // a safety behavior, so a typo must not be the thing that turns
+        // one off. See `parse_bool_token`.
+        return parse_bool_token(&s).unwrap_or(true);
     }
     config().power.as_ref().and_then(|p| p.pause_running_below_min).unwrap_or(true)
 }

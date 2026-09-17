@@ -4635,7 +4635,7 @@
     /// writes in production, so tests exercising the happy path (or the
     /// workspace gate specifically) don't have to hand-roll the JSON.
     fn write_origin(dir: &std::path::Path, workspace: &str, read_only: bool) {
-        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only);
+        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only, None);
     }
 
     /// (#2162) Test-only composition mirroring the OLD (pre-#2162)
@@ -4708,6 +4708,161 @@
             !new_out.path().join(CHECKPOINT_FILENAME).exists(),
             "no container should ever see a checkpoint that was never validated"
         );
+    }
+
+    // ── (#2774 review F2) Tier 4's resume hint must be a command the
+    //    resume gate ACCEPTS ──
+
+    /// Parse a generated hint back into the arguments a shell would hand
+    /// `darkmux dispatch`, so a test can feed them to the REAL gate rather
+    /// than eyeballing the string. Handles the single-quoting
+    /// `shell_quote` emits; deliberately tiny — it only has to understand
+    /// the forms this project's own hint builder produces.
+    fn parse_hint_args(hint: &str) -> Vec<String> {
+        // Everything up to the trailing parenthetical is the command.
+        let cmd = hint.split(" (once conditions").next().unwrap();
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut in_quote = false;
+        let mut started = false;
+        for ch in cmd.chars() {
+            match ch {
+                '\'' => {
+                    in_quote = !in_quote;
+                    started = true;
+                }
+                ' ' if !in_quote => {
+                    if started || !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if started || !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    }
+
+    /// The F2 regression, end to end: generate tier 4's hint from a real
+    /// `resume_origin.json`, parse the flags back out, and feed them
+    /// through the ACTUAL `validate_resume_checkpoint`. Before the fix the
+    /// hint carried only `--resume-from`, and the resumed dispatch would
+    /// resolve a fresh ephemeral workspace it could never match — refused
+    /// with RESUME WORKSPACE MISMATCH every time, for every dispatch.
+    #[test]
+    fn the_tier4_resume_hint_is_accepted_by_the_real_resume_gate() {
+        let workspace = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_resume_origin_meta(prior.path(), workspace.path(), false, Some("rust:latest"));
+
+        let hint = resume_hint_from_origin(prior.path(), "coder", Some("p-7"));
+        let args = parse_hint_args(&hint);
+
+        assert_eq!(args.first().map(String::as_str), Some("darkmux"));
+        assert_eq!(args.get(1).map(String::as_str), Some("dispatch"));
+        assert_eq!(args.get(2).map(String::as_str), Some("coder"));
+        assert_eq!(flag_value(&args, "--image"), Some("rust:latest"), "hint: {hint}");
+        assert_eq!(flag_value(&args, "--phase-id"), Some("p-7"), "hint: {hint}");
+
+        let resume_from = flag_value(&args, "--resume-from").expect("hint names --resume-from");
+        let workdir = flag_value(&args, "--workdir").expect("hint names --workdir");
+        let read_only = args.iter().any(|a| a == "--workspace-read-only");
+        assert!(!read_only, "a read-write origin must not ask for a read-only resume");
+
+        validate_resume_checkpoint(
+            std::path::Path::new(resume_from),
+            "coder",
+            std::path::Path::new(workdir),
+            read_only,
+        )
+        .expect("the hint darkmux prints must be a command darkmux accepts");
+    }
+
+    /// The crawl-unit case, which needs BOTH the right `--workdir` and
+    /// `--workspace-read-only`: a read-only origin resumed read-write is
+    /// refused as a mount escalation.
+    #[test]
+    fn the_tier4_resume_hint_for_a_read_only_unit_is_accepted_too() {
+        let workspace = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_resume_origin_meta(prior.path(), workspace.path(), true, None);
+
+        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        let args = parse_hint_args(&hint);
+        assert!(
+            args.iter().any(|a| a == "--workspace-read-only"),
+            "a read-only origin's hint must carry the flag, or the gate refuses it: {hint}"
+        );
+        assert!(!args.iter().any(|a| a == "--phase-id"), "no phase, no flag: {hint}");
+        assert!(!args.iter().any(|a| a == "--image"), "no image recorded, no flag: {hint}");
+
+        let resume_from = flag_value(&args, "--resume-from").unwrap();
+        let workdir = flag_value(&args, "--workdir").unwrap();
+        validate_resume_checkpoint(
+            std::path::Path::new(resume_from),
+            "coder",
+            std::path::Path::new(workdir),
+            true,
+        )
+        .expect("a read-only unit's hint must also be accepted");
+    }
+
+    /// Without `--workspace-read-only` the SAME checkpoint is refused —
+    /// which is why the flag has to be in the hint, and (since #2774's F2)
+    /// has to exist on the CLI at all.
+    #[test]
+    fn dropping_the_read_only_flag_from_the_hint_is_refused_as_an_escalation() {
+        let workspace = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_resume_origin_meta(prior.path(), workspace.path(), true, None);
+
+        let err = validate_resume_checkpoint(prior.path(), "coder", workspace.path(), false)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME WORKSPACE MOUNT ESCALATION"),
+            "got: {err:#}"
+        );
+    }
+
+    /// A path with a space must survive the round trip — an unquoted hint
+    /// would silently mean a different workspace.
+    #[test]
+    fn a_workspace_path_with_a_space_is_quoted_and_still_accepted() {
+        let parent = TempDir::new().unwrap();
+        let workspace = parent.path().join("My Projects");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_resume_origin_meta(prior.path(), &workspace, false, None);
+
+        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        assert!(hint.contains("'"), "a path with a space must be quoted: {hint}");
+        let args = parse_hint_args(&hint);
+        let workdir = flag_value(&args, "--workdir").unwrap();
+        assert_eq!(workdir, workspace.display().to_string());
+        validate_resume_checkpoint(prior.path(), "coder", std::path::Path::new(workdir), false)
+            .expect("a quoted path must still be the right path");
+    }
+
+    /// No provenance file means no valid resume command exists — the gate
+    /// itself would refuse with RESUME ORIGIN UNKNOWN. Say so, rather than
+    /// printing a command that cannot work.
+    #[test]
+    fn the_hint_says_so_plainly_when_no_resume_is_possible() {
+        let prior = TempDir::new().unwrap(); // no resume_origin.json
+        let hint = resume_hint_from_origin(prior.path(), "coder", None);
+        assert!(!hint.contains("darkmux dispatch"), "must not print an unusable command: {hint}");
+        assert!(hint.contains("RESUME ORIGIN UNKNOWN"), "{hint}");
     }
 
     #[test]
@@ -11564,7 +11719,7 @@ fn a_detection_reaches_the_envelope() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
@@ -11583,7 +11738,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["detections"].is_array(), "must be present: {out}");
@@ -11610,7 +11765,7 @@ fn bounds_argument_survives_into_the_envelope() {
         &no_extras(),
         no_findings_dir(),
         distinctive_bounds.clone(),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -11641,7 +11796,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
 }
@@ -11724,7 +11879,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
@@ -11747,7 +11902,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -11768,7 +11923,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
                 &no_extras(),
                 no_findings_dir(),
                 serde_json::json!({}),
-                crate::thermal_governor::ThermalLadderSummary::default(),
+                None,
             ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
@@ -11882,7 +12037,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
@@ -11936,7 +12091,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &extras,
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
@@ -11959,7 +12114,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
     for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
@@ -11979,7 +12134,7 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["host"]["cpu"]["peak_pct"].is_number(), "the #2107 block still lands");
@@ -12002,7 +12157,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
@@ -12056,7 +12211,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         &no_extras(),
         td.path(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 3, "the caller's next action turns on this: {out}");
@@ -12078,7 +12233,7 @@ fn a_trailing_newline_is_not_a_finding() {
         &no_extras(),
         td.path(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 1, "records, not lines: {out}");
@@ -12098,7 +12253,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
-        crate::thermal_governor::ThermalLadderSummary::default(),
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
@@ -13609,7 +13764,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             no_findings_dir(),
             serde_json::json!({}),
-            crate::thermal_governor::ThermalLadderSummary::default(),
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host_window"]["thermal_worst_state"], "serious");
@@ -13631,6 +13786,89 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(total["max"], 3100);
     }
 
+    /// (#2774 review F4) The two ladder fields were pinned by NOTHING:
+    /// deleting both lines from `host_window_json` left the crate green,
+    /// because every call-site test threaded `ThermalLadderSummary::
+    /// default()` and asserted on the other keys. This threads DISTINCT,
+    /// non-default values and asserts both reach the envelope — so a
+    /// deletion, a swap of the two keys, or a wrong field goes red.
+    #[test]
+    fn the_thermal_ladder_numbers_reach_the_envelope_distinctly() {
+        let stats = super::reduce_host_stats(&worked_samples());
+        let out = super::enrich_envelope_with_summary(
+            r#"{"result":"stop"}"#.to_string(),
+            &super::TrajectorySummary::default(),
+            &stats,
+            &no_extras(),
+            no_findings_dir(),
+            serde_json::json!({}),
+            Some(crate::thermal_governor::ThermalLadderSummary {
+                serious_episodes: 3,
+                current_duty_delay_ms: 120_000,
+            }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["host_window"]["thermal_serious_episodes"], 3,
+            "the episode count must reach the envelope: {v}"
+        );
+        assert_eq!(
+            v["host_window"]["thermal_duty_delay_ms"], 120_000,
+            "the live ratcheted delay must reach the envelope: {v}"
+        );
+    }
+
+    /// The same two numbers on the FLOW RECORD path, which is a separate
+    /// builder — #2111's own history says a `host_window` insert deleted
+    /// from one of these two paths left the other's coverage green.
+    #[test]
+    fn the_thermal_ladder_numbers_reach_the_flow_record_distinctly() {
+        let stats = super::reduce_host_stats(&worked_samples());
+        let payload = super::build_dispatch_complete_payload(
+            1000,
+            super::RestTotals { rest_ms: 200, rests: 1 },
+            Some(50),
+            "stdout-body",
+            "",
+            0,
+            &super::TrajectorySummary::default(),
+            super::TokenTotals { prompt: 10, completion: 20, reasoning: None, cached: None },
+            super::CumulativeCounts::default(),
+            None,
+            &stats,
+            &no_extras(),
+            &None,
+            None,
+            Some(crate::thermal_governor::ThermalLadderSummary {
+                serious_episodes: 7,
+                current_duty_delay_ms: 240_000,
+            }),
+        );
+        assert_eq!(payload["host_window"]["thermal_serious_episodes"], 7, "{payload}");
+        assert_eq!(payload["host_window"]["thermal_duty_delay_ms"], 240_000, "{payload}");
+    }
+
+    /// (#2774 review C3) A PANICKED sampler must leave both fields `null`,
+    /// not `0` — `0 episodes / 0 ms` is not a reachable live reading (the
+    /// delay never drops below the configured base), so zeros would read
+    /// as "measured, and never throttled."
+    #[test]
+    fn a_lost_thermal_ladder_reads_as_null_not_zero() {
+        let stats = super::reduce_host_stats(&worked_samples());
+        let out = super::enrich_envelope_with_summary(
+            r#"{"result":"stop"}"#.to_string(),
+            &super::TrajectorySummary::default(),
+            &stats,
+            &no_extras(),
+            no_findings_dir(),
+            serde_json::json!({}),
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["host_window"]["thermal_serious_episodes"].is_null(), "{v}");
+        assert!(v["host_window"]["thermal_duty_delay_ms"].is_null(), "{v}");
+    }
+
     #[test]
     fn an_unsampled_run_omits_host_window_too() {
         let out = super::enrich_envelope_with_summary(
@@ -13640,7 +13878,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             no_findings_dir(),
             serde_json::json!({}),
-            crate::thermal_governor::ThermalLadderSummary::default(),
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("host_window").is_none(), "unsampled must omit host_window, never zero it");
@@ -13683,7 +13921,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             &None,
             None,
-            crate::thermal_governor::ThermalLadderSummary::default(),
+            None,
         );
         assert_eq!(
             payload["host_window"]["thermal_worst_state"], "serious",
@@ -13746,7 +13984,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             &None,
             None,
-            crate::thermal_governor::ThermalLadderSummary::default(),
+            None,
         );
         assert_eq!(payload["prompt_tokens"], 100);
         assert_eq!(payload["completion_tokens"], 600);
@@ -13797,7 +14035,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             &None,
             None,
-            crate::thermal_governor::ThermalLadderSummary::default(),
+            None,
         );
         assert_eq!(payload["result_class"], "error");
         assert_eq!(payload["endpoint"], "azure/gpt-x");
@@ -13828,7 +14066,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             &None,
             None,
-            crate::thermal_governor::ThermalLadderSummary::default(),
+            None,
         );
         assert!(
             payload.get("host_window").is_none(),

@@ -193,7 +193,7 @@ enum State {
 /// # Why thermal wins
 ///
 /// Both governors write ONE file, so precedence has to be decided rather
-/// than raced. Every entry point takes `thermal_pacing`, and while that is
+/// than raced. Every entry point takes `thermal_pausing`, and while that is
 /// true this governor **writes nothing and emits nothing** — it records
 /// that the pace file is no longer carrying its pause
 /// ([`Self::pace_owned`]) and re-asserts on the first tick after thermal
@@ -201,6 +201,17 @@ enum State {
 /// not the charge level) and its breaker is terminal, so deferring to it is
 /// the right ordering; re-asserting within one sampler tick (~2s) is what
 /// keeps deferring from becoming forgetting.
+///
+/// **The flag means an actual thermal PAUSE, not "thermal is doing
+/// something" (#2774 review F1).** It is
+/// [`crate::thermal_governor::ThermalGovernor::is_pausing`], never
+/// `is_pacing` — the latter is also true for tier 2's `DutyCycle`, which
+/// writes `pause: false` and is therefore not a condition this governor
+/// may defer to. Standing down for it would silently drop a real
+/// battery-critical pause for the whole duty-cycle episode: the run keeps
+/// working, the battery keeps draining, and nothing is checking it.
+/// Deferring is only safe for a condition that ALREADY satisfies "stop the
+/// run."
 pub struct BatteryGovernor {
     config: PowerPolicyConfig,
     state: State,
@@ -278,8 +289,8 @@ impl BatteryGovernor {
     }
 
     /// Whether this governor is currently holding a pause — the mirror of
-    /// [`crate::thermal_governor::ThermalGovernor::is_pacing`], so a caller
-    /// can report which condition is parking a run.
+    /// [`crate::thermal_governor::ThermalGovernor::is_pausing`], so a
+    /// caller can report which condition is parking a run.
     pub fn is_pacing(&self) -> bool {
         self.state == State::Paused
     }
@@ -292,8 +303,9 @@ impl BatteryGovernor {
     ///   reading is not evidence the charge crossed anything.
     /// - `elapsed_ms` is wall time since the previous tick, injected so the
     ///   heartbeat is testable without real sleeps.
-    /// - `thermal_pacing` — the thermal governor holds the pace file this
-    ///   tick. See the struct doc for why this governor then stands down.
+    /// - `thermal_pausing` — the thermal governor holds an ACTUAL pause
+    ///   this tick (`is_pausing`, NOT `is_pacing` — see the struct doc).
+    ///   That is the only condition this governor stands down for.
     ///
     /// Returns the event that fired this tick, if any. At most one fires.
     pub fn on_sample(
@@ -301,7 +313,7 @@ impl BatteryGovernor {
         battery: Option<&BatterySample>,
         elapsed_ms: u64,
         host_out: &Path,
-        thermal_pacing: bool,
+        thermal_pausing: bool,
     ) -> Option<BatteryEvent> {
         // THE INERTNESS, first and unconditional. A machine with no battery
         // never reaches a config read, a threshold comparison, or a write.
@@ -311,7 +323,7 @@ impl BatteryGovernor {
         }
         self.last_known_pct = b.charge_pct;
 
-        if thermal_pacing {
+        if thermal_pausing {
             // Thermal owns the file. Accumulate time so the heartbeat stays
             // honest, but write nothing and claim nothing — and remember
             // that whatever is in the file now is not ours.
@@ -633,7 +645,7 @@ mod tests {
         );
         assert!(
             !crate::pace_file::path(dir.path()).exists(),
-            "the battery governor must not write while thermal is pacing"
+            "the battery governor must not write while thermal holds a real pause"
         );
     }
 

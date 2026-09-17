@@ -142,6 +142,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             session_id,
             timeout,
             workdir,
+            workspace_read_only,
             phase_id,
             skip_preflight,
             json,
@@ -160,6 +161,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             session_id,
             timeout,
             workdir,
+            workspace_read_only,
             phase_id,
             skip_preflight,
             json,
@@ -1386,6 +1388,7 @@ struct DispatchInvocation {
     session_id: Option<String>,
     timeout: Option<u32>,
     workdir: Option<std::path::PathBuf>,
+    workspace_read_only: bool,
     phase_id: Option<String>,
     skip_preflight: bool,
     json: bool,
@@ -1412,6 +1415,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         session_id,
         timeout,
         workdir,
+        workspace_read_only,
         phase_id,
         skip_preflight,
         json,
@@ -1524,7 +1528,11 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         }
     }
     let opts = crew::dispatch::DispatchOpts {
-        workspace_read_only: false,
+        // (#2774 review F2) Operator-settable now, so a checkpoint written
+        // under a read-only mount (every crawl unit) can actually be
+        // resumed — the resume gate refuses an origin-read-only checkpoint
+        // resumed read-write, and tier 4's own resume hint emits this flag.
+        workspace_read_only,
         record_context: None,
         role_id: role,
         message,
@@ -1902,7 +1910,14 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
     // carries what the old "nothing to eject" message needed, so there is
     // no separate peek to keep in sync with it.
     let summary = swap::eject_all_managed(dry_run)?;
-    if summary.ejected.is_empty() {
+    // (#2774 review C1) A stuck resident no longer aborts the sweep, so
+    // report what did NOT come out alongside what did — and exit non-zero,
+    // since "eject" did not fully happen.
+    let had_failures = !summary.failed.is_empty();
+    for f in &summary.failed {
+        eprintln!("darkmux: ⚠ could not eject {} — {}", f.identifier, f.error);
+    }
+    if summary.ejected.is_empty() && !had_failures {
         println!("no darkmux-managed loads to eject");
         if summary.user_loaded_count > 0 {
             println!(
@@ -1924,11 +1939,14 @@ fn cmd_model_eject(dry_run: bool) -> Result<i32> {
     if summary.user_loaded_count > 0 {
         line.push_str(&format!(", respected {} user-loaded model(s)", summary.user_loaded_count));
     }
+    if had_failures {
+        line.push_str(&format!(", {} FAILED to eject", summary.failed.len()));
+    }
     if dry_run {
         line.push_str(" [DRY RUN]");
     }
     println!("{line}");
-    Ok(0)
+    Ok(i32::from(had_failures))
 }
 
 fn cmd_profile(sub: ProfileCmd) -> Result<i32> {

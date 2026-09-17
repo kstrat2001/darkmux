@@ -3183,6 +3183,48 @@ fn check_thermal_governor() -> Check {
         };
     }
 
+    // (#2774 review F6) `pause_at` and `resume_at` are ordered severities
+    // (position in `THERMAL_STATES`), and the ladder's whole hysteresis
+    // model assumes `pause_at` is STRICTLY more severe than `resume_at` —
+    // a real gap for the entry/resume holds to occupy. When the two touch
+    // or invert, a single unchanging reading satisfies BOTH "enter
+    // serious" and "resume from serious" on the same sample: tier 3
+    // enters and, ~`resume_hold_ms` later, resumes STRAIGHT BACK into
+    // tier 3 on the next tick (landing in `DutyCycle` for exactly one
+    // tick before re-entering) — falsifying "an episode is a transition,
+    // never a sample" in practice, since each of those re-entries IS a
+    // fresh transition. With the default `episode_threshold: 2` this
+    // reaches a terminal, operator-gated `OperatorHold` in roughly
+    // `2 * resume_hold_ms` (about a minute at the 60s default) from a
+    // machine that never moved off one reading. This is exactly the
+    // config an operator reaching for MORE caution would pick
+    // (`pause_at = resume_at = "fair"`), so it is worth a loud Warn
+    // rather than silently reaching a Pass.
+    let pause_severity = states.iter().position(|s| *s == pause_at.to_ascii_lowercase().as_str());
+    let resume_severity = states.iter().position(|s| *s == resume_at.to_ascii_lowercase().as_str());
+    if let (Some(p), Some(r)) = (pause_severity, resume_severity) {
+        if p <= r {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "pause_at=`{pause_at}` is not strictly more severe than resume_at=`{resume_at}` \
+                     — the ladder needs a real gap between them for the entry/resume holds to \
+                     occupy. With these equal (or inverted), a single unchanging reading can \
+                     satisfy both \"enter serious\" and \"resume from serious\" on the same \
+                     sample, cycling straight back into a fresh `serious` episode every \
+                     ~{resume_hold_ms}ms and reaching a terminal, operator-gated pause in roughly \
+                     2x that — from a machine that never actually got worse."
+                ),
+                hint: Some(format!(
+                    "darkmux config set runtime.thermal.resume_at <a state milder than {pause_at}> \
+                     (valid: {})",
+                    states.join("|")
+                )),
+            };
+        }
+    }
+
     // (N2, final re-check) An explicit `0` doesn't achieve "disable"
     // semantics — it's silently coerced to `1` by
     // `thermal_speed_limit_hold_samples`'s own `.max(1)` floor (a naive
@@ -9413,6 +9455,57 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", v),
                 None => std::env::remove_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn thermal_governor_warns_when_pause_at_is_not_strictly_more_severe_than_resume_at() {
+        // (#2774 review F6) `pause_at == resume_at` reaches a terminal
+        // OperatorHold in about a minute from a machine that never
+        // actually changed temperature — see this check's own doc for the
+        // exact mechanism. Must surface as a loud Warn.
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
+        }
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("pause_at"), "{}", check.message);
+        assert!(check.message.contains("resume_at"), "{}", check.message);
+
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+        }
+        let ok_check = check_thermal_governor();
+        assert_eq!(
+            ok_check.status,
+            Status::Pass,
+            "a real gap (fair pause_at, nominal resume_at) must not warn: {}",
+            ok_check.message
+        );
+
+        // Inverted (pause_at MILDER than resume_at) must also warn.
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "serious");
+        }
+        let inverted = check_thermal_governor();
+        assert_eq!(inverted.status, Status::Warn, "{}", inverted.message);
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
             }
         }
     }

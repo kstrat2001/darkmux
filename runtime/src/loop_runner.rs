@@ -5244,6 +5244,93 @@ mod tests {
         assert_eq!(rests, 1);
     }
 
+    /// (#2774 review F3) The WIRING, not the function. Seven tests call
+    /// `apply_pace_duty_cycle_delay` directly and `honor_pace_pause` — the
+    /// only thing that calls it in production — had no direct test at all,
+    /// so deleting all eleven lines of the call left the whole crate green
+    /// while tier 2's ONLY mechanism did nothing. This drives
+    /// `honor_pace_pause` with a duty-cycle pace file and asserts the
+    /// injected sleeper saw the host-set delay.
+    #[test]
+    fn honor_pace_pause_applies_the_host_set_duty_cycle_delay() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(
+            tmp.path(),
+            r#"{"pause": false, "reason": "thermal-duty-cycle", "state": "fair", "turn_delay_ms": 15000}"#,
+        );
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+        let mut expiry_warned = false;
+
+        honor_pace_pause(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600,
+            &mut expiry_warned,
+            &sleeper,
+            &mut traj,
+            3,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert_eq!(
+            sleeper.calls.borrow().as_slice(),
+            &[15_000],
+            "the turn boundary must actually rest for the host-set duty-cycle delay — \
+             this is tier 2's only mechanism"
+        );
+        assert_eq!(rest_ms, 15_000);
+        assert_eq!(rests, 1);
+        // `pause: false` means the pause loop itself breaks immediately, so
+        // the 15s above is the duty-cycle prelude and nothing else.
+        assert_eq!(sleeper.calls.borrow().len(), 1, "no 2s pause-poll increments on a non-paused file");
+    }
+
+    /// The other half: with no `turn_delay_ms` at all, `honor_pace_pause`
+    /// rests for nothing. Without this, the test above could pass off a
+    /// hard-coded sleep as the wiring.
+    #[test]
+    fn honor_pace_pause_rests_for_nothing_when_the_file_carries_no_turn_delay() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(tmp.path(), r#"{"pause": false, "reason": "thermal", "state": "nominal"}"#);
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+        let mut expiry_warned = false;
+
+        honor_pace_pause(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600,
+            &mut expiry_warned,
+            &sleeper,
+            &mut traj,
+            3,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert!(sleeper.calls.borrow().is_empty(), "nothing to duty-cycle, nothing to wait for");
+        assert_eq!(rest_ms, 0);
+        assert_eq!(rests, 0);
+    }
+
     #[test]
     fn duty_cycle_delay_goes_through_the_same_budget_clamp_as_the_configured_delay() {
         // budget=10s -> half=5000ms; a host-set 15000ms must clamp exactly

@@ -1524,7 +1524,7 @@ mod tests {
             valid_checkpoint_json("coder"),
         )
         .unwrap();
-        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false);
+        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None);
 
         let mut opts = test_opts("coder", "resume please");
         opts.resume_from = Some(resume_from.path().to_path_buf());
