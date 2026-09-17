@@ -68,7 +68,7 @@ fn ack_dir_default() -> PathBuf {
     let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return PathBuf::from("/tmp/darkmux-test-isolated/acks");
+        return darkmux_types::paths::test_isolated_dir("acks");
     }
     resolved.root.join("acks")
 }

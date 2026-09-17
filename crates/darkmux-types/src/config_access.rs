@@ -515,7 +515,7 @@ fn hooks_outbox_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/hooks");
+        return crate::paths::test_isolated_dir("hooks");
     }
     resolved.root.join("hooks")
 }
@@ -588,6 +588,145 @@ pub fn hooks_jq_timeout_ms() -> u64 {
 pub fn hooks_jq_max_output_bytes() -> u64 {
     let cfg = config().hooks.as_ref().and_then(|h| h.jq_max_output_bytes);
     pick_parsed("DARKMUX_HOOKS_JQ_MAX_OUTPUT_BYTES", cfg, Some(1_048_576)).unwrap()
+}
+
+// ── Serve daemon address (#2765) ──
+// The daemon's port and bind address, resolved the same way everything else
+// here is: `env(DARKMUX_SERVE_PORT / DARKMUX_SERVE_BIND) > config.serve.* >
+// built-in default`. A `--port` / `--bind` on the command line still wins
+// outright above all three — the CLI-beats-config convention.
+//
+// **Both the server AND every client resolve through these two functions.**
+// That is the whole fix: the bug (#2765) was not that the port had no config
+// tier, it was that the SERVER took its port from one place and every CLIENT
+// took it from a different hardcoded literal, so the two could disagree with
+// nothing reporting an error. Adding a config tier that only the server read
+// would have left the asymmetry exactly where it was.
+
+/// The built-in daemon port. Also the literal `DarkmuxConfig::with_defaults`
+/// writes, so the two paths an untouched install can take — a written
+/// `config.json` and no config at all — cannot disagree.
+pub const SERVE_PORT_DEFAULT: u16 = 8765;
+
+/// The built-in daemon bind address: loopback only. A non-loopback bind is
+/// separately refused without a resolved serve token (`darkmux-serve`).
+pub const SERVE_BIND_DEFAULT: &str = "127.0.0.1";
+
+/// The resolved daemon port — `env(DARKMUX_SERVE_PORT) > config.serve.port >
+/// 8765`.
+pub fn serve_port() -> u16 {
+    serve_port_with_source().0
+}
+
+/// [`serve_port`] plus WHICH tier resolved it, for `darkmux doctor`'s row.
+/// One call yields both, so the number and the provenance printed next to it
+/// are structurally incapable of disagreeing.
+pub fn serve_port_with_source() -> (u16, Source) {
+    let cfg = config().serve.as_ref().and_then(|s| s.port);
+    let (v, src) = pick_parsed_with_source("DARKMUX_SERVE_PORT", cfg, Some(SERVE_PORT_DEFAULT));
+    (v.unwrap_or(SERVE_PORT_DEFAULT), src)
+}
+
+/// The resolved daemon bind address — `env(DARKMUX_SERVE_BIND) >
+/// config.serve.bind > 127.0.0.1`.
+pub fn serve_bind() -> String {
+    serve_bind_with_source().0
+}
+
+/// [`serve_bind`] plus WHICH tier resolved it.
+pub fn serve_bind_with_source() -> (String, Source) {
+    let cfg = config().serve.as_ref().and_then(|s| s.bind.as_deref());
+    let (v, src) = pick_string_with_source("DARKMUX_SERVE_BIND", cfg, Some(SERVE_BIND_DEFAULT));
+    (v.unwrap_or_else(|| SERVE_BIND_DEFAULT.to_string()), src)
+}
+
+/// The address a CLIENT ON THIS MACHINE should probe to reach the local
+/// daemon — `<host>:<port>`, where the port is [`serve_port`] and the host is
+/// [`serve_bind`] EXCEPT when the bind is a wildcard.
+///
+/// The wildcard case is the reason this is a function rather than a
+/// `format!` at each call site. `0.0.0.0` and `::` are bind directives
+/// ("every interface"), not destinations: connecting to `0.0.0.0` is
+/// unspecified-to-hostile across platforms, so a daemon bound to all
+/// interfaces is probed on loopback, which it is by definition also
+/// listening on. Every other bind is used verbatim — an operator who bound
+/// one specific interface meant that interface.
+///
+/// IPv6 literals are bracketed so the result parses as a `SocketAddr`.
+pub fn serve_client_addr() -> String {
+    format_client_addr(&serve_bind(), serve_port())
+}
+
+/// Pure core of [`serve_client_addr`] — takes the bind + port explicitly so
+/// every case (wildcard v4, wildcard v6, a specific v6 literal, a hostname)
+/// is table-testable without touching process env or config.
+pub(crate) fn format_client_addr(bind: &str, port: u16) -> String {
+    let host = bind.trim();
+    let host = if host.is_empty() {
+        SERVE_BIND_DEFAULT
+    } else {
+        host
+    };
+    // A wildcard bind is not an address to connect TO.
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => SERVE_BIND_DEFAULT,
+        _ => host,
+    };
+    // Bracket a bare IPv6 literal (`::1` -> `[::1]:8765`); anything already
+    // bracketed, an IPv4 literal, or a hostname is used as-is.
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
+// ── Machine-lens aggregate heartbeat (#2775) ──
+// `env(DARKMUX_MACHINE_ROLLUP_ENABLED / _PERIOD_SECONDS) >
+// config.machine_rollup.* > built-in default`. See `MachineRollupConfig`'s
+// own doc for why this is a periodic RECORD rather than a timed hook.
+
+/// The built-in emission period, in seconds. Also the literal
+/// `DarkmuxConfig::with_defaults` writes.
+pub const MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT: u64 = 60;
+
+/// Whether the daemon emits the periodic `machine.rollup` record at all.
+/// Default `false`: this adds steady-state volume to the flow stream, and
+/// nobody pays for a heartbeat they have not subscribed to.
+///
+/// Fail-CLOSED on an unrecognized env token, the same
+/// `parse_bool_token(...).unwrap_or(false)` shape `hooks_enabled` uses — a
+/// typo leaves a gated feature off rather than silently turning it on.
+pub fn machine_rollup_enabled() -> bool {
+    machine_rollup_enabled_with_source().0
+}
+
+/// [`machine_rollup_enabled`] plus WHICH tier resolved it.
+pub fn machine_rollup_enabled_with_source() -> (bool, Source) {
+    if let Some(s) = env_str("DARKMUX_MACHINE_ROLLUP_ENABLED") {
+        return (parse_bool_token(&s).unwrap_or(false), Source::Env);
+    }
+    match config().machine_rollup.as_ref().and_then(|m| m.enabled) {
+        Some(v) => (v, Source::Config),
+        None => (false, Source::BuiltIn),
+    }
+}
+
+/// Seconds between `machine.rollup` emissions. `0` means OFF — the
+/// zero-means-off convention `runtime.host_sampler_interval_ms` and
+/// `redis.maxlen` already use here, never "emit continuously".
+pub fn machine_rollup_period_seconds() -> u64 {
+    machine_rollup_period_seconds_with_source().0
+}
+
+/// [`machine_rollup_period_seconds`] plus WHICH tier resolved it.
+pub fn machine_rollup_period_seconds_with_source() -> (u64, Source) {
+    let cfg = config().machine_rollup.as_ref().and_then(|m| m.period_seconds);
+    let (v, src) = pick_parsed_with_source(
+        "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS",
+        cfg,
+        Some(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT),
+    );
+    (v.unwrap_or(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT), src)
 }
 
 // ── Runtime behavior ──
@@ -1227,7 +1366,8 @@ pub fn liveness_dir() -> std::path::PathBuf {
 ///
 /// `dispatch_liveness::liveness_dir()` carries its OWN test isolation
 /// (#2653 MUST FIX 1: `DARKMUX_HOME` if set, else a fixed
-/// `/tmp/darkmux-test-isolated` scratch path in test / `test-support`
+/// `<system temp>/darkmux-test-isolated/<pid>` scratch path (#2777) in
+/// test / `test-support`
 /// builds — never the real home), so this needs no separate test-cfg
 /// variant of its own any more; the (#994/#2359-style) isolation guarantee
 /// carries through automatically.
@@ -1627,7 +1767,7 @@ fn flows_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/flows");
+        return crate::paths::test_isolated_dir("flows");
     }
     resolved.root.join("flows")
 }
@@ -1669,7 +1809,7 @@ fn findings_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/findings");
+        return crate::paths::test_isolated_dir("findings");
     }
     resolved.root.join("findings")
 }
@@ -1708,7 +1848,7 @@ fn mods_dir_default() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/mods");
+        return crate::paths::test_isolated_dir("mods");
     }
     resolved.root.join("mods")
 }
@@ -1770,7 +1910,7 @@ fn lab_dir_default() -> std::path::PathBuf {
     // honored verbatim, because a test that isolated itself means it.
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/runs");
+        return crate::paths::test_isolated_dir("runs");
     }
     resolved.runs
 }
@@ -1791,7 +1931,7 @@ fn lab_dir_default() -> std::path::PathBuf {
 /// #2093, #2363, and `fleet_file` (#2450) itself. Probed and confirmed
 /// broken (not assumed from shape) before this fix.
 ///
-/// Carries the same `#[cfg(test)]` `/tmp/darkmux-test-isolated` redirect its
+/// Carries the same `#[cfg(test)]` `paths::test_isolated_root` redirect its
 /// sibling defaults do (`fleet_file_default`, `flows_dir_default`,
 /// `hooks_outbox_dir_default`, `lab_dir_default`).
 ///
@@ -1823,7 +1963,7 @@ pub fn runtime_cache_dir() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/runtime");
+        return crate::paths::test_isolated_dir("runtime");
     }
     resolved.root.join("runtime")
 }
@@ -1850,7 +1990,7 @@ pub fn cache_dir() -> std::path::PathBuf {
     let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/cache");
+        return crate::paths::test_isolated_dir("cache");
     }
     resolved.root.join("cache")
 }
@@ -1931,7 +2071,7 @@ fn fleet_file_default() -> std::path::PathBuf {
 // NO test-build guard here, deliberately — see #2450's CI failure.
 //
 // The sibling accessors guard by comparing the resolved root against
-// `dirs::home_dir()/.darkmux` and redirecting to `/tmp/darkmux-test-isolated`
+// `dirs::home_dir()/.darkmux` and redirecting to `paths::test_isolated_root`
 // when they match, on the premise that "resolved to the home root" means "this
 // test forgot to isolate itself". That premise is FALSE for any test that
 // isolates by moving `HOME` rather than by setting `DARKMUX_HOME`: the guard's
@@ -1941,7 +2081,7 @@ fn fleet_file_default() -> std::path::PathBuf {
 // Not hypothetical. `tests/fleet_concurrent_add_no_lost_writes.rs` isolates
 // exactly that way (`.env("HOME", …).env_remove("DARKMUX_HOME")`) and asserts
 // the roster lands under its own temp home; the guard turned it red, in CI and
-// locally, with the roster written to `/tmp/darkmux-test-isolated/fleet.json`.
+// locally, with the roster written under `paths::test_isolated_root()`.
 // `worktrees_base_dir` is left unguarded for the same reason and about the
 // same kind of test.
 //
@@ -4080,6 +4220,209 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_MAX_PAUSE_MS", v),
                 None => std::env::remove_var("DARKMUX_THERMAL_MAX_PAUSE_MS"),
+            }
+        }
+    }
+    // ── (#2765) serve.port / serve.bind, and the client-side address ──
+    //
+    // The bug these lock down was an ASYMMETRY, not a missing value: the
+    // server took its port from one place and every client took it from a
+    // hardcoded literal, so a daemon on a configured port went invisible to
+    // all of them at once with nothing reporting an error. The assertions
+    // that matter are therefore about ONE resolution being shared, and
+    // about the wildcard case a naive `format!("{bind}:{port}")` gets
+    // silently wrong.
+
+    #[serial_test::serial]
+    #[test]
+    fn serve_port_env_beats_config_beats_default() {
+        let k = "DARKMUX_SERVE_PORT";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+
+        let (v, src) = serve_port_with_source();
+        assert_eq!(v, SERVE_PORT_DEFAULT, "the built-in tier");
+        assert_eq!(src, Source::BuiltIn);
+        // Config tier: the process-wide `config()` under test is the empty
+        // test config (#811), so the ORDERING and the key are exercised
+        // through the same picker the accessor uses.
+        assert_eq!(
+            pick_parsed_with_source::<u16>(k, Some(8799), Some(SERVE_PORT_DEFAULT)),
+            (Some(8799), Source::Config),
+            "config beats the built-in"
+        );
+
+        unsafe { std::env::set_var(k, "8799"); }
+        let (v, src) = serve_port_with_source();
+        assert_eq!(v, 8799, "env wins live");
+        assert_eq!(src, Source::Env);
+        assert_eq!(serve_port(), 8799, "the value-only accessor reads the same tier");
+        assert_eq!(
+            pick_parsed_with_source::<u16>(k, Some(1234), Some(SERVE_PORT_DEFAULT)),
+            (Some(8799), Source::Env),
+            "env beats config too"
+        );
+
+        // An unparseable env value falls through rather than panicking —
+        // the same leniency every other numeric knob here has.
+        unsafe { std::env::set_var(k, "eight-seven-nine-nine"); }
+        assert_eq!(serve_port(), SERVE_PORT_DEFAULT);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn serve_bind_env_beats_config_beats_default() {
+        let k = "DARKMUX_SERVE_BIND";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+
+        let (v, src) = serve_bind_with_source();
+        assert_eq!(v, SERVE_BIND_DEFAULT, "loopback is the built-in");
+        assert_eq!(src, Source::BuiltIn);
+        assert_eq!(
+            pick_string_with_source(k, Some("0.0.0.0"), Some(SERVE_BIND_DEFAULT)),
+            (Some("0.0.0.0".to_string()), Source::Config),
+            "config beats the built-in"
+        );
+
+        unsafe { std::env::set_var(k, "0.0.0.0"); }
+        let (v, src) = serve_bind_with_source();
+        assert_eq!(v, "0.0.0.0", "env wins live");
+        assert_eq!(src, Source::Env);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// The CLIENT address is not simply `bind:port`. A wildcard bind is a
+    /// directive ("every interface"), never a destination — probing
+    /// `0.0.0.0` is unspecified-to-hostile across platforms, and a daemon
+    /// bound to all interfaces is by definition also listening on loopback.
+    #[test]
+    fn a_wildcard_bind_is_probed_on_loopback_not_at_the_wildcard() {
+        assert_eq!(format_client_addr("0.0.0.0", 8799), "127.0.0.1:8799");
+        assert_eq!(format_client_addr("::", 8799), "127.0.0.1:8799");
+        // An empty / whitespace bind is the same "nothing useful named"
+        // case, not a reason to build `:8799`.
+        assert_eq!(format_client_addr("", 8799), "127.0.0.1:8799");
+        assert_eq!(format_client_addr("   ", 8799), "127.0.0.1:8799");
+    }
+
+    /// A SPECIFIC bind is honored verbatim — an operator who bound one
+    /// interface meant that interface, and quietly probing loopback instead
+    /// would recreate the issue's own "the client looks somewhere the
+    /// daemon isn't" failure from the other direction.
+    #[test]
+    fn a_specific_bind_is_used_verbatim_and_ipv6_is_bracketed() {
+        assert_eq!(format_client_addr("127.0.0.1", 8765), "127.0.0.1:8765");
+        assert_eq!(format_client_addr("100.64.0.2", 8799), "100.64.0.2:8799");
+        // Bracketed so the result parses as a `SocketAddr` — an unbracketed
+        // `::1:8799` is ambiguous and every probe on it would fail closed.
+        assert_eq!(format_client_addr("::1", 8799), "[::1]:8799");
+        assert!(format_client_addr("::1", 8799).parse::<std::net::SocketAddr>().is_ok());
+        // A hostname is not an IP literal and is passed through for the
+        // caller to resolve.
+        assert_eq!(format_client_addr("localhost", 8799), "localhost:8799");
+    }
+
+    /// The whole point of #2765: the address a CLIENT probes and the port
+    /// the DAEMON is told to bind resolve from the same place, so they
+    /// cannot disagree. A fix that only gave the server a config tier would
+    /// have left the defect exactly where it was.
+    #[serial_test::serial]
+    #[test]
+    fn the_client_address_tracks_the_same_resolution_the_daemon_binds() {
+        let k = "DARKMUX_SERVE_PORT";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "8799"); }
+        assert_eq!(serve_client_addr(), "127.0.0.1:8799");
+        assert_eq!(serve_port(), 8799);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── (#2775) machine_rollup.* ──
+
+    #[serial_test::serial]
+    #[test]
+    fn machine_rollup_is_off_by_default_and_fails_closed_on_a_typo() {
+        let k = "DARKMUX_MACHINE_ROLLUP_ENABLED";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+
+        assert_eq!(
+            machine_rollup_enabled_with_source(),
+            (false, Source::BuiltIn),
+            "nobody pays stream volume for a heartbeat they did not ask for"
+        );
+
+        unsafe { std::env::set_var(k, "true"); }
+        assert_eq!(machine_rollup_enabled_with_source(), (true, Source::Env));
+
+        // Fail CLOSED on an unrecognized token — a typo must leave a gated
+        // feature off, never silently turn it on. Same rule `hooks_enabled`
+        // follows.
+        unsafe { std::env::set_var(k, "yes-please"); }
+        assert_eq!(
+            machine_rollup_enabled_with_source(),
+            (false, Source::Env),
+            "an unrecognized token reads as off, and still reports the env tier"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn machine_rollup_period_env_beats_config_beats_default() {
+        let k = "DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+
+        assert_eq!(
+            machine_rollup_period_seconds_with_source(),
+            (MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT, Source::BuiltIn)
+        );
+        assert_eq!(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT, 60, "one-minute updates");
+        assert_eq!(
+            pick_parsed_with_source::<u64>(k, Some(300), Some(MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT)),
+            (Some(300), Source::Config)
+        );
+
+        unsafe { std::env::set_var(k, "300"); }
+        assert_eq!(machine_rollup_period_seconds(), 300);
+
+        // `0` is OFF, and the accessor reports it verbatim rather than
+        // coercing it back to the default — the zero-means-off convention
+        // is the EMITTER's to honor, and silently rewriting the operator's
+        // 0 here would make the config say something it does not mean.
+        unsafe { std::env::set_var(k, "0"); }
+        assert_eq!(machine_rollup_period_seconds(), 0);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
             }
         }
     }

@@ -82,11 +82,11 @@ fn darkmux_bin_path() -> &'static str {
 /// `findings_dir_default`, `mods_dir_default`, `liveness_dir_default`)
 /// carry a test-build guard that reads "if the resolved root IS
 /// `dirs::home_dir()/.darkmux`, this test forgot to isolate itself" and
-/// redirects to `/tmp/darkmux-test-isolated/...`. Nesting `DARKMUX_HOME`
+/// redirects to `<test-isolated root>/...`. Nesting `DARKMUX_HOME`
 /// under `HOME` makes a properly isolated child look exactly like an
 /// un-isolated one to that check, and it fires: measured 2026-09-07,
 /// `lab notebook draft` then resolved its run dir to
-/// `/tmp/darkmux-test-isolated/runs` and could not see the fixture the
+/// `<test-isolated root>/runs` and could not see the fixture the
 /// test had just written. Sibling roots keep the two distinguishable.
 fn isolated_roots() -> (std::path::PathBuf, std::path::PathBuf) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -396,7 +396,7 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
         child_home.join(".darkmux"),
         "(#2184) DARKMUX_HOME must NOT be nested at `<HOME>/.darkmux` — see `isolated_roots`: \
          six config_access test-build guards read that exact equality as `this test forgot to \
-         isolate itself` and silently redirect to /tmp/darkmux-test-isolated"
+         isolate itself` and silently redirect to the test-isolated root"
     );
     assert_ne!(
         Some(child_home.clone()),

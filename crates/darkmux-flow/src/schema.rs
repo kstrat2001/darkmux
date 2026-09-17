@@ -77,8 +77,68 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.50.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.51.0";
 // Version history:
+//   1.51.0 (#2775): new action `machine.rollup` (Category::Machinery,
+//           source `host-sampler`) — ONE periodic record carrying the whole
+//           MACHINE-LENS AGGREGATE, so a harness integrating darkmux as a
+//           machine-observability module gets the machine's state in one
+//           heartbeat rather than correlating a thermal feed against a
+//           separate battery feed against a separate memory feed.
+//
+//           The payload is the machine lens's own vocabulary, spliced at
+//           the top level (`now`, `window`, `battery_health` — exactly what
+//           `/machine/resources`' `load` block carries, from the same
+//           builder) plus `residency` (loaded models with owner /
+//           loaded_ctx / potential / current / state, the pool's
+//           capacity/used/available bytes, the attribution and its
+//           messages, and the ledger's own `gather_ms`), plus four
+//           self-describing fields: `period_seconds` (the CONFIGURED
+//           cadence), `emitted_interval_ms` (the MEASURED gap since the
+//           previous emission — same rule `machine.telemetry` follows),
+//           `gather_ms` (this rollup's OWN cost, observer constraint 3),
+//           and `previous_thermal_state` (the last state before the
+//           current one, `null` until a transition has actually been
+//           observed, so a subscriber that missed an edge can reconstruct
+//           direction from a heartbeat alone).
+//
+//           `window.thermal` gains two keys on BOTH carriers (this record
+//           and `/machine/resources`' `load.window.thermal`, one builder):
+//           `level_ms` — wall-clock per thermal level, same left-Riemann
+//           duty and same sleep-gap cap as `above_nominal_ms`, which is
+//           exactly the sum of its non-`nominal` entries — and
+//           `level_entries` — how many times each level was ENTERED,
+//           counting TRANSITIONS INTO it (#2774's episode definition), not
+//           samples observed in it. The distinction is the value: at a 5 s
+//           cadence a per-sample count reports one sustained hour in
+//           `fair` as 720 and two brief excursions as 2, so "how often"
+//           and "how long" must not share a field. Both are maps keyed by
+//           the level's own name rather than fixed structs, because the
+//           kernel owns that vocabulary — `thermal_severity` already ranks
+//           an unknown state above `critical` so a future macOS level
+//           cannot hide pressure, and a fixed struct would drop its time.
+//
+//           OFF BY DEFAULT (`machine_rollup.enabled`, config schema 1.26),
+//           at `period_seconds: 60`: this adds steady-state volume for
+//           every operator, most of whom will never subscribe.
+//
+//           Deliberately a periodic RECORD and not a "timed hook": a hook
+//           rule is a pure function of a `FlowRecord`, so a schedule-fired
+//           rule would have no record to match and would have to PULL
+//           state, inverting the pipeline's direction and putting a second
+//           execution model into one config surface. A record is durable,
+//           has precedent here (`machine.telemetry` already streams on an
+//           interval), and needs NO hook-layer change — `action:
+//           "machine.*"` already matches and dotted `payload.*` predicates
+//           already work.
+//
+//           MINOR, on this history's own precedent for additive actions
+//           and additive payload keys (1.21.0, 1.25.0, 1.29.0, 1.32.0,
+//           1.33.0, 1.36.0, 1.48.0, 1.50.0). Older readers ignore the new
+//           action and the two new `window.thermal` keys; no existing
+//           consumer's computed output changes. The viewer needs no change
+//           either — `activitySectionOf` routes any `machine*` action to
+//           the MACHINE section by prefix.
 //   1.50.0 (#2705, #2706): battery. THREE additive changes, all MINOR:
 //
 //           * `machine.telemetry`'s payload gains a `battery` object —

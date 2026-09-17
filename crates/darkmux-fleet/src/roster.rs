@@ -12,8 +12,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// it does in the every-dispatch nudge.
 const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// Default daemon port used when an address omits an explicit `:port`.
-/// Matches `serve::DEFAULT_DAEMON_ADDR`'s 8765.
+/// Default daemon port used when a ROSTER address omits an explicit
+/// `:port`. Matches `darkmux_flow::daemon_probe::DEFAULT_DAEMON_PORT`'s
+/// 8765.
+///
+/// (#2765) **Deliberately still a constant, and this is a boundary, not an
+/// oversight.** #2765 made the LOCAL daemon's address configurable and
+/// routed every client that looks for the LOCAL daemon through
+/// `config_access::serve_port`/`serve_bind`. A roster entry is a different
+/// thing: it names ANOTHER machine's daemon. Defaulting a peer's port to
+/// this machine's `serve.port` would be right only for a homogeneous fleet
+/// and silently wrong for a mixed one — and it would make one machine's
+/// config quietly redirect traffic aimed at another, which is the class of
+/// surprise #2765 exists to remove rather than relocate. The operator names
+/// the port in the address when it differs (`machine add studio --address
+/// 100.64.0.2:9000`), which is explicit input rather than a guess.
+///
+/// The same reasoning covers `fleet_cli::normalize_daemon_base` /
+/// `fetch_machine_specs` and `darkmux_serve::peer_graph::
+/// normalize_daemon_base`, which build peer base URLs from the same
+/// portless form.
 pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
 
 /// Hard cap on DNS resolution time inside `parse_address` (Wave-E.10

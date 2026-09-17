@@ -123,6 +123,25 @@ fn mw_json(m: &MwStats) -> serde_json::Value {
     serde_json::json!({ "mean": m.mean_mw, "p95": m.p95_mw, "max": m.max_mw })
 }
 
+/// (#2775) One window's thermal summary on the wire — the ONE spelling, so
+/// `/machine/resources`' `load.window.thermal` and the `machine.rollup`
+/// record's `window.thermal` are the same object built by the same code.
+///
+/// `level_ms` and `level_entries` answer two different questions that a
+/// single "above nominal" bucket collapses: how LONG the machine spent at
+/// each level, and how OFTEN it arrived there. See
+/// `darkmux_crew::host_probe::ThermalWindow`'s own field docs for why
+/// entries count transitions rather than samples.
+fn thermal_window_json(t: &darkmux_crew::host_probe::ThermalWindow) -> serde_json::Value {
+    serde_json::json!({
+        "worst_state": t.worst_state,
+        "above_nominal_ms": t.above_nominal_ms,
+        "min_cpu_speed_limit_pct": t.min_cpu_speed_limit_pct,
+        "level_ms": t.level_ms,
+        "level_entries": t.level_entries,
+    })
+}
+
 impl HostSamplerRing {
     pub(crate) fn new() -> Self {
         Self {
@@ -253,11 +272,12 @@ impl HostSamplerRing {
                     "cpu": mw_json(&p.cpu),
                     "gpu": mw_json(&p.gpu),
                 })),
-                "thermal": ex.thermal.as_ref().map(|t| serde_json::json!({
-                    "worst_state": t.worst_state,
-                    "above_nominal_ms": t.above_nominal_ms,
-                    "min_cpu_speed_limit_pct": t.min_cpu_speed_limit_pct,
-                })),
+                // (#2775) `level_ms`/`level_entries` ride the SAME reduction
+                // `above_nominal_ms` comes from, so the machine lens and the
+                // `machine.rollup` record cannot disagree about how long the
+                // machine spent hot or how often it got there. Additive on
+                // the wire — an existing consumer ignores two new keys.
+                "thermal": ex.thermal.as_ref().map(thermal_window_json),
                 "energy_mwh": ex.energy_mwh,
             },
         }))
@@ -369,19 +389,26 @@ fn thermal_edge(
     }
 }
 
-/// (#2705) Is a battery-HEALTH poll due?
+/// (#2705, #2775) Has `interval_ms` of MEASURED time elapsed since this
+/// thing last happened?
 ///
-/// Pure and integer-only ON PURPOSE: the cadence this gates is an hour
-/// long, and an assertion about an hourly cadence that consulted the wall
-/// clock would either take an hour to run or prove nothing. The caller
+/// Two callers on two different clocks — the hourly battery-HEALTH poll
+/// (#2705) and the `machine.rollup` heartbeat (#2775). Named for the RULE
+/// rather than for either caller, because it is one rule: a second copy
+/// would be one place for the zero-means-off convention below to be
+/// mis-implemented.
+///
+/// Pure and integer-only ON PURPOSE: one of the cadences it gates is an
+/// hour long, and an assertion about an hourly cadence that consulted the
+/// wall clock would either take an hour to run or prove nothing. The caller
 /// accumulates the MEASURED gap between sampler ticks and hands it here, so
 /// the tests drive a scripted clock.
 ///
-/// `interval_ms == 0` is "never poll" — the same zero-means-off convention
+/// `interval_ms == 0` is "never" — the same zero-means-off convention
 /// `runtime.host_sampler_interval_ms` and `redis.maxlen` use, never
-/// "poll continuously", which is what a naive `>=` would give it.
-fn health_poll_due(ms_since_last_poll: u64, interval_ms: u64) -> bool {
-    interval_ms != 0 && ms_since_last_poll >= interval_ms
+/// "continuously", which is what a naive `>=` would give it.
+fn interval_due(ms_since_last: u64, interval_ms: u64) -> bool {
+    interval_ms != 0 && ms_since_last >= interval_ms
 }
 
 /// (#2705) Build a `machine.battery_health` MACHINE-RECORD flow record.
@@ -574,6 +601,167 @@ fn battery_edge(
     (Some(*b), Some(rec))
 }
 
+// ── (#2775) The periodic machine-lens aggregate ────────────────────────
+//
+// ONE heartbeat carrying the whole machine picture — thermal, cpu/gpu/
+// memory, power, battery, residency — rather than a thermal feed a
+// subscriber then has to correlate against a separate battery feed and a
+// separate memory feed. See `darkmux_types::config::MachineRollupConfig`
+// for why this is a periodic RECORD and not a "timed hook", and for the
+// `enabled: false` / `period_seconds: 60` defaults.
+//
+// **Observer doctrine (CLAUDE.md "the observer must not join the
+// observed", #1286), point by point:**
+//
+// 1. ZERO model dispatches. The ring is already sampled (kernel counters,
+//    in-process); the residency block reads `lms` metadata and kernel
+//    counters through the same ledger `/machine/resources` serves. Nothing
+//    on this path asks a model anything.
+// 2. The DISPLAY renders off-machine — this emits JSON into the flow
+//    stream, and whoever charts it pays for the charting.
+// 3. The gatherer stamps its OWN cost (`gather_ms`, plus the ledger's own
+//    `residency.gather_ms` inside it), so "the observer was negligible"
+//    stays a verifiable claim in the artifact rather than an assumption.
+// 4. The cadence is a RECORDED knob: `period_seconds` (configured) and
+//    `emitted_interval_ms` (measured) both ride in the payload, so a
+//    tightened debug cadence is visible in the data instead of inferred
+//    from row spacing.
+
+/// The flow-record action for the periodic aggregate. `machine.*` hook
+/// matching already covers it, and dotted `payload.*` predicates already
+/// let a rule subscribe to one section — which is exactly why this feature
+/// needed no change to the hook layer at all.
+pub(crate) const MACHINE_ROLLUP_ACTION: &str = "machine.rollup";
+
+/// (#2775) The residency section — what is loaded and how much unified
+/// memory is left for AI, for a subscriber deciding whether to schedule
+/// work here.
+///
+/// Built from the SAME `darkmux_profiles::model_ledger` gather that backs
+/// `darkmux machine resources --json` and `GET /machine/resources`, so a
+/// consumer reading this record and an operator reading the lens are
+/// looking at one implementation's answer, not two.
+///
+/// Deliberately does NOT reuse the daemon's `/machine/resources` response
+/// cache. That cache is guarded by a tokio mutex and this is a plain std
+/// sampler thread with no runtime to await on; and a once-a-minute
+/// heartbeat wants a reading of its own moment rather than one it inherited
+/// from whenever a phone last polled. The cost is one gather per period and
+/// it is stamped into the payload.
+fn residency_json(ledger: &darkmux_profiles::model_ledger::ModelLedger) -> serde_json::Value {
+    let models: Vec<serde_json::Value> = ledger
+        .models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "identifier": m.identifier,
+                "model_key": m.model_key,
+                "owner": m.owner,
+                "loaded_ctx": m.loaded_ctx,
+                "potential_bytes": m.potential_bytes,
+                "current_bytes": m.current_bytes,
+                "state": m.state,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "models": models,
+        "limit_bytes": ledger.limit_bytes,
+        "pool": ledger.pool.as_ref().map(|p| serde_json::json!({
+            "capacity_bytes": p.capacity_bytes,
+            "used_bytes": p.used_bytes,
+            // The colloquial "how much is left for AI" — the ledger's own
+            // `available_bytes`, named here the way the lens names it
+            // rather than re-deriving a second figure that could drift.
+            "available_bytes": p.available_bytes,
+        })),
+        "attribution": ledger.attribution,
+        // The honesty channel (#1821): a degraded reading says so in the
+        // record rather than looking precise. Usually empty.
+        "messages": ledger.messages,
+        // The ledger's OWN observer cost, kept distinct from the rollup's
+        // total below so the expensive half is attributable.
+        "gather_ms": ledger.gather_ms,
+    })
+}
+
+/// (#2775) Build the periodic `machine.rollup` record.
+///
+/// Pure given its inputs (no probe, no clock, no config read) so the whole
+/// payload contract is unit-testable against a scripted snapshot — the same
+/// discipline `thermal_edge` / `battery_edge` follow.
+///
+/// `previous_thermal_state` is the last state the machine was in BEFORE the
+/// current one — the operator's explicit ask, so a subscriber that missed an
+/// edge-triggered `machine.thermal` can still reconstruct direction from a
+/// heartbeat alone. `None` before any transition has been observed (a daemon
+/// that started in this state and never left it), which is a different claim
+/// from "it came from nominal" and is reported as such rather than guessed.
+///
+/// Always `Level::Info`: this is a periodic READING, and darkmux describes
+/// rather than adjudicates. The edge-triggered `machine.thermal` /
+/// `machine.battery` records keep their `Warn` for the transitions that
+/// change what the machine will DO; a heartbeat that warned on its own
+/// would light the same lamp every minute for a condition already reported.
+#[allow(clippy::too_many_arguments)]
+fn build_machine_rollup_record(
+    load: serde_json::Value,
+    residency: Option<serde_json::Value>,
+    previous_thermal_state: Option<&str>,
+    period_seconds: u64,
+    emitted_interval_ms: u64,
+    gather_ms: u64,
+    sampled_at_ms: u64,
+) -> darkmux_flow::FlowRecord {
+    let mut payload = serde_json::json!({
+        // Constraint 4: the CONFIGURED cadence...
+        "period_seconds": period_seconds,
+        // ...and the MEASURED gap since the previous emission. The same
+        // rule `machine.telemetry` follows: a tick that ran late reports
+        // what actually happened rather than restating the knob.
+        "emitted_interval_ms": emitted_interval_ms,
+        // Constraint 3: this rollup's own total cost, ledger gather
+        // included (`residency.gather_ms` breaks out the expensive half).
+        "gather_ms": gather_ms,
+        "sampled_at_ms": sampled_at_ms,
+        "previous_thermal_state": previous_thermal_state,
+        "residency": residency,
+    });
+    // `load` is the machine lens's own `now`/`window`/`battery_health`
+    // object, spliced in at the top level rather than nested under a
+    // `load` key: the aggregate IS the machine picture, and a consumer
+    // writing a hook predicate should say `payload.window.thermal.…`, not
+    // `payload.load.window.thermal.…`.
+    if let (Some(obj), Some(load_obj)) = (payload.as_object_mut(), load.as_object()) {
+        for (k, v) in load_obj {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: darkmux_flow::Level::Info,
+        category: darkmux_flow::Category::Machinery,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: MACHINE_ROLLUP_ACTION.to_string(),
+        handle: display_name,
+        phase_id: None,
+        session_id: None,
+        source: Some("host-sampler".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
 /// Spawn the daemon-side host sampler thread. `interval_ms` is the
 /// resolved `config_access::host_sampler_interval_ms()` cadence; `0`
 /// disables the sampler entirely and this returns `None` without spawning
@@ -640,6 +828,28 @@ pub(crate) fn spawn(
         // for a value unchanged since the last thousand.
         let mut known_battery: Option<BatterySample> = None;
         let mut known_battery_health: Option<BatteryHealth> = None;
+        // (#2775) The state the machine was in BEFORE `known_thermal_state`
+        // — set only when a real transition fires, so it is the last
+        // DIFFERENT state rather than "whatever the previous tick read".
+        // `None` until the daemon has seen one transition, which the rollup
+        // reports as `null` rather than inventing a plausible predecessor.
+        let mut previous_thermal_state: Option<String> = None;
+        // (#2775) Accumulated MEASURED time since the last `machine.rollup`
+        // emission, seeded past any interval so the FIRST tick emits — a
+        // subscriber that just enabled the feature should not wait a full
+        // period to learn the machine exists. Same seeding rationale as the
+        // health poll above.
+        let mut ms_since_rollup: u64 = u64::MAX;
+        // The rollup's OWN previous-tick stamp. Deliberately separate from
+        // `prev_tick_at_ms`, which the health block above has already
+        // advanced to this tick by the time the rollup block runs — reusing
+        // it would accumulate a zero gap every time and the heartbeat would
+        // never come due after its first emission.
+        let mut prev_rollup_tick_at_ms: Option<u64> = None;
+        // Measured-gap bookkeeping for the rollup's own `emitted_interval_ms`
+        // — `None` before the first emission, which has no prior gap and
+        // stamps the configured period instead.
+        let mut last_rollup_at_ms: Option<u64> = None;
         // Accumulated MEASURED time since the last health poll, seeded past
         // the interval so the FIRST tick polls — the issue's "plus one read
         // at daemon start, so a short-lived daemon still contributes a
@@ -695,6 +905,13 @@ pub(crate) fn spawn(
             // (#2111) Edge-detect BEFORE the sample moves into the ring —
             // `thermal_edge` only borrows it.
             let (next_state, transition) = thermal_edge(known_thermal_state.as_deref(), &sample, at_ms);
+            // (#2775) A transition is the ONLY thing that moves
+            // `previous_thermal_state` — captured before `known_thermal_state`
+            // is overwritten, so the rollup's "state now / previous state"
+            // pair describes a real movement rather than the last tick.
+            if transition.is_some() {
+                previous_thermal_state = known_thermal_state.clone();
+            }
             known_thermal_state = next_state;
             if let Some(rec) = transition {
                 let _ = darkmux_flow::record(rec);
@@ -722,7 +939,7 @@ pub(crate) fn spawn(
                 None => ms_since_health_poll,
             };
             prev_tick_at_ms = Some(at_ms);
-            if health_poll_due(ms_since_health_poll, battery::HEALTH_POLL_INTERVAL_MS) {
+            if interval_due(ms_since_health_poll, battery::HEALTH_POLL_INTERVAL_MS) {
                 ms_since_health_poll = 0;
                 let (next_health, health_record) = battery_health_edge(
                     known_battery_health.as_ref(),
@@ -740,6 +957,60 @@ pub(crate) fn spawn(
                 }
                 if let Some(rec) = health_record {
                     let _ = darkmux_flow::record(rec);
+                }
+            }
+
+            // (#2775) The periodic machine-lens aggregate. Gated OFF by
+            // default; when on, it fires on its own MEASURED clock, the
+            // same rule the health poll above uses and for the same reason
+            // (a tick count would drift with the configured interval and
+            // lie across a host sleep).
+            //
+            // Both knobs are re-read every tick rather than captured at
+            // spawn, so `darkmux config set machine_rollup.enabled true`
+            // takes effect on the next tick instead of on the next daemon
+            // restart. That is two cheap config reads per `interval_ms` —
+            // `config()` is a process-cached `DarkmuxConfig` plus an env
+            // peek, not a file read — and it is what keeps the operator in
+            // the loop without a restart.
+            //
+            // The ring was pushed regardless (below); only the flow-record
+            // WRITE and the ledger gather are gated, per the observer-cost
+            // rule — this must not make the machine busier to watch than to
+            // use.
+            ms_since_rollup = match prev_rollup_tick_at_ms {
+                Some(prev) => ms_since_rollup.saturating_add(at_ms.saturating_sub(prev)),
+                None => ms_since_rollup,
+            };
+            prev_rollup_tick_at_ms = Some(at_ms);
+            if darkmux_types::config_access::machine_rollup_enabled() {
+                let period_seconds = darkmux_types::config_access::machine_rollup_period_seconds();
+                let period_ms = period_seconds.saturating_mul(1_000);
+                if interval_due(ms_since_rollup, period_ms) {
+                    ms_since_rollup = 0;
+                    let gather_start = Instant::now();
+                    // The ring already holds this tick's sample; `snapshot`
+                    // is a mutex lock plus arithmetic. `None` only before
+                    // the very first push, which cannot happen here (the
+                    // push below has run on every prior iteration) but is
+                    // handled rather than unwrapped.
+                    if let Some(load) = ring.snapshot() {
+                        let ledger = darkmux_profiles::model_ledger::gather();
+                        let residency = residency_json(&ledger);
+                        let emitted_interval_ms =
+                            machine_telemetry_effective_interval_ms(last_rollup_at_ms, at_ms, period_ms, 1);
+                        last_rollup_at_ms = Some(at_ms);
+                        let rec = build_machine_rollup_record(
+                            load,
+                            Some(residency),
+                            previous_thermal_state.as_deref(),
+                            period_seconds,
+                            emitted_interval_ms,
+                            gather_start.elapsed().as_millis() as u64,
+                            at_ms,
+                        );
+                        let _ = darkmux_flow::record(rec);
+                    }
                 }
             }
 
@@ -974,10 +1245,10 @@ mod tests {
         // that consulted the wall clock would either take an hour to run or
         // prove nothing.
         let hour = battery::HEALTH_POLL_INTERVAL_MS;
-        assert!(!health_poll_due(0, hour));
-        assert!(!health_poll_due(hour - 1, hour), "one millisecond short is not due");
-        assert!(health_poll_due(hour, hour), "exactly at the interval is due");
-        assert!(health_poll_due(hour * 3, hour), "a long gap (a host sleep) is still just due");
+        assert!(!interval_due(0, hour));
+        assert!(!interval_due(hour - 1, hour), "one millisecond short is not due");
+        assert!(interval_due(hour, hour), "exactly at the interval is due");
+        assert!(interval_due(hour * 3, hour), "a long gap (a host sleep) is still just due");
     }
 
     #[test]
@@ -985,8 +1256,8 @@ mod tests {
         // The zero-means-off convention `host_sampler_interval_ms` and
         // `redis.maxlen` already use — a naive `>=` would read it as
         // "always due", which is the opposite.
-        assert!(!health_poll_due(0, 0));
-        assert!(!health_poll_due(u64::MAX, 0));
+        assert!(!interval_due(0, 0));
+        assert!(!interval_due(u64::MAX, 0));
     }
 
     #[test]
@@ -996,7 +1267,7 @@ mod tests {
         // `u64::MAX` seed, pinned here so a later refactor to `0` (the
         // obvious-looking initial value) is caught.
         assert!(
-            health_poll_due(u64::MAX, battery::HEALTH_POLL_INTERVAL_MS),
+            interval_due(u64::MAX, battery::HEALTH_POLL_INTERVAL_MS),
             "the daemon's first tick must poll rather than wait an hour"
         );
     }
@@ -1271,7 +1542,7 @@ mod tests {
     /// resolves through process-global `DARKMUX_HOME`. Left un-isolated,
     /// this test contended for the FIXED machine-global fallback path
     /// (`dispatch_liveness::darkmux_home_dir_fallback` →
-    /// `/tmp/darkmux-test-isolated/liveness/host-sampler.lock`) — shared
+    /// `<test-isolated root>/liveness/host-sampler.lock`) — shared
     /// with every other test binary in the workspace running with
     /// `DARKMUX_HOME` unset — and, being non-serial, could also run
     /// alongside the serial tests below, whose isolated `DARKMUX_HOME` it
@@ -1838,5 +2109,157 @@ mod tests {
         assert_eq!(payload["cpu_speed_limit_pct"], 62);
         assert_eq!(payload["power_mw_total"], 1230);
         assert_eq!(payload["sampled_at_ms"], 5000);
+    }
+    // ─── (#2775) the periodic machine-lens aggregate ───────────────────
+
+    /// The payload is the MACHINE LENS's own vocabulary at the top level —
+    /// `now` / `window` / `battery_health` spliced in rather than nested
+    /// under a wrapper key. The operator's settled decision was one
+    /// heartbeat carrying the machine's state, and a hook predicate should
+    /// read `payload.window.thermal.…`, which is also what the lens calls
+    /// it. A wrapper key would give one fact two spellings.
+    #[test]
+    fn the_rollup_payload_carries_the_machine_lens_shape_at_the_top_level() {
+        let ring = HostSamplerRing::new();
+        ring.set_configured_interval_for_test(5_000);
+        ring.push_for_test(0, 10, 20, 30, 7);
+        ring.push_for_test(5_000, 50, 60, 70, 8);
+        let load = ring.snapshot().expect("two samples are in the ring");
+
+        let rec = build_machine_rollup_record(
+            load,
+            Some(serde_json::json!({ "models": [], "gather_ms": 3 })),
+            Some("fair"),
+            60,
+            60_000,
+            11,
+            5_000,
+        );
+        assert_eq!(rec.action, MACHINE_ROLLUP_ACTION);
+        assert_eq!(rec.source.as_deref(), Some("host-sampler"));
+        let p = rec.payload.expect("payload");
+        // The lens's own keys, not re-spelled and not wrapped.
+        assert!(p.get("now").is_some(), "the lens's `now` block rides at the top level");
+        assert_eq!(p["window"]["samples"], 2);
+        assert_eq!(p["window"]["cpu_pct"]["max"], 50);
+        assert!(p.get("battery_health").is_some(), "present (as null) rather than absent");
+        assert_eq!(p["residency"]["gather_ms"], 3);
+    }
+
+    /// Observer doctrine, checked as a payload contract rather than as an
+    /// intention (#1286 constraints 3 and 4): the emitter stamps its OWN
+    /// cost, and the cadence is recorded — both the CONFIGURED period and
+    /// the MEASURED gap, so a tightened debug cadence is visible in the
+    /// data instead of inferred from row spacing.
+    #[test]
+    fn the_rollup_stamps_its_own_cost_and_records_both_cadences() {
+        let rec = build_machine_rollup_record(
+            serde_json::json!({}),
+            None,
+            None,
+            60,
+            61_400,
+            42,
+            9_000,
+        );
+        let p = rec.payload.expect("payload");
+        assert_eq!(p["gather_ms"], 42, "the observer's own cost must be in the artifact");
+        assert_eq!(p["period_seconds"], 60, "the configured knob");
+        assert_eq!(
+            p["emitted_interval_ms"], 61_400,
+            "the MEASURED gap — a tick that ran late reports what happened"
+        );
+        assert_eq!(p["sampled_at_ms"], 9_000);
+    }
+
+    /// `previous_thermal_state` exists so a subscriber that missed an
+    /// edge-triggered `machine.thermal` can still reconstruct DIRECTION
+    /// from a heartbeat alone. Before any transition has been observed
+    /// there is no honest predecessor, and the record says `null` rather
+    /// than guessing `nominal`.
+    #[test]
+    fn previous_thermal_state_is_null_until_a_transition_has_been_seen() {
+        let rec = build_machine_rollup_record(serde_json::json!({}), None, None, 60, 60_000, 1, 0);
+        assert_eq!(rec.payload.unwrap()["previous_thermal_state"], serde_json::Value::Null);
+
+        let rec = build_machine_rollup_record(
+            serde_json::json!({}),
+            None,
+            Some("nominal"),
+            60,
+            60_000,
+            1,
+            0,
+        );
+        assert_eq!(rec.payload.unwrap()["previous_thermal_state"], "nominal");
+    }
+
+    /// A heartbeat is a READING, not a verdict. The edge-triggered
+    /// `machine.thermal` / `machine.battery` records keep their `Warn` for
+    /// the transitions that change what the machine will DO; a periodic
+    /// record that warned would light the same lamp every minute for a
+    /// condition already reported, which is the editorializing darkmux does
+    /// not do.
+    #[test]
+    fn the_rollup_is_always_info_even_when_the_machine_is_critical() {
+        let ring = HostSamplerRing::new();
+        ring.set_configured_interval_for_test(5_000);
+        ring.push(RingEntry {
+            at_ms: 0,
+            sample: HostSampleFull {
+                thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 40 }),
+                ..Default::default()
+            },
+        });
+        let load = ring.snapshot().expect("one sample");
+        let rec = build_machine_rollup_record(load, None, Some("serious"), 60, 60_000, 1, 0);
+        assert!(matches!(rec.level, darkmux_flow::Level::Info));
+    }
+
+    /// The emission clock is `interval_due`, and `0` there means OFF — this
+    /// codebase's zero convention (`runtime.host_sampler_interval_ms`,
+    /// `redis.maxlen`), never "emit continuously", which is exactly what a
+    /// naive `>=` would give a zero period.
+    #[test]
+    fn a_zero_period_never_comes_due() {
+        assert!(!interval_due(0, 0));
+        assert!(!interval_due(60_000, 0));
+        assert!(!interval_due(u64::MAX, 0), "an unbounded wait on a 0 period is still off");
+        // …and a real period behaves normally.
+        assert!(!interval_due(59_999, 60_000));
+        assert!(interval_due(60_000, 60_000));
+    }
+
+    /// `level_ms`/`level_entries` ride the SAME `/machine/resources` window
+    /// block the rollup carries, from one builder — so the machine lens and
+    /// a rollup subscriber cannot disagree about how long the machine spent
+    /// hot or how often it got there.
+    #[test]
+    fn the_window_thermal_block_is_one_shape_for_both_carriers() {
+        let ring = HostSamplerRing::new();
+        ring.set_configured_interval_for_test(5_000);
+        for (i, state) in ["nominal", "fair", "fair", "nominal"].iter().enumerate() {
+            ring.push(RingEntry {
+                at_ms: i as u64 * 5_000,
+                sample: HostSampleFull {
+                    thermal: Some(ThermalSample {
+                        state: (*state).into(),
+                        cpu_speed_limit_pct: 100,
+                    }),
+                    ..Default::default()
+                },
+            });
+        }
+        let load = ring.snapshot().expect("samples");
+        let from_lens = load["window"]["thermal"].clone();
+        assert_eq!(from_lens["level_entries"]["fair"], 1, "one arrival, not two samples");
+        assert_eq!(from_lens["level_ms"]["fair"], 10_000);
+
+        let rec = build_machine_rollup_record(load, None, None, 60, 60_000, 1, 0);
+        assert_eq!(
+            rec.payload.unwrap()["window"]["thermal"],
+            from_lens,
+            "the rollup must carry the lens's own block, not a second rendering of it"
+        );
     }
 }

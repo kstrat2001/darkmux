@@ -6957,6 +6957,92 @@ fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
 // `admit_manual_run_at`, `src/acp.rs`'s `idle_self_exit_loop_with`) so a
 // multi-hour sleep gap is directly unit-testable without sleeping the
 // real machine.
+// (#2765) The daemon's own listen-address resolution — see
+// `crate::resolve_listen_addr`'s doc for why the flags are `Option`s.
+mod serve_listen_addr {
+
+    /// The flag still wins outright — the CLI-beats-config convention every
+    /// other flag here follows. Adding a config tier must not take the
+    /// operator's explicit `--port` away from them.
+    #[serial_test::serial]
+    #[test]
+    fn an_explicit_port_flag_beats_the_config_tier() {
+        let k = "DARKMUX_SERVE_PORT";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "8799") };
+        let (port, _) = crate::resolve_listen_addr(Some(9000), None);
+        assert_eq!(port, 9000, "the flag the operator typed wins over every tier below it");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// …and with NO flag, the config tier is actually reachable. This is
+    /// the half that was structurally impossible before: `--port` carried a
+    /// clap `default_value`, so every invocation looked explicit and no
+    /// tier beneath it could ever be consulted. A restart that forgot the
+    /// flag therefore reverted to the built-in while the machine's proxy
+    /// still pointed at the operator's port, with nothing reporting an
+    /// error.
+    #[serial_test::serial]
+    #[test]
+    fn an_absent_port_flag_falls_through_to_the_configured_value() {
+        let kp = "DARKMUX_SERVE_PORT";
+        let kb = "DARKMUX_SERVE_BIND";
+        let prev_p = std::env::var(kp).ok();
+        let prev_b = std::env::var(kb).ok();
+        unsafe {
+            std::env::set_var(kp, "8799");
+            std::env::set_var(kb, "0.0.0.0");
+        }
+        let (port, bind) = crate::resolve_listen_addr(None, None);
+        assert_eq!(port, 8799);
+        assert_eq!(bind, "0.0.0.0");
+        // And the client-side locator resolves from the SAME place, which
+        // is the whole point — a wildcard bind is probed on loopback.
+        assert_eq!(darkmux_types::config_access::serve_client_addr(), "127.0.0.1:8799");
+        unsafe {
+            match prev_p {
+                Some(v) => std::env::set_var(kp, v),
+                None => std::env::remove_var(kp),
+            }
+            match prev_b {
+                Some(v) => std::env::set_var(kb, v),
+                None => std::env::remove_var(kb),
+            }
+        }
+    }
+
+    /// Nothing set anywhere still lands on the documented built-in, so a
+    /// fresh install behaves exactly as it did before this block existed.
+    #[serial_test::serial]
+    #[test]
+    fn no_flag_and_no_config_still_lands_on_the_documented_built_in() {
+        let kp = "DARKMUX_SERVE_PORT";
+        let kb = "DARKMUX_SERVE_BIND";
+        let prev_p = std::env::var(kp).ok();
+        let prev_b = std::env::var(kb).ok();
+        unsafe {
+            std::env::remove_var(kp);
+            std::env::remove_var(kb);
+        }
+        assert_eq!(crate::resolve_listen_addr(None, None), (8765, "127.0.0.1".to_string()));
+        unsafe {
+            match prev_p {
+                Some(v) => std::env::set_var(kp, v),
+                None => std::env::remove_var(kp),
+            }
+            match prev_b {
+                Some(v) => std::env::set_var(kb, v),
+                None => std::env::remove_var(kb),
+            }
+        }
+    }
+}
+
 mod fleet_cache_wall_clock {
     use super::*;
     use std::time::{Duration, SystemTime};
@@ -7021,5 +7107,4 @@ mod fleet_cache_wall_clock {
              silently UNDER-report how old the snapshot actually is, the same failure class \
              this audit exists to close"
         );
-    }
-}
+    }}

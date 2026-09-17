@@ -1091,6 +1091,26 @@ fn build_startup_banner(
 /// axum gets `SHUTDOWN_GRACE_SECS` to drain in-flight connections
 /// before the process force-exits — SSE streams to the viewer would
 /// otherwise keep the daemon alive forever.
+/// (#2765) Resolve the daemon's listen address from the `--port` / `--bind`
+/// flags, falling through to `env(DARKMUX_SERVE_*) > config.serve.* >
+/// built-in default` when a flag was not passed.
+///
+/// A separate function, taking `Option`s, for two reasons. First, the flag
+/// tier can only WIN over config if "not passed" is representable — which is
+/// why `--port` lost its clap `default_value`; with a default baked in every
+/// invocation looked explicit and the config tier was unreachable by
+/// construction, which is how the port came to live only in the launch
+/// command in the first place. Second, it makes the precedence red-provable
+/// without binding a socket: the whole point of #2765 is that the daemon and
+/// every client resolve the same way, and a rule living only inline in
+/// `main.rs`'s match arm cannot be asserted.
+pub fn resolve_listen_addr(port: Option<u16>, bind: Option<String>) -> (u16, String) {
+    (
+        port.unwrap_or_else(darkmux_types::config_access::serve_port),
+        bind.unwrap_or_else(darkmux_types::config_access::serve_bind),
+    )
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#1461) Capture the mtime of the binary we were launched from BEFORE
     // serving anything. It has to be read at startup, not lazily on the first

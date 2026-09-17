@@ -340,6 +340,38 @@ pub struct ThermalWindow {
     pub above_nominal_ms: u64,
     /// The lowest CPU speed cap seen. 100 means the kernel never capped.
     pub min_cpu_speed_limit_pct: u64,
+    /// (#2775) Wall-clock spent in EACH thermal level over the window,
+    /// keyed by the level's own name, measured with the same left-Riemann
+    /// duty and the same sleep-gap cap as `above_nominal_ms` above — which
+    /// is exactly the sum of every non-`nominal` entry here, so the two
+    /// cannot disagree.
+    ///
+    /// A `BTreeMap` rather than a fixed struct because the KERNEL owns this
+    /// vocabulary, not darkmux: [`thermal_severity`] already ranks an
+    /// unrecognized state above `critical` precisely so a future macOS
+    /// level cannot hide real pressure, and a fixed struct would drop that
+    /// level's time on the floor instead of reporting it under its own
+    /// name. Only levels actually OBSERVED appear — an absent key means
+    /// "never seen in this window", a different claim from `0` ("seen, and
+    /// no measured time attributed", which is what a level entered and left
+    /// between two samples gets).
+    pub level_ms: std::collections::BTreeMap<String, u64>,
+    /// (#2775) How many times each level was ENTERED during the window —
+    /// counting TRANSITIONS INTO the level, never samples observed in it.
+    ///
+    /// The distinction is the whole value of the number: at a 5 s cadence a
+    /// per-sample count would report one sustained hour in `fair` as 720
+    /// and two brief excursions as 2, which makes "how OFTEN did this
+    /// machine get hot" unanswerable from the same field that answers "how
+    /// LONG". `level_ms` answers duration; this answers frequency. Same
+    /// transitions-into definition #2774 settled on for thermal episodes.
+    ///
+    /// The window's FIRST observed level counts as an entry: from the
+    /// record's point of view the window opens with the machine arriving in
+    /// that state, and not counting it would make a window that opened hot
+    /// and stayed hot report zero entries into the level it spent all of its
+    /// time in.
+    pub level_entries: std::collections::BTreeMap<String, u64>,
 }
 
 /// One sample's power/thermal reading plus when it was taken. `at_ms` is on
@@ -491,10 +523,40 @@ pub fn reduce_host_extras(raw: &[HostExtraAt], configured_interval_ms: Option<u6
             .filter_map(|s| s.thermal.as_ref().map(|t| t.cpu_speed_limit_pct))
             .min()
             .unwrap_or(100);
+        // (#2775) Per-level residency: the same left-Riemann duty and the
+        // SAME capped gap `above_nominal_ms` above uses, just attributed to
+        // the level each pair's LEFT sample was in rather than collapsed
+        // into one above-nominal bucket. Summing every non-`nominal` key
+        // here reproduces `above_nominal_ms` exactly, by construction —
+        // they walk the same pairs with the same cap.
+        let mut level_ms: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for w in raw.windows(2) {
+            if let Some(t) = w[0].thermal.as_ref() {
+                *level_ms.entry(t.state.clone()).or_insert(0) += capped_gap(w[0].at_ms, w[1].at_ms);
+            }
+        }
+        // (#2775) Per-level ENTRY counts: transitions INTO a level, over the
+        // thermal-bearing samples in order. A sample whose thermal reading
+        // is absent is skipped rather than treated as a state change — an
+        // unreadable tick is not evidence the machine went anywhere, the
+        // same rule `darkmux-serve`'s `thermal_edge` applies to the live
+        // edge detector.
+        let mut level_entries: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        let mut prev_state: Option<&str> = None;
+        for t in raw.iter().filter_map(|s| s.thermal.as_ref()) {
+            if prev_state != Some(t.state.as_str()) {
+                *level_entries.entry(t.state.clone()).or_insert(0) += 1;
+            }
+            prev_state = Some(t.state.as_str());
+        }
         ThermalWindow {
             worst_state: worst,
             above_nominal_ms,
             min_cpu_speed_limit_pct,
+            level_ms,
+            level_entries,
         }
     });
 
@@ -981,6 +1043,134 @@ mod tests {
         assert_eq!(w.min_cpu_speed_limit_pct, 62);
         // Left-Riemann: the `serious` sample at 1000 holds until 2000.
         assert_eq!(w.above_nominal_ms, 1000);
+    }
+
+    // ─── (#2775) per-level residency + per-level entry counts ──────────
+
+    /// `level_ms` is a partition of the same duty `above_nominal_ms`
+    /// measures — every non-`nominal` entry sums to it exactly. They walk
+    /// the same pairs with the same cap, so a drift between them would
+    /// mean one of the two stopped describing the window it claims to.
+    #[test]
+    fn per_level_residency_partitions_the_same_duty_above_nominal_measures() {
+        let raw = vec![
+            at(0, None, t("nominal", 100)),
+            at(1_000, None, t("fair", 90)),
+            at(3_000, None, t("serious", 62)),
+            at(6_000, None, t("nominal", 100)),
+        ];
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
+        assert_eq!(w.level_ms.get("nominal"), Some(&1_000), "0→1000 held nominal");
+        assert_eq!(w.level_ms.get("fair"), Some(&2_000), "1000→3000 held fair");
+        assert_eq!(w.level_ms.get("serious"), Some(&3_000), "3000→6000 held serious");
+        let above: u64 = w.level_ms.iter().filter(|(k, _)| *k != "nominal").map(|(_, v)| *v).sum();
+        assert_eq!(
+            above, w.above_nominal_ms,
+            "the non-nominal levels must sum to above_nominal_ms, or the two \
+             fields describe different windows"
+        );
+    }
+
+    /// The whole reason entries are counted as TRANSITIONS: at a 5s cadence
+    /// a per-sample count reports one sustained stretch as however many
+    /// samples it happened to cover, which makes "how often did this
+    /// machine get hot" unanswerable from the field that answers "how
+    /// long".
+    #[test]
+    fn level_entries_count_transitions_into_a_level_not_samples_observed_in_it() {
+        // Ten consecutive `fair` samples — ONE arrival, not ten.
+        let raw: Vec<HostExtraAt> =
+            (0..10).map(|i| at(i * 5_000, None, t("fair", 90))).collect();
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
+        assert_eq!(
+            w.level_entries.get("fair"),
+            Some(&1),
+            "a sustained stretch is one entry; a per-sample count would say 10"
+        );
+        // …and the duration field still reports the full stretch, so the
+        // two answer their own questions independently.
+        assert_eq!(w.level_ms.get("fair"), Some(&45_000));
+    }
+
+    /// Two separate excursions into the same level count twice — this is
+    /// the discrimination the field exists for, and a naive
+    /// "count distinct levels" or "count samples" implementation gets one
+    /// of the two cases wrong.
+    #[test]
+    fn returning_to_a_level_counts_as_a_second_entry() {
+        let raw = vec![
+            at(0, None, t("nominal", 100)),
+            at(1_000, None, t("fair", 90)),
+            at(2_000, None, t("nominal", 100)),
+            at(3_000, None, t("fair", 90)),
+            at(4_000, None, t("nominal", 100)),
+        ];
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
+        assert_eq!(w.level_entries.get("fair"), Some(&2), "two distinct excursions");
+        assert_eq!(
+            w.level_entries.get("nominal"),
+            Some(&3),
+            "coming back down is an entry into nominal, counted the same way"
+        );
+    }
+
+    /// A window that opens hot and never leaves must report an entry into
+    /// the level it spent all its time in — otherwise a consumer reads
+    /// "0 entries" beside an hour of residency and concludes the machine
+    /// never got there.
+    #[test]
+    fn the_first_observed_level_counts_as_an_entry() {
+        let raw = vec![at(0, None, t("serious", 62)), at(5_000, None, t("serious", 62))];
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
+        assert_eq!(w.level_entries.get("serious"), Some(&1));
+        assert_eq!(w.level_ms.get("serious"), Some(&5_000));
+    }
+
+    /// A tick the probe could not read is not evidence the machine moved.
+    /// Treating an absent reading as a state change would manufacture two
+    /// spurious entries (out of the level and back into it) every time a
+    /// single probe hiccuped.
+    #[test]
+    fn an_unreadable_tick_does_not_manufacture_a_transition() {
+        let raw = vec![
+            at(0, None, t("fair", 90)),
+            at(1_000, None, None),
+            at(2_000, None, t("fair", 90)),
+        ];
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
+        assert_eq!(
+            w.level_entries.get("fair"),
+            Some(&1),
+            "one continuous stay through a gap in the readings, not two"
+        );
+    }
+
+    /// A level the kernel names but this build does not know still gets its
+    /// own residency and its own entry count. A fixed-field struct would
+    /// drop that time on the floor, which is the failure
+    /// `thermal_severity`'s unknown-outranks-critical rule already exists
+    /// to prevent one layer up.
+    #[test]
+    fn an_unrecognized_level_gets_its_own_residency_and_entries() {
+        let raw = vec![
+            at(0, None, t("unknown-9", 100)),
+            at(2_000, None, t("nominal", 100)),
+        ];
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
+        assert_eq!(w.level_ms.get("unknown-9"), Some(&2_000));
+        assert_eq!(w.level_entries.get("unknown-9"), Some(&1));
+    }
+
+    /// The sleep-gap cap applies to per-level residency for the same reason
+    /// it applies to `above_nominal_ms`: a pre-sleep `serious` reading must
+    /// not bill eight hours of heat against a machine that was asleep.
+    #[test]
+    fn per_level_residency_caps_a_sleep_gap() {
+        let eight_hours_ms = 8 * 60 * 60 * 1000;
+        let raw = vec![at(0, None, t("serious", 62)), at(eight_hours_ms, None, t("nominal", 100))];
+        let w = reduce_host_extras(&raw, Some(5_000)).thermal.expect("thermal measured");
+        assert_eq!(w.level_ms.get("serious"), Some(&15_000), "capped at 3x the cadence");
+        assert_eq!(w.level_ms.get("serious").copied(), Some(w.above_nominal_ms));
     }
 
     #[test]

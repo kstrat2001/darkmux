@@ -1500,7 +1500,11 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // NB the old "isn't a TTY" spelling of that second case stopped being
     // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
     // resolve — bounded by the daemon's own panel cache.
-    let link_base = darkmux_doctor::viewer_link_base(8765);
+    // (#2765) The RESOLVED daemon port, not the built-in literal — a
+    // clickable viewer link built against a port nothing is listening on is
+    // the same silent asymmetry the issue was filed about, and a dead link
+    // reads as working right up until it is clicked.
+    let link_base = darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_port());
     let all_link = panel_deep_link(&link_base, "mission-status-all");
     // The link is one affordance for the whole board, not one per section:
     // it goes to the same place from every group, and Active + Paused +

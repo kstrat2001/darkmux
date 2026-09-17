@@ -407,12 +407,15 @@ pub(crate) enum Cmd {
     },
     /// Start an HTTP daemon for flow record retrieval.
     Serve {
-        /// Port to listen on (default: 8765).
-        #[arg(long, default_value = "8765")]
-        port: u16,
-        /// Address to bind (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
+        /// Port to listen on. Unset resolves `env(DARKMUX_SERVE_PORT) >
+        /// config.serve.port > 8765` (#2765); `darkmux doctor` prints the
+        /// resolved value with its provenance.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Address to bind. Unset resolves `env(DARKMUX_SERVE_BIND) >
+        /// config.serve.bind > 127.0.0.1` (#2765).
+        #[arg(long)]
+        bind: Option<String>,
         /// Directory to serve flow records from (default: ~/.darkmux/flows/).
         #[arg(long = "flows-dir")]
         flows_dir: Option<std::path::PathBuf>,

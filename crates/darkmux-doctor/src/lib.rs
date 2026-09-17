@@ -145,6 +145,11 @@ pub fn run() -> DoctorReport {
         check_models_loaded(),
         check_profile_loaded_match(),
         check_darkmux_version_vs_latest_release(),
+        // (#2765) The CONFIGURED address, before the reachability probe that
+        // uses it — so a reader sees where darkmux is looking, then whether
+        // anything answered there. The pair is what makes a port mismatch
+        // readable in one command instead of by probing ports by hand.
+        check_serve_address(),
         check_daemon_reachable(),
         // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
         check_daemon_freshness(),
@@ -171,6 +176,9 @@ pub fn run() -> DoctorReport {
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
+        // (#2775) Immediately after the sampler cadence it depends on — the
+        // one combination worth reporting is "rollup on, sampler off".
+        check_machine_rollup(),
         check_host_sampler(),
         check_liveness_retention(),
         check_generation_checkpoint_interval(),
@@ -2830,6 +2838,97 @@ fn check_host_sampler_interval() -> Check {
     }
 }
 
+/// (#2775) The periodic `machine.rollup` heartbeat — the machine-lens
+/// aggregate (thermal, cpu/gpu/memory, power, battery, residency) emitted
+/// into the flow stream so darkmux is usable as a machine-observability
+/// module by a harness that never opens the viewer.
+///
+/// The row exists mainly for ONE state that is otherwise invisible:
+/// `machine_rollup.enabled: true` while `runtime.host_sampler_interval_ms`
+/// is `0`. The emitter rides the daemon's sampler thread, and a `0` there
+/// means that thread is never spawned — so the feature reads as ON in the
+/// config and emits nothing, forever, with no error anywhere. An operator
+/// discovering that by the absence of records is the same "healthy and
+/// silent" failure shape #2765 was filed about, and the fix is the same:
+/// say so in one line rather than leave it to be inferred.
+///
+/// Warn, not Fail: nothing is broken, and darkmux does not adjudicate the
+/// operator's intent. It reports the combination and names both knobs.
+fn check_machine_rollup() -> Check {
+    use darkmux_types::config_access::Source;
+    let name = "machine_rollup";
+    let (enabled, enabled_src) = darkmux_types::config_access::machine_rollup_enabled_with_source();
+    let (period, period_src) =
+        darkmux_types::config_access::machine_rollup_period_seconds_with_source();
+    let label = |s: Source| match s {
+        Source::Env => "env",
+        Source::Config => "config.json",
+        Source::BuiltIn => "default",
+    };
+    if !enabled {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "off ({}) — no periodic machine.rollup records. Enable with \
+                 `darkmux config set machine_rollup.enabled true`",
+                label(enabled_src)
+            ),
+            hint: None,
+        };
+    }
+    let sampler_ms = darkmux_types::config_access::host_sampler_interval_ms();
+    if sampler_ms == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "on ({}), period {period}s ({}) — but runtime.host_sampler_interval_ms is 0, \
+                 which disables the daemon sampler thread the emitter runs on, so no \
+                 machine.rollup record is ever written",
+                label(enabled_src),
+                label(period_src)
+            ),
+            hint: Some(
+                "set a non-zero cadence (`darkmux config set \
+                 runtime.host_sampler_interval_ms 5000`), or turn the rollup off \
+                 (`darkmux config set machine_rollup.enabled false`) so the config says \
+                 what is actually happening."
+                    .into(),
+            ),
+        };
+    }
+    if period == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "on ({}), but period_seconds is 0 ({}) — 0 means OFF here (the same \
+                 convention as runtime.host_sampler_interval_ms / redis.maxlen), so no \
+                 record is ever emitted",
+                label(enabled_src),
+                label(period_src)
+            ),
+            hint: Some(
+                "set a real period (`darkmux config set machine_rollup.period_seconds 60`), \
+                 or turn the block off so the two fields agree."
+                    .into(),
+            ),
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "on ({}) · every {period}s ({}) — machine.rollup carries the machine-lens \
+             aggregate into the flow stream",
+            label(enabled_src),
+            label(period_src)
+        ),
+        hint: None,
+    }
+}
+
 /// (#2413) Surface the singleton host-sampler lock's state —
 /// `<darkmux-home>/liveness/host-sampler.lock` — the coordination file that
 /// keeps exactly one machine.telemetry emitter alive per machine (the
@@ -4286,11 +4385,70 @@ pub fn viewer_link_base(port: u16) -> String {
     }
 }
 
+/// (#2765) Where the RESOLVED daemon address came from, rendered for the
+/// `serve address` row: `env` names the variable, `config.json` names the
+/// key, and the built-in tier says so plainly.
+///
+/// Both halves are resolved independently because they are independent
+/// knobs — an operator with `DARKMUX_SERVE_PORT` exported and `serve.bind`
+/// in their config has two different provenances at once, and a single
+/// blended label would have to lie about one of them.
+fn serve_address_provenance() -> String {
+    use darkmux_types::config_access::Source;
+    let port_src = match darkmux_types::config_access::serve_port_with_source().1 {
+        Source::Env => "port from DARKMUX_SERVE_PORT env",
+        Source::Config => "port from config.serve.port",
+        Source::BuiltIn => "port default",
+    };
+    let bind_src = match darkmux_types::config_access::serve_bind_with_source().1 {
+        Source::Env => "bind from DARKMUX_SERVE_BIND env",
+        Source::Config => "bind from config.serve.bind",
+        Source::BuiltIn => "bind default",
+    };
+    format!("{port_src}, {bind_src}")
+}
+
+/// (#2765) The resolved daemon listen address, with the tier each half came
+/// from. A pure config read — it never touches the network, so it answers
+/// even when the daemon is down, which is exactly when the question gets
+/// asked.
+///
+/// This row exists because the failure it describes is INVISIBLE from the
+/// host: on 2026-09-16 a daemon was serving happily on the operator's
+/// configured port while every client probed the built-in 8765, and
+/// diagnosing it cost several minutes of probing ports by hand. One line
+/// naming the resolved address and where it came from answers it outright.
+/// Separate from `DAEMON_CHECK_NAME` (reachability) on purpose: "what
+/// address is configured" and "is anything answering there" are different
+/// questions, and collapsing them is what made the first one unanswerable
+/// while the second was failing.
+fn check_serve_address() -> Check {
+    Check {
+        name: "serve address".into(),
+        status: Status::Pass,
+        message: format!(
+            "{} ({})",
+            darkmux_types::config_access::serve_client_addr(),
+            serve_address_provenance()
+        ),
+        hint: None,
+    }
+}
+
 fn check_daemon_reachable() -> Check {
-    // Check if the darkmux daemon is reachable at 127.0.0.1:8765/health.
-    // Pass when reachable, Warn otherwise (daemon being off doesn't break
-    // end-to-end; it just disables live viewing).
-    check_daemon_reachable_impl("127.0.0.1", 8765)
+    // (#2765) Probe the RESOLVED address, not a hardcoded literal. Probing
+    // 127.0.0.1:8765 while the daemon listens on the operator's configured
+    // port is the exact asymmetry the issue was filed about — doctor would
+    // have reported "daemon not reachable" about a perfectly healthy
+    // daemon, which is worse than not checking.
+    //
+    // `serve_client_addr` resolves a wildcard bind to loopback for us, so a
+    // daemon bound to every interface is probed somewhere it is actually
+    // listening rather than at the unroutable `0.0.0.0`.
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let port = darkmux_types::config_access::serve_port();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+    check_daemon_reachable_impl(host, port)
 }
 
 /// (#1665) Whether a raw HTTP response's body parses as JSON carrying a
@@ -4372,15 +4530,28 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     let addr = format!("{}:{}", host, port);
 
     // Use a short timeout since this is local loopback.
+    //
+    // (#2765) A literal IP parses directly; a NAME (`localhost`, a
+    // `.tailnet.ts.net` host) needs resolution. Before the bind address
+    // became configurable every caller passed `127.0.0.1`, so the parse
+    // could not fail; now an operator may legitimately write
+    // `serve.bind: "localhost"`, and reporting their own config back as
+    // "invalid address" would be a false Warn about a working daemon.
     let addr_parsed = match addr.parse() {
         Ok(a) => a,
         Err(_) => {
-            return Check {
-                name: DAEMON_CHECK_NAME.into(),
-                status: Status::Warn,
-                message: format!("invalid address {}", addr),
-                hint: None,
-            };
+            use std::net::ToSocketAddrs;
+            match addr.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+                Some(a) => a,
+                None => {
+                    return Check {
+                        name: DAEMON_CHECK_NAME.into(),
+                        status: Status::Warn,
+                        message: format!("invalid address {}", addr),
+                        hint: None,
+                    };
+                }
+            }
         }
     };
 
@@ -4476,11 +4647,14 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
                  darkmux's — no `darkmux_version` field. Possibly another process holding \
                  this port."
             ),
-            hint: Some(
+            // (#2765) Name the port that was ACTUALLY probed. A hint telling
+            // the operator to `lsof -i :8765` when the probe went to the port
+            // their config names sends them to look at the wrong port —
+            // the same mismatch this issue is about, one layer down.
+            hint: Some(format!(
                 "run `darkmux serve` on a free port, or check what's already listening on \
-                 8765 (`lsof -i :8765`)"
-                    .into(),
-            ),
+                 {port} (`lsof -i :{port}`)"
+            )),
         }
     } else {
         // Port is open but not darkmux (or wrong endpoint).
@@ -4492,10 +4666,9 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
                 "daemon not responding correctly at {}: {}",
                 addr, first_line
             ),
-            hint: Some(
-                "ensure `darkmux serve` is running (port 8765 may be held by another process)"
-                    .into(),
-            ),
+            hint: Some(format!(
+                "ensure `darkmux serve` is running (port {port} may be held by another process)"
+            )),
         }
     }
 }
@@ -4682,10 +4855,15 @@ fn fmt_age(secs: u64) -> String {
 }
 
 fn check_daemon_freshness() -> Check {
-    // Same locator the reachability check uses (127.0.0.1:8765) — there is no
-    // port resolver in the codebase to reuse; the daemon's port is a `serve`
-    // flag with this default, and both checks hardcode it identically.
-    let running = loopback_http_body("127.0.0.1", 8765, "/health")
+    // (#2765) Same locator the reachability check uses — and it is now a
+    // RESOLVER, not a literal. The comment this replaces said "there is no
+    // port resolver in the codebase to reuse; both checks hardcode it
+    // identically", which was true and was the bug: identical hardcoding
+    // across every client is exactly how a daemon on a configured port
+    // became invisible to all of them at once.
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
+    let running = loopback_http_body(&host, darkmux_types::config_access::serve_port(), "/health")
         .as_deref()
         .and_then(parse_daemon_build);
     classify_daemon_freshness(
@@ -5311,6 +5489,20 @@ fn summarize_temp_residue(dir: &std::path::Path) -> TempResidue {
 ///   NAMESPACE rather than on a source pattern, so it sees a directory
 ///   nobody has taught it about — which is the property a text scan for
 ///   "creates a temp dir and abandons it" could not have.
+///
+/// # (#2777) `darkmux-test-isolated` needs no special handling here
+///
+/// Worth stating so nobody "fixes" it later. #2777 moved the test-build
+/// scratch fallback from a fixed `/tmp/darkmux-test-isolated` to
+/// `<temp>/darkmux-test-isolated/<pid>` — under the root this check
+/// already scans, and with the per-process split one level DOWN. Since
+/// [`summarize_temp_residue`] counts only the entries DIRECTLY under the
+/// temp root, that whole tree reads as exactly one directory in one family
+/// no matter how many test processes have run: the operator sees that the
+/// tree exists, and the count does not inflate with it. Making this recurse
+/// so each `<pid>` counted separately would turn one honest row into a
+/// noisy one and would start reporting on live processes' working state as
+/// though it were abandoned.
 fn check_temp_residue() -> Check {
     let tmp = std::env::temp_dir();
     let residue = summarize_temp_residue(&tmp);
@@ -8789,6 +8981,178 @@ mod tests {
         );
     }
 
+    // ─── (#2765) check_serve_address / the resolved daemon locator ────────
+
+    /// The row exists because the failure is INVISIBLE from the host: a
+    /// daemon serving happily on a configured port while every client
+    /// probes the built-in one. It must name the RESOLVED address and where
+    /// each half came from, and — being a pure config read — must answer
+    /// even with no daemon running, which is exactly when it is asked.
+    #[serial_test::serial]
+    #[test]
+    fn check_serve_address_names_the_resolved_address_and_its_provenance() {
+        let prev = std::env::var("DARKMUX_SERVE_PORT").ok();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_PORT") };
+        let check = check_serve_address();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("127.0.0.1:8765"), "{}", check.message);
+        assert!(check.message.contains("port default"), "{}", check.message);
+
+        unsafe { std::env::set_var("DARKMUX_SERVE_PORT", "8799") };
+        let check = check_serve_address();
+        assert!(
+            check.message.contains("127.0.0.1:8799"),
+            "must report the RESOLVED port, not the built-in: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("DARKMUX_SERVE_PORT"),
+            "must name the tier that won, so the operator never wonders \
+             where the value came from: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+                None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+        }
+    }
+
+    /// The reachability probe must follow the SAME resolution. Probing
+    /// 127.0.0.1:8765 while the daemon listens elsewhere would report
+    /// "not reachable" about a healthy daemon — worse than not checking.
+    /// Proved against a real listener on an ephemeral port, so the
+    /// assertion is about the probe's destination and not about a string.
+    #[serial_test::serial]
+    #[test]
+    fn check_daemon_reachable_probes_the_configured_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let prev = std::env::var("DARKMUX_SERVE_PORT").ok();
+        unsafe { std::env::set_var("DARKMUX_SERVE_PORT", port.to_string()) };
+
+        let check = check_daemon_reachable();
+        // Nothing speaks HTTP on that listener, so the verdict is a Warn —
+        // but the ADDRESS in the message is the point: it proves the probe
+        // went where the config said, not to the built-in literal.
+        assert!(
+            check.message.contains(&format!("127.0.0.1:{port}")),
+            "the probe must target the resolved address: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("127.0.0.1:8765"),
+            "the built-in literal must not appear when the config names \
+             another port: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+                None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+        }
+    }
+
+    // ─── (#2775) check_machine_rollup ─────────────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_reports_off_by_default() {
+        let prev = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        unsafe { std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED") };
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.starts_with("off"), "{}", check.message);
+        assert!(
+            check.message.contains("machine_rollup.enabled"),
+            "an off feature should say how to turn it on: {}",
+            check.message
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+        }
+    }
+
+    /// The one state worth a row: enabled, and silent forever, because the
+    /// sampler thread the emitter rides is disabled. Discovering that by
+    /// the absence of records is the same "healthy and silent" shape #2765
+    /// was filed about.
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_warns_when_enabled_but_the_sampler_is_off() {
+        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "true");
+            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0");
+        }
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("runtime.host_sampler_interval_ms"),
+            "must name the OTHER knob, or the operator cannot act on it: {}",
+            check.message
+        );
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+            match prev_sampler {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    /// `period_seconds: 0` means OFF here, so "enabled with a 0 period" is
+    /// a config that contradicts itself — reported, not silently coerced to
+    /// the default, because coercing would make the file say something it
+    /// does not mean.
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_warns_when_enabled_with_a_zero_period() {
+        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        let prev_period = std::env::var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS").ok();
+        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "1");
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "0");
+            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5000");
+        }
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("period_seconds is 0"), "{}", check.message);
+
+        // …and a healthy combination passes, naming both resolved values.
+        unsafe { std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "60") };
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("every 60s"), "{}", check.message);
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+            match prev_period {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
+            }
+            match prev_sampler {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
     // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
 
     #[serial_test::serial]
@@ -10984,9 +11348,21 @@ mod tests {
         // the `let checks = vec![...]` block returns 58, plus the one
         // `check_hooks()` always contributes.
         //
+        // (#2765/#2775) 61, not 59: `check_serve_address` and
+        // `check_machine_rollup` joined the static array. Re-derived, not
+        // incremented on faith — and the re-derivation caught that the
+        // grep recipe the note above prescribes UNDERCOUNTS BY ONE: it
+        // anchors on `^        check_`, which misses
+        // `checks_power::check_power_posture()` (module-qualified, so the
+        // line starts with `checks_power::`). The honest count of entries
+        // in the `vec![...]` block is 60, plus the one `check_hooks()`
+        // always contributes = 61. Use
+        // `grep -cE '^        (checks_[a-z_]+::)?check_'` instead, or just
+        // count the non-comment lines in the block.
+        //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 59 + darkmux_eureka::all_rules().len();
+        let expected = 61 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

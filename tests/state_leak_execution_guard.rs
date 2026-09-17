@@ -318,7 +318,7 @@ fn enumerate_units() -> Vec<Unit> {
 /// suite and wants its own measurement.
 ///
 /// Measured with `DARKMUX_HOME` UNSET — the ordinary developer machine —
-/// the test-build default sends it to `/tmp/darkmux-test-isolated`
+/// the test-build default sends it to the per-pid test-isolated root
 /// instead, so the operator's real tree is untouched. The exposure is an
 /// operator who exports `DARKMUX_HOME`, and the artifact is a prunable
 /// heartbeat file rather than a chained record.

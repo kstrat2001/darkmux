@@ -81,6 +81,102 @@ impl DarkmuxPaths {
     }
 }
 
+/// (#2777) The scratch-dir prefix every test-build fallback root sits
+/// under. Kept as its own constant because `darkmux-doctor`'s temp-residue
+/// check reports on it by family name (`temp_residue_family` strips the
+/// trailing pid segment back to exactly this string), and a rename here
+/// with a stale literal there would silently stop reporting.
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_ISOLATED_DIR_NAME: &str = "darkmux-test-isolated";
+
+/// (#2777) The scratch root a test / `test-support` build falls back to when
+/// `DARKMUX_HOME` is unset and nothing else isolated the process:
+/// `<system temp>/darkmux-test-isolated-<pid>`.
+///
+/// # What this guarantees, and what it does not
+///
+/// **It guarantees:** a test that forgot to isolate itself never resolves
+/// onto the operator's real `~/.darkmux`. That is #2653's guarantee and it
+/// is preserved here EXACTLY — this is still, unconditionally, not a home
+/// directory. #2653 was a good fix for a genuinely worse problem:
+/// `dispatch_liveness`'s prune pass DELETES files, so an un-isolated test
+/// did not merely leave a stray file behind, it destroyed real operator
+/// history (proved 2026-09-11 — one unrelated unit test deleted three
+/// seeded heartbeat files outright).
+///
+/// **It did NOT guarantee, before this change:** isolation of test
+/// PROCESSES from each other. The old fallback was a single FIXED,
+/// machine-global path, so every un-isolated test process on the machine
+/// shared one directory — and the name `darkmux-test-isolated` invited
+/// reading it as though it did more than it does. Measured on one laptop:
+/// 260 liveness entries and 1.9 MB of residue, across TEN separate shared
+/// subtrees (liveness, acks, audit, hooks, flows, findings, mods, runs,
+/// runtime, cache) declared independently in four crates. A forgotten
+/// `DARKMUX_HOME` shared not just heartbeats but flow records, findings,
+/// mods, run artifacts and the audit chain with every concurrent test
+/// process.
+///
+/// The `-<pid>` suffix closes that everywhere at once, because all ten of
+/// those sites now resolve through this ONE function instead of repeating
+/// the literal — and because the helper it delegates to also SWEEPS, the
+/// 1.9 MB drains rather than being re-spread one directory per process.
+///
+/// # Why a per-pid split is safe here
+///
+/// Checked rather than assumed: nothing depends on a parent process and a
+/// spawned child both FALLING THROUGH to the same shared path. Every
+/// binary-spawning integration test pins `DARKMUX_HOME` explicitly
+/// (`tests/e2e/harness.rs`, plus `lab_concurrent_register_no_lost_writes`,
+/// `state_leak_execution_guard`, `state_files_owner_only_mode`,
+/// `fleet_concurrent_add_no_lost_writes`), and an explicit `DARKMUX_HOME`
+/// wins over this fallback in every accessor, parent and child alike. And
+/// `test-support` is a `[dev-dependencies]`-only feature, so a SHIPPED
+/// binary never resolves this at all.
+///
+/// # Why this delegates to [`crate::test_isolation::process_scratch_dir`]
+///
+/// Because that is already the repo's answer to "a throwaway directory
+/// owned by this process", and it answers two things a hand-rolled
+/// `temp_dir().join(…).join(pid)` does not:
+///
+/// * **It collects itself.** `atexit(3)` removes it on a normal exit, and
+///   the creation path sweeps siblings whose owning process is gone — so a
+///   hard kill (`.config/nextest.toml`'s `terminate-after`, which CLAUDE.md
+///   records firing twice) bounds the population instead of growing it.
+///   Without that, splitting one shared directory into one-per-pid would
+///   have traded a shared tree for an unbounded pile of private ones, which
+///   is not obviously the better failure.
+/// * **It starts empty**, removing any tree a recycled pid inherited, so a
+///   test never reads a dead process's leftovers as its own state.
+///
+/// The name it produces is `<system temp>/darkmux-test-isolated-<pid>`.
+/// `std::env::temp_dir()` rather than a literal `/tmp` matters for two
+/// reasons of its own: `/tmp` is world-writable and shared between
+/// accounts, so a `darkmux-test-isolated` owned by another user is a
+/// permission failure nothing here can recover from, while `temp_dir()` is
+/// the per-user location the platform nominates (and honors `TMPDIR`); and
+/// it is the same root `darkmux doctor`'s temp-residue check scans, so the
+/// directory is VISIBLE to the operator's housekeeping rather than sitting
+/// where that check never looks.
+///
+/// **`darkmux doctor` needs no change for the new shape**, which is worth
+/// stating because it was an open question on the issue: `temp_residue_family`
+/// already strips a trailing all-digits segment, so
+/// `darkmux-test-isolated-41213` reports under the family
+/// `darkmux-test-isolated` — the exact string that check's own unit test
+/// already pins.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_isolated_root() -> PathBuf {
+    crate::test_isolation::process_scratch_dir(TEST_ISOLATED_DIR_NAME)
+}
+
+/// (#2777) [`test_isolated_root`] with one named subdirectory — the form
+/// every call site actually wants (`…/flows`, `…/acks`, `…/audit`).
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_isolated_dir(name: &str) -> PathBuf {
+    test_isolated_root().join(name)
+}
+
 pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {
     // (#661) DARKMUX_HOME is the bootstrap pointer — it overrides the darkmux
     // root directory entirely (a relocated install, or test isolation), and
@@ -423,5 +519,104 @@ mod tests {
         ensure(&paths).unwrap();
         ensure(&paths).unwrap(); // second call is a no-op
         assert!(paths.runs.exists());
+    }
+    // ── (#2777) the test-build scratch root ──
+
+    /// The guarantee #2653 bought and #2777 had to preserve exactly: this
+    /// is never the operator's real `~/.darkmux`. An un-isolated test that
+    /// touches a liveness call site PRUNES files, so a regression here does
+    /// not leave a stray file behind, it deletes real operator history.
+    #[test]
+    fn the_scratch_root_is_never_the_operators_real_darkmux_home() {
+        let root = test_isolated_root();
+        let real = dirs::home_dir().map(|h| h.join(".darkmux"));
+        assert_ne!(Some(root.clone()), real);
+        if let Some(home) = dirs::home_dir() {
+            assert!(
+                !root.starts_with(&home) || root.starts_with(std::env::temp_dir()),
+                "the scratch root must live in the system temp root, not under HOME: {}",
+                root.display()
+            );
+        }
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "{} is not under the system temp root",
+            root.display()
+        );
+    }
+
+    /// The property #2653 did NOT have and the name implied: separation
+    /// between test PROCESSES. The old fallback was one fixed
+    /// machine-global path, so every un-isolated process shared flow
+    /// records, findings, mods, run artifacts, the audit chain and dispatch
+    /// acks with every other one.
+    #[test]
+    fn the_scratch_root_is_scoped_to_this_process() {
+        let root = test_isolated_root();
+        assert_eq!(
+            root.file_name().and_then(|s| s.to_str()),
+            Some(format!("{TEST_ISOLATED_DIR_NAME}-{}", std::process::id()).as_str()),
+            "the name must carry this process's pid, or two concurrent test \
+             processes share one tree again"
+        );
+        assert_eq!(
+            root.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "it sits directly in the temp root darkmux doctor's residue check \
+             scans, so the tree is visible to the operator's housekeeping"
+        );
+    }
+
+    /// The residue question the issue left open, answered as an assertion
+    /// rather than as prose: `darkmux doctor`'s residue check groups by
+    /// FAMILY, and its family derivation strips a trailing all-digits
+    /// segment — so every per-pid root reports under the one family name
+    /// that check's own unit test already pins. No doctor change is needed
+    /// for the new shape, and this fails if either side drifts.
+    #[test]
+    fn every_per_pid_root_reports_under_the_one_family_name_doctor_knows() {
+        let name = test_isolated_root()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("a utf-8 directory name")
+            .to_string();
+        // The same derivation `darkmux_doctor::temp_residue_family` applies:
+        // split on `-`, drop all-digit segments, rejoin.
+        let family: Vec<&str> = name
+            .split('-')
+            .filter(|seg| !seg.is_empty() && !seg.bytes().all(|b| b.is_ascii_digit()))
+            .collect();
+        // The LITERAL, not `TEST_ISOLATED_DIR_NAME` — comparing against the
+        // constant the name was built from would be tautological in exactly
+        // the thing being pinned. This string is the one
+        // `darkmux-doctor`'s own `temp_residue_family` unit test asserts, so
+        // this is a genuine cross-file pin: renaming the prefix here without
+        // teaching doctor's check about it turns this red.
+        assert_eq!(family.join("-"), "darkmux-test-isolated");
+        // And the namespace prefix the check filters on before it ever
+        // derives a family — an entry not starting `darkmux-`/`dmx-` is
+        // skipped outright, so a rename out of the namespace would make the
+        // whole tree invisible to the residue report rather than mis-grouped.
+        assert!(name.starts_with("darkmux-"), "{name} must be in the darkmux namespace");
+    }
+
+    /// Every subtree that used to declare the literal independently now
+    /// derives from ONE root — which is what makes "fix it once, not ten
+    /// times" true rather than aspirational.
+    #[test]
+    fn every_named_subtree_hangs_off_the_one_root() {
+        let root = test_isolated_root();
+        for name in ["hooks", "flows", "findings", "mods", "runs", "runtime", "cache", "acks", "audit"] {
+            let d = test_isolated_dir(name);
+            assert_eq!(d.parent(), Some(root.as_path()), "{name} must hang off the shared root");
+            assert_eq!(d.file_name().and_then(|s| s.to_str()), Some(name));
+        }
+    }
+
+    /// Stable within a process: two calls in the same run must agree, or a
+    /// writer and a reader inside one test would land in different trees.
+    #[test]
+    fn the_scratch_root_is_stable_within_one_process() {
+        assert_eq!(test_isolated_root(), test_isolated_root());
     }
 }
