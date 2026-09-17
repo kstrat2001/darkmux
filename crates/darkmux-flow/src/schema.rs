@@ -89,11 +89,25 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.51.0";
 //           The payload is the machine lens's own vocabulary, spliced at
 //           the top level (`now`, `window`, `battery_health` — exactly what
 //           `/machine/resources`' `load` block carries, from the same
-//           builder) plus `residency` (loaded models with owner /
-//           loaded_ctx / potential / current / state, the pool's
-//           capacity/used/available bytes, the attribution and its
-//           messages, and the ledger's own `gather_ms`), plus four
-//           self-describing fields: `period_seconds` (the CONFIGURED
+//           builder) plus `residency` — the WHOLE `ModelLedger`, run
+//           through `serde_json::to_value`, structurally identical to the
+//           object `/machine/resources` serves under that same key.
+//
+//           `residency`'s own fields are DELIBERATELY not enumerated here
+//           (#2782 C7). An earlier revision of this entry listed seven of
+//           them; the emitter hand-picked the same seven; and both were
+//           already missing the `pressure` block (`swap_used_bytes`,
+//           `compressor_bytes`, `margin_percent`, `red` — the figure a
+//           subscriber deciding whether to schedule work on this machine
+//           most needs), plus `machine.potential_bytes`,
+//           `unpriced_models`, `limit_source`, `attribution_note` and four
+//           per-model fields. A field list in a doc rots at exactly the
+//           rate of the hand-picked renderer that caused that drift, so
+//           the shape is `ModelLedger`'s own definition and nothing here
+//           restates it. A new field on it reaches BOTH carriers at once,
+//           which is the property this key is now built to have.
+//
+//           Plus four self-describing fields: `period_seconds` (the CONFIGURED
 //           cadence), `emitted_interval_ms` (the MEASURED gap since the
 //           previous emission — same rule `machine.telemetry` follows),
 //           `gather_ms` (this rollup's OWN cost, observer constraint 3),

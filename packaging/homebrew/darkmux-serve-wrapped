@@ -29,7 +29,11 @@
 #   DARKMUX_REDIS_MAXLEN   — override default 10000
 #   DARKMUX_DAEMON_CORS_ORIGINS — opt-in cross-tailnet viewer access
 #
-# Operator overrides for the bind:
+# Operator overrides for the bind. Since #2782 this wrapper does NOT read or
+# forward them — it passes no `--bind`/`--port` at all, so `darkmux serve`
+# resolves them itself (`env > config.serve.* > 127.0.0.1:8765`) and
+# `darkmux config set serve.port` works under brew services. See the exec
+# line at the bottom for why forwarding them was a defect, not a courtesy.
 #   DARKMUX_SERVE_BIND  — default 127.0.0.1, set to 0.0.0.0 for the
 #                         substrate+viewer posture
 #   DARKMUX_SERVE_PORT  — default 8765
@@ -91,9 +95,26 @@ if [[ -n "$DARKMUX_REDIS_PASS" ]]; then
   unset DARKMUX_REDIS_PASS
 fi
 
-# Bind defaults — localhost-only matches CORS-localhost-only default
-BIND="${DARKMUX_SERVE_BIND:-127.0.0.1}"
-PORT="${DARKMUX_SERVE_PORT:-8765}"
-
 # Hand off to darkmux serve.
-exec "$DARKMUX_BIN" serve --bind "$BIND" --port "$PORT"
+#
+# (#2782) NO `--bind` / `--port` flags, and their absence is the point. This
+# used to read `BIND="${DARKMUX_SERVE_BIND:-127.0.0.1}"` / `PORT=
+# "${DARKMUX_SERVE_PORT:-8765}"` and pass BOTH unconditionally. A flag
+# outranks every other tier, so the wrapper pinned the built-in default on
+# every launch and `darkmux config set serve.port` could NEVER take effect
+# under `brew services` — the documented mechanism, on the recommended
+# install path, silently doing nothing. The daemon came back healthy on 8765
+# while every client that honours the config (the reachability nudge,
+# `darkmux doctor`, `mission status`'s viewer links, any tailnet proxy) went
+# looking somewhere else, with no error anywhere. That is the exact
+# healthy-and-silent shape #2765 exists to remove, reintroduced by the
+# launcher.
+#
+# Omitted, `darkmux serve` resolves the pair itself, once, in
+# `config_access`: `env(DARKMUX_SERVE_BIND / DARKMUX_SERVE_PORT) >
+# config.serve.* > 127.0.0.1:8765`. The two env overrides documented at the
+# top of this file keep working unchanged — they are inherited by the exec'd
+# process and read there, which is a tier the wrapper never needed to
+# reimplement. `darkmux doctor`'s `serve address` row prints the resolved
+# value and which tier produced it.
+exec "$DARKMUX_BIN" serve

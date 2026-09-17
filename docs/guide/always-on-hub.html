@@ -210,7 +210,7 @@ brew services restart redis</code></pre>
     <p>If you installed via Homebrew, the formula already ships a launchd-managed service. Because your Redis is password-less, there's nothing to wire up: the daemon resolves its Redis connection from the <code>config.redis</code> you set in the quick path:</p>
     <pre><code>brew services start darkmux
 sleep 3
-curl -s http://127.0.0.1:8765/health               <span class="comment"># {"darkmux_version":"…","flow_schema_version":"…"}</span>
+curl -s http://127.0.0.1:8765/health               <span class="comment"># 8765 unless you set serve.port; expect {"darkmux_version":"…",…}</span>
 darkmux doctor 2>&amp;1 | grep -i "daemon reachable"   <span class="comment"># expect ✓ + the viewer URL</span></code></pre>
     <p>The daemon binds <code>127.0.0.1:8765</code> by default. That's correct: the live viewer loads on the hub itself, and for cross-tailnet browser access you proxy through Tailscale Serve (see <a href="#viewer">the viewer section</a>) rather than exposing the daemon's port directly. To set the operator-named machine id the service reports, export <code>DARKMUX_MACHINE_ID</code> in your shell rc before <code>brew services start</code> (the service picks it up at load), or rely on the <code>config set machine_id</code> you already ran.</p>
     <p><strong>If you need a different port, put it in the config rather than only in the launch command:</strong> <code>darkmux config set serve.port 8799</code>. The daemon reads it, and so does every client that goes looking for the daemon — the per-dispatch <em>&ldquo;you won&rsquo;t see records live&rdquo;</em> nudge, <code>darkmux doctor</code>, and the viewer links <code>darkmux mission status</code> prints. A port that lives only on the command line is the one thing a reboot, a <code>brew services</code> restart, or a hand-typed <code>darkmux serve</code> can silently drop: the daemon comes back healthy on the built-in <code>8765</code> while whatever proxies this machine still points at the port you chose, and nothing reports an error. <code>darkmux doctor</code>&rsquo;s <code>serve address</code> row prints the resolved value and which tier it came from.</p>
@@ -230,8 +230,6 @@ darkmux doctor 2>&amp;1 | grep -i "daemon reachable"   <span class="comment"># e
   &lt;array&gt;
     &lt;string&gt;/opt/homebrew/bin/darkmux&lt;/string&gt;
     &lt;string&gt;serve&lt;/string&gt;
-    &lt;string&gt;--bind&lt;/string&gt;&lt;string&gt;127.0.0.1&lt;/string&gt;
-    &lt;string&gt;--port&lt;/string&gt;&lt;string&gt;8765&lt;/string&gt;
   &lt;/array&gt;
 
   &lt;key&gt;EnvironmentVariables&lt;/key&gt;
@@ -252,13 +250,14 @@ darkmux doctor 2>&amp;1 | grep -i "daemon reachable"   <span class="comment"># e
   &lt;key&gt;ProcessType&lt;/key&gt;&lt;string&gt;Background&lt;/string&gt;
 &lt;/dict&gt;
 &lt;/plist&gt;</code></pre>
-    <p>No Redis URL in the plist: the daemon resolves Redis from <code>config.redis</code> (the <code>~/.darkmux/config.json</code> the quick path wrote). The password-less posture means there's no secret to inject at process-start, so the <code>/bin/zsh -lc</code> Keychain-reading wrapper the old guide used is unnecessary. (If you add <code>requirepass</code> later, the simplest path is to switch to <code>brew services</code>, whose wrapper does the Keychain read for you.)</p>
+    <p><strong>No <code>--bind</code> / <code>--port</code> in the plist either, deliberately.</strong> Omitted, they resolve <code>env &gt; config.serve.* &gt; 127.0.0.1:8765</code> — so the paragraph above (&ldquo;put the port in the config, not only in the launch command&rdquo;) actually holds. Naming them here is the launch-command-only port that paragraph warns about, one layer worse: a plist written months ago would pin <code>8765</code> and silently override the <code>serve.port</code> you set today, because a flag outranks the config tier.</p>
+    <p>No Redis URL in the plist either: the daemon resolves Redis from <code>config.redis</code> (the <code>~/.darkmux/config.json</code> the quick path wrote). The password-less posture means there's no secret to inject at process-start, so the <code>/bin/zsh -lc</code> Keychain-reading wrapper the old guide used is unnecessary. (If you add <code>requirepass</code> later, the simplest path is to switch to <code>brew services</code>, whose wrapper does the Keychain read for you.)</p>
     <pre><code>mkdir -p ~/Library/Logs/darkmux
 plutil -lint ~/Library/LaunchAgents/com.darkmux.serve.plist
 launchctl load -w ~/Library/LaunchAgents/com.darkmux.serve.plist
 sleep 3
 launchctl list | grep com.darkmux.serve            <span class="comment"># expect: &lt;pid&gt; 0 com.darkmux.serve</span>
-curl -s http://127.0.0.1:8765/health</code></pre>
+curl -s http://127.0.0.1:8765/health                <span class="comment"># 8765 unless you set serve.port</span></code></pre>
 
     <h3>KeepAlive smoke test</h3>
     <p>Prove auto-recovery works by killing the daemon and confirming a new PID:</p>
@@ -370,11 +369,16 @@ cat ~/Library/Logs/darkmux/integrity.log           <span class="comment"># expec
 <section id="viewer">
   <div class="wrap">
     <h2>The cross-tailnet viewer</h2>
-    <p>The daemon binds <code>127.0.0.1:8765</code> and serves the live viewer there. To open it from another device's browser (your phone, a peer), proxy through Tailscale Serve. The daemon stays on loopback; Tailscale handles the cross-tailnet hop and TLS:</p>
+    <p>The daemon binds <code>127.0.0.1:8765</code> by default and serves the live viewer there. To open it from another device's browser (your phone, a peer), proxy through Tailscale Serve. The daemon stays on loopback; Tailscale handles the cross-tailnet hop and TLS:</p>
     <pre><code><span class="comment"># On the hub. --bg persists across reboots via tailscaled.</span>
+<span class="comment"># The proxy target must name the port this daemon LISTENS on — 8765 unless</span>
+<span class="comment"># you set serve.port. `darkmux doctor`'s `serve address` row prints it.</span>
 tailscale serve --bg --https=443 http://127.0.0.1:8765
 tailscale serve status                              <span class="comment"># shows the assigned https://&lt;hub&gt;.&lt;tailnet&gt;.ts.net/ URL</span></code></pre>
     <p>Now <code>https://&lt;hub-magic-dns-name&gt;.ts.net/</code> loads the live viewer on any device in your tailnet, with real HTTPS, and the daemon never leaves loopback.</p>
+    <div class="callout">
+      <strong>A route pointed at the wrong port fails silently, in both directions.</strong> A <code>tailscale serve</code> target is written once and outlives the config change that moves the daemon: set <code>serve.port 8799</code> after running the command above and the tailnet URL keeps resolving, keeps terminating TLS, and proxies to a port nothing listens on. Tailscale reports the route as healthy because it is &mdash; the dead end is on the far side. And <code>darkmux doctor</code> reports <em>no</em> tailnet viewer URL for that hub, because it finds the URL by matching the proxy target against this daemon's resolved address; a target at the old port matches nothing. Re-run <code>tailscale serve</code> with the new port whenever you change <code>serve.port</code>, and re-check <code>tailscale serve status</code>.
+    </div>
     <div class="callout">
       <strong>Why Tailscale Serve, not a non-loopback <code>--bind</code>:</strong> binding the daemon to the tailnet IP directly would trip darkmux's remote-auth gate. A non-loopback bind requires a bearer token, and a browser page-navigation can't send an <code>Authorization</code> header, so the viewer would 401. Tailscale Serve keeps the daemon on <code>127.0.0.1</code>, so the daemon sees a loopback connection and serves the viewer freely while Tailscale enforces the tailnet boundary. It's the same reason the bind-to-loopback + serve pattern is the recommended phone-dashboard setup.
     </div>

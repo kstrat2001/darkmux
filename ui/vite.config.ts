@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { viteSingleFile } from "vite-plugin-singlefile";
+import { devProxyTarget } from "./devProxyTarget";
 
 // Packet 1 (UI port) — build config only. This project builds to exactly ONE
 // self-contained `dist/index.html` (inlined JS/CSS, no separate chunks), which
@@ -23,14 +24,22 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 // and the same cost the legacy viewer had. `bun run build` itself is 0.8s;
 // the other 99% is Rust relinking a file it only embeds.
 //
-// With this proxy, an API request from the dev server goes to the daemon on
-// 8765 while the UI hot-reloads locally in well under a second. Nothing here
-// ships: `vite build` ignores `server`.
+// With this proxy, an API request from the dev server goes to the REAL
+// daemon while the UI hot-reloads locally in well under a second. Nothing
+// here ships: `vite build` ignores `server`.
 //
 // `host: true` binds beyond loopback so the dev server is reachable from a
 // phone over the tailnet — reviewing mobile layout on an actual phone is the
 // only way this project has reliably caught mobile bugs.
-const DAEMON = "http://127.0.0.1:8765";
+//
+// (#2782) The target was the literal `http://127.0.0.1:8765`, so on a machine
+// that set `serve.port` the dev server proxied into a dead port and the
+// viewer rendered nothing. It now resolves from the environment —
+// `env(DARKMUX_SERVE_BIND / DARKMUX_SERVE_PORT) > built-in default`, the ENV
+// TIER ONLY, deliberately narrower than the Rust resolver's `env > config >
+// default`. `devProxyTarget.ts` holds that rule, says why the config tier is
+// skipped, and is pinned by `devProxyTarget.test.ts`.
+const DAEMON = devProxyTarget(process.env);
 const API_PREFIXES = [
   "/flow", "/flow-days", "/flow-missions", "/flow-mission", "/flow-session",
   "/flow-status", "/runs", "/missions", "/phases", "/machine", "/fleet",

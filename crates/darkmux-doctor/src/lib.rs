@@ -11802,6 +11802,45 @@ mod tests {
         assert_eq!(parse_tailnet_viewer_url("not json", "127.0.0.1", 8765), None);
     }
 
+    /// (#2782 C3) The THIRD accepted spelling — the daemon's own resolved
+    /// bind host — has no other pin. `parse_tailnet_viewer_url` is private,
+    /// so no consumer test can reach it: deleting `|| p == want_bind` left
+    /// every other test in this crate green.
+    ///
+    /// The operator this matters to bound one specific interface and wrote
+    /// `tailscale serve` against THAT address. Matching only the two
+    /// loopback spellings reports "no tailnet URL" for a proxy pointed
+    /// straight at this daemon.
+    #[test]
+    fn parse_tailnet_viewer_url_accepts_a_proxy_written_at_the_configured_bind() {
+        // A proxy target at a non-loopback bind, matching NEITHER loopback
+        // spelling — so only the `want_bind` arm can accept it.
+        let j = r#"{"Web":{"hub.tailnet-example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://192.0.2.10:8799"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(j, "192.0.2.10", 8799).as_deref(),
+            Some("https://hub.tailnet-example.ts.net/"),
+            "a proxy target written at the configured bind must match"
+        );
+        // Same JSON, a DIFFERENT bind → no longer ours. Pins that the arm
+        // compares the resolved bind rather than accepting any host.
+        assert_eq!(parse_tailnet_viewer_url(j, "192.0.2.11", 8799), None);
+        // The bind's PORT is not a free pass either.
+        assert_eq!(parse_tailnet_viewer_url(j, "192.0.2.10", 9000), None);
+        // A wildcard bind collapses to loopback before it gets here, so it
+        // adds no fourth case — it matches the loopback target, not `0.0.0.0`.
+        let jloop = r#"{"Web":{"hub.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8799"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(jloop, "0.0.0.0", 8799).as_deref(),
+            Some("http://hub.tailnet-example.ts.net/")
+        );
+        let jwild = r#"{"Web":{"hub.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://0.0.0.0:8799"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(jwild, "0.0.0.0", 8799),
+            None,
+            "a wildcard is a bind directive, never a proxy destination"
+        );
+    }
+
     // ─── check_daemon_auth (#881) ─────────────────────────────────────
     #[test]
     fn daemon_auth_status_arms() {

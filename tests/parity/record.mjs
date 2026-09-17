@@ -72,7 +72,27 @@ import { sanitizeText, scanForSentinels } from "./lib/sanitize.mjs";
 import { CORPUS_DIR, META_JSON } from "./lib/paths.js";
 import { GRAPH_FIXTURE_MISSION_ID } from "./lib/graph-fixture.js";
 
-const DAEMON_URL = process.env.DARKMUX_DAEMON_URL || "http://127.0.0.1:8765";
+// (#2782) `DARKMUX_DAEMON_URL` still wins outright — it is the full-URL
+// escape hatch this harness has always had. Below it, fall through to the
+// SAME env tier the daemon itself honours, rather than straight to the
+// built-in default: recording needs the operator's live daemon, and on a
+// machine that set `serve.port` the bare default is a dead port. The failure
+// there is a connection refused at record time — loud, unlike the dev
+// server's silent empty render — but the fix is the same one line.
+//
+// Env tier only, deliberately, for the same reason `ui/devProxyTarget.ts`
+// states: reading `config.json` from a JS tool would be a second
+// implementation of a precedence rule that lives in exactly one place.
+const DAEMON_HOST = process.env.DARKMUX_SERVE_BIND?.trim() || "127.0.0.1";
+const DAEMON_PORT = process.env.DARKMUX_SERVE_PORT?.trim() || "8765";
+const DEFAULT_DAEMON_URL = `http://${
+  DAEMON_HOST === "0.0.0.0" || DAEMON_HOST === "::"
+    ? "127.0.0.1"
+    : DAEMON_HOST.includes(":") && !DAEMON_HOST.startsWith("[")
+      ? `[${DAEMON_HOST}]`
+      : DAEMON_HOST
+}:${DAEMON_PORT}`;
+const DAEMON_URL = process.env.DARKMUX_DAEMON_URL || DEFAULT_DAEMON_URL;
 const TMP_DIR = `${CORPUS_DIR}.tmp-${process.pid}`;
 
 // Fixed, deterministic offset applied to the recorded capture time when the

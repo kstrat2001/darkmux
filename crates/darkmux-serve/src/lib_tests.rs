@@ -1837,6 +1837,48 @@
         assert!(bind_requires_token("127.0.0.5", false).is_ok());
     }
 
+    /// (#2782 C5) The gate above says v6 loopback is legal; before this the
+    /// daemon could not actually START on it, because `run` built its
+    /// `SocketAddr` with a bare `format!("{bind}:{port}")` — `"::1:8765"`,
+    /// which does not parse. Four #2782 surfaces meanwhile render IPv6 as
+    /// supported. This pins that the bind the daemon computes agrees with
+    /// what those surfaces print.
+    #[test]
+    fn an_ipv6_bind_resolves_to_a_bindable_socket_addr() {
+        let v6_loopback = listen_socket_addr("::1", 8765).expect("`::1` must bind");
+        assert_eq!(v6_loopback, "[::1]:8765".parse::<std::net::SocketAddr>().unwrap());
+        assert!(v6_loopback.is_ipv6() && v6_loopback.ip().is_loopback());
+        // The gate that says this configuration is legal, restated against
+        // the address actually computed for it.
+        assert!(bind_requires_token("::1", false).is_ok());
+
+        let v6_wildcard = listen_socket_addr("::", 8799).expect("`::` must bind");
+        assert_eq!(v6_wildcard.port(), 8799);
+        assert!(v6_wildcard.ip().is_unspecified(), "a wildcard stays a wildcard");
+
+        // v4 and the empty/default cases are unchanged.
+        assert_eq!(
+            listen_socket_addr("127.0.0.1", 8765).unwrap(),
+            "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            listen_socket_addr("0.0.0.0", 8799).unwrap(),
+            "0.0.0.0:8799".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            listen_socket_addr("", 8765).unwrap(),
+            "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap(),
+            "an empty bind falls back to the built-in default"
+        );
+
+        // A hostname is still refused — unchanged behavior, deliberately not
+        // widened here — but the error names the bind and what is accepted
+        // rather than bare `invalid socket address syntax`.
+        let err = listen_socket_addr("localhost", 8765).unwrap_err().to_string();
+        assert!(err.contains("localhost"), "{err}");
+        assert!(err.contains("serve.bind"), "points at the knob: {err}");
+    }
+
     #[test]
     fn bind_gate_refuses_nonloopback_without_token() {
         assert!(bind_requires_token("0.0.0.0", false).is_err());

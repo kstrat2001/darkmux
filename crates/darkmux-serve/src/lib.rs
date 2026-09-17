@@ -1111,6 +1111,40 @@ pub fn resolve_listen_addr(port: Option<u16>, bind: Option<String>) -> (u16, Str
     )
 }
 
+/// (#2782 C5) The `SocketAddr` the daemon binds, from an already-resolved
+/// bind + port.
+///
+/// Bracketing goes through `config_access::format_listen_addr` — the SAME
+/// helper `darkmux doctor`'s `serve address` row renders — rather than a
+/// second `format!("{bind}:{port}")` here, which is what this was. That
+/// spelling produced `":::8765"` for a `::` bind and `"::1:8765"` for
+/// `::1`; neither parses, so the daemon refused to start on either while
+/// four #2782 surfaces rendered IPv6 as supported (`serve address` printing
+/// `[::]:8765`, `viewer_link_base` emitting `http://[::1]:8765/`, the
+/// tailnet matcher, and the tests asserting all three) and
+/// `bind_requires_token("::1", false)` returned `Ok`, i.e. the codebase
+/// already INTENDED v6 loopback to be legal. One bracketing rule keeps the
+/// address the daemon binds and the address doctor prints from disagreeing.
+///
+/// A HOSTNAME bind is still an error, unchanged: `format_listen_addr`
+/// passes it through as typed, and `"localhost:8765"` is not a
+/// `SocketAddr`. That is pre-existing behavior and deliberately not widened
+/// here — resolving a name would mean picking one of its addresses, which
+/// is a different decision from bracketing a literal. The error just says
+/// so now instead of surfacing bare `invalid socket address syntax`.
+pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let rendered = darkmux_types::config_access::format_listen_addr(bind, port);
+    rendered.parse::<std::net::SocketAddr>().map_err(|e| {
+        anyhow::anyhow!(
+            "cannot bind the serve daemon to `{bind}` (resolved to `{rendered}`): {e}.\n  \
+             The bind must be an IP literal — `127.0.0.1` (the default), `::1`, `0.0.0.0`, `::`, \
+             or one interface's address. A hostname is not accepted. \
+             Set it with `darkmux config set serve.bind <addr>`; `darkmux doctor`'s `serve address` \
+             row prints the resolved value and which tier it came from."
+        )
+    })
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#1461) Capture the mtime of the binary we were launched from BEFORE
     // serving anything. It has to be read at startup, not lazily on the first
@@ -1125,7 +1159,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
 
     rt.block_on(async move {
         let app = build_router_full(flows_dir.clone(), worktrees_base_dir(), lab_dir.clone());
-        let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
+        let addr = listen_socket_addr(&bind, port)?;
         // (#881) Refuse a non-loopback bind without a configured token BEFORE we
         // bind the socket — exposing the read surface unauthenticated is the
         // vulnerability this gate closes.

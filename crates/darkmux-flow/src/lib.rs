@@ -3191,8 +3191,13 @@ mod tests {
         //           the whole machine-lens aggregate: the `now` /
         //           `window` / `battery_health` object
         //           `/machine/resources` already serves (same builder),
-        //           plus `residency` (loaded models, pool bytes,
-        //           attribution), plus four self-describing fields —
+        //           plus `residency` — the whole `ModelLedger`
+        //           serialized, structurally identical to what
+        //           `/machine/resources` serves under that key, and
+        //           deliberately not enumerated here or in `schema.rs`
+        //           (#2782 C7: a field list drifts from the record at
+        //           exactly the rate the hand-picked renderer did) —
+        //           plus four self-describing fields —
         //           `period_seconds` (configured cadence),
         //           `emitted_interval_ms` (measured gap since the last
         //           emission), `gather_ms` (the emitter's OWN cost), and

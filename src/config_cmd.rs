@@ -326,8 +326,37 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
 
     let pretty = serde_json::to_string_pretty(&root).context("serializing config.json")?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))?;
-    Ok(format!("set `{key}` = {parsed} in {}", path.display()))
+    Ok(format!(
+        "set `{key}` = {parsed} in {}\n{RESTART_CLAUSE}",
+        path.display()
+    ))
 }
+
+/// (#2782 C6) Appended to EVERY `config set` confirmation.
+///
+/// `config_access::config()` is a process-wide `OnceLock` with no
+/// invalidation path, so a config-tier write lands on disk and is invisible
+/// to every darkmux process already running — permanently, not until some
+/// refresh. Only the env tier is read live, and an env var cannot change
+/// inside a running process either.
+///
+/// **General rather than a per-key list, on purpose.** #2782 MF1 put this
+/// clause on `machine_rollup`'s three surfaces because that is where the
+/// wrong claim was; but the OnceLock is not a `machine_rollup` property, it
+/// is how every key resolves. A key list here would have to be maintained
+/// against "which long-lived process reads what", would be wrong the first
+/// time a knob gained a second consumer, and is exactly the hand-picked-
+/// subset shape that produced #2782's own C7 and MF1. The mechanism is one
+/// sentence and is true for every key, so state the mechanism.
+///
+/// It is stated as a MECHANISM, not an outcome ("processes read this file at
+/// start"), which stays true for a key no daemon happens to read — such a
+/// process still holds the old value; it just does not matter. Claiming
+/// "restart the daemon for this to take effect" would be the outcome form,
+/// and wrong for most keys.
+const RESTART_CLAUSE: &str = "  note: config is read once per process at start. Anything already \
+running — the `darkmux serve` daemon, an in-flight `mission launch` — keeps the old value until it \
+restarts.";
 
 /// Print a key's stored value, or note it's unset (falls through to env/default).
 fn get_at(path: &Path, key: &str) -> Result<String> {
@@ -633,6 +662,44 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(v["machine_rollup"]["enabled"], Value::Bool(true));
         assert_eq!(v["machine_rollup"]["period_seconds"], serde_json::json!(300));
+    }
+
+    /// (#2782 C6) `config set` is the surface the operator actually types,
+    /// and it was the one place the OnceLock restart clause did NOT appear —
+    /// #2782 MF1 put it on `MachineRollupConfig`'s doc, both ENVIRONMENT.md
+    /// rows, and both doctor messages, all of which an operator reaches only
+    /// by going looking.
+    ///
+    /// Pinned as GENERAL: the assertion runs over keys from unrelated
+    /// families, so re-narrowing this to a `machine_rollup`-shaped special
+    /// case fails here rather than in review.
+    #[test]
+    fn every_set_confirmation_carries_the_restart_clause() {
+        let f = tmp();
+        let p = f.path();
+        for (key, value) in [
+            ("machine_rollup.enabled", "true"),
+            ("serve.port", "8799"),
+            ("redis.host", "192.0.2.10"),
+            ("fleet.mode", "hub"),
+            ("role_profiles.example-coder", "qwen35b"),
+        ] {
+            let msg = set_at(p, key, value).unwrap();
+            assert!(
+                msg.contains(&format!("set `{key}`")),
+                "the confirmation still names the key it wrote: {msg}"
+            );
+            assert!(
+                msg.contains("read once per process at start"),
+                "`{key}` must carry the restart clause — the OnceLock is a \
+                 property of config resolution, not of one key: {msg}"
+            );
+            assert!(
+                msg.contains("darkmux serve"),
+                "`{key}`'s clause must name the long-lived process an \
+                 operator would otherwise have to guess at: {msg}"
+            );
+        }
     }
 
     #[test]

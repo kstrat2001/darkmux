@@ -114,6 +114,8 @@ If `flow sink health` is `⚠` — re-check the Redis URL. The most common error
 ## Step 6 — Add this machine to the local roster
 
 ```bash
+# 8765 unless serve.port is set — read the resolved one from
+# `darkmux doctor`'s `serve address` row and type THAT port here.
 darkmux machine add <this-machine-id> --address 127.0.0.1:8765
 ```
 
@@ -157,7 +159,9 @@ Then on the operator's coordinator (or any other fleet member):
 
 ```bash
 # That machine's daemon Redis-aggregates the whole fleet, so the new
-# machine's records show up here (needs `darkmux serve` running there):
+# machine's records show up here (needs `darkmux serve` running there).
+# Loopback, so the port is THAT machine's serve.port — 8765 unless it set
+# one; `darkmux doctor` run there prints the resolved value.
 curl -s "http://127.0.0.1:8765/flow/$(date +%F)"
 ```
 

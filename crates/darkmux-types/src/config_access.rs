@@ -679,12 +679,21 @@ pub fn serve_listen_addr() -> String {
 /// Pure core of [`serve_listen_addr`] — see [`format_client_addr`] for the
 /// one behavioral difference (this one does NOT collapse a wildcard).
 ///
-/// `pub(crate)` on purpose: nothing outside this crate needs a listen
-/// address built from a bind it supplies, and only the accessor above is
-/// meant to be reachable. Its twin is `pub` only because
+/// `pub` since #2782 C5 (it was `pub(crate)`, on the reasoning that nothing
+/// outside this crate builds a listen address from a bind it supplies —
+/// which was false of the one caller that matters). `darkmux_serve::run`
+/// receives an ALREADY-RESOLVED bind + port from `resolve_listen_addr` and
+/// has to turn them into a `SocketAddr`; it was doing its own
+/// `format!("{bind}:{port}")`, which produces `":::8765"` for a `::` bind
+/// and `"::1:8765"` for `::1` — neither parses, so the daemon could not
+/// start on a bind the rest of the codebase treats as legal
+/// (`bind_requires_token("::1", false)` is `Ok`, and four #2782 surfaces
+/// render `[::1]` as supported). One bracketing rule, here, rather than a
+/// second spelling at the call site that can disagree with what doctor
+/// prints. Its twin is `pub` for the same class of reason:
 /// `darkmux_doctor::viewer_link_base` builds a client address around an
 /// explicitly-passed port.
-pub(crate) fn format_listen_addr(bind: &str, port: u16) -> String {
+pub fn format_listen_addr(bind: &str, port: u16) -> String {
     let host = bind.trim();
     let host = if host.is_empty() {
         SERVE_BIND_DEFAULT

@@ -24,7 +24,8 @@ pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>
     // own doc), or a previously-resolved/hand-edited value preserved
     // across this update (see `add_machine`'s own doc for why `None` here
     // never clobbers it).
-    let uid = if fleet::address_host_is_loopback(address) {
+    let is_self_entry = fleet::address_host_is_loopback(address);
+    let uid = if is_self_entry {
         darkmux_hardware::machine_uid()
     } else {
         None
@@ -43,7 +44,76 @@ pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>
         println!("  machine_uid: {u} (resolved locally — self-registration)");
     }
     println!("  roster: {}", fleet::roster_path().display());
+    if let Some(w) = self_entry_port_warning(
+        is_self_entry,
+        address,
+        darkmux_types::config_access::serve_port(),
+    ) {
+        println!("{w}");
+    }
     Ok(0)
+}
+
+/// The port a roster address resolves to: the explicit `:port` when one is
+/// written, else the portless default every roster lookup applies.
+///
+/// Total and non-resolving on purpose — it feeds a WARNING, never a
+/// rejection, so an address it cannot read as `host:port` reads as portless
+/// rather than as an error. Ordering mirrors `address_host_is_loopback`: a
+/// bare IP literal is checked FIRST, because `::1` would otherwise split at
+/// its own last colon and report port `1`.
+fn roster_address_port(address: &str) -> u16 {
+    let trimmed = address.trim();
+    let rest = trimmed
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let unbracketed = rest
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(rest);
+    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
+        return crate::serve::DEFAULT_DAEMON_PORT;
+    }
+    rest.rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(crate::serve::DEFAULT_DAEMON_PORT)
+}
+
+/// (#2782 C4) Warn when a SELF entry names a port this machine's daemon does
+/// not listen on. Returns the text rather than printing, so it is testable
+/// without capturing stdout.
+///
+/// The roster's `DEFAULT_DAEMON_PORT` is deliberately uniform — a roster
+/// entry names ANOTHER machine, and one machine's `serve.port` must not
+/// silently redirect traffic aimed at another (see that constant's own doc).
+/// #2782 C10 handled the one case that carve-out does not cover — the
+/// documented self-registration recipe, where the port IS this machine's —
+/// in the DOCS alone. This is the structural half of the same fix, and it
+/// belongs HERE rather than in the roster for the same reason the carve-out
+/// exists: `cmd_machine_add` is the layer that already knows whether an
+/// entry is "me" (it branches on exactly that to resolve `machine_uid`),
+/// while the roster deliberately does not model the distinction.
+///
+/// Surface + suggest, never mutate (#44): the entry is written as typed. An
+/// operator CAN legitimately want a self entry on another port — a second
+/// daemon on this host — so this reports the mismatch and names both
+/// numbers rather than correcting one of them.
+fn self_entry_port_warning(is_self_entry: bool, address: &str, serve_port: u16) -> Option<String> {
+    if !is_self_entry {
+        return None;
+    }
+    let named = roster_address_port(address);
+    if named == serve_port {
+        return None;
+    }
+    Some(format!(
+        "  ⚠ this entry points at port {named}, but this machine's daemon resolves to {serve_port}.\n    \
+         A roster address is the one place `serve.port` is NOT consulted — a peer's port is not this \
+         machine's — so a self entry has to name the port itself. Re-run with `--address 127.0.0.1:{serve_port}` \
+         if you meant this daemon; `darkmux doctor`'s `serve address` row prints the resolved value and its tier."
+    ))
 }
 
 pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
@@ -508,6 +578,47 @@ mod tests {
         assert_eq!(
             normalize_daemon_base("100.64.0.2"),
             format!("http://100.64.0.2:{}", crate::serve::DEFAULT_DAEMON_PORT)
+        );
+    }
+
+    // ── self-entry port mismatch (#2782 C4) ─────────────────────────────
+
+    #[test]
+    fn roster_address_port_reads_the_written_port_or_the_default() {
+        let d = crate::serve::DEFAULT_DAEMON_PORT;
+        assert_eq!(roster_address_port("127.0.0.1:8799"), 8799);
+        assert_eq!(roster_address_port("127.0.0.1"), d, "portless → default");
+        assert_eq!(roster_address_port("http://127.0.0.1:8799/"), 8799);
+        // A bare v6 literal is PORTLESS — it must not split at its own last
+        // colon and report port 1, which is what a naive rsplit does.
+        assert_eq!(roster_address_port("::1"), d);
+        assert_eq!(roster_address_port("[::1]"), d);
+        assert_eq!(roster_address_port("[::1]:8799"), 8799);
+        // Unreadable tail → portless, never an error (this feeds a warning).
+        assert_eq!(roster_address_port("localhost:not-a-port"), d);
+        assert_eq!(roster_address_port("studio.tailnet-example.ts.net"), d);
+    }
+
+    #[test]
+    fn self_entry_port_warning_fires_only_on_a_self_entry_that_disagrees() {
+        // The failure #2782 C10 documented: self entry at the built-in
+        // default while this daemon listens elsewhere.
+        let w = self_entry_port_warning(true, "127.0.0.1:8765", 8799)
+            .expect("a self entry naming a dead port must warn");
+        assert!(w.contains("8765") && w.contains("8799"), "names BOTH ports: {w}");
+        assert!(w.contains("serve address"), "points at the resolved value: {w}");
+        // A portless self entry inherits the roster default, so it is the
+        // same mismatch — the carve-out is exactly what makes it one.
+        assert!(self_entry_port_warning(true, "127.0.0.1", 8799).is_some());
+        // Agreement is silent.
+        assert_eq!(self_entry_port_warning(true, "127.0.0.1:8799", 8799), None);
+        assert_eq!(self_entry_port_warning(true, "127.0.0.1", 8765), None);
+        // A PEER is never warned about, however its port compares to ours:
+        // that is the roster carve-out, and warning here would contradict it.
+        assert_eq!(self_entry_port_warning(false, "192.0.2.10:8765", 8799), None);
+        assert_eq!(
+            self_entry_port_warning(false, "studio.tailnet-example.ts.net", 8799),
+            None
         );
     }
 
