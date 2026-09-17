@@ -239,6 +239,16 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2093 merge-gate finding 5) The hard cap on undelivered bytes per
     // rule, in MiB — see `HooksConfig::max_outbox_mb`'s own doc.
     ("hooks.max_outbox_mb", Ty::Uint),
+    // (#2765) Where the daemon listens — and where every client looks for
+    // it. `Ty::Uint` like `redis.port`: a value past 65535 fails the
+    // `DarkmuxConfig` re-parse `set_at` runs before writing, so it is
+    // refused rather than written. `serve.token` is NOT here — it is a
+    // secret, and `SECRET_KEYS` above refuses it with the Keychain form.
+    ("serve.port", Ty::Uint),
+    ("serve.bind", Ty::Str),
+    // (#2775) The periodic machine-lens aggregate heartbeat.
+    ("machine_rollup.enabled", Ty::Bool),
+    ("machine_rollup.period_seconds", Ty::Uint),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS
@@ -316,8 +326,37 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
 
     let pretty = serde_json::to_string_pretty(&root).context("serializing config.json")?;
     std::fs::write(path, pretty + "\n").with_context(|| format!("writing {}", path.display()))?;
-    Ok(format!("set `{key}` = {parsed} in {}", path.display()))
+    Ok(format!(
+        "set `{key}` = {parsed} in {}\n{RESTART_CLAUSE}",
+        path.display()
+    ))
 }
+
+/// (#2782 C6) Appended to EVERY `config set` confirmation.
+///
+/// `config_access::config()` is a process-wide `OnceLock` with no
+/// invalidation path, so a config-tier write lands on disk and is invisible
+/// to every darkmux process already running — permanently, not until some
+/// refresh. Only the env tier is read live, and an env var cannot change
+/// inside a running process either.
+///
+/// **General rather than a per-key list, on purpose.** #2782 MF1 put this
+/// clause on `machine_rollup`'s three surfaces because that is where the
+/// wrong claim was; but the OnceLock is not a `machine_rollup` property, it
+/// is how every key resolves. A key list here would have to be maintained
+/// against "which long-lived process reads what", would be wrong the first
+/// time a knob gained a second consumer, and is exactly the hand-picked-
+/// subset shape that produced #2782's own C7 and MF1. The mechanism is one
+/// sentence and is true for every key, so state the mechanism.
+///
+/// It is stated as a MECHANISM, not an outcome ("processes read this file at
+/// start"), which stays true for a key no daemon happens to read — such a
+/// process still holds the old value; it just does not matter. Claiming
+/// "restart the daemon for this to take effect" would be the outcome form,
+/// and wrong for most keys.
+const RESTART_CLAUSE: &str = "  note: config is read once per process at start. Anything already \
+running — the `darkmux serve` daemon, an in-flight `mission launch` — keeps the old value until it \
+restarts.";
 
 /// Print a key's stored value, or note it's unset (falls through to env/default).
 fn get_at(path: &Path, key: &str) -> Result<String> {
@@ -563,6 +602,104 @@ mod tests {
 
     fn tmp() -> NamedTempFile {
         NamedTempFile::new().unwrap()
+    }
+
+    /// (#2765) The knob the operator could not reach. `darkmux config list`
+    /// showed no `serve` block at all, so there was no
+    /// `darkmux config set serve.port 8799` to reach for — the port lived
+    /// only in the launch command, and a restart that forgot it silently
+    /// reverted while every client kept probing the built-in.
+    #[test]
+    fn serve_port_and_bind_are_settable_and_coerced() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "serve.port", "8799").unwrap();
+        set_at(p, "serve.bind", "0.0.0.0").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v["serve"]["port"], serde_json::json!(8799), "coerced to a number");
+        assert_eq!(v["serve"]["bind"], Value::String("0.0.0.0".into()));
+        // And it round-trips through the typed config, which is what
+        // `set_at`'s own re-parse gate enforces before writing.
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(cfg.serve.as_ref().and_then(|s| s.port), Some(8799));
+    }
+
+    /// A port past the u16 range is REFUSED rather than written — the
+    /// `DarkmuxConfig` re-parse gate catches it, so an operator cannot
+    /// leave a config behind that the daemon would then reject at startup.
+    #[test]
+    fn a_serve_port_outside_the_u16_range_is_refused() {
+        let f = tmp();
+        assert!(set_at(f.path(), "serve.port", "70000").is_err());
+        assert!(set_at(f.path(), "serve.port", "not-a-port").is_err());
+    }
+
+    /// The serve BEARER TOKEN is a secret and stays one. Adding a `serve`
+    /// block is exactly the moment someone would reach for
+    /// `config set serve.token`, and the refusal must still point at the
+    /// Keychain rather than becoming an "unknown key" — or worse, writing
+    /// it.
+    #[test]
+    fn serve_token_is_still_refused_as_a_secret_now_that_a_serve_block_exists() {
+        let f = tmp();
+        let err = set_at(f.path(), "serve.token", "hunter2").unwrap_err().to_string();
+        assert!(err.contains("darkmux-serve-token"), "{err}");
+        assert!(err.contains("security add-generic-password"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(f.path()).unwrap(),
+            "",
+            "a refused secret must not touch the file"
+        );
+    }
+
+    /// (#2775) The rollup's two knobs.
+    #[test]
+    fn machine_rollup_knobs_are_settable() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "machine_rollup.enabled", "true").unwrap();
+        set_at(p, "machine_rollup.period_seconds", "300").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v["machine_rollup"]["enabled"], Value::Bool(true));
+        assert_eq!(v["machine_rollup"]["period_seconds"], serde_json::json!(300));
+    }
+
+    /// (#2782 C6) `config set` is the surface the operator actually types,
+    /// and it was the one place the OnceLock restart clause did NOT appear —
+    /// #2782 MF1 put it on `MachineRollupConfig`'s doc, both ENVIRONMENT.md
+    /// rows, and both doctor messages, all of which an operator reaches only
+    /// by going looking.
+    ///
+    /// Pinned as GENERAL: the assertion runs over keys from unrelated
+    /// families, so re-narrowing this to a `machine_rollup`-shaped special
+    /// case fails here rather than in review.
+    #[test]
+    fn every_set_confirmation_carries_the_restart_clause() {
+        let f = tmp();
+        let p = f.path();
+        for (key, value) in [
+            ("machine_rollup.enabled", "true"),
+            ("serve.port", "8799"),
+            ("redis.host", "192.0.2.10"),
+            ("fleet.mode", "hub"),
+            ("role_profiles.example-coder", "qwen35b"),
+        ] {
+            let msg = set_at(p, key, value).unwrap();
+            assert!(
+                msg.contains(&format!("set `{key}`")),
+                "the confirmation still names the key it wrote: {msg}"
+            );
+            assert!(
+                msg.contains("read once per process at start"),
+                "`{key}` must carry the restart clause — the OnceLock is a \
+                 property of config resolution, not of one key: {msg}"
+            );
+            assert!(
+                msg.contains("darkmux serve"),
+                "`{key}`'s clause must name the long-lived process an \
+                 operator would otherwise have to guess at: {msg}"
+            );
+        }
     }
 
     #[test]

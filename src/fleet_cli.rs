@@ -24,7 +24,8 @@ pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>
     // own doc), or a previously-resolved/hand-edited value preserved
     // across this update (see `add_machine`'s own doc for why `None` here
     // never clobbers it).
-    let uid = if fleet::address_host_is_loopback(address) {
+    let is_self_entry = fleet::address_host_is_loopback(address);
+    let uid = if is_self_entry {
         darkmux_hardware::machine_uid()
     } else {
         None
@@ -43,7 +44,141 @@ pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>
         println!("  machine_uid: {u} (resolved locally — self-registration)");
     }
     println!("  roster: {}", fleet::roster_path().display());
+    if let Some(w) = self_entry_port_warning(
+        is_self_entry,
+        address,
+        &darkmux_types::config_access::serve_bind(),
+        darkmux_types::config_access::serve_port(),
+    ) {
+        println!("{w}");
+    }
     Ok(0)
+}
+
+/// The port a roster address resolves to: the explicit `:port` when one is
+/// written, else the portless default every roster lookup applies.
+///
+/// Total and non-resolving on purpose — it feeds a WARNING, never a
+/// rejection, so an address it cannot read as `host:port` reads as portless
+/// rather than as an error. Ordering mirrors `address_host_is_loopback`: a
+/// bare IP literal is checked FIRST, because `::1` would otherwise split at
+/// its own last colon and report port `1`.
+fn roster_address_port(address: &str) -> u16 {
+    let trimmed = address.trim();
+    let rest = trimmed
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let unbracketed = rest
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(rest);
+    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
+        return crate::serve::DEFAULT_DAEMON_PORT;
+    }
+    rest.rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(crate::serve::DEFAULT_DAEMON_PORT)
+}
+
+/// The host a roster address names, unbracketed and scheme-stripped — the
+/// twin of [`roster_address_port`], split out for the same reason that one
+/// exists: this feeds a WARNING, so an unreadable address yields the string
+/// as-typed rather than an error. Ordering mirrors it exactly (bare IP
+/// literal first, so `::1` is not split at its own last colon).
+fn roster_address_host(address: &str) -> String {
+    let trimmed = address.trim();
+    let rest = trimmed
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let unbracketed = rest
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(rest);
+    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
+        return unbracketed.to_string();
+    }
+    match rest.rsplit_once(':') {
+        Some((host, p)) if p.parse::<u16>().is_ok() => host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+/// (#2782 C4) Warn when a SELF entry names an address this machine's daemon
+/// does not answer on. Returns the text rather than printing, so it is
+/// testable without capturing stdout.
+///
+/// (#2782 C2) Compares the whole ADDRESS, not just the port, and renders
+/// both sides through `config_access::format_client_addr` — the same
+/// function `serve_client_addr` (and therefore `darkmux doctor`'s `serve
+/// address` row, and the daemon-reachability probe) resolves with. A
+/// port-only comparison with a hardcoded `127.0.0.1:{port}` suggestion was
+/// wrong in both directions the moment `serve.bind = ::1` became bindable
+/// in this same delta: it would tell an operator on a `::1` bind to write
+/// `127.0.0.1:8822`, which answers nothing, and it stayed silent when they
+/// typed that address themselves.
+///
+/// A WILDCARD bind (`0.0.0.0`, `::`) is the one case compared on port
+/// alone: it answers on every interface, so any loopback host in the entry
+/// reaches it and only the port can disagree. `format_client_addr` collapses
+/// a wildcard to loopback for the suggestion, which is what a client should
+/// dial — so the bind is passed in alongside rather than read back out of
+/// the rendered string.
+///
+/// The roster's `DEFAULT_DAEMON_PORT` is deliberately uniform — a roster
+/// entry names ANOTHER machine, and one machine's `serve.port` must not
+/// silently redirect traffic aimed at another (see that constant's own doc).
+/// #2782 C10 handled the one case that carve-out does not cover — the
+/// documented self-registration recipe, where the port IS this machine's —
+/// in the DOCS alone. This is the structural half of the same fix, and it
+/// belongs HERE rather than in the roster for the same reason the carve-out
+/// exists: `cmd_machine_add` is the layer that already knows whether an
+/// entry is "me" (it branches on exactly that to resolve `machine_uid`),
+/// while the roster deliberately does not model the distinction.
+///
+/// Surface + suggest, never mutate (#44): the entry is written as typed. An
+/// operator CAN legitimately want a self entry on another address — a second
+/// daemon on this host — so this reports the mismatch and names both sides
+/// rather than correcting one of them.
+fn self_entry_port_warning(
+    is_self_entry: bool,
+    address: &str,
+    serve_bind: &str,
+    serve_port: u16,
+) -> Option<String> {
+    if !is_self_entry {
+        return None;
+    }
+    use darkmux_types::config_access::format_client_addr;
+    let named = format_client_addr(&roster_address_host(address), roster_address_port(address));
+    let resolved = format_client_addr(serve_bind, serve_port);
+    let bind_is_wildcard = serve_bind
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_unspecified())
+        .unwrap_or(false);
+    let agrees = if bind_is_wildcard {
+        roster_address_port(address) == serve_port
+    } else {
+        named == resolved
+    };
+    if agrees {
+        return None;
+    }
+    Some(format!(
+        "  ⚠ this entry points at {named}, but this machine's daemon resolves to {resolved}.\n    \
+         A roster address is the one place `serve.bind`/`serve.port` are NOT consulted — a peer's \
+         address is not this machine's — so a self entry has to name the address itself. Re-run with \
+         `--address {resolved}` if you meant this daemon; `darkmux doctor`'s `serve address` row \
+         prints the resolved value and its tier."
+    ))
 }
 
 pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
@@ -509,6 +644,123 @@ mod tests {
             normalize_daemon_base("100.64.0.2"),
             format!("http://100.64.0.2:{}", crate::serve::DEFAULT_DAEMON_PORT)
         );
+    }
+
+    // ── self-entry port mismatch (#2782 C4) ─────────────────────────────
+
+    #[test]
+    fn roster_address_port_reads_the_written_port_or_the_default() {
+        let d = crate::serve::DEFAULT_DAEMON_PORT;
+        assert_eq!(roster_address_port("127.0.0.1:8799"), 8799);
+        assert_eq!(roster_address_port("127.0.0.1"), d, "portless → default");
+        assert_eq!(roster_address_port("http://127.0.0.1:8799/"), 8799);
+        // A bare v6 literal is PORTLESS — it must not split at its own last
+        // colon and report port 1, which is what a naive rsplit does.
+        assert_eq!(roster_address_port("::1"), d);
+        assert_eq!(roster_address_port("[::1]"), d);
+        assert_eq!(roster_address_port("[::1]:8799"), 8799);
+        // Unreadable tail → portless, never an error (this feeds a warning).
+        assert_eq!(roster_address_port("localhost:not-a-port"), d);
+        assert_eq!(roster_address_port("studio.tailnet-example.ts.net"), d);
+    }
+
+    #[test]
+    fn roster_address_host_reads_the_host_or_the_string_as_typed() {
+        assert_eq!(roster_address_host("127.0.0.1:8799"), "127.0.0.1");
+        assert_eq!(roster_address_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(roster_address_host("http://127.0.0.1:8799/"), "127.0.0.1");
+        // A bare v6 literal is a HOST, not `host:port` — the same ordering
+        // `roster_address_port` relies on, from the other side.
+        assert_eq!(roster_address_host("::1"), "::1");
+        assert_eq!(roster_address_host("[::1]"), "::1");
+        assert_eq!(roster_address_host("[::1]:8799"), "::1");
+        assert_eq!(
+            roster_address_host("studio.tailnet-example.ts.net"),
+            "studio.tailnet-example.ts.net"
+        );
+        // Unreadable tail → the whole string is the host, never an error.
+        assert_eq!(
+            roster_address_host("localhost:not-a-port"),
+            "localhost:not-a-port"
+        );
+    }
+
+    #[test]
+    fn self_entry_port_warning_fires_only_on_a_self_entry_that_disagrees() {
+        // The failure #2782 C10 documented: self entry at the built-in
+        // default while this daemon listens elsewhere.
+        let w = self_entry_port_warning(true, "127.0.0.1:8765", "127.0.0.1", 8799)
+            .expect("a self entry naming a dead port must warn");
+        assert!(w.contains("8765") && w.contains("8799"), "names BOTH ports: {w}");
+        assert!(w.contains("serve address"), "points at the resolved value: {w}");
+        // A portless self entry inherits the roster default, so it is the
+        // same mismatch — the carve-out is exactly what makes it one.
+        assert!(self_entry_port_warning(true, "127.0.0.1", "127.0.0.1", 8799).is_some());
+        // Agreement is silent.
+        assert_eq!(
+            self_entry_port_warning(true, "127.0.0.1:8799", "127.0.0.1", 8799),
+            None
+        );
+        assert_eq!(
+            self_entry_port_warning(true, "127.0.0.1", "127.0.0.1", 8765),
+            None
+        );
+        // A PEER is never warned about, however its port compares to ours:
+        // that is the roster carve-out, and warning here would contradict it.
+        assert_eq!(
+            self_entry_port_warning(false, "192.0.2.10:8765", "127.0.0.1", 8799),
+            None
+        );
+        assert_eq!(
+            self_entry_port_warning(
+                false,
+                "studio.tailnet-example.ts.net",
+                "127.0.0.1",
+                8799
+            ),
+            None
+        );
+    }
+
+    /// (#2782 C2) The comparison and the suggestion are ADDRESS-shaped, not
+    /// port-shaped. `serve.bind = ::1` only became bindable in this same
+    /// delta, and a v4 entry does not reach a v6-only daemon — measured:
+    /// `curl http://[::1]:8822/health` answers, `curl
+    /// http://127.0.0.1:8822/health` does not.
+    #[test]
+    fn self_entry_warning_is_address_aware_not_port_only() {
+        // Right port, wrong family → previously silent, and dead.
+        let w = self_entry_port_warning(true, "127.0.0.1:8822", "::1", 8822)
+            .expect("a v4 self entry against a v6-only bind must warn");
+        assert!(w.contains("[::1]:8822"), "suggests the bracketed v6: {w}");
+        assert!(
+            !w.contains("--address 127.0.0.1:8822"),
+            "must not suggest the dead v4 address: {w}"
+        );
+        // …and the converse: the entry that DOES reach a `::1` daemon is
+        // silent, which is what makes the warning above actionable.
+        assert_eq!(
+            self_entry_port_warning(true, "[::1]:8822", "::1", 8822),
+            None
+        );
+        assert_eq!(self_entry_port_warning(true, "::1", "::1", 8765), None);
+        // A wildcard bind answers on every interface, so ANY loopback host
+        // reaches it — only the port can disagree there.
+        assert_eq!(
+            self_entry_port_warning(true, "127.0.0.1:8822", "0.0.0.0", 8822),
+            None
+        );
+        assert_eq!(
+            self_entry_port_warning(true, "[::1]:8822", "0.0.0.0", 8822),
+            None
+        );
+        assert!(self_entry_port_warning(true, "127.0.0.1:8765", "0.0.0.0", 8822).is_some());
+        // A wildcard is a bind directive, never a destination: the
+        // suggestion dials loopback, matching `serve_client_addr`.
+        let w = self_entry_port_warning(true, "127.0.0.1:8765", "0.0.0.0", 8822)
+            .expect("port mismatch under a wildcard bind still warns");
+        assert!(w.contains("--address 127.0.0.1:8822"), "{w}");
+        assert!(!w.contains("0.0.0.0"), "never suggests dialing a wildcard: {w}");
     }
 
     // ── cmd_machine_add uid resolution (#2768) ──────────────────────────

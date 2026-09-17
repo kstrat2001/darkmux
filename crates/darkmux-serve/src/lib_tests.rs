@@ -1837,6 +1837,48 @@
         assert!(bind_requires_token("127.0.0.5", false).is_ok());
     }
 
+    /// (#2782 C5) The gate above says v6 loopback is legal; before this the
+    /// daemon could not actually START on it, because `run` built its
+    /// `SocketAddr` with a bare `format!("{bind}:{port}")` — `"::1:8765"`,
+    /// which does not parse. Four #2782 surfaces meanwhile render IPv6 as
+    /// supported. This pins that the bind the daemon computes agrees with
+    /// what those surfaces print.
+    #[test]
+    fn an_ipv6_bind_resolves_to_a_bindable_socket_addr() {
+        let v6_loopback = listen_socket_addr("::1", 8765).expect("`::1` must bind");
+        assert_eq!(v6_loopback, "[::1]:8765".parse::<std::net::SocketAddr>().unwrap());
+        assert!(v6_loopback.is_ipv6() && v6_loopback.ip().is_loopback());
+        // The gate that says this configuration is legal, restated against
+        // the address actually computed for it.
+        assert!(bind_requires_token("::1", false).is_ok());
+
+        let v6_wildcard = listen_socket_addr("::", 8799).expect("`::` must bind");
+        assert_eq!(v6_wildcard.port(), 8799);
+        assert!(v6_wildcard.ip().is_unspecified(), "a wildcard stays a wildcard");
+
+        // v4 and the empty/default cases are unchanged.
+        assert_eq!(
+            listen_socket_addr("127.0.0.1", 8765).unwrap(),
+            "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            listen_socket_addr("0.0.0.0", 8799).unwrap(),
+            "0.0.0.0:8799".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            listen_socket_addr("", 8765).unwrap(),
+            "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap(),
+            "an empty bind falls back to the built-in default"
+        );
+
+        // A hostname is still refused — unchanged behavior, deliberately not
+        // widened here — but the error names the bind and what is accepted
+        // rather than bare `invalid socket address syntax`.
+        let err = listen_socket_addr("localhost", 8765).unwrap_err().to_string();
+        assert!(err.contains("localhost"), "{err}");
+        assert!(err.contains("serve.bind"), "points at the knob: {err}");
+    }
+
     #[test]
     fn bind_gate_refuses_nonloopback_without_token() {
         assert!(bind_requires_token("0.0.0.0", false).is_err());
@@ -6957,6 +6999,142 @@ fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
 // `admit_manual_run_at`, `src/acp.rs`'s `idle_self_exit_loop_with`) so a
 // multi-hour sleep gap is directly unit-testable without sleeping the
 // real machine.
+// (#2765) The daemon's own listen-address resolution — see
+// `crate::resolve_listen_addr`'s doc for why the flags are `Option`s.
+mod serve_listen_addr {
+
+    /// The flag still wins outright — the CLI-beats-config convention every
+    /// other flag here follows. Adding a config tier must not take the
+    /// operator's explicit `--port` away from them.
+    #[serial_test::serial]
+    #[test]
+    fn an_explicit_port_flag_beats_the_config_tier() {
+        let k = "DARKMUX_SERVE_PORT";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "8799") };
+        let (port, _) = crate::resolve_listen_addr(Some(9000), None);
+        assert_eq!(port, 9000, "the flag the operator typed wins over every tier below it");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// …and with NO flag, the config tier is actually reachable. This is
+    /// the half that was structurally impossible before: `--port` carried a
+    /// clap `default_value`, so every invocation looked explicit and no
+    /// tier beneath it could ever be consulted. A restart that forgot the
+    /// flag therefore reverted to the built-in while the machine's proxy
+    /// still pointed at the operator's port, with nothing reporting an
+    /// error.
+    #[serial_test::serial]
+    #[test]
+    fn an_absent_port_flag_falls_through_to_the_configured_value() {
+        let kp = "DARKMUX_SERVE_PORT";
+        let kb = "DARKMUX_SERVE_BIND";
+        let prev_p = std::env::var(kp).ok();
+        let prev_b = std::env::var(kb).ok();
+        unsafe {
+            std::env::set_var(kp, "8799");
+            std::env::set_var(kb, "0.0.0.0");
+        }
+        let (port, bind) = crate::resolve_listen_addr(None, None);
+        assert_eq!(port, 8799);
+        assert_eq!(bind, "0.0.0.0");
+        // And the client-side locator resolves from the SAME place, which
+        // is the whole point — a wildcard bind is probed on loopback.
+        assert_eq!(darkmux_types::config_access::serve_client_addr(), "127.0.0.1:8799");
+        unsafe {
+            match prev_p {
+                Some(v) => std::env::set_var(kp, v),
+                None => std::env::remove_var(kp),
+            }
+            match prev_b {
+                Some(v) => std::env::set_var(kb, v),
+                None => std::env::remove_var(kb),
+            }
+        }
+    }
+
+    /// Nothing set anywhere still lands on the documented built-in, so a
+    /// fresh install behaves exactly as it did before this block existed.
+    #[serial_test::serial]
+    #[test]
+    fn no_flag_and_no_config_still_lands_on_the_documented_built_in() {
+        let kp = "DARKMUX_SERVE_PORT";
+        let kb = "DARKMUX_SERVE_BIND";
+        let prev_p = std::env::var(kp).ok();
+        let prev_b = std::env::var(kb).ok();
+        unsafe {
+            std::env::remove_var(kp);
+            std::env::remove_var(kb);
+        }
+        assert_eq!(crate::resolve_listen_addr(None, None), (8765, "127.0.0.1".to_string()));
+        unsafe {
+            match prev_p {
+                Some(v) => std::env::set_var(kp, v),
+                None => std::env::remove_var(kp),
+            }
+            match prev_b {
+                Some(v) => std::env::set_var(kb, v),
+                None => std::env::remove_var(kb),
+            }
+        }
+    }
+
+    /// (#2782 C1) A bind failure carries the address it failed on.
+    ///
+    /// The banner that holds the address only prints after a SUCCESSFUL
+    /// bind, so an uncontextualized `io::Error` here is the operator's
+    /// ENTIRE stderr — and under `brew services` it respawn-loops a
+    /// context-free errno into `serve.err`. Diagnosable by elimination
+    /// while the port was always 8765; not since the port became whatever
+    /// `serve.port` resolves to.
+    ///
+    /// Squats an ephemeral loopback port and asks `run` for that exact one,
+    /// so the failure is EADDRINUSE rather than a privileged-port EACCES —
+    /// same code path, no root needed, and deterministic on any host.
+    #[serial_test::serial]
+    #[test]
+    fn a_bind_failure_names_the_address_it_failed_on() {
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let home = tempfile::tempdir().unwrap();
+        let kh = "DARKMUX_HOME";
+        let prev_h = std::env::var(kh).ok();
+        unsafe { std::env::set_var(kh, home.path()) };
+        let err = crate::run(
+            port,
+            "127.0.0.1".to_string(),
+            home.path().join("flows"),
+            None,
+        )
+        .expect_err("binding an already-bound port must fail");
+        unsafe {
+            match prev_h {
+                Some(v) => std::env::set_var(kh, v),
+                None => std::env::remove_var(kh),
+            }
+        }
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(&format!("127.0.0.1:{port}")),
+            "names the address it failed on: {chain}"
+        );
+        assert!(
+            chain.contains("serve address"),
+            "points at the row that prints the resolved value: {chain}"
+        );
+        // The OS cause survives the added context rather than replacing it.
+        assert!(
+            chain.contains("in use") || chain.contains("os error 48"),
+            "keeps the underlying io::Error: {chain}"
+        );
+    }
+}
+
 mod fleet_cache_wall_clock {
     use super::*;
     use std::time::{Duration, SystemTime};
@@ -7021,5 +7199,4 @@ mod fleet_cache_wall_clock {
              silently UNDER-report how old the snapshot actually is, the same failure class \
              this audit exists to close"
         );
-    }
-}
+    }}

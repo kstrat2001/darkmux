@@ -3,12 +3,15 @@ import { test, expect } from "@playwright/test";
 // #2280's red-first render proof. The other two specs in this directory
 // (`live-render.spec.ts`, `machine-render.spec.ts`) talk to a THROWAWAY
 // daemon on 8790 and never 8765 (see `playwright.config.ts`'s own doc) —
-// this spec needs the opposite: the OPERATOR'S real daemon on 8765, because
+// this spec needs the opposite: the OPERATOR'S own real daemon, because
 // the defect only reproduces against real mission data (a 14-step task
 // named "darkmux · unnamed-predicate" long enough to actually get squeezed;
 // a synthetic fixture wouldn't exercise the same width pressure). It never
-// talks to 8765 directly, though — `baseURL` here is the `bun run dev` vite
-// server on 5273, which proxies API calls to 8765 (see `ui/vite.config.ts`).
+// talks to that daemon directly, though — `baseURL` here is the `bun run dev`
+// vite server on 5273, which proxies API calls to it (see
+// `ui/vite.config.ts` + `ui/devProxyTarget.ts`: 8765 by default, or wherever
+// `DARKMUX_SERVE_PORT` points — export it if your port lives in
+// `config.json`, since the dev proxy reads only the env tier, #2782).
 // Run with: `DARKMUX_VERIFY_PORT=5273 npx playwright test verify/task-row-name.spec.ts --config verify/playwright.config.ts`
 // (the dev server must already be running: `bun run dev`).
 //

@@ -31,7 +31,10 @@ Does not touch `tests/e2e/`.
 ## What's still here
 
 1. **`bun run record`** — hits the operator's LIVE daemon
-   (`http://127.0.0.1:8765` by default; override with `DARKMUX_DAEMON_URL`)
+   (`DARKMUX_DAEMON_URL` wins; below it `DARKMUX_SERVE_BIND` /
+   `DARKMUX_SERVE_PORT`, the same env tier the daemon honours; else
+   `http://127.0.0.1:8765`. A JS tool does not read `config.json`, so if your
+   port lives there, export it or pass `DARKMUX_DAEMON_URL` — #2782)
    for every endpoint the viewer's lenses fetch, sanitizes every response
    (see below), and writes `corpus/*.json` + `corpus/meta.json`. Refuses to
    write anything if the daemon is unreachable or a response isn't valid
@@ -139,7 +142,7 @@ changes it demands.
 
 ```bash
 cd tests/parity
-bun run record      # needs the live daemon at 127.0.0.1:8765 (or DARKMUX_DAEMON_URL)
+bun run record      # needs the live daemon (127.0.0.1:8765, or DARKMUX_SERVE_PORT / DARKMUX_DAEMON_URL)
 bun run check
 git diff corpus/    # review before committing
 # then run every next-parity* suite and rebaseline any golden it breaks

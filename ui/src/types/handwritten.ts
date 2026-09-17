@@ -482,6 +482,27 @@ export interface MachineThermalWindow {
   worst_state: ThermalState;
   above_nominal_ms: number;
   min_cpu_speed_limit_pct: number;
+  /**
+   * (#2775) Wall-clock spent in each thermal level over the window, keyed by
+   * the level's own name. Same left-Riemann duty and sleep-gap cap as
+   * `above_nominal_ms`, which is exactly the sum of the non-`nominal`
+   * entries here. Keyed by string rather than by `ThermalState` because the
+   * KERNEL owns this vocabulary — a future macOS level is reported under its
+   * own name rather than dropped. A missing key means "never observed in
+   * this window", which is not the same claim as `0`.
+   *
+   * Optional on this type: a daemon older than FLOW schema 1.51.0 serves a
+   * `window.thermal` without it.
+   */
+  level_ms?: Record<string, number>;
+  /**
+   * (#2775) How many times each level was ENTERED during the window —
+   * transitions INTO the level, never samples observed in it. At a 5s
+   * cadence a per-sample count would report one sustained hour in `fair` as
+   * 720 and two brief excursions as 2; `level_ms` answers how long, this
+   * answers how often. Optional for the same reason as `level_ms`.
+   */
+  level_entries?: Record<string, number>;
 }
 
 export interface MachinePowerNow {

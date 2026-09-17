@@ -5,7 +5,10 @@ import { defineConfig } from "@playwright/test";
 // throwaway daemon the operator/agent starts by hand — port 8790 by
 // default (Packet 1's own proof; never port 8765, the operator's real
 // daemon — EXCEPT via `DARKMUX_VERIFY_PORT=5273`, the vite dev server, which
-// proxies API calls to 8765: `task-row-name.spec.ts` needs a REAL mission (the
+// proxies API calls to the operator's real daemon — 8765 by default, or
+// wherever `DARKMUX_SERVE_PORT` points (#2782, `ui/devProxyTarget.ts`);
+// export that here too if your port lives in `config.json`, since the dev
+// proxy reads only the env tier. `task-row-name.spec.ts` needs a REAL mission (the
 // defect only reproduces on real data), so it is a local-only proof, not CI.
 // #2282.
 // daemon), overridable via `DARKMUX_VERIFY_PORT` so a later lens packet's

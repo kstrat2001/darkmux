@@ -261,7 +261,7 @@ fn audit_dir_default() -> PathBuf {
     let resolved = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto);
     let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
     if real_user_root.as_ref() == Some(&resolved.root) {
-        return PathBuf::from("/tmp/darkmux-test-isolated/audit");
+        return darkmux_types::paths::test_isolated_dir("audit");
     }
     resolved.root.join("audit")
 }
@@ -3186,7 +3186,30 @@ mod tests {
         //           own history entry, including why ONE emitter is the
         //           whole affected population and what live verification
         //           is still owed.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.50.0");
+        //   1.51.0 (#2775): new action `machine.rollup` (Machinery,
+        //           source `host-sampler`) — ONE periodic record carrying
+        //           the whole machine-lens aggregate: the `now` /
+        //           `window` / `battery_health` object
+        //           `/machine/resources` already serves (same builder),
+        //           plus `residency` — the whole `ModelLedger`
+        //           serialized, structurally identical to what
+        //           `/machine/resources` serves under that key, and
+        //           deliberately not enumerated here or in `schema.rs`
+        //           (#2782 C7: a field list drifts from the record at
+        //           exactly the rate the hand-picked renderer did) —
+        //           plus four self-describing fields —
+        //           `period_seconds` (configured cadence),
+        //           `emitted_interval_ms` (measured gap since the last
+        //           emission), `gather_ms` (the emitter's OWN cost), and
+        //           `previous_thermal_state`. `window.thermal` gains
+        //           `level_ms` + `level_entries` on BOTH carriers.
+        //           OFF by default (`machine_rollup.enabled`). Minor,
+        //           same "additive action / additive payload key" bar as
+        //           1.21.0/1.25.0/1.29.0/1.32.0/1.33.0/1.36.0/1.48.0/
+        //           1.50.0. See `schema.rs`'s own entry for why this is a
+        //           periodic RECORD rather than a timed hook, and why
+        //           entries count transitions rather than samples.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.51.0");
     }
 
     #[test]

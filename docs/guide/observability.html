@@ -101,7 +101,7 @@ darkmux mission finalize &lt;your-mission-id&gt;   <span class="comment"># cyan:
 brew services restart darkmux     <span class="comment"># after `brew upgrade darkmux`</span>
 brew services stop darkmux        <span class="comment"># stop + unregister from login</span>
 brew services info darkmux        <span class="comment"># is it running? where are the logs?</span></code></pre>
-    <p>The brew service binds <code>127.0.0.1:8765</code> and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
+    <p>The brew service binds <code>127.0.0.1:8765</code> by default and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
 
     <h3>From source (manual)</h3>
     <p>A <code>cargo install</code> build has no brew service, so you run the daemon yourself. It is a foreground process that blocks until you Ctrl-C, so give it its own terminal tab:</p>
@@ -115,20 +115,21 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
     </div>
 
     <h3>Verify it's up</h3>
-    <pre><code>curl -s http://127.0.0.1:8765/health
+    <pre><code><span class="comment"># 8765 unless you set serve.port — `darkmux doctor`'s `serve address` row prints the resolved one.</span>
+curl -s http://127.0.0.1:8765/health
 <span class="comment"># {"darkmux_version":"3.7.1","flow_schema_version":"1.42.0"}</span></code></pre>
-    <p>Or run <code>darkmux doctor</code>: the <code>daemon: reachable</code> check reports Pass, and shows the viewer URL.</p>
+    <p>Or run <code>darkmux doctor</code>: the <code>daemon: reachable</code> check reports Pass, and shows the viewer URL. It resolves the address itself, which makes it the reliable answer when you are not certain what this daemon is listening on.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>What the doctor's daemon check does</h2>
-    <p><code>darkmux doctor</code> includes a <code>daemon: reachable</code> check that probes <code>127.0.0.1:8765/health</code> with a short timeout. Three outcomes:</p>
+    <p><code>darkmux doctor</code> includes a <code>daemon: reachable</code> check that probes this machine's <em>resolved</em> daemon address at <code>/health</code> with a short timeout — <code>serve.bind</code> and <code>serve.port</code> if you set them, otherwise <code>127.0.0.1:8765</code>. It does not assume the built-in port. Three outcomes:</p>
     <ul>
       <li><strong>Pass</strong>: daemon is up and returning 200 OK. Live viewing works, and the line shows the viewer URL.</li>
       <li><strong>Warn (connection refused)</strong>: the daemon isn't running. On Homebrew, start it with <code>brew services start darkmux</code>; from source, run <code>darkmux serve</code>. Non-fatal: you can still do work, you just won't see it live.</li>
-      <li><strong>Warn (port held)</strong>: something is on 8765 but isn't responding HTTP 200. Check whether another process is using the port.</li>
+      <li><strong>Warn (port held)</strong>: something is on that port but isn't responding HTTP 200. Check whether another process is using it.</li>
     </ul>
     <p>The check is <strong>Warn</strong>, not Fail: the daemon being off doesn't break anything end-to-end. It only disables live viewing.</p>
   </div>

@@ -211,6 +211,12 @@ fn run(cmd: Cmd) -> Result<i32> {
             flows_dir,
             lab_dir,
         } => {
+            // (#2765) `--port`/`--bind` still win outright; unset now falls
+            // through to `env(DARKMUX_SERVE_*) > config.serve.* > built-in`
+            // — the SAME resolution every client-side daemon probe reads, so
+            // the two halves cannot land on different ports the way they
+            // could when the port lived only in this command line.
+            let (port, bind) = serve::resolve_listen_addr(port, bind);
             let flows_dir = flows_dir.unwrap_or_else(crate::flow::flows_dir);
             // (#1585) `--lab-dir` > `DARKMUX_LAB_DIR` > `config.dirs.lab` >
             // `~/.darkmux/runs`. The flag still wins; the tiers beneath it are

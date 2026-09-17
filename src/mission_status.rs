@@ -184,6 +184,22 @@ fn panel_deep_link(link_base: &str, target: &str) -> Option<String> {
     Some(format!("{link_base}#lens=console&panel={target}"))
 }
 
+/// (#2765) The base URL the board's viewer deep links are built on — the
+/// RESOLVED daemon address, not the built-in literal. A clickable link
+/// built against a port nothing is listening on is the same silent
+/// asymmetry the issue was filed about, and a dead link reads as working
+/// right up until it is clicked.
+///
+/// A named function rather than an inline expression at the one call site
+/// (#2782 C5) so the resolution is reachable from a test: reverting it to
+/// a hardcoded `8765` left the entire binary crate's suite green, which
+/// means the fix was not pinned. `viewer_link_base` handles the host half
+/// and short-circuits without spawning `tailscale` when no link will be
+/// emitted.
+fn board_link_base() -> String {
+    darkmux_doctor::viewer_link_base(darkmux_types::config_access::serve_port())
+}
+
 /// (#1612) What the row CALLS a mission.
 ///
 /// The id is a mint artifact — `dispatch-code-reviewer-1785589698-5d6a-0` —
@@ -1500,7 +1516,7 @@ pub fn run(json: bool, limit: Option<usize>, all: bool, missions_only: bool) -> 
     // NB the old "isn't a TTY" spelling of that second case stopped being
     // true in B1: a panel spawn is a pipe but sets CLICOLOR_FORCE, so it DOES
     // resolve — bounded by the daemon's own panel cache.
-    let link_base = darkmux_doctor::viewer_link_base(8765);
+    let link_base = board_link_base();
     let all_link = panel_deep_link(&link_base, "mission-status-all");
     // The link is one affordance for the whole board, not one per section:
     // it goes to the same place from every group, and Active + Paused +
@@ -3025,6 +3041,30 @@ mod tests {
         std::env::set_var("DARKMUX_PANEL", "mission-status-all");
         assert_eq!(panel_deep_link(base, "mission-status-all"), None);
         std::env::remove_var("DARKMUX_PANEL");
+    }
+
+    /// (#2782 C5) The board's link base follows the RESOLVED daemon port.
+    ///
+    /// #2765 fixed this call site and pinned nothing: reverting it to a
+    /// hardcoded `8765` left this crate's whole suite green. A dead link
+    /// reads as working right up until it is clicked, which is precisely
+    /// the class of silence the issue was filed about — so it gets a test
+    /// that fails when the literal comes back.
+    #[test]
+    #[serial_test::serial]
+    fn board_link_base_follows_the_configured_serve_port() {
+        let prev = std::env::var("DARKMUX_SERVE_PORT").ok();
+        std::env::set_var("DARKMUX_SERVE_PORT", "8799");
+        let base = board_link_base();
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+            None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+        }
+        assert!(base.contains(":8799/"), "must use the resolved port: {base}");
+        assert!(
+            !base.contains(":8765"),
+            "the built-in literal must not survive a configured port: {base}"
+        );
     }
 
     #[test]

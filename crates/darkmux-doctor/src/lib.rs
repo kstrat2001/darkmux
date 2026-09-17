@@ -145,6 +145,11 @@ pub fn run() -> DoctorReport {
         check_models_loaded(),
         check_profile_loaded_match(),
         check_darkmux_version_vs_latest_release(),
+        // (#2765) The CONFIGURED address, before the reachability probe that
+        // uses it — so a reader sees where darkmux is looking, then whether
+        // anything answered there. The pair is what makes a port mismatch
+        // readable in one command instead of by probing ports by hand.
+        check_serve_address(),
         check_daemon_reachable(),
         // (#1461) Staleness: what is RUNNING vs what is INSTALLED vs the source.
         check_daemon_freshness(),
@@ -171,6 +176,9 @@ pub fn run() -> DoctorReport {
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
+        // (#2775) Immediately after the sampler cadence it depends on — the
+        // one combination worth reporting is "rollup on, sampler off".
+        check_machine_rollup(),
         check_host_sampler(),
         check_liveness_retention(),
         check_generation_checkpoint_interval(),
@@ -2830,6 +2838,111 @@ fn check_host_sampler_interval() -> Check {
     }
 }
 
+/// (#2775) The periodic `machine.rollup` heartbeat — the machine-lens
+/// aggregate (thermal, cpu/gpu/memory, power, battery, residency) emitted
+/// into the flow stream so darkmux is usable as a machine-observability
+/// module by a harness that never opens the viewer.
+///
+/// The row exists mainly for ONE state that is otherwise invisible:
+/// `machine_rollup.enabled: true` while `runtime.host_sampler_interval_ms`
+/// is `0`. The emitter rides the daemon's sampler thread, and a `0` there
+/// means that thread is never spawned — so the feature reads as ON in the
+/// config and emits nothing, forever, with no error anywhere. An operator
+/// discovering that by the absence of records is the same "healthy and
+/// silent" failure shape #2765 was filed about, and the fix is the same:
+/// say so in one line rather than leave it to be inferred.
+///
+/// Warn, not Fail: nothing is broken, and darkmux does not adjudicate the
+/// operator's intent. It reports the combination and names both knobs.
+///
+/// **The row says "takes effect on daemon restart", and that clause is
+/// load-bearing.** This check runs in a FRESH process, so it reads the
+/// config file as it is now; the daemon read its own copy once at start
+/// (`config_access::config` is a process-wide `OnceLock` with no
+/// invalidation path). Without the clause the row confirms the wrong
+/// thing — an operator flips the knob, sees `✓ machine_rollup on`, and
+/// gets silence forever, which is the same healthy-and-silent shape the
+/// row exists to prevent, one feature over. Proven live 2026-09-17: knob
+/// flipped, this row read "on", and the running daemon emitted 0 rollups
+/// over 40s; 4 in the 12s after a restart.
+fn check_machine_rollup() -> Check {
+    use darkmux_types::config_access::Source;
+    let name = "machine_rollup";
+    let (enabled, enabled_src) = darkmux_types::config_access::machine_rollup_enabled_with_source();
+    let (period, period_src) =
+        darkmux_types::config_access::machine_rollup_period_seconds_with_source();
+    let label = |s: Source| match s {
+        Source::Env => "env",
+        Source::Config => "config.json",
+        Source::BuiltIn => "default",
+    };
+    if !enabled {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "off ({}) — no periodic machine.rollup records. Enable with \
+                 `darkmux config set machine_rollup.enabled true` (takes effect \
+                 on daemon restart)",
+                label(enabled_src)
+            ),
+            hint: None,
+        };
+    }
+    let sampler_ms = darkmux_types::config_access::host_sampler_interval_ms();
+    if sampler_ms == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "on ({}), period {period}s ({}) — but runtime.host_sampler_interval_ms is 0, \
+                 which disables the daemon sampler thread the emitter runs on, so no \
+                 machine.rollup record is ever written",
+                label(enabled_src),
+                label(period_src)
+            ),
+            hint: Some(
+                "set a non-zero cadence (`darkmux config set \
+                 runtime.host_sampler_interval_ms 5000`), or turn the rollup off \
+                 (`darkmux config set machine_rollup.enabled false`) so the config says \
+                 what is actually happening."
+                    .into(),
+            ),
+        };
+    }
+    if period == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "on ({}), but period_seconds is 0 ({}) — 0 means OFF here (the same \
+                 convention as runtime.host_sampler_interval_ms / redis.maxlen), so no \
+                 record is ever emitted",
+                label(enabled_src),
+                label(period_src)
+            ),
+            hint: Some(
+                "set a real period (`darkmux config set machine_rollup.period_seconds 60`), \
+                 or turn the block off so the two fields agree."
+                    .into(),
+            ),
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "on ({}) · every {period}s ({}) — machine.rollup carries the machine-lens \
+             aggregate into the flow stream. This row reads the config FILE, not the \
+             running daemon — a daemon reads its config once at start, so a change \
+             here takes effect on daemon restart",
+            label(enabled_src),
+            label(period_src)
+        ),
+        hint: None,
+    }
+}
+
 /// (#2413) Surface the singleton host-sampler lock's state —
 /// `<darkmux-home>/liveness/host-sampler.lock` — the coordination file that
 /// keeps exactly one machine.telemetry emitter alive per machine (the
@@ -4195,11 +4308,23 @@ fn eureka_checks() -> Vec<Check> {
 /// else). The serve-status JSON shape: `.Web["<host>:<port>"].Handlers["/"]
 /// .Proxy == "http://127.0.0.1:<our-port>"`; the served port picks the scheme
 /// (443 → https, else http).
-fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
+///
+/// (#2782 C4) Three spellings of "us" are accepted, not two: loopback,
+/// `localhost`, and the daemon's own resolved `bind` host. An operator who
+/// bound one specific interface will have written `tailscale serve` against
+/// THAT address, and matching only the loopback spellings would report "no
+/// tailnet URL" for a proxy that is in fact pointed straight at this daemon.
+/// A wildcard bind collapses back to loopback before it gets here
+/// (`format_client_addr`), so it adds no fourth case.
+fn parse_tailnet_viewer_url(json: &str, bind: &str, port: u16) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let web = v.get("Web")?.as_object()?;
     let want_loopback = format!("http://127.0.0.1:{port}");
     let want_localhost = format!("http://localhost:{port}");
+    let want_bind = format!(
+        "http://{}",
+        darkmux_types::config_access::format_client_addr(bind, port)
+    );
     for (hostport, cfg) in web {
         let proxies_to_us = cfg
             .get("Handlers")
@@ -4208,7 +4333,7 @@ fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
                 handlers.values().any(|h| {
                     h.get("Proxy")
                         .and_then(|p| p.as_str())
-                        .map(|p| p == want_loopback || p == want_localhost)
+                        .map(|p| p == want_loopback || p == want_localhost || p == want_bind)
                         .unwrap_or(false)
                 })
             })
@@ -4231,8 +4356,8 @@ fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
 /// URL proxying to the local daemon on `port`. `None` on any failure (tailscale
 /// absent, not serving, or a non-zero/garbage response) — a missing tailnet URL
 /// is never an error, just an absent line in the doctor message.
-fn tailnet_viewer_url(port: u16) -> Option<String> {
-    tailnet_viewer_url_bounded(port, TAILNET_PROBE_TIMEOUT)
+fn tailnet_viewer_url(bind: &str, port: u16) -> Option<String> {
+    tailnet_viewer_url_bounded(bind, port, TAILNET_PROBE_TIMEOUT)
 }
 
 /// (#1569 packet A gate) How long the `tailscale` probe may take before it is
@@ -4256,7 +4381,11 @@ const TAILNET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 /// Poll-and-kill rather than a watchdog thread: `try_wait` keeps ownership of
 /// the child so the kill is guaranteed on every exit path, and the cost is a
 /// few 25ms sleeps in the rare slow case.
-fn tailnet_viewer_url_bounded(port: u16, timeout: std::time::Duration) -> Option<String> {
+fn tailnet_viewer_url_bounded(
+    bind: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Option<String> {
     let mut child = std::process::Command::new("tailscale")
         .args(["serve", "status", "--json"])
         .stdout(std::process::Stdio::piped())
@@ -4290,7 +4419,7 @@ fn tailnet_viewer_url_bounded(port: u16, timeout: std::time::Duration) -> Option
     }
 
     let out = child.wait_with_output().ok()?;
-    parse_tailnet_viewer_url(&String::from_utf8_lossy(&out.stdout), port)
+    parse_tailnet_viewer_url(&String::from_utf8_lossy(&out.stdout), bind, port)
 }
 
 /// (#1569 packet A) The base URL that linkified CLI output points at — the
@@ -4330,22 +4459,115 @@ fn tailnet_viewer_url_bounded(port: u16, timeout: std::time::Duration) -> Option
 /// gated on `colorize_enabled()`: piped, redirected, and `--json` output emit
 /// no links at all, and therefore pay no subprocess. A standalone machine
 /// never spawns it regardless.
+///
+/// **The direct fallback honors `serve.bind`, not a hardcoded loopback**
+/// (#2782 C4). #2765 made this take the resolved PORT but left the HOST a
+/// literal `127.0.0.1`, which closed the defect halfway: with a
+/// non-loopback bind, doctor's own `serve address` row named that address
+/// while every link this function produced pointed at loopback, so the two
+/// rows disagreed and the clickable link went somewhere nothing is
+/// listening. `config_access::format_client_addr` is the one place that
+/// answers "what does a client on this machine connect to", wildcard rule
+/// included (`0.0.0.0` is a bind directive, not a destination, so it still
+/// resolves back to loopback here).
 pub fn viewer_link_base(port: u16) -> String {
-    let loopback = format!("http://127.0.0.1:{port}/");
+    let bind = darkmux_types::config_access::serve_bind();
+    let direct = format!(
+        "http://{}/",
+        darkmux_types::config_access::format_client_addr(&bind, port)
+    );
     if !darkmux_types::style::colorize_enabled() {
-        return loopback;
+        return direct;
     }
     match darkmux_types::config_access::fleet_mode() {
-        darkmux_types::config::FleetMode::Standalone => loopback,
-        _ => tailnet_viewer_url(port).unwrap_or(loopback),
+        darkmux_types::config::FleetMode::Standalone => direct,
+        _ => tailnet_viewer_url(&bind, port).unwrap_or(direct),
+    }
+}
+
+/// (#2765) Where the RESOLVED daemon address came from, rendered for the
+/// `serve address` row: `env` names the variable, `config.json` names the
+/// key, and the built-in tier says so plainly.
+///
+/// Both halves are resolved independently because they are independent
+/// knobs — an operator with `DARKMUX_SERVE_PORT` exported and `serve.bind`
+/// in their config has two different provenances at once, and a single
+/// blended label would have to lie about one of them.
+fn serve_address_provenance() -> String {
+    use darkmux_types::config_access::Source;
+    let port_src = match darkmux_types::config_access::serve_port_with_source().1 {
+        Source::Env => "port from DARKMUX_SERVE_PORT env",
+        Source::Config => "port from config.serve.port",
+        Source::BuiltIn => "port default",
+    };
+    let bind_src = match darkmux_types::config_access::serve_bind_with_source().1 {
+        Source::Env => "bind from DARKMUX_SERVE_BIND env",
+        Source::Config => "bind from config.serve.bind",
+        Source::BuiltIn => "bind default",
+    };
+    format!("{port_src}, {bind_src}")
+}
+
+/// (#2765) The resolved daemon listen address, with the tier each half came
+/// from. A pure config read — it never touches the network, so it answers
+/// even when the daemon is down, which is exactly when the question gets
+/// asked.
+///
+/// This row exists because the failure it describes is INVISIBLE from the
+/// host: on 2026-09-16 a daemon was serving happily on the operator's
+/// configured port while every client probed the built-in 8765, and
+/// diagnosing it cost several minutes of probing ports by hand. One line
+/// naming the resolved address and where it came from answers it outright.
+/// Separate from `DAEMON_CHECK_NAME` (reachability) on purpose: "what
+/// address is configured" and "is anything answering there" are different
+/// questions, and collapsing them is what made the first one unanswerable
+/// while the second was failing.
+///
+/// **It prints the LISTEN address, and appends the client-probe address
+/// only when the two differ** (#2782 MF2). The first cut printed
+/// `serve_client_addr()` under a label built from `serve_bind_with_source()`
+/// — fine while the bind was loopback, and inverted the moment it was not:
+/// with `DARKMUX_SERVE_BIND=0.0.0.0` the row rendered
+/// `127.0.0.1:8765 (port default, bind from DARKMUX_SERVE_BIND env)`, so
+/// the value the operator had just set appeared NOWHERE in the output of
+/// the row added specifically so provenance is never in doubt. An operator
+/// debugging "why can't the tailnet reach my daemon" reads that as their
+/// bind not having taken. Both addresses are real and both are wanted; the
+/// row names which is which rather than silently picking one.
+fn check_serve_address() -> Check {
+    let listen = darkmux_types::config_access::serve_listen_addr();
+    let client = darkmux_types::config_access::serve_client_addr();
+    let provenance = serve_address_provenance();
+    // The common case (a specific bind) has one address and says so once.
+    // A wildcard bind has two, and both matter: the first answers "did my
+    // bind take", the second answers "where do checks on this machine go".
+    let message = if listen == client {
+        format!("{listen} ({provenance})")
+    } else {
+        format!("{listen} ({provenance}) · clients on this machine probe {client}")
+    };
+    Check {
+        name: "serve address".into(),
+        status: Status::Pass,
+        message,
+        hint: None,
     }
 }
 
 fn check_daemon_reachable() -> Check {
-    // Check if the darkmux daemon is reachable at 127.0.0.1:8765/health.
-    // Pass when reachable, Warn otherwise (daemon being off doesn't break
-    // end-to-end; it just disables live viewing).
-    check_daemon_reachable_impl("127.0.0.1", 8765)
+    // (#2765) Probe the RESOLVED address, not a hardcoded literal. Probing
+    // 127.0.0.1:8765 while the daemon listens on the operator's configured
+    // port is the exact asymmetry the issue was filed about — doctor would
+    // have reported "daemon not reachable" about a perfectly healthy
+    // daemon, which is worse than not checking.
+    //
+    // `serve_client_addr` resolves a wildcard bind to loopback for us, so a
+    // daemon bound to every interface is probed somewhere it is actually
+    // listening rather than at the unroutable `0.0.0.0`.
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let port = darkmux_types::config_access::serve_port();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+    check_daemon_reachable_impl(host, port)
 }
 
 /// (#1665) Whether a raw HTTP response's body parses as JSON carrying a
@@ -4427,15 +4649,28 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
     let addr = format!("{}:{}", host, port);
 
     // Use a short timeout since this is local loopback.
+    //
+    // (#2765) A literal IP parses directly; a NAME (`localhost`, a
+    // `.tailnet.ts.net` host) needs resolution. Before the bind address
+    // became configurable every caller passed `127.0.0.1`, so the parse
+    // could not fail; now an operator may legitimately write
+    // `serve.bind: "localhost"`, and reporting their own config back as
+    // "invalid address" would be a false Warn about a working daemon.
     let addr_parsed = match addr.parse() {
         Ok(a) => a,
         Err(_) => {
-            return Check {
-                name: DAEMON_CHECK_NAME.into(),
-                status: Status::Warn,
-                message: format!("invalid address {}", addr),
-                hint: None,
-            };
+            use std::net::ToSocketAddrs;
+            match addr.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+                Some(a) => a,
+                None => {
+                    return Check {
+                        name: DAEMON_CHECK_NAME.into(),
+                        status: Status::Warn,
+                        message: format!("invalid address {}", addr),
+                        hint: None,
+                    };
+                }
+            }
         }
     };
 
@@ -4505,7 +4740,7 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
         // the loopback URL (this machine) + the tailnet URL (phone / other
         // tailnet device) when `tailscale serve` is proxying to this daemon.
         let mut message = format!("reachable · viewer http://{addr}/");
-        if let Some(tn) = tailnet_viewer_url(port) {
+        if let Some(tn) = tailnet_viewer_url(host, port) {
             message.push_str(&format!(" · phone {tn}"));
         }
         Check {
@@ -4531,11 +4766,14 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
                  darkmux's — no `darkmux_version` field. Possibly another process holding \
                  this port."
             ),
-            hint: Some(
+            // (#2765) Name the port that was ACTUALLY probed. A hint telling
+            // the operator to `lsof -i :8765` when the probe went to the port
+            // their config names sends them to look at the wrong port —
+            // the same mismatch this issue is about, one layer down.
+            hint: Some(format!(
                 "run `darkmux serve` on a free port, or check what's already listening on \
-                 8765 (`lsof -i :8765`)"
-                    .into(),
-            ),
+                 {port} (`lsof -i :{port}`)"
+            )),
         }
     } else {
         // Port is open but not darkmux (or wrong endpoint).
@@ -4547,10 +4785,9 @@ fn check_daemon_reachable_impl(host: &str, port: u16) -> Check {
                 "daemon not responding correctly at {}: {}",
                 addr, first_line
             ),
-            hint: Some(
-                "ensure `darkmux serve` is running (port 8765 may be held by another process)"
-                    .into(),
-            ),
+            hint: Some(format!(
+                "ensure `darkmux serve` is running (port {port} may be held by another process)"
+            )),
         }
     }
 }
@@ -4737,10 +4974,15 @@ fn fmt_age(secs: u64) -> String {
 }
 
 fn check_daemon_freshness() -> Check {
-    // Same locator the reachability check uses (127.0.0.1:8765) — there is no
-    // port resolver in the codebase to reuse; the daemon's port is a `serve`
-    // flag with this default, and both checks hardcode it identically.
-    let running = loopback_http_body("127.0.0.1", 8765, "/health")
+    // (#2765) Same locator the reachability check uses — and it is now a
+    // RESOLVER, not a literal. The comment this replaces said "there is no
+    // port resolver in the codebase to reuse; both checks hardcode it
+    // identically", which was true and was the bug: identical hardcoding
+    // across every client is exactly how a daemon on a configured port
+    // became invisible to all of them at once.
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
+    let running = loopback_http_body(&host, darkmux_types::config_access::serve_port(), "/health")
         .as_deref()
         .and_then(parse_daemon_build);
     classify_daemon_freshness(
@@ -5366,6 +5608,34 @@ fn summarize_temp_residue(dir: &std::path::Path) -> TempResidue {
 ///   NAMESPACE rather than on a source pattern, so it sees a directory
 ///   nobody has taught it about — which is the property a text scan for
 ///   "creates a temp dir and abandons it" could not have.
+///
+/// # (#2777) `darkmux-test-isolated-<pid>` needs no special handling here
+///
+/// Worth stating so nobody "fixes" it later — and worth stating the SHAPE
+/// exactly, because the first draft of this paragraph got it wrong and
+/// then reasoned from the wrong shape (#2782 MF3). #2777 moved the
+/// test-build scratch fallback from a fixed `/tmp/darkmux-test-isolated`
+/// to `<temp>/darkmux-test-isolated-<pid>`: a HYPHEN, so each test process
+/// gets its own SIBLING directory directly under the temp root, not a
+/// `<pid>` subdirectory one level down. `darkmux_types::paths::
+/// test_isolated_root`'s own unit tests pin both halves of that (the
+/// pid-bearing name, and the parent being the temp root itself).
+///
+/// Two consequences, and neither needs code here:
+///
+/// * **The count is per-process, and that is correct.** Three abandoned
+///   roots count 3, not 1 — they ARE three trees, and this row's whole job
+///   is making accumulation visible. Collapsing them would be the row
+///   lying to keep itself quiet.
+/// * **The BREAKDOWN still reads as one line.** [`temp_residue_family`]
+///   strips a trailing all-digits segment, so every `darkmux-test-isolated-
+///   <pid>` reports under the single family `darkmux-test-isolated` no
+///   matter how many processes have run — which is the property that keeps
+///   a warn-threshold breakdown readable.
+///
+/// What this check must NOT grow is recursion: descending into a per-pid
+/// root would start counting live processes' working state as though it
+/// were abandoned residue.
 fn check_temp_residue() -> Check {
     let tmp = std::env::temp_dir();
     let residue = summarize_temp_residue(&tmp);
@@ -7073,6 +7343,37 @@ mod tests {
         let residue = summarize_temp_residue(root.path());
         assert_eq!(residue.total, TEMP_RESIDUE_WARN_AT);
         assert_eq!(residue.families, vec![("darkmux-flow-test".to_string(), TEMP_RESIDUE_WARN_AT)]);
+    }
+
+    /// (#2782 MF3) The `darkmux-test-isolated-<pid>` shape, asserted so the
+    /// paragraph above this check cannot drift away from it again.
+    ///
+    /// That paragraph used to describe a nested `<temp>/darkmux-test-
+    /// isolated/<pid>` and conclude the tree "reads as exactly one
+    /// directory no matter how many test processes have run". The shipped
+    /// shape is a HYPHEN — per-pid SIBLINGS directly under the temp root —
+    /// so the count is per-process, which is correct (three abandoned trees
+    /// are three trees) and the opposite of what the comment claimed. Only
+    /// the FAMILY collapses, via the trailing-digits strip.
+    #[test]
+    fn per_pid_test_isolated_roots_count_separately_and_share_one_family() {
+        let names = [
+            "darkmux-test-isolated-111",
+            "darkmux-test-isolated-222",
+            "darkmux-test-isolated-333",
+        ];
+        let root = temp_root_with(&names, &[]);
+        let residue = summarize_temp_residue(root.path());
+        assert_eq!(
+            residue.total, 3,
+            "each per-pid root is its own directory under the temp root"
+        );
+        assert_eq!(
+            residue.families,
+            vec![(darkmux_types::paths::TEST_ISOLATED_DIR_NAME.to_string(), 3)],
+            "…and they all report under the one family, so the breakdown stays \
+             one line however many processes have run"
+        );
     }
 
     /// An unreadable or absent temp root reports nothing rather than
@@ -8934,6 +9235,383 @@ mod tests {
         );
     }
 
+    // ─── (#2765) check_serve_address / the resolved daemon locator ────────
+
+    /// The row exists because the failure is INVISIBLE from the host: a
+    /// daemon serving happily on a configured port while every client
+    /// probes the built-in one. It must name the RESOLVED address and where
+    /// each half came from, and — being a pure config read — must answer
+    /// even with no daemon running, which is exactly when it is asked.
+    #[serial_test::serial]
+    #[test]
+    fn check_serve_address_names_the_resolved_address_and_its_provenance() {
+        let prev = std::env::var("DARKMUX_SERVE_PORT").ok();
+        unsafe { std::env::remove_var("DARKMUX_SERVE_PORT") };
+        let check = check_serve_address();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.contains("127.0.0.1:8765"), "{}", check.message);
+        assert!(check.message.contains("port default"), "{}", check.message);
+
+        unsafe { std::env::set_var("DARKMUX_SERVE_PORT", "8799") };
+        let check = check_serve_address();
+        assert!(
+            check.message.contains("127.0.0.1:8799"),
+            "must report the RESOLVED port, not the built-in: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("DARKMUX_SERVE_PORT"),
+            "must name the tier that won, so the operator never wonders \
+             where the value came from: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+                None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+        }
+    }
+
+    /// (#2782 MF2) The row prints the address its own LABEL describes.
+    ///
+    /// The first cut printed `serve_client_addr()` under a provenance
+    /// string built from `serve_bind_with_source()`, so with
+    /// `DARKMUX_SERVE_BIND=0.0.0.0` it rendered `127.0.0.1:8765 (port
+    /// default, bind from DARKMUX_SERVE_BIND env)` — the value the operator
+    /// had just set appeared nowhere, on the row added specifically so
+    /// provenance is never in doubt. Someone debugging "why can't the
+    /// tailnet reach my daemon" reads that as their bind not having taken.
+    #[serial_test::serial]
+    #[test]
+    fn check_serve_address_prints_the_bind_it_names_and_the_probe_address_too() {
+        let prev_bind = std::env::var("DARKMUX_SERVE_BIND").ok();
+        let prev_port = std::env::var("DARKMUX_SERVE_PORT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_SERVE_BIND", "0.0.0.0");
+            std::env::remove_var("DARKMUX_SERVE_PORT");
+        }
+
+        let check = check_serve_address();
+        assert!(
+            check.message.contains("0.0.0.0:8765"),
+            "the row names DARKMUX_SERVE_BIND as the source, so the value from \
+             it has to be what is printed: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("DARKMUX_SERVE_BIND"),
+            "provenance still named: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("clients on this machine probe 127.0.0.1:8765"),
+            "a wildcard bind is not a destination — the probe address is real \
+             and wanted, it just is not the listen address: {}",
+            check.message
+        );
+
+        // A SPECIFIC bind has one address, and the row must not pad it with a
+        // redundant second copy of the same string.
+        unsafe { std::env::set_var("DARKMUX_SERVE_BIND", "127.0.0.1") };
+        let check = check_serve_address();
+        assert!(
+            !check.message.contains("clients on this machine probe"),
+            "listen == probe, so there is nothing to disambiguate: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev_bind {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_BIND", v),
+                None => std::env::remove_var("DARKMUX_SERVE_BIND"),
+            }
+            match prev_port {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+                None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+        }
+    }
+
+    /// The reachability probe must follow the SAME resolution. Probing
+    /// 127.0.0.1:8765 while the daemon listens elsewhere would report
+    /// "not reachable" about a healthy daemon — worse than not checking.
+    /// Proved against a real listener on an ephemeral port, so the
+    /// assertion is about the probe's destination and not about a string.
+    #[serial_test::serial]
+    #[test]
+    fn check_daemon_reachable_probes_the_configured_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let prev = std::env::var("DARKMUX_SERVE_PORT").ok();
+        unsafe { std::env::set_var("DARKMUX_SERVE_PORT", port.to_string()) };
+
+        let check = check_daemon_reachable();
+        // Nothing speaks HTTP on that listener, so the verdict is a Warn —
+        // but the ADDRESS in the message is the point: it proves the probe
+        // went where the config said, not to the built-in literal.
+        assert!(
+            check.message.contains(&format!("127.0.0.1:{port}")),
+            "the probe must target the resolved address: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("127.0.0.1:8765"),
+            "the built-in literal must not appear when the config names \
+             another port: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+                None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+        }
+    }
+
+    /// (#2782 C5) The FRESHNESS check probes too, and it was unpinned:
+    /// reverting it to the literal `loopback_http_body("127.0.0.1", 8765,
+    /// "/health")` left all 294 tests in this crate green. A surviving
+    /// mutation is not a guard.
+    ///
+    /// Same ephemeral-listener shape as the reachability test above, but
+    /// this one has to ANSWER, because a probe that connects to nothing
+    /// yields `not_applicable` ("no daemon running") — which is also what
+    /// the mutated code produces when nothing happens to hold 8765. So the
+    /// fake daemon returns a legacy `/health` body carrying a sentinel
+    /// version, and the assertion is that the sentinel came back. That
+    /// stays red under the mutation in BOTH worlds: nothing on 8765 (no
+    /// daemon ⇒ `not_applicable`), or the operator's REAL daemon on 8765
+    /// (a modern build ⇒ some other message).
+    #[serial_test::serial]
+    #[test]
+    fn check_daemon_freshness_probes_the_configured_port() {
+        const SENTINEL: &str = "0.0.0-freshness-port-probe";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The accept is DEADLINED, not blocking. Under the mutation this
+        // test exists to catch, the probe goes to 8765 and never connects
+        // here — a bare `accept()` would then block forever and the join
+        // below would turn a clean RED into a hang, which is the worst
+        // shape a guard can have (`.config/nextest.toml`'s whole reason for
+        // existing). Non-blocking poll + a deadline makes the mutated run
+        // FAIL in a couple of seconds instead.
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                            .ok();
+                        // Read the request line so the client's write
+                        // completes, then answer and hang up (`Connection:
+                        // close` is what makes `loopback_http_body`'s
+                        // read_to_end terminate).
+                        let mut scratch = [0u8; 1024];
+                        let _ = std::io::Read::read(&mut stream, &mut scratch);
+                        let body = format!("{{\"darkmux_version\":\"{SENTINEL}\"}}");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let prev = std::env::var("DARKMUX_SERVE_PORT").ok();
+        unsafe { std::env::set_var("DARKMUX_SERVE_PORT", port.to_string()) };
+        let check = check_daemon_freshness();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_PORT", v),
+                None => std::env::remove_var("DARKMUX_SERVE_PORT"),
+            }
+        }
+        let _ = server.join();
+
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a legacy daemon answered on the CONFIGURED port, so the check must \
+             have reached it: {check:?}"
+        );
+        assert!(
+            check.message.contains(SENTINEL),
+            "the verdict must be about the daemon on the configured port, not \
+             whatever holds the built-in literal: {}",
+            check.message
+        );
+    }
+
+    // ─── (#2775) check_machine_rollup ─────────────────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_reports_off_by_default() {
+        let prev = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        unsafe { std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED") };
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.message.starts_with("off"), "{}", check.message);
+        assert!(
+            check.message.contains("machine_rollup.enabled"),
+            "an off feature should say how to turn it on: {}",
+            check.message
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+        }
+    }
+
+    /// The one state worth a row: enabled, and silent forever, because the
+    /// sampler thread the emitter rides is disabled. Discovering that by
+    /// the absence of records is the same "healthy and silent" shape #2765
+    /// was filed about.
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_warns_when_enabled_but_the_sampler_is_off() {
+        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "true");
+            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0");
+        }
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("runtime.host_sampler_interval_ms"),
+            "must name the OTHER knob, or the operator cannot act on it: {}",
+            check.message
+        );
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+            match prev_sampler {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    /// `period_seconds: 0` means OFF here, so "enabled with a 0 period" is
+    /// a config that contradicts itself — reported, not silently coerced to
+    /// the default, because coercing would make the file say something it
+    /// does not mean.
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_warns_when_enabled_with_a_zero_period() {
+        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        let prev_period = std::env::var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS").ok();
+        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "1");
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "0");
+            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5000");
+        }
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("period_seconds is 0"), "{}", check.message);
+
+        // …and a healthy combination passes, naming both resolved values.
+        unsafe { std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "60") };
+        let check = check_machine_rollup();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("every 60s"), "{}", check.message);
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+            match prev_period {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
+            }
+            match prev_sampler {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    /// (#2782 MF1) The row must say the change needs a daemon RESTART, in
+    /// BOTH the on and the off state.
+    ///
+    /// Without that clause this row confirms the wrong thing. `config()` is
+    /// a process-wide `OnceLock` with no invalidation path, so a
+    /// config-tier write is invisible to an already-running daemon — but
+    /// this check runs in a fresh process and reads the new file. Proven
+    /// live 2026-09-17: knob flipped, row read `✓ machine_rollup on
+    /// (config.json) · every 2s`, daemon emitted 0 rollups in 40s; 4 in the
+    /// 12s after a restart. The operator's next move after reading this row
+    /// is the whole point of the row.
+    #[serial_test::serial]
+    #[test]
+    fn check_machine_rollup_says_a_change_needs_a_daemon_restart() {
+        let prev_enabled = std::env::var("DARKMUX_MACHINE_ROLLUP_ENABLED").ok();
+        let prev_period = std::env::var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS").ok();
+        let prev_sampler = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+
+        unsafe { std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED") };
+        let off = check_machine_rollup();
+        assert!(
+            off.message.contains("daemon restart"),
+            "the OFF row tells the operator how to turn it on, so it must also \
+             tell them that doing so needs a restart: {}",
+            off.message
+        );
+
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", "true");
+            std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", "60");
+            std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5000");
+        }
+        let on = check_machine_rollup();
+        assert_eq!(on.status, Status::Pass, "{}", on.message);
+        assert!(
+            on.message.contains("daemon restart"),
+            "the ON row is the one that reproduced the defect — it read as \
+             healthy while the running daemon emitted nothing: {}",
+            on.message
+        );
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_ENABLED"),
+            }
+            match prev_period {
+                Some(v) => std::env::set_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_MACHINE_ROLLUP_PERIOD_SECONDS"),
+            }
+            match prev_sampler {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
     // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
 
     #[serial_test::serial]
@@ -10200,6 +10878,60 @@ mod tests {
         }
     }
 
+    /// (#2782 C4) The link's HOST follows `serve.bind`, the same as its
+    /// port follows `serve.port`.
+    ///
+    /// #2765 closed this halfway: it threaded the resolved port through and
+    /// left `127.0.0.1` hardcoded, so on a non-loopback bind doctor's own
+    /// `serve address` row named one address while every link this function
+    /// produced named another — two rows of the same output disagreeing,
+    /// and the clickable one pointing where nothing is listening.
+    ///
+    /// The wildcard half is the other direction and is equally required: a
+    /// bind of `0.0.0.0` is a directive, not a destination, so a LINK must
+    /// still resolve back to loopback. Both cases in one test because
+    /// "honors the bind" and "does not honor a wildcard" are the same rule.
+    #[test]
+    #[serial_test::serial]
+    fn viewer_link_base_honors_the_bind_host_but_not_a_wildcard() {
+        let prev_mode = std::env::var("DARKMUX_FLEET_MODE").ok();
+        let prev_bind = std::env::var("DARKMUX_SERVE_BIND").ok();
+        unsafe { std::env::set_var("DARKMUX_FLEET_MODE", "standalone") };
+        darkmux_types::style::set_colorize_override(Some(true));
+
+        // A documentation-range address (RFC 5737 TEST-NET-1), so nothing in
+        // this repo's committed text names a real host.
+        unsafe { std::env::set_var("DARKMUX_SERVE_BIND", "192.0.2.10") };
+        assert_eq!(
+            viewer_link_base(8765),
+            "http://192.0.2.10:8765/",
+            "a specific bind is where the daemon is; a loopback link would be dead"
+        );
+
+        unsafe { std::env::set_var("DARKMUX_SERVE_BIND", "0.0.0.0") };
+        assert_eq!(
+            viewer_link_base(8765),
+            "http://127.0.0.1:8765/",
+            "a wildcard is a bind directive, not somewhere a browser can go"
+        );
+
+        // An IPv6 literal has to come back bracketed or the URL is unparseable.
+        unsafe { std::env::set_var("DARKMUX_SERVE_BIND", "::1") };
+        assert_eq!(viewer_link_base(8765), "http://[::1]:8765/");
+
+        darkmux_types::style::set_colorize_override(None);
+        unsafe {
+            match prev_mode {
+                Some(v) => std::env::set_var("DARKMUX_FLEET_MODE", v),
+                None => std::env::remove_var("DARKMUX_FLEET_MODE"),
+            }
+            match prev_bind {
+                Some(v) => std::env::set_var("DARKMUX_SERVE_BIND", v),
+                None => std::env::remove_var("DARKMUX_SERVE_BIND"),
+            }
+        }
+    }
+
     /// (#1593 gate, MUST FIX) The probe must not outlive its deadline. A
     /// wedged `tailscaled` used to hang `mission status` forever — the same
     /// unbounded-external-dependency class #1570/#1573 removed for Redis.
@@ -10220,7 +10952,7 @@ mod tests {
         unsafe { std::env::set_var("PATH", format!("{}:{prev_path}", dir.path().display())) };
 
         let started = std::time::Instant::now();
-        let got = tailnet_viewer_url_bounded(8765, std::time::Duration::from_millis(300));
+        let got = tailnet_viewer_url_bounded("127.0.0.1", 8765, std::time::Duration::from_millis(300));
         let elapsed = started.elapsed();
 
         unsafe { std::env::set_var("PATH", prev_path) };
@@ -11129,9 +11861,21 @@ mod tests {
         // the `let checks = vec![...]` block returns 58, plus the one
         // `check_hooks()` always contributes.
         //
+        // (#2765/#2775) 61, not 59: `check_serve_address` and
+        // `check_machine_rollup` joined the static array. Re-derived, not
+        // incremented on faith — and the re-derivation caught that the
+        // grep recipe the note above prescribes UNDERCOUNTS BY ONE: it
+        // anchors on `^        check_`, which misses
+        // `checks_power::check_power_posture()` (module-qualified, so the
+        // line starts with `checks_power::`). The honest count of entries
+        // in the `vec![...]` block is 60, plus the one `check_hooks()`
+        // always contributes = 61. Use
+        // `grep -cE '^        (checks_[a-z_]+::)?check_'` instead, or just
+        // count the non-comment lines in the block.
+        //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 59 + darkmux_eureka::all_rules().len();
+        let expected = 61 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -11187,20 +11931,59 @@ mod tests {
         // The real `tailscale serve status --json` shape (captured live).
         let json = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"laptop.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
         assert_eq!(
-            parse_tailnet_viewer_url(json, 8765).as_deref(),
+            parse_tailnet_viewer_url(json, "127.0.0.1", 8765).as_deref(),
             Some("http://laptop.tailnet-example.ts.net/")
         );
         // A different daemon port → not our proxy → None.
-        assert_eq!(parse_tailnet_viewer_url(json, 9000), None);
+        assert_eq!(parse_tailnet_viewer_url(json, "127.0.0.1", 9000), None);
         // Served on 443 → https scheme.
         let j443 = r#"{"Web":{"tailnet-example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
-        assert_eq!(parse_tailnet_viewer_url(j443, 8765).as_deref(), Some("https://tailnet-example.ts.net/"));
+        assert_eq!(parse_tailnet_viewer_url(j443, "127.0.0.1", 8765).as_deref(), Some("https://tailnet-example.ts.net/"));
         // localhost proxy target is accepted too.
         let jlocal = r#"{"Web":{"example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://localhost:8765"}}}}}"#;
-        assert_eq!(parse_tailnet_viewer_url(jlocal, 8765).as_deref(), Some("http://example.ts.net/"));
+        assert_eq!(parse_tailnet_viewer_url(jlocal, "127.0.0.1", 8765).as_deref(), Some("http://example.ts.net/"));
         // Not serving / empty / garbage → None (best-effort, never an error).
-        assert_eq!(parse_tailnet_viewer_url("{}", 8765), None);
-        assert_eq!(parse_tailnet_viewer_url("not json", 8765), None);
+        assert_eq!(parse_tailnet_viewer_url("{}", "127.0.0.1", 8765), None);
+        assert_eq!(parse_tailnet_viewer_url("not json", "127.0.0.1", 8765), None);
+    }
+
+    /// (#2782 C3) The THIRD accepted spelling — the daemon's own resolved
+    /// bind host — has no other pin. `parse_tailnet_viewer_url` is private,
+    /// so no consumer test can reach it: deleting `|| p == want_bind` left
+    /// every other test in this crate green.
+    ///
+    /// The operator this matters to bound one specific interface and wrote
+    /// `tailscale serve` against THAT address. Matching only the two
+    /// loopback spellings reports "no tailnet URL" for a proxy pointed
+    /// straight at this daemon.
+    #[test]
+    fn parse_tailnet_viewer_url_accepts_a_proxy_written_at_the_configured_bind() {
+        // A proxy target at a non-loopback bind, matching NEITHER loopback
+        // spelling — so only the `want_bind` arm can accept it.
+        let j = r#"{"Web":{"hub.tailnet-example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://192.0.2.10:8799"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(j, "192.0.2.10", 8799).as_deref(),
+            Some("https://hub.tailnet-example.ts.net/"),
+            "a proxy target written at the configured bind must match"
+        );
+        // Same JSON, a DIFFERENT bind → no longer ours. Pins that the arm
+        // compares the resolved bind rather than accepting any host.
+        assert_eq!(parse_tailnet_viewer_url(j, "192.0.2.11", 8799), None);
+        // The bind's PORT is not a free pass either.
+        assert_eq!(parse_tailnet_viewer_url(j, "192.0.2.10", 9000), None);
+        // A wildcard bind collapses to loopback before it gets here, so it
+        // adds no fourth case — it matches the loopback target, not `0.0.0.0`.
+        let jloop = r#"{"Web":{"hub.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8799"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(jloop, "0.0.0.0", 8799).as_deref(),
+            Some("http://hub.tailnet-example.ts.net/")
+        );
+        let jwild = r#"{"Web":{"hub.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://0.0.0.0:8799"}}}}}"#;
+        assert_eq!(
+            parse_tailnet_viewer_url(jwild, "0.0.0.0", 8799),
+            None,
+            "a wildcard is a bind directive, never a proxy destination"
+        );
     }
 
     // ─── check_daemon_auth (#881) ─────────────────────────────────────

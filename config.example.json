@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.25",
+  "schema_version": "1.26",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -75,6 +75,14 @@
     "max_outbox_mb": 256,
     "jq_timeout_ms": 5000,
     "jq_max_output_bytes": 1048576
+  },
+  "serve": {
+    "port": 8765,
+    "bind": "127.0.0.1"
+  },
+  "machine_rollup": {
+    "enabled": false,
+    "period_seconds": 60
   },
   "role_profiles": {}
 }

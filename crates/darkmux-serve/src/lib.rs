@@ -1,6 +1,6 @@
 //! `darkmux serve` — minimal HTTP daemon for flow record retrieval.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
@@ -1091,6 +1091,60 @@ fn build_startup_banner(
 /// axum gets `SHUTDOWN_GRACE_SECS` to drain in-flight connections
 /// before the process force-exits — SSE streams to the viewer would
 /// otherwise keep the daemon alive forever.
+/// (#2765) Resolve the daemon's listen address from the `--port` / `--bind`
+/// flags, falling through to `env(DARKMUX_SERVE_*) > config.serve.* >
+/// built-in default` when a flag was not passed.
+///
+/// A separate function, taking `Option`s, for two reasons. First, the flag
+/// tier can only WIN over config if "not passed" is representable — which is
+/// why `--port` lost its clap `default_value`; with a default baked in every
+/// invocation looked explicit and the config tier was unreachable by
+/// construction, which is how the port came to live only in the launch
+/// command in the first place. Second, it makes the precedence red-provable
+/// without binding a socket: the whole point of #2765 is that the daemon and
+/// every client resolve the same way, and a rule living only inline in
+/// `main.rs`'s match arm cannot be asserted.
+pub fn resolve_listen_addr(port: Option<u16>, bind: Option<String>) -> (u16, String) {
+    (
+        port.unwrap_or_else(darkmux_types::config_access::serve_port),
+        bind.unwrap_or_else(darkmux_types::config_access::serve_bind),
+    )
+}
+
+/// (#2782 C5) The `SocketAddr` the daemon binds, from an already-resolved
+/// bind + port.
+///
+/// Bracketing goes through `config_access::format_listen_addr` — the SAME
+/// helper `darkmux doctor`'s `serve address` row renders — rather than a
+/// second `format!("{bind}:{port}")` here, which is what this was. That
+/// spelling produced `":::8765"` for a `::` bind and `"::1:8765"` for
+/// `::1`; neither parses, so the daemon refused to start on either while
+/// four #2782 surfaces rendered IPv6 as supported (`serve address` printing
+/// `[::]:8765`, `viewer_link_base` emitting `http://[::1]:8765/`, the
+/// tailnet matcher, and the tests asserting all three) and
+/// `bind_requires_token("::1", false)` returned `Ok`, i.e. the codebase
+/// already INTENDED v6 loopback to be legal. One bracketing rule keeps the
+/// address the daemon binds and the address doctor prints from disagreeing.
+///
+/// A HOSTNAME bind is still an error, unchanged: `format_listen_addr`
+/// passes it through as typed, and `"localhost:8765"` is not a
+/// `SocketAddr`. That is pre-existing behavior and deliberately not widened
+/// here — resolving a name would mean picking one of its addresses, which
+/// is a different decision from bracketing a literal. The error just says
+/// so now instead of surfacing bare `invalid socket address syntax`.
+pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr> {
+    let rendered = darkmux_types::config_access::format_listen_addr(bind, port);
+    rendered.parse::<std::net::SocketAddr>().map_err(|e| {
+        anyhow::anyhow!(
+            "cannot bind the serve daemon to `{bind}` (resolved to `{rendered}`): {e}.\n  \
+             The bind must be an IP literal — `127.0.0.1` (the default), `::1`, `0.0.0.0`, `::`, \
+             or one interface's address. A hostname is not accepted. \
+             Set it with `darkmux config set serve.bind <addr>`; `darkmux doctor`'s `serve address` \
+             row prints the resolved value and which tier it came from."
+        )
+    })
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#1461) Capture the mtime of the binary we were launched from BEFORE
     // serving anything. It has to be read at startup, not lazily on the first
@@ -1105,13 +1159,34 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
 
     rt.block_on(async move {
         let app = build_router_full(flows_dir.clone(), worktrees_base_dir(), lab_dir.clone());
-        let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
+        let addr = listen_socket_addr(&bind, port)?;
         // (#881) Refuse a non-loopback bind without a configured token BEFORE we
         // bind the socket — exposing the read surface unauthenticated is the
         // vulnerability this gate closes.
         bind_requires_token(&bind, darkmux_flow::serve_token_present())
             .map_err(anyhow::Error::msg)?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        // (#2782) Name the address in the bind failure. The banner below holds
+        // it, and only prints AFTER a successful bind — so a bare `io::Error`
+        // here is the operator's entire stderr: `Error: Permission denied (os
+        // error 13)` for a privileged port, `Error: Address already in use (os
+        // error 48)` for a taken one, naming neither the address nor the knob
+        // that chose it. That was diagnosable by elimination while the port was
+        // always 8765; since #2782 it is whatever `serve.bind`/`serve.port`
+        // resolve to, and under `brew services` (`keep_alive true`,
+        // `error_log_path`) a context-free errno respawn-loops into `serve.err`.
+        // `listen_socket_addr` one screen up already fails loudly and names the
+        // knob; the far likelier failure is this one.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "binding the serve daemon to {addr} — resolved from \
+                     `env(DARKMUX_SERVE_BIND / DARKMUX_SERVE_PORT) > config.serve.* > \
+                     127.0.0.1:8765`. `darkmux doctor`'s `serve address` row prints the \
+                     resolved value and which tier it came from; change it with \
+                     `darkmux config set serve.port <port>`"
+                )
+            })?;
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.

@@ -211,7 +211,29 @@ use std::path::Path;
 //           resident — same reasoning `max_turns` etc. already document.
 //           `Option<u32>`, lenient-on-read: an older binary ignores the
 //           field and keeps deriving the cap from the live declaration.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.25";
+//   1.26 (#2765, #2775): two additive top-level blocks.
+//           `serve{}` — `port` / `bind`, the daemon's listen address.
+//           Before this the port lived ONLY in the launch command, so a
+//           restart that forgot `--port` silently reverted to the
+//           built-in 8765 while the machine's proxy still pointed
+//           somewhere else; the daemon stayed healthy and every client
+//           looked in the wrong place. Written VISIBLY by `init` at the
+//           built-in defaults (8765 / 127.0.0.1). NOT an `enabled`-gated
+//           feature block — the daemon is not a feature you turn on, it
+//           is a process you start, and the block only says where.
+//           `serve.token` remains a SECRET and is never a field here
+//           (Keychain item `darkmux-serve-token`).
+//           `machine_rollup{}` — `enabled` / `period_seconds`, the
+//           periodic `machine.rollup` flow record carrying the whole
+//           machine-lens aggregate. An `enabled`-gated feature block in
+//           the redis/audit/hooks mold: written visibly with
+//           `enabled: false` and `period_seconds: 60`, because it adds
+//           steady-state volume to the flow stream nobody should pay for
+//           unsubscribed.
+//           Both `Option`-typed and lenient-on-read: an older binary
+//           ignores either block into `extras` and behaves exactly as it
+//           did before.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.26";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -262,6 +284,14 @@ pub struct DarkmuxConfig {
     /// [`HooksConfig`]'s own doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
+    /// (#2765) Where the `darkmux serve` daemon listens — see
+    /// [`ServeConfig`]'s own doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<ServeConfig>,
+    /// (#2775) The periodic machine-lens aggregate flow record — see
+    /// [`MachineRollupConfig`]'s own doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_rollup: Option<MachineRollupConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -849,6 +879,133 @@ pub struct RemoteConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#2765) Where the `darkmux serve` daemon listens — and, just as
+/// importantly, where every CLIENT that looks for it expects to find it.
+///
+/// **The defect this block closes was an ASYMMETRY, not a missing knob.**
+/// The port lived in exactly one place — the launch command — so a restart
+/// that forgot `--port` (a reboot, a `brew services` restart, a hand-typed
+/// `darkmux serve` while debugging) silently reverted to the built-in 8765
+/// while whatever proxies the machine (`tailscale serve`, an nginx block)
+/// still pointed at the port the operator had chosen. Nothing was
+/// misconfigured and nothing reported an error: the daemon was healthy and
+/// serving, just not where anything was looking. Observed 2026-09-16 —
+/// a real dispatch printed `darkmux serve isn't reachable on
+/// 127.0.0.1:8765` while the daemon was answering on the operator's
+/// configured port, so flow records did not stream to the live view.
+///
+/// So a fix that only moved the SERVER's default here would have fixed
+/// nothing. Both halves resolve through `config_access::serve_port` /
+/// `serve_bind`: the `serve` command, and every client that probes for the
+/// daemon (the per-dispatch reachability nudge, `darkmux doctor`'s daemon
+/// check, the portless-address default for a peer base URL).
+///
+/// **Not an `enabled`-gated feature block.** The redis/audit/hooks pattern
+/// exists for integrations that are OFF until opted into; a daemon is not
+/// a feature you turn on, it is a process you start, and this block only
+/// says where it listens when you do. There is nothing for an `enabled`
+/// field to mean here that `darkmux serve` not running does not already.
+///
+/// **`serve.token` is deliberately absent.** The daemon's bearer token is a
+/// SECRET and lives in the macOS Keychain (item `darkmux-serve-token`); the
+/// non-secret gate for it is `runtime.daemon_auth_enabled`. `config set`
+/// refuses `serve.token` with the `security add-generic-password` form —
+/// that refusal predates this block and is unchanged by it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServeConfig {
+    /// TCP port the daemon listens on. Built-in default `8765`. A
+    /// `--port` on the command line still wins outright, matching the
+    /// CLI-beats-config convention every other flag here follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub port: Option<u16>,
+    /// Address the daemon binds. Built-in default `127.0.0.1`
+    /// (loopback-only). A non-loopback bind is refused without a resolved
+    /// serve token — that gate is unchanged and lives in `darkmux-serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub bind: Option<String>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2775) The periodic `machine.rollup` flow record — ONE heartbeat
+/// carrying the whole machine-lens aggregate (thermal, cpu/gpu/memory,
+/// power, battery, residency), so darkmux is usable as a machine-
+/// observability module by a harness that never opens the viewer.
+///
+/// "The whole aggregate" is literal for the residency half since #2782:
+/// `payload.residency` is the model ledger serialized exactly as `GET
+/// /machine/resources` serializes it, so the record and the lens cannot
+/// drift apart as `ModelLedger` grows fields.
+///
+/// **A periodic RECORD, deliberately not a "timed hook".** A hook rule
+/// answers exactly one question — does this record match? — and
+/// `hook_match` is a pure function of a `FlowRecord`. A rule that fired on
+/// a schedule would have no record to match against and would have to go
+/// PULL state, inverting the direction the pipeline flows and putting a
+/// second execution model into one config surface. Emitting a record
+/// instead keeps that boundary intact and pays three ways: the rollup is
+/// DURABLE (the viewer can render it, a later comparison can read it, and
+/// a consumer who configured no hook still benefits), it follows an
+/// established shape here (`machine.telemetry` already streams on an
+/// interval), and the hook layer needs NO change at all — `action:
+/// "machine.*"` already matches and dotted `payload.*` predicates already
+/// work.
+///
+/// **`enabled` defaults to `false`** — the redis/audit/hooks convention.
+/// This adds steady-state volume to the flow stream for every operator,
+/// most of whom will never subscribe, so `init` writes the whole block
+/// visibly with the gate off and the sub-defaults populated: discoverable,
+/// and one flip from on.
+///
+/// **Period and window are independent.** `period_seconds` is how often the
+/// heartbeat fires; the WINDOW it rolls up over is the daemon host
+/// sampler's own ring span, and the record stamps that span
+/// (`window.span_ms`, `window.samples`) so a consumer is never guessing
+/// what an "avg" averaged over.
+///
+/// **What it costs, measured rather than asserted.** One emission on an
+/// M5 Max, 2026-09-17: `gather_ms` 481, of which `residency.gather_ms` was
+/// 480 — so essentially the whole cost is the model-ledger gather's `lms`
+/// shell-out, and the ring read underneath `now`/`window` is free (it is a
+/// mutex lock plus arithmetic on samples already taken). At the default
+/// 60-second period that is under 1% of one core; at a 1-second period it
+/// would be roughly half of one, which is why the figure is stamped into
+/// every record rather than left to be assumed. An operator tightening
+/// `period_seconds` for a debug session can read the real cost out of the
+/// artifact (#1286 constraint 3) instead of inferring it.
+///
+/// **It rides the daemon's host sampler, so it needs two things running.**
+/// The emitter lives in `darkmux serve`'s sampler thread — the one place
+/// that already holds the machine-lens ring — so the record is emitted only
+/// while the daemon is up, and only while
+/// `runtime.host_sampler_interval_ms` is non-zero (a `0` there disables the
+/// sampler thread entirely, and takes this with it). `darkmux doctor`
+/// reports that combination rather than leaving an enabled-but-silent
+/// feature to be discovered by its absence.
+///
+/// **Both fields take effect on the next daemon RESTART.** The config tier
+/// is a process-wide `OnceLock` read from disk once per process
+/// ([`crate::config_access`]'s `config()`), with no invalidation path — so
+/// `darkmux config set machine_rollup.enabled true` changes the file and
+/// the already-running daemon keeps the value it booted with. Restart it
+/// (`brew services restart darkmux`, reload the plist, or re-run `darkmux
+/// serve`) after flipping either knob. Stated in three places on purpose —
+/// here, `docs/ENVIRONMENT.md`, and `darkmux doctor`'s `machine_rollup`
+/// row — because the failure it prevents is silent: `doctor` is a FRESH
+/// process, so it reads the new file and reports the feature on while the
+/// daemon that will never see it emits nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MachineRollupConfig {
+    /// The gate: `true` → the daemon's host sampler emits a
+    /// `machine.rollup` record every `period_seconds`; `false`/absent →
+    /// nothing is emitted and nothing is gathered. Declared first so it
+    /// reads at the top of the block, same as `redis`/`audit`/`hooks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    /// Seconds between emissions. Built-in default `60`. `0` means OFF —
+    /// this codebase's zero-means-unbounded/off convention
+    /// (`runtime.host_sampler_interval_ms`, `redis.maxlen`), never
+    /// "emit continuously", which is what a naive `>=` would give it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub period_seconds: Option<u64>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// (#1230 Packet 5) Mission-board drift-detection knobs — consumed by
 /// `darkmux mission status`'s `detect_drift`.
 ///
@@ -1392,6 +1549,28 @@ impl DarkmuxConfig {
                 // operator would otherwise have to know to add by hand).
                 jq_timeout_ms: Some(5_000),
                 jq_max_output_bytes: Some(1_048_576),
+                extras: Default::default(),
+            }),
+            // (#2765) Written visible at the built-in defaults. The whole
+            // point of the issue is that this knob was invisible: the
+            // operator could not `config set` it because it did not exist,
+            // and could not SEE that the daemon's address was a decision
+            // anyone had made. Visible-at-default is what makes a restart
+            // that forgets `--port` land on the operator's own value
+            // instead of silently reverting.
+            serve: Some(ServeConfig {
+                port: Some(crate::config_access::SERVE_PORT_DEFAULT),
+                bind: Some(crate::config_access::SERVE_BIND_DEFAULT.to_string()),
+                extras: Default::default(),
+            }),
+            // (#2775) Written visible with `enabled: false` and the
+            // default period populated — the `enabled`-gated feature-block
+            // convention (`redis`/`audit`/`hooks`). Nobody pays stream
+            // volume for a heartbeat they have not asked for, and the
+            // surface is one flip from on.
+            machine_rollup: Some(MachineRollupConfig {
+                enabled: Some(false),
+                period_seconds: Some(crate::config_access::MACHINE_ROLLUP_PERIOD_SECONDS_DEFAULT),
                 extras: Default::default(),
             }),
             extras: Default::default(),

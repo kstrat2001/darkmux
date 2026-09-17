@@ -216,9 +216,21 @@ fn darkmux_home_dir_fallback() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".darkmux")
 }
 
-/// (#2653 MUST FIX 1) **Test / `test-support`** fallback when `DARKMUX_HOME`
-/// is unset: a fixed, non-home scratch path — NEVER the operator's real
-/// `~/.darkmux`.
+/// (#2653 MUST FIX 1, #2777) **Test / `test-support`** fallback when
+/// `DARKMUX_HOME` is unset: a non-home scratch path — NEVER the operator's
+/// real `~/.darkmux`.
+///
+/// **It isolates from the operator's HOME; since #2777 it also isolates
+/// test processes from each other.** The distinction is worth stating
+/// plainly because the name invites over-reading: through #2653 this
+/// returned one FIXED machine-global path, so it fully guaranteed the first
+/// property and none of the second. It now returns
+/// [`crate::paths::test_isolated_root`] — `<system temp>/
+/// darkmux-test-isolated-<pid>`, a per-process SIBLING directly under the
+/// temp root, not a `<pid>` subdirectory — which keeps the home guarantee
+/// and adds per-process separation. See that function's doc for the
+/// measured residue, the ten sites that shared the old path, and why a
+/// per-pid split is safe.
 ///
 /// Before this existed, a test that forgot to set `DARKMUX_HOME` fell
 /// through to `dirs::home_dir()` (which honors `$HOME`) same as
@@ -233,17 +245,17 @@ fn darkmux_home_dir_fallback() -> PathBuf {
 /// `dispatch_internal` unit test, run with `DARKMUX_HOME` unset, deleted
 /// three seeded heartbeat files outright).
 ///
-/// Returns the SAME isolated path `config_access::liveness_dir_default`
-/// redirects to (`/tmp/darkmux-test-isolated`), so both resolvers land on
-/// one isolated liveness directory rather than two, when a test forgets to
-/// isolate. Deliberately NOT keyed off comparing against `dirs::home_dir()`
+/// Returns the SAME isolated root every sibling accessor redirects to
+/// (`crate::paths::test_isolated_root`), so all of them land on one
+/// isolated tree rather than ten, when a test forgets to isolate.
+/// Deliberately NOT keyed off comparing against `dirs::home_dir()`
 /// (that comparison is what `config_access` does, via `paths::resolve`) —
 /// this module's whole reason for existing is to avoid exactly that kind
 /// of resolution machinery, so in test builds it just never resolves to a
 /// real home at all, full stop.
 #[cfg(any(test, feature = "test-support"))]
 fn darkmux_home_dir_fallback() -> PathBuf {
-    PathBuf::from("/tmp/darkmux-test-isolated")
+    crate::paths::test_isolated_root()
 }
 
 /// The heartbeat directory: `<darkmux-home>/liveness/`.
