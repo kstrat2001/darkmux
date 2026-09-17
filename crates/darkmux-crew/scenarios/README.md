@@ -76,8 +76,9 @@ appears unclassified OR if a workspace file starts carrying a watched action
 literal without being classified — an earlier hand-written list in the module
 doc went stale twice and left four records unstamped. What the scan does not
 see is named in `watched_action_literals`' own doc: an action assembled at
-runtime rather than written as a literal, or a brand-new action family. The machine-scoped
-ones are why it has to be exhaustive: a dispatch run this way acquires the
+runtime rather than written as a literal, or a brand-new action family.
+
+The machine-scoped ones are why it has to be exhaustive: a dispatch run this way acquires the
 machine's host-sampler lock and becomes its sole `machine.telemetry`
 emitter for the run's lifetime, so with Redis enabled those records ride
 the fleet stream to your OTHER machine. Unstamped, that machine's lens

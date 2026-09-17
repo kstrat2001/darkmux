@@ -585,6 +585,12 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
         "crates/darkmux-serve/src/lib_tests.rs",
         "tests for the serve daemon, same sibling-file shape",
     ),
+    (
+        "crates/darkmux-crew/src/envelope.rs",
+        "its only watched literal is a `machine.telemetry` fixture inside its own \
+         `#[cfg(test)]` module, which the untruncated discovery scan sees and `audit` does \
+         not; the envelope builds no flow records",
+    ),
 ];
 
 /// Every flow-record action, in the sources [`audit`] scans, whose payload
@@ -666,18 +672,44 @@ pub struct HostReadingAudit {
 /// general Rust lexer.
 #[cfg(test)]
 pub(crate) fn watched_action_literals(src: &str) -> Vec<String> {
-    // Tests live after this marker in `host_sampler.rs` and assert on
-    // action strings constantly; scanning them would classify every
-    // consumer-side literal as a producer. Safe as the files stand — every
-    // watched literal sits before it — and a marker that stopped matching
-    // fails LOUD (the test tail floods `unclassified`) rather than silently
-    // narrowing the scan.
+    // Tests live after this marker and assert on action strings
+    // constantly; scanning them would ask the registry to classify every
+    // consumer-side literal as a producer. A marker that stopped matching
+    // fails LOUD here (the test tail floods `unclassified`) rather than
+    // silently narrowing the scan.
     let body = match src.find("\n#[cfg(test)]\nmod tests") {
         Some(i) => &src[..i],
         None => src,
     };
+    watched_action_literals_anywhere(body)
+}
+
+/// [`watched_action_literals`] WITHOUT the `#[cfg(test)]` cut — the whole
+/// file, tests included.
+///
+/// The file-DISCOVERY scan uses this one, and the asymmetry is the whole
+/// point rather than a detail. Truncating is correct for [`audit`], whose
+/// question is *which LITERALS must be classified* and which would
+/// otherwise drown in test assertions. It is wrong for discovery, whose
+/// question is *which FILES carry one at all*: a cut there makes every
+/// literal below the marker invisible, so a producer defined after a file's
+/// test module — or in a file whose test module happens to sit near the top
+/// — is a silent miss, and the guard is then only as strong as the
+/// assumption that nobody ever appends below a `#[cfg(test)]`.
+///
+/// That is not hypothetical. It is exactly what swallowed the first attempt
+/// at the discovery guard: the repro appended a watched literal to the end
+/// of `host_probe/thermal.rs`, below its test module at line 194, and the
+/// truncating scanner dropped it before discovery ever saw it — 1 test run,
+/// 1 passed, on a file in neither classification list.
+///
+/// Over-discovery costs nothing by comparison: a file found only because of
+/// its own tests is classified once as a non-producer, with a reason, and
+/// never thought about again.
+#[cfg(test)]
+pub(crate) fn watched_action_literals_anywhere(src: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    for line in body.lines() {
+    for line in src.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
             continue;
@@ -832,7 +864,7 @@ mod producer_registry_tests {
         let mut discovered: Vec<String> = Vec::new();
         for path in &files {
             let Ok(text) = std::fs::read_to_string(path) else { continue };
-            if watched_action_literals(&text).is_empty() {
+            if watched_action_literals_anywhere(&text).is_empty() {
                 continue;
             }
             let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
