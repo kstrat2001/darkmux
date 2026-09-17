@@ -1267,8 +1267,21 @@ mod tests {
         assert!(ring.snapshot().is_none(), "and the ring stays empty");
     }
 
+    /// (#2762) `spawn` takes the singleton sampler lock, and `lock_path()`
+    /// resolves through process-global `DARKMUX_HOME`. Left un-isolated,
+    /// this test contended for the FIXED machine-global fallback path
+    /// (`dispatch_liveness::darkmux_home_dir_fallback` →
+    /// `/tmp/darkmux-test-isolated/liveness/host-sampler.lock`) — shared
+    /// with every other test binary in the workspace running with
+    /// `DARKMUX_HOME` unset — and, being non-serial, could also run
+    /// alongside the serial tests below, whose isolated `DARKMUX_HOME` it
+    /// would then resolve into. Isolate and serialize it like its
+    /// neighbors: this test is about the ring and the teardown, and has no
+    /// business touching a lock any other test can see.
+    #[serial_test::serial]
     #[test]
     fn spawned_sampler_populates_the_ring_and_stops_promptly() {
+        with_isolated_env(|_flows_dir| {
         let ring = HostSamplerRing::new();
         let stop = Arc::new(AtomicBool::new(false));
         // A tight interval so the test doesn't wait long for a sample to land.
@@ -1290,6 +1303,7 @@ mod tests {
             t0.elapsed() < Duration::from_secs(2),
             "teardown must be prompt (bounded by STOP_POLL_INTERVAL), not a full interval wait"
         );
+        });
     }
 
     // ─── (#2413) spawn() — the singleton machine.telemetry emitter ─────
@@ -1593,7 +1607,9 @@ mod tests {
             // tick; this test doesn't, so it needs a generous declared
             // interval instead to stay "fresh" without one.
             let other_pid = 1u32;
-            let guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 60_000)
+            // Held for the whole test body — `Drop` releases the lock, so
+            // it must outlive the ownership check after the window.
+            let _guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 60_000)
                 .expect("the lock is free at test start");
 
             let ring = HostSamplerRing::new();
@@ -1610,32 +1626,76 @@ mod tests {
             // slow the suite.
             //
             // (#2475) A real dispatch holder keeps this lock fresh by
-            // heartbeating every tick; this fixture must too, or the
-            // assertion below is really pinning "sleep(3s) never overruns
-            // 3x the declared interval on whatever machine runs this,"
-            // not the invariant it names. Refresh throughout the window —
-            // far more often than any plausible gap between refreshes —
-            // so the held lock is PROVABLY fresh for the whole 3s, not
-            // merely fresh-if-nothing-stalls-the-thread. This is what
-            // failed under `cargo llvm-cov --workspace`'s coverage-job
-            // load: a single unrefreshed write followed by a plain
-            // `sleep(3000)` lets the real elapsed time (stretched by
-            // instrumentation + a loaded runner) cross the lock's own
-            // staleness threshold mid-window, at which point the daemon
-            // CORRECTLY takes over and emits — and the old assertion
-            // failed on behavior that was right.
-            let window = Duration::from_millis(3000);
-            let refresh_every = Duration::from_millis(50);
-            let window_deadline = Instant::now() + window;
-            while Instant::now() < window_deadline {
-                assert!(
-                    guard.heartbeat(60_000),
-                    "must still own the lock — nothing else in this test should be racing to steal it"
-                );
-                std::thread::sleep(refresh_every.min(window_deadline.saturating_duration_since(Instant::now())));
-            }
+            // heartbeating every tick. An earlier round of this fixture
+            // imitated that with a 50ms refresh loop that ALSO asserted
+            // ownership on every iteration — sixty assertions per run, each
+            // one able to abort the test.
+            //
+            // (#2762) That refresh loop WAS the flake, not the cure. Two
+            // things make a per-iteration `guard.heartbeat()` assertion
+            // structurally fragile in a threaded test binary:
+            //
+            //   1. `heartbeat()` re-resolves the lock's ADDRESS on every
+            //      call — `lock_path()` reads process-global `DARKMUX_HOME`
+            //      live. Any sibling test that mutates that env var while
+            //      this window is open sends the heartbeat to a different
+            //      file, where it correctly finds no lock of ours and
+            //      reports `false`. The holder never lost anything; the
+            //      assertion was just pointed somewhere else.
+            //   2. With `DARKMUX_HOME` unset, every test build in this
+            //      workspace falls back to ONE fixed machine-global path
+            //      (`dispatch_liveness::darkmux_home_dir_fallback`), so
+            //      "a sibling test" is not even bounded to this binary.
+            //
+            // Neither is a timing problem, which is why widening the timing
+            // tolerance twice never helped. So stop depending on a
+            // re-resolved address and a maintained clock at all:
+            //
+            //   * Freshness is STRUCTURAL, not maintained. The declared
+            //     interval is 60s, so this holder's own staleness threshold
+            //     (3x = 180s) outlives the 3s window by 60x with no
+            //     refreshing whatsoever — which is what the `other_pid`
+            //     comment above already said before the refresh loop was
+            //     layered on top of it.
+            //   * Ownership is checked ONCE, after the window, against the
+            //     lock path CAPTURED AT ACQUIRE TIME rather than
+            //     re-resolved. A sibling's env mutation can no longer reach
+            //     that assertion; a genuine takeover (a different pid
+            //     written to that same file) still fails it.
+            //
+            // One check instead of sixty, and the one that remains cannot
+            // be perturbed by anything except the takeover it exists to
+            // detect.
+            let lock_path_at_acquire = darkmux_types::config_access::host_sampler_lock_path();
+            let home_at_acquire = std::env::var("DARKMUX_HOME").ok();
+            std::thread::sleep(Duration::from_millis(3000));
+
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
+
+            // (#2762) The one ownership check — reads the CAPTURED path, so
+            // it is about the lock itself, never about where `DARKMUX_HOME`
+            // happens to point by now. Without it the no-emission assertion
+            // below could pass vacuously: a sampler that never faced a
+            // contended lock trivially emits nothing.
+            let held: Option<darkmux_crew::host_sampler_lock::LockState> = std::fs::read_to_string(&lock_path_at_acquire)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok());
+            assert_eq!(
+                held.as_ref().map(|st| st.pid),
+                Some(other_pid),
+                "the simulated dispatch holder must still own the lock after the window, or the \
+                 no-emission assertion below proves nothing.\n  \
+                 lock path (captured at acquire): {lock_path_at_acquire:?}\n  \
+                 DARKMUX_HOME at acquire: {home_at_acquire:?}\n  \
+                 DARKMUX_HOME now:        {now_home:?}\n  \
+                 lock file at that path now: {held:?}\n\
+                 Read it this way: a present file with a DIFFERENT pid is a real takeover race \
+                 (the thing this test guards); an ABSENT file means something deleted it. A \
+                 changed DARKMUX_HOME can no longer cause either, since this reads the captured \
+                 path — so if you are seeing this, it is NOT an env-isolation problem.",
+                now_home = std::env::var("DARKMUX_HOME").ok(),
+            );
 
             let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
             let text = std::fs::read_to_string(&day_path).unwrap_or_default();
@@ -1646,9 +1706,29 @@ mod tests {
                     .as_deref()
                     == Some("machine.telemetry")
             });
+            // (#2762) The other assertion that a mid-window `DARKMUX_HOME`
+            // mutation can trip, and for a DIFFERENT reason than the
+            // ownership check above: if the lock's address moves, the
+            // daemon finds no holder at the new address, correctly takes
+            // over, and emits. Measured — a HOME-only swap for 1.5s of this
+            // window produces exactly this failure while the ownership
+            // check stays green. Say so here, so that occurrence is not
+            // misread as the sampler ignoring a lock it could plainly see.
             assert!(
                 !emitted_machine_telemetry,
-                "the daemon sampler must not emit while another process holds a fresh lock"
+                "the daemon sampler must not emit while another process holds a fresh lock.\n  \
+                 lock path (captured at acquire): {lock_path_at_acquire:?}\n  \
+                 lock path now:                   {now_path:?}  (same: {same_path})\n  \
+                 DARKMUX_HOME at acquire: {home_at_acquire:?}\n  \
+                 DARKMUX_HOME now:        {now_home:?}\n\
+                 Read it this way: if the two paths DIFFER, a sibling test mutated process-global \
+                 env mid-window and the daemon correctly took over a lock that had moved — \
+                 serialize that sibling, this is not a sampler defect. If they are the SAME, the \
+                 sampler emitted while a fresh lock it could see was held, which is the real \
+                 defect this test exists to catch.",
+                now_path = darkmux_types::config_access::host_sampler_lock_path(),
+                same_path = darkmux_types::config_access::host_sampler_lock_path() == lock_path_at_acquire,
+                now_home = std::env::var("DARKMUX_HOME").ok(),
             );
             // Still samples its OWN ring regardless (the ring is
             // unconditional, per the issue's own rule).
