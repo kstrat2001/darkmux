@@ -1053,6 +1053,67 @@ impl ThermalGovernor {
         self.bands.disarm_notes()
     }
 
+    /// (#2774 round-9 MF1) Every warning this governor's CONFIG earns at
+    /// dispatch start, one ready-to-print line each. Empty when the
+    /// governor is disabled or the config is unremarkable.
+    ///
+    /// Round 4 gave the dispatch-start surface the band-disarm notes and
+    /// stopped there, so its breaker sentence — "The breaker (`critical`,
+    /// and the sustained cpu_speed_limit floor) still runs." — was
+    /// UNCONDITIONAL. Two consequences, both operator-facing:
+    ///
+    /// - With `min_cpu_speed_limit_pct > 100` it described a
+    ///   trip-on-every-dispatch breaker as ordinary hardware protection.
+    ///   The comparison is `cpu_speed_limit_pct < min_cpu_speed_limit_pct`
+    ///   and `100` is the "no cap recorded" reading a HEALTHY machine
+    ///   reports, so above 100 every sample is "below the floor": a cold
+    ///   machine drops a `thermal-critical` STOP file after its first
+    ///   `speed_limit_hold_samples` samples.
+    /// - With the bands ARMED it printed nothing at all, so that config
+    ///   reached the operator through neither surface (`darkmux doctor`
+    ///   had the same hole from the other direction — its own check
+    ///   returned on the disarm note before the floor check ran).
+    ///
+    /// Returned as lines rather than printed here so the CONTENT is
+    /// testable without capturing stderr; `dispatch_internal.rs` prints
+    /// them verbatim.
+    pub fn dispatch_start_warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if !self.config.enabled {
+            return out;
+        }
+        let floor_always_trips = self.config.min_cpu_speed_limit_pct > 100;
+        let breaker_clause = if floor_always_trips {
+            "The breaker is unaffected and still runs — and on this config it trips on EVERY \
+             dispatch, cold machine included."
+        } else {
+            "The breaker (`critical`, and the sustained cpu_speed_limit floor) still runs."
+        };
+        for note in self.disarm_notes() {
+            out.push(format!(
+                "darkmux: ⚠ thermal ladder — {} DISARMED for this dispatch: {} {breaker_clause} \
+                 Fix with: {}",
+                note.tiers, note.why, note.remedy,
+            ));
+        }
+        if floor_always_trips {
+            out.push(format!(
+                "darkmux: ⚠ thermal breaker — min_cpu_speed_limit_pct={} is above the 100% \
+                 ceiling of the reading it is compared against (`cpu_speed_limit_pct`, where 100 \
+                 means no cap recorded), so EVERY dispatch trips the breaker after its first {} \
+                 sample(s) and drops a `thermal-critical` STOP file — on a cold machine as \
+                 readily as a hot one. Fix with: darkmux config set \
+                 runtime.thermal.min_cpu_speed_limit_pct 50",
+                self.config.min_cpu_speed_limit_pct,
+                // The same `.max(1)` floor the breaker's own streak test
+                // applies, so this line cannot promise a threshold the
+                // governor does not use.
+                self.config.speed_limit_hold_samples.max(1),
+            ));
+        }
+        out
+    }
+
     /// (#2774 review F5) Seed `serious_episodes`/`current_duty_delay_ms`
     /// from a PRIOR dispatch's mission-scoped ladder state, and arrange to
     /// persist this governor's own updates back to the SAME file — so
@@ -1814,6 +1875,133 @@ mod tests {
     fn read_pace(host_out: &Path) -> serde_json::Value {
         let raw = std::fs::read_to_string(pace_file_path(host_out)).unwrap();
         serde_json::from_str(&raw).unwrap()
+    }
+
+    // ─── (#2774 round-9 MF1) dispatch-start warnings ───────────────────
+    //
+    // The console half of the disclosure the doctor check does on the
+    // other side. `dispatch_internal.rs` prints these lines verbatim, so
+    // asserting on the CONTENT here is asserting on what the operator
+    // reads at dispatch start — no stderr capture required.
+
+    #[test]
+    fn an_ordinary_config_earns_no_dispatch_start_warnings() {
+        // Pinned first, so none of the guards below can be satisfied by a
+        // function that simply always warns.
+        let gov = ThermalGovernor::new(cfg());
+        assert!(
+            gov.dispatch_start_warnings().is_empty(),
+            "{:?}",
+            gov.dispatch_start_warnings()
+        );
+    }
+
+    #[test]
+    fn a_disabled_governor_earns_no_dispatch_start_warnings() {
+        // Even with a config that would otherwise warn twice over: a
+        // governor that will not run has nothing to disclose.
+        let gov = ThermalGovernor::new(ThermalGovernorConfig {
+            enabled: false,
+            pause_at: "fair".to_string(),
+            resume_at: "fair".to_string(),
+            min_cpu_speed_limit_pct: 150,
+            ..cfg()
+        });
+        assert!(gov.dispatch_start_warnings().is_empty(), "{:?}", gov.dispatch_start_warnings());
+    }
+
+    #[test]
+    fn a_cpu_floor_above_100_is_disclosed_at_dispatch_start_even_with_the_bands_armed() {
+        // The hole this closes: the dispatch-start surface only ever
+        // printed inside `for note in disarm_notes()`, so a config with
+        // ARMED bands and a trip-on-every-dispatch breaker reached the
+        // operator through neither this surface nor `darkmux doctor`.
+        let gov = ThermalGovernor::new(ThermalGovernorConfig {
+            min_cpu_speed_limit_pct: 150,
+            speed_limit_hold_samples: 3,
+            ..cfg()
+        });
+        assert!(gov.disarm_notes().is_empty(), "this test needs ARMED bands");
+
+        let lines = gov.dispatch_start_warnings();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("min_cpu_speed_limit_pct=150"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("EVERY dispatch") && lines[0].contains("cold machine"),
+            "the operator must be told a cold machine trips it: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("after its first 3 sample(s)"),
+            "…and after how many samples, at the value the breaker actually uses: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("darkmux config set runtime.thermal.min_cpu_speed_limit_pct"),
+            "…and how to fix it: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_disarmed_band_no_longer_calls_a_trip_on_every_dispatch_breaker_ordinary() {
+        // The exact sentence the finding is about: with the bands
+        // disarmed, the line said "The breaker (`critical`, and the
+        // sustained cpu_speed_limit floor) still runs." — unconditionally,
+        // with no `min_cpu` check anywhere on this path.
+        let gov = ThermalGovernor::new(ThermalGovernorConfig {
+            pause_at: "fair".to_string(),
+            resume_at: "fair".to_string(),
+            min_cpu_speed_limit_pct: 150,
+            ..cfg()
+        });
+        assert!(!gov.disarm_notes().is_empty(), "this test needs a DISARMED band");
+
+        let lines = gov.dispatch_start_warnings();
+        let joined = lines.join("\n");
+        assert!(joined.contains("DISARMED"), "{joined}");
+        assert!(
+            !joined.contains("(`critical`, and the sustained cpu_speed_limit floor) still runs."),
+            "the reassuring sentence must not survive a floor that trips on every dispatch: \
+             {joined}"
+        );
+        assert!(
+            joined.contains("EVERY dispatch") && joined.contains("min_cpu_speed_limit_pct=150"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn a_disarmed_band_with_an_ordinary_floor_still_says_the_breaker_runs() {
+        // The inverse of the test above — the reassuring sentence is
+        // CORRECT when the floor is ordinary, and must not be collateral
+        // damage of the guard.
+        let gov = ThermalGovernor::new(ThermalGovernorConfig {
+            pause_at: "fair".to_string(),
+            resume_at: "fair".to_string(),
+            ..cfg()
+        });
+        let lines = gov.dispatch_start_warnings();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("(`critical`, and the sustained cpu_speed_limit floor) still runs."),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("EVERY dispatch"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_floor_of_exactly_100_is_not_disclosed_as_degenerate() {
+        // 100 is the TOP legal value, not a degenerate one: a throttled
+        // machine reads below it, an unthrottled one reads exactly 100 and
+        // is NOT below it. Pinned so the guard cannot drift down onto a
+        // real setting.
+        let gov = ThermalGovernor::new(ThermalGovernorConfig {
+            min_cpu_speed_limit_pct: 100,
+            ..cfg()
+        });
+        assert!(gov.dispatch_start_warnings().is_empty(), "{:?}", gov.dispatch_start_warnings());
     }
 
     #[test]

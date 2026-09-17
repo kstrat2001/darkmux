@@ -139,11 +139,21 @@ pub struct PaceFile {
     /// `{"pause": true}`, or a governor build that predates this field —
     /// all three read identically as "no duty-cycle instruction," matching
     /// every other optional field's tolerant-on-read treatment in this
-    /// struct. Honored only while this pace file is fresh (the SAME
-    /// `written_at_ms`/`is_expired` heartbeat contract `pause` uses — no
-    /// separate staleness rule for this field), and clamped through the
-    /// loop's own `resolve_turn_delay_ms` budget guard before being
+    /// struct. Honored only while this pace file is fresh — the SAME
+    /// `written_at_ms` heartbeat contract `pause` uses, judged through the
+    /// SAME [`PaceReader::pause_is_expired`] (the raw [`PaceFile::is_expired`]
+    /// plus the stamp-in-the-future guard), not through the raw fn alone;
+    /// there is no separate staleness rule for this field. Clamped through
+    /// the loop's own `resolve_turn_delay_ms` budget guard before being
     /// applied, never around it.
+    ///
+    /// (#2774 round-9 MF2) This used to read "`written_at_ms`/`is_expired`",
+    /// and the duty-cycle call site really did call the RAW fn — so a
+    /// future-dated stamp, which `saturating_sub` reads as "0ms elapsed"
+    /// forever, was honored at every turn boundary for the rest of the
+    /// dispatch (the module doc's second clock-skew case, reached through
+    /// the one call site the guard had not been wired to). The doc claimed
+    /// a parity the code did not have; both now say the same thing.
     #[serde(default)]
     pub turn_delay_ms: Option<u64>,
 }

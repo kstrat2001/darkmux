@@ -59,6 +59,43 @@ pub fn pin_cwd(cmd: &mut Command) {
     cmd.current_dir("/");
 }
 
+/// Every model LMStudio currently has resident, via `lms ps --json` with a
+/// `lms ps` text fallback.
+///
+/// **"Nothing is loaded" and "I could not tell" are DISTINCT results
+/// (#2774 round-9 MF3).** An `Ok(vec![])` is a positive statement that the
+/// host reported zero residents; anything this function could not
+/// interpret is an `Err`, never an empty success.
+///
+/// It used to collapse the two. Both probes fell through to
+/// `Ok(parse_text_ps(&stdout))`, and `parse_text_ps` yields an empty vec
+/// for unrecognized text exactly as it does for a header with no rows —
+/// with neither call site checking `status.success()`. Proven with a fake
+/// `lms` on `PATH`: garbage stdout at exit 0, and exit 1 with no stdout,
+/// each produced `Ok(vec![])`.
+///
+/// The consumer that makes this a safety defect rather than a cosmetic one
+/// is tier 5. The thermal breaker calls `swap::eject_all_managed` on a real
+/// `critical` trip, unattended, and that function's only `Err` path is this
+/// listing. A silent empty made it emit
+/// `thermal.tier5_eject { ejected: [], user_loaded_count: 0 }` —
+/// indistinguishable from "genuinely nothing was resident" — while every
+/// managed model stayed loaded and the machine kept cooking, with
+/// `thermal.tier5_eject_failed` never firing.
+///
+/// Fixed HERE rather than inside `eject_all_managed` because every other
+/// consumer (`darkmux doctor`, the serve daemon, the telemetry sampler,
+/// `main.rs`) inherits the same gap; the ones that would rather have an
+/// empty than an error already say so at their own call site with
+/// `unwrap_or_default()`.
+///
+/// **The strictness is narrow on purpose.** A legitimately empty host
+/// still returns `Ok(vec![])` — including on an older `lms` with no
+/// `--json` support, whose text output is empty or a bare column header.
+/// See [`interpret_text_ps`] for exactly which shapes count as a definite
+/// answer; widening this to "no rows parsed ⇒ error" would break that
+/// case, which is the blast radius that made the narrow reading worth
+/// writing down.
 pub fn list_loaded() -> Result<Vec<LoadedModel>> {
     let mut cmd = Command::new(lms_bin());
     cmd.args(["ps", "--json"]);
@@ -77,7 +114,62 @@ pub fn list_loaded() -> Result<Vec<LoadedModel>> {
     cmd.args(["ps"]);
     let text_out = run_bounded(cmd, "ps", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
         .map_err(|e| anyhow::anyhow!("running `lms ps`: {e}"))?;
-    Ok(parse_text_ps(&text_out.stdout))
+    if !text_out.status.success() {
+        bail!(
+            "`lms ps --json` did not return a JSON array and `lms ps` {} — cannot tell whether \
+             any models are loaded, which is NOT the same as none being loaded. Check that `{}` \
+             is a working LMStudio CLI and that LMStudio is running.",
+            text_out.exit_detail(),
+            lms_bin(),
+        );
+    }
+    interpret_text_ps(&text_out.stdout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`lms ps --json` did not return a JSON array and the output of `lms ps` was not \
+             recognizable as a model listing — cannot tell whether any models are loaded, which \
+             is NOT the same as none being loaded. First line was: {:?}. Check that `{}` is a \
+             working LMStudio CLI.",
+            text_out.stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim(),
+            lms_bin(),
+        )
+    })
+}
+
+/// `lms ps` TEXT output → `Some(rows)` when the output is a DEFINITE
+/// answer, `None` when it could not be interpreted at all (#2774 round-9
+/// MF3). The `None` is what [`list_loaded`] turns into an `Err` instead of
+/// an empty success.
+///
+/// Three shapes are a definite empty, and each is here because an older
+/// `lms` with no `--json` support and nothing resident really does produce
+/// one of them:
+///
+/// - no output at all;
+/// - the column header with no rows beneath it;
+/// - an explicit "no models …" line.
+///
+/// Anything else that parsed to zero rows — a stack trace, an auth prompt,
+/// a truncated response, a future CLI's redesigned table — is `None`. A
+/// header PLUS unparseable rows is `None` too: the CLI is recognizable but
+/// this parser did not understand what it said, which is precisely the
+/// "could not tell" case.
+fn interpret_text_ps(stdout: &str) -> Option<Vec<LoadedModel>> {
+    let rows = parse_text_ps(stdout);
+    if !rows.is_empty() {
+        return Some(rows);
+    }
+    let unparsed: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("IDENTIFIER"))
+        .collect();
+    if unparsed.is_empty() {
+        return Some(Vec::new());
+    }
+    if unparsed.iter().all(|l| l.to_ascii_lowercase().contains("no models")) {
+        return Some(Vec::new());
+    }
+    None
 }
 
 fn model_from_json(v: &serde_json::Value) -> LoadedModel {
@@ -430,5 +522,131 @@ mod tests {
         let parsed = parse_text_ps(text);
         // 2 columns is below the 5-column threshold
         assert_eq!(parsed.len(), 0);
+    }
+
+    // ─── (#2774 round-9 MF3) "nothing loaded" vs "could not tell" ──────
+    //
+    // `parse_text_ps` above returns an empty vec for BOTH, which is fine
+    // for a parser and fatal for a safety path — tier 5's unattended
+    // eject had no way to distinguish them. `interpret_text_ps` is where
+    // the distinction lives; these pin both halves, because a guard that
+    // only ever answers "could not tell" would pass the `None` cases and
+    // break every legitimately-empty host.
+
+    #[test]
+    fn a_definite_empty_listing_is_still_a_success() {
+        for (label, text) in [
+            ("no output at all", ""),
+            ("whitespace only", "\n  \n"),
+            ("the header with no rows", "IDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\n"),
+            ("an explicit no-models line", "No models are currently loaded.\n"),
+        ] {
+            assert_eq!(
+                interpret_text_ps(text),
+                Some(Vec::new()),
+                "{label} is a POSITIVE statement that nothing is resident — an older `lms` with \
+                 no --json support produces exactly this"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_listing_is_still_parsed() {
+        let text = "IDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\ndarkmux:qwen3-4b  qwen3-4b  idle  2.15 GB  68000\n";
+        let rows = interpret_text_ps(text).expect("a recognizable listing is a definite answer");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identifier, "darkmux:qwen3-4b");
+    }
+
+    #[test]
+    fn output_this_parser_cannot_read_is_not_an_empty_listing() {
+        for (label, text) in [
+            ("a stack trace", "Error: connect ECONNREFUSED 127.0.0.1:1234\n    at TCPConnectWrap\n"),
+            ("an auth prompt", "Please run `lms login` first.\n"),
+            ("a redesigned table", "IDENTIFIER  MODEL\nqwen3-4b  qwen3-4b\n"),
+            ("one truncated row", "IDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\nqwen3-4b  qwen\n"),
+        ] {
+            assert_eq!(
+                interpret_text_ps(text),
+                None,
+                "{label} must read as \"could not tell\", never as \"nothing is loaded\""
+            );
+        }
+    }
+
+    /// Writes a throwaway executable that impersonates `lms`, so the
+    /// subprocess half of [`list_loaded`] is EXECUTED rather than reasoned
+    /// about. Never touches the operator's real LMStudio — the fake is
+    /// reached through `DARKMUX_LMS_BIN`, and nothing here loads or
+    /// unloads anything.
+    fn fake_lms(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("fake-lms");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// (#2774 round-9 MF3) The two shapes the sweep proved live, executed
+    /// end to end: an `lms` that answers with garbage, and one that fails
+    /// outright. Both used to return `Ok(vec![])` — an artifact reading as
+    /// a clean successful sweep while every managed model stayed resident.
+    ///
+    /// Two notes, so neither reads as a defect in this test:
+    ///
+    /// - The FIRST run on a machine can take ~12s, and that is not a hang.
+    ///   It spawns five real processes, and macOS rescans each
+    ///   newly-written executable the first time it is exec'd; warm, the
+    ///   same test finishes in ~0.3s. `run_bounded`'s own poll interval is
+    ///   25ms, so nothing here waits on a deadline.
+    /// - nextest may mark it `leaky`. That is `run_bounded`'s pipe-drain
+    ///   threads, which it deliberately abandons after `PIPE_GRACE` rather
+    ///   than blocking on — shared by every `lms` call in this crate, just
+    ///   exercised five times here instead of once. Pre-existing, and out
+    ///   of scope for the listing fix.
+    #[test]
+    #[serial_test::serial]
+    fn an_lms_that_cannot_be_understood_is_an_error_not_an_empty_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+
+        for (label, body) in [
+            ("garbage on stdout at exit 0", "echo 'not a listing'; exit 0"),
+            ("a hard failure with no stdout", "exit 1"),
+        ] {
+            let bin = fake_lms(tmp.path(), body);
+            unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+            let result = list_loaded();
+            assert!(
+                result.is_err(),
+                "{label}: must not report an empty listing as a successful answer, got {:?}",
+                result.map(|r| r.len())
+            );
+            let msg = format!("{:#}", result.unwrap_err());
+            assert!(
+                msg.contains("cannot tell whether any models are loaded"),
+                "{label}: the error must say WHICH of the two it is: {msg}"
+            );
+        }
+
+        // The inverse, through the same fake: a working `lms ps --json`
+        // reporting an empty host is still a plain success. Without this
+        // the guard above could be satisfied by erroring unconditionally.
+        let bin = fake_lms(tmp.path(), "echo '[]'; exit 0");
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        assert_eq!(
+            list_loaded().expect("an empty JSON array is a definite answer").len(),
+            0
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
     }
 }
