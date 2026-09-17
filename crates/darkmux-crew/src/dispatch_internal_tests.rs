@@ -13934,6 +13934,208 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    // ─── (#2779) host-derived records outside the `dispatch.rest` family ──
+
+    /// The stamp for records the sampler thread builds outside the two
+    /// `emit_rest` closures. `emit_rest` stamps inline; these could not,
+    /// and were missed by the #2779 retrofit — `thermal.stop_unresolved`
+    /// carries the thermal `state` verbatim, `battery.pause_unsupported`
+    /// carries `charge_pct`, and BOTH are `Level::Warn`. A scenario file
+    /// made either of them indistinguishable from the real thing.
+    #[test]
+    fn host_derived_payload_names_the_scenario_and_leaves_a_real_reading_unmarked() {
+        use crate::host_source::Provenance;
+        let scripted = Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 4,
+            span_ms: 90_000,
+        };
+        let p =
+            super::host_derived_payload(serde_json::json!({ "state": "critical", "charge_pct": 5 }), &scripted);
+        assert_eq!(p["state"], "critical", "the reading still rides the record");
+        assert_eq!(p["charge_pct"], 5);
+        assert_eq!(
+            p["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a record built on scripted readings must name the scenario behind it: {p}"
+        );
+
+        let real = super::host_derived_payload(serde_json::json!({ "state": "critical" }), &Provenance::Real);
+        assert!(
+            real.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing at all, not with a null: {real}"
+        );
+
+        let unavailable = super::host_derived_payload(
+            serde_json::json!({ "state": "critical" }),
+            &Provenance::ScriptedUnavailable {
+                path: "/nope.jsonl".to_string(),
+                error: "No such file".to_string(),
+            },
+        );
+        assert!(
+            unavailable.get("simulated_host_source").is_none(),
+            "nothing is simulated when the scenario failed to load, so nothing may be stamped"
+        );
+    }
+
+    /// (C3) The `thermal.stop_unresolved` payload, pinned by BEHAVIOR.
+    /// Both emission sites live on the sampler thread of a live dispatch
+    /// where no in-process test reaches them, so the payload was extracted
+    /// the way `runtime_rest_payload` was — and is asserted on the same way:
+    /// the fields it owes, plus the stamp, at each provenance.
+    #[test]
+    fn thermal_stop_unresolved_carries_the_state_and_names_a_scripted_source() {
+        use crate::host_source::Provenance;
+        let scripted = Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 4,
+            span_ms: 90_000,
+        };
+        let p = super::thermal_stop_unresolved_payload("missing_context", "no crawl id", "critical", &scripted);
+        assert_eq!(p["stop_written"], false);
+        assert_eq!(p["cause"], "missing_context");
+        assert_eq!(p["reason"], "no crawl id");
+        assert_eq!(p["state"], "critical", "the host reading rides the record");
+        assert_eq!(
+            p["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a fabricated `critical` must not read as a real one: {p}"
+        );
+
+        let real = super::thermal_stop_unresolved_payload("missing_context", "no crawl id", "critical", &Provenance::Real);
+        assert!(
+            real.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing, not with a null: {real}"
+        );
+    }
+
+    /// (C3) The `battery.pause_unsupported` payload, pinned by behavior for
+    /// the same reason. `Level::Warn` at the call site: the operator asked
+    /// for a pause and is not getting one, on numbers that a scenario file
+    /// can fabricate.
+    #[test]
+    fn battery_pause_unsupported_carries_the_charge_and_names_a_scripted_source() {
+        use crate::host_source::Provenance;
+        let scripted = Provenance::Scripted {
+            path: "/tmp/battery-floor.jsonl".to_string(),
+            frames: 2,
+            span_ms: 4_000,
+        };
+        let p = super::battery_pause_unsupported_payload(5, 50, &scripted);
+        assert_eq!(p["charge_pct"], 5, "the host reading rides the record");
+        assert_eq!(p["floor_pct"], 50);
+        assert_eq!(p["paused"], false);
+        assert_eq!(p["reason"], crate::power_policy::PACE_REASON);
+        assert_eq!(p["policy_field"], crate::power_policy::INFLIGHT_POLICY_FIELD);
+        assert!(
+            p["detail"].as_str().expect("detail is a string").contains("cannot be resumed"),
+            "the record still says WHY it did not pause: {p}"
+        );
+        assert_eq!(
+            p["simulated_host_source"], "/tmp/battery-floor.jsonl",
+            "a fabricated low battery must not read as a real one: {p}"
+        );
+
+        let real = super::battery_pause_unsupported_payload(5, 50, &Provenance::Real);
+        assert!(
+            real.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing, not with a null: {real}"
+        );
+    }
+
+    /// (C3) The tier-5 eject records, pinned by behavior through the seam
+    /// that made it possible. `tier5_eject_on_critical` itself cannot be
+    /// driven in-process — it shells out to `lms` to unload real residents
+    /// — but its emitter WRAPPER can, with a collecting closure, and that
+    /// is where the stamping lives.
+    ///
+    /// All three of that function's emissions go through one wrapper, so
+    /// one test covers `thermal.tier5_eject` and both
+    /// `thermal.tier5_eject_failed` paths. A token count cannot tell a real
+    /// stamp from a decoy call beside a bare `emit`; reading the payload
+    /// back can.
+    #[test]
+    fn the_tier5_emitter_stamps_every_record_that_passes_through_it() {
+        use crate::host_source::Provenance;
+        use std::sync::Mutex;
+        let collected: Mutex<Vec<(String, serde_json::Value)>> = Mutex::new(Vec::new());
+        let sink = |action: &str, payload: serde_json::Value| {
+            collected.lock().expect("not poisoned").push((action.to_string(), payload));
+        };
+        let scripted = Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 1,
+            span_ms: 2_000,
+        };
+        let emit = super::stamping_emitter(&sink, &scripted);
+        emit("thermal.tier5_eject", serde_json::json!({ "ejected": [], "user_loaded_count": 0 }));
+        emit("thermal.tier5_eject_failed", serde_json::json!({ "error": "lms unreachable" }));
+
+        let seen = collected.lock().expect("not poisoned");
+        assert_eq!(seen.len(), 2, "the wrapper must forward every record, not swallow any");
+        for (action, payload) in seen.iter() {
+            assert_eq!(
+                payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+                "{action} fires ONLY on a literal `critical`, so a scenario file makes it eject \
+                 real residents — the record must say the cause was fabricated: {payload}"
+            );
+        }
+        // …and the record's own fields survive the wrapping.
+        assert_eq!(seen[0].1["user_loaded_count"], 0);
+        assert_eq!(seen[1].1["error"], "lms unreachable");
+        drop(seen);
+
+        // Real hardware: forwarded, unmarked.
+        let collected_real: Mutex<Vec<(String, serde_json::Value)>> = Mutex::new(Vec::new());
+        let sink_real = |action: &str, payload: serde_json::Value| {
+            collected_real.lock().expect("not poisoned").push((action.to_string(), payload));
+        };
+        super::stamping_emitter(&sink_real, &Provenance::Real)(
+            "thermal.tier5_eject",
+            serde_json::json!({ "ejected": [] }),
+        );
+        let seen = collected_real.lock().expect("not poisoned");
+        assert!(
+            seen[0].1.get("simulated_host_source").is_none(),
+            "a real thermal trip carries no marker at all: {:?}",
+            seen[0].1
+        );
+    }
+
+    /// The wiring check that behavior cannot reach: that the five records
+    /// above are built by the stamping builders rather than by an inline
+    /// `json!` beside them. A physical source check, for the same reason
+    /// `the_dispatch_prints_the_simulated_source_warning_at_sampler_start`
+    /// below is one — the call sites are on a live dispatch's sampler
+    /// thread.
+    ///
+    /// Named builders rather than a raw `host_derived_payload` count: a
+    /// count could be satisfied by a decoy call next to a bare emit, while
+    /// these names appear only where the record is actually built, and each
+    /// one's payload is pinned by a behavioral test above.
+    #[test]
+    fn every_host_derived_record_in_this_module_is_built_by_a_stamping_builder() {
+        let src = include_str!("dispatch_internal.rs");
+        for (builder, expected, what) in [
+            ("thermal_stop_unresolved_payload(", 3, "2 emission sites + its definition"),
+            ("battery_pause_unsupported_payload(", 2, "1 emission site + its definition"),
+        ] {
+            let n = src.matches(builder).count();
+            assert_eq!(
+                n, expected,
+                "expected {expected} occurrences of `{builder}` ({what}), found {n}. An inline \
+                 `json!` at one of these sites is the #2779 defect returning: the record ships \
+                 unstamped and the behavioral test above still passes, because it never sees the \
+                 call site."
+            );
+        }
+        // The tier5 wrapper is a shadowing binding rather than a builder
+        // call, so it is pinned by its exact line instead of by a count.
+        assert!(
+            src.contains("let emit = stamping_emitter(emit, crate::host_source::provenance());"),
+            "tier5_eject_on_critical must shadow its `emit` parameter with the stamping wrapper —              without it all three of its records emit unstamped, and the behavioral test above              still passes because it drives the wrapper directly"
+        );
+    }
+
     // ─── (#2779) the dispatch-start warning is actually wired ────────────
 
     /// A physical source check, for the reason

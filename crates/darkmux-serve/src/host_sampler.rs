@@ -441,6 +441,26 @@ fn interval_due(ms_since_last: u64, interval_ms: u64) -> bool {
 /// contract says the cadence is a recorded knob, never adaptive-silent: an
 /// artifact says what cadence produced it, and a tightened debug cadence is
 /// visible in the data rather than inferred from row spacing.
+///
+/// **Deliberately carries no `simulated_host_source`, and that is not an
+/// oversight** — it is the one `machine.*` record in this module a scenario
+/// file cannot reach. `DARKMUX_HOST_SOURCE_SCRIPT` substitutes
+/// `host_probe::thermal::sample` and `host_probe::battery::sample`; HEALTH
+/// comes from `host_probe::battery::health()`, which reads IOKit
+/// unconditionally and never consults `host_source` in either its macOS or
+/// its non-Apple-Silicon implementation. Stamping a reading that is always
+/// real would be its own lie, the same reason `ScriptedUnavailable` stamps
+/// nothing. Registered as `StampDuty::Exempt` in
+/// `darkmux_crew::host_source::HOST_READING_ACTIONS` so the next sweep reads
+/// the call instead of re-deriving it.
+///
+/// The claim is pinned where it can actually be OBSERVED —
+/// `host_source::producer_registry_tests::
+/// the_probes_the_facade_substitutes_never_read_the_facade_themselves`, a
+/// source check over `host_probe/battery.rs`. A test driving THIS builder
+/// cannot see it: the builder takes a `&BatteryHealth` that is already read,
+/// so routing `health()` through the facade would leave every assertion here
+/// green.
 fn build_battery_health_record(
     health: &BatteryHealth,
     poll_interval_ms: u64,
@@ -552,12 +572,43 @@ fn build_battery_transition_record(
     floor_pct: u8,
     sampled_at_ms: u64,
 ) -> darkmux_flow::FlowRecord {
+    build_battery_transition_record_with(
+        transitions,
+        from,
+        to,
+        floor_pct,
+        sampled_at_ms,
+        darkmux_crew::host_source::provenance(),
+    )
+}
+
+/// [`build_battery_transition_record`]'s body, with the host provenance
+/// passed in rather than read from the process-wide resolution — split for
+/// the reason `darkmux_crew::host_source::stamp_with` is split from `stamp`,
+/// so the scripted branch is reachable from a test at all.
+///
+/// This record predates the scripted-source facade (#2705/#2706 shipped
+/// before #2779) and the retrofit that stamped `machine.telemetry` and
+/// `machine.thermal` never reached it. It is the stamp that matters MOST of
+/// the three: `below-floor` is `Level::Warn`, and #2706 acts on it — an
+/// in-flight dispatch PAUSES. A fabricated low-battery event was, until
+/// this split, indistinguishable from a real one on the very record the
+/// pause is justified by, and being machine-scoped it rides the fleet
+/// stream to another machine's machine lens.
+fn build_battery_transition_record_with(
+    transitions: &[&'static str],
+    from: &BatterySample,
+    to: &BatterySample,
+    floor_pct: u8,
+    sampled_at_ms: u64,
+    provenance: &darkmux_crew::host_source::Provenance,
+) -> darkmux_flow::FlowRecord {
     let level = if transitions.contains(&"below-floor") {
         darkmux_flow::Level::Warn
     } else {
         darkmux_flow::Level::Info
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "transitions": transitions,
         "from": darkmux_crew::host_probe::battery_sample_json(from),
         "to": darkmux_crew::host_probe::battery_sample_json(to),
@@ -567,6 +618,7 @@ fn build_battery_transition_record(
         "floor_field": darkmux_crew::power_policy::FLOOR_FIELD,
         "sampled_at_ms": sampled_at_ms,
     });
+    darkmux_crew::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
@@ -721,6 +773,43 @@ fn build_machine_rollup_record(
     gather_ms: u64,
     sampled_at_ms: u64,
 ) -> darkmux_flow::FlowRecord {
+    build_machine_rollup_record_with(
+        load,
+        residency,
+        previous_thermal_state,
+        period_seconds,
+        emitted_interval_ms,
+        gather_ms,
+        sampled_at_ms,
+        darkmux_crew::host_source::provenance(),
+    )
+}
+
+/// [`build_machine_rollup_record`]'s body, with the host provenance passed
+/// in rather than read from the process-wide resolution — split for the
+/// reason `darkmux_crew::host_source::stamp_with` is split from `stamp`, so
+/// the scripted branch is reachable from a test at all.
+///
+/// The rollup landed one commit after the #2779 retrofit that stamped
+/// `machine.telemetry` and `machine.thermal`, and had no `provenance`
+/// parameter AT ALL — so there was no code path at any provenance that
+/// could stamp it. It is the widest carrier of the two readings the facade
+/// simulates: `thermal.state`, `window.thermal.worst_state`,
+/// `level_entries`, and the whole battery block all ride one payload, on a
+/// machine-scoped record that goes to the fleet stream. Unstamped, a
+/// one-frame `critical` scenario told every subscriber this machine was
+/// cooking with nothing in the data saying otherwise.
+#[allow(clippy::too_many_arguments)]
+fn build_machine_rollup_record_with(
+    load: serde_json::Value,
+    residency: Option<serde_json::Value>,
+    previous_thermal_state: Option<&str>,
+    period_seconds: u64,
+    emitted_interval_ms: u64,
+    gather_ms: u64,
+    sampled_at_ms: u64,
+    provenance: &darkmux_crew::host_source::Provenance,
+) -> darkmux_flow::FlowRecord {
     let mut payload = serde_json::json!({
         // Constraint 4: the CONFIGURED cadence...
         "period_seconds": period_seconds,
@@ -745,6 +834,10 @@ fn build_machine_rollup_record(
             obj.insert(k.clone(), v.clone());
         }
     }
+    // AFTER the splice, not before: the splice is a blind key-by-key
+    // overwrite of whatever the lens object carries, so a stamp written
+    // first would be one `load` key away from being silently replaced.
+    darkmux_crew::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
@@ -2215,6 +2308,122 @@ mod tests {
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
+
+    /// `machine.battery` predates the facade (#2705/#2706 shipped before
+    /// #2779) and the retrofit never reached it. It is the
+    /// operator-ACTIONABLE one: `below-floor` is `Level::Warn` and #2706
+    /// PAUSES an in-flight dispatch on it, so a fabricated low-battery
+    /// event was indistinguishable from a real one on the record that acts
+    /// on it.
+    ///
+    /// Real-hardware first, so the absence is what makes the presence below
+    /// mean something.
+    #[test]
+    fn a_scripted_battery_crossing_names_the_scenario_that_produced_it() {
+        let above = battery_at(60, false);
+        let below = battery_at(5, false);
+
+        let (_, real) = battery_edge(Some(&above), &sample_with_battery(Some(below)), 50, 1_000);
+        let real = real.expect("60% -> 5% crosses a 50% floor").payload.expect("payload");
+        assert_eq!(real["transitions"], serde_json::json!(["below-floor"]));
+        assert!(
+            real.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing, not with a null: {real}"
+        );
+
+        let scripted = darkmux_crew::host_source::Provenance::Scripted {
+            path: "/tmp/battery-floor.jsonl".to_string(),
+            frames: 2,
+            span_ms: 4_000,
+        };
+        let rec = build_battery_transition_record_with(&["below-floor"], &above, &below, 50, 1_000, &scripted);
+        assert!(
+            matches!(rec.level, darkmux_flow::Level::Warn),
+            "a floor crossing stays operator-actionable — the stamp answers WHOSE reading it was, \
+             it does not downgrade the event"
+        );
+        let payload = rec.payload.expect("payload present");
+        assert_eq!(
+            payload["simulated_host_source"], "/tmp/battery-floor.jsonl",
+            "a scripted pause trigger must name the scenario file behind it: {payload}"
+        );
+
+        // A NAMED scenario that failed to load reads REAL hardware, so it
+        // must not be marked — same rule the thermal record follows.
+        let unavailable = build_battery_transition_record_with(
+            &["below-floor"],
+            &above,
+            &below,
+            50,
+            1_000,
+            &darkmux_crew::host_source::Provenance::ScriptedUnavailable {
+                path: "/nope.jsonl".to_string(),
+                error: "No such file".to_string(),
+            },
+        );
+        assert!(
+            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            "nothing is simulated when the scenario failed to load, so nothing may be stamped"
+        );
+    }
+
+    /// (C4) The rollup stamps AFTER splicing the lens object in, and the
+    /// ordering is load-bearing: the splice is a blind key-by-key overwrite
+    /// of whatever `load` carries, so a stamp written first is one key away
+    /// from being silently replaced. `load` cannot carry that key today —
+    /// which is exactly why the ordering needs a test rather than only a
+    /// comment, since reversing it is green until the day it is not.
+    #[test]
+    fn the_rollup_stamp_survives_a_load_object_carrying_the_same_key() {
+        let scripted = darkmux_crew::host_source::Provenance::Scripted {
+            path: "/tmp/real-scenario.jsonl".to_string(),
+            frames: 1,
+            span_ms: 1_000,
+        };
+        let load = serde_json::json!({
+            "now": { "thermal": { "state": "critical" } },
+            // The decoy: a `load` key claiming the readings were real.
+            "simulated_host_source": "/tmp/DECOY-from-the-load-object.jsonl",
+        });
+        let payload = build_machine_rollup_record_with(load, None, None, 60, 60_000, 1, 0, &scripted)
+            .payload
+            .expect("payload");
+        assert_eq!(
+            payload["simulated_host_source"], "/tmp/real-scenario.jsonl",
+            "the provenance the record was BUILT with must win over anything the spliced lens              object carries under the same key: {payload}"
+        );
+    }
+
+    /// `machine.battery_health` is the one `machine.*` record in this module
+    /// that is CORRECTLY unstamped: `host_probe::battery::health()` reads
+    /// IOKit unconditionally and never consults `host_source`, so there is
+    /// nothing to stamp and stamping would label a real reading simulated.
+    ///
+    /// **What this test can and cannot see.** It pins the BUILDER's output
+    /// and the registry classification. It cannot observe where
+    /// `health()` reads from — the builder takes an already-read
+    /// `&BatteryHealth` — so it is not the tripwire for the exemption
+    /// itself. That one is
+    /// `darkmux_crew::host_source::producer_registry_tests::
+    /// the_probes_the_facade_substitutes_never_read_the_facade_themselves`,
+    /// a source check that goes red the moment `host_probe/battery.rs`
+    /// references `host_source` at all.
+    #[test]
+    fn battery_health_is_never_stamped_because_the_facade_cannot_reach_it() {
+        let payload =
+            build_battery_health_record(&health_with(120), 3_600_000, 1_000).payload.expect("payload");
+        assert!(
+            payload.get("simulated_host_source").is_none(),
+            "health is a real IOKit read on every source, so it carries no simulation marker: {payload}"
+        );
+        assert!(
+            darkmux_crew::host_source::HOST_READING_ACTIONS.iter().any(|(action, duty)| *action
+                == "machine.battery_health"
+                && matches!(duty, darkmux_crew::host_source::StampDuty::Exempt(_))),
+            "and the registry must say so, with the reason, so the next sweep reads the call \
+             instead of re-deriving it"
+        );
+    }
     // ─── (#2775) the periodic machine-lens aggregate ───────────────────
 
     /// The payload is the MACHINE LENS's own vocabulary at the top level —
@@ -2319,6 +2528,76 @@ mod tests {
         let load = ring.snapshot().expect("one sample");
         let rec = build_machine_rollup_record(load, None, Some("serious"), 60, 60_000, 1, 0);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
+    }
+
+    /// The rollup is the WIDEST carrier of the two readings the facade
+    /// simulates — `thermal.state`, `window.thermal.worst_state`,
+    /// `level_entries` and the whole battery block all ride one payload —
+    /// and it is machine-scoped, so it goes to another machine's machine
+    /// lens over the fleet stream. Until the `_with` split existed it had no
+    /// `provenance` parameter at all, so no code path at ANY provenance
+    /// could stamp it: a one-frame `critical` scenario told every subscriber
+    /// this machine was cooking with nothing in the data saying otherwise.
+    #[test]
+    fn a_scripted_rollup_names_the_scenario_that_produced_it() {
+        let ring = HostSamplerRing::new();
+        ring.set_configured_interval_for_test(5_000);
+        ring.push(RingEntry {
+            at_ms: 0,
+            sample: HostSampleFull {
+                thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 40 }),
+                ..Default::default()
+            },
+        });
+        let load = ring.snapshot().expect("one sample");
+
+        // Real hardware first: the absence is what makes the presence below
+        // mean something, and an explicit `null` would NOT do — the flow
+        // records answer "were these real" by the key's absence.
+        let real = build_machine_rollup_record(load.clone(), None, None, 60, 60_000, 1, 0)
+            .payload
+            .expect("payload");
+        assert_eq!(real["now"]["thermal"]["state"], "critical", "the reading really is in there");
+        assert!(
+            real.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing, not with a null: {real}"
+        );
+
+        let scripted = darkmux_crew::host_source::Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 1,
+            span_ms: 2_000,
+        };
+        let payload =
+            build_machine_rollup_record_with(load.clone(), None, None, 60, 60_000, 1, 0, &scripted)
+                .payload
+                .expect("payload");
+        assert_eq!(
+            payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a scripted machine picture must name the scenario file behind it: {payload}"
+        );
+        assert_eq!(
+            payload["now"]["thermal"]["state"], "critical",
+            "the splice of the lens object must not have dropped the reading the stamp describes"
+        );
+
+        let unavailable = build_machine_rollup_record_with(
+            load,
+            None,
+            None,
+            60,
+            60_000,
+            1,
+            0,
+            &darkmux_crew::host_source::Provenance::ScriptedUnavailable {
+                path: "/nope.jsonl".to_string(),
+                error: "No such file".to_string(),
+            },
+        );
+        assert!(
+            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            "nothing is simulated when the scenario failed to load, so nothing may be stamped"
+        );
     }
 
     /// The emission clock is `interval_due`, and `0` there means OFF — this
