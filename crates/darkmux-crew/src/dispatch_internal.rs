@@ -8111,24 +8111,30 @@ fn run_telemetry_sampler(
         crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env())
             .owned_by(mission_id.as_deref())
             .seeded_from_mission(thermal_ladder_state_file.as_deref());
-    // (#2774 round-3 MF1) An incoherent `pause_at`/`resume_at` pair runs no
-    // soft tier at all. `darkmux doctor` warns about the config itself, but
-    // an operator who never ran doctor would otherwise watch a hot machine
-    // simply never pace and have no way to know why — the exact "never
-    // wonder where a decision came from" failure operator sovereignty (#44)
-    // exists to prevent. Says it at dispatch start, not per sample.
-    if darkmux_types::config_access::thermal_enabled() && !thermal_governor.soft_tiers_armed() {
-        eprintln!(
-            "darkmux: ⚠ thermal ladder DISARMED — runtime.thermal.pause_at \
-             (`{}`) is not strictly more severe than runtime.thermal.resume_at (`{}`), so \
-             there is no band for the entry/resume holds to occupy. Duty-cycle, pause/resume \
-             and the episode-count hold will not run this dispatch; the breaker (`critical`, \
-             and the sustained cpu_speed_limit floor) still will. Fix with: darkmux config set \
-             runtime.thermal.resume_at <a state milder than {}>",
-            darkmux_types::config_access::thermal_pause_at(),
-            darkmux_types::config_access::thermal_resume_at(),
-            darkmux_types::config_access::thermal_pause_at(),
-        );
+    // (#2774 round-3 MF1) A `pause_at`/`resume_at` pair that leaves a tier
+    // no usable band runs that tier not at all. `darkmux doctor` warns
+    // about the config itself, but an operator who never ran doctor would
+    // otherwise watch a hot machine simply never pace and have no way to
+    // know why — the exact "never wonder where a decision came from"
+    // failure operator sovereignty (#44) exists to prevent. Says it at
+    // dispatch start, not per sample.
+    //
+    // (#2774 round-4) Reports whatever the governor's OWN bands value says
+    // is disarmed, rather than restating one hardcoded reason. Round 3's
+    // version was gated on the WHOLE ladder being disarmed and phrased for
+    // a single cause, so it stayed silent for both of round 4's findings: a
+    // typo'd `pause_at` (which used to rank above `critical` and therefore
+    // "armed" the ladder, silencing this very warning), and `resume_at =
+    // nominal` (which disarms tier 2 alone). These are the same notes
+    // doctor renders, so the two surfaces cannot disagree.
+    if darkmux_types::config_access::thermal_enabled() {
+        for note in thermal_governor.disarm_notes() {
+            eprintln!(
+                "darkmux: ⚠ thermal ladder — {} DISARMED for this dispatch: {} The breaker \
+                 (`critical`, and the sustained cpu_speed_limit floor) still runs. Fix with: {}",
+                note.tiers, note.why, note.remedy,
+            );
+        }
     }
     let thermal_stop_file =
         crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());

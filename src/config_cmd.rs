@@ -58,16 +58,25 @@ enum Ty {
     /// `darkmux_crew::host_probe::thermal::THERMAL_STATES`
     /// (`nominal`/`fair`/`serious`/`critical`) — `runtime.thermal.pause_at`
     /// / `.resume_at`. Without this, a typo (`"seroius"`) silently parsed
-    /// as `Ty::Str`, and `severity()`'s `unwrap_or(THERMAL_STATES.len())`
-    /// ranks an unrecognized name WORSE than `critical` — inverting either
-    /// knob's intent with no error anywhere in the path: a typo'd
-    /// `pause_at` makes `sev >= severity(pause_at)` (4) all but
-    /// unreachable for any real OS reading, silently disabling the
-    /// governor's soft pause (the breaker's own hardcoded `"critical"`
-    /// check is unaffected); a typo'd `resume_at` makes
-    /// `sev <= severity(resume_at)` (4) true for every reading, so the
-    /// hysteresis hold fills up regardless of actual temperature and the
-    /// pause clears almost immediately even on a machine still hot.
+    /// as `Ty::Str`, and the governor's old `severity()` helper ranked an
+    /// unrecognized name WORSE than `critical` via
+    /// `unwrap_or(THERMAL_STATES.len())` — inverting either knob's intent
+    /// with no error anywhere in the path: a typo'd `pause_at` made
+    /// `sev >= severity(pause_at)` (4) all but unreachable for any real OS
+    /// reading, silently disabling the governor's soft pause (the
+    /// breaker's own hardcoded `"critical"` check was unaffected); a
+    /// typo'd `resume_at` made `sev <= severity(resume_at)` (4) true for
+    /// every reading, so the hysteresis hold filled up regardless of
+    /// actual temperature and the pause cleared almost immediately even on
+    /// a machine still hot.
+    ///
+    /// (#2774 round-4 C3) That helper is gone: the governor now resolves
+    /// `darkmux_crew::thermal_bands::ThermalBands`, which has no rank for
+    /// an unrecognized name and DISARMS the soft tiers with a stated
+    /// reason instead of inventing one. This validation is still the first
+    /// line of defense — it stops the token reaching a config file at
+    /// all — but a typo that gets in by hand is now loud rather than
+    /// silently inverting.
     ThermalState,
     /// (#1685) Comma-separated list of non-empty, trimmed strings, coerced
     /// to a JSON array — `darkmux config set cmd.allowed pr-list,pr-merge`.

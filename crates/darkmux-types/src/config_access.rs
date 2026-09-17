@@ -1270,7 +1270,9 @@ pub fn thermal_enabled() -> bool {
 ///
 /// This closes a proven split. `darkmux doctor` validated `pause_at` by
 /// LOWERCASING it before comparing against `THERMAL_STATES`, while
-/// `thermal_governor::severity()` compared the RAW string, and nothing in
+/// the governor's then-current `severity()` helper compared the RAW string
+/// (today: `thermal_bands::ThermalBands`, which matches `THERMAL_STATES`
+/// exactly), and nothing in
 /// between normalized. So `pause_at = "Serious"` — a hand-edited config,
 /// or one written before `config set` validated the token — reached a
 /// doctor **Pass** whose message affirmatively claimed tier 4 was enabled,
@@ -3913,8 +3915,13 @@ mod tests {
     }
 
     /// (#2774 round-3 C4) Thermal-state tokens normalize at RESOLUTION, so
-    /// `thermal_governor::severity()`'s raw comparison and `darkmux
-    /// doctor`'s validation can never disagree about the same config.
+    /// the governor's band resolution (`thermal_bands::ThermalBands`, which
+    /// matches `THERMAL_STATES` exactly) and `darkmux doctor`'s validation
+    /// can never disagree about the same config.
+    ///
+    /// **This one sets the ENV tier**; the CONFIG tier — a hand-edited
+    /// `config.json` carrying `"Serious"`, which is the case C4 was
+    /// actually about — has its own test below.
     #[serial_test::serial]
     #[test]
     fn thermal_state_tokens_normalize_at_resolution() {
@@ -3926,6 +3933,66 @@ mod tests {
         }
         assert_eq!(thermal_pause_at(), "serious");
         assert_eq!(thermal_resume_at(), "fair");
+        unsafe {
+            match prev_p {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_r {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-4 C5) The CONFIG tier, which is the tier C4 was about.
+    ///
+    /// C4's defect was a hand-edited `config.json` carrying `"Serious"` —
+    /// doctor lowercased before validating, the governor compared raw, and
+    /// the two disagreed. Both of round 3's tests for it set the ENV tier
+    /// only. The config tier is correct by construction (the normalizer
+    /// wraps the WHOLE precedence chain, not just the env branch) but
+    /// nothing executed it, so a future edit that moved
+    /// `normalize_thermal_state` inside the `env_str(...)` arm would pass
+    /// both tests while restoring the exact defect.
+    #[cfg(feature = "test-support")]
+    #[serial_test::serial]
+    #[test]
+    fn thermal_state_tokens_normalize_from_the_config_tier_too() {
+        let prev_p = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_r = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        // The env tier must be OUT of the way, or this would test it again.
+        unsafe {
+            std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT");
+            std::env::remove_var("DARKMUX_THERMAL_RESUME_AT");
+        }
+
+        {
+            let cfg = DarkmuxConfig {
+                runtime: Some(crate::config::RuntimeBehaviorConfig {
+                    thermal: Some(crate::config::ThermalConfig {
+                        pause_at: Some(" Serious ".to_string()),
+                        resume_at: Some("FAIR".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let _guard = set_config_for_test(cfg);
+            assert_eq!(
+                thermal_pause_at(),
+                "serious",
+                "a hand-edited config.json token must reach consumers canonicalized"
+            );
+            assert_eq!(thermal_resume_at(), "fair");
+        }
+
+        // Guard dropped: back to the built-in defaults, which are already
+        // canonical.
+        assert_eq!(thermal_pause_at(), "serious");
+        assert_eq!(thermal_resume_at(), "fair");
+
         unsafe {
             match prev_p {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),

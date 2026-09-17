@@ -1324,7 +1324,7 @@ impl StepKind for CrawlUnitStepKind {
                 // The operator MUST be able to get unstuck from the message
                 // alone — the file is invisible otherwise, and the way out
                 // differs by which kind of stop this is.
-                let remedy = match hold {
+                let remedy = match hold.scope {
                     thermal_governor::StopHold::ThisMission => format!(
                         "let the machine cool, then launch the crawl again — a new mission is not \
                          bound by this run's stop; to clear it by hand: rm {}",
@@ -1337,11 +1337,18 @@ impl StepKind for CrawlUnitStepKind {
                         stop_path.display()
                     ),
                 };
+                // (#2774 round-4 C2) What the file SAYS happened, not what
+                // this reader assumes: tier 4's episode-count hold drops
+                // the same STOP file and this message used to call every
+                // one of them a breaker trip, on machines that never
+                // reported `critical`. `what_happened` is the single place
+                // a reason word becomes prose — see its own doc.
+                let what = hold.what_happened();
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "`{CRAWL_UNIT_KIND}`: unit `{}` skipped — the thermal breaker's STOP file is \
-                         present at {} (#2109); this unit was never dispatched. {remedy}",
+                        "`{CRAWL_UNIT_KIND}`: unit `{}` skipped — {what}, and its STOP file is \
+                         present at {}; this unit was never dispatched. {remedy}",
                         ctx.unit_id,
                         stop_path.display()
                     ))
@@ -1364,7 +1371,7 @@ impl StepKind for CrawlUnitStepKind {
                     sha: ctx.sha.clone(),
                     rest_ms: 0,
                     reason: Some(format!(
-                        "thermal breaker tripped (#2109) — STOP file present at {}. {remedy}",
+                        "{what} — STOP file present at {}. {remedy}",
                         stop_path.display()
                     )),
                     detections: None,

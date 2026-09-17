@@ -3148,111 +3148,63 @@ fn check_thermal_governor() -> Check {
     let episode_threshold = darkmux_types::config_access::thermal_episode_threshold();
     let tier4_enabled = darkmux_types::config_access::thermal_tier4_enabled();
 
-    // (#2110/#2109 review finding 6) `darkmux config set` rejects an
-    // unrecognized thermal-state token going forward, but a hand-edited
-    // config.json or a value written before that validation existed can
-    // still carry one — and, per `Ty::ThermalState`'s own doc, a typo here
-    // silently INVERTS the governor's intent rather than erroring, so this
-    // is worth a loud Warn rather than folding into the Pass message above.
-    let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
-    // (#2774 round-3 C4) Compared RAW, deliberately. These used to
-    // `.to_ascii_lowercase()` first, while `thermal_governor::severity()`
-    // compared the raw string — so `pause_at = "Serious"` passed doctor
-    // and was scored as an UNKNOWN state by the governor, silently
-    // inerting tiers 2/3/4. `config_access::thermal_pause_at` now
-    // normalizes at resolution, so these ARE lowercase by the time they
-    // arrive; comparing raw here means that if the normalization ever goes
-    // away, doctor warns (loud) instead of passing (silent).
-    let bad_pause_at = !states.contains(&pause_at.as_str());
-    let bad_resume_at = !states.contains(&resume_at.as_str());
-    if bad_pause_at || bad_resume_at {
-        let mut bad = Vec::new();
-        if bad_pause_at {
-            bad.push(format!("pause_at=`{pause_at}`"));
-        }
-        if bad_resume_at {
-            bad.push(format!("resume_at=`{resume_at}`"));
-        }
+    // (#2774 round-4) EVERY arming verdict comes from the same value the
+    // GOVERNOR runs on: `ThermalBands`, whose only band constructor
+    // refuses a band no reading can satisfy and one that every reading
+    // satisfies. Doctor RENDERS those refusals; it does not re-derive
+    // them. Four verdicts this check used to compute for itself now
+    // arrive from there:
+    //
+    // - an unrecognized token in either slot (review finding 6 — a typo
+    //   that `darkmux config set` rejects going forward but a hand-edited
+    //   config.json can still carry);
+    // - `pause_at` not strictly more severe than `resume_at` (F6);
+    // - `pause_at = "critical"` (round-3 C4), which never fires a soft
+    //   tier because the breaker's own `critical` rule is evaluated FIRST
+    //   on every sample, so the reading that would enter tier 3 has
+    //   already tripped the breaker — and a Pass message saying "tier 4
+    //   enabled after N episodes" under it is affirmatively wrong;
+    // - `resume_at = "nominal"` (round-4 MF1), the mirror image at the
+    //   other end of the enum, whose absence here is what let round 4's
+    //   defect ship.
+    //
+    // This check used to derive its own verdicts from the raw thresholds,
+    // and that is exactly how it came to report **Pass** on `pause_at =
+    // fair, resume_at = nominal` — a config round 4 then proved wedges a
+    // cold machine into a permanent, ratcheting turn delay — with a
+    // committed test asserting the Pass was correct. A second
+    // implementation of the arming rule is a second chance to get it
+    // wrong, and the two cannot be kept in agreement by intention. There
+    // is now one.
+    //
+    // The raw (un-lowercased) comparison the token check used to make
+    // deliberately is preserved: `ThermalBands::resolve` matches
+    // `THERMAL_STATES` exactly, so if `config_access`'s normalization ever
+    // goes away, this warns (loud) instead of passing (silent).
+    let bands = darkmux_crew::thermal_bands::ThermalBands::resolve(&pause_at, &resume_at);
+    if let Some(first) = bands.disarm_notes().first() {
         return Check {
             name: name.into(),
             status: Status::Warn,
             message: format!(
-                "unrecognized thermal state: {} — valid: {}. An unrecognized pause_at silently \
-                 disables the governor's soft pause; an unrecognized resume_at defeats the \
-                 hysteresis hold and clears a pause almost immediately regardless of actual \
-                 temperature.",
-                bad.join(", "),
-                states.join(", ")
+                "{} DISARMED — {} The breaker is unaffected and still runs: an OS-reported \
+                 `critical` state, and {speed_limit_hold_samples} consecutive samples with \
+                 cpu_speed_limit_pct < {min_cpu}%.",
+                bands
+                    .disarm_notes()
+                    .iter()
+                    .map(|n| n.tiers)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                bands
+                    .disarm_notes()
+                    .iter()
+                    .map(|n| n.why.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" Also: "),
             ),
-            hint: Some(format!(
-                "darkmux config set runtime.thermal.pause_at <{}>",
-                states.join("|")
-            )),
+            hint: Some(first.remedy.clone()),
         };
-    }
-
-    // (#2774 review F6; remedy text corrected round-3 C5) `pause_at` and
-    // `resume_at` are ordered severities (position in `THERMAL_STATES`),
-    // and the ladder's hysteresis model needs `pause_at` STRICTLY more
-    // severe than `resume_at` — a real band for the entry/resume holds to
-    // occupy. When the two touch or invert, every reading is at once "hot
-    // enough to pause" and "cool enough to resume", which is not a
-    // condition the ladder can act on coherently. So the governor now
-    // DISARMS its soft tiers for such a pair (#2774 round-3 MF1,
-    // `ThermalGovernor::soft_tiers_armed`) rather than picking a tie-break
-    // — two earlier attempts to pick one each shipped a defect, in
-    // opposite directions.
-    //
-    // (C5) This message previously described the PRE-guard behavior
-    // ("cycling straight back into a fresh `serious` episode every
-    // ~{resume_hold_ms}ms and reaching a terminal, operator-gated pause in
-    // roughly 2x that"), which the guard landing in the same commit had
-    // already falsified. It now says what actually happens.
-    let pause_severity = states.iter().position(|s| *s == pause_at.as_str());
-    let resume_severity = states.iter().position(|s| *s == resume_at.as_str());
-    if let (Some(p), Some(r)) = (pause_severity, resume_severity) {
-        if p <= r {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "pause_at=`{pause_at}` is not strictly more severe than resume_at=`{resume_at}` \
-                     — the ladder needs a real band between them for the entry/resume holds to \
-                     occupy, so with these equal (or inverted) every reading would be both \"hot \
-                     enough to pause\" and \"cool enough to resume\" at once. The soft tiers are \
-                     therefore DISARMED: no duty-cycle, no pause/resume, no episode-count hold. \
-                     The breaker is unaffected and still runs — an OS-reported `critical` state, \
-                     and {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct \
-                     < {min_cpu}%."
-                ),
-                hint: Some(format!(
-                    "darkmux config set runtime.thermal.resume_at <a state milder than {pause_at}> \
-                     (valid: {})",
-                    states.join("|")
-                )),
-            };
-        }
-        // (#2774 round-3 C4) `pause_at = "critical"` passes every check
-        // above and then never fires a soft tier either: the breaker's own
-        // `sev >= severity("critical")` rule is evaluated FIRST on every
-        // sample, so the reading that would enter tier 3 has already
-        // tripped the breaker. Saying "tier 4 enabled after N episodes" in
-        // a Pass message under that config is affirmatively wrong.
-        if p >= states.len() - 1 {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "pause_at=`{pause_at}` is the breaker's own threshold, so the soft tiers can \
-                     never run: a `{pause_at}` reading trips the breaker (pause + a crawl STOP \
-                     file) before anything would enter the duty-cycle/pause ladder. Set pause_at \
-                     to a milder state if you want a graduated response before the breaker."
-                ),
-                hint: Some(
-                    "darkmux config set runtime.thermal.pause_at serious".to_string(),
-                ),
-            };
-        }
     }
 
     // (N2, final re-check) An explicit `0` doesn't achieve "disable"
@@ -9508,15 +9460,47 @@ mod tests {
         assert!(check.message.contains("pause_at"), "{}", check.message);
         assert!(check.message.contains("resume_at"), "{}", check.message);
 
+        // (#2774 round-4 MF1) **This assertion used to read `Status::Pass`
+        // for `fair`/`nominal`, with the message "a real gap (fair
+        // pause_at, nominal resume_at) must not warn". It was wrong, and
+        // it is CHANGED rather than worked around.** A gap between the two
+        // thresholds is necessary and not sufficient: `resume_at = nominal`
+        // makes tier 2's duty band cover every reading below `pause_at`, so
+        // the duty cycle can be entered and never exited. Measured, on this
+        // exact config: 900 samples x 2000ms of `nominal` yielded
+        // `DutyCycleEntered { delay_ms: 15000 }` and a pace file still
+        // pacing at the end, ratcheting 15s -> 300s per turn across a
+        // mission, on a machine that was cold throughout. Doctor reporting
+        // **Pass** on it was the second half of the defect — and the remedy
+        // text of the check right above this one recommends `nominal` as
+        // one of its two answers.
         unsafe {
             std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
             std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+        }
+        let nominal_resume = check_thermal_governor();
+        assert_eq!(
+            nominal_resume.status,
+            Status::Warn,
+            "resume_at=nominal leaves tier 2 no exit — doctor must not call it fine: {}",
+            nominal_resume.message
+        );
+        assert!(
+            nominal_resume.message.contains("tier 2"),
+            "…and must name the tier that will not run: {}",
+            nominal_resume.message
+        );
+
+        // The shipped default pair IS a real gap, and still passes.
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "serious");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
         }
         let ok_check = check_thermal_governor();
         assert_eq!(
             ok_check.status,
             Status::Pass,
-            "a real gap (fair pause_at, nominal resume_at) must not warn: {}",
+            "the default pair (serious pause_at, fair resume_at) must not warn: {}",
             ok_check.message
         );
 
@@ -9600,7 +9584,8 @@ mod tests {
         assert_eq!(
             darkmux_types::config_access::thermal_pause_at(),
             "serious",
-            "the resolved value must be the canonical token the governor's severity() compares"
+            "the resolved value must be the canonical token the governor's band resolution \
+             (thermal_bands::ThermalBands) matches against"
         );
         let check = check_thermal_governor();
         assert_eq!(check.status, Status::Pass, "{}", check.message);
@@ -9636,8 +9621,16 @@ mod tests {
             check.message
         );
         assert!(
-            !check.message.contains("tier 4"),
-            "and must not still claim tier 4 is enabled: {}",
+            !check.message.contains("enabled after"),
+            "and must not still claim tier 4 is enabled after N episodes: {}",
+            check.message
+        );
+        // (#2774 round-4) …and must name which tiers those are. The old
+        // assertion here only checked that the string "tier 4" was ABSENT,
+        // which a message saying nothing at all would also satisfy.
+        assert!(
+            check.message.contains("tiers 3 and 4") && check.message.contains("DISARMED"),
+            "the operator must be told exactly what will not run: {}",
             check.message
         );
 
@@ -9645,6 +9638,59 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
                 None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-4 MF1) The exact mirror image of the check above, at
+    /// the other end of the enum — and the gap that let round 4's defect
+    /// ship. `pause_at = critical` was warned about; `resume_at = nominal`
+    /// reported **Pass**, with a committed test asserting the Pass was
+    /// correct, while it wedged a cold machine into a permanent ratcheting
+    /// duty cycle. Both ends are now one refusal in `ThermalBands`.
+    #[test]
+    #[serial_test::serial]
+    fn resume_at_nominal_warns_that_tier_2_could_never_be_exited() {
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+
+        for pause_at in ["fair", "serious"] {
+            unsafe {
+                std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", pause_at);
+                std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+            }
+            let check = check_thermal_governor();
+            assert_eq!(
+                check.status,
+                Status::Warn,
+                "pause_at={pause_at}: {}",
+                check.message
+            );
+            assert!(
+                check.message.contains("tier 2") && check.message.contains("DISARMED"),
+                "pause_at={pause_at}: must name the tier that will not run: {}",
+                check.message
+            );
+            assert!(
+                check.message.contains("breaker"),
+                "pause_at={pause_at}: …and what DOES still run: {}",
+                check.message
+            );
+            assert!(
+                check.hint.as_deref().is_some_and(|h| h.contains("resume_at")),
+                "pause_at={pause_at}: the remedy must point at the knob that is wrong: {:?}",
+                check.hint
+            );
+        }
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
             }
         }
     }

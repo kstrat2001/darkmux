@@ -104,30 +104,52 @@
 //! `thermal-critical` regardless, so the two artifacts of one event
 //! disagreed about what the event was.
 //!
-//! **The soft tiers need a coherent threshold pair, and refuse to run
-//! without one.** Tiers 2/3/4 all key off `pause_at`/`resume_at`, and the
-//! hysteresis model needs `pause_at` STRICTLY more severe than `resume_at`
-//! — otherwise one reading is at once "hot enough to pause" and "cool
-//! enough to resume", and there is no coherent answer to give.
-//! `ThermalGovernor::new` decides this once
-//! ([`ThermalGovernor::soft_tiers_armed`]) and an incoherent pair runs no
-//! soft tier at all; the BREAKER compares against its own thresholds and
-//! is unaffected. See that method's own doc for the two defects, in
-//! opposite directions, that produced this rule (#2774 round-3 MF1).
+//! **The soft tiers need a usable BAND, and refuse to run without one.**
+//! Tiers 2/3/4 all key off `pause_at`/`resume_at`, and each needs a band of
+//! readings that is both inhabited (something can be in it) and proper
+//! (something the tier can actually see is outside it — otherwise whatever
+//! the complement gates, such as leaving a duty cycle or clearing a pause,
+//! is unreachable). `ThermalGovernor::new` resolves all three bands once,
+//! through [`crate::thermal_bands::ThermalBands`], whose only band
+//! constructor REFUSES a degenerate one. A tier whose band was refused does
+//! not run, and says why ([`ThermalGovernor::disarm_notes`] — rendered
+//! identically by the dispatch-start warning and `darkmux doctor`, off that
+//! one value). The BREAKER compares against its own thresholds and is
+//! unaffected. See the `thermal_bands` module doc for the three shipped
+//! defects — one per review round, each introduced by the previous round's
+//! fix — that produced this design (#2774 rounds 1-4).
+//!
+//! Two consequences worth knowing before reading the tier table above,
+//! because the table's own rows would otherwise imply these configs work:
+//!
+//! - **`resume_at = "nominal"` disarms tier 2.** Every reading below
+//!   `pause_at` would be inside the duty band, so the duty cycle could be
+//!   entered and never exited — measured at 900 samples of `nominal`
+//!   yielding a permanent, ratcheting 15s -> 300s per-turn delay on a cold
+//!   machine. Tier 1's own row above (`nominal` | no delay) is the
+//!   contradiction that made it visible.
+//! - **`pause_at = "critical"` disarms tiers 3 and 4.** The breaker owns
+//!   that reading and fires first, so the pause ladder's entry band is
+//!   empty over the readings a soft tier can ever be handed.
 
-use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
+use crate::thermal_bands::{SoftReading, ThermalBands};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-/// Severity rank of a thermal state name. An unrecognized name (a future
-/// macOS state this build doesn't know) ranks WORSE than `critical` —
-/// mirrors `host_probe::mod::thermal_severity`'s reasoning: silently
-/// treating an unknown state as mild would hide real thermal pressure.
-fn severity(state: &str) -> usize {
-    THERMAL_STATES.iter().position(|s| *s == state).unwrap_or(THERMAL_STATES.len())
-}
+// (#2774 round-4) There is deliberately NO `severity(&str) -> usize` in this
+// module any more. Every soft tier reads its band off [`ThermalBands`]
+// instead, because three of the four review rounds on #2774 each shipped a
+// defect of exactly one shape: a hand-written comparison against a raw
+// severity rank whose band turned out to be unsatisfiable or tautological.
+// A raw rank is the thing that made those writable; `SoftReading` +
+// `Band::contains` is what replaced it. See `thermal_bands`' module doc.
+//
+// The one comparison that is NOT a band is the breaker's, and it does not
+// need one: `SoftReading::of` returns `None` for exactly the readings the
+// breaker owns (`critical`, and any name this build does not recognize), so
+// `on_sample` matches on that `None` rather than ranking anything.
 
 /// `<host_out>/pace.json`, re-exported from [`crate::pace_file`] — this
 /// module was the pace file's only writer until #2706 added the battery
@@ -506,6 +528,46 @@ pub enum StopHold {
     Unattributed,
 }
 
+/// (#2774 round-4 C2) One STOP file, read: whose stop it is, and WHAT the
+/// writer said happened.
+///
+/// Round 3's C8 fixed the WRITER — tier 4 stopped stamping
+/// `thermal-critical` into a file it dropped for a count-based escalation —
+/// but the only READER still split the body for the `mission=` token and
+/// threw the rest away. So the same artifact disagreement C8 was filed to
+/// close simply moved one consumer out: a tier-4 hold printed "the thermal
+/// breaker's STOP file is present (#2109)" and stamped
+/// `UnitOutcome.reason = "thermal breaker tripped (#2109) — …"` on a
+/// machine that never reported `critical`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopFileHold {
+    /// Whose stop this is — see [`StopHold`].
+    pub scope: StopHold,
+    /// The reason word the writer recorded ([`STOP_FILE_REASON`],
+    /// [`STOP_FILE_REASON_EPISODE_LIMIT`], or something a future writer or
+    /// a human put there). `None` for a body carrying none — a human's bare
+    /// `touch`, or a token this reader will not render (see
+    /// [`stop_file_reason`]).
+    pub reason: Option<String>,
+}
+
+impl StopFileHold {
+    /// What this stop says happened, in a clause that fits mid-sentence.
+    /// The ONE place a reason word becomes operator-facing prose, so a
+    /// consumer cannot re-describe a tier-4 hold as a breaker trip by
+    /// writing its own message — which is exactly what C2 found.
+    pub fn what_happened(&self) -> String {
+        match self.reason.as_deref() {
+            Some(STOP_FILE_REASON) => "the thermal breaker tripped (#2109)".to_string(),
+            Some(STOP_FILE_REASON_EPISODE_LIMIT) => {
+                "the thermal ladder's episode-count hold escalated (#2774 tier 4)".to_string()
+            }
+            Some(other) => format!("a thermal stop was recorded with reason `{other}`"),
+            None => "a stop was recorded with no reason".to_string(),
+        }
+    }
+}
+
 /// (#2454) Should the mission `mission_id` honor the STOP file at
 /// `stop_file`? `None` — dispatch — when there is no such file, when it is
 /// unreadable, or when it names a DIFFERENT mission.
@@ -524,13 +586,33 @@ pub enum StopHold {
 /// attributed to anything is not evidence of a thermal condition, and
 /// failing closed here would brick the workspace on a truncated write,
 /// which is the exact failure this function exists to prevent.
-pub fn stop_hold_for_mission(stop_file: &Path, mission_id: &str) -> Option<StopHold> {
+pub fn stop_hold_for_mission(stop_file: &Path, mission_id: &str) -> Option<StopFileHold> {
     let body = std::fs::read_to_string(stop_file).ok()?;
-    match stop_file_owner(&body) {
-        None => Some(StopHold::Unattributed),
-        Some(owner) if owner == mission_id.trim() => Some(StopHold::ThisMission),
-        Some(_) => None,
-    }
+    let scope = match stop_file_owner(&body) {
+        None => StopHold::Unattributed,
+        Some(owner) if owner == mission_id.trim() => StopHold::ThisMission,
+        Some(_) => return None,
+    };
+    Some(StopFileHold { scope, reason: stop_file_reason(&body).map(str::to_string) })
+}
+
+/// (#2774 round-4 C2) The reason word of a STOP file's body: the first
+/// whitespace-separated token that is not the `mission=` field.
+///
+/// **Bounded and charset-restricted deliberately.** This value comes off
+/// disk and ends up in a terminal line, and a byte-bounded value rendered
+/// in an indented row is how a forged line gets built (a long token wraps
+/// and the continuation looks like darkmux's own output). A token that is
+/// not short lowercase-ASCII-plus-dash reads as `None` — "a stop with no
+/// reason" — rather than being echoed: an unrecognized reason changes
+/// nothing about honoring the stop, so there is nothing to gain by
+/// rendering it and a forgery surface to lose.
+fn stop_file_reason(body: &str) -> Option<&str> {
+    body.split_whitespace()
+        .find(|tok| !tok.starts_with("mission="))
+        .filter(|tok| {
+            tok.len() <= 32 && tok.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
 }
 
 /// The `mission=<id>` field of a STOP file's body, when it has one.
@@ -832,10 +914,14 @@ pub struct ThermalGovernor {
     /// derivation failure), which keeps the pre-F5 behavior: state scoped
     /// to this one governor's lifetime only.
     ladder_state_file: Option<PathBuf>,
-    /// (#2774 round-3 MF1) Whether the SOFT tiers (2 duty-cycle, 3
-    /// pause/resume, 4 operator hold) are armed at all — decided once at
-    /// construction. See [`ThermalGovernor::soft_tiers_armed`].
-    soft_tiers_armed: bool,
+    /// (#2774 round-3 MF1, rebuilt round-4) The SOFT tiers' severity bands
+    /// — tier 2's duty band, tiers 3/4's pause-entry and recovery pair —
+    /// resolved ONCE at construction from `pause_at`/`resume_at`. A tier
+    /// whose band could not be built (unsatisfiable, or tautological, so
+    /// its complement would be unreachable) is `None` here and does not
+    /// run. See [`ThermalGovernor::soft_tiers_armed`] and the
+    /// [`crate::thermal_bands`] module doc.
+    bands: ThermalBands,
     /// (#2774 round-3 C12) Set once a `persist_ladder_state` failure has
     /// been reported, so a failure that repeats every episode (the ladder
     /// path being a DIRECTORY, say) says so ONCE rather than either
@@ -846,10 +932,14 @@ pub struct ThermalGovernor {
 impl ThermalGovernor {
     pub fn new(config: ThermalGovernorConfig) -> Self {
         let current_duty_delay_ms = config.duty_delay_ms;
-        // (#2774 round-3 MF1) Decided ONCE, here, from the config alone —
-        // never re-derived per sample, so no sample-path predicate can
-        // disagree with the arming decision.
-        let soft_tiers_armed = severity(&config.pause_at) > severity(&config.resume_at);
+        // (#2774 round-3 MF1, rebuilt round-4) Decided ONCE, here, from the
+        // config alone — never re-derived per sample, so no sample-path
+        // predicate can disagree with the arming decision. Round 3 made
+        // that decision a single `bool` from one pair comparison; round 4
+        // found the pair comparison says nothing about whether either
+        // tier's own band is inhabited, so it is now a value that carries
+        // each tier's band and refuses to build a degenerate one.
+        let bands = ThermalBands::resolve(&config.pause_at, &config.resume_at);
         Self {
             config,
             state: State::Idle,
@@ -866,22 +956,28 @@ impl ThermalGovernor {
             stop_owner: None,
             last_stop_write_error: None,
             ladder_state_file: None,
-            soft_tiers_armed,
+            bands,
             ladder_persist_error_reported: false,
         }
     }
 
-    /// (#2774 round-3 MF1) Whether the SOFT tiers run at all on this
+    /// (#2774 round-3 MF1) Whether ANY soft tier runs at all on this
     /// governor: tier 2 (duty-cycle), tier 3 (pause/resume) and tier 4
-    /// (operator hold). `false` when `pause_at` is not STRICTLY more
-    /// severe than `resume_at` — the one shape the ladder's hysteresis
-    /// model cannot express, because the two thresholds leave no band for
-    /// the entry and resume holds to occupy.
+    /// (operator hold). `false` when no tier's band could be built.
     ///
-    /// **Why disarm rather than patch the predicate.** Two rounds of this
-    /// review each produced a defect from the same root, in opposite
-    /// directions, and both were a run DYING on a machine that was never
-    /// in trouble:
+    /// **(#2774 round-4) This is now a summary, not the decision.** Arming
+    /// is PER TIER and lives in [`crate::thermal_bands::ThermalBands`]: a
+    /// tier runs iff its band survived construction, and a band survives
+    /// only when at least one reading is inside it and at least one reading
+    /// the tier can actually see is outside it. So `true` here means "some
+    /// tier is armed", never "every tier is". The consumers that want the
+    /// specifics read [`ThermalGovernor::disarm_notes`] — `darkmux doctor`
+    /// and the dispatch-start warning both render those, off this one
+    /// value, so they cannot disagree about what the ladder will do.
+    ///
+    /// **Why disarm rather than patch the predicate.** Three rounds of this
+    /// review each produced a defect from the same root, and each was a run
+    /// DYING on a machine that was never in trouble:
     ///
     /// - Round 1's shape: one unchanging reading satisfied BOTH "enter
     ///   `pause_at`" and "resume to `resume_at`", so the governor cycled,
@@ -897,13 +993,19 @@ impl ThermalGovernor {
     ///   for the `fair`/`fair` case that fix was written for, the end
     ///   state became the BREAKER (labeled `thermal-critical` on evidence
     ///   that only ever said `fair`) rather than the operator-gated hold.
+    /// - Round 3's fix — the pair comparison this method used to BE —
+    ///   caught both of those and nothing else, because it never looked at
+    ///   either threshold against the enum's ends. Round 4 found
+    ///   `resume_at = "nominal"` making tier 2's `sev >= 0` a tautology, so
+    ///   `DutyCycle` could be entered and never exited: a cold machine
+    ///   picked up a permanent 15s/turn delay that ratcheted to 300s.
     ///
-    /// Both attempts tried to give an incoherent config some SAFE
-    /// behavior. There isn't one: every reading is simultaneously "hot
-    /// enough to pause" and "cool enough to resume", so whichever way the
-    /// tie is broken, the ladder is acting on evidence it does not have.
-    /// Disarming says that plainly — the soft tiers do nothing, the
-    /// operator is told, and `darkmux doctor` names the fix.
+    /// Each attempt tried to give a degenerate config some SAFE behavior.
+    /// There isn't one: when a band covers every reading or none, the
+    /// ladder is acting on evidence it does not have, whichever way the
+    /// tie is broken. Disarming says that plainly — the affected tier does
+    /// nothing, the operator is told at dispatch start, and `darkmux
+    /// doctor` names the fix.
     ///
     /// **What stays armed: the breaker.** An OS-reported `critical` state
     /// and the sustained `cpu_speed_limit_pct` floor are compared against
@@ -913,7 +1015,21 @@ impl ThermalGovernor {
     /// loses only the graduated soft response it could not have coherently
     /// received anyway.
     pub fn soft_tiers_armed(&self) -> bool {
-        self.soft_tiers_armed
+        self.bands.any_armed()
+    }
+
+    /// (#2774 round-4) Why any tier that will not run on this config is
+    /// disarmed, each with the `darkmux config set` line that fixes it.
+    /// Empty when the whole ladder is armed.
+    ///
+    /// This is the ONE source both operator-facing surfaces render — the
+    /// dispatch-start warning (`dispatch_internal.rs`) and `darkmux
+    /// doctor`'s thermal check. Round 3 had each surface derive its own
+    /// verdict from the raw thresholds, which is how doctor came to report
+    /// **Pass** on the config round 4 proved wedges a cold machine into a
+    /// permanent duty cycle.
+    pub fn disarm_notes(&self) -> &[crate::thermal_bands::DisarmNote] {
+        self.bands.disarm_notes()
     }
 
     /// (#2774 review F5) Seed `serious_episodes`/`current_duty_delay_ms`
@@ -1197,22 +1313,21 @@ impl ThermalGovernor {
         (self.config.max_pause_ms / 4).max(1)
     }
 
-    /// Whether a reading counts as RECOVERY from an active pause: at or
-    /// below `resume_at`.
+    /// Whether a reading counts as RECOVERY from an active pause.
     ///
-    /// (#2774 round-3 MF1) Round 2 carried a second clause here — "and
-    /// strictly milder than `pause_at`" — to keep a touching/inverted
-    /// threshold pair from resuming and re-entering off the SAME sample.
-    /// It is gone, and deliberately not replaced with a clamped variant:
-    /// [`ThermalGovernor::soft_tiers_armed`] now refuses to run the soft
-    /// tiers AT ALL for such a pair, so by the time any sample reaches
-    /// this predicate `severity(pause_at) > severity(resume_at)` holds by
-    /// construction and `sev <= resume_at` already implies
-    /// `sev < pause_at`. A second clause here would be dead code that
-    /// cannot be red-proven — and, as MF1 measured, one more place for the
-    /// two thresholds' relationship to be got wrong.
-    fn is_recovery_reading(&self, sev: usize) -> bool {
-        sev <= severity(&self.config.resume_at)
+    /// (#2774 round-4) Reads tier 3's recovery BAND rather than comparing
+    /// ranks. Round 2 carried a second clause here — "and strictly milder
+    /// than `pause_at`" — to keep a touching/inverted threshold pair from
+    /// resuming and re-entering off the SAME sample; it is gone and stays
+    /// gone, now for a structural reason rather than a remembered one:
+    /// [`crate::thermal_bands::PauseBands`] cannot be constructed with an
+    /// entry band and a recovery band that overlap, so a reading being in
+    /// this band already means it is not in the entry band.
+    ///
+    /// `false` when tier 3 is disarmed, which is vacuous rather than
+    /// meaningful — `State::Paused` is unreachable without an entry band.
+    fn is_recovery_reading(&self, reading: SoftReading) -> bool {
+        self.bands.pause().is_some_and(|p| p.recovery.contains(reading))
     }
 
     /// Feed one thermal sample. `elapsed_ms` is the wall time since the
@@ -1325,7 +1440,14 @@ impl ThermalGovernor {
             }
         };
 
-        let sev = severity(&thermal.state);
+        // (#2774 round-4) `SoftReading::of` is the breaker's state test:
+        // `None` is exactly `critical`, or a state name this build does not
+        // recognize (which ranks worse than `critical` by the same
+        // reasoning `host_probe::thermal_severity` uses — treating an
+        // unknown state as mild would hide real thermal pressure). Every
+        // `Some` is a reading the soft tiers' bands are defined over, so
+        // the two definitions of "breaker-class reading" cannot drift.
+        let reading = SoftReading::of(&thermal.state);
         // (finding 7) The speed-limit floor requires N CONSECUTIVE
         // low samples; a single low reading is common DVFS noise. The
         // `critical` state check is untouched — a discrete OS-reported
@@ -1335,7 +1457,7 @@ impl ThermalGovernor {
         } else {
             self.speed_limit_low_streak = 0;
         }
-        let is_breaker_condition = sev >= severity("critical")
+        let is_breaker_condition = reading.is_none()
             || self.speed_limit_low_streak >= self.config.speed_limit_hold_samples.max(1);
 
         if is_breaker_condition {
@@ -1348,32 +1470,47 @@ impl ThermalGovernor {
             return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
         }
 
-        // (#2774 round-3 MF1) The soft tiers (2/3/4) only run when the two
+        // (#2774 round-3 MF1) The soft tiers (2/3/4) only run when the
         // thresholds describe a real band. The breaker above is compared
         // against its OWN thresholds and therefore ran already — disarming
         // costs the graduated response, never the hardware-danger stop.
-        // See `soft_tiers_armed`'s own doc for why an incoherent pair has
+        // See `soft_tiers_armed`'s own doc for why a degenerate band has
         // no safe soft behavior to fall back to.
-        if !self.soft_tiers_armed {
+        //
+        // (#2774 round-4) This is now only a fast path: each tier below
+        // reads its OWN band, so a config where some tiers are armed and
+        // others are not behaves correctly without this early return.
+        if !self.bands.any_armed() {
             return None;
         }
+        // Not `None` — a breaker-class reading returned above.
+        let reading = reading.expect("breaker-class readings returned above");
 
         match self.state {
             State::Idle | State::DutyCycle => {
-                if sev >= severity(&self.config.pause_at) {
+                if self.bands.pause().is_some_and(|p| p.entry.contains(reading)) {
                     return self.enter_paused(&thermal.state, host_out, stop_file);
                 }
-                // (#2774 tier 2) `in_duty_band`: at/above `resume_at` and
-                // (by the check just above) below `pause_at` — the "fair"
-                // range. Entering FROM `Idle` needs a sustained hold IN
-                // this band; leaving FROM `DutyCycle` needs a sustained
-                // hold OUTSIDE it — opposite directions, so which reading
-                // counts as progress toward the transition flips with
-                // `was_duty_cycle`. Both hysteresis holds share
-                // `duty_hold_accum_ms`, since a governor is never in both
-                // states at once.
+                // (#2774 tier 2) `in_duty_band`: inside tier 2's duty band
+                // — at/above `resume_at` and, when tier 3 is armed, below
+                // `pause_at` (the branch above returned already). Entering
+                // FROM `Idle` needs a sustained hold IN this band; leaving
+                // FROM `DutyCycle` needs a sustained hold OUTSIDE it —
+                // opposite directions, so which reading counts as progress
+                // toward the transition flips with `was_duty_cycle`. Both
+                // hysteresis holds share `duty_hold_accum_ms`, since a
+                // governor is never in both states at once.
+                //
+                // (#2774 round-4 MF1) `duty()` is `None` when the band
+                // would have had no reachable complement — `resume_at =
+                // nominal`, where every reading below `pause_at` is inside
+                // it and the exit is therefore unreachable. `false` for
+                // every reading is then the correct reading of a disarmed
+                // tier 2: entry (`in_duty_band`) can never fire, and the
+                // exit below stays available so a governor somehow left in
+                // `DutyCycle` still leaves it.
                 let was_duty_cycle = self.state == State::DutyCycle;
-                let in_duty_band = sev >= severity(&self.config.resume_at);
+                let in_duty_band = self.bands.duty().is_some_and(|d| d.contains(reading));
                 if was_duty_cycle {
                     self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
                 }
@@ -1433,7 +1570,7 @@ impl ThermalGovernor {
             State::Paused => {
                 self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
                 self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
-                if self.is_recovery_reading(sev) {
+                if self.is_recovery_reading(reading) {
                     self.resume_hold_accum_ms = self.resume_hold_accum_ms.saturating_add(elapsed_ms);
                 } else {
                     // Still hot enough to matter — hysteresis resets: only
@@ -1465,11 +1602,12 @@ impl ThermalGovernor {
                     self.resume_hold_accum_ms = 0;
                     self.mark_stamped();
                     // Land in `DutyCycle` if the recovering sample is
-                    // still in the fair band, `Idle` if it's fully
-                    // nominal — the SAME `in_duty_band` test the
-                    // Idle/DutyCycle branch uses, so "where do we land"
-                    // never disagrees with "when would we leave again."
-                    if sev >= severity(&self.config.resume_at) {
+                    // still in the duty band, `Idle` if it's below it —
+                    // the SAME band the Idle/DutyCycle branch tests, read
+                    // off the same value, so "where do we land" cannot
+                    // disagree with "when would we leave again." With tier
+                    // 2 disarmed there is nowhere to land but `Idle`.
+                    if self.bands.duty().is_some_and(|d| d.contains(reading)) {
                         self.state = State::DutyCycle;
                         write_pace_file_with_delay(
                             host_out,
@@ -1567,6 +1705,7 @@ impl ThermalGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_probe::thermal::THERMAL_STATES;
 
     fn sample(state: &str, cpu_speed_limit_pct: u64) -> ThermalSample {
         ThermalSample { state: state.to_string(), cpu_speed_limit_pct }
@@ -1709,7 +1848,13 @@ mod tests {
 
         assert_eq!(
             stop_hold_for_mission(&stop, "crawl-m-1"),
-            Some(StopHold::ThisMission),
+            // (#2774 round-4 C2) The REASON is part of the value now, and
+            // asserted with it: a reader that gets the scope right and the
+            // reason wrong is exactly what C2 found.
+            Some(StopFileHold {
+                scope: StopHold::ThisMission,
+                reason: Some(STOP_FILE_REASON.to_string()),
+            }),
             "the run whose breaker tripped must be stopped"
         );
         assert_eq!(
@@ -1732,7 +1877,13 @@ mod tests {
 
         gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
         assert_eq!(std::fs::read_to_string(&stop).unwrap(), "thermal-critical\n");
-        assert_eq!(stop_hold_for_mission(&stop, "anything"), Some(StopHold::Unattributed));
+        assert_eq!(
+            stop_hold_for_mission(&stop, "anything"),
+            Some(StopFileHold {
+                scope: StopHold::Unattributed,
+                reason: Some(STOP_FILE_REASON.to_string()),
+            })
+        );
     }
 
     #[test]
@@ -1899,7 +2050,13 @@ mod tests {
         let mut gov_a = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-1"));
         gov_a.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
         assert_eq!(gov_a.last_stop_write_error(), None);
-        assert_eq!(stop_hold_for_mission(&stop, "crawl-m-1"), Some(StopHold::ThisMission));
+        assert_eq!(
+            stop_hold_for_mission(&stop, "crawl-m-1"),
+            Some(StopFileHold {
+                scope: StopHold::ThisMission,
+                reason: Some(STOP_FILE_REASON.to_string()),
+            })
+        );
 
         // #2454's reader still works against the new writer, and a
         // second mission's own trip re-stamps the SAME file cleanly.
@@ -1908,7 +2065,10 @@ mod tests {
         assert_eq!(gov_b.last_stop_write_error(), None);
         assert_eq!(
             stop_hold_for_mission(&stop, "crawl-m-2"),
-            Some(StopHold::ThisMission),
+            Some(StopFileHold {
+                scope: StopHold::ThisMission,
+                reason: Some(STOP_FILE_REASON.to_string()),
+            }),
             "a later mission's own trip must be able to re-stamp the file"
         );
         assert_eq!(
@@ -3161,22 +3321,52 @@ mod tests {
     /// Every incoherent pair, every state, exhaustively — nothing in tiers
     /// 2/3/4 may fire and nothing may be written to the pace file. This is
     /// the 4x4 sweep the MF1 report ran by hand, committed.
+    ///
+    /// (#2774 round-4 C3) Widened to UNRECOGNIZED names in either slot.
+    /// The old sweep ran over the four KNOWN states only, which is why it
+    /// missed that `severity()`'s `unwrap_or(THERMAL_STATES.len())` ranked
+    /// a typo'd `pause_at = "seroius"` at 4 — above `critical` — so
+    /// `4 > severity("fair")` ARMED the ladder with tiers 3/4 unreachable
+    /// (the breaker owns every reading at or above `critical`), `serious`
+    /// silently degraded to a duty cycle, and the dispatch-start warning,
+    /// gated on `!soft_tiers_armed()`, never fired.
     #[test]
     fn every_incoherent_threshold_pair_disarms_the_soft_tiers_entirely() {
-        for (pi, pause_at) in THERMAL_STATES.iter().enumerate() {
-            for (ri, resume_at) in THERMAL_STATES.iter().enumerate() {
-                if pi > ri {
-                    continue; // coherent — covered by the sane-gap tests below
+        let tokens: Vec<&str> = THERMAL_STATES
+            .iter()
+            .copied()
+            .chain(["seroius", "", "Serious", "unknown-9"])
+            .collect();
+        let rank = |t: &str| THERMAL_STATES.iter().position(|s| *s == t);
+        for pause_at in &tokens {
+            for resume_at in &tokens {
+                let (pause_at, resume_at) = (*pause_at, *resume_at);
+                // Coherent pairs are covered by the sane-gap tests below.
+                // An unrecognized token in EITHER slot is incoherent by
+                // construction: there is no rank to compare.
+                if let (Some(pi), Some(ri)) = (rank(pause_at), rank(resume_at)) {
+                    if pi > ri {
+                        continue;
+                    }
                 }
                 let gov_cfg = ThermalGovernorConfig {
-                    pause_at: (*pause_at).to_string(),
-                    resume_at: (*resume_at).to_string(),
+                    pause_at: pause_at.to_string(),
+                    resume_at: resume_at.to_string(),
                     ..cfg()
                 };
+                let armed = ThermalGovernor::new(gov_cfg.clone());
                 assert!(
-                    !ThermalGovernor::new(gov_cfg.clone()).soft_tiers_armed(),
+                    !armed.soft_tiers_armed(),
                     "pause_at={pause_at} / resume_at={resume_at} leaves no band for the holds \
                      to occupy and must not arm the soft tiers"
+                );
+                // (#2774 round-4 C3) …and SAYS so. A disarm the operator
+                // is never told about is how the typo'd-`pause_at` case
+                // stayed invisible: the dispatch-start warning renders
+                // these notes, so an empty list is a silent disarm.
+                assert!(
+                    !armed.disarm_notes().is_empty(),
+                    "pause_at={pause_at} / resume_at={resume_at}: a disarmed ladder must say why"
                 );
                 // `nominal` and `fair` only: `serious`/`critical` are real
                 // thermal pressure and the breaker's own (threshold-
@@ -3312,6 +3502,192 @@ mod tests {
         assert_eq!(gov.current_duty_delay_ms(), 30_000, "and still ratchets on the way out");
     }
 
+    // ── (#2774 round-4 MF1) `resume_at = nominal` made tier 2's duty band
+    //    a TAUTOLOGY (`sev >= 0`), so `DutyCycle` could be entered and
+    //    never left. These drive the governor through the configs the
+    //    `thermal_bands` enumeration covers statically. ──
+
+    /// MF1's exact repro, from its own PROVEN report: 900 samples x 2000ms
+    /// (30 minutes) of `nominal` on a config the round-3 remedy text
+    /// literally recommends. It used to yield `DutyCycleEntered { state:
+    /// "nominal", delay_ms: 15000 }` and a pace file still pacing every
+    /// turn at the end, on a machine that was cold throughout — a 40-turn
+    /// run silently gaining ten minutes, ratcheting to 300s/turn over a
+    /// mission and never unwinding.
+    #[test]
+    fn resume_at_nominal_never_enters_a_duty_cycle() {
+        for pause_at in ["fair", "serious", "critical"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+                pause_at: pause_at.to_string(),
+                resume_at: "nominal".to_string(),
+                ..cfg()
+            });
+            for _ in 0..900 {
+                let ev = gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None);
+                assert_eq!(
+                    ev, None,
+                    "pause_at={pause_at}: 30 minutes of `nominal` is not a duty-cycle \
+                     condition, got {ev:?}"
+                );
+            }
+            assert!(
+                !pace_file_path(dir.path()).exists(),
+                "pause_at={pause_at}: a cold machine must not be paced at all"
+            );
+            assert_eq!(gov.current_duty_delay_ms(), 15_000, "…and nothing may ratchet");
+        }
+    }
+
+    /// The second half of MF1: recovering from a REAL `serious` episode
+    /// under the same config must land in `Idle`, not in a `DutyCycle`
+    /// that cannot be exited. This is the path that made the wedge
+    /// permanent — the governor landed back in `DutyCycle` on every
+    /// recovery, so the ratchet compounded with nothing able to unwind it.
+    #[test]
+    fn resume_at_nominal_recovers_into_idle_not_a_permanent_duty_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+            pause_at: "serious".to_string(),
+            resume_at: "nominal".to_string(),
+            ..cfg_tier4_disabled()
+        });
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Paused { state: "serious".to_string() }),
+            "tiers 3/4 stay armed under this config — only tier 2 is disarmed"
+        );
+        let mut resumed = None;
+        for _ in 0..31 {
+            if let Some(ev) = gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None) {
+                resumed = Some(ev);
+            }
+        }
+        assert_eq!(resumed, Some(ThermalEvent::Resumed { state: "nominal".to_string() }));
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false));
+        assert!(
+            pace.get("turn_delay_ms").is_none(),
+            "recovery must not hand the run a turn delay it can never shed: {pace}"
+        );
+        // …and it stays shed. Half an hour later, still nothing.
+        for _ in 0..900 {
+            assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+        }
+        assert_eq!(read_pace(dir.path())["pause"], serde_json::json!(false));
+        assert!(read_pace(dir.path()).get("turn_delay_ms").is_none());
+    }
+
+    /// **The behavioral half of the class-regression net.** For EVERY
+    /// threshold pair whose tier-2 band survived construction, the band's
+    /// own witnesses are driven through the governor: the member enters the
+    /// duty cycle and the non-member leaves it. `thermal_bands`'
+    /// `every_threshold_pair_yields_bands_that_are_neither_empty_nor_total`
+    /// proves the witnesses exist; this proves they do what the band says
+    /// they do, so a band that is well-formed but wired to the wrong
+    /// predicate is caught too.
+    #[test]
+    fn every_armed_duty_band_can_be_both_entered_and_exited() {
+        let mut exercised = 0;
+        for pause_at in THERMAL_STATES {
+            for resume_at in THERMAL_STATES {
+                let Some(duty) =
+                    crate::thermal_bands::ThermalBands::resolve(pause_at, resume_at).duty()
+                else {
+                    continue;
+                };
+                exercised += 1;
+                let label = format!("pause_at={pause_at} resume_at={resume_at}");
+                let dir = tempfile::tempdir().unwrap();
+                let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+                    pause_at: pause_at.to_string(),
+                    resume_at: resume_at.to_string(),
+                    ..cfg()
+                });
+                let inside = duty.a_member().name();
+                let outside = duty.a_non_member().name();
+
+                let mut entered = None;
+                for _ in 0..30 {
+                    if let Some(ev) = gov.on_sample(Some(&sample(inside, 100)), 2000, dir.path(), None)
+                    {
+                        entered = Some(ev);
+                    }
+                }
+                assert_eq!(
+                    entered,
+                    Some(ThermalEvent::DutyCycleEntered {
+                        state: inside.to_string(),
+                        delay_ms: 15_000
+                    }),
+                    "{label}: `{inside}` is in the duty band and must enter it"
+                );
+
+                let mut exited = None;
+                for _ in 0..30 {
+                    if let Some(ev) =
+                        gov.on_sample(Some(&sample(outside, 100)), 2000, dir.path(), None)
+                    {
+                        exited = Some(ev);
+                    }
+                }
+                assert_eq!(
+                    exited,
+                    Some(ThermalEvent::DutyCycleExited { state: outside.to_string() }),
+                    "{label}: `{outside}` is outside the duty band and must EXIT it — an exit \
+                     that never fires is round 4's defect"
+                );
+            }
+        }
+        assert!(exercised >= 3, "the sweep must exercise real armed bands, got {exercised}");
+    }
+
+    /// The same, for tiers 3/4: every armed pause pair's entry witness
+    /// pauses and its recovery witness resumes. Round 2's defect was
+    /// exactly an entry that fired with a recovery that could not.
+    #[test]
+    fn every_armed_pause_band_can_be_both_entered_and_recovered_from() {
+        let mut exercised = 0;
+        for pause_at in THERMAL_STATES {
+            for resume_at in THERMAL_STATES {
+                let Some(pause) =
+                    crate::thermal_bands::ThermalBands::resolve(pause_at, resume_at).pause()
+                else {
+                    continue;
+                };
+                exercised += 1;
+                let label = format!("pause_at={pause_at} resume_at={resume_at}");
+                let dir = tempfile::tempdir().unwrap();
+                let mut gov = ThermalGovernor::new(ThermalGovernorConfig {
+                    pause_at: pause_at.to_string(),
+                    resume_at: resume_at.to_string(),
+                    ..cfg_tier4_disabled()
+                });
+                let hot = pause.entry.a_member().name();
+                let cool = pause.recovery.a_member().name();
+                assert_eq!(
+                    gov.on_sample(Some(&sample(hot, 100)), 2000, dir.path(), None),
+                    Some(ThermalEvent::Paused { state: hot.to_string() }),
+                    "{label}: `{hot}` is in the pause-entry band"
+                );
+                let mut resumed = None;
+                for _ in 0..31 {
+                    if let Some(ev) = gov.on_sample(Some(&sample(cool, 100)), 2000, dir.path(), None)
+                    {
+                        resumed = Some(ev);
+                    }
+                }
+                assert_eq!(
+                    resumed,
+                    Some(ThermalEvent::Resumed { state: cool.to_string() }),
+                    "{label}: `{cool}` is in the recovery band and must clear the pause — a \
+                     recovery that can never fire is round 2's defect"
+                );
+            }
+        }
+        assert!(exercised >= 3, "the sweep must exercise real armed bands, got {exercised}");
+    }
+
     /// The WIDE-gap case, which the round-2 predicate could also have got
     /// wrong in the other direction: `pause_at = serious`,
     /// `resume_at = nominal` means `fair` is NOT a recovery, and `nominal`
@@ -3347,6 +3723,14 @@ mod tests {
             Some(ThermalEvent::Resumed { state: "nominal".to_string() }),
             "reaching resume_at must still recover — the disarm narrows nothing real"
         );
+        // (#2774 round-4 MF1) What this test did NOT assert, and the gap
+        // MF1 lived in: where the recovery LANDS. `resume_at = nominal`
+        // leaves tier 2 no duty band with a reachable exit, so tier 2 is
+        // disarmed and the landing is `Idle`. It used to be `DutyCycle`,
+        // permanently.
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false));
+        assert!(pace.get("turn_delay_ms").is_none(), "no duty cycle to land in: {pace}");
     }
 
     // ── (#2774 review F5) Mission-scoped ladder state across dispatches ──
@@ -3697,6 +4081,67 @@ mod tests {
             "…and the pace file must agree with it"
         );
         assert!(body.contains("mission=crawl-m-8"), "the owner line survives: {body:?}");
+
+        // (#2774 round-4 C2) …and the READER carries it through. C8 fixed
+        // the writer; the one consumer still split the body for `mission=`
+        // and dropped the rest, so a tier-4 hold printed "the thermal
+        // breaker's STOP file is present (#2109)" and stamped a
+        // `UnitOutcome.reason` saying the breaker tripped — on a machine
+        // that never reported `critical`. Same artifact disagreement,
+        // relocated one consumer out.
+        let hold = stop_hold_for_mission(&stop, "crawl-m-8").expect("this mission is held");
+        assert_eq!(
+            hold,
+            StopFileHold {
+                scope: StopHold::ThisMission,
+                reason: Some(STOP_FILE_REASON_EPISODE_LIMIT.to_string()),
+            }
+        );
+        let what = hold.what_happened();
+        assert!(what.contains("episode-count hold"), "{what}");
+        assert!(
+            !what.contains("breaker"),
+            "a count-based escalation must not be described as a breaker trip: {what}"
+        );
+    }
+
+    /// The other half of C2: a REAL breaker trip still reads as one.
+    #[test]
+    fn a_breaker_stop_file_reads_as_a_breaker_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(cfg()).owned_by(Some("crawl-m-9"));
+        gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        let hold = stop_hold_for_mission(&stop, "crawl-m-9").unwrap();
+        assert_eq!(hold.reason.as_deref(), Some(STOP_FILE_REASON));
+        assert!(hold.what_happened().contains("thermal breaker tripped"));
+    }
+
+    /// A human's bare `touch` carries no reason, and a reason token this
+    /// reader will not render (too long, or not lowercase-ASCII-plus-dash)
+    /// reads the same way — the stop is still honored, and nothing off disk
+    /// is echoed into the operator's terminal. See [`stop_file_reason`].
+    #[test]
+    fn an_unrenderable_or_absent_reason_still_honors_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        for (body, label) in [
+            ("", "an empty file"),
+            ("\n", "a bare newline"),
+            ("mission=m-1\n", "an owner with no reason"),
+            ("THERMAL-CRITICAL mission=m-1\n", "a non-lowercase token"),
+            ("\u{1b}[2Kdarkmux: mission=m-1\n", "a terminal-control payload"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa mission=m-1\n",
+                "an over-long token",
+            ),
+        ] {
+            let stop = dir.path().join(format!("STOP-{}", label.replace(' ', "-")));
+            std::fs::write(&stop, body).unwrap();
+            let hold = stop_hold_for_mission(&stop, "m-1")
+                .unwrap_or_else(|| panic!("{label}: the stop must still be honored"));
+            assert_eq!(hold.reason, None, "{label}: must not be rendered");
+            assert_eq!(hold.what_happened(), "a stop was recorded with no reason", "{label}");
+        }
     }
 
     #[test]
