@@ -80,6 +80,14 @@
 //!    [`audit`] makes it. Read the table for what is stamped, what is
 //!    exempt, and why.
 //!
+//!    The FILES the table is checked against are discovered, not
+//!    remembered: a workspace walk asserts that every `.rs` file carrying a
+//!    watched action literal is classified as a producer or as a
+//!    non-producer with a reason. The residual gap is narrow and named — an
+//!    action ASSEMBLED rather than written (`format!("{}.x", "machine")`),
+//!    or a brand-new action family; see [`WATCHED_ACTION_PREFIXES`] and
+//!    [`watched_action_literals`] for both boundaries.
+//!
 //!    The machine-SCOPED records matter most: with Redis enabled they ride
 //!    the fleet stream to another machine's machine lens, which an
 //!    unstamped one would show hitting `critical` with nothing in the data
@@ -514,17 +522,73 @@ pub enum StampDuty {
 /// a NEW family name (`"power.foo"`) escapes the scan until that prefix is
 /// added here. The scan catches the realistic case — a new record in an
 /// existing family, which is how all four unstamped producers arrived — not
-/// every conceivable one.
+/// every conceivable one. The FILE set has no such hole: see
+/// [`PRODUCER_SOURCE_PATHS`].
+#[cfg(test)]
 const WATCHED_ACTION_PREFIXES: &[&str] = &["machine.", "thermal.", "battery.", "dispatch.rest"];
+
+/// The files [`audit`] is given — every source in the workspace that BUILDS
+/// a flow record in a watched family.
+///
+/// **This list is not hand-maintained on trust.** An earlier revision of
+/// this registry closed the action-level hole and left the FILE-level one
+/// open, which is the same rot mode one level up: `audit` only ever sees
+/// the strings it is handed, so a new host-derived record landing in an
+/// unscanned file — `host_probe/thermal.rs` or `host_probe/battery.rs`, the
+/// two modules the facade exists to substitute, or `darkmux-flow`'s
+/// `hooks.rs` — would have shipped unclassified with a green suite.
+///
+/// `producer_paths_are_discovered_not_remembered` walks every `.rs` file in
+/// the workspace, finds the ones containing a watched literal, and asserts
+/// that set equals this list plus [`NON_PRODUCER_SOURCE_PATHS`]. A new file
+/// therefore cannot appear without someone deciding which of the two it is.
+///
+/// A `build.rs` emitting this list was the alternative and was rejected:
+/// it adds a build script to a deliberately dep-light crate, it makes every
+/// `.rs` edit in the workspace a rebuild trigger, and — the deciding
+/// reason — it would silently WIDEN the scan to consumer files, where
+/// `audit` would then flood with false `unclassified` entries for actions
+/// those files only match on. Forcing a decision is the point; generating
+/// the list would remove it.
+#[cfg(test)]
+pub(crate) const PRODUCER_SOURCE_PATHS: &[&str] = &[
+    "crates/darkmux-crew/src/dispatch_internal.rs",
+    "crates/darkmux-crew/src/host_probe/mod.rs",
+    "crates/darkmux-serve/src/host_sampler.rs",
+    "crates/darkmux-flow/src/presence_reconciler.rs",
+];
+
+/// Files that contain a watched action literal but produce no record from a
+/// host reading — with the reason, so the next sweep reads the call instead
+/// of re-deriving it.
+#[cfg(test)]
+pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
+    (
+        "crates/darkmux-crew/src/host_source.rs",
+        "this file — the registry itself. Its literals ARE the table, plus the scanner's own \
+         fixtures; scanning it would classify the table as its own producer",
+    ),
+    (
+        "crates/darkmux-crew/src/records_emitted.rs",
+        "consumer: filters a record stream on `action == \"machine.telemetry\"`, builds nothing",
+    ),
+    (
+        "crates/darkmux-serve/src/runs.rs",
+        "consumer: the runs board matches on action strings, builds nothing",
+    ),
+    (
+        "crates/darkmux-crew/src/dispatch_internal_tests.rs",
+        "tests for a scanned producer, in a sibling file rather than behind the `#[cfg(test)]` \
+         marker the scanner cuts at",
+    ),
+    (
+        "crates/darkmux-serve/src/lib_tests.rs",
+        "tests for the serve daemon, same sibling-file shape",
+    ),
+];
 
 /// Every flow-record action, in the sources [`audit`] scans, whose payload
 /// can carry or be caused by a host reading — and what each one owes.
-///
-/// Deliberately does NOT list `machine.online` / `machine.offline`
-/// (`darkmux-flow`'s `presence_reconciler`). Those are presence edges with
-/// `payload: None` — no reading to stamp, and no host source in the crate
-/// that emits them — so listing them would be an entry no scan covers,
-/// which is the rot this table exists to replace.
 pub const HOST_READING_ACTIONS: &[(&str, StampDuty)] = &[
     // ── machine-scoped: these ride the fleet stream to ANOTHER machine's
     // machine lens, which is what makes an unstamped one a second machine
@@ -538,8 +602,20 @@ pub const HOST_READING_ACTIONS: &[(&str, StampDuty)] = &[
         StampDuty::Exempt(
             "battery::health() reads IOKit unconditionally and never consults host_source, on \
              macOS and on every other target — there is no simulated reading to name, and \
-             stamping would label a real one",
+             stamping would label a real one. Pinned by \
+             `the_probes_the_facade_substitutes_never_read_the_facade_themselves`",
         ),
+    ),
+    (
+        "machine.online",
+        StampDuty::Exempt(
+            "presence edge from darkmux-flow's reconciler: `payload: None`, so there is no \
+             reading in it and nothing to stamp. Emitted from a crate with no host source at all",
+        ),
+    ),
+    (
+        "machine.offline",
+        StampDuty::Exempt("presence edge, same shape as machine.online"),
     ),
     // ── dispatch-scoped: session records, but the reading in them is this
     // machine's, and two of them are Warn.
@@ -551,6 +627,7 @@ pub const HOST_READING_ACTIONS: &[(&str, StampDuty)] = &[
 ];
 
 /// What [`audit`] found wrong, if anything.
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HostReadingAudit {
     /// Action literals present in the scanned sources, in a watched
@@ -563,44 +640,80 @@ pub struct HostReadingAudit {
     pub stale: Vec<&'static str>,
 }
 
+/// Every watched action literal in one source file, in order of first
+/// appearance.
+///
+/// The single scanner both [`audit`] and the file-discovery test run, so
+/// "which files contain a literal" and "which literals are classified"
+/// cannot disagree about what counts as one.
+///
+/// **What it catches**, verified by mutation: a plain literal, a `const`- or
+/// `let`-bound one, a raw string, a literal after a trailing `//` on a code
+/// line, a literal inside a `#[cfg(feature = …)]` module, and
+/// `format!("machine.{}", x)` — which registers as the literal `machine.{}`
+/// and fails LOUD as unclassified rather than passing silently.
+///
+/// **What it misses**, recorded so the boundary does not have to be
+/// re-derived: an action assembled rather than written —
+/// `format!("{}.invented", "machine")`, `concat!("machine", ".invented")`,
+/// `String::push_str`, or macro-generated idents — and any line whose first
+/// non-space character is `*`, which is skipped as a doc-comment
+/// continuation. (Deref-assignment lines starting with `*` exist in the
+/// scanned files today; none carries a watched literal.)
+///
+/// String literals are the odd-indexed segments of a `"`-split: exact for
+/// action strings, none of which contain an escape, and deliberately not a
+/// general Rust lexer.
+#[cfg(test)]
+pub(crate) fn watched_action_literals(src: &str) -> Vec<String> {
+    // Tests live after this marker in `host_sampler.rs` and assert on
+    // action strings constantly; scanning them would classify every
+    // consumer-side literal as a producer. Safe as the files stand — every
+    // watched literal sits before it — and a marker that stopped matching
+    // fails LOUD (the test tail floods `unclassified`) rather than silently
+    // narrowing the scan.
+    let body = match src.find("\n#[cfg(test)]\nmod tests") {
+        Some(i) => &src[..i],
+        None => src,
+    };
+    let mut found: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+            continue;
+        }
+        for (i, segment) in line.split('"').enumerate() {
+            if i % 2 == 0 {
+                continue;
+            }
+            if WATCHED_ACTION_PREFIXES.iter().any(|p| segment.starts_with(p))
+                && !found.iter().any(|f| f == segment)
+            {
+                found.push(segment.to_string());
+            }
+        }
+    }
+    found
+}
+
 /// Scan producing sources for watched action literals and reconcile them
 /// against [`HOST_READING_ACTIONS`].
 ///
-/// A plain `pub fn` rather than a `#[cfg(test)]` helper because the caller
-/// is a test in ANOTHER crate (`darkmux-serve`'s `host_sampler`), and
-/// `cfg(test)` items are invisible across a crate boundary. Pure, cheap,
-/// and string-only — the alternative was a second copy of the scanner in
-/// every producing crate, which is the drift this whole section exists to
-/// stop.
-///
-/// Lines whose first non-space characters are `//` or `*` are skipped, so
-/// prose naming an action does not register as a producer. String literals
-/// are taken as the odd-indexed segments of a `"`-split, which is exact for
-/// action strings (none contain an escape) and is not a general Rust lexer.
-pub fn audit(sources: &[&str]) -> HostReadingAudit {
+/// `#[cfg(test)] pub(crate)`: the only caller is this module's own registry
+/// test, which reaches the other crates' sources through `include_str!`
+/// rather than through a dependency, so the scanner has no reason to exist
+/// in a shipped binary. [`StampDuty`] and [`HOST_READING_ACTIONS`] stay
+/// genuinely public — `darkmux-serve`'s host-sampler tests read the
+/// classification across the crate boundary, and a `cfg(test)` item is
+/// invisible there. An earlier revision made the scanner `pub` on the
+/// stated grounds that darkmux-serve called it; nothing ever did.
+#[cfg(test)]
+pub(crate) fn audit(sources: &[&str]) -> HostReadingAudit {
     let mut found: Vec<String> = Vec::new();
     for src in sources {
-        // Tests live after this marker in `host_sampler.rs` and assert on
-        // action strings constantly; scanning them would classify every
-        // consumer-side literal as a producer.
-        let body = match src.find("\n#[cfg(test)]\nmod tests") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        for line in body.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
-                continue;
-            }
-            for (i, segment) in line.split('"').enumerate() {
-                if i % 2 == 0 {
-                    continue;
-                }
-                if WATCHED_ACTION_PREFIXES.iter().any(|p| segment.starts_with(p))
-                    && !found.iter().any(|f| f == segment)
-                {
-                    found.push(segment.to_string());
-                }
+        for lit in watched_action_literals(src) {
+            if !found.contains(&lit) {
+                found.push(lit);
             }
         }
     }
@@ -636,7 +749,38 @@ mod producer_registry_tests {
             include_str!("dispatch_internal.rs"),
             include_str!("host_probe/mod.rs"),
             include_str!("../../darkmux-serve/src/host_sampler.rs"),
+            include_str!("../../darkmux-flow/src/presence_reconciler.rs"),
         ]
+    }
+
+    /// The workspace root, derived from this crate's own manifest dir at
+    /// COMPILE time — so it points at the source tree even when the test
+    /// binary runs from somewhere else.
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/<crate> has a workspace root two levels up")
+            .to_path_buf()
+    }
+
+    /// Every `.rs` file under the workspace, skipping build output and
+    /// vendored trees.
+    fn all_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(name.as_ref(), "target" | "node_modules" | ".git") {
+                    continue;
+                }
+                all_rust_sources(&path, out);
+            } else if name.ends_with(".rs") {
+                out.push(path);
+            }
+        }
     }
 
     /// The guard the two prior sweeps did not have. A new `machine.*` /
@@ -655,6 +799,124 @@ mod producer_registry_tests {
              producer is gone (remove it, so this table does not rot the way the module doc \
              above did)."
         );
+    }
+
+    /// **The MF1 guard: the scanned-FILE set is discovered, not
+    /// remembered.** `audit` only ever sees the strings it is handed, so an
+    /// earlier revision closed the action-level hole and left this one open
+    /// — a new host-derived record in `host_probe/thermal.rs`,
+    /// `host_probe/battery.rs` (the two modules the facade exists to
+    /// substitute) or `darkmux-flow`'s `hooks.rs` would have shipped
+    /// unclassified with a green suite.
+    ///
+    /// Walks every `.rs` file in the workspace with the SAME scanner
+    /// `audit` uses, and requires each file carrying a watched literal to
+    /// be classified as a producer or as a non-producer with a reason.
+    #[test]
+    fn producer_paths_are_discovered_not_remembered() {
+        let root = workspace_root();
+        let mut files = Vec::new();
+        all_rust_sources(&root, &mut files);
+
+        // Prove the walk can fail before trusting that it passed: a scan
+        // that found nothing (wrong root, unreadable tree) looks exactly
+        // like a clean result.
+        assert!(
+            files.len() > 200,
+            "the workspace walk found only {} .rs files under {} — it is not scanning the source \
+             tree, and a scan of nothing passes every assertion below",
+            files.len(),
+            root.display()
+        );
+
+        let mut discovered: Vec<String> = Vec::new();
+        for path in &files {
+            let Ok(text) = std::fs::read_to_string(path) else { continue };
+            if watched_action_literals(&text).is_empty() {
+                continue;
+            }
+            let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+            discovered.push(rel);
+        }
+        discovered.sort();
+
+        let mut classified: Vec<String> = PRODUCER_SOURCE_PATHS
+            .iter()
+            .map(|p| (*p).to_string())
+            .chain(NON_PRODUCER_SOURCE_PATHS.iter().map(|(p, _)| (*p).to_string()))
+            .collect();
+        classified.sort();
+
+        assert_eq!(
+            discovered, classified,
+            "every workspace file containing a watched action literal must be classified. A file \
+             in `discovered` but not `classified` is the MF1 failure: it is unscanned, so any \
+             record it builds ships unstamped with a green suite — add it to \
+             PRODUCER_SOURCE_PATHS (and to `producer_sources()`), or to NON_PRODUCER_SOURCE_PATHS \
+             with the reason. A file in `classified` but not `discovered` no longer has one."
+        );
+    }
+
+    /// `producer_sources()` hands `audit` the file CONTENTS via
+    /// `include_str!`, while [`PRODUCER_SOURCE_PATHS`] names the same files
+    /// by path for the discovery test — two lists, and this is what keeps
+    /// them the same list. Without it, an `include_str!` could point
+    /// somewhere the path list does not name and the discovery guard would
+    /// be checking a set nobody scans.
+    ///
+    /// The `include_str!` form is kept deliberately alongside the runtime
+    /// read: it makes a moved file a BUILD error, and it makes an edit to
+    /// any scanned file rebuild and re-run this crate's registry tests.
+    #[test]
+    fn the_included_sources_are_exactly_the_paths_the_discovery_test_guards() {
+        let root = workspace_root();
+        let included = producer_sources();
+        assert_eq!(
+            included.len(),
+            PRODUCER_SOURCE_PATHS.len(),
+            "producer_sources() and PRODUCER_SOURCE_PATHS must name the same files"
+        );
+        for (path, text) in PRODUCER_SOURCE_PATHS.iter().zip(included) {
+            let on_disk = std::fs::read_to_string(root.join(path))
+                .unwrap_or_else(|e| panic!("{path} must exist and be readable: {e}"));
+            assert_eq!(
+                on_disk, text,
+                "{path} is not the file `producer_sources()` includes at that position — the two \
+                 lists have drifted, in order or in content"
+            );
+        }
+    }
+
+    /// **The MF2 tripwire, made able to observe the thing it watches.**
+    ///
+    /// `machine.battery_health` is registered `Exempt` on one claim:
+    /// `battery::health()` reads IOKit unconditionally and never consults
+    /// the facade. The test backing it used to drive the record BUILDER
+    /// with a hand-built struct, which cannot observe where the reading
+    /// came from — routing `health()` through the facade left all 50
+    /// host-sampler tests green.
+    ///
+    /// A physical source check can observe it, for the same reason
+    /// `the_host_probe_advances_the_source_by_its_own_measured_interval`
+    /// is one. The invariant is directional: `host_source` WRAPS these two
+    /// modules from outside (`ScriptedSource` substitutes their `sample`
+    /// functions); neither may read it back. The moment one does, the
+    /// exemption is wrong and this goes red.
+    #[test]
+    fn the_probes_the_facade_substitutes_never_read_the_facade_themselves() {
+        for (name, src) in [
+            ("host_probe/battery.rs", include_str!("host_probe/battery.rs")),
+            ("host_probe/thermal.rs", include_str!("host_probe/thermal.rs")),
+        ] {
+            assert!(
+                !src.contains("host_source"),
+                "{name} must not reference `host_source`: the facade substitutes these probes \
+                 from OUTSIDE, and a probe reading the facade back inverts that. For battery.rs \
+                 specifically, `machine.battery_health`'s Exempt classification rests on \
+                 `health()` being an unconditional IOKit read — if that changed, the record now \
+                 needs a stamp and the registry entry is a lie."
+            );
+        }
     }
 
     /// The scan must actually be scanning. A rule that silently matches

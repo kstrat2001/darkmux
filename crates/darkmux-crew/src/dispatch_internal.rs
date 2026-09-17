@@ -7801,6 +7801,74 @@ fn host_derived_payload(
     payload
 }
 
+/// (#2779) The `thermal.stop_unresolved` payload — the breaker could not
+/// write (or could not resolve) the crawl STOP file, reported with the
+/// thermal `state` that tripped it.
+///
+/// Extracted the way `runtime_rest_payload` was, and for the same reason:
+/// the two emission sites live on the sampler thread of a live dispatch,
+/// which no in-process test reaches, so an inline `json!` was pinned by
+/// nothing. `state` IS the host reading, which is what puts this record in
+/// [`crate::host_source::HOST_READING_ACTIONS`] as `Stamped`.
+fn thermal_stop_unresolved_payload(
+    cause: &str,
+    reason: &str,
+    state: &str,
+    provenance: &crate::host_source::Provenance,
+) -> serde_json::Value {
+    host_derived_payload(
+        serde_json::json!({
+            "stop_written": false,
+            "cause": cause,
+            "reason": reason,
+            "state": state,
+        }),
+        provenance,
+    )
+}
+
+/// (#2779) The `battery.pause_unsupported` payload — the operator asked for
+/// a battery-floor pause and this run type cannot take one, so it continues
+/// and says so loudly.
+///
+/// Extracted for the same reason as [`thermal_stop_unresolved_payload`].
+/// `charge_pct` is the host reading; the record is `Level::Warn`, so a
+/// fabricated low battery must not read as a real one here.
+fn battery_pause_unsupported_payload(
+    charge_pct: u8,
+    floor_pct: u8,
+    provenance: &crate::host_source::Provenance,
+) -> serde_json::Value {
+    host_derived_payload(
+        serde_json::json!({
+            "reason": crate::power_policy::PACE_REASON,
+            "charge_pct": charge_pct,
+            "floor_pct": floor_pct,
+            "policy_field": crate::power_policy::INFLIGHT_POLICY_FIELD,
+            "paused": false,
+            "detail": "this run type cannot be resumed from a pace pause, so it \
+                       continues rather than parking in a state it cannot leave",
+        }),
+        provenance,
+    )
+}
+
+/// (#2779) Wrap an emitter so every record it carries is stamped.
+///
+/// Extracted from [`tier5_eject_on_critical`]'s body so the stamping is
+/// pinned by BEHAVIOR rather than by the presence of a call: a test drives
+/// this with a collecting closure and reads the payloads back. The eject
+/// path itself cannot be driven in-process — it shells out to `lms` to
+/// unload real residents — so wrapping is the seam that is testable.
+fn stamping_emitter<'a>(
+    emit: &'a dyn Fn(&str, serde_json::Value),
+    provenance: &'a crate::host_source::Provenance,
+) -> impl Fn(&str, serde_json::Value) + 'a {
+    move |action: &str, payload: serde_json::Value| {
+        emit(action, host_derived_payload(payload, provenance));
+    }
+}
+
 /// (#2774 tier 5) The breaker tripped on a literal `critical` OS thermal
 /// state — the operator's own escalation ladder closes the gap #2109's own
 /// doc names: the breaker pauses the DISPATCH but "never kills the
@@ -7832,9 +7900,7 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
     // on all of them. Shadowed once here rather than stamped at each of the
     // three `emit` call sites, so a fourth record added later inherits the
     // rule instead of having to remember it.
-    let emit = |action: &str, payload: serde_json::Value| {
-        emit(action, host_derived_payload(payload, crate::host_source::provenance()));
-    };
+    let emit = stamping_emitter(emit, crate::host_source::provenance());
     let checkpoint_path = host_out.join("checkpoint.json");
     let deadline = Instant::now() + CHECKPOINT_WAIT_BOUND;
     let reached_checkpoint_boundary = loop {
@@ -8426,15 +8492,10 @@ fn run_telemetry_sampler(
                         // the crawl's own identifying fields (unit,
                         // source, sha, rule) ride along, same as
                         // `emit_rest` above.
-                        // (#2779) `state` IS the host reading, so a
-                        // scripted source is named beside it.
-                        let mut payload = host_derived_payload(
-                            serde_json::json!({
-                                "stop_written": false,
-                                "cause": cause.as_str(),
-                                "reason": reason,
-                                "state": state,
-                            }),
+                        let mut payload = thermal_stop_unresolved_payload(
+                            cause.as_str(),
+                            reason,
+                            &state,
                             crate::host_source::provenance(),
                         );
                         merge_record_context(&mut payload, &record_context);
@@ -8550,15 +8611,10 @@ fn run_telemetry_sampler(
                         governors.thermal.last_stop_write_error(),
                     );
                     if let Some((cause, reason)) = unresolved {
-                        // (#2779) `state` IS the host reading, so a
-                        // scripted source is named beside it.
-                        let mut payload = host_derived_payload(
-                            serde_json::json!({
-                                "stop_written": false,
-                                "cause": cause.as_str(),
-                                "reason": reason,
-                                "state": state,
-                            }),
+                        let mut payload = thermal_stop_unresolved_payload(
+                            cause.as_str(),
+                            reason,
+                            &state,
                             crate::host_source::provenance(),
                         );
                         merge_record_context(&mut payload, &record_context);
@@ -8623,19 +8679,9 @@ fn run_telemetry_sampler(
                     // failure #2706 exists to prevent. Names the numbers
                     // and the field, and gives no advice, same contract as
                     // the start refusal.
-                    // (#2779) `charge_pct` IS the host reading, and this
-                    // record is Warn — a fabricated low battery must not
-                    // read as a real one on the record that reports it.
-                    let mut payload = host_derived_payload(
-                        serde_json::json!({
-                            "reason": crate::power_policy::PACE_REASON,
-                            "charge_pct": charge_pct,
-                            "floor_pct": floor_pct,
-                            "policy_field": crate::power_policy::INFLIGHT_POLICY_FIELD,
-                            "paused": false,
-                            "detail": "this run type cannot be resumed from a pace pause, so it \
-                                       continues rather than parking in a state it cannot leave",
-                        }),
+                    let mut payload = battery_pause_unsupported_payload(
+                        charge_pct,
+                        floor_pct,
                         crate::host_source::provenance(),
                     );
                     merge_record_context(&mut payload, &record_context);

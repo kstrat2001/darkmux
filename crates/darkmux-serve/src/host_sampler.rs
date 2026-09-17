@@ -452,8 +452,15 @@ fn interval_due(ms_since_last: u64, interval_ms: u64) -> bool {
 /// real would be its own lie, the same reason `ScriptedUnavailable` stamps
 /// nothing. Registered as `StampDuty::Exempt` in
 /// `darkmux_crew::host_source::HOST_READING_ACTIONS` so the next sweep reads
-/// the call instead of re-deriving it — and so this claim goes stale loudly
-/// if `health()` ever starts reading through the facade.
+/// the call instead of re-deriving it.
+///
+/// The claim is pinned where it can actually be OBSERVED —
+/// `host_source::producer_registry_tests::
+/// the_probes_the_facade_substitutes_never_read_the_facade_themselves`, a
+/// source check over `host_probe/battery.rs`. A test driving THIS builder
+/// cannot see it: the builder takes a `&BatteryHealth` that is already read,
+/// so routing `health()` through the facade would leave every assertion here
+/// green.
 fn build_battery_health_record(
     health: &BatteryHealth,
     poll_interval_ms: u64,
@@ -2360,12 +2367,47 @@ mod tests {
         );
     }
 
+    /// (C4) The rollup stamps AFTER splicing the lens object in, and the
+    /// ordering is load-bearing: the splice is a blind key-by-key overwrite
+    /// of whatever `load` carries, so a stamp written first is one key away
+    /// from being silently replaced. `load` cannot carry that key today —
+    /// which is exactly why the ordering needs a test rather than only a
+    /// comment, since reversing it is green until the day it is not.
+    #[test]
+    fn the_rollup_stamp_survives_a_load_object_carrying_the_same_key() {
+        let scripted = darkmux_crew::host_source::Provenance::Scripted {
+            path: "/tmp/real-scenario.jsonl".to_string(),
+            frames: 1,
+            span_ms: 1_000,
+        };
+        let load = serde_json::json!({
+            "now": { "thermal": { "state": "critical" } },
+            // The decoy: a `load` key claiming the readings were real.
+            "simulated_host_source": "/tmp/DECOY-from-the-load-object.jsonl",
+        });
+        let payload = build_machine_rollup_record_with(load, None, None, 60, 60_000, 1, 0, &scripted)
+            .payload
+            .expect("payload");
+        assert_eq!(
+            payload["simulated_host_source"], "/tmp/real-scenario.jsonl",
+            "the provenance the record was BUILT with must win over anything the spliced lens              object carries under the same key: {payload}"
+        );
+    }
+
     /// `machine.battery_health` is the one `machine.*` record in this module
     /// that is CORRECTLY unstamped: `host_probe::battery::health()` reads
     /// IOKit unconditionally and never consults `host_source`, so there is
     /// nothing to stamp and stamping would label a real reading simulated.
-    /// Pinned as a test rather than left as a comment so the claim goes RED
-    /// if `health()` is ever routed through the facade.
+    ///
+    /// **What this test can and cannot see.** It pins the BUILDER's output
+    /// and the registry classification. It cannot observe where
+    /// `health()` reads from — the builder takes an already-read
+    /// `&BatteryHealth` — so it is not the tripwire for the exemption
+    /// itself. That one is
+    /// `darkmux_crew::host_source::producer_registry_tests::
+    /// the_probes_the_facade_substitutes_never_read_the_facade_themselves`,
+    /// a source check that goes red the moment `host_probe/battery.rs`
+    /// references `host_source` at all.
     #[test]
     fn battery_health_is_never_stamped_because_the_facade_cannot_reach_it() {
         let payload =
