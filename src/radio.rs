@@ -101,6 +101,22 @@ pub struct CatalogEntry {
     /// `panel.hint` — the same optional input hint the editor shows before
     /// the user has typed anything after the command name.
     pub hint: Option<String>,
+    /// (#2050) `panel.accepts_args`, resolved (unset means `true`). When
+    /// `false`, [`validate_router_output`] DROPS whatever `args` the
+    /// routing seat carried over rather than forwarding them.
+    ///
+    /// The seat is a 4B classifier reading one line of description text,
+    /// and it copies trailing words by default — measured live, `review my
+    /// working tree diff` routed to `review` carrying `"my working tree
+    /// diff"` as its argument. `review` declares no `__panel_args__`
+    /// reader at all, so those words are forwarded as `--param args=<raw>`
+    /// to a config with nothing to receive them: inert today (see
+    /// `radio_cli::spawn_mission_launch`'s own "args honesty note"), and
+    /// wrong the moment a config does declare one. Enforcing the
+    /// declaration here, rather than only instructing the model, is what
+    /// makes it a guarantee instead of a request: the model is free to
+    /// keep getting this wrong and the command still runs correctly.
+    pub accepts_args: bool,
 }
 
 /// Compile the model-facing catalog from the SAME merged, panel-blocked
@@ -116,6 +132,7 @@ pub fn compile_catalog() -> Vec<CatalogEntry> {
             id: cmd.id,
             description: cmd.description,
             hint: cmd.hint,
+            accepts_args: cmd.accepts_args,
         })
         .collect()
 }
@@ -389,6 +406,15 @@ fn validate_router_output(raw: &str, catalog: &[CatalogEntry]) -> RouteDecision 
             // differently-cased id still resolves correctly while an
             // out-of-catalog id still refuses.
             match catalog.iter().find(|c| c.id.eq_ignore_ascii_case(&command)) {
+                // (#2050) A command that declares `panel.accepts_args:
+                // false` receives NO arguments, whatever the seat carried
+                // over. Same posture as wall 2 one field across: the
+                // model's claim is checked against the catalog rather
+                // than trusted, here for `args` as there for `command`.
+                Some(entry) if !entry.accepts_args => RouteDecision::Route {
+                    command: entry.id.clone(),
+                    args: String::new(),
+                },
                 Some(entry) => RouteDecision::Route {
                     command: entry.id.clone(),
                     args,
@@ -565,7 +591,16 @@ mod tests {
             id: id.to_string(),
             description: description.to_string(),
             hint: hint.map(str::to_string),
+            // The unset-`panel.accepts_args` resolution (#2050) — what
+            // every config authored before that field existed compiles to.
+            accepts_args: true,
         }
+    }
+
+    /// (#2050) A catalog entry for a command that declares
+    /// `panel.accepts_args: false` — the built-in `review`'s own shape.
+    fn entry_taking_no_args(id: &str, description: &str, hint: Option<&str>) -> CatalogEntry {
+        CatalogEntry { accepts_args: false, ..entry(id, description, hint) }
     }
 
     fn fixture_catalog() -> Vec<CatalogEntry> {
@@ -667,7 +702,8 @@ mod tests {
             ## Rules\n\
             \n\
             - `command` MUST be copied EXACTLY from the list of available command ids you were given — never invent one, never guess at a close spelling, never combine two.\n\
-            - When in doubt, refuse. A wrong refusal costs the user one extra step; a wrong route runs the wrong command. Refusing is always the safer answer.\n\
+            - Match on MEANING, not wording. A description states what a command does in one phrasing; the user asks in their own. A message asking for what a description describes — in ordinary synonyms, a paraphrase, or a shorter or longer form of the same request — names that command, and should be routed to it.\n\
+            - When in doubt, refuse. A wrong refusal costs the user one extra step; a wrong route runs the wrong command. Refusing is always the safer answer. \"In doubt\" means you cannot tell which command is being asked for, or whether any is — it does not mean the user's words differ from the description's.\n\
             - `args` is free text — copy the user's own words that follow the command's intent, don't paraphrase or summarize them. Use an empty string when there is nothing left to carry over.\n\
             - Choose at most ONE command. Never chain commands, never describe a sequence of steps, never answer the message yourself — you are only choosing one existing command or declining, nothing else.\n";
         assert_eq!(
@@ -690,6 +726,37 @@ mod tests {
         assert_eq!(
             decision,
             RouteDecision::Route { command: "review".to_string(), args: "123".to_string() }
+        );
+    }
+
+    // ── (#2050) `panel.accepts_args: false` is enforced, not requested ───
+
+    #[test]
+    fn validate_router_output_drops_args_for_a_command_that_takes_none() {
+        // Measured live on 3.7.1: `review my working tree diff` routed and
+        // carried `"my working tree diff"` into a config whose hint reads
+        // `(no arguments)`. The seat is free to keep doing that; the
+        // command still runs correctly.
+        let catalog = vec![entry_taking_no_args("review", "Code review of the current changes.", Some("(no arguments)"))];
+        let raw = "```json\n{\"command\": \"review\", \"args\": \"my working tree diff\"}\n```";
+        assert_eq!(
+            validate_router_output(raw, &catalog),
+            RouteDecision::Route { command: "review".to_string(), args: String::new() },
+            "a command declaring it takes no arguments must receive none"
+        );
+    }
+
+    #[test]
+    fn validate_router_output_keeps_args_for_a_command_that_takes_them() {
+        // The inverted case: a rule that cleared `args` unconditionally
+        // would pass the test above just as happily, and would silently
+        // break every command that actually reads its argument.
+        let catalog = vec![entry("pr-view", "Show one pull request.", Some("a PR number"))];
+        let raw = "```json\n{\"command\": \"pr-view\", \"args\": \"482\"}\n```";
+        assert_eq!(
+            validate_router_output(raw, &catalog),
+            RouteDecision::Route { command: "pr-view".to_string(), args: "482".to_string() },
+            "an unset `panel.accepts_args` still forwards the seat's argument verbatim"
         );
     }
 

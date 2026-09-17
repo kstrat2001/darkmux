@@ -449,6 +449,7 @@ mod tests {
             id: "review".to_string(),
             description: "Run the review pipeline.".to_string(),
             hint: None,
+            accepts_args: true,
         }];
         let mut call = |_msg: &str| -> Result<String> { Ok("```json\n{\"command\": \"review\", \"args\": \"42\"}\n```".to_string()) };
         let decision = radio::route("review this", &catalog, &mut call);
@@ -475,8 +476,8 @@ mod tests {
         // input to this function is not a real production shape, and no
         // test pins one.
         let catalog = vec![
-            radio::CatalogEntry { id: "review".to_string(), description: "d".to_string(), hint: None },
-            radio::CatalogEntry { id: "pr-list".to_string(), description: "d2".to_string(), hint: None },
+            radio::CatalogEntry { id: "review".to_string(), description: "d".to_string(), hint: None, accepts_args: true },
+            radio::CatalogEntry { id: "pr-list".to_string(), description: "d2".to_string(), hint: None, accepts_args: true },
         ];
         let msg = advertised_list_message(&catalog);
         assert!(msg.contains("`/review`"), "{msg}");

@@ -1769,6 +1769,7 @@ mod tests {
         cfg.panel = Some(PanelConfig {
             description: Some("desc".to_string()),
             hint: Some("hint".to_string()),
+            accepts_args: None,
             extras: Default::default(),
         });
         let loaded = loaded_doc(cfg);
