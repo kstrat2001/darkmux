@@ -1074,6 +1074,21 @@ impl ThermalGovernor {
     ///   had the same hole from the other direction — its own check
     ///   returned on the disarm note before the floor check ran).
     ///
+    /// (Review C7) The floor is not the only breaker knob that changes
+    /// what the machine DOES, so it is not the only one disclosed here.
+    /// `speed_limit_hold_samples = 0` is silently coerced to `1` by the
+    /// streak test's own `.max(1)`, which makes the breaker trip on the
+    /// FIRST low sample rather than never — the opposite of the "disable
+    /// it" reading a `0` invites. An operator who never runs `doctor`
+    /// otherwise never hears about it.
+    ///
+    /// `ratchet_factor = 0` is deliberately NOT here, and that is a call
+    /// rather than an omission: it is coerced to `1` too, but the result
+    /// is a duty-cycle delay that HOLDS STEADY instead of growing. That
+    /// is a milder run than the operator configured, never a harsher one,
+    /// and nothing about this dispatch's start changes. `doctor` covers
+    /// it; a dispatch-start line for it would be noise on every dispatch.
+    ///
     /// Returned as lines rather than printed here so the CONTENT is
     /// testable without capturing stderr; `dispatch_internal.rs` prints
     /// them verbatim.
@@ -1095,6 +1110,16 @@ impl ThermalGovernor {
                  Fix with: {}",
                 note.tiers, note.why, note.remedy,
             ));
+        }
+        if self.config.speed_limit_hold_samples == 0 {
+            out.push(
+                "darkmux: ⚠ thermal breaker — runtime.thermal.speed_limit_hold_samples is 0, \
+                 which is coerced to 1: the breaker trips on the FIRST sample below the CPU \
+                 floor, not never. There is no way to disable this signal with a 0 — disable \
+                 the thermal governor overall (runtime.thermal.enabled) if that is the intent. \
+                 Fix with: darkmux config set runtime.thermal.speed_limit_hold_samples 1"
+                    .to_string(),
+            );
         }
         if floor_always_trips {
             out.push(format!(
@@ -1989,6 +2014,59 @@ mod tests {
             lines[0]
         );
         assert!(!lines[0].contains("EVERY dispatch"), "{}", lines[0]);
+    }
+
+    /// (#2774 round-9 review C7) The floor is not the only breaker knob
+    /// that changes what the machine DOES, so it is not the only one
+    /// disclosed at dispatch start. `speed_limit_hold_samples = 0` is
+    /// coerced to 1 by the streak test's own `.max(1)`, which makes the
+    /// breaker trip on the FIRST low sample — the opposite of the
+    /// "disable it" reading a `0` invites. It reached the operator
+    /// through `doctor` alone.
+    #[test]
+    fn a_zero_hold_samples_is_disclosed_at_dispatch_start_not_only_by_doctor() {
+        let gov = ThermalGovernor::new(ThermalGovernorConfig {
+            speed_limit_hold_samples: 0,
+            ..cfg()
+        });
+        assert!(gov.disarm_notes().is_empty(), "this test needs ARMED bands");
+
+        let lines = gov.dispatch_start_warnings();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("speed_limit_hold_samples is 0")
+                && lines[0].contains("coerced to 1"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("FIRST sample"),
+            "the operator must be told what the coercion DOES, not just that it happened: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("darkmux config set runtime.thermal.speed_limit_hold_samples"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// The stated other half of C7, pinned so it is a decision rather than
+    /// an oversight: `ratchet_factor = 0` is coerced to 1 too, but the
+    /// result is a duty-cycle delay that holds steady instead of growing —
+    /// a MILDER run than configured, never a harsher one, and nothing
+    /// about this dispatch's start changes. `doctor` covers it; a line on
+    /// every dispatch would be noise. If a future change makes a zero
+    /// ratchet do something at dispatch time, this test is where the
+    /// decision gets revisited.
+    #[test]
+    fn a_zero_ratchet_factor_stays_a_doctor_only_disclosure() {
+        let gov = ThermalGovernor::new(ThermalGovernorConfig { ratchet_factor: 0, ..cfg() });
+        assert!(
+            gov.dispatch_start_warnings().is_empty(),
+            "{:?}",
+            gov.dispatch_start_warnings()
+        );
     }
 
     #[test]

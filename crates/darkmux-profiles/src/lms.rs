@@ -115,11 +115,27 @@ pub fn list_loaded() -> Result<Vec<LoadedModel>> {
     let text_out = run_bounded(cmd, "ps", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
         .map_err(|e| anyhow::anyhow!("running `lms ps`: {e}"))?;
     if !text_out.status.success() {
+        // (#2774 round-9 review C5) Composed here rather than through
+        // `BoundedRun::exit_detail`, whose `"exited with {}: {}"` leaves a
+        // dangling colon and a double space when stderr is empty — which
+        // is exactly the shape of the `exit 1` case this branch exists
+        // for. The status is also rendered from its CODE: `ExitStatus`'s
+        // own `Display` is already "exit status: 1", so interpolating it
+        // after the word "exited" read "exited with exit status: 1".
+        let how = match text_out.status.code() {
+            Some(code) => format!("exited with status {code}"),
+            None => "was killed by a signal".to_string(),
+        };
+        let stderr = text_out.stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" ({stderr})")
+        };
         bail!(
-            "`lms ps --json` did not return a JSON array and `lms ps` {} — cannot tell whether \
-             any models are loaded, which is NOT the same as none being loaded. Check that `{}` \
-             is a working LMStudio CLI and that LMStudio is running.",
-            text_out.exit_detail(),
+            "`lms ps --json` did not return a JSON array and `lms ps` {how}{detail} — cannot \
+             tell whether any models are loaded, which is NOT the same as none being loaded. \
+             Check that `{}` is a working LMStudio CLI and that LMStudio is running.",
             lms_bin(),
         );
     }
@@ -145,28 +161,42 @@ pub fn list_loaded() -> Result<Vec<LoadedModel>> {
 /// one of them:
 ///
 /// - no output at all;
-/// - the column header with no rows beneath it;
+/// - the column header with no rows beneath it — with any PREAMBLE above
+///   that header (a version banner, say) discounted, since it is not
+///   evidence about what is resident (review C4);
 /// - an explicit "no models …" line.
 ///
 /// Anything else that parsed to zero rows — a stack trace, an auth prompt,
 /// a truncated response, a future CLI's redesigned table — is `None`. A
-/// header PLUS unparseable rows is `None` too: the CLI is recognizable but
-/// this parser did not understand what it said, which is precisely the
-/// "could not tell" case.
+/// header PLUS unparseable rows BELOW it is `None` too: the CLI is
+/// recognizable but this parser did not understand what it said, which is
+/// precisely the "could not tell" case.
 fn interpret_text_ps(stdout: &str) -> Option<Vec<LoadedModel>> {
     let rows = parse_text_ps(stdout);
     if !rows.is_empty() {
         return Some(rows);
     }
-    let unparsed: Vec<&str> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("IDENTIFIER"))
-        .collect();
-    if unparsed.is_empty() {
+    // (#2774 round-9 review C4) Everything ABOVE the header is preamble
+    // and is not evidence of anything; only what comes BELOW it had to
+    // parse. Without this the reading was narrower than the very case it
+    // exists to protect: an old `lms` that prints its own version banner
+    // above the header, on a host with genuinely nothing loaded, read as
+    // "could not tell" — so `machine eject` went rc 0 -> rc 1 on a
+    // correct answer. Reachable only when `--json` ALSO fails, which is
+    // precisely the old-CLI case.
+    //
+    // With no header at all there is no preamble to discount, so every
+    // non-blank line still has to be accounted for.
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    let body: &[&str] = match lines.iter().position(|l| is_ps_header(l)) {
+        Some(header_at) => &lines[header_at + 1..],
+        None => &lines[..],
+    };
+    let unaccounted: Vec<&&str> = body.iter().filter(|l| !l.is_empty()).collect();
+    if unaccounted.is_empty() {
         return Some(Vec::new());
     }
-    if unparsed.iter().all(|l| l.to_ascii_lowercase().contains("no models")) {
+    if unaccounted.iter().all(|l| l.to_ascii_lowercase().contains("no models")) {
         return Some(Vec::new());
     }
     None
@@ -219,11 +249,29 @@ fn model_from_json(v: &serde_json::Value) -> LoadedModel {
     }
 }
 
+/// Whether a trimmed `lms ps` line is the COLUMN HEADER rather than a
+/// model row.
+///
+/// (#2774 round-9 review) Case-INSENSITIVE, and matching the first
+/// whitespace-separated word rather than a prefix. Both halves fix a
+/// pre-existing defect: `starts_with("IDENTIFIER")` let a lowercase
+/// header (`identifier model status size context`) through as a
+/// five-column model row, so `parse_text_ps` reported one PHANTOM
+/// resident — a model named "identifier" that is not loaded and cannot
+/// be unloaded. Word-matching also stops a real identifier that merely
+/// begins with those letters from being swallowed as a header.
+fn is_ps_header(trimmed: &str) -> bool {
+    trimmed
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("IDENTIFIER"))
+}
+
 fn parse_text_ps(text: &str) -> Vec<LoadedModel> {
     let mut out: Vec<LoadedModel> = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("IDENTIFIER") {
+        if trimmed.is_empty() || is_ps_header(trimmed) {
             continue;
         }
         // columns separated by 2+ spaces
@@ -558,6 +606,64 @@ mod tests {
         assert_eq!(rows[0].identifier, "darkmux:qwen3-4b");
     }
 
+    /// (#2774 round-9 review C4) The narrow reading must actually cover
+    /// the case it was written for. An old `lms` with no `--json` support
+    /// prints its own version banner above the header; on a host with
+    /// genuinely nothing loaded that read as "could not tell", so
+    /// `machine eject` went rc 0 -> rc 1 on a correct answer — reachable
+    /// only when `--json` also fails, which IS the old-CLI case.
+    #[test]
+    fn a_preamble_above_the_header_does_not_make_an_empty_listing_unreadable() {
+        for (label, text) in [
+            (
+                "a version banner",
+                "LM Studio CLI v0.3.9\nIDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\n",
+            ),
+            (
+                "a banner and a blank line",
+                "LM Studio CLI v0.3.9\n\nIDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\n\n",
+            ),
+        ] {
+            assert_eq!(
+                interpret_text_ps(text),
+                Some(Vec::new()),
+                "{label}: what sits ABOVE the header is not evidence about what is resident"
+            );
+        }
+
+        // …and a preamble does NOT license ignoring a row below the
+        // header this parser could not read.
+        assert_eq!(
+            interpret_text_ps(
+                "LM Studio CLI v0.3.9\nIDENTIFIER  MODEL  STATUS  SIZE  CONTEXT\nqwen3-4b  qwen\n"
+            ),
+            None,
+            "a preamble must not turn an unreadable row into an empty listing"
+        );
+    }
+
+    /// (#2774 round-9 review) Pre-existing in `parse_text_ps`, found while
+    /// fixing the listing: `starts_with("IDENTIFIER")` is case-SENSITIVE,
+    /// so a lowercase header parsed as a five-column model row and the
+    /// listing reported one PHANTOM resident — a model named "identifier"
+    /// that is not loaded and cannot be unloaded.
+    #[test]
+    fn a_lowercase_header_is_a_header_not_a_phantom_resident() {
+        let lower = "identifier  model  status  size  context\n";
+        assert!(
+            parse_text_ps(lower).is_empty(),
+            "got {:?}",
+            parse_text_ps(lower)
+        );
+        assert_eq!(interpret_text_ps(lower), Some(Vec::new()));
+
+        // A real row under a lowercase header is still a real row.
+        let with_row = "identifier  model  status  size  context\ndarkmux:qwen3-4b  qwen3-4b  idle  2.15 GB  68000\n";
+        let rows = parse_text_ps(with_row);
+        assert_eq!(rows.len(), 1, "got {rows:?}");
+        assert_eq!(rows[0].identifier, "darkmux:qwen3-4b");
+    }
+
     #[test]
     fn output_this_parser_cannot_read_is_not_an_empty_listing() {
         for (label, text) in [
@@ -629,6 +735,18 @@ mod tests {
             assert!(
                 msg.contains("cannot tell whether any models are loaded"),
                 "{label}: the error must say WHICH of the two it is: {msg}"
+            );
+            // (#2774 round-9 review C5) …and it must read as a sentence.
+            // `BoundedRun::exit_detail` appends ": {stderr}" with no
+            // stderr to append on the `exit 1` path, which is exactly
+            // this case: "exited with exit status: 1:  — cannot tell".
+            assert!(
+                !msg.contains(": 1:") && !msg.contains("exit status:"),
+                "{label}: no dangling colon and no doubled \"exit status\": {msg}"
+            );
+            assert!(
+                !msg.contains("  "),
+                "{label}: no run of consecutive spaces in an operator-facing sentence: {msg:?}"
             );
         }
 

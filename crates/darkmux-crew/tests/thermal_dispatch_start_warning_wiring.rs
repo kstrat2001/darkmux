@@ -19,6 +19,19 @@
 //! rather than by a roster someone has to remember to update. It is
 //! deliberately modest — it asserts the call is present and the old
 //! hand-rolled sentence is gone, nothing about what the lines SAY.
+//!
+//! **Its ceiling, named so nobody reads more into a green than is there
+//! (review C6): this catches DELETION, not UNREACHABILITY.** A source scan
+//! sees text, not control flow, so wrapping the print site in a condition
+//! that is never true — `if std::env::var("__NEVER_SET__").is_ok()` —
+//! leaves the asserted text verbatim and this file green while the warning
+//! never reaches an operator. Demonstrated on this very test. Closing that
+//! gap needs the call driven, which on this path means a real
+//! container-backed dispatch with stderr captured; that is a heavier test
+//! than the hazard warrants, and an honest modest guard is worth more here
+//! than a clever fragile one. If you are reviewing a change that moves
+//! this call rather than deleting it, read the control flow around it —
+//! this file will not do that for you.
 
 use std::path::PathBuf;
 

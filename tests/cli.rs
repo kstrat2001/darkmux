@@ -1817,6 +1817,66 @@ fn machine_status_remote_happy_path_json_carries_machine_id() {
     assert_eq!(json["managed"][0]["identifier"], "darkmux:qwen-x");
 }
 
+/// (#2774 round-9 review C1) The LOCAL branch must answer an unreachable
+/// LMStudio the SAME way the remote branch above does.
+///
+/// `lms::list_loaded` now distinguishes "nothing is loaded" from "I could
+/// not tell", and a bare `?` on the local path turned the second into an
+/// anyhow chain with rc 1 and — the part that actually breaks a caller —
+/// ZERO bytes on stdout in `--json` mode, where the identical condition on
+/// a PEER hands back a parseable object and rc 2. Driven through the real
+/// binary against a fake `lms` that fails; nothing here touches the
+/// operator's LMStudio.
+#[test]
+fn machine_status_local_unreachable_lms_matches_the_remote_shape() {
+    let tmp = TempDir::new().unwrap();
+    let fake = tmp.path().join("fake-lms");
+    std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = darkmux_cmd()
+        .env("DARKMUX_LMS_BIN", &fake)
+        .args(["machine", "status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "same exit code the remote branch uses for the same condition; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`--json` must emit a parseable object, not empty stdout ({e}); stdout was {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(json["lms_unreachable"], true);
+    assert_eq!(json["managed"], serde_json::json!([]));
+    assert_eq!(json["user_state"], serde_json::json!([]));
+    // `machine_id` is present and may be null — this host need not have
+    // declared one, and inventing a name would be worse than saying so.
+    assert!(json.get("machine_id").is_some(), "{json}");
+
+    // Non-JSON mode says the same thing in a sentence, on stderr, with the
+    // same exit code.
+    let plain = darkmux_cmd()
+        .env("DARKMUX_LMS_BIN", &fake)
+        .args(["machine", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        stderr.contains("UNKNOWN"),
+        "must say residents are unknown rather than empty: {stderr}"
+    );
+}
+
 /// (#1426) A peer payload whose `models` doesn't parse (older/newer daemon
 /// shape) falls back to a raw JSON print — never a fabricated-empty render.
 #[test]

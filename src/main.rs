@@ -1790,7 +1790,36 @@ fn cmd_machine_status(id: Option<&str>, config: Option<&str>, json: bool) -> Res
         }
         return render_residents(&models, None, None, json, Some(id));
     }
-    let loaded = lms::list_loaded()?;
+    // (#2774 round-9 review C1) The LOCAL twin of the remote branch's
+    // `lms_unreachable` handling just above.
+    //
+    // `list_loaded` distinguishes "nothing is loaded" from "I could not
+    // tell" (#2774 round-9 MF3), and a bare `?` here turned the second
+    // into an anyhow chain on stderr with rc 1 and — measured, in `--json`
+    // mode — ZERO bytes on stdout, where a script reading the IDENTICAL
+    // condition from a PEER gets a parseable object and rc 2. One host's
+    // answer to "can you see LMStudio" should not depend on which side of
+    // the fleet is asking. Same shape, same exit code, both branches.
+    let loaded = match lms::list_loaded() {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            if json {
+                let out = serde_json::json!({
+                    "machine_id": darkmux_types::config_access::machine_id(),
+                    "lms_unreachable": true,
+                    "managed": [],
+                    "user_state": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                eprintln!(
+                    "this machine: could not query LMStudio (`lms ps` failed here) — residents \
+                     UNKNOWN, not empty. Check LMStudio + the `lms` CLI. ({e:#})"
+                );
+            }
+            return Ok(2);
+        }
+    };
     // Which registered profile(s) does the loaded set match? (The retired
     // top-level `status` verb's one unique dimension.)
     let (matches, registry_path): (Option<Vec<String>>, Option<String>) =
