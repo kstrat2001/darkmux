@@ -168,6 +168,10 @@ pub mod single_shot;
 pub mod step_output;
 pub mod step_kinds;
 pub mod telemetry_sampler;
+// (#2774 round-4) Validated severity bands for the thermal ladder's soft
+// tiers — the value that makes an unsatisfiable or tautological band
+// unrepresentable. See the module doc for the defect class it ends.
+pub mod thermal_bands;
 // (#2110/#2109) Host-side thermal governor + breaker — see the module doc.
 pub mod thermal_governor;
 pub mod types;

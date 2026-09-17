@@ -3139,39 +3139,125 @@ fn check_thermal_governor() -> Check {
     let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
     let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
     let speed_limit_hold_samples = darkmux_types::config_access::thermal_speed_limit_hold_samples();
+    // (#2774) The escalation ladder's own three tier-2/3/4 knobs — surfaced
+    // in the Pass message below so `darkmux doctor` answers "what would
+    // actually happen" for the whole ladder, not just the pre-existing
+    // pause/breaker half of it.
+    let duty_delay_ms = darkmux_types::config_access::thermal_duty_delay_ms();
+    let ratchet_factor = darkmux_types::config_access::thermal_ratchet_factor();
+    let episode_threshold = darkmux_types::config_access::thermal_episode_threshold();
+    let tier4_enabled = darkmux_types::config_access::thermal_tier4_enabled();
 
-    // (#2110/#2109 review finding 6) `darkmux config set` rejects an
-    // unrecognized thermal-state token going forward, but a hand-edited
-    // config.json or a value written before that validation existed can
-    // still carry one — and, per `Ty::ThermalState`'s own doc, a typo here
-    // silently INVERTS the governor's intent rather than erroring, so this
-    // is worth a loud Warn rather than folding into the Pass message above.
-    let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
-    let bad_pause_at = !states.contains(&pause_at.to_ascii_lowercase().as_str());
-    let bad_resume_at = !states.contains(&resume_at.to_ascii_lowercase().as_str());
-    if bad_pause_at || bad_resume_at {
-        let mut bad = Vec::new();
-        if bad_pause_at {
-            bad.push(format!("pause_at=`{pause_at}`"));
-        }
-        if bad_resume_at {
-            bad.push(format!("resume_at=`{resume_at}`"));
-        }
+    // (#2774 round-8 MF1) The breaker's two CONFIGURABLE triggers, rendered
+    // by what they DO at their degenerate values rather than by
+    // interpolating the raw number into a sentence that then describes a
+    // trigger which cannot fire.
+    //
+    // Both knobs degenerate, in opposite directions, and both used to be
+    // spelled out raw here:
+    //
+    // - `max_pause_ms = 0` means an UNBOUNDED episode (round-6 MF2 —
+    //   `pause_episode_exhausted` returns `false` forever at `0`), so the
+    //   handoff never happens. Interpolated raw, doctor said "breaker after
+    //   0ms of one pause episode" — the exact opposite, and in the same
+    //   sentence where `episode_threshold = 0` IS correctly spelled out as
+    //   unbounded.
+    // - `min_cpu_speed_limit_pct = 0` disables the floor outright (the
+    //   comparison is `pct < floor` and no reading is below zero — the
+    //   honest reading of "no floor", and why the knob is not clamped; see
+    //   `docs/ENVIRONMENT.md`). Interpolated raw, doctor said "3
+    //   consecutive samples with cpu_speed_limit_pct < 0%".
+    //
+    // An operator who sets either one runs `doctor` to confirm what would
+    // actually happen — that is what this surface is for (#44) — and was
+    // told a false thing about their own config.
+    let episode_handoff_clause = if max_pause_ms == 0 {
+        "never from a pause episode (max_pause_ms=0 — unbounded, rest as long as it takes)"
+            .to_string()
+    } else {
+        format!("after {max_pause_ms}ms of one pause episode")
+    };
+    let cpu_floor_clause = if min_cpu == 0 {
+        "never from the CPU floor (min_cpu_speed_limit_pct=0 — no reading is below 0%)".to_string()
+    } else {
+        format!(
+            "after {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < \
+             {min_cpu}%"
+        )
+    };
+
+    // (#2774 round-4) EVERY arming verdict comes from the same value the
+    // GOVERNOR runs on: `ThermalBands`, whose only band constructor
+    // refuses a band no reading can satisfy and one that every reading
+    // satisfies. Doctor RENDERS those refusals; it does not re-derive
+    // them. Four verdicts this check used to compute for itself now
+    // arrive from there:
+    //
+    // - an unrecognized token in either slot (review finding 6 — a typo
+    //   that `darkmux config set` rejects going forward but a hand-edited
+    //   config.json can still carry);
+    // - `pause_at` not strictly more severe than `resume_at` (F6);
+    // - `pause_at = "critical"` (round-3 C4), which never fires a soft
+    //   tier because the breaker's own `critical` rule is evaluated FIRST
+    //   on every sample, so the reading that would enter tier 3 has
+    //   already tripped the breaker — and a Pass message saying "tier 4
+    //   enabled after N episodes" under it is affirmatively wrong;
+    // - `resume_at = "nominal"` (round-4 MF1), the mirror image at the
+    //   other end of the enum, whose absence here is what let round 4's
+    //   defect ship.
+    //
+    // This check used to derive its own verdicts from the raw thresholds,
+    // and that is exactly how it came to report **Pass** on `pause_at =
+    // fair, resume_at = nominal` — a config round 4 then proved wedges a
+    // cold machine into a permanent, ratcheting turn delay — with a
+    // committed test asserting the Pass was correct. A second
+    // implementation of the arming rule is a second chance to get it
+    // wrong, and the two cannot be kept in agreement by intention. There
+    // is now one.
+    //
+    // The raw (un-lowercased) comparison the token check used to make
+    // deliberately is preserved: `ThermalBands::resolve` matches
+    // `THERMAL_STATES` exactly, so if `config_access`'s normalization ever
+    // goes away, this warns (loud) instead of passing (silent).
+    let bands = darkmux_crew::thermal_bands::ThermalBands::resolve(&pause_at, &resume_at);
+    if !bands.disarm_notes().is_empty() {
         return Check {
             name: name.into(),
             status: Status::Warn,
             message: format!(
-                "unrecognized thermal state: {} — valid: {}. An unrecognized pause_at silently \
-                 disables the governor's soft pause; an unrecognized resume_at defeats the \
-                 hysteresis hold and clears a pause almost immediately regardless of actual \
-                 temperature.",
-                bad.join(", "),
-                states.join(", ")
+                "{} DISARMED — {} The breaker is unaffected and still runs: an OS-reported \
+                 `critical` state (immediate, always), and {cpu_floor_clause}.",
+                bands
+                    .disarm_notes()
+                    .iter()
+                    .map(|n| n.tiers)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                bands
+                    .disarm_notes()
+                    .iter()
+                    .map(|n| n.why.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" Also: "),
             ),
-            hint: Some(format!(
-                "darkmux config set runtime.thermal.pause_at <{}>",
-                states.join("|")
-            )),
+            // (#2774 round-6 C2) EVERY note's remedy, not just the first.
+            // The message already concatenates every `why`; handing back
+            // one remedy for two problems sends the operator round the
+            // loop — on `pause_at = critical, resume_at = nominal` both
+            // tiers are disarmed for different reasons, so fixing the
+            // first and re-running doctor just produces the second
+            // warning. Deduped because two notes can legitimately share a
+            // remedy (one `config set` line resolving both), and printing
+            // it twice reads as two steps.
+            hint: Some({
+                let mut seen: Vec<&str> = Vec::new();
+                for note in bands.disarm_notes() {
+                    if !seen.contains(&note.remedy.as_str()) {
+                        seen.push(note.remedy.as_str());
+                    }
+                }
+                seen.join(" ")
+            }),
         };
     }
 
@@ -3195,13 +3281,74 @@ fn check_thermal_governor() -> Check {
         };
     }
 
+    // (#2774) Same shape as the speed-limit-hold-samples check above: a
+    // configured `0` doesn't achieve "no growth" — it's silently coerced to
+    // `1` by `thermal_ratchet_factor`'s own `.max(1)` floor, because a
+    // literal `0` would ZERO the duty-cycle delay on the very first
+    // `serious` recovery, defeating the ratchet's whole purpose (each
+    // recovery should be MORE cautious than the last, never less).
+    let ratchet_factor_raw = darkmux_types::config_access::thermal_ratchet_factor_raw();
+    if ratchet_factor_raw == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: "runtime.thermal.ratchet_factor is 0 — coerced to 1 (the duty-cycle delay \
+                       holds steady across a `serious` recovery instead of growing). A literal \
+                       0 would zero the delay on the first escalation, which is never the \
+                       intent; use 1 explicitly if \"don't grow it\" is what you want."
+                .to_string(),
+            hint: Some("darkmux config set runtime.thermal.ratchet_factor 1".to_string()),
+        };
+    }
+
+    // (#2774 round-8) The same degenerate-threshold class as the two
+    // warnings above, at the one knob whose comparison degenerates UPWARD
+    // rather than downward — which is why the family had a hole here.
+    // `cpu_speed_limit_pct` is a percentage, and `100` is what the probe
+    // reports when no cap is recorded at all, so a floor ABOVE 100 makes
+    // `pct < floor` true of every reading a healthy machine produces: the
+    // breaker trips on the `speed_limit_hold_samples`'th sample of EVERY
+    // dispatch and drops a `thermal-critical` STOP file on a cold machine
+    // — a state word naming something that never happened, the same
+    // failure round-6 MF2 ended at the other end of the range.
+    // Warned rather than clamped, consistent with its siblings and with
+    // `min_cpu = 0`'s own documented "no floor" reading: the operator owns
+    // the value, doctor says what it will do (#44).
+    if min_cpu > 100 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "runtime.thermal.min_cpu_speed_limit_pct is {min_cpu}, above the 100% ceiling of \
+                 the reading it is compared against (`cpu_speed_limit_pct`, where 100 means no \
+                 cap recorded). Every sample is below this floor, so EVERY dispatch trips the \
+                 breaker after its first {speed_limit_hold_samples} samples and drops a \
+                 `thermal-critical` STOP file on a cold machine. Use a value in 1..=100, or 0 to \
+                 disable the floor and leave the `critical`-state check as the only breaker \
+                 trigger."
+            ),
+            hint: Some("darkmux config set runtime.thermal.min_cpu_speed_limit_pct 50".to_string()),
+        };
+    }
+
     Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
             "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
-             {resume_hold_ms}ms, breaker after {max_pause_ms}ms of one pause episode or \
-             {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < {min_cpu}%"
+             {resume_hold_ms}ms; breaker on an OS-reported `critical` state (immediate, always), \
+             {episode_handoff_clause}, and {cpu_floor_clause}; \
+             duty-cycle at `{resume_at}` starts at {duty_delay_ms}ms and ratchets x{ratchet_factor} \
+             per `serious` recovery; tier 4 (indefinite, operator-gated pause) {}",
+            if tier4_enabled {
+                if episode_threshold == 0 {
+                    "enabled but unbounded (episode_threshold=0 — never escalates)".to_string()
+                } else {
+                    format!("enabled after {episode_threshold} `serious` episode(s)")
+                }
+            } else {
+                "disabled".to_string()
+            }
         ),
         hint: None,
     }
@@ -9376,6 +9523,490 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES"),
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn thermal_governor_warns_when_pause_at_is_not_strictly_more_severe_than_resume_at() {
+        // (#2774 review F6) `pause_at == resume_at` reaches a terminal
+        // OperatorHold in about a minute from a machine that never
+        // actually changed temperature — see this check's own doc for the
+        // exact mechanism. Must surface as a loud Warn.
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
+        }
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("pause_at"), "{}", check.message);
+        assert!(check.message.contains("resume_at"), "{}", check.message);
+
+        // (#2774 round-4 MF1) **This assertion used to read `Status::Pass`
+        // for `fair`/`nominal`, with the message "a real gap (fair
+        // pause_at, nominal resume_at) must not warn". It was wrong, and
+        // it is CHANGED rather than worked around.** A gap between the two
+        // thresholds is necessary and not sufficient: `resume_at = nominal`
+        // makes tier 2's duty band cover every reading below `pause_at`, so
+        // the duty cycle can be entered and never exited. Measured, on this
+        // exact config: 900 samples x 2000ms of `nominal` yielded
+        // `DutyCycleEntered { delay_ms: 15000 }` and a pace file still
+        // pacing at the end, ratcheting 15s -> 300s per turn across a
+        // mission, on a machine that was cold throughout. Doctor reporting
+        // **Pass** on it was the second half of the defect — and the remedy
+        // text of the check right above this one recommends `nominal` as
+        // one of its two answers.
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+        }
+        let nominal_resume = check_thermal_governor();
+        assert_eq!(
+            nominal_resume.status,
+            Status::Warn,
+            "resume_at=nominal leaves tier 2 no exit — doctor must not call it fine: {}",
+            nominal_resume.message
+        );
+        assert!(
+            nominal_resume.message.contains("tier 2"),
+            "…and must name the tier that will not run: {}",
+            nominal_resume.message
+        );
+
+        // The shipped default pair IS a real gap, and still passes.
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "serious");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
+        }
+        let ok_check = check_thermal_governor();
+        assert_eq!(
+            ok_check.status,
+            Status::Pass,
+            "the default pair (serious pause_at, fair resume_at) must not warn: {}",
+            ok_check.message
+        );
+
+        // Inverted (pause_at MILDER than resume_at) must also warn.
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "serious");
+        }
+        let inverted = check_thermal_governor();
+        assert_eq!(inverted.status, Status::Warn, "{}", inverted.message);
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-3 C5) The touching/inverted remedy must describe what
+    /// NOW happens (the soft tiers are disarmed), not the pre-guard
+    /// cycling-to-a-terminal-hold behavior the guard already falsified.
+    #[test]
+    #[serial_test::serial]
+    fn the_touching_threshold_warning_describes_the_disarm_not_the_old_cycling() {
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "fair");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "fair");
+        }
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let lower = check.message.to_ascii_lowercase();
+        assert!(
+            lower.contains("disarmed"),
+            "the remedy must say the soft tiers are disarmed: {}",
+            check.message
+        );
+        assert!(
+            !lower.contains("cycling"),
+            "the remedy must not still describe the pre-guard cycling behavior: {}",
+            check.message
+        );
+        assert!(
+            lower.contains("breaker"),
+            "…and must say what DOES still run, or the operator reads it as \"no thermal \
+             protection at all\": {}",
+            check.message
+        );
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-3 C4, first half) A mixed-case token must not reach a
+    /// Pass that claims tier 4 is enabled while the governor scores it as
+    /// an unknown state. Normalizing at resolution
+    /// (`config_access::thermal_pause_at`) is what closes it — this pins
+    /// the OUTCOME, so removing the normalization turns the silent Pass
+    /// into either a red test here or a Warn in the field, never a Pass.
+    #[test]
+    #[serial_test::serial]
+    fn a_mixed_case_pause_at_resolves_to_a_real_state_rather_than_passing_inert() {
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", " Serious ") };
+
+        assert_eq!(
+            darkmux_types::config_access::thermal_pause_at(),
+            "serious",
+            "the resolved value must be the canonical token the governor's band resolution \
+             (thermal_bands::ThermalBands) matches against"
+        );
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("pause at `serious`"),
+            "doctor must report the value actually IN FORCE: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-3 C4, second half) `pause_at = "critical"` passed with
+    /// a message affirmatively claiming tier 4 was enabled, while the
+    /// breaker's own rule fires first on every such reading so tiers 2/3/4
+    /// could never run.
+    #[test]
+    #[serial_test::serial]
+    fn pause_at_critical_warns_that_the_breaker_preempts_the_soft_tiers() {
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "critical") };
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("breaker"),
+            "the operator must be told WHY the ladder never runs: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("enabled after"),
+            "and must not still claim tier 4 is enabled after N episodes: {}",
+            check.message
+        );
+        // (#2774 round-4) …and must name which tiers those are. The old
+        // assertion here only checked that the string "tier 4" was ABSENT,
+        // which a message saying nothing at all would also satisfy.
+        assert!(
+            check.message.contains("tiers 3 and 4") && check.message.contains("DISARMED"),
+            "the operator must be told exactly what will not run: {}",
+            check.message
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-4 MF1) The exact mirror image of the check above, at
+    /// the other end of the enum — and the gap that let round 4's defect
+    /// ship. `pause_at = critical` was warned about; `resume_at = nominal`
+    /// reported **Pass**, with a committed test asserting the Pass was
+    /// correct, while it wedged a cold machine into a permanent ratcheting
+    /// duty cycle. Both ends are now one refusal in `ThermalBands`.
+    #[test]
+    #[serial_test::serial]
+    fn resume_at_nominal_warns_that_tier_2_could_never_be_exited() {
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+
+        for pause_at in ["fair", "serious"] {
+            unsafe {
+                std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", pause_at);
+                std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+            }
+            let check = check_thermal_governor();
+            assert_eq!(
+                check.status,
+                Status::Warn,
+                "pause_at={pause_at}: {}",
+                check.message
+            );
+            assert!(
+                check.message.contains("tier 2") && check.message.contains("DISARMED"),
+                "pause_at={pause_at}: must name the tier that will not run: {}",
+                check.message
+            );
+            assert!(
+                check.message.contains("breaker"),
+                "pause_at={pause_at}: …and what DOES still run: {}",
+                check.message
+            );
+            assert!(
+                check.hint.as_deref().is_some_and(|h| h.contains("resume_at")),
+                "pause_at={pause_at}: the remedy must point at the knob that is wrong: {:?}",
+                check.hint
+            );
+        }
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// (#2774 round-6 C2) When TWO things are wrong, the hint names both.
+    ///
+    /// The message already concatenates every disarm note's `why`; the
+    /// hint took only `disarm_notes().first()`. On `pause_at = critical,
+    /// resume_at = nominal` that sends the operator round the loop —
+    /// fix the one remedy shown, re-run doctor, get a second warning about
+    /// a knob that was already wrong when they ran it the first time.
+    #[test]
+    #[serial_test::serial]
+    fn a_doubly_broken_pair_gets_a_remedy_for_every_reason_it_is_broken() {
+        let prev_pause = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        let prev_resume = std::env::var("DARKMUX_THERMAL_RESUME_AT").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "critical");
+            std::env::set_var("DARKMUX_THERMAL_RESUME_AT", "nominal");
+        }
+
+        // Pre-check: this pair really does produce more than one note, so
+        // the assertion below is not vacuously satisfied by a single-note
+        // config that happens to mention both knobs.
+        let notes = darkmux_crew::thermal_bands::ThermalBands::resolve("critical", "nominal");
+        assert!(
+            notes.disarm_notes().len() > 1,
+            "this test needs a pair that is broken for two DIFFERENT reasons, got {:?}",
+            notes.disarm_notes()
+        );
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let hint = check.hint.clone().unwrap_or_default();
+        for note in notes.disarm_notes() {
+            assert!(
+                hint.contains(note.remedy.as_str()),
+                "every reason the ladder is disarmed needs its remedy in the hint — missing \
+                 {:?} from {hint:?}",
+                note.remedy
+            );
+        }
+
+        unsafe {
+            match prev_pause {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+            match prev_resume {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_RESUME_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
+            }
+        }
+    }
+
+    /// Restores one env var to its prior value on drop — the #2774
+    /// round-8 tests below each mutate two or three of them and every
+    /// early `assert!` between the set and the restore would otherwise
+    /// leak the mutation into the next `#[serial]` test in this module.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: every caller is `#[serial_test::serial]`.
+            unsafe { std::env::set_var(key, value) };
+            EnvGuard { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller is `#[serial_test::serial]`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// (#2774 round-8 MF1, first half) `max_pause_ms = 0` means an
+    /// UNBOUNDED episode — `pause_episode_exhausted` returns `false`
+    /// forever at `0`, so the breaker never takes the handoff. Doctor
+    /// interpolated the raw number and told the operator the opposite:
+    /// "breaker after 0ms of one pause episode", in the same sentence
+    /// where `episode_threshold = 0` was correctly spelled out as
+    /// unbounded.
+    #[test]
+    #[serial_test::serial]
+    fn a_zero_max_pause_ms_reads_as_unbounded_not_as_an_instant_handoff() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _max = EnvGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", "0");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            !check.message.contains("after 0ms"),
+            "doctor must not claim a handoff that `pause_episode_exhausted` makes unreachable: \
+             {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("never from a pause episode")
+                && check.message.contains("max_pause_ms=0"),
+            "…it must say the handoff never happens, and name the knob that decided it: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-8 MF1, second half) `min_cpu_speed_limit_pct = 0`
+    /// disables the CPU-floor trigger outright — the comparison is
+    /// `pct < floor` and no reading is below zero. Doctor rendered it as
+    /// "3 consecutive samples with cpu_speed_limit_pct < 0%", a condition
+    /// no sample can satisfy, described as a live trigger.
+    #[test]
+    #[serial_test::serial]
+    fn a_zero_cpu_floor_reads_as_disabled_not_as_a_live_sub_zero_trigger() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "0");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            !check.message.contains("< 0%"),
+            "doctor must not print an unsatisfiable comparison as a trigger: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("never from the CPU floor")
+                && check.message.contains("min_cpu_speed_limit_pct=0"),
+            "…it must say the floor is off, and name the knob that decided it: {}",
+            check.message
+        );
+        // …and must still say what DOES run, or "never / never" reads as
+        // "no breaker at all" — which is false: the `critical`-state check
+        // is unconditional.
+        assert!(
+            check.message.contains("`critical` state (immediate, always)"),
+            "the one unconditional breaker trigger must survive both disables: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-8 MF1) The NON-degenerate rendering, pinned so the
+    /// branch above cannot be "fixed" by making every config read as
+    /// disabled. A shipped-default pair must still name both live
+    /// triggers with their actual numbers.
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_breaker_values_still_render_as_live_triggers_with_their_numbers() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _max = EnvGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", "900000");
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "50");
+        let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "3");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("after 900000ms of one pause episode"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check.message.contains("after 3 consecutive samples with cpu_speed_limit_pct < 50%"),
+            "{}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("never from"),
+            "no trigger is disabled in this config: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-8) The one knob that degenerates UPWARD.
+    /// `cpu_speed_limit_pct` is a percentage whose "no cap recorded"
+    /// reading is 100, so a floor above 100 makes `pct < floor` true of
+    /// every sample: the breaker trips on the `speed_limit_hold_samples`th
+    /// sample of EVERY dispatch and drops a `thermal-critical` STOP file
+    /// on a cold machine. `darkmux config set … 500` accepted it silently
+    /// and doctor reported **Pass**.
+    #[test]
+    #[serial_test::serial]
+    fn a_cpu_floor_above_100_warns_that_every_sample_trips_the_breaker() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+
+        for value in ["101", "500"] {
+            let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", value);
+            let check = check_thermal_governor();
+            assert_eq!(check.status, Status::Warn, "floor={value}: {}", check.message);
+            assert!(
+                check.message.contains("min_cpu_speed_limit_pct") && check.message.contains(value),
+                "floor={value}: the warning must name the knob and the value in force: {}",
+                check.message
+            );
+            assert!(
+                check.message.contains("EVERY dispatch"),
+                "floor={value}: …and what it will actually do: {}",
+                check.message
+            );
+            assert!(
+                check.hint.as_deref().is_some_and(|h| h.contains("min_cpu_speed_limit_pct")),
+                "floor={value}: the remedy must point at the knob that is wrong: {:?}",
+                check.hint
+            );
+        }
+
+        // 100 is the TOP legal value, not a degenerate one: `pct < 100` is
+        // satisfiable (a throttled machine reads below 100) and a machine
+        // with no cap recorded reads exactly 100, which is NOT below it.
+        // Pinned so the guard above cannot drift down onto a real setting.
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "100");
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "floor=100: {}", check.message);
+        assert!(
+            check.message.contains("cpu_speed_limit_pct < 100%"),
+            "floor=100: {}",
+            check.message
+        );
     }
 
     #[test]

@@ -203,6 +203,19 @@ pub(crate) enum Cmd {
         /// scope. When omitted, a fresh ephemeral tempdir is used.
         #[arg(long = "workdir", value_name = "PATH")]
         workdir: Option<std::path::PathBuf>,
+        /// (#2774 review F2) Mount the workspace READ-ONLY, as a crawl
+        /// unit does. Required to resume a checkpoint that was written
+        /// under a read-only mount: darkmux refuses to grant a resumed
+        /// dispatch write access the run that wrote the checkpoint never
+        /// had (RESUME WORKSPACE MOUNT ESCALATION), so without this flag a
+        /// crawl unit's `--resume-from` cannot be accepted at all.
+        /// Mounting MORE restrictively is never an escalation, so this is
+        /// always accepted — but it is a real restriction: the agent
+        /// cannot write into the workspace at all, including the ephemeral
+        /// tempdir it gets when `--workdir` is omitted. `/darkmux-out`
+        /// stays read-write either way.
+        #[arg(long = "workspace-read-only")]
+        workspace_read_only: bool,
         /// Phase id binding this dispatch to a phase in a mission (#714).
         /// When set, every flow record this dispatch emits carries
         /// `mission_id`/`phase_id` so the observability view groups it

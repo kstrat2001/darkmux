@@ -58,16 +58,25 @@ enum Ty {
     /// `darkmux_crew::host_probe::thermal::THERMAL_STATES`
     /// (`nominal`/`fair`/`serious`/`critical`) — `runtime.thermal.pause_at`
     /// / `.resume_at`. Without this, a typo (`"seroius"`) silently parsed
-    /// as `Ty::Str`, and `severity()`'s `unwrap_or(THERMAL_STATES.len())`
-    /// ranks an unrecognized name WORSE than `critical` — inverting either
-    /// knob's intent with no error anywhere in the path: a typo'd
-    /// `pause_at` makes `sev >= severity(pause_at)` (4) all but
-    /// unreachable for any real OS reading, silently disabling the
-    /// governor's soft pause (the breaker's own hardcoded `"critical"`
-    /// check is unaffected); a typo'd `resume_at` makes
-    /// `sev <= severity(resume_at)` (4) true for every reading, so the
-    /// hysteresis hold fills up regardless of actual temperature and the
-    /// pause clears almost immediately even on a machine still hot.
+    /// as `Ty::Str`, and the governor's old `severity()` helper ranked an
+    /// unrecognized name WORSE than `critical` via
+    /// `unwrap_or(THERMAL_STATES.len())` — inverting either knob's intent
+    /// with no error anywhere in the path: a typo'd `pause_at` made
+    /// `sev >= severity(pause_at)` (4) all but unreachable for any real OS
+    /// reading, silently disabling the governor's soft pause (the
+    /// breaker's own hardcoded `"critical"` check was unaffected); a
+    /// typo'd `resume_at` made `sev <= severity(resume_at)` (4) true for
+    /// every reading, so the hysteresis hold filled up regardless of
+    /// actual temperature and the pause cleared almost immediately even on
+    /// a machine still hot.
+    ///
+    /// (#2774 round-4 C3) That helper is gone: the governor now resolves
+    /// `darkmux_crew::thermal_bands::ThermalBands`, which has no rank for
+    /// an unrecognized name and DISARMS the soft tiers with a stated
+    /// reason instead of inventing one. This validation is still the first
+    /// line of defense — it stops the token reaching a config file at
+    /// all — but a typo that gets in by hand is now loud rather than
+    /// silently inverting.
     ThermalState,
     /// (#1685) Comma-separated list of non-empty, trimmed strings, coerced
     /// to a JSON array — `darkmux config set cmd.allowed pr-list,pr-merge`.
@@ -165,6 +174,12 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.thermal.max_pause_ms", Ty::Uint),
     ("runtime.thermal.min_cpu_speed_limit_pct", Ty::Uint),
     ("runtime.thermal.speed_limit_hold_samples", Ty::Uint),
+    // (#2774) Tiers 2-4 of the operator's thermal escalation ladder — see
+    // `ThermalConfig`'s own field docs.
+    ("runtime.thermal.duty_delay_ms", Ty::Uint),
+    ("runtime.thermal.ratchet_factor", Ty::Uint),
+    ("runtime.thermal.episode_threshold", Ty::Uint),
+    ("runtime.thermal.tier4_enabled", Ty::Bool),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
@@ -422,10 +437,14 @@ fn load_object(path: &Path) -> Result<Value> {
 fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
     Ok(match ty {
         Ty::Str => Value::String(raw.to_string()),
-        Ty::Bool => match raw.trim().to_ascii_lowercase().as_str() {
-            "true" => Value::Bool(true),
-            "false" => Value::Bool(false),
-            _ => bail!("expected `true` or `false`, got `{raw}`"),
+        // (#2774 review C7) The SAME vocabulary the env tier accepts —
+        // see `config_access::parse_bool_token`. Strict here (a typo is
+        // refused with a named error) because this surface is an explicit
+        // operator command with a human reading the result, unlike the env
+        // tier's lenient hot-load read.
+        Ty::Bool => match darkmux_types::config_access::parse_bool_token(raw) {
+            Some(b) => Value::Bool(b),
+            None => bail!("expected a boolean (true/false, 1/0, yes/no, on/off), got `{raw}`"),
         },
         Ty::Uint => {
             let n: u64 = raw
@@ -768,7 +787,13 @@ mod tests {
     fn bad_value_type_is_rejected() {
         let f = tmp();
         assert!(set_at(f.path(), "redis.port", "not-a-number").is_err());
-        assert!(set_at(f.path(), "redis.enabled", "yes").is_err(), "bool is strict true/false");
+        // (#2774 review C7) `yes` is now ACCEPTED — the env tier always
+        // took it, and the two surfaces disagreeing about what a boolean
+        // is was the finding. A token NEITHER side recognizes is still
+        // refused; see `config_set_accepts_exactly_the_boolean_vocabulary_
+        // the_env_tier_does` for the shared vocabulary.
+        assert!(set_at(f.path(), "redis.enabled", "yes").is_ok());
+        assert!(set_at(f.path(), "redis.enabled", "maybe").is_err(), "an unrecognized token is refused");
         assert!(set_at(f.path(), "fleet.mode", "hubb").unwrap_err().to_string().contains("invalid fleet.mode"));
     }
 
@@ -790,6 +815,35 @@ mod tests {
         assert!(get_at(f.path(), "runtime.thermal.pause_at").unwrap().contains("serious"));
         set_at(f.path(), "runtime.thermal.resume_at", "fair").unwrap();
         assert!(get_at(f.path(), "runtime.thermal.resume_at").unwrap().contains("fair"));
+    }
+
+    #[test]
+    fn thermal_ladder_keys_are_settable_and_typed() {
+        // (#2774) The escalation ladder's own knobs — same registry-driven
+        // path the pre-existing thermal keys use, no bespoke plumbing.
+        let f = tmp();
+        set_at(f.path(), "runtime.thermal.duty_delay_ms", "20000").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.duty_delay_ms").unwrap().contains("20000"));
+        set_at(f.path(), "runtime.thermal.ratchet_factor", "3").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.ratchet_factor").unwrap().contains('3'));
+        set_at(f.path(), "runtime.thermal.episode_threshold", "0").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.episode_threshold").unwrap().contains('0'));
+        set_at(f.path(), "runtime.thermal.tier4_enabled", "false").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.tier4_enabled").unwrap().contains("false"));
+
+        assert!(
+            set_at(f.path(), "runtime.thermal.duty_delay_ms", "not-a-number").is_err(),
+            "still typed as Ty::Uint — a non-numeric value must be rejected"
+        );
+        // (#2774 review C7) `yes` is the env tier's own vocabulary and is
+        // now accepted here too — an operator disabling a safety tier must
+        // not have to guess which of two spellings each surface takes.
+        set_at(f.path(), "runtime.thermal.tier4_enabled", "yes").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.tier4_enabled").unwrap().contains("true"));
+        assert!(
+            set_at(f.path(), "runtime.thermal.tier4_enabled", "sometimes").is_err(),
+            "still typed as Ty::Bool — a token neither surface recognizes is refused, not guessed"
+        );
     }
 
     #[test]
@@ -959,5 +1013,37 @@ mod tests {
     fn levenshtein_basic() {
         assert_eq!(levenshtein("host", "hsot"), 2);
         assert_eq!(levenshtein("fleet.mode", "fleet.mode"), 0);
+    }
+
+    /// (#2774 review C7) The two surfaces an operator can set a boolean
+    /// through — `DARKMUX_*` env and `darkmux config set` — must agree on
+    /// what a boolean IS. They did not: `yes` was accepted by env and
+    /// refused by `config set`, on a knob (`runtime.thermal.tier4_enabled`)
+    /// that disables a safety tier. This pins the shared vocabulary from
+    /// BOTH directions, so widening one side without the other goes red.
+    #[test]
+    fn config_set_accepts_exactly_the_boolean_vocabulary_the_env_tier_does() {
+        use darkmux_types::config_access::parse_bool_token;
+        for tok in ["true", "1", "yes", "on", "TRUE", " Yes "] {
+            assert_eq!(parse_bool_token(tok), Some(true), "env tier: {tok}");
+            assert_eq!(
+                parse_value(Ty::Bool, tok).unwrap(),
+                Value::Bool(true),
+                "config set must accept the same token the env tier does: {tok}"
+            );
+        }
+        for tok in ["false", "0", "no", "off", "FALSE", " Off "] {
+            assert_eq!(parse_bool_token(tok), Some(false), "env tier: {tok}");
+            assert_eq!(
+                parse_value(Ty::Bool, tok).unwrap(),
+                Value::Bool(false),
+                "config set must accept the same token the env tier does: {tok}"
+            );
+        }
+        // And a token NEITHER side recognizes is refused here, named — not
+        // silently coerced to one of the two answers.
+        assert_eq!(parse_bool_token("maybe"), None);
+        let err = parse_value(Ty::Bool, "maybe").unwrap_err();
+        assert!(format!("{err:#}").contains("maybe"), "got: {err:#}");
     }
 }

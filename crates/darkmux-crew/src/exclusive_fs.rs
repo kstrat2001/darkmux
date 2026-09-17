@@ -309,10 +309,13 @@ pub(crate) fn create_dir_exclusive_unique_0700(base: &Path) -> Result<PathBuf> {
 /// atomicity reason (a reader must never observe a half-written file).
 ///
 /// Returns `Err` with a human-readable reason on any refusal or I/O
-/// failure. Never panics — the one production caller
-/// (`thermal_governor::write_stop_file`) is the thermal breaker's LAST
-/// ACTION under duress and must not panic or block; it surfaces this
-/// `Err` as an operator-facing warning rather than unwrapping it.
+/// failure. Never panics — both production callers live on the thermal
+/// sampler thread and must not panic or block:
+/// `thermal_governor::write_stop_file` is the breaker's LAST ACTION under
+/// duress, and `thermal_governor::persist_ladder_state` (#2774 round-3 C6)
+/// writes the mission's episode/ratchet state into the same directory.
+/// Each surfaces this `Err` as an operator-facing warning rather than
+/// unwrapping it.
 pub(crate) fn write_file_refusing_symlinks_0600(path: &Path, contents: &[u8]) -> Result<(), String> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,

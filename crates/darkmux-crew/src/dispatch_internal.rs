@@ -892,10 +892,45 @@ pub(crate) const RESUME_ORIGIN_FILENAME: &str = "resume_origin.json";
 /// `loop_runner.rs`) — it just means a FUTURE resume attempt from this
 /// `host_out` will refuse with RESUME ORIGIN UNKNOWN rather than guess,
 /// which is the safe direction to fail in.
-pub(crate) fn write_resume_origin_meta(host_out: &Path, workspace: &Path, workspace_read_only: bool) {
+///
+/// (#2774 review F2) Also carries `image` — the one flag tier 4's
+/// `resume_hint` needs that is NOT already a resume-acceptance input. This
+/// file is already "what mount this dispatch ran under"; the image is the
+/// rest of that same answer, and putting it here is what lets
+/// [`resume_hint_from_origin`] build a real command from `host_out` alone
+/// rather than growing two more parameters on the telemetry sampler. Purely
+/// additive and lenient-on-read: `validate_resume_checkpoint` never looks
+/// at it, and a file written before this field existed reads as `None`.
+///
+/// (#2774 round-3 MF2) The recorded `workspace` is CANONICALIZED. The gate
+/// compares this string against a path that has been through
+/// `darkmux_types::workdir::validate_workdir`, which canonicalizes — so
+/// recording a non-canonical path guarantees a mismatch no matter what the
+/// operator types. A no-`--workdir` dispatch's workspace is
+/// [`auto_workspace_path`], `std::env::temp_dir().join(...)`, raw: on
+/// macOS that is `/var/folders/...`, `/var` being a symlink to
+/// `/private/var`, so the two strings NEVER matched and every such resume
+/// was refused with RESUME WORKSPACE MISMATCH — the exact error F2 was
+/// filed to eliminate, still reachable after F2's own fix (proven round 3
+/// through the real gate). Canonicalizing HERE fixes it for every producer
+/// of a workspace path rather than for one call site's derivation.
+///
+/// Falls back to the raw path when canonicalize fails (the dir was removed
+/// under us): recording something is strictly better than recording
+/// nothing, since the gate's failure mode for a missing field is
+/// RESUME ORIGIN UNKNOWN either way.
+pub(crate) fn write_resume_origin_meta(
+    host_out: &Path,
+    workspace: &Path,
+    workspace_read_only: bool,
+    image: Option<&str>,
+) {
+    let recorded_workspace =
+        workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
     let body = serde_json::json!({
-        "workspace": workspace.display().to_string(),
+        "workspace": recorded_workspace.display().to_string(),
         "workspace_read_only": workspace_read_only,
+        "image": image,
     });
     let path = host_out.join(RESUME_ORIGIN_FILENAME);
     match serde_json::to_vec_pretty(&body) {
@@ -912,6 +947,89 @@ pub(crate) fn write_resume_origin_meta(host_out: &Path, workspace: &Path, worksp
             eprintln!("darkmux dispatch: ⚠ failed to serialize resume-origin metadata: {e}");
         }
     }
+}
+
+/// (#2774 review F2) Shell-quote one argument for a hint an operator is
+/// expected to PASTE. A workspace path with a space in it (`~/My
+/// Projects/...`) otherwise produces a command that silently means
+/// something else.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./:@+=,".contains(&b)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// (#2774 review F2) Build tier 4's `resume_hint` — the command an
+/// operator reads at 3am and pastes — so that it is a command darkmux will
+/// actually ACCEPT.
+///
+/// The original hint was `darkmux dispatch <role> --resume-from <out-dir>`
+/// and nothing else, which [`validate_resume_checkpoint`] refuses for
+/// EVERY dispatch: without `--workdir` the resumed run resolves a fresh
+/// ephemeral tempdir ([`auto_workspace_path`]) that cannot match the
+/// origin's recorded `workspace`, so it fails RESUME WORKSPACE MISMATCH;
+/// and for a crawl unit (mounted `:ro`) even the right `--workdir` fails
+/// RESUME WORKSPACE MOUNT ESCALATION without `--workspace-read-only`. A
+/// hint whose whole product is "here is how to continue" has to clear that
+/// gate, so it is built from the SAME file the gate reads —
+/// `<host_out>/resume_origin.json`, written by
+/// [`write_resume_origin_meta`] at dispatch start — rather than from a
+/// separately-maintained idea of what this dispatch was doing.
+///
+/// `resume_origin.json` missing or unreadable is the one case where no
+/// valid command exists: the gate itself would refuse with RESUME ORIGIN
+/// UNKNOWN. The hint then says so plainly instead of printing a command
+/// that cannot work.
+pub(crate) fn resume_hint_from_origin(
+    host_out: &Path,
+    role_id: &str,
+    phase_id: Option<&str>,
+) -> String {
+    let origin_path = host_out.join(RESUME_ORIGIN_FILENAME);
+    let origin = fs::read_to_string(&origin_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(origin) = origin else {
+        return format!(
+            "this run has no readable {} in {}, so `--resume-from` would refuse with RESUME \
+             ORIGIN UNKNOWN — the run cannot be resumed; start a fresh dispatch once conditions \
+             look better",
+            RESUME_ORIGIN_FILENAME,
+            host_out.display()
+        );
+    };
+    let Some(workspace) = origin.get("workspace").and_then(|v| v.as_str()) else {
+        return format!(
+            "{} in {} names no `workspace`, so `--resume-from` would refuse with RESUME ORIGIN \
+             UNKNOWN — the run cannot be resumed; start a fresh dispatch once conditions look \
+             better",
+            RESUME_ORIGIN_FILENAME,
+            host_out.display()
+        );
+    };
+    let read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let image = origin.get("image").and_then(|v| v.as_str());
+
+    let mut cmd = format!(
+        "darkmux dispatch {} --resume-from {} --workdir {}",
+        shell_quote(role_id),
+        shell_quote(&host_out.display().to_string()),
+        shell_quote(workspace)
+    );
+    if read_only {
+        cmd.push_str(" --workspace-read-only");
+    }
+    if let Some(image) = image {
+        cmd.push_str(" --image ");
+        cmd.push_str(&shell_quote(image));
+    }
+    if let Some(phase_id) = phase_id {
+        cmd.push_str(" --phase-id ");
+        cmd.push_str(&shell_quote(phase_id));
+    }
+    format!("{cmd} (once conditions look better — this pause does not clear on its own)")
 }
 
 // (#2158 / #2456) `create_dir_exclusive_0700` and
@@ -5125,7 +5243,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // workspace path/mount-mode into its own host_out, unconditionally —
     // the host-held record a LATER --resume-from reads back rather than
     // guessing. See `write_resume_origin_meta`'s own doc.
-    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only);
+    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only, opts.image.as_deref());
 
     // (#2114 follow-up / #2162) `--resume-from <dir>` trigger: the checkpoint
     // was already validated — see the `validate_resume_checkpoint` call
@@ -5509,7 +5627,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2110/#2109) Resolved through config_access now that
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
-        max_pause_ms_env: Some(darkmux_types::config_access::thermal_max_pause_ms()),
+        //
+        // (#2774 round-6 MF2) The STALENESS-CEILING reading of that knob,
+        // not the raw one: what the container does with this number is
+        // `now - written_at > n` (`runtime/src/pace.rs::is_expired`), and
+        // an unbounded episode (`max_pause_ms = 0`) forwarded literally
+        // would make every pause expire on the next poll — the runtime
+        // racing on a machine the host believes it stopped. See that
+        // accessor's own doc for why the substitute is the default rather
+        // than infinity.
+        max_pause_ms_env: Some(darkmux_types::config_access::thermal_pace_staleness_ceiling_ms()),
         // (#2114 follow-up / #2162) The trigger: `validate_resume_checkpoint`
         // (before model selection) and `write_staged_resume_checkpoint`
         // (once `host_out` exists) above already verified + staged the
@@ -5985,7 +6112,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panicked sampler thread degrades to "no more samples", not a
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
-    let (host_stats, host_extras) = sampler_handle.join().unwrap_or_default();
+    // (#2774 review C3) A PANICKED sampler yields `None` for the ladder,
+    // not a zeroed summary. `0 episodes / 0 ms` is not a possible live
+    // reading (the delay is never below the configured base), so writing
+    // zeros here would be indistinguishable from "this run was never
+    // throttled" — the same reason every sibling field in `host_window`
+    // is already `Option`.
+    let (host_stats, host_extras, thermal_ladder_summary) = match sampler_handle.join() {
+        Ok((stats, extras, ladder)) => (stats, extras, Some(ladder)),
+        Err(_) => (HostStats::default(), HostExtras::default(), None),
+    };
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -6062,6 +6198,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.max_turns_override,
             opts.timeout_override_seconds,
         ),
+        thermal_ladder_summary,
     );
 
     // (#782) Read the runtime's token totals from metrics.json now the
@@ -6140,6 +6277,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &host_extras,
         &opts.record_context,
         opts.resume_from.as_deref(),
+        thermal_ladder_summary,
     );
     let (action, level) = if exit_code == 0 {
         ("dispatch complete", darkmux_flow::Level::Info)
@@ -6438,6 +6576,8 @@ fn enrich_envelope_with_summary(
     // start record and the finished envelope can't independently drift on
     // what "the resolved knobs" means.
     bounds: serde_json::Value,
+    // (#2774) See `host_window_json`'s own doc.
+    thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
 ) -> String {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('{') {
@@ -6532,7 +6672,7 @@ fn enrich_envelope_with_summary(
         // (#2111) The flatter dispatch-summary shape — see
         // `host_window_json`'s own doc for why it exists alongside `host`
         // above rather than replacing it.
-        if let Some(hw) = host_window_json(stats, extras) {
+        if let Some(hw) = host_window_json(stats, extras, thermal_ladder) {
             obj.insert("host_window".into(), hw);
         }
     }
@@ -7386,7 +7526,11 @@ fn run_tailer(
 /// `sample_interval_ms` from a span, run in reverse. `None` when the
 /// sampler never took a sample (`stats.samples == 0`) — an absent block
 /// says "not measured", never "measured, and idle".
-fn host_window_json(stats: &HostStats, extras: &HostExtras) -> Option<serde_json::Value> {
+fn host_window_json(
+    stats: &HostStats,
+    extras: &HostExtras,
+    thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
+) -> Option<serde_json::Value> {
     if stats.samples == 0 {
         return None;
     }
@@ -7398,6 +7542,16 @@ fn host_window_json(stats: &HostStats, extras: &HostExtras) -> Option<serde_json
         "thermal_worst_state": extras.thermal.as_ref().map(|t| t.worst_state.clone()),
         "above_nominal_ms": extras.thermal.as_ref().map(|t| t.above_nominal_ms),
         "min_cpu_speed_limit_pct": extras.thermal.as_ref().map(|t| t.min_cpu_speed_limit_pct),
+        // (#2774) "Was this run throttled, and how hard" — the escalation
+        // ladder's own two numbers, recorded alongside `above_nominal_ms`
+        // per #1247's own principle (cited by the operator in #2774):
+        // answerable from the artifact, not from logs nobody reads.
+        // (#2774 review C3) `Option`, like every sibling above: `None`
+        // means the sampler thread panicked and the ladder was never
+        // recovered, which `0`/`0` would have silently read as "no
+        // throttling at all".
+        "thermal_serious_episodes": thermal_ladder.map(|l| l.serious_episodes),
+        "thermal_duty_delay_ms": thermal_ladder.map(|l| l.current_duty_delay_ms),
         "power_mw_total": extras.power.as_ref().map(|p| serde_json::json!({
             "mean": p.total.mean_mw,
             "max": p.total.max_mw,
@@ -7440,6 +7594,8 @@ fn build_dispatch_complete_payload(
     host_extras: &HostExtras,
     record_context: &Option<serde_json::Value>,
     resume_from: Option<&std::path::Path>,
+    // (#2774) See `host_window_json`'s own doc.
+    thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "runtime": "internal",
@@ -7562,7 +7718,7 @@ fn build_dispatch_complete_payload(
     // (#2111) Same compact host-pressure summary as the envelope's
     // `host_window` (`enrich_envelope_with_summary`) — reaching the FLOW
     // RECORD too, not just the CLI's own `--json` stdout.
-    if let Some(hw) = host_window_json(host_stats, host_extras) {
+    if let Some(hw) = host_window_json(host_stats, host_extras, thermal_ladder) {
         payload["host_window"] = hw;
     }
     // (#1959) Same provenance merge as `dispatch_start_payload` above.
@@ -7594,6 +7750,109 @@ fn build_dispatch_complete_payload(
 /// the ONLY, case) is not an error.
 fn clear_stale_pace_file(host_out: &Path) {
     let _ = std::fs::remove_file(crate::thermal_governor::pace_file_path(host_out));
+}
+
+/// (#2774 tier 5) Pure decision: has the runtime reached a fresh
+/// turn-boundary checkpoint SINCE the breaker tripped? Extracted so the
+/// boundary condition itself is unit-testable without real timing — the
+/// polling loop that calls this (`tier5_eject_on_critical`, below) is not:
+/// it lives on the sampler thread inside a live dispatch, same as the
+/// STOP-file derivation elsewhere in this file. `None` (no checkpoint on
+/// disk, or its mtime couldn't be read) is "not yet" rather than an error —
+/// a dispatch that never wrote a checkpoint (killed before its first turn
+/// boundary) has nothing fresher to wait for.
+fn checkpoint_is_fresh_since(checkpoint_modified: Option<SystemTime>, trip_wall: SystemTime) -> bool {
+    checkpoint_modified.map(|m| m >= trip_wall).unwrap_or(false)
+}
+
+/// (#2774 tier 5) The breaker tripped on a literal `critical` OS thermal
+/// state — the operator's own escalation ladder closes the gap #2109's own
+/// doc names: the breaker pauses the DISPATCH but "never kills the
+/// container," so the resident model that produced the heat keeps holding
+/// the GPU. This unloads every `darkmux:`-namespaced resident on this host
+/// (via [`darkmux_profiles::swap::eject_all_managed`] — the SAME mechanism
+/// `darkmux machine eject` uses, not a second unloader) so the machine can
+/// actually cool.
+///
+/// **Ordering, per the operator's own spec:** checkpoint first, eject
+/// second, where there is time for both — waits up to `bound` for the
+/// runtime's next turn-boundary checkpoint write (`checkpoint.json`'s
+/// mtime advancing past `trip_wall`) before ejecting. But `critical` is
+/// the one tier where waiting is itself the risk: if the bound elapses
+/// with no fresh checkpoint, ejects anyway and accepts losing the in-flight
+/// turn — hardware protection outranks one unit's partial turn, and every
+/// completed unit before it is already durable (#1248's per-event
+/// streaming). `reached_checkpoint_boundary` in the emitted record says
+/// which case this was, so an operator reading the artifact later can tell
+/// "the turn finished cleanly first" from "we cut it off."
+///
+/// Best-effort like every other sampler-thread side effect in this file: an
+/// eject failure is recorded, never panicked on.
+fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn(&str, serde_json::Value)) {
+    const CHECKPOINT_WAIT_BOUND: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(250);
+    let checkpoint_path = host_out.join("checkpoint.json");
+    let deadline = Instant::now() + CHECKPOINT_WAIT_BOUND;
+    let reached_checkpoint_boundary = loop {
+        let modified = std::fs::metadata(&checkpoint_path).and_then(|m| m.modified()).ok();
+        if checkpoint_is_fresh_since(modified, trip_wall) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    match darkmux_profiles::swap::eject_all_managed(false) {
+        Ok(summary) => {
+            let ejected: Vec<serde_json::Value> = summary
+                .ejected
+                .iter()
+                .map(|m| serde_json::json!({ "identifier": m.identifier, "context": m.context }))
+                .collect();
+            emit(
+                "thermal.tier5_eject",
+                serde_json::json!({
+                    "reached_checkpoint_boundary": reached_checkpoint_boundary,
+                    "ejected": ejected,
+                    "user_loaded_count": summary.user_loaded_count,
+                }),
+            );
+            // (#2774 review C1) A model that refused to unload no longer
+            // aborts the sweep, so BOTH outcomes can be real on one trip:
+            // some residents released, some still holding the GPU. The
+            // failure record is emitted alongside the success one and
+            // names every model still resident — on the safety path the
+            // operator needs to know exactly which ones darkmux could not
+            // release, not just that something went wrong.
+            if !summary.failed.is_empty() {
+                let failed: Vec<serde_json::Value> = summary
+                    .failed
+                    .iter()
+                    .map(|f| serde_json::json!({ "identifier": f.identifier, "error": f.error }))
+                    .collect();
+                emit(
+                    "thermal.tier5_eject_failed",
+                    serde_json::json!({
+                        "reached_checkpoint_boundary": reached_checkpoint_boundary,
+                        "failed": failed,
+                        "ejected_count": summary.ejected.len(),
+                    }),
+                );
+            }
+        }
+        Err(e) => {
+            // Could not even LIST the residents — there is no per-model
+            // detail to report, only the enumeration failure.
+            emit(
+                "thermal.tier5_eject_failed",
+                serde_json::json!({
+                    "reached_checkpoint_boundary": reached_checkpoint_boundary,
+                    "error": e.to_string(),
+                }),
+            );
+        }
+    }
 }
 
 /// (#557 slice 4 · #1064) Run the always-on lms + host-load telemetry
@@ -7781,7 +8040,7 @@ fn spawn_guarded_sampler(
     phase_id: Option<String>,
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
-) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras)>) {
+) -> (StopFlagGuard, thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>) {
     let guard = StopFlagGuard(Arc::clone(sampler_stop));
     let stop = Arc::clone(sampler_stop);
     // (#2643) Named via `spawn_detached_named` — see its doc comment.
@@ -7819,7 +8078,7 @@ fn run_telemetry_sampler(
     phase_id: Option<String>,
     host_out: PathBuf,
     record_context: Option<serde_json::Value>,
-) -> (HostStats, HostExtras) {
+) -> (HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
     // makes `reduce_host_stats` testable with plain integers instead of
@@ -7849,9 +8108,43 @@ fn run_telemetry_sampler(
     // previous run's thermal event from its own and is not refused by it
     // forever — nothing removes that file. See `thermal_governor::
     // stop_file_body`.
+    // (#2774 review F5) `.seeded_from_mission` is what makes the ratchet
+    // and the episode count mean the whole crawl MISSION, not just this
+    // one dispatch: `ThermalGovernor` is constructed fresh per `dispatch()`
+    // call, and a crawl mission calls `dispatch()` once per unit — without
+    // this, "the delay doubles for the rest of the run" and "the Nth
+    // `serious` episode" would both silently reset every single unit.
+    let thermal_ladder_state_file =
+        crate::thermal_governor::ladder_state_file_path_from_record_context(record_context.as_ref());
     let mut thermal_governor =
         crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env())
-            .owned_by(mission_id.as_deref());
+            .owned_by(mission_id.as_deref())
+            .seeded_from_mission(thermal_ladder_state_file.as_deref());
+    // (#2774 round-3 MF1) A `pause_at`/`resume_at` pair that leaves a tier
+    // no usable band runs that tier not at all. `darkmux doctor` warns
+    // about the config itself, but an operator who never ran doctor would
+    // otherwise watch a hot machine simply never pace and have no way to
+    // know why — the exact "never wonder where a decision came from"
+    // failure operator sovereignty (#44) exists to prevent. Says it at
+    // dispatch start, not per sample.
+    //
+    // (#2774 round-4) Reports whatever the governor's OWN bands value says
+    // is disarmed, rather than restating one hardcoded reason. Round 3's
+    // version was gated on the WHOLE ladder being disarmed and phrased for
+    // a single cause, so it stayed silent for both of round 4's findings: a
+    // typo'd `pause_at` (which used to rank above `critical` and therefore
+    // "armed" the ladder, silencing this very warning), and `resume_at =
+    // nominal` (which disarms tier 2 alone). These are the same notes
+    // doctor renders, so the two surfaces cannot disagree.
+    if darkmux_types::config_access::thermal_enabled() {
+        for note in thermal_governor.disarm_notes() {
+            eprintln!(
+                "darkmux: ⚠ thermal ladder — {} DISARMED for this dispatch: {} The breaker \
+                 (`critical`, and the sustained cpu_speed_limit floor) still runs. Fix with: {}",
+                note.tiers, note.why, note.remedy,
+            );
+        }
+    }
     let thermal_stop_file =
         crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
     // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
@@ -7902,6 +8195,32 @@ fn run_telemetry_sampler(
             payload,
         ));
     };
+    // (#2774 tiers 2/4) Same shape as `emit_rest` above, plus arbitrary
+    // extra fields merged onto the payload — the duty-cycle events want to
+    // carry `delay_ms`, the tier-4 hold wants `episode`, and neither
+    // deserves a bespoke one-off closure. `level` is explicit (not always
+    // `Info`) because tier 4's hold is operator-actionable, not routine
+    // pacing telemetry.
+    let emit_rest_with_extra =
+        |level: darkmux_flow::Level, reason: &str, state: &str, pause: bool, extra: serde_json::Value| {
+            let mut payload = serde_json::json!({ "reason": reason, "state": state, "pause": pause });
+            if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), extra.as_object()) {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            merge_record_context(&mut payload, &record_context);
+            let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+                level,
+                "dispatch.rest",
+                &role_id,
+                &session_id,
+                Some(&model),
+                mission_id.as_deref(),
+                phase_id.as_deref(),
+                Some(payload),
+            ));
+        };
 
     // (#2413) This dispatch is, by definition, LIVE for as long as this
     // sampler thread runs — so if it becomes the machine's singleton host
@@ -8056,6 +8375,125 @@ fn run_telemetry_sampler(
                             payload,
                         ));
                     }
+                    // (#2774 tier 5) A literal `critical` OS thermal state
+                    // — not the speed-limit-sustained trigger, and not the
+                    // pre-existing max-pause-exceeded-while-paused
+                    // escalation, both of which also reach this arm — gets
+                    // the operator's own "hard stop plus eject" treatment
+                    // on top of the breaker's existing pause+STOP-file
+                    // behavior. Scoped to the literal state name (the
+                    // issue's own condition), deliberately NOT widened to
+                    // the speed-limit trigger: that one is a proxy signal,
+                    // this is the hardware's own worst-case report.
+                    //
+                    // (#2774 review C6) **What "hard stop" reaches, stated
+                    // exactly:** THIS dispatch (the pace file pauses it)
+                    // and, if this is a crawl unit, that crawl's remaining
+                    // units (the STOP file the breaker arm above already
+                    // wrote). Plus every `darkmux:`-namespaced resident on
+                    // this host, which the eject below releases. It does
+                    // NOT reach other concurrent dispatches, other
+                    // missions, or the fleet: a MACHINE-WIDE thermal
+                    // broadcast is #2774's open half and is not built.
+                    // An earlier wording here said "no question asked,"
+                    // which read as a claim about scope it never had.
+                    if state == "critical" {
+                        let trip_wall = SystemTime::now();
+                        tier5_eject_on_critical(&host_out, trip_wall, &|action, payload| {
+                            emit("thermal", action, payload)
+                        });
+                    }
+                }
+                crate::thermal_governor::ThermalEvent::DutyCycleEntered { state, delay_ms } => {
+                    // (#2774 tier 2) `pause: false` — this is NOT a rest
+                    // the run stops for; it is the duty-cycle instruction
+                    // itself. `delay_ms` rides the SAME `dispatch.rest`
+                    // record family so a reader watching that one action
+                    // string sees every pacing decision, tier 2 included.
+                    emit_rest_with_extra(
+                        darkmux_flow::Level::Info,
+                        "thermal-duty-cycle",
+                        &state,
+                        false,
+                        serde_json::json!({ "delay_ms": delay_ms }),
+                    );
+                }
+                crate::thermal_governor::ThermalEvent::DutyCycleExited { state } => {
+                    emit_rest("thermal-duty-cycle", &state, false);
+                }
+                crate::thermal_governor::ThermalEvent::OperatorHold { state, episode } => {
+                    // (#2774 tier 4) LOUD and operator-actionable, never a
+                    // diagnosis (CLAUDE.md: darkmux describes, never
+                    // adjudicates) — the checklist names things to CHECK,
+                    // it does not assert what is wrong. `resume_hint` names
+                    // the concrete, already-wired mechanism
+                    // (`--resume-from`, #2114 follow-up) rather than
+                    // leaving the operator to guess how to continue.
+                    let checklist = "worth checking: ambient temperature / air conditioning, an external \
+                         fan or active cooling on this machine, proximity to other hot machines, and \
+                         airflow obstruction";
+                    // (#2774 review F2) Built from this dispatch's OWN
+                    // `resume_origin.json` — the same file the resume gate
+                    // reads — so the command the operator pastes is one
+                    // darkmux accepts. The earlier bare
+                    // `--resume-from <dir>` form was refused by
+                    // `validate_resume_checkpoint` for every dispatch; see
+                    // `resume_hint_from_origin`'s own doc.
+                    let resume_hint =
+                        resume_hint_from_origin(&host_out, &role_id, phase_id.as_deref());
+                    // (#2774 round-3 C9) "this mission", not "this run":
+                    // F5 made the episode count MISSION-scoped (seeded
+                    // across dispatches from the ladder-state file), so a
+                    // unit whose own governor saw exactly one episode
+                    // legitimately prints "2 time(s)". The old wording made
+                    // that read as a bug in the count.
+                    eprintln!(
+                        "darkmux: this machine reached `serious` {episode} time(s) this mission — \
+                         pausing indefinitely, no further turns until you say to. {checklist}. \
+                         To continue: {resume_hint}"
+                    );
+                    emit_rest_with_extra(
+                        darkmux_flow::Level::Warn,
+                        "thermal-episode-limit",
+                        &state,
+                        true,
+                        serde_json::json!({
+                            "episode": episode,
+                            "checklist": checklist,
+                            "resume_hint": resume_hint,
+                        }),
+                    );
+                    // (#2774 tier 4) Tier 4 also drops the crawl's STOP
+                    // file (see `enter_paused`'s own doc) — same
+                    // "the breaker tried and could not stop the crawl"
+                    // warning shape the Breaker arm above uses, reused
+                    // rather than re-derived, since both mean the same
+                    // thing to an operator reading the flow stream.
+                    let unresolved = crate::thermal_governor::stop_unresolved_cause(
+                        thermal_stop_file.as_deref(),
+                        thermal_stop_unresolved_reason,
+                        thermal_governor.last_stop_write_error(),
+                    );
+                    if let Some((cause, reason)) = unresolved {
+                        let mut payload = serde_json::json!({
+                            "stop_written": false,
+                            "cause": cause.as_str(),
+                            "reason": reason,
+                            "state": state,
+                        });
+                        merge_record_context(&mut payload, &record_context);
+                        let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+                            darkmux_flow::Level::Warn,
+                            "thermal.stop_unresolved",
+                            "thermal",
+                            &role_id,
+                            &session_id,
+                            Some(&model),
+                            mission_id.as_deref(),
+                            phase_id.as_deref(),
+                            payload,
+                        ));
+                    }
                 }
             }
         }
@@ -8064,11 +8502,23 @@ fn run_telemetry_sampler(
         // used — one clock, so the two governors' heartbeat accounting can
         // never disagree about how much time passed.
         //
-        // `thermal_governor.is_pacing()` is read AFTER the thermal tick
+        // `thermal_governor.is_pausing()` is read AFTER the thermal tick
         // above, so this is the post-decision state: thermal owns the pace
-        // file this tick if it is pausing or broken, and the battery
-        // governor stands down and re-asserts on the first free tick. See
+        // file this tick if it holds a GENUINE pause (`Paused`,
+        // `OperatorHold`, or `Broken`), and the battery governor stands
+        // down and re-asserts on the first free tick. See
         // `power_policy::BatteryGovernor`'s own doc for that precedence.
+        //
+        // (#2774 review F1) Deliberately `is_pausing`, NOT `is_pacing` —
+        // `is_pacing` also covers tier 2's `DutyCycle`, which writes
+        // `pause: false`. Gating the battery governor's stand-down on that
+        // would silently drop a real battery-critical pause for the whole
+        // duration of a duty-cycle episode: the run keeps working, the
+        // battery keeps draining, and nothing is checking it. `is_pausing`
+        // stands the battery governor down only for a condition that
+        // ALREADY satisfies "stop the run" — see that method's own doc for
+        // why this is race-free given the two governors tick sequentially
+        // in this same loop, not just usually-right.
         //
         // A machine with NO battery reaches this line every tick and does
         // nothing at all: `sample.battery` is `None` on a desktop, and the
@@ -8078,7 +8528,7 @@ fn run_telemetry_sampler(
             sample.battery.as_ref(),
             thermal_elapsed_ms,
             &host_out,
-            thermal_governor.is_pacing(),
+            thermal_governor.is_pausing(),
         ) {
             match event {
                 // The `state` string carries BOTH numbers the decision was
@@ -8267,6 +8717,7 @@ fn run_telemetry_sampler(
                 return (
                     reduce_host_stats(&raw),
                     reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
+                    thermal_governor.ladder_summary(),
                 );
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
@@ -8274,7 +8725,11 @@ fn run_telemetry_sampler(
             slept += nap;
         }
     }
-    (reduce_host_stats(&raw), reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)))
+    (
+        reduce_host_stats(&raw),
+        reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
+        thermal_governor.ladder_summary(),
+    )
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,

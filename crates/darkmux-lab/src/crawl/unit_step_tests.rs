@@ -599,6 +599,74 @@ fn a_thermal_stop_file_prevents_the_unit_from_dispatching() {
     );
 }
 
+/// (#2774 round-4 C2) A TIER-4 stop must not be reported as a breaker trip.
+///
+/// Round 3's C8 fixed the WRITER — tier 4 stopped stamping
+/// `thermal-critical` into the STOP file it drops for a count-based
+/// escalation — but this READER still split the body for the `mission=`
+/// token and threw the reason away, so it printed "the thermal breaker's
+/// STOP file is present (#2109)" and stamped
+/// `UnitOutcome.reason = "thermal breaker tripped (#2109) - ..."` on a
+/// machine that never reported `critical`. The same artifact disagreement
+/// C8 was filed to close, relocated one consumer out.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME, a process-global
+fn a_tier4_episode_limit_stop_is_not_reported_as_a_breaker_trip() {
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+
+    let stop_dir = home.path().join("crawl").join("fixture-ws");
+    fs::create_dir_all(&stop_dir).unwrap();
+    // Exactly what `ThermalGovernor`'s tier-4 hold writes.
+    fs::write(
+        stop_dir.join("STOP"),
+        format!(
+            "{} mission={MISSION}\n",
+            darkmux_crew::thermal_governor::STOP_FILE_REASON_EPISODE_LIMIT
+        ),
+    )
+    .unwrap();
+
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    let kind = CrawlUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        ok_result(envelope("stop", 100, 20, 5_000), PathBuf::new())
+    }));
+
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate"
+    }));
+    let outcome = kind.run(&step, &unit_task(), &BTreeMap::new()).unwrap();
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "a tier-4 hold still stops the unit - only the DESCRIPTION changes"
+    );
+
+    let parsed = darkmux_crew::step_output::Output::<UnitOutcome>::read(&outcome.output, UNIT_OUTCOME_KIND)
+        .unwrap()
+        .body;
+    assert_eq!(parsed.result, THERMAL_STOP);
+    let reason = parsed.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("episode-count hold"),
+        "the run artifact must say what actually happened: {reason:?}"
+    );
+    assert!(
+        !reason.contains("breaker"),
+        "...and must not call a count-based escalation a breaker trip on a machine that never \
+         reported `critical`: {reason:?}"
+    );
+    // The remedy still has to be there - the operator is just as stuck.
+    assert!(
+        reason.contains(&format!("rm {}", stop_dir.join("STOP").display())),
+        "the reason must still tell the operator how to get unstuck: {reason:?}"
+    );
+}
+
 /// (#2454) The anti-brick regression. `<root>/crawl/<manifest>/STOP` is
 /// scoped to the WORKSPACE, not to a run, and NOTHING in this repo has ever
 /// deleted one — not the retired launcher (`src/crawl_launch.rs`, which only
