@@ -1048,10 +1048,21 @@ async fn serve(
                     let advertised = crate::acp_panel::list_panel_commands();
                     let route = crate::acp_panel::parse_command(&text)
                         .and_then(|(cmd, args)| {
-                            crate::acp_panel::route_command(&advertised, &cmd).map(|plan| (plan, args))
+                            // (#2050 sweep) `panel.accepts_args: false` was
+                            // enforced only on the ROUTED channel
+                            // (`radio::decide_route`); this direct
+                            // `/command args` path forwarded whatever the
+                            // operator typed. Decided here, where the
+                            // registry entry is in hand, and the notice is
+                            // sent below rather than dropping the text
+                            // silently. See `acp_panel::enforce_accepts_args`.
+                            let (args, notice) =
+                                crate::acp_panel::enforce_accepts_args(&advertised, &cmd, &args);
+                            crate::acp_panel::route_command(&advertised, &cmd)
+                                .map(|plan| (plan, args, notice))
                         });
 
-                    let Some((plan, args)) = route else {
+                    let Some((plan, args, args_notice)) = route else {
                         // Never hang, never bounce an error across the
                         // protocol boundary for an input we just don't support
                         // yet — reply plainly and end the turn. Lists the
@@ -1063,6 +1074,13 @@ async fn serve(
                         ));
                         return responder.respond(PromptResponse::new(StopReason::EndTurn));
                     };
+
+                    // Told BEFORE the command runs, so the operator reads
+                    // "your text was not passed on" next to the invocation
+                    // rather than after its output.
+                    if let Some(notice) = args_notice {
+                        let _ = cx.send_notification(agent_chunk(&session_id, notice));
+                    }
 
                     let Some(cwd) = session_cwd(&sessions_for_prompt, &session_id) else {
                         let _ = cx.send_notification(agent_chunk(&session_id, NO_CWD_MESSAGE));
@@ -2854,6 +2872,107 @@ mod tests {
             response["result"]["stopReason"], "end_turn",
             "expected the session/prompt response to end the turn: {response}"
         );
+    }
+
+    /// Like [`write_echo_fixture`], but the advertised command declares
+    /// `panel.accepts_args: false` — the shape the shipped `review` config
+    /// uses, and the one the direct `/command args` path never consulted.
+    fn write_nullary_echo_fixture(crew_dir: &Path, id: &str, output: &str) {
+        let dir = crew_dir.join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_string(&serde_json::json!({
+                "id": id,
+                "name": id,
+                "panel": {"description": "Pipe-level test fixture — takes no arguments.", "accepts_args": false},
+                "phases": [{
+                    "id": "p1",
+                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"output": output}}]}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// (#2050 sweep) `panel.accepts_args: false` is enforced on the DIRECT
+    /// `/command args` path, and the operator is told their text was
+    /// dropped — proven behaviourally over the real pipe, not by asserting
+    /// on source text.
+    ///
+    /// Before this, `route_command` matched on the command NAME alone and
+    /// `execute_route_plan` forwarded whatever followed it, so typing
+    /// `/review please look closely at X` built an unused `--param
+    /// args=...`, discarded the operator's text, and reported nothing —
+    /// while the command's own hint advertises "(no arguments)".
+    ///
+    /// The ORDER is asserted, not merely the presence: the notice has to
+    /// arrive before the command's output, or the operator reads "your text
+    /// was not passed on" after a result they have already acted on.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_nullary_slash_command_drops_typed_args_and_says_so_before_running() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_nullary_echo_fixture(crew_tmp.path(), "nullary-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("a slash command must never reach the router");
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "/nullary-fixture please look closely at X").await;
+
+        let notice = recv_json(&mut reader).await;
+        let notice = chunk_text(&notice);
+        assert!(
+            notice.contains("/nullary-fixture") && notice.contains("takes no arguments"),
+            "the dropped text must be announced BEFORE the command's output, got: {notice}"
+        );
+
+        let output = recv_json(&mut reader).await;
+        assert!(
+            chunk_text(&output).contains("fixture output"),
+            "and the command must still run: {}",
+            chunk_text(&output)
+        );
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// The inverted case over the same pipe: a command that DOES take
+    /// arguments must not be announced and must not lose its text. Without
+    /// it, clearing unconditionally would satisfy the test above just as
+    /// happily while breaking every advertised command that reads its args.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_slash_command_that_takes_args_is_not_announced() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("a slash command must never reach the router");
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "/echo-fixture please look closely at X").await;
+
+        let first = recv_json(&mut reader).await;
+        assert!(
+            chunk_text(&first).contains("fixture output"),
+            "the FIRST chunk must be the output — no args notice belongs here: {}",
+            chunk_text(&first)
+        );
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
     }
 
     /// (#1698 Packet B) The no-slash channel's core contract: a successful

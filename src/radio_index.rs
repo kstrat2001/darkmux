@@ -27,9 +27,17 @@ pub struct VerbEntry {
     pub options: Vec<String>,
 }
 
-/// Walk the tree. Leaves only: a verb that exists just to hold subverbs is
-/// not something the user runs. Hidden commands and clap's own `help` are
-/// skipped.
+/// Walk the tree. Runnable INVOCATIONS only: a verb that exists just to
+/// hold subverbs is not something the user runs. Hidden commands and
+/// clap's own `help` are skipped.
+///
+/// "Leaves only" was the rule until #2050's review sweep, and it was wrong
+/// for one real shape: a node that has subcommands AND its own positional
+/// argument. `darkmux lab run <workload>` is the exemplar — `lab run` also
+/// holds `list`/`inspect`/`compare`, so leaf-walking emitted those three
+/// and dropped the workload-dispatch form, which is **this repo's own
+/// documented smoke command**. The seat therefore could not read it out of
+/// the grounding, and `radio_answer`'s backstop called it invented.
 pub fn build_verb_index(root: &clap::Command) -> Vec<VerbEntry> {
     let mut out = Vec::new();
     walk(root, &[], &mut out);
@@ -44,6 +52,13 @@ fn walk(cmd: &clap::Command, prefix: &[&str], out: &mut Vec<VerbEntry>) {
         }
         out.push(VerbEntry { path: prefix.join(" "), summary: summarize(cmd), options: option_names(cmd) });
         return;
+    }
+    // (#2050 sweep) A group node that ALSO takes a positional of its own is
+    // a real invocation, not just a namespace — emit it BESIDE its
+    // children. Asked of clap rather than listed by hand, so a verb that
+    // grows or loses a positional later needs no edit here.
+    if !prefix.is_empty() && cmd.get_positionals().any(|a| !a.is_hide_set()) {
+        out.push(VerbEntry { path: prefix.join(" "), summary: summarize(cmd), options: option_names(cmd) });
     }
     for sub in subs {
         let mut p: Vec<&str> = prefix.to_vec();

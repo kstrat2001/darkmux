@@ -775,27 +775,52 @@ fn answer_references_a_command(text: &str, catalog: &[CatalogEntry]) -> bool {
     catalog.iter().any(|c| lower.contains(&format!("/{}", c.id.to_ascii_lowercase())))
 }
 
-/// The mechanical backstop for #1861 defects 1 and 2, as #2050 rebuilt it:
-/// a DETECTOR, not a repair. `true` iff `reply` names a command that
-/// cannot actually be run on `surface`.
+/// The mechanical backstop for #1861 defects 1 and 2, as #2050 rebuilt it
+/// and its review sweep generalized it: a DETECTOR, not a repair. `true`
+/// iff `reply` names a command that cannot actually be run on `surface`.
 ///
 /// The persona's own "never invent a command" rule (radio-host.md rule 2)
 /// is honored only as well as whichever model is loaded that day honors an
 /// instruction — model-dependent, and not provable by any test. So this
-/// scans the seat's raw reply for the two command-reference SHAPES rule 2
-/// tells it to produce — backtick-quoted, and (since a model routinely
-/// writes a slash id as bare prose) unquoted too — and checks each against
-/// what is ACTUALLY runnable:
+/// scans the seat's raw reply for the command-reference SHAPES rule 2
+/// tells it to produce and checks each against what is ACTUALLY runnable:
 ///
 /// - `/id` — valid ONLY on [`RadioSurface::Panel`] (on the CLI there is no
 ///   shell that runs `/anything` — a routed id is executed by radio
 ///   itself, never typed by the operator; defect 1) AND only when `id` is
 ///   one of `catalog`'s advertised ids (defect 2).
-/// - `` `darkmux <path...>` `` — valid on EITHER surface when `<path...>`
-///   is a real leaf path in `verb_index` (#1784's introspected index —
-///   the single grounding source this validates against, per the issue's
-///   own fix-shape note), or names any node of that tree with `--help` /
+/// - `darkmux <path...>` — valid on EITHER surface when `<path...>` is a
+///   real leaf path in `verb_index` (#1784's introspected index — the
+///   single grounding source this validates against, per the issue's own
+///   fix-shape note), or names any node of that tree with `--help` /
 ///   `--version`, which are real at every node including the root.
+/// - a bare catalog id handed over as something to type (`` `review` ``),
+///   which is runnable on NEITHER surface — see [`is_a_bare_catalog_id`].
+///
+/// **Decoration is not the input format (the #2050 review sweep).** Rule 2
+/// says "name it exactly ... in the syntax that's actually real" — a
+/// constraint on the COMMAND, with no requirement to put backticks round
+/// it. The first build of this detector nonetheless scrutinized
+/// backtick-quoted spans and barely checked bare prose, which cost three
+/// findings at once: a bare-prose `darkmux machine roster` was never
+/// checked at all, ONE unmatched backtick moved every later reference into
+/// an "inside" part that only an exact catalog-id match could trip (and a
+/// backtick where an apostrophe belongs is this seat's demonstrated
+/// failure pattern, not a hypothesis), and `Darkmux ...` failed a
+/// case-sensitive prefix. So the scan now runs on
+/// [`decoration_stripped`] text, where backticks, emphasis, brackets and
+/// quotes are all spaces: parity cannot be broken by an unmatched
+/// delimiter, because nothing depends on parity any more.
+///
+/// **What the quoted half still buys.** Two shapes are judged ONLY inside
+/// a closed inline-code span, because the markup is the whole signal that
+/// the seat is handing over something to TYPE rather than describing
+/// something: a bare catalog id (an id is frequently an ordinary English
+/// word), and a `darkmux ...` reference whose first word is not a real
+/// top-level verb. In bare prose those two are read as description. The
+/// symmetric part — the part the sweep was about — is that every reference
+/// shape is now scanned in BOTH contexts; only the threshold for calling
+/// one an instruction differs, and it differs on purpose.
 ///
 /// **Why a detector and not a repair (#2050, second measurement).** Two
 /// repairs were tried and both shipped broken prose, for the same reason.
@@ -823,24 +848,36 @@ fn answer_references_a_command(text: &str, catalog: &[CatalogEntry]) -> bool {
 /// refusal plus the listing. Accepted deliberately — the alternative is a
 /// surface that renders cleanly and misleads, and the fallback is the
 /// output the operator measured as the best line of the original run.
+/// That cost is also why widening the scan to bare prose came WITH a
+/// narrowing ([`FILESYSTEM_ROOT_SEGMENTS`]) and two framing gates: a
+/// discarded reply is invisible — it looks exactly like an ordinary
+/// refusal — so the false-positive direction gets the same pinning as the
+/// false-negative one.
 ///
-/// **A `/`-prefixed span is only a candidate when it is COMMAND-SHAPED**
-/// ([`looks_like_a_slash_command`]): one segment of `[A-Za-z0-9_-]`. An
-/// absolute path — `` `/Users/kain/.darkmux/config.json` `` — is not a
-/// command reference and must never trip this. That boundary is MORE
-/// load-bearing now, not less: a false positive used to cost one span,
-/// and now costs the entire answer. Anything else (a config key, a bare
-/// flag, `n_ctx`, an ordinary code span, a URL, a date, a path) is not a
-/// candidate at all.
+/// **Known coverage limits, pinned by tests so they are decisions.**
 ///
-/// **One documented coverage limit.** A fenced code block is quoted
-/// material — sample output, a transcript — and is excluded, so an
-/// invented id inside a fence does not trip the fallback. Deliberate, and
-/// the reason the fence split happens FIRST: without it, whether a fence
-/// body was scanned depended on backtick parity, which is worse than a
-/// stated exclusion. (The old second limit — a single-segment absolute
-/// path such as `` `/tmp` `` reading as an invented id — still holds, and
-/// is now a reason to keep the candidate test narrow.)
+/// - **A fenced code block is not scanned at all, and by likelihood this
+///   is the DOMINANT residual — not a narrow one.** `index % 2 == 0` drops
+///   every fence body, closed or unclosed, and handing over a command
+///   inside a fence is the most idiomatic way a model answers "how do I do
+///   X". The exclusion predates this detector's rebuild and is kept here
+///   deliberately rather than revisited in passing: a fence is quoted
+///   material (sample output, a transcript), and a truncated fence — the
+///   seat hitting its token cap mid-block — is a real output whose body
+///   read as prose would discard good replies. It wants its own change
+///   with its own measurement; earlier wording in this doc called it "one
+///   documented coverage limit", which understated it.
+/// - An invented `darkmux <verb>` in bare prose with NO invocation cue and
+///   no markup — *"darkmux machine roster sounds like a good feature"* — is
+///   read as description and passes.
+/// - A bare-prose reference whose first word is not a real top-level verb
+///   is not a candidate, so a WHOLLY-invented verb — *"run darkmux
+///   telepathy."* — is missed. Nothing separates it from the English word
+///   in *"use darkmux instead of driving lms by hand"*, which the same gate
+///   protects. Quoted (`` `darkmux telepathy --help` ``) it is caught.
+/// - An unadvertised `/id` that nothing frames — *"the command is
+///   /machine"* — is read as prose. That is the price of not discarding
+///   *"mounted at /workspace"*; see [`token_is_framed`].
 fn names_an_unrunnable_command(
     reply: &str,
     catalog: &[CatalogEntry],
@@ -848,7 +885,7 @@ fn names_an_unrunnable_command(
     surface: RadioSurface,
 ) -> bool {
     // Fences first, so a fence body is excluded DETERMINISTICALLY rather
-    // than by whatever parity the inline backtick split happens to land on.
+    // than by whatever parity the inline scan happens to land on.
     reply
         .split("```")
         .enumerate()
@@ -856,72 +893,432 @@ fn names_an_unrunnable_command(
         .any(|(_, chunk)| chunk_names_an_unrunnable_command(chunk, catalog, verb_index, surface))
 }
 
-/// One outside-a-fence chunk: inline backtick spans checked by shape,
-/// everything between them scanned for the same references written as
-/// bare prose (`Try running /machine to see them.` — issue #1861's own
-/// wording, which no backtick-only scan would ever have caught).
+/// One outside-a-fence chunk. Two passes, and the split between them is
+/// the sweep's whole point:
+///
+/// 1. **Decoration-independent** ([`decoration_stripped`]) — every `/id`
+///    candidate, and every `darkmux ...` reference that bare prose FRAMES
+///    as an instruction. No backtick parity is consulted, so an unmatched
+///    delimiter cannot hide anything from this pass.
+/// 2. **Closed inline-code spans only** — the two shapes whose only signal
+///    that they are an instruction IS the markup: a bare catalog id, and a
+///    `darkmux ...` reference with any first word. A span is a span only
+///    when it CLOSES ([`closed_code_spans`]); an unmatched trailing
+///    backtick simply opens nothing, and pass 1 has already covered the
+///    text either way.
 fn chunk_names_an_unrunnable_command(
     chunk: &str,
     catalog: &[CatalogEntry],
     verb_index: &[crate::radio_index::VerbEntry],
     surface: RadioSurface,
 ) -> bool {
-    for (i, part) in chunk.split('`').enumerate() {
-        if i % 2 == 0 {
-            if bare_slash_token_is_unrunnable(part, catalog, surface) {
+    let undecorated = decoration_stripped(chunk);
+    let tokens = tokenize(&undecorated);
+    if slash_reference_is_unrunnable(&undecorated, &tokens, catalog, surface) {
+        return true;
+    }
+    if prose_darkmux_reference_is_unrunnable(&undecorated, &tokens, verb_index) {
+        return true;
+    }
+    for span in closed_code_spans(chunk) {
+        let span = span.trim();
+        if let Some(rest) = strip_darkmux_prefix(span) {
+            if !darkmux_reference_is_valid(rest, verb_index) {
                 return true;
             }
-            continue;
-        }
-        let unrunnable = if part.starts_with('/') {
-            // A path is not a command reference at all — never judge it.
-            looks_like_a_slash_command(part) && !slash_reference_is_valid(part, catalog, surface)
-        } else if let Some(rest) = part.strip_prefix("darkmux ") {
-            !darkmux_reference_is_valid(rest, verb_index)
-        } else {
-            is_a_bare_catalog_id(part, catalog)
-        };
-        if unrunnable {
+        } else if is_a_bare_catalog_id(span, catalog) {
             return true;
         }
     }
     false
 }
 
-/// Sentence punctuation that can trail a bare `/id` written as prose. It
-/// is trimmed BEFORE the shape test — otherwise `/machine.` fails the
-/// character check and the invented id sails through undetected.
-fn is_trailing_punctuation(c: char) -> bool {
-    matches!(c, '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '"' | '\'')
+/// Decoration that FRAMES a reference — inline-code backticks, markdown
+/// emphasis, brackets, and quotes (straight and curly). Each becomes a
+/// [`DECORATION_MARK`], so a scanner sees the reference undressed AND can
+/// still tell that the seat marked it as a token rather than writing prose.
+///
+/// Two deliberate absences, each load-bearing:
+///
+/// - `_` is a legal character inside a command id, and in this seat's
+///   output an id carrying an underscore is likelier than markdown
+///   underscore-emphasis.
+/// - `~` must stay glued to the `/` after it. Most home-relative paths
+///   survive its removal anyway — `~/.darkmux/profiles.json` stops at the
+///   `.`, and any two-segment path at the second `/` — but a
+///   SINGLE-segment one, `~/runs`, would become a word-initial `/runs`
+///   and read as an invented command.
+const FRAMING_DECORATION: &[char] =
+    &['`', '*', '(', ')', '[', ']', '{', '}', '"', '\'', '\u{2018}', '\u{2019}'];
+
+/// What a [`FRAMING_DECORATION`] character becomes. U+000B is whitespace to
+/// `char::is_whitespace`, so it ends a token exactly like a space does,
+/// while staying distinguishable from one — which is the whole trick: the
+/// scan is decoration-INDEPENDENT (no parity, nothing hidden) and still
+/// decoration-AWARE (it knows the seat put markup there).
+const DECORATION_MARK: char = '\u{000B}';
+
+/// `chunk` with decoration replaced per the two classes above.
+fn decoration_stripped(chunk: &str) -> Vec<char> {
+    chunk
+        .chars()
+        .map(|c| {
+            if FRAMING_DECORATION.contains(&c) {
+                DECORATION_MARK
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
-/// The unquoted half of the backstop. Only a token that STARTS a word (the
-/// preceding character is whitespace or nothing) is considered, which is
-/// what keeps `https://example.com`, `and/or` and `9/12` out of scope
-/// without any special-casing.
-fn bare_slash_token_is_unrunnable(text: &str, catalog: &[CatalogEntry], surface: RadioSurface) -> bool {
-    let chars: Vec<char> = text.chars().collect();
+/// One whitespace-delimited token of a [`decoration_stripped`] chunk, with
+/// the character offsets that let [`token_is_framed`] look at what sat on
+/// either side of it.
+struct Token {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+/// Split on whitespace, keeping offsets. A [`DECORATION_MARK`] counts as
+/// whitespace here, so `(/machine)` and `` `darkmux machine status` ``
+/// tokenize exactly like their bare equivalents.
+fn tokenize(chars: &[char]) -> Vec<Token> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        let starts_a_word = i == 0 || chars[i - 1].is_whitespace();
-        if chars[i] != '/' || !starts_a_word {
+        if chars[i].is_whitespace() {
             i += 1;
             continue;
         }
-        let mut end = i;
-        while end < chars.len() && !chars[end].is_whitespace() {
-            end += 1;
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
         }
-        let token: String = chars[i..end].iter().collect();
-        let core = token.trim_end_matches(is_trailing_punctuation);
-        if looks_like_a_slash_command(core) && !slash_reference_is_valid(core, catalog, surface) {
-            return true;
+        out.push(Token { text: chars[start..i].iter().collect(), start, end: i });
+    }
+    out
+}
+
+/// Every CLOSED inline-code span in `chunk`, in order.
+///
+/// A scanner rather than `split('`')`, because split alternates in/out by
+/// backtick COUNT PARITY: one unmatched backtick — a backtick typed where
+/// an apostrophe belongs, this seat's demonstrated slip — inverted the
+/// classification of everything after it and made a huge run of prose the
+/// "inside" part. Here an unmatched trailing backtick simply opens a span
+/// that never closes, and yields nothing.
+///
+/// Pairing is first-to-next, which is what markdown itself does. With an
+/// ODD number of backticks that still leaves one real span unpaired —
+/// `` It`s easy: `darkmux machine roster` lists your crew `` pairs the
+/// apostrophe-slip with the command's OPENING backtick — and nothing in
+/// the text says which pairing was meant. That case is caught by the
+/// decoration-aware pass instead: the command's own backticks are
+/// [`DECORATION_MARK`]s there, so it is framed whether or not it pairs.
+fn closed_code_spans(chunk: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = chunk;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        out.push(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+/// Characters legal inside a command id — the id half of `/id`, and of a
+/// `darkmux` verb token.
+fn is_command_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Sentence punctuation that can trail a reference written as prose. It is
+/// trimmed BEFORE any shape test, and it also ENDS a multi-word candidate:
+/// a clause boundary is a command-path boundary.
+///
+/// (#2050 sweep finding 1.) An earlier revision deleted this helper on the
+/// grounds that [`slash_candidate_id`]'s character scan stops at the first
+/// non-id character anyway. That was true of the slash path and false of
+/// the bare-prose `darkmux` path, which splits on whitespace and so
+/// inherits the period: `"Try darkmux machine roster."` truncated to the
+/// valid parent node `machine` and passed, while the same sentence with a
+/// trailing clause — `"... roster for that."` — was caught. The bare-prose
+/// pass was therefore near-inert in ordinary prose, which ends in a full
+/// stop.
+fn is_trailing_punctuation(c: char) -> bool {
+    matches!(c, '.' | ',' | ';' | ':' | '?' | '!' | '"' | '\'' | '\u{2026}')
+}
+
+/// Words that FRAME a reference as an INSTRUCTION rather than a
+/// description, plus the shell-prompt characters that do the same job in a
+/// transcript.
+///
+/// This is prose's counterpart to markup, and one of the two things
+/// [`token_is_framed`] accepts. Without it the scan eats the seat's
+/// ordinary sentences about the tool it exists to talk about —
+/// *"darkmux config lives at ~/.darkmux/config.json"* names a real node
+/// followed by an English verb, which is structurally identical to
+/// *"darkmux machine roster"*, and no amount of tree lookup separates
+/// them. What separates them is that one is framed as something to do.
+const REFERENCE_INVOCATION_CUES: &[&str] = &[
+    "run", "runs", "running", "ran", "type", "types", "typing", "try", "tries", "trying", "use",
+    "uses", "using", "execute", "executes", "executing", "invoke", "invokes", "invoking", "call",
+    "calls", "calling", "launch", "launches", "launching", "start", "starts", "enter", "enters",
+    "issue", "issues", "do", "does", "want", "wants", "simply", "just", "via", "$", ">", "%",
+];
+
+/// English function words a bare-prose reference STOPS at, so the judged
+/// candidate is the command path and not the rest of the sentence.
+///
+/// Closed and small on purpose, and every entry is a word that can never be
+/// a darkmux verb token — guarded mechanically against the LIVE verb index
+/// by `no_stop_word_collides_with_a_real_verb_token`, so a verb added later
+/// fails a test rather than silently shortening every candidate.
+const REFERENCE_STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "am", "to", "of", "in", "on", "at",
+    "by", "for", "from", "with", "into", "onto", "and", "or", "but", "so", "if", "then", "when",
+    "while", "because", "it", "its", "this", "that", "these", "those", "there", "here", "you",
+    "your", "we", "our", "they", "their", "i", "my", "will", "would", "could", "should", "may",
+    "might", "must", "has", "have", "had", "did", "not", "no", "as", "than",
+];
+
+/// How many pure-punctuation tokens [`token_is_framed`] steps back over
+/// looking for a cue. An em dash is its own token — *"Run — darkmux
+/// machine roster"* — and so is a lone bullet; two is enough for those
+/// without letting a cue five words back frame something it does not
+/// govern.
+const MAX_PUNCTUATION_TOKENS_BEFORE_A_CUE: usize = 2;
+
+/// `true` iff `word` could be part of a verb path: a long or short flag, or
+/// a token of nothing but [`is_command_id_char`]. Punctuation ends a
+/// candidate, which is what makes a sentence boundary a path boundary.
+///
+/// Case is NOT a signal here, and an earlier draft that rejected any
+/// capitalized word was measurably worse in both directions: it missed
+/// *"try darkmux machine Roster"* (the candidate collapsed to the valid
+/// group node `machine`) while buying nothing the case-INSENSITIVE stop
+/// list below does not already buy.
+fn looks_like_a_verb_token(word: &str) -> bool {
+    !word.is_empty() && (word.starts_with('-') || word.chars().all(is_command_id_char))
+}
+
+/// `true` iff `word` is a [`REFERENCE_STOP_WORDS`] entry, case-insensitively
+/// — a line break or a list item routinely capitalizes one (*"run darkmux
+/// machine\nAnd then check the board"*), and a case-sensitive match would
+/// let the candidate run on into the sentence.
+fn is_a_reference_stop_word(word: &str) -> bool {
+    REFERENCE_STOP_WORDS.iter().any(|stop| word.eq_ignore_ascii_case(stop))
+}
+
+/// `true` iff token `k` is FRAMED as something to type rather than
+/// something to read: the seat put decoration against it, or an invocation
+/// cue governs it.
+///
+/// **This is the single judgement that replaced a hardcoded list of
+/// filesystem roots** (#2050 sweep finding 4). That list tried to name the
+/// single-segment absolute paths a seat may legitimately quote — `/tmp`,
+/// `/etc`, `/var` — and the set is OPEN, so it missed darkmux's own
+/// container mounts: `"the sandbox is mounted at /workspace"` and
+/// `"bookkeeping goes to /darkmux-out"` (`darkmux_types::workdir`, the
+/// literal paths this project mounts) were each discarded whole, as were
+/// `/scratch` and `/Makefile`. "Where does my code live inside the
+/// runtime?" is an ordinary radio question.
+///
+/// Framing closes that without an allowlist, because the distinction is
+/// structural rather than lexical: *"mounted at /workspace"* is a location,
+/// *"run /workspace"* and `` `/workspace` `` are claims about something to
+/// type. The residual cost, unchanged from before this change and stated
+/// so it stays a decision: a BACKTICKED single-segment path — `` `/tmp` ``
+/// — still reads as a command and costs the reply.
+fn token_is_framed(chars: &[char], tokens: &[Token], k: usize) -> bool {
+    let token = &tokens[k];
+    if (token.start > 0 && chars[token.start - 1] == DECORATION_MARK)
+        || chars.get(token.end).is_some_and(|c| *c == DECORATION_MARK)
+    {
+        return true;
+    }
+    let mut skipped = 0;
+    let mut j = k;
+    while j > 0 {
+        j -= 1;
+        let core = tokens[j].text.trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '$' | '>' | '%'));
+        if core.is_empty() {
+            // A pure-punctuation token (an em dash, a bullet) does not
+            // break the cue's reach, but only a couple of them.
+            skipped += 1;
+            if skipped > MAX_PUNCTUATION_TOKENS_BEFORE_A_CUE {
+                return false;
+            }
+            continue;
         }
-        i = end;
+        return REFERENCE_INVOCATION_CUES.iter().any(|cue| core.eq_ignore_ascii_case(cue));
     }
     false
 }
 
+/// The bare id of a `/`-prefixed COMMAND-SHAPED token, or `None`.
+///
+/// A candidate is a token that STARTS with `/`, followed by at least one
+/// [`is_command_id_char`], NOT followed by a second path segment or a file
+/// extension. That last clause is what keeps absolute paths out —
+/// `/Users/kain/.darkmux/config.json` and `/etc/hosts` stop at the second
+/// `/`, `/tmp/x.json` at the `.` before an alphanumeric — while a
+/// sentence-final `/machine.` still yields `machine`, because a `.` with
+/// no alphanumeric after it is punctuation, not an extension.
+///
+/// Requiring the token to START with `/` is what keeps
+/// `https://example.com`, `and/or`, `9/12` and `~/.darkmux/profiles.json`
+/// out without special-casing any of them; decoration is already
+/// whitespace by the time this runs, so `(/machine)` and `*/machine*` do
+/// start tokens (#2050 sweep finding 5).
+fn slash_candidate_id(token: &str) -> Option<String> {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.first() != Some(&'/') {
+        return None;
+    }
+    let mut end = 1;
+    while end < chars.len() && is_command_id_char(chars[end]) {
+        end += 1;
+    }
+    if end == 1 {
+        return None;
+    }
+    let next = chars.get(end).copied();
+    let is_a_path =
+        next == Some('/') || (next == Some('.') && chars.get(end + 1).is_some_and(|c| c.is_ascii_alphanumeric()));
+    (!is_a_path).then(|| chars[1..end].iter().collect())
+}
+
+/// `true` iff any `/`-shaped candidate names something the user cannot run
+/// here.
+///
+/// The two branches are ORDERED, and the order is the point. An ADVERTISED
+/// id is a command reference however it was written, and gets the surface
+/// check — telling a CLI user to type `/tmp` is the #1861 defect whether or
+/// not `tmp` also names a directory. Anything else has to be
+/// [`token_is_framed`] before it counts as a reference at all.
+fn slash_reference_is_unrunnable(
+    chars: &[char],
+    tokens: &[Token],
+    catalog: &[CatalogEntry],
+    surface: RadioSurface,
+) -> bool {
+    tokens.iter().enumerate().any(|(k, token)| {
+        let Some(id) = slash_candidate_id(&token.text) else { return false };
+        if is_an_advertised_id(&id, catalog) {
+            // Valid on the panel only: the CLI has no shell that runs
+            // `/anything` — a routed id is executed by radio itself.
+            surface != RadioSurface::Panel
+        } else {
+            token_is_framed(chars, tokens, k)
+        }
+    })
+}
+
+/// `true` iff `id` names one of `catalog`'s advertised commands.
+/// Case-insensitive, matching `acp_panel::route_command`'s own rule — a
+/// mixed-case spelling of a real id is a real command, not an invention.
+fn is_an_advertised_id(id: &str, catalog: &[CatalogEntry]) -> bool {
+    catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
+}
+
+/// `Some(rest)` iff `span` opens with the binary name followed by
+/// whitespace, matched case-INSENSITIVELY (#2050 sweep finding 3).
+/// Sentence-initial capitalization is ordinary for a model and nothing in
+/// the persona says the name is always lowercase; a case-sensitive
+/// `strip_prefix("darkmux ")` sent `Darkmux machine roster` straight to the
+/// bare-id test, which a multi-word span can never trip.
+///
+/// Only the NAME folds. The verb path after it stays case-sensitive,
+/// because clap's subcommand matching is: `darkmux Machine status` really
+/// does fail.
+fn strip_darkmux_prefix(span: &str) -> Option<&str> {
+    let (head, rest) = span.split_at_checked(7)?;
+    if !head.eq_ignore_ascii_case("darkmux") {
+        return None;
+    }
+    let trimmed = rest.trim_start();
+    (trimmed.len() < rest.len()).then_some(trimmed)
+}
+
+/// `true` iff `word` is the first segment of some path in the tree — the
+/// candidacy gate for bare prose. *"darkmux uses LMStudio"* fails it and is
+/// left alone; *"darkmux machine roster"* passes it and gets judged.
+///
+/// The gate's cost, pinned as a test rather than left implicit: a
+/// WHOLLY-invented top-level verb in bare prose — *"run darkmux telepathy"*
+/// — is not a candidate, because nothing distinguishes it from the English
+/// word that follows `darkmux` in *"use darkmux instead of driving lms by
+/// hand"*. Quoted, the same text is caught.
+fn is_a_top_level_verb_token(word: &str, verb_index: &[crate::radio_index::VerbEntry]) -> bool {
+    verb_index.iter().any(|v| v.path.split(' ').next() == Some(word))
+}
+
+/// `true` iff `path` names a node of the tree — a leaf, or a group with
+/// children under it.
+///
+/// Accepted in bare prose and NOT in a code span, which is the same
+/// instruction-vs-description split the rest of this module runs on:
+/// *"you can use darkmux machine to manage models"* describes a real part
+/// of the CLI, while `` `darkmux machine` `` hands over something to type
+/// that exits with a usage error.
+fn names_a_verb_node(path: &str, verb_index: &[crate::radio_index::VerbEntry]) -> bool {
+    verb_index.iter().any(|v| v.path == path || v.path.starts_with(&format!("{path} ")))
+}
+
+/// `true` iff some framed `darkmux ...` reference names something the
+/// binary will not accept (#2050 sweep findings 1 and 2).
+///
+/// The proven miss this closes: *"You can run darkmux machine roster to see
+/// your crew from here."* — `machine roster` does not exist, and before
+/// this the unquoted half of the scan looked ONLY for `/`-prefixed tokens,
+/// so the sentence shipped verbatim. The tokens arrive decoration-aware, so
+/// the same sentence with a stray backtick anywhere in front of it is the
+/// identical input.
+fn prose_darkmux_reference_is_unrunnable(
+    chars: &[char],
+    tokens: &[Token],
+    verb_index: &[crate::radio_index::VerbEntry],
+) -> bool {
+    for (k, token) in tokens.iter().enumerate() {
+        let name = token.text.trim_end_matches(is_trailing_punctuation);
+        if !name.eq_ignore_ascii_case("darkmux") || !token_is_framed(chars, tokens, k) {
+            continue;
+        }
+        let mut candidate: Vec<&str> = Vec::new();
+        for following in &tokens[k + 1..] {
+            let core = following.text.trim_end_matches(is_trailing_punctuation);
+            if core.is_empty() || !looks_like_a_verb_token(core) || is_a_reference_stop_word(core) {
+                break;
+            }
+            candidate.push(core);
+            // Trailing punctuation ENDED a clause, and a clause boundary is
+            // a command-path boundary (finding 1).
+            //
+            // No length cap: an earlier revision carried one and mutation
+            // showed it could not change any verdict, because
+            // `verb_path_matches` validates on a PREFIX — a longer
+            // candidate whose first words name a real leaf stays valid, and
+            // one whose first words do not was already invalid. An
+            // unprovable constant is worse than no constant.
+            if core.len() < following.text.len() {
+                break;
+            }
+        }
+        let Some(first) = candidate.first() else { continue };
+        if !first.starts_with('-') && !is_a_top_level_verb_token(first, verb_index) {
+            continue;
+        }
+        let path = candidate.join(" ");
+        if !darkmux_reference_is_valid(&path, verb_index) && !names_a_verb_node(&path, verb_index) {
+            return true;
+        }
+    }
+    false
+}
 /// `true` iff `span` is EXACTLY an advertised command id, with no
 /// `/` and no `darkmux ` in front of it (#2050, third measurement).
 ///
@@ -962,27 +1359,6 @@ fn bare_slash_token_is_unrunnable(text: &str, catalog: &[CatalogEntry], surface:
 fn is_a_bare_catalog_id(span: &str, catalog: &[CatalogEntry]) -> bool {
     let id = span.trim();
     !id.is_empty() && catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
-}
-
-/// `true` iff `span` is SHAPED like a slash command rather than a path: a
-/// leading `/` followed by exactly one segment of `[A-Za-z0-9_-]`. This is
-/// the guard that keeps every backtick-quoted absolute path in the
-/// grounding bundle out of [`names_an_unrunnable_command`]'s reach — see
-/// that function's doc for why tripping on those is worse than the defect.
-fn looks_like_a_slash_command(span: &str) -> bool {
-    let Some(rest) = span.strip_prefix('/') else { return false };
-    let id = rest.split_whitespace().next().unwrap_or("");
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// `true` iff `span` is a slash reference the user could ACTUALLY run:
-/// [`RadioSurface::Panel`] only, and only for an advertised catalog id.
-/// Case-insensitive, matching `acp_panel::route_command`'s own rule — a
-/// mixed-case spelling of a real id is a real command, not an invention.
-fn slash_reference_is_valid(span: &str, catalog: &[CatalogEntry], surface: RadioSurface) -> bool {
-    let Some(rest) = span.strip_prefix('/') else { return false };
-    let id = rest.split_whitespace().next().unwrap_or("");
-    surface == RadioSurface::Panel && catalog.iter().any(|c| c.id.eq_ignore_ascii_case(id))
 }
 
 /// `true` iff `rest` (the text right after `"darkmux "`) names something
@@ -2080,6 +2456,11 @@ mod tests {
     #[test]
     fn leaves_a_home_relative_path_alone() {
         assert!(!detects("The registry is `~/.darkmux/profiles.json` on this machine.", RadioSurface::Cli));
+        // The SINGLE-segment case is the one that actually needs `~` kept
+        // out of `REFERENCE_DECORATION`: every longer path stops at its
+        // second `/` or its extension regardless, while `~/runs` would
+        // become a word-initial `/runs` and read as an invented command.
+        assert!(!detects("Your runs land in `~/runs` under the darkmux root.", RadioSurface::Cli));
     }
 
     #[test]
@@ -2122,7 +2503,15 @@ mod tests {
     fn detects_a_bare_slash_command_with_trailing_punctuation() {
         // Sentence punctuation must be trimmed BEFORE the shape test, or
         // `/machine.` fails the character check and sails through.
-        assert!(detects("The command is /machine.", RadioSurface::Panel));
+        //
+        // The cue is load-bearing and was NOT here before the sweep: an
+        // unadvertised slash token now has to be FRAMED (see
+        // `token_is_framed`), which is what stops `"mounted at /workspace"`
+        // discarding a good reply. This test's original text — "The command
+        // is /machine." — is consequently no longer judged. That is the
+        // trade, taken deliberately, not an oversight.
+        assert!(detects("Run /machine.", RadioSurface::Panel));
+        assert!(detects("Run `/machine`, then look at the board.", RadioSurface::Panel));
     }
 
     #[test]
@@ -2198,6 +2587,473 @@ mod tests {
         }
     }
 
+    // ── (#2050 sweep) decoration is not the detector's input format ──────
+    //
+    // The persona never requires backticks — rule 2 says "name it exactly
+    // ... in the syntax that's actually real", which is a constraint on the
+    // COMMAND, not on the markup around it. Everything below feeds crafted
+    // reply strings straight to the predicate; no model runs under test.
+
+    #[test]
+    fn detects_an_invented_darkmux_verb_written_as_bare_prose() {
+        // Sweep finding 1. `machine roster` does not exist, and before this
+        // the outside-a-backtick half of the scan looked ONLY for
+        // `/`-prefixed tokens — so this shipped verbatim.
+        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+            assert!(
+                detects("You can run darkmux machine roster to see your crew from here.", surface),
+                "an invented verb in bare prose must be caught on {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stray_backtick_does_not_blind_the_detector() {
+        // Sweep finding 2. The old scan alternated in/out of code by
+        // backtick COUNT PARITY, so one unmatched backtick moved every
+        // later reference into an "inside" part that was only ever tested
+        // for exact equality against a catalog id — which a multi-word span
+        // never satisfies. This seat has three documented rounds of
+        // producing malformed markdown, and the natural trigger is a
+        // backtick typed where an apostrophe belongs.
+        assert!(
+            detects("It`s set up — run darkmux machine roster to check.", RadioSurface::Cli),
+            "an apostrophe typo must not hide the invented verb after it"
+        );
+        assert!(
+            detects("Check `/Users/kain/.darkmux — then try running /machine.", RadioSurface::Panel),
+            "an unclosed span must not hide the invented slash command after it"
+        );
+        assert!(
+            detects("- first `bullet\n- then run darkmux machine roster\n", RadioSurface::Cli),
+            "a formatting slip in an early bullet must not hide a later bullet's bad command"
+        );
+    }
+
+    #[test]
+    fn detects_a_capitalized_darkmux_reference() {
+        // Sweep finding 3. Sentence-initial capitalization is ordinary for
+        // a model, and nothing in the persona says the binary name is
+        // always lowercase. A case-sensitive `strip_prefix("darkmux ")`
+        // dropped the span straight through to the bare-id test, which a
+        // multi-word span can never trip.
+        assert!(detects("Run `Darkmux machine roster` to see your crew.", RadioSurface::Cli));
+        assert!(detects("Try DARKMUX machine roster for that.", RadioSurface::Cli));
+        // Span-ONLY: `telepathy` is not a real top-level verb, so the bare-
+        // prose pass does not treat this as a candidate at all. Only the
+        // quoted half can catch it, and only if the name folds — which is
+        // what keeps this assertion honest about where the fix lives.
+        assert!(detects("Try `Darkmux telepathy --help`.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn accepts_a_capitalized_real_darkmux_verb() {
+        // The inverted case for finding 3: case-insensitivity must not turn
+        // a REAL verb into a detection. Only the binary name is folded —
+        // the verb path stays case-sensitive, because clap's own
+        // subcommand matching is.
+        assert!(!detects("Run `Darkmux machine status` to see what's loaded.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn detects_a_decorated_bare_slash_command() {
+        // Sweep finding 5. The word-boundary test required literal
+        // whitespace before the `/`, so a parenthetical or an emphasis
+        // marker walked straight past it.
+        for reply in [
+            "See your crew (/machine) for details.",
+            "Run */machine* to see your crew.",
+            "Check [/machine] for that.",
+            "Use \"/machine\" instead.",
+        ] {
+            assert!(detects(reply, RadioSurface::Panel), "decoration must not hide a slash command: {reply}");
+        }
+    }
+
+    // ── the false-positive direction: what the detector must NOT eat ─────
+
+    #[test]
+    fn leaves_an_unframed_single_segment_path_alone() {
+        // Sweep finding 4, and the relaxation this change pays for the
+        // three tightenings above with. "Explain where a file lives" is an
+        // ordinary answer shape for this seat, and a discarded reply is
+        // INVISIBLE — it looks exactly like an ordinary refusal.
+        //
+        // The first revision of this fix used a hardcoded list of
+        // filesystem roots, and the review sweep proved the set is OPEN by
+        // naming darkmux's OWN container mounts — `/workspace` and
+        // `/darkmux-out` (`darkmux_types::workdir`) — plus `/scratch` and
+        // `/Makefile`, none of which any allowlist would have held. The
+        // rule is structural instead: an unadvertised slash token is a
+        // command reference only when something FRAMES it as one.
+        for reply in [
+            "The sandbox is mounted at /workspace in the container.",
+            "Bookkeeping goes to /darkmux-out inside the container.",
+            "It writes to /scratch on this box.",
+            "Read /Makefile at the root.",
+            "Logs are written to /tmp for now.",
+            "It reads /etc for that.",
+            "The daemon runs as /root here.",
+            "Binaries land in /usr for a brew install.",
+        ] {
+            for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+                assert!(!detects(reply, surface), "an unframed path is not a command ({surface:?}): {reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_framed_single_segment_path_is_still_judged_and_that_is_the_residual_cost() {
+        // The other side of the rule above, stated as a decision rather
+        // than discovered later: framing cannot tell `` `/tmp` `` from
+        // `` `/machine` ``, so a backticked single-segment path still
+        // costs the reply. Unchanged from before this PR (it was the
+        // module's original documented limit) and narrower than it was,
+        // since the unframed form — by far the commoner one — is now free.
+        assert!(detects("Your logs live in `/tmp` for now.", RadioSurface::Panel));
+    }
+
+    #[test]
+    fn an_unframed_invented_slash_command_is_not_judged() {
+        // The false-negative this rule buys the false-positive fix with.
+        // Both halves in one place so the boundary is visible: same id,
+        // same surface, framing is the only difference.
+        assert!(!detects("The command is /machine.", RadioSurface::Panel));
+        assert!(detects("Run /machine.", RadioSurface::Panel));
+        assert!(detects("It is `/machine`.", RadioSurface::Panel));
+    }
+
+    #[test]
+    fn leaves_a_multi_segment_path_alone_whatever_its_first_segment() {
+        // The path SHAPE guard, independent of anything lexical: a second
+        // segment or a file extension is what makes these paths, and
+        // nothing else has to know their names. None of them carries an
+        // invocation cue either, so this and
+        // `leaves_an_unframed_single_segment_path_alone` protect the same
+        // replies by two different mechanisms — which is why both exist.
+        for reply in [
+            "The build lands in /workspace/darkmux/target/debug/darkmux here.",
+            "It wrote /scratch/run-42/trajectory.jsonl for that run.",
+            "Read `/data/darkmux/flow.jsonl` for the raw records.",
+            "The manifest is /manifest.json in the run directory.",
+        ] {
+            for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+                assert!(!detects(reply, surface), "a path is not a command reference ({surface:?}): {reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_underscore_in_a_command_id_survives_the_decoration_strip() {
+        // `_` is deliberately NOT a decoration character. Markdown uses it
+        // for emphasis, but it is also legal inside a command id, and
+        // stripping it would split `/pr_list` into `/pr` plus a stray word
+        // — turning a REAL command into an invented one, which costs the
+        // whole reply.
+        let catalog = vec![entry("pr_list", "List open pull requests.")];
+        assert!(
+            !names_an_unrunnable_command("Try /pr_list for that.", &catalog, &fixture_verb_index(), RadioSurface::Panel),
+            "an underscored id must survive decoration stripping intact"
+        );
+    }
+
+    #[test]
+    fn an_advertised_id_is_judged_as_a_command_however_it_is_written() {
+        // Ordering pin for finding 4's relaxation: an ADVERTISED id is a
+        // command reference however the seat wrote it, and gets the surface
+        // check with no framing required. Only an unadvertised token has to
+        // be framed. So an operator whose catalog really does advertise
+        // `/tmp` keeps the surface check on it.
+        let catalog = vec![entry("tmp", "Temp things.")];
+        let index = fixture_verb_index();
+        assert!(
+            names_an_unrunnable_command("Run /tmp to do it.", &catalog, &index, RadioSurface::Cli),
+            "a real catalog id is still surface-checked: the CLI runs no /commands"
+        );
+        assert!(
+            !names_an_unrunnable_command("Run /tmp to do it.", &catalog, &index, RadioSurface::Panel),
+            "and on the panel it is simply valid"
+        );
+    }
+
+    #[test]
+    fn leaves_prose_about_darkmux_itself_alone() {
+        // The cost of scanning bare prose for `darkmux <verb>` is that the
+        // seat TALKS about darkmux constantly. A reference is judged only
+        // when it is framed as an instruction; a sentence is not.
+        for reply in [
+            "darkmux is an orchestrator for local models.",
+            "darkmux config lives at ~/.darkmux/config.json.",
+            "darkmux radio answers questions like this one.",
+            "darkmux machine management happens through the roster.",
+            "Everything darkmux loads is namespaced.",
+            "See https://darkmux.com/docs for the guide.",
+            // A cue IS present here; what saves it is the candidacy gate —
+            // `instead` is not a top-level verb, so there is no reference.
+            "Use darkmux instead of driving lms by hand.",
+        ] {
+            for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+                assert!(!detects(reply, surface), "prose about darkmux must not trip it ({surface:?}): {reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_prose_darkmux_reference_is_judged_only_when_framed_as_an_instruction() {
+        // The boundary, stated as a decision rather than left implicit: an
+        // invocation cue ("run", "try", "use", a shell prompt) is what
+        // makes bare prose an instruction, the way backticks do in the
+        // quoted half. The last assertion is the residual cost — an
+        // invented verb mentioned with no cue and no markup is missed.
+        assert!(detects("Try darkmux machine roster for that.", RadioSurface::Cli));
+        assert!(detects("$ darkmux machine roster", RadioSurface::Cli));
+        assert!(
+            !detects("darkmux machine roster sounds like a good feature request.", RadioSurface::Cli),
+            "no cue, no markup: judged as prose, and this miss is the accepted cost"
+        );
+    }
+
+    #[test]
+    fn a_capitalized_invented_subverb_in_prose_is_still_caught() {
+        // Case carries no meaning in a candidate's WORDS, only in its stop
+        // list. An earlier draft rejected any capitalized word as English,
+        // which quietly collapsed this candidate to the valid group node
+        // `machine` and let the invention through.
+        assert!(detects("Try darkmux machine Roster for that.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn a_capitalized_stop_word_still_ends_a_candidate() {
+        // The inverted case for the rule above, and the reason the stop
+        // list matches case-insensitively: a line break or a list item
+        // routinely capitalizes the next word, and a candidate that ran on
+        // past it would read the rest of the sentence as a command path.
+        //
+        // Both assertions have to REACH the stop list to mean anything. An
+        // earlier pair had a second case — "Use darkmux machine status.
+        // Then read the board." — that was settled by the CLAUSE boundary
+        // (the period on `status.`) before the stop list was consulted, so
+        // it would have passed even with `machine status` invented. That
+        // case belongs in `a_clause_boundary_ends_a_candidate_...` and is
+        // there; neither of these carries punctuation at the boundary.
+        assert!(!detects("Run darkmux machine\nAnd then check the board.", RadioSurface::Cli));
+        assert!(!detects("Run darkmux machine And then check the board.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn leaves_a_real_darkmux_verb_in_bare_prose_alone() {
+        // The inverted case for finding 1, and the one that matters most:
+        // if these tripped, the seat could never name a verb correctly
+        // without backticks and every such reply would collapse to the
+        // refusal.
+        for reply in [
+            "Run darkmux machine status to see what's loaded.",
+            "Use darkmux mission launch review and wait for it.",
+            "Try darkmux --help for the full list.",
+            "You can run darkmux machine --help for that group.",
+            "Run darkmux mission launch <config_id> when you're ready.",
+        ] {
+            assert!(!detects(reply, RadioSurface::Cli), "a real verb in prose must pass: {reply}");
+        }
+    }
+
+    #[test]
+    fn a_group_node_is_prose_unquoted_and_an_instruction_when_quoted() {
+        // `darkmux machine` names a real node but runs nothing. Naming it
+        // in prose is description and passes; handing it over as something
+        // to type is the #2050 "bare catalog id" defect one level up, and
+        // is caught.
+        assert!(!detects("You can use darkmux machine to manage models.", RadioSurface::Cli));
+        assert!(detects("Run `darkmux machine` to manage models.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn a_sentence_final_invented_verb_is_caught() {
+        // MF1 of the review sweep, and the one that made the whole
+        // bare-prose pass near-inert: `looks_like_a_verb_token` rejects any
+        // word carrying punctuation, so the LAST word of a sentence always
+        // failed it, the candidate truncated to its valid parent node, and
+        // `names_a_verb_node` accepted it. Ordinary prose ends in a full
+        // stop, so this was the common case, not the edge one.
+        //
+        // The earlier revision of this PR passed its own test only because
+        // a trailing clause ("... roster for that.") stripped the period
+        // off the invented word.
+        for reply in [
+            "Try darkmux machine roster.",
+            "Try darkmux machine roster!",
+            "Try darkmux machine roster?",
+            "Try darkmux machine roster, then check the board.",
+            "Run darkmux mission teleport.",
+        ] {
+            assert!(detects(reply, RadioSurface::Cli), "a clause boundary must not rescue an invention: {reply}");
+        }
+    }
+
+    #[test]
+    fn a_clause_boundary_ends_a_candidate_rather_than_extending_it() {
+        // The inverted case for the rule above. Trailing punctuation is
+        // trimmed so the word can be judged, and then it ENDS the
+        // candidate — otherwise a valid command would absorb the next
+        // sentence and stop matching its own verb path.
+        for reply in [
+            "Run darkmux machine status. Then read the board.",
+            "Run darkmux machine status, and the board will show it.",
+            "Use darkmux mission launch review. It reports inline.",
+            // The one that actually needs the BREAK rather than the trim:
+            // `machine` alone is a valid node, and without the clause
+            // boundary the candidate runs on into "Models load fast" and
+            // stops naming anything.
+            "Use darkmux machine. Models load fast on this box.",
+        ] {
+            assert!(!detects(reply, RadioSurface::Cli), "a real verb must survive its own sentence: {reply}");
+        }
+    }
+
+    #[test]
+    fn a_group_node_that_takes_a_positional_is_a_real_invocation() {
+        // MF3. The verb index held LEAVES only, so `lab run`'s children
+        // (`list`/`inspect`/`compare`) were emitted and the
+        // workload-dispatch form — THIS REPO'S OWN documented smoke
+        // command — was not. Nothing named it, so the backstop called it
+        // invented. Asserted against the LIVE index, because the fix is
+        // that `radio_index` now asks clap for the node's positionals.
+        let live = command_verb_index();
+        assert!(
+            live.iter().any(|v| v.path == "lab run"),
+            "`lab run` takes a <workload> positional and must be in the index"
+        );
+        assert!(
+            live.iter().any(|v| v.path == "lab run list"),
+            "and its children must still be there — this adds an entry, it does not replace them"
+        );
+        for reply in ["Run darkmux lab run quick-q to smoke it.", "Try `darkmux lab run quick-q`."] {
+            assert!(
+                !names_an_unrunnable_command(reply, &fixture_catalog(), &live, RadioSurface::Cli),
+                "the documented smoke command must not be called invented: {reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_node_without_a_positional_is_still_not_an_invocation() {
+        // The inverted case for MF3: emitting group nodes WHOLESALE would
+        // have made `darkmux machine` a valid leaf and killed the headline
+        // detection, so only a node clap says takes a positional is added.
+        let live = command_verb_index();
+        assert!(
+            !live.iter().any(|v| v.path == "machine"),
+            "`machine` is a pure namespace and must not become an invocation"
+        );
+        assert!(names_an_unrunnable_command(
+            "Run `darkmux machine roster`.",
+            &fixture_catalog(),
+            &live,
+            RadioSurface::Cli
+        ));
+    }
+
+    #[test]
+    fn a_stray_backtick_does_not_hide_a_correctly_quoted_command() {
+        // The stray-backtick case the first revision missed: an
+        // apostrophe-slip EARLIER in the line steals the command's opening
+        // backtick, so no pairing yields the command as a span — and there
+        // is no invocation cue either. Caught because the command's own
+        // backticks survive as decoration marks, which frame it directly.
+        assert!(detects("It`s easy: `darkmux machine roster` lists your crew.", RadioSurface::Cli));
+        assert!(detects("It`s easy: `/machine` lists your crew.", RadioSurface::Panel));
+    }
+
+    #[test]
+    fn a_quoted_command_in_a_markdown_table_is_judged() {
+        // A table of commands is a natural answer to "what can I run?",
+        // and before the sweep no pass looked at one. It is the BACKTICKS
+        // that make the first row a reference — the pipe needs no special
+        // handling at all, since the cue scan already steps over a
+        // punctuation-only token. A prose cell stays prose, which is why
+        // the pipe must NOT be treated as framing.
+        assert!(detects("| `darkmux machine roster` | lists your crew |", RadioSurface::Cli));
+        assert!(
+            !detects("| darkmux config lives here | see the docs |", RadioSurface::Cli),
+            "a prose cell must not be read as an invocation"
+        );
+    }
+
+    #[test]
+    fn single_quotes_frame_a_reference_and_an_em_dash_does_not_break_a_cue() {
+        // Two shapes the first revision let through. `'` was absent from
+        // the decoration set, and the cue check read only the immediately
+        // preceding token — an em dash is a token of its own.
+        assert!(detects("run '/machine' from the panel.", RadioSurface::Panel));
+        assert!(detects("Run \u{2018}/machine\u{2019} from the panel.", RadioSurface::Panel));
+        assert!(detects("Run — darkmux machine roster.", RadioSurface::Cli));
+        assert!(detects("- Run: darkmux machine roster.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn a_cue_does_not_reach_across_a_whole_clause() {
+        // The bound on the punctuation skip: a cue is allowed to reach past
+        // an em dash or a bullet, not past the words of another clause. If
+        // it did, one "run" anywhere in a paragraph would frame every later
+        // sentence about darkmux.
+        assert!(
+            !detects("Run the suite first — the board, the logs, darkmux config lives there.", RadioSurface::Cli),
+            "a cue five words back must not frame a later description"
+        );
+        // And the numeric bound itself, which only punctuation-only tokens
+        // consume. Artificial on purpose — it pins the constant, not a
+        // shape the seat produces.
+        assert!(
+            !detects("Run — — — darkmux machine roster.", RadioSurface::Cli),
+            "the punctuation skip is bounded, not unlimited"
+        );
+    }
+
+    #[test]
+    fn closed_code_spans_yields_only_closed_spans() {
+        // The scanner that replaced `split('`')`, pinned directly — the
+        // difference between them shows up only on an ODD backtick count,
+        // and every reference-level test reaches the same verdict through
+        // the decoration-aware pass, so nothing else distinguishes them.
+        assert_eq!(closed_code_spans("Set `n_ctx` and `radio.humor` now."), vec!["n_ctx", "radio.humor"]);
+        // One unmatched backtick: the parity split returned the entire
+        // remainder of the line as an "inside" span. Here it opens a span
+        // that never closes and yields nothing, so no run of prose is ever
+        // tested as though it were quoted.
+        assert!(closed_code_spans("It`s set up — run the review now.").is_empty());
+        assert_eq!(closed_code_spans("Use `n_ctx` here, or `review"), vec!["n_ctx"]);
+    }
+
+    #[test]
+    fn a_flag_is_a_valid_first_word_of_a_prose_candidate() {
+        // The `starts_with('-')` half of the candidacy gate: `--help` and
+        // `--version` are real at every node, and a flag is never a
+        // top-level verb token, so without this clause `darkmux --help` in
+        // bare prose is not a candidate at all — which is fine — but
+        // `darkmux --explain` would not be caught either.
+        assert!(!detects("Run darkmux --help for the full list.", RadioSurface::Cli));
+        assert!(detects("Run darkmux --explain for the full list.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn no_stop_word_collides_with_a_real_verb_token() {
+        // A mechanical guard on the closed stop-word list: a stop word
+        // truncates a prose candidate, so one colliding with a real token
+        // in darkmux's OWN tree would silently shorten what gets judged.
+        // Checked against the LIVE index, not a fixture, so a verb added
+        // later fails here rather than in production.
+        let index = command_verb_index();
+        let tokens: std::collections::HashSet<String> =
+            index.iter().flat_map(|v| v.path.split(' ').map(str::to_string)).collect();
+        assert!(!tokens.is_empty(), "the live verb index must not be empty, or this guard proves nothing");
+        for word in REFERENCE_STOP_WORDS {
+            assert!(
+                !tokens.contains(*word),
+                "`{word}` is a real verb token — truncating a prose candidate at it would hide an invented path"
+            );
+        }
+    }
+
     #[test]
     fn answer_never_tells_a_cli_user_to_run_a_panel_only_command() {
         // The end-to-end pin the operator asked for: a seat reply naming a
@@ -2256,6 +3112,31 @@ mod tests {
         assert!(msg.contains("written around it"), "the error must name WHY the remainder is unusable: {msg}");
         // And the specific shape that shipped: no orphaned continuation.
         assert!(!msg.contains("It will scan"), "the dangling remainder must not ride out on the error either: {msg}");
+    }
+
+    #[test]
+    fn answer_falls_back_on_an_invented_verb_named_without_backticks() {
+        // The #2050 sweep's headline finding, driven through `answer()`
+        // rather than the predicate: the seat returns Ok, the reply reads
+        // perfectly, and `machine roster` does not exist. Before this it
+        // shipped verbatim as `outcome.rendered`.
+        let mut call = |_msg: &str| -> Result<String> {
+            Ok("You can run darkmux machine roster to see your crew from here. It lists every \
+                model this machine has loaded."
+                .to_string())
+        };
+        let shelf = ArtifactShelf::default();
+        let err = answer(
+            "how do I see my crew?",
+            &fixture_catalog(),
+            &shelf,
+            Path::new("/tmp"),
+            GroundingScope::Full,
+            RadioSurface::Cli,
+            &mut call,
+        )
+        .expect_err("an invented verb in bare prose must not reach the operator");
+        assert!(format!("{err:#}").contains("cannot be run on this surface"), "{err:#}");
     }
 
     #[test]

@@ -411,6 +411,21 @@ fn validate_router_output(raw: &str, catalog: &[CatalogEntry]) -> RouteDecision 
                 // over. Same posture as wall 2 one field across: the
                 // model's claim is checked against the catalog rather
                 // than trusted, here for `args` as there for `command`.
+                //
+                // **Silently, and deliberately — unlike the direct slash
+                // path** (`acp_panel::enforce_accepts_args`, which tells
+                // the operator their text was dropped). The asymmetry is
+                // real and was raised in review; the reason it stands is
+                // that these `args` are not text the operator typed. They
+                // are the ROUTING SEAT'S extraction from a free-text
+                // message, and the operator's own message is neither
+                // discarded nor hidden — it is what produced the route,
+                // and the caller has already echoed "routing to /<cmd> —
+                // from your text". A notice here would report the loss of
+                // something the operator never wrote and cannot see, which
+                // is noise rather than provenance. On the slash path the
+                // dropped text IS the operator's, verbatim, which is why
+                // that one speaks up.
                 Some(entry) if !entry.accepts_args => RouteDecision::Route {
                     command: entry.id.clone(),
                     args: String::new(),
