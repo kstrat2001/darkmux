@@ -750,10 +750,11 @@ pub type AnswererCall<'a> = dyn FnMut(&str) -> Result<String> + 'a;
 /// The answering seat's reply.
 #[derive(Debug, Clone)]
 pub struct AnswerOutcome {
-    /// The seat's own prose, AFTER [`sanitize_command_references`] has run
-    /// (#1861 defect 2 — no longer strictly verbatim: an invented or
-    /// surface-inappropriate command reference is rewritten before this
-    /// field is ever set, not just before it's rendered).
+    /// The seat's own prose, VERBATIM (#2050 restored this, after #1861
+    /// defect 2 had made it a rewritten copy). Nothing is edited out of a
+    /// reply any more, because a reply naming a command that cannot be run
+    /// on this surface never becomes an `AnswerOutcome` at all — see
+    /// [`names_an_unrunnable_command`] and [`answer`]'s own fallback.
     pub text: String,
     /// `text` plus the live command listing, appended ONLY when `text`
     /// itself names an advertised `/command` AND the seat is speaking to
@@ -773,119 +774,17 @@ fn answer_references_a_command(text: &str, catalog: &[CatalogEntry]) -> bool {
     catalog.iter().any(|c| lower.contains(&format!("/{}", c.id.to_ascii_lowercase())))
 }
 
-/// The INTERNAL sentinel that marks where an invented or
-/// surface-inappropriate command reference stood (#1861 defects 1 and 2).
+/// The mechanical backstop for #1861 defects 1 and 2, as #2050 rebuilt it:
+/// a DETECTOR, not a repair. `true` iff `reply` names a command that
+/// cannot actually be run on `surface`.
 ///
-/// **It no longer reaches the operator** (#2050). Until this change it was
-/// substituted inline, mid-sentence, and shipped — which produced, live on
-/// `3.7.1`, sentences like:
-///
-/// > `Run (not an available command) to kick off the local-model diff review.`
-///
-/// The seat's sentence is BUILT around naming a command, so deleting the
-/// name leaves a stub: the guard fired and the output was still unusable.
-/// An inline substitution cannot fix this, because there is nothing to
-/// substitute that makes the surrounding sentence true. So the marker is
-/// now only a marker: [`drop_marked_sentences`] removes the whole sentence
-/// it lands in, and a reply that was entirely such sentences becomes an
-/// error, so the caller falls back to the plain refusal (see [`answer`]).
-///
-/// Deliberately NOT wrapped in backticks, and deliberately containing no
-/// sentence terminator — it must never look like a fresh command
-/// reference to a re-scan, and it must never split the sentence it is
-/// meant to condemn.
-const INVALID_COMMAND_MARKER: &str = "(not an available command)";
-
-/// Remove every SENTENCE of `text` containing [`INVALID_COMMAND_MARKER`]
-/// (#2050). This is the repair half of the #1861 backstop: the validity
-/// checks decide WHICH references are unrunnable, this decides what the
-/// operator is shown instead of them, and the answer is "not a stub".
-///
-/// A sentence ends at `.`/`!`/`?` FOLLOWED BY whitespace or the end of the
-/// text — the "followed by" clause is what keeps `config.json`, `v3.7.1`
-/// and `9/12` whole — or at a newline, so a markdown bullet or heading is
-/// its own unit even with no terminal punctuation. Whitespace trailing a
-/// terminator rides with the sentence it closes, so dropping one does not
-/// leave a double space behind.
-///
-/// **The known imprecision, stated rather than hidden:** an abbreviation
-/// ("e.g.") is a false sentence boundary, so a marker after one drops from
-/// that point rather than from the true start of the sentence. The failure
-/// mode is a slightly over-trimmed reply, never a stub that names a
-/// command — which is the property this function exists to guarantee.
-/// Fences never reach here (see [`sanitize_command_references`]), so a
-/// literal marker quoted inside one is not a boundary concern either.
-fn drop_marked_sentences(text: &str) -> String {
-    if !text.contains(INVALID_COMMAND_MARKER) {
-        return text.to_string();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut sentence = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        sentence.push(c);
-        i += 1;
-        let ends_here = if c == '\n' {
-            true
-        } else if matches!(c, '.' | '!' | '?') {
-            match chars.get(i) {
-                None => true,
-                Some(next) if next.is_whitespace() => {
-                    while matches!(chars.get(i), Some(' ') | Some('\t')) {
-                        sentence.push(chars[i]);
-                        i += 1;
-                    }
-                    true
-                }
-                Some(_) => false,
-            }
-        } else {
-            false
-        };
-        if ends_here {
-            if !sentence.contains(INVALID_COMMAND_MARKER) {
-                out.push_str(&sentence);
-            }
-            sentence.clear();
-        }
-    }
-    if !sentence.contains(INVALID_COMMAND_MARKER) {
-        out.push_str(&sentence);
-    }
-    collapse_blank_runs(&out)
-}
-
-/// Collapse a run of three or more newlines to the two that render as one
-/// paragraph break. Dropping a whole paragraph leaves its own blank lines
-/// behind on both sides; without this the reply grows visible holes where
-/// the suppression happened, which is its own kind of tell.
-fn collapse_blank_runs(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut newlines = 0usize;
-    for c in text.chars() {
-        if c == '\n' {
-            newlines += 1;
-            if newlines <= 2 {
-                out.push(c);
-            }
-        } else {
-            newlines = 0;
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The mechanical backstop for #1861 defects 1 and 2. The persona's own
-/// "never invent a command" rule (radio-host.md rule 2) is honored only as
-/// well as whichever model is loaded that day honors an instruction —
-/// model-dependent, and not provable by any test. This scans the seat's
-/// raw reply for the two command-reference SHAPES rule 2 tells it to
-/// produce — backtick-quoted, and (since a model routinely writes a slash
-/// id as bare prose) unquoted too — and rewrites anything that fails a
-/// real check against what is ACTUALLY runnable on `surface`:
+/// The persona's own "never invent a command" rule (radio-host.md rule 2)
+/// is honored only as well as whichever model is loaded that day honors an
+/// instruction — model-dependent, and not provable by any test. So this
+/// scans the seat's raw reply for the two command-reference SHAPES rule 2
+/// tells it to produce — backtick-quoted, and (since a model routinely
+/// writes a slash id as bare prose) unquoted too — and checks each against
+/// what is ACTUALLY runnable:
 ///
 /// - `/id` — valid ONLY on [`RadioSurface::Panel`] (on the CLI there is no
 ///   shell that runs `/anything` — a routed id is executed by radio
@@ -897,118 +796,100 @@ fn collapse_blank_runs(text: &str) -> String {
 ///   own fix-shape note), or names any node of that tree with `--help` /
 ///   `--version`, which are real at every node including the root.
 ///
+/// **Why a detector and not a repair (#2050, second measurement).** Two
+/// repairs were tried and both shipped broken prose, for the same reason.
+/// Substituting the reference inline left a stub — *"Run (not an available
+/// command) to kick off the local-model diff review."* Dropping the
+/// SENTENCE the reference stood in left a dangling remainder, measured
+/// live on this branch for `run the review pipeline`:
+///
+/// > `It will scan your current working-tree diff for bugs and report
+/// > back. Let me know if it flags anything worth fixing.`
+///
+/// That is fluent, future-tense, and has no instruction in it, so it reads
+/// as though the review is already running and the user can wait for a
+/// verdict that never comes. **Fluent and misleading is worse than
+/// visibly broken**, which is the severity ordering this project applies
+/// everywhere else. The remainder of such a reply is ABOUT the reference
+/// that was removed, and no amount of text surgery can see that — so the
+/// whole reply is discarded and [`answer`] falls back to the plain
+/// refusal, which both callers already render together with the live
+/// command listing. That listing is exactly the "what can I actually run"
+/// content the discarded reply was getting wrong.
+///
+/// **The cost, stated rather than buried:** a long, otherwise-good answer
+/// that names one invented verb in passing is replaced wholesale by the
+/// refusal plus the listing. Accepted deliberately — the alternative is a
+/// surface that renders cleanly and misleads, and the fallback is the
+/// output the operator measured as the best line of the original run.
+///
 /// **A `/`-prefixed span is only a candidate when it is COMMAND-SHAPED**
 /// ([`looks_like_a_slash_command`]): one segment of `[A-Za-z0-9_-]`. An
 /// absolute path — `` `/Users/kain/.darkmux/config.json` `` — is not a
-/// command reference and is left byte-for-byte alone. Getting this wrong
-/// is worse than the bug it guards: the grounding bundle is full of
-/// absolute paths and the persona explicitly tells the seat to name
-/// file-shaped things, so a blanket `starts_with('/')` rule replaced
-/// correct paths with the marker, and in a mixed sentence the reader
-/// could no longer tell which reference had been invented.
+/// command reference and must never trip this. That boundary is MORE
+/// load-bearing now, not less: a false positive used to cost one span,
+/// and now costs the entire answer. Anything else (a config key, a bare
+/// flag, `n_ctx`, an ordinary code span, a URL, a date, a path) is not a
+/// candidate at all.
 ///
-/// Anything else (a config key, a bare flag, `n_ctx`, an ordinary code
-/// span, a URL, a date, a path) is left untouched byte-for-byte — this
-/// only ever touches the two patterns rule 2 instructs the seat to
-/// produce, the same narrow-heuristic posture
-/// [`answer_references_a_command`] already takes rather than a real
-/// markdown parse.
-///
-/// **Two documented coverage limits**, stated rather than papered over:
-///
-/// 1. **Fenced code blocks pass through verbatim.** A ```` ``` ```` fence
-///    is quoted material — sample output, a transcript — where rewriting
-///    a line would corrupt what the seat was quoting. An invented id
-///    inside a fence therefore still ships. Deliberate, and the reason the
-///    fence split happens FIRST: without it, whether a fence body was
-///    reached at all depended on backtick parity, which is worse than a
-///    stated exclusion.
-/// 2. **A single-segment absolute path is indistinguishable from an
-///    invented id.** `` `/tmp` `` is command-shaped and not in the
-///    catalog, so it is dropped with its sentence. Narrow, and the safe
-///    direction: the ambiguous case is one bare word, not the
-///    multi-segment paths the grounding actually carries.
-///
-/// **(#2050) An unrunnable reference takes its whole SENTENCE with it.**
-/// [`INVALID_COMMAND_MARKER`] is now internal: each non-fence chunk is
-/// marked as before, then run through [`drop_marked_sentences`]. Replacing
-/// the name inline left a stub the operator could not act on — see the
-/// marker's own doc for the live transcript. One real cost, taken
-/// deliberately: a sentence mixing an unrunnable command reference with
-/// something legitimate (a real path) loses the legitimate half too. That
-/// is the honest trade — the alternative is the stub, and the seat's own
-/// next sentence is where a real path usually lives anyway.
-///
-/// Best-effort text surgery beyond that: an ODD number of backticks in
-/// the reply (a stray, unclosed one) can misclassify the final span.
-/// Accepted, same documented scope as [`answer_references_a_command`]'s
-/// own heuristic — malformed markdown from the seat is a presentation
-/// defect, not the invented-command defect this function exists to close.
-fn sanitize_command_references(
+/// **One documented coverage limit.** A fenced code block is quoted
+/// material — sample output, a transcript — and is excluded, so an
+/// invented id inside a fence does not trip the fallback. Deliberate, and
+/// the reason the fence split happens FIRST: without it, whether a fence
+/// body was scanned depended on backtick parity, which is worse than a
+/// stated exclusion. (The old second limit — a single-segment absolute
+/// path such as `` `/tmp` `` reading as an invented id — still holds, and
+/// is now a reason to keep the candidate test narrow.)
+fn names_an_unrunnable_command(
     reply: &str,
     catalog: &[CatalogEntry],
     verb_index: &[crate::radio_index::VerbEntry],
     surface: RadioSurface,
-) -> String {
-    let mut out = String::with_capacity(reply.len());
+) -> bool {
     // Fences first, so a fence body is excluded DETERMINISTICALLY rather
     // than by whatever parity the inline backtick split happens to land on.
-    for (i, chunk) in reply.split("```").enumerate() {
-        if i > 0 {
-            out.push_str("```");
-        }
-        if i % 2 == 1 {
-            out.push_str(chunk);
-        } else {
-            // (#2050) Mark, then drop the marked sentences — per chunk, so
-            // the sentence walk never has to reason about fence bodies.
-            let marked = sanitize_inline(chunk, catalog, verb_index, surface);
-            out.push_str(&drop_marked_sentences(&marked));
-        }
-    }
-    out
+    reply
+        .split("```")
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 0)
+        .any(|(_, chunk)| chunk_names_an_unrunnable_command(chunk, catalog, verb_index, surface))
 }
 
-/// One outside-a-fence chunk: inline backtick spans validated by shape,
+/// One outside-a-fence chunk: inline backtick spans checked by shape,
 /// everything between them scanned for the same references written as
 /// bare prose (`Try running /machine to see them.` — issue #1861's own
 /// wording, which no backtick-only scan would ever have caught).
-fn sanitize_inline(
+fn chunk_names_an_unrunnable_command(
     chunk: &str,
     catalog: &[CatalogEntry],
     verb_index: &[crate::radio_index::VerbEntry],
     surface: RadioSurface,
-) -> String {
-    let mut out = String::with_capacity(chunk.len());
+) -> bool {
     for (i, part) in chunk.split('`').enumerate() {
         if i % 2 == 0 {
-            out.push_str(&sanitize_bare_slash_tokens(part, catalog, surface));
+            if bare_slash_token_is_unrunnable(part, catalog, surface) {
+                return true;
+            }
             continue;
         }
-        let valid = if part.starts_with('/') {
-            // A path is not a command reference at all — pass it through
-            // rather than judge it.
-            !looks_like_a_slash_command(part) || slash_reference_is_valid(part, catalog, surface)
+        let unrunnable = if part.starts_with('/') {
+            // A path is not a command reference at all — never judge it.
+            looks_like_a_slash_command(part) && !slash_reference_is_valid(part, catalog, surface)
         } else if let Some(rest) = part.strip_prefix("darkmux ") {
-            darkmux_reference_is_valid(rest, verb_index)
+            !darkmux_reference_is_valid(rest, verb_index)
         } else {
-            true
+            false
         };
-        if valid {
-            out.push('`');
-            out.push_str(part);
-            out.push('`');
-        } else {
-            out.push_str(INVALID_COMMAND_MARKER);
+        if unrunnable {
+            return true;
         }
     }
-    out
+    false
 }
 
 /// Sentence punctuation that can trail a bare `/id` written as prose. It
-/// is trimmed BEFORE the shape test (otherwise `/machine.` fails the
-/// character check and the invented id sails through) and pushed back
-/// after the marker, so the sentence still reads.
+/// is trimmed BEFORE the shape test — otherwise `/machine.` fails the
+/// character check and the invented id sails through undetected.
 fn is_trailing_punctuation(c: char) -> bool {
     matches!(c, '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '"' | '\'')
 }
@@ -1017,14 +898,12 @@ fn is_trailing_punctuation(c: char) -> bool {
 /// preceding character is whitespace or nothing) is considered, which is
 /// what keeps `https://example.com`, `and/or` and `9/12` out of scope
 /// without any special-casing.
-fn sanitize_bare_slash_tokens(text: &str, catalog: &[CatalogEntry], surface: RadioSurface) -> String {
-    let mut out = String::with_capacity(text.len());
+fn bare_slash_token_is_unrunnable(text: &str, catalog: &[CatalogEntry], surface: RadioSurface) -> bool {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         let starts_a_word = i == 0 || chars[i - 1].is_whitespace();
         if chars[i] != '/' || !starts_a_word {
-            out.push(chars[i]);
             i += 1;
             continue;
         }
@@ -1034,22 +913,19 @@ fn sanitize_bare_slash_tokens(text: &str, catalog: &[CatalogEntry], surface: Rad
         }
         let token: String = chars[i..end].iter().collect();
         let core = token.trim_end_matches(is_trailing_punctuation);
-        if !looks_like_a_slash_command(core) || slash_reference_is_valid(core, catalog, surface) {
-            out.push_str(&token);
-        } else {
-            out.push_str(INVALID_COMMAND_MARKER);
-            out.push_str(&token[core.len()..]);
+        if looks_like_a_slash_command(core) && !slash_reference_is_valid(core, catalog, surface) {
+            return true;
         }
         i = end;
     }
-    out
+    false
 }
 
 /// `true` iff `span` is SHAPED like a slash command rather than a path: a
 /// leading `/` followed by exactly one segment of `[A-Za-z0-9_-]`. This is
 /// the guard that keeps every backtick-quoted absolute path in the
-/// grounding bundle out of [`sanitize_command_references`]'s reach — see
-/// that function's doc for why destroying those was worse than the defect.
+/// grounding bundle out of [`names_an_unrunnable_command`]'s reach — see
+/// that function's doc for why tripping on those is worse than the defect.
 fn looks_like_a_slash_command(span: &str) -> bool {
     let Some(rest) = span.strip_prefix('/') else { return false };
     let id = rest.split_whitespace().next().unwrap_or("");
@@ -1143,23 +1019,27 @@ pub fn answer(
     let message = build_answer_message(text, &grounding);
     let raw = call(&message)?;
     let reply = raw.trim().to_string();
-    // (#1861 defects 1 + 2) The mechanical backstop: whatever the seat
-    // actually said, never ship an invented or surface-inappropriate
-    // command reference as-is.
-    let reply = sanitize_command_references(&reply, catalog, &command_verb_index(), surface);
-    let reply = reply.trim().to_string();
-    // (#2050) The seat composed NOTHING but prose naming commands that
-    // cannot be run here, so there is no answer left to render. An Err —
-    // not an empty `Ok` — because both callers (`src/radio_cli.rs`,
-    // `src/acp.rs`'s `answer_no_slash_refusal`) already treat an Err as
-    // "fall back to the plain refusal + the live command listing", which
-    // is exactly the right outcome and measurably a better one: on `review
-    // this branch` the seat failed outright and that fallback produced the
-    // most useful line of the whole 3.7.1 run.
+    // (#1861 defects 1 + 2, rebuilt by #2050) The mechanical backstop.
+    // A reply that names a command the operator cannot actually run here
+    // is discarded WHOLE, never edited: every attempt to salvage the rest
+    // of it shipped broken prose — first a mid-sentence stub, then (after
+    // sentence-level suppression) a fluent, future-tense remainder that
+    // read as though the command had already started. See
+    // `names_an_unrunnable_command`'s own doc for both transcripts.
+    //
+    // An Err — not an empty `Ok` — because both callers
+    // (`src/radio_cli.rs`, `src/acp.rs`'s `answer_no_slash_refusal`)
+    // already treat an Err as "print the plain refusal + the live command
+    // listing". That is the measurably good output: on `review this
+    // branch` against 3.7.1 the seat failed outright and that same
+    // fallback produced the most useful line of the whole run.
     if reply.is_empty() {
+        anyhow::bail!("the answering seat returned no usable text");
+    }
+    if names_an_unrunnable_command(&reply, catalog, &command_verb_index(), surface) {
         anyhow::bail!(
-            "the answering seat's reply named only commands that cannot be run on this \
-             surface, and nothing usable was left once they were removed"
+            "the answering seat's reply named a command that cannot be run on this surface, \
+             and the rest of the reply was written around it"
         );
     }
     // (#1698 Packet B2 gate) The bare LISTING, not `not_a_command_message`
@@ -2016,83 +1896,76 @@ mod tests {
         ]
     }
 
+    /// Every detector test reads the same way: does this reply name
+    /// something the operator cannot run HERE? `true` costs the whole
+    /// reply (see `names_an_unrunnable_command`'s doc), so the false
+    /// cases below are load-bearing, not filler.
+    fn detects(reply: &str, surface: RadioSurface) -> bool {
+        names_an_unrunnable_command(reply, &fixture_catalog(), &fixture_verb_index(), surface)
+    }
+
     #[test]
-    fn sanitize_strips_an_invented_slash_command_on_the_panel_surface() {
+    fn detects_an_invented_slash_command_on_the_panel_surface() {
         // #1861 defect 2: `/machine` was never in the catalog (only
         // `pr-list` and `review` are). A real check must catch what the
         // persona's own "never invent" rule cannot prove.
-        let reply = "Run `/machine` to see your crew.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Panel);
-        assert!(!out.contains("/machine"), "an invented catalog id must not survive: {out}");
-        // (#2050) And the marker must not survive either. Substituting it
-        // inline left `Run (not an available command) to see your crew.` —
-        // the guard firing and the output still unusable.
-        assert!(!out.contains(INVALID_COMMAND_MARKER), "the internal marker must never ship: {out}");
-        assert_eq!(out, "", "the reply was one sentence built around the invented id — nothing survives it: {out:?}");
+        assert!(detects("Run `/machine` to see your crew.", RadioSurface::Panel));
     }
 
     #[test]
-    fn sanitize_strips_a_real_slash_command_on_the_cli_surface() {
+    fn detects_a_real_slash_command_on_the_cli_surface() {
         // #1861 defect 1: `/pr-list` IS a real catalog id, but the CLI has
         // no shell that runs `/anything` — surface-inappropriate, not
         // invented, and must still not ship.
-        let reply = "Run `/pr-list` to see them.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert!(!out.contains("/pr-list"), "a slash command must not survive on the CLI surface: {out}");
+        assert!(detects("Run `/pr-list` to see them.", RadioSurface::Cli));
     }
 
     #[test]
-    fn sanitize_leaves_a_real_slash_command_untouched_on_the_panel_surface() {
-        // The inverted case (task brief): a LEGITIMATE reference on the
-        // surface it's actually valid on must pass through unchanged — a
-        // validator that strips everything would pass the two tests above
-        // just as happily.
-        let reply = "Run `/pr-list` to see them.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Panel);
-        assert_eq!(out, reply, "a real catalog id on the panel surface must pass through unchanged");
+    fn leaves_a_real_slash_command_alone_on_the_panel_surface() {
+        // The inverted case: a LEGITIMATE reference on the surface it is
+        // actually valid on must pass — a detector that fired on
+        // everything would satisfy the two tests above just as happily,
+        // and would replace every panel answer with the refusal.
+        assert!(!detects("Run `/pr-list` to see them.", RadioSurface::Panel));
     }
 
     #[test]
-    fn sanitize_leaves_a_real_darkmux_verb_untouched_on_either_surface() {
-        let reply = "Run `darkmux machine status` to see what's loaded.";
+    fn leaves_a_real_darkmux_verb_alone_on_either_surface() {
         for surface in [RadioSurface::Cli, RadioSurface::Panel] {
-            let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), surface);
-            assert_eq!(out, reply, "a real darkmux verb must pass through unchanged on {surface:?}");
+            assert!(
+                !detects("Run `darkmux machine status` to see what's loaded.", surface),
+                "a real darkmux verb must not trip the fallback on {surface:?}"
+            );
         }
     }
 
     #[test]
-    fn sanitize_accepts_a_real_darkmux_verb_with_a_placeholder_argument() {
-        let reply = "Run `darkmux mission launch <config_id>` to start it.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, reply, "a placeholder-suffixed real verb must pass through unchanged: {out}");
+    fn accepts_a_real_darkmux_verb_with_a_placeholder_argument() {
+        assert!(!detects("Run `darkmux mission launch <config_id>` to start it.", RadioSurface::Cli));
     }
 
     #[test]
-    fn sanitize_strips_an_invented_darkmux_subcommand_on_either_surface() {
+    fn detects_an_invented_darkmux_subcommand_on_either_surface() {
         // `machine roster` is exactly issue #1861's own example of a
         // doubly-invented reference (no such subcommand exists at all).
-        let reply = "Run `darkmux machine roster` to see your crew.";
         for surface in [RadioSurface::Cli, RadioSurface::Panel] {
-            let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), surface);
-            assert!(!out.contains("machine roster"), "an invented subcommand must not survive on {surface:?}: {out}");
+            assert!(
+                detects("Run `darkmux machine roster` to see your crew.", surface),
+                "an invented subcommand must be caught on {surface:?}"
+            );
         }
     }
 
     #[test]
-    fn sanitize_leaves_non_command_backtick_content_untouched() {
-        let reply = "Set `n_ctx` and `radio.humor` as you like.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, reply, "content that isn't a command reference must never be touched: {out}");
+    fn leaves_non_command_backtick_content_alone() {
+        assert!(!detects("Set `n_ctx` and `radio.humor` as you like.", RadioSurface::Cli));
     }
 
     #[test]
-    fn answer_sanitizes_an_invented_command_before_it_reaches_the_operator() {
-        let mut call = |_msg: &str| -> Result<String> {
-            Ok("Your crew is staffed from the profile registry. Run `/machine` to see it.".to_string())
-        };
+    fn answer_falls_back_rather_than_shipping_an_invented_command() {
+        let mut call = |_msg: &str| -> Result<String> { Ok("Run `/machine` to see your crew.".to_string()) };
         let shelf = ArtifactShelf::default();
-        let outcome = answer(
+        let err = answer(
             "how do I see my crew?",
             &fixture_catalog(),
             &shelf,
@@ -2101,32 +1974,23 @@ mod tests {
             RadioSurface::Panel,
             &mut call,
         )
-        .unwrap();
-        assert!(!outcome.text.contains("/machine"), "{outcome:?}");
-        assert!(!outcome.rendered.contains("/machine"), "{outcome:?}");
-        // (#2050) And no stub in place of it — the marker is internal now.
-        assert!(!outcome.rendered.contains(INVALID_COMMAND_MARKER), "{outcome:?}");
-        assert_eq!(
-            outcome.text, "Your crew is staffed from the profile registry.",
-            "the sentence that did not name a command must survive intact: {outcome:?}"
-        );
+        .expect_err("a reply naming an invented command must never reach the operator");
+        assert!(format!("{err:#}").contains("cannot be run on this surface"), "{err:#}");
     }
 
     #[test]
-    fn answer_errors_when_every_sentence_named_an_unrunnable_command() {
-        // (#2050) The whole reply was built around naming a command that
-        // cannot be run here, so there is no answer left. Both callers
-        // (`src/radio_cli.rs`, `src/acp.rs`'s `answer_no_slash_refusal`)
-        // treat an Err as "print the plain refusal + the live command
-        // listing" — measurably the better output: on `review this branch`
-        // against 3.7.1 the seat failed outright and that same fallback
-        // produced the most useful line of the run.
-        let mut call = |_msg: &str| -> Result<String> {
-            Ok("Run `/review` to kick off the local-model diff review.".to_string())
-        };
+    fn answer_never_appends_the_slash_listing_on_the_cli_surface() {
+        // #1698 Packet B2 appends the panel-command listing under an
+        // answer that names a command — but that listing is itself a list
+        // of `/id`s, meaningless on a surface with no shell that runs
+        // `/anything` (#1861 defect 1). The reply here names a REAL verb,
+        // so it is shipped rather than discarded, and the question is only
+        // whether the listing gets bolted on.
+        let mut call =
+            |_msg: &str| -> Result<String> { Ok("Run `darkmux machine status` to see them.".to_string()) };
         let shelf = ArtifactShelf::default();
-        let err = answer(
-            "review my changes",
+        let outcome = answer(
+            "anything loaded?",
             &fixture_catalog(),
             &shelf,
             Path::new("/tmp"),
@@ -2134,16 +1998,142 @@ mod tests {
             RadioSurface::Cli,
             &mut call,
         )
-        .expect_err("a reply with nothing left after suppression must not render as an answer");
+        .unwrap();
+        assert_eq!(
+            outcome.text, outcome.rendered,
+            "the panel-only slash listing must never append on the CLI surface: {outcome:?}"
+        );
+    }
+
+    // ── the path/command boundary (#1861 review blocker 1) ───────────────
+    //
+    // Now MORE load-bearing than when it was written: a false positive
+    // used to cost one span, and since #2050 costs the entire answer.
+
+    #[test]
+    fn leaves_a_backticked_absolute_path_alone() {
+        // A blanket `starts_with('/')` rule treated every absolute path
+        // the seat quoted as an invented command — and the grounding
+        // bundle is full of them.
+        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
+            assert!(
+                !detects("Your config lives at `/Users/kain/.darkmux/config.json` — edit it there.", surface),
+                "an absolute path is not a command reference ({surface:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_next_to_an_invented_command_does_not_rescue_the_reply() {
+        // The reply still goes, because the invented verb is in it — but
+        // the PATH is not what caught it. Paired with the test above,
+        // which proves the path alone is inert.
+        assert!(detects(
+            "Run `darkmux machine roster` then check `/Users/me/.darkmux/config.json`.",
+            RadioSurface::Cli
+        ));
+    }
+
+    #[test]
+    fn leaves_a_home_relative_path_alone() {
+        assert!(!detects("The registry is `~/.darkmux/profiles.json` on this machine.", RadioSurface::Cli));
+    }
+
+    #[test]
+    fn leaves_urls_dates_and_prose_slashes_alone() {
+        assert!(!detects(
+            "See https://darkmux.com/docs, filed 9/12, and either read/write works.",
+            RadioSurface::Cli
+        ));
+    }
+
+    #[test]
+    fn accepts_darkmux_help_and_version() {
+        // The verb index holds LEAVES, so a bare top-level flag matches
+        // nothing in it — yet `darkmux --help` is the one command
+        // guaranteed real on every build.
+        for reply in [
+            "Run `darkmux --help` to see everything.",
+            "Run `darkmux -h` for the list.",
+            "Check `darkmux --version` first.",
+            "Try `darkmux machine --help` for that group.",
+        ] {
+            assert!(!detects(reply, RadioSurface::Cli), "help/version is real at every node: {reply}");
+        }
+    }
+
+    #[test]
+    fn still_rejects_an_invented_group_asking_for_help() {
+        assert!(detects("Try `darkmux telepathy --help`.", RadioSurface::Cli));
+    }
+
+    // ── the unbackticked half of the backstop (#1861 review) ─────────────
+
+    #[test]
+    fn detects_a_bare_unbackticked_invented_slash_command() {
+        // Issue #1861's own wording. A backtick-only scan never saw it.
+        assert!(detects("Try running /machine to see them.", RadioSurface::Panel));
+    }
+
+    #[test]
+    fn detects_a_bare_slash_command_with_trailing_punctuation() {
+        // Sentence punctuation must be trimmed BEFORE the shape test, or
+        // `/machine.` fails the character check and sails through.
+        assert!(detects("The command is /machine.", RadioSurface::Panel));
+    }
+
+    #[test]
+    fn leaves_a_bare_real_slash_command_alone_on_the_panel_surface() {
+        assert!(!detects("Try running /pr-list to see them.", RadioSurface::Panel));
+    }
+
+    #[test]
+    fn leaves_a_fenced_code_block_alone() {
+        // Documented coverage limit: a fence is quoted material, so it is
+        // excluded — including an id that would have tripped the detector
+        // in prose. Pinned so the limit is a decision, not a surprise.
+        assert!(!detects("Like this:\n```\n/machine\n```\nThat is the shape.", RadioSurface::Cli));
+    }
+
+    // ── (#2050, second measurement) no salvaged remainder, ever ──────────
+
+    #[test]
+    fn answer_never_ships_prose_left_dangling_by_a_removed_command() {
+        // The regression this rule exists for, measured live on this
+        // branch for `run the review pipeline` under sentence-level
+        // suppression: the sentence naming the command was removed and the
+        // remainder — fluent, future-tense, instruction-free — shipped:
+        //
+        //   "It will scan your current working-tree diff for bugs and
+        //    report back. Let me know if it flags anything worth fixing."
+        //
+        // The user can reasonably sit and wait for a verdict that never
+        // comes. Fluent and misleading beats visibly broken, so the whole
+        // reply goes and the caller prints the plain refusal instead.
+        let seat_reply = "Run `/review` — it will scan your current working-tree diff for bugs and \
+                          report back. Let me know if it flags anything worth fixing.";
+        let mut call = |_msg: &str| -> Result<String> { Ok(seat_reply.to_string()) };
+        let shelf = ArtifactShelf::default();
+        let err = answer(
+            "run the review pipeline",
+            &fixture_catalog(),
+            &shelf,
+            Path::new("/tmp"),
+            GroundingScope::Full,
+            RadioSurface::Cli,
+            &mut call,
+        )
+        .expect_err("a reply written around an unrunnable command must not be salvaged");
         let msg = format!("{err:#}");
-        assert!(msg.contains("cannot be run on this surface"), "the error must say WHY it is empty: {msg}");
+        assert!(msg.contains("written around it"), "the error must name WHY the remainder is unusable: {msg}");
+        // And the specific shape that shipped: no orphaned continuation.
+        assert!(!msg.contains("It will scan"), "the dangling remainder must not ride out on the error either: {msg}");
     }
 
     #[test]
     fn answer_still_renders_a_reply_that_names_no_command_at_all() {
-        // The inverted case: the suppression path must not be reachable
-        // for ordinary prose, or every answer would collapse to the
-        // fallback and this whole seat would go dark.
+        // The inverted case: ordinary prose must still reach the operator,
+        // or every answer collapses to the fallback and the seat goes dark.
         let mut call = |_msg: &str| -> Result<String> {
             Ok("Your context window is 100000 tokens on the current profile.".to_string())
         };
@@ -2159,210 +2149,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.text, "Your context window is 100000 tokens on the current profile.");
-    }
-
-    #[test]
-    fn answer_never_appends_the_slash_listing_on_the_cli_surface() {
-        // #1861 defect 1: the panel-command listing this gate appends is
-        // itself a list of `/id`s — meaningless, and exactly the shape of
-        // the defect, on a surface with no shell that runs `/anything`.
-        // The fixture reply is UNBACKTICKED on purpose: it is issue
-        // #1861's own wording, and the reply itself must lose `/pr-list`
-        // too, not merely go un-appended-to.
-        let mut call = |_msg: &str| -> Result<String> {
-            Ok("Nothing is waiting on you. Try running /pr-list to see them.".to_string())
-        };
-        let shelf = ArtifactShelf::default();
-        let outcome = answer(
-            "anything mergeable?",
-            &fixture_catalog(),
-            &shelf,
-            Path::new("/tmp"),
-            GroundingScope::Full,
-            RadioSurface::Cli,
-            &mut call,
-        )
-        .unwrap();
-        assert_eq!(
-            outcome.text, outcome.rendered,
-            "the panel-only slash listing must never append on the CLI surface: {outcome:?}"
-        );
-        assert!(
-            !outcome.rendered.contains("/pr-list"),
-            "a bare, unbackticked slash id must not ship to a CLI user either: {outcome:?}"
-        );
-    }
-
-    // ── the path/command boundary (#1861 review blocker 1) ───────────────
-
-    #[test]
-    fn sanitize_leaves_a_backticked_absolute_path_untouched() {
-        // A blanket `starts_with('/')` rule destroyed every absolute path
-        // the seat quoted — and the grounding bundle is full of them.
-        let reply = "Your config lives at `/Users/kain/.darkmux/config.json` — edit it there.";
-        for surface in [RadioSurface::Cli, RadioSurface::Panel] {
-            let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), surface);
-            assert_eq!(out, reply, "an absolute path is not a command reference ({surface:?}): {out}");
-        }
-    }
-
-    #[test]
-    fn sanitize_keeps_a_path_in_a_neighboring_sentence_and_drops_only_the_invented_command() {
-        // The original defect this pins: a path is not a command
-        // candidate, so a sentence carrying one must be judged on its own
-        // merits rather than swept up with the invented verb next door.
-        // (#2050 moved the boundary from mid-sentence to sentence-level —
-        // see `sanitize_command_references`'s own doc on the trade — so
-        // the path now has to be in its OWN sentence to survive, and this
-        // test says so explicitly rather than implying it.)
-        let reply = "Run `darkmux machine roster` first. Then check `/Users/me/.darkmux/config.json`.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert!(!out.contains("machine roster"), "the invented verb must not survive: {out}");
-        assert_eq!(
-            out, "Then check `/Users/me/.darkmux/config.json`.",
-            "the path's own sentence must survive verbatim, and only it: {out:?}"
-        );
-    }
-
-    #[test]
-    fn sanitize_drops_a_path_that_shares_a_sentence_with_an_invented_command() {
-        // The stated COST of sentence-level suppression, pinned so it is a
-        // decision rather than a surprise: a legitimate reference sharing
-        // a sentence with an unrunnable one goes with it. The alternative
-        // is the stub (`Run (not an available command) then check ...`),
-        // which is what #2050 was filed about.
-        let reply = "Run `darkmux machine roster` then check `/Users/me/.darkmux/config.json`.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, "", "one sentence, one unrunnable reference, nothing left: {out:?}");
-    }
-
-    #[test]
-    fn sanitize_leaves_a_home_relative_path_untouched() {
-        let reply = "The registry is `~/.darkmux/profiles.json` on this machine.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, reply, "{out}");
-    }
-
-    #[test]
-    fn sanitize_leaves_urls_dates_and_prose_slashes_untouched() {
-        let reply = "See https://darkmux.com/docs, filed 9/12, and either read/write works.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, reply, "only a token that STARTS a word is a slash-command candidate: {out}");
-    }
-
-    #[test]
-    fn sanitize_accepts_darkmux_help_and_version() {
-        // The verb index holds LEAVES, so a bare top-level flag matches
-        // nothing in it — yet `darkmux --help` is the one command
-        // guaranteed real on every build.
-        for reply in [
-            "Run `darkmux --help` to see everything.",
-            "Run `darkmux -h` for the list.",
-            "Check `darkmux --version` first.",
-            "Try `darkmux machine --help` for that group.",
-        ] {
-            let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-            assert_eq!(out, reply, "help/version is real at every node of the tree: {out}");
-        }
-    }
-
-    #[test]
-    fn sanitize_still_rejects_an_invented_group_asking_for_help() {
-        let reply = "Try `darkmux telepathy --help`.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert!(!out.contains("telepathy"), "`--help` must not launder an invented verb: {out}");
-    }
-
-    // ── the unbackticked half of the backstop (#1861 review) ─────────────
-
-    #[test]
-    fn sanitize_strips_a_bare_unbackticked_invented_slash_command() {
-        // Issue #1861's own wording. A backtick-only scan never saw it.
-        let reply = "Here is the shape. Try running /machine to see them.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Panel);
-        assert!(!out.contains("/machine"), "{out}");
-        // (#2050) The sentence goes with it — `Try running (not an
-        // available command) to see them.` is not an instruction anyone
-        // can follow. Its NEIGHBOR is what must still read.
-        assert_eq!(out, "Here is the shape. ", "only the sentence naming the invented id is dropped: {out:?}");
-    }
-
-    #[test]
-    fn sanitize_strips_a_bare_slash_command_with_trailing_punctuation() {
-        // Sentence punctuation must be trimmed BEFORE the shape test, or
-        // `/machine.` fails the character check and sails through.
-        let reply = "Two things. The command is /machine.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Panel);
-        assert!(!out.contains("/machine"), "{out}");
-        // The punctuation trim still has to happen BEFORE the shape test,
-        // or `/machine.` fails the character check and sails through
-        // un-marked — which would leave the sentence standing here.
-        assert_eq!(out, "Two things. ", "the sentence carrying the invented id is dropped whole: {out:?}");
-    }
-
-    #[test]
-    fn sanitize_leaves_a_bare_real_slash_command_on_the_panel_surface() {
-        let reply = "Try running /pr-list to see them.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Panel);
-        assert_eq!(out, reply, "a real catalog id on its own surface must pass through: {out}");
-    }
-
-    // ── (#2050) sentence-level suppression, not inline substitution ──────
-
-    #[test]
-    fn sanitize_reproduces_the_live_3_7_1_transcript_without_the_stub() {
-        // The literal reply shape measured live on 3.7.1 for `review my
-        // changes`, which rendered as:
-        //   `Run (not an available command) to kick off the local-model
-        //    diff review. I'll stand by for the verdict.`
-        // The command sentence goes; the seat's other sentence stays.
-        let reply = "Run `/review` to kick off the local-model diff review. I'll stand by for the verdict.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert!(!out.contains(INVALID_COMMAND_MARKER), "the stub must never reach the operator: {out:?}");
-        assert_eq!(out, "I'll stand by for the verdict.", "{out:?}");
-    }
-
-    #[test]
-    fn sanitize_does_not_split_a_sentence_at_a_version_number() {
-        // A terminator only closes a sentence when whitespace or the end
-        // of the text follows it. Without that clause the walk splits
-        // `3.7.1` and the first half — which carries the marker — is what
-        // gets dropped, leaving the stub `.1 first.` behind.
-        let reply = "Upgrade to 3.7.1 first, then run `darkmux telepathy`.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, "", "the whole sentence goes, never a fragment of it: {out:?}");
-    }
-
-    #[test]
-    fn sanitize_treats_each_markdown_bullet_as_its_own_sentence() {
-        // A list item usually has no terminal punctuation, so a newline
-        // has to close a unit too — otherwise one bad bullet takes the
-        // whole list with it.
-        let reply = "Two options:\n- run /pr-list for the open ones\n- run `darkmux machine status` for models\n";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert!(!out.contains("/pr-list"), "the CLI-invalid bullet must go: {out:?}");
-        assert_eq!(
-            out, "Two options:\n- run `darkmux machine status` for models\n",
-            "the surviving bullet must be untouched, and no blank line left behind: {out:?}"
-        );
-    }
-
-    #[test]
-    fn sanitize_does_not_leave_a_hole_where_a_paragraph_was_dropped() {
-        let reply = "First.\n\nRun `darkmux telepathy` now.\n\nThird.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, "First.\n\nThird.", "a dropped paragraph must not widen the gap around it: {out:?}");
-    }
-
-    #[test]
-    fn sanitize_leaves_a_fenced_code_block_untouched() {
-        // Documented coverage limit 1: a fence is quoted material, so it
-        // passes through verbatim — including an id that would have been
-        // rewritten in prose. Pinned so the limit is a decision, not a
-        // surprise.
-        let reply = "Like this:\n```\n/machine\n```\nThat is the shape.";
-        let out = sanitize_command_references(reply, &fixture_catalog(), &fixture_verb_index(), RadioSurface::Cli);
-        assert_eq!(out, reply, "a fence body is never rewritten: {out}");
     }
 
     // ── persona substitution (#1861 review) ──────────────────────────────
