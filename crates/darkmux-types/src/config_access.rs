@@ -657,10 +657,55 @@ pub fn serve_client_addr() -> String {
     format_client_addr(&serve_bind(), serve_port())
 }
 
+/// The address the daemon LISTENS on — `<bind>:<port>`, verbatim, with a
+/// wildcard kept as a wildcard.
+///
+/// The twin of [`serve_client_addr`], and deliberately a separate function
+/// because the two answer different questions and DIVERGE exactly when the
+/// question matters: with `bind = 0.0.0.0` the daemon listens on every
+/// interface while a local client probes loopback. Printing one under the
+/// other's label is what #2765's own `serve address` row did in review —
+/// it rendered `127.0.0.1:8765` for a `0.0.0.0` bind, so `0.0.0.0` appeared
+/// nowhere in the output and an operator debugging "why can't the tailnet
+/// reach my daemon" would read the provenance row as saying their bind had
+/// not taken.
+///
+/// IPv6 literals are bracketed so the result parses as a `SocketAddr`; a
+/// hostname bind is passed through as typed.
+pub fn serve_listen_addr() -> String {
+    format_listen_addr(&serve_bind(), serve_port())
+}
+
+/// Pure core of [`serve_listen_addr`] — see [`format_client_addr`] for the
+/// one behavioral difference (this one does NOT collapse a wildcard).
+///
+/// `pub(crate)` on purpose: nothing outside this crate needs a listen
+/// address built from a bind it supplies, and only the accessor above is
+/// meant to be reachable. Its twin is `pub` only because
+/// `darkmux_doctor::viewer_link_base` builds a client address around an
+/// explicitly-passed port.
+pub(crate) fn format_listen_addr(bind: &str, port: u16) -> String {
+    let host = bind.trim();
+    let host = if host.is_empty() {
+        SERVE_BIND_DEFAULT
+    } else {
+        host
+    };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        _ => format!("{host}:{port}"),
+    }
+}
+
 /// Pure core of [`serve_client_addr`] — takes the bind + port explicitly so
 /// every case (wildcard v4, wildcard v6, a specific v6 literal, a hostname)
 /// is table-testable without touching process env or config.
-pub(crate) fn format_client_addr(bind: &str, port: u16) -> String {
+///
+/// `pub` rather than `pub(crate)` since #2782: `darkmux_doctor::
+/// viewer_link_base` needs the same bind-aware host for a link built
+/// against an explicitly-passed port, and re-deriving it there is how the
+/// hardcoded `127.0.0.1` got into that function in the first place.
+pub fn format_client_addr(bind: &str, port: u16) -> String {
     let host = bind.trim();
     let host = if host.is_empty() {
         SERVE_BIND_DEFAULT
@@ -1365,8 +1410,8 @@ pub fn liveness_dir() -> std::path::PathBuf {
 /// at the resolution root rather than patching each consumer.
 ///
 /// `dispatch_liveness::liveness_dir()` carries its OWN test isolation
-/// (#2653 MUST FIX 1: `DARKMUX_HOME` if set, else a fixed
-/// `<system temp>/darkmux-test-isolated/<pid>` scratch path (#2777) in
+/// (#2653 MUST FIX 1: `DARKMUX_HOME` if set, else a per-process
+/// `<system temp>/darkmux-test-isolated-<pid>` scratch path (#2777) in
 /// test / `test-support`
 /// builds — never the real home), so this needs no separate test-cfg
 /// variant of its own any more; the (#994/#2359-style) isolation guarantee
@@ -4334,6 +4379,38 @@ mod tests {
         // A hostname is not an IP literal and is passed through for the
         // caller to resolve.
         assert_eq!(format_client_addr("localhost", 8799), "localhost:8799");
+    }
+
+    /// (#2782 MF2) The LISTEN address keeps a wildcard as a wildcard — the
+    /// one behavior that separates it from [`format_client_addr`], and the
+    /// reason both exist.
+    ///
+    /// `doctor`'s `serve address` row printed the client address under a
+    /// label built from the BIND's provenance, so `0.0.0.0` rendered as
+    /// `127.0.0.1:8765 (… bind from DARKMUX_SERVE_BIND env)` and the value
+    /// the operator set appeared nowhere. Collapsing here would put that
+    /// defect back one layer down, where nothing above could see it.
+    #[test]
+    fn the_listen_address_keeps_a_wildcard_and_the_client_address_does_not() {
+        assert_eq!(format_listen_addr("0.0.0.0", 8765), "0.0.0.0:8765");
+        assert_eq!(format_listen_addr("::", 8765), "[::]:8765");
+        assert_ne!(
+            format_listen_addr("0.0.0.0", 8765),
+            format_client_addr("0.0.0.0", 8765),
+            "the two answers DIVERGE on a wildcard — that divergence is the \
+             whole reason there are two functions"
+        );
+        // Everywhere else the two agree, which is why the doctor row prints
+        // one address in the common case rather than two.
+        for bind in ["127.0.0.1", "192.0.2.10", "::1", "localhost"] {
+            assert_eq!(
+                format_listen_addr(bind, 8799),
+                format_client_addr(bind, 8799),
+                "a specific bind is both where it listens and where a client goes: {bind}"
+            );
+        }
+        // An empty bind is "nothing useful named", not a reason to build `:8765`.
+        assert_eq!(format_listen_addr("  ", 8765), "127.0.0.1:8765");
     }
 
     /// The whole point of #2765: the address a CLIENT probes and the port

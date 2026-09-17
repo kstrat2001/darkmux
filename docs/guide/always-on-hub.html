@@ -268,7 +268,8 @@ sleep 14                                            <span class="comment"># Thro
 launchctl list | grep com.darkmux.serve            <span class="comment"># expect: a NEW PID</span></code></pre>
 
     <h3>Register the hub in its own fleet roster</h3>
-    <pre><code>darkmux machine add &lt;your-machine-id&gt; --address 127.0.0.1:8765
+    <p><strong>Use the port this daemon actually listens on.</strong> A roster address is the one place <code>serve.port</code> is <em>not</em> consulted &mdash; a roster entry normally names another machine, and one machine's config must not silently redirect traffic aimed at another, so a portless roster address defaults to <code>8765</code> regardless of what you set. That carve-out is right for a peer and wrong for this self entry, so type the port. <code>darkmux doctor</code>'s <code>serve address</code> row prints the resolved one.</p>
+    <pre><code>darkmux machine add &lt;your-machine-id&gt; --address 127.0.0.1:8765   <span class="comment"># 8765 unless you set serve.port</span>
 darkmux machine list</code></pre>
 
     <h3>Phase 2 rollback</h3>

@@ -117,7 +117,9 @@ If `flow sink health` is `⚠` — re-check the Redis URL. The most common error
 darkmux machine add <this-machine-id> --address 127.0.0.1:8765
 ```
 
-This registers the new machine in its OWN roster (the daemon on this machine listens on `:8765` by default; the address points at the local daemon).
+This registers the new machine in its OWN roster; the address points at the local daemon.
+
+**Use the port this daemon actually listens on.** `8765` is the built-in default, but if `serve.port` is set to something else, a self entry at `:8765` points at a dead port. A roster address is deliberately the one place `serve.port` is NOT consulted — a roster entry normally names ANOTHER machine, and one machine's config must not silently redirect traffic aimed at another — so a portless roster address always defaults to `8765`. That carve-out is right for a peer and wrong here, so type the port. `darkmux doctor`'s `serve address` row prints the resolved one.
 
 Verify:
 

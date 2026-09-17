@@ -929,6 +929,11 @@ pub struct ServeConfig {
 /// power, battery, residency), so darkmux is usable as a machine-
 /// observability module by a harness that never opens the viewer.
 ///
+/// "The whole aggregate" is literal for the residency half since #2782:
+/// `payload.residency` is the model ledger serialized exactly as `GET
+/// /machine/resources` serializes it, so the record and the lens cannot
+/// drift apart as `ModelLedger` grows fields.
+///
 /// **A periodic RECORD, deliberately not a "timed hook".** A hook rule
 /// answers exactly one question — does this record match? — and
 /// `hook_match` is a pure function of a `FlowRecord`. A rule that fired on
@@ -974,6 +979,18 @@ pub struct ServeConfig {
 /// sampler thread entirely, and takes this with it). `darkmux doctor`
 /// reports that combination rather than leaving an enabled-but-silent
 /// feature to be discovered by its absence.
+///
+/// **Both fields take effect on the next daemon RESTART.** The config tier
+/// is a process-wide `OnceLock` read from disk once per process
+/// ([`crate::config_access`]'s `config()`), with no invalidation path — so
+/// `darkmux config set machine_rollup.enabled true` changes the file and
+/// the already-running daemon keeps the value it booted with. Restart it
+/// (`brew services restart darkmux`, reload the plist, or re-run `darkmux
+/// serve`) after flipping either knob. Stated in three places on purpose —
+/// here, `docs/ENVIRONMENT.md`, and `darkmux doctor`'s `machine_rollup`
+/// row — because the failure it prevents is silent: `doctor` is a FRESH
+/// process, so it reads the new file and reports the feature on while the
+/// daemon that will never see it emits nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MachineRollupConfig {
     /// The gate: `true` → the daemon's host sampler emits a

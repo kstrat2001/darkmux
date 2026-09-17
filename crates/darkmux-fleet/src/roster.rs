@@ -32,6 +32,20 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// `fetch_machine_specs` and `darkmux_serve::peer_graph::
 /// normalize_daemon_base`, which build peer base URLs from the same
 /// portless form.
+///
+/// **The one case the reasoning does NOT cover, and how it is handled**
+/// (#2782 C10). `always-on-hub.html` and the `darkmux-add-machine` skill
+/// both tell the operator to register THIS machine in its own roster
+/// (`machine add <me> --address 127.0.0.1:8765`), and there the port IS
+/// this machine's — so an operator who set `serve.port` and followed the
+/// old wording got a self entry pointing at a dead port. The fix is in the
+/// DOCS, not here: both now say to type the port this daemon listens on
+/// and where to read it (`darkmux doctor`'s `serve address` row). Resolving
+/// it in code would mean this constant knowing whether an entry is "me",
+/// which the roster deliberately does not model — a roster entry is a
+/// name plus an address, and the whole carve-out above is that this file
+/// must not infer a peer's port from local config. Keeping the rule
+/// uniform and making the docs explicit is the smaller surface.
 pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
 
 /// Hard cap on DNS resolution time inside `parse_address` (Wave-E.10

@@ -226,7 +226,8 @@ fn darkmux_home_dir_fallback() -> PathBuf {
 /// returned one FIXED machine-global path, so it fully guaranteed the first
 /// property and none of the second. It now returns
 /// [`crate::paths::test_isolated_root`] — `<system temp>/
-/// darkmux-test-isolated/<pid>` — which keeps the home guarantee exactly
+/// darkmux-test-isolated-<pid>`, a per-process SIBLING directly under the
+/// temp root, not a `<pid>` subdirectory — which keeps the home guarantee
 /// and adds per-process separation. See that function's doc for the
 /// measured residue, the ten sites that shared the old path, and why a
 /// per-pid split is safe.
