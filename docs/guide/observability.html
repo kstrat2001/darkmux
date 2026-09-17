@@ -101,7 +101,7 @@ darkmux mission finalize &lt;your-mission-id&gt;   <span class="comment"># cyan:
 brew services restart darkmux     <span class="comment"># after `brew upgrade darkmux`</span>
 brew services stop darkmux        <span class="comment"># stop + unregister from login</span>
 brew services info darkmux        <span class="comment"># is it running? where are the logs?</span></code></pre>
-    <p>The brew service binds <code>127.0.0.1:8765</code> and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
+    <p>The brew service binds <code>127.0.0.1:8765</code> by default and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
 
     <h3>From source (manual)</h3>
     <p>A <code>cargo install</code> build has no brew service, so you run the daemon yourself. It is a foreground process that blocks until you Ctrl-C, so give it its own terminal tab:</p>

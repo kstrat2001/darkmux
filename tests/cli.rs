@@ -1685,6 +1685,96 @@ fn roster_with_peer(tmp: &TempDir, id: &str, addr: &str) -> std::path::PathBuf {
     fleet_file
 }
 
+/// (#2782 C3) `machine add` actually PRINTS the self-entry warning.
+///
+/// The helper behind it is covered in both directions as a pure function in
+/// `fleet_cli`'s own tests — but deleting the whole `if let Some(w) =
+/// self_entry_port_warning(…) { println!("{w}") }` block left all 20 of
+/// those green, because none of them reach the call site. Same
+/// extracted-guard-hides-call-site shape this PR fixed twice elsewhere, so
+/// this one runs the real verb and reads its real stdout.
+///
+/// Both directions, so a warning that fired unconditionally would fail here
+/// too: a self entry naming the built-in default against a configured
+/// `serve.port` of 8799 warns; the same entry naming 8799 is silent.
+#[test]
+fn machine_add_prints_the_self_entry_warning_when_the_port_disagrees() {
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = tmp.path().join("fleet.json");
+    let out = darkmux_cmd()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .env("DARKMUX_SERVE_PORT", "8799")
+        .args(["machine", "add", "self", "--address", "127.0.0.1:8765"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "machine add must still succeed: {stdout}");
+    assert!(
+        stdout.contains("127.0.0.1:8765") && stdout.contains("127.0.0.1:8799"),
+        "the printed warning names both addresses: {stdout}"
+    );
+    assert!(
+        stdout.contains("serve address"),
+        "the printed warning points at the resolved-value row: {stdout}"
+    );
+
+    // Agreement is silent — an entry naming the configured port prints no
+    // warning at all.
+    let tmp2 = TempDir::new().unwrap();
+    let out2 = darkmux_cmd()
+        .env("DARKMUX_FLEET_FILE", tmp2.path().join("fleet.json"))
+        .env("DARKMUX_SERVE_PORT", "8799")
+        .args(["machine", "add", "self", "--address", "127.0.0.1:8799"])
+        .output()
+        .unwrap();
+    let stdout2 = String::from_utf8_lossy(&out2.stdout).to_string();
+    assert!(out2.status.success(), "{stdout2}");
+    assert!(
+        !stdout2.contains("serve address"),
+        "an agreeing self entry must print nothing: {stdout2}"
+    );
+}
+
+/// (#2782 C4) The brew wrapper passes NO `--bind` / `--port`.
+///
+/// `packaging/homebrew/darkmux-serve-wrapped` is read by no test and no CI
+/// job, so a later edit re-adding either flag would reintroduce #2765
+/// invisibly, on the RECOMMENDED install path: a flag outranks every other
+/// tier, so the wrapper would pin the built-in default on every launch and
+/// `darkmux config set serve.port` could never take effect under `brew
+/// services` — healthy daemon, silent wrong port, no error anywhere.
+///
+/// Asserts on the EXEC line rather than the whole file, because the flag
+/// names appear throughout the comment block that explains why they are
+/// gone, and a guard that forbade the strings outright would forbid the
+/// explanation too.
+#[test]
+fn the_brew_wrapper_passes_no_bind_or_port_flag() {
+    let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("packaging/homebrew/darkmux-serve-wrapped");
+    let body = std::fs::read_to_string(&wrapper)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", wrapper.display()));
+    let exec_lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("exec ") && l.contains("serve"))
+        .collect();
+    assert_eq!(
+        exec_lines.len(),
+        1,
+        "exactly one exec line hands off to the daemon: {exec_lines:?}"
+    );
+    let exec = exec_lines[0];
+    assert!(
+        !exec.contains("--bind") && !exec.contains("--port"),
+        "the wrapper must let `darkmux serve` resolve its own address (#2765): {exec}"
+    );
+    assert_eq!(
+        exec, "exec \"$DARKMUX_BIN\" serve",
+        "the handoff is the bare verb: {exec}"
+    );
+}
+
 /// (#1426 gate fix) A peer whose daemon answers but can't reach LMStudio
 /// (`lms_unreachable: true`) must NOT render as a healthy-empty machine —
 /// residents are UNKNOWN, not zero. Loud message, exit 2.

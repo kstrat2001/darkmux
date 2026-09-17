@@ -1,6 +1,6 @@
 //! `darkmux serve` — minimal HTTP daemon for flow record retrieval.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
@@ -1165,7 +1165,28 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // vulnerability this gate closes.
         bind_requires_token(&bind, darkmux_flow::serve_token_present())
             .map_err(anyhow::Error::msg)?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        // (#2782) Name the address in the bind failure. The banner below holds
+        // it, and only prints AFTER a successful bind — so a bare `io::Error`
+        // here is the operator's entire stderr: `Error: Permission denied (os
+        // error 13)` for a privileged port, `Error: Address already in use (os
+        // error 48)` for a taken one, naming neither the address nor the knob
+        // that chose it. That was diagnosable by elimination while the port was
+        // always 8765; since #2782 it is whatever `serve.bind`/`serve.port`
+        // resolve to, and under `brew services` (`keep_alive true`,
+        // `error_log_path`) a context-free errno respawn-loops into `serve.err`.
+        // `listen_socket_addr` one screen up already fails loudly and names the
+        // knob; the far likelier failure is this one.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "binding the serve daemon to {addr} — resolved from \
+                     `env(DARKMUX_SERVE_BIND / DARKMUX_SERVE_PORT) > config.serve.* > \
+                     127.0.0.1:8765`. `darkmux doctor`'s `serve address` row prints the \
+                     resolved value and which tier it came from; change it with \
+                     `darkmux config set serve.port <port>`"
+                )
+            })?;
 
         // Banner: print after bind succeeds so we don't claim "listening"
         // before we actually are.

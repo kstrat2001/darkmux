@@ -7083,6 +7083,56 @@ mod serve_listen_addr {
             }
         }
     }
+
+    /// (#2782 C1) A bind failure carries the address it failed on.
+    ///
+    /// The banner that holds the address only prints after a SUCCESSFUL
+    /// bind, so an uncontextualized `io::Error` here is the operator's
+    /// ENTIRE stderr — and under `brew services` it respawn-loops a
+    /// context-free errno into `serve.err`. Diagnosable by elimination
+    /// while the port was always 8765; not since the port became whatever
+    /// `serve.port` resolves to.
+    ///
+    /// Squats an ephemeral loopback port and asks `run` for that exact one,
+    /// so the failure is EADDRINUSE rather than a privileged-port EACCES —
+    /// same code path, no root needed, and deterministic on any host.
+    #[serial_test::serial]
+    #[test]
+    fn a_bind_failure_names_the_address_it_failed_on() {
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let home = tempfile::tempdir().unwrap();
+        let kh = "DARKMUX_HOME";
+        let prev_h = std::env::var(kh).ok();
+        unsafe { std::env::set_var(kh, home.path()) };
+        let err = crate::run(
+            port,
+            "127.0.0.1".to_string(),
+            home.path().join("flows"),
+            None,
+        )
+        .expect_err("binding an already-bound port must fail");
+        unsafe {
+            match prev_h {
+                Some(v) => std::env::set_var(kh, v),
+                None => std::env::remove_var(kh),
+            }
+        }
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(&format!("127.0.0.1:{port}")),
+            "names the address it failed on: {chain}"
+        );
+        assert!(
+            chain.contains("serve address"),
+            "points at the row that prints the resolved value: {chain}"
+        );
+        // The OS cause survives the added context rather than replacing it.
+        assert!(
+            chain.contains("in use") || chain.contains("os error 48"),
+            "keeps the underlying io::Error: {chain}"
+        );
+    }
 }
 
 mod fleet_cache_wall_clock {
