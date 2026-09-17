@@ -29,7 +29,7 @@
 //! deferred.
 
 use anyhow::{bail, Result};
-use darkmux_crew::host_probe::{battery, power_posture, BatterySample};
+use darkmux_crew::host_probe::{power_posture, BatterySample};
 use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
 use darkmux_types::style;
 
@@ -60,7 +60,15 @@ pub fn check_power_posture(params: &[String]) -> Result<()> {
     // it cannot distinguish "no battery" from "the spawn failed", which is
     // exactly the distinction the whole feature turns on. The IOKit read
     // answers `None` for "this Mac has no battery" and nothing else.
-    evaluate_battery_floor(battery::sample().as_ref(), &PowerPolicyConfig::from_env(), force)
+    // (#2779) Through the resolved host source, `read` only — a pre-flight
+    // gate is one-shot and must not advance a scenario's cursor. The
+    // `None`-means-no-battery contract above is unchanged: a scenario frame
+    // with no `battery` key reads `None` exactly as a desktop does.
+    evaluate_battery_floor(
+        darkmux_crew::host_source::current().read().battery.as_ref(),
+        &PowerPolicyConfig::from_env(),
+        force,
+    )
 }
 
 /// The pure battery-floor decision, split out for the same reason
@@ -357,9 +365,21 @@ mod tests {
         // sleep-assertion one below.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join("src/preflight.rs")).expect("read source");
+        // (#2779) Search the PRODUCTION half only. This assertion quotes the
+        // very strings it looks for, so scanning the whole file makes the
+        // test satisfy itself: deleting the call from `check_power_posture`
+        // left this green, because the literals below still matched. Proven
+        // by mutation — the version that scanned the whole file did not go
+        // red when the call was reverted.
+        let production = text.split("#[cfg(test)]").next().expect("split always yields one part");
         assert!(
-            text.contains("evaluate_battery_floor(battery::sample().as_ref()"),
-            "check_power_posture must actually call the battery gate with the IOKit probe"
+            // Two independent substrings rather than one literal spanning a
+            // line break: the call site wraps, and a source check that also
+            // pins the FORMATTING goes red on a reflow that changed no
+            // behavior.
+            production.contains("evaluate_battery_floor(")
+                && production.contains("host_source::current().read().battery.as_ref()"),
+            "check_power_posture must actually call the battery gate with the resolved host source"
         );
     }
 

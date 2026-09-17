@@ -290,6 +290,25 @@ fn build_thermal_transition_record(
     sample: &HostSampleFull,
     sampled_at_ms: u64,
 ) -> darkmux_flow::FlowRecord {
+    build_thermal_transition_record_with(from, to, sample, sampled_at_ms, darkmux_crew::host_source::provenance())
+}
+
+/// (#2779) [`build_thermal_transition_record`]'s body, with the host
+/// provenance passed in rather than read from the process-wide resolution —
+/// split for the reason `darkmux_crew::host_source::stamp_with` is split
+/// from `stamp`, so the scripted branch is reachable from a test at all.
+///
+/// A `machine.thermal` escalation is the loudest record this daemon emits
+/// (`Level::Warn` on a rise into `serious`), so an UNSTAMPED one produced
+/// from a scenario file is a fictional heat alarm — on the fleet stream,
+/// read by another machine's machine lens, with no marker.
+fn build_thermal_transition_record_with(
+    from: &str,
+    to: &str,
+    sample: &HostSampleFull,
+    sampled_at_ms: u64,
+    provenance: &darkmux_crew::host_source::Provenance,
+) -> darkmux_flow::FlowRecord {
     use darkmux_crew::host_probe::thermal_severity;
     let rising_into_elevated =
         thermal_severity(to) > thermal_severity(from) && thermal_severity(to) >= thermal_severity("serious");
@@ -298,13 +317,14 @@ fn build_thermal_transition_record(
     } else {
         darkmux_flow::Level::Info
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "from": from,
         "to": to,
         "cpu_speed_limit_pct": sample.thermal.as_ref().map(|t| t.cpu_speed_limit_pct),
         "power_mw_total": sample.power.as_ref().map(|p| p.total_mw().round() as i64),
         "sampled_at_ms": sampled_at_ms,
     });
+    darkmux_crew::host_source::stamp_with(provenance, &mut payload);
     let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
@@ -1838,5 +1858,66 @@ mod tests {
         assert_eq!(payload["cpu_speed_limit_pct"], 62);
         assert_eq!(payload["power_mw_total"], 1230);
         assert_eq!(payload["sampled_at_ms"], 5000);
+        // (#2779) A real-hardware transition carries no simulation marker
+        // at all — the absence is what makes its presence meaningful on
+        // the scripted record below.
+        assert!(
+            payload.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing, not with a null: {payload}"
+        );
+    }
+
+    // ── #2779: a scripted escalation is not allowed to look real ──────────
+
+    /// `machine.thermal` is the loudest record this daemon emits —
+    /// `Level::Warn` on a rise into `serious` — and it is machine-SCOPED,
+    /// so with Redis enabled it rides the fleet stream to another machine's
+    /// machine lens. Unstamped, a scenario file produces a fictional heat
+    /// alarm on a second machine with no marker on it.
+    ///
+    /// Driven through the `_with` split because the process-wide provenance
+    /// is a `OnceLock` read of an env var that resolves `Real` in any test
+    /// process — the scripted branch is reachable no other way.
+    #[test]
+    fn a_scripted_thermal_transition_names_the_scenario_that_produced_it() {
+        let sample = HostSampleFull {
+            thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 30 }),
+            ..Default::default()
+        };
+        let scripted = darkmux_crew::host_source::Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 4,
+            span_ms: 90_000,
+        };
+        let rec = build_thermal_transition_record_with("nominal", "critical", &sample, 5000, &scripted);
+        assert!(
+            matches!(rec.level, darkmux_flow::Level::Warn),
+            "a rise into critical is still an operator-actionable Warn — the stamp answers \
+             WHOSE machine it happened on, it does not downgrade the event"
+        );
+        let payload = rec.payload.expect("payload present");
+        assert_eq!(payload["to"], "critical");
+        assert_eq!(
+            payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a scripted heat alarm must name the scenario file behind it: {payload}"
+        );
+
+        // A NAMED scenario that failed to load is reading REAL hardware, so
+        // it must not be marked — stamping there would label real readings
+        // as simulated.
+        let unavailable = build_thermal_transition_record_with(
+            "nominal",
+            "critical",
+            &sample,
+            5000,
+            &darkmux_crew::host_source::Provenance::ScriptedUnavailable {
+                path: "/nope.jsonl".to_string(),
+                error: "No such file".to_string(),
+            },
+        );
+        assert!(
+            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            "nothing is simulated when the scenario failed to load, so nothing may be stamped"
+        );
     }
 }

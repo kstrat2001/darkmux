@@ -1,0 +1,6 @@
+{"hold_ms": 20000, "note": "#2779 scenario 9 — a GAP in the OS thermal reading mid-episode. Cool start.", "thermal": {"state": "nominal"}}
+{"hold_ms": 60000, "note": "Episode 1 — tier 3 pauses.", "thermal": {"state": "serious"}}
+{"hold_ms": 60000, "note": "A minute with NO thermal key at all — the OS read came back empty. Omitting the key IS the `None` reading; it is not a missing field to be defaulted. A gap is `time passed, no new information`: the pause must hold."}
+{"hold_ms": 60000, "note": "Readings return, still hot. Same episode — the pause never lifted, so this must not be counted as a second one.", "thermal": {"state": "serious"}}
+{"hold_ms": 120000, "note": "A SECOND gap, two minutes long, and this one runs straight into the recovery below with no hot reading in between to wipe it. That adjacency is the point: if a gap ACCUMULATED toward the resume hold instead of resetting it, the very first cool reading after this frame would satisfy a 60s hold that had never actually been served, and the run would resume on a machine nobody has a reading for."}
+{"hold_ms": 120000, "note": "Genuine recovery. It must take a full, CONTINUOUS resume_hold_ms of cool readings inside THIS frame — none of the gap above counts.", "thermal": {"state": "nominal"}}

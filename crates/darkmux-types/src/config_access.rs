@@ -1497,6 +1497,26 @@ pub fn thermal_tier4_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// (#2779) A scenario file that SIMULATES this machine's thermal + battery
+/// readings, so the escalation ladder can be regression-tested without a
+/// machine anybody has to actually cook. `None` — the overwhelming default
+/// — means the real IOKit reads.
+///
+/// **`env > real`, with no `config.json` tier, and that omission is the
+/// design.** Every other knob in this file has three tiers because the
+/// operator is expected to SET it. This one makes a machine report a
+/// fiction: a value that persists in `config.json` across reboots, across
+/// upgrades, and into every future dispatch is exactly the "reports
+/// `nominal` while it cooks" failure the facade's own provenance surfaces
+/// exist to prevent. An env var is scoped to the shell that set it, which
+/// is the correct lifetime for a simulation.
+///
+/// The resolution, and the four surfaces that announce a resolved
+/// scenario, live in `darkmux_crew::host_source`.
+pub fn host_source_script() -> Option<std::path::PathBuf> {
+    env_str("DARKMUX_HOST_SOURCE_SCRIPT").map(std::path::PathBuf::from)
+}
+
 // ── Battery-charge policy (#2706) ──
 // `env(DARKMUX_POWER_*) > config.power.* > default`, the same wiring the
 // thermal block above uses. See `PowerConfig`'s own doc for why the start

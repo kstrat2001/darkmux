@@ -1,0 +1,3 @@
+{"hold_ms": 20000, "note": "#2779 scenario 5 — the operator's own transition-not-a-sample invariant.", "thermal": {"state": "nominal"}}
+{"hold_ms": 600000, "note": "TEN MINUTES at `serious` — 300 samples at the tier-3 threshold. This is exactly ONE episode. A per-sample count would read 300 and reach tier 4's terminal hold on the second tick.", "thermal": {"state": "serious"}}
+{"hold_ms": 120000, "note": "Recovery, so the single episode has an observable end.", "thermal": {"state": "nominal"}}

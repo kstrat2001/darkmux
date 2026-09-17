@@ -1,0 +1,7 @@
+{"hold_ms": 20000, "note": "#2779 scenario 3 — the ratchet, ACROSS a dispatch boundary. Cool start.", "thermal": {"state": "nominal"}}
+{"hold_ms": 120000, "note": "First duty cycle, at the BASE delay.", "thermal": {"state": "fair"}}
+{"hold_ms": 120000, "note": "Episode 1: `serious` crosses pause_at, tier 3 pauses.", "thermal": {"state": "serious"}}
+{"hold_ms": 120000, "note": "Recovery. The pause clears and the duty delay DOUBLES. Driver 1 stops here; driver 2 starts with a FRESH governor seeded from the mission ladder-state file, which is what a crawl's next unit gets.", "thermal": {"state": "fair"}}
+{"hold_ms": 120000, "note": "Episode 2, in the NEXT dispatch. The count and the delay must have carried: without the mission seeding, a 40-unit crawl would reset both every unit and never compound.", "thermal": {"state": "serious"}}
+{"hold_ms": 120000, "note": "Second recovery — the delay doubles again, never back down.", "thermal": {"state": "fair"}}
+{"hold_ms": 60000, "note": "Cool. The duty cycle exits; the ratcheted delay is NOT restored to base.", "thermal": {"state": "nominal"}}

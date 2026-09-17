@@ -296,7 +296,10 @@ mod imp {
         let pmset_g_text = run("pmset", &["-g"]);
         let low_power_mode = pmset_g_text.as_deref().and_then(parse_low_power_mode);
         let low_power_mode_unreadable = pmset_g_text.is_none();
-        let thermal = thermal::sample();
+        // (#2779) Through the resolved source, `read` only — a posture
+        // reading is one-shot and must not advance a scenario's cursor.
+        // See `host_source`'s module doc for the read/advance split.
+        let thermal = crate::host_source::current().read().thermal;
         let mut posture = PowerPosture {
             source,
             battery_pct,

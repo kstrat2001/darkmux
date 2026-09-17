@@ -13816,6 +13816,147 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             "health must not ride the 2s telemetry cadence: {payload}"
         );
         assert!(payload.get("context").is_none(), "no record_context merge — this record has no dispatch to key to");
+        // (#2779) A REAL run stamps nothing — the field's absence here is
+        // what makes its presence meaningful on the record below.
+        assert!(
+            payload.get("simulated_host_source").is_none(),
+            "a real-hardware reading must carry no simulation marker at all: {payload}"
+        );
+    }
+
+    // ─── (#2779) machine.telemetry carries the simulation marker ─────────
+
+    /// The machine-SCOPED telemetry record is the one that leaves this
+    /// machine. A dispatch run under `DARKMUX_HOST_SOURCE_SCRIPT` acquires
+    /// `host_sampler_lock` and becomes the machine's sole `machine.telemetry`
+    /// emitter for its lifetime, and with Redis enabled those records ride
+    /// the fleet stream to another machine's machine lens — which, unstamped,
+    /// would show this laptop hitting `critical` with nothing in the data
+    /// saying otherwise.
+    ///
+    /// Driven through the `_with` split rather than the wrapper for the
+    /// reason that split exists: the process-wide provenance is a `OnceLock`
+    /// read of an env var and resolves `Real` in every test process, so the
+    /// branch that matters would be reachable from no test.
+    #[test]
+    fn machine_scoped_telemetry_stamps_the_scenario_when_the_readings_are_scripted() {
+        use crate::host_probe::{build_machine_scoped_telemetry_record_with, HostSampleFull, ThermalSample};
+        use crate::host_source::Provenance;
+        let sample = HostSampleFull {
+            thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 30 }),
+            ..Default::default()
+        };
+        let scripted = Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 4,
+            span_ms: 90_000,
+        };
+        let rec = build_machine_scoped_telemetry_record_with(&sample, 12_345, 5000, &scripted);
+        let payload = rec.payload.expect("payload present");
+        assert_eq!(
+            payload["thermal"]["state"], "critical",
+            "the fiction rides the record — which is precisely why it must be marked"
+        );
+        assert_eq!(
+            payload["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a scripted machine.telemetry record must name the scenario that produced it: {payload}"
+        );
+
+        // The real branch, on the SAME builder: absent, never `false`,
+        // never `null`. The flow-record surface's whole contract is that
+        // presence alone answers "were these readings real".
+        let real = build_machine_scoped_telemetry_record_with(&sample, 12_345, 5000, &Provenance::Real);
+        let real_payload = real.payload.expect("payload present");
+        assert!(
+            real_payload.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing at all, not with a null: {real_payload}"
+        );
+
+        // A NAMED scenario that could not be loaded is reading real
+        // hardware (the safe direction), so it must not be marked either —
+        // stamping there would label real readings as simulated.
+        let unavailable = build_machine_scoped_telemetry_record_with(
+            &sample,
+            12_345,
+            5000,
+            &Provenance::ScriptedUnavailable {
+                path: "/nope.jsonl".to_string(),
+                error: "No such file".to_string(),
+            },
+        );
+        assert!(
+            unavailable.payload.expect("payload present").get("simulated_host_source").is_none(),
+            "nothing is simulated when the scenario failed to load, so nothing may be stamped"
+        );
+    }
+
+    // ─── (#2779) the tailer's dispatch.rest carries the marker ───────────
+
+    /// The record reporting the rest the run ACTUALLY took — the pace
+    /// file's own `reason` and thermal `state` forwarded onto the flow
+    /// stream. The most pacing-ish record in the system, so an unstamped
+    /// one falsifies the contract exactly where it is loudest.
+    #[test]
+    fn the_tailers_dispatch_rest_stamps_the_scenario_and_still_forwards_reason_and_state() {
+        use crate::host_source::Provenance;
+        let event = serde_json::json!({
+            "type": "runtime.rest", "seq": 4, "ms": 30_000,
+            "reason": "thermal", "state": "critical",
+        });
+        let scripted = Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 4,
+            span_ms: 90_000,
+        };
+        let p = super::runtime_rest_payload(&event, 30_000, 45_000, 3, "thermal", &scripted);
+        // The forwarding this function already owed, asserted here so the
+        // stamp cannot be added by quietly replacing the payload.
+        assert_eq!(p["ms"], 30_000);
+        assert_eq!(p["turn"], 4);
+        assert_eq!(p["rest_ms"], 45_000);
+        assert_eq!(p["rests"], 3);
+        assert_eq!(p["reason"], "thermal");
+        assert_eq!(p["state"], "critical");
+        assert_eq!(
+            p["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a rest taken on scripted readings must say so: {p}"
+        );
+
+        // Real readings: absent, and `state` still omitted (not nulled)
+        // when the runtime's event carries none.
+        let plain = serde_json::json!({ "type": "runtime.rest", "seq": 1, "ms": 500 });
+        let p = super::runtime_rest_payload(&plain, 500, 500, 1, "turn_delay", &Provenance::Real);
+        assert_eq!(p["reason"], "turn_delay");
+        assert!(p.get("state").is_none(), "no pace-file state on a plain turn delay: {p}");
+        assert!(
+            p.get("simulated_host_source").is_none(),
+            "a real rest carries no marker at all: {p}"
+        );
+    }
+
+    // ─── (#2779) the dispatch-start warning is actually wired ────────────
+
+    /// A physical source check, for the reason
+    /// `the_host_probe_advances_the_source_by_its_own_measured_interval`
+    /// and `a_critical_breaker_event_is_what_tier_five_s_eject_keys_on`
+    /// are: the warning prints from the sampler thread of a LIVE dispatch,
+    /// off a process-wide `OnceLock` that resolves `Real` in any test
+    /// process, so no in-process test can reach it.
+    ///
+    /// It is the second of the four "never fake silently" surfaces and the
+    /// only one an operator sees without asking. Deleting it leaves every
+    /// `darkmux-crew` test green while a scripted dispatch starts in
+    /// silence — which is how it came to be the one provenance surface
+    /// pinned by nothing.
+    #[test]
+    fn the_dispatch_prints_the_simulated_source_warning_at_sampler_start() {
+        let src = include_str!("dispatch_internal.rs");
+        assert!(
+            src.contains("crate::host_source::provenance().warning()"),
+            "run_telemetry_sampler must render the sampler-start warning off \
+             host_source::provenance().warning(), so doctor and the dispatch cannot disagree \
+             about what is driving the readings"
+        );
     }
 
     // ─── (#2413) dispatch() emits ZERO retired-emitter records ───────────

@@ -1,0 +1,4 @@
+{"hold_ms": 20000, "note": "#2779 scenario 8 — a reading of every soft severity, replayed under DEGENERATE threshold pairs. Under a healthy config this drives the whole ladder; the test runs it under configs that must DISARM instead, and pins that a disarmed tier says why, manufactures no episodes, and wedges no permanent duty cycle.", "thermal": {"state": "nominal"}}
+{"hold_ms": 300000, "thermal": {"state": "fair"}}
+{"hold_ms": 120000, "thermal": {"state": "serious"}}
+{"hold_ms": 300000, "thermal": {"state": "nominal"}}
