@@ -3292,6 +3292,24 @@ fn check_thermal_governor() -> Check {
     };
     let cpu_floor_clause = if min_cpu == 0 {
         "never from the CPU floor (min_cpu_speed_limit_pct=0 — no reading is below 0%)".to_string()
+    } else if min_cpu > 100 {
+        // (#2774 round-9 MF1) The third arm of the same family, and the
+        // one whose absence made the DISARMED message below actively
+        // misleading. `100` is the "no cap recorded" reading a HEALTHY
+        // machine produces, so a floor above it makes `pct < floor` true
+        // of every sample: the breaker trips on every dispatch, cold
+        // machine included. Rendering the raw number here produced "and
+        // after 3 consecutive samples with cpu_speed_limit_pct < 150%"
+        // directly after the words "The breaker is unaffected and still
+        // runs" — literally true, and read by an operator as ordinary
+        // hardware protection. Rendered by what it DOES, exactly as the
+        // two arms around it are.
+        format!(
+            "on EVERY dispatch of any machine, cold included, after its first \
+             {speed_limit_hold_samples} sample(s) (min_cpu_speed_limit_pct={min_cpu} is above the \
+             100% ceiling of the reading it is compared against, so no sample can be at or above \
+             it)"
+        )
     } else {
         format!(
             "after {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < \
@@ -3333,11 +3351,140 @@ fn check_thermal_governor() -> Check {
     // `THERMAL_STATES` exactly, so if `config_access`'s normalization ever
     // goes away, this warns (loud) instead of passing (silent).
     let bands = darkmux_crew::thermal_bands::ThermalBands::resolve(&pause_at, &resume_at);
-    if !bands.disarm_notes().is_empty() {
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!(
+
+    // (#2774 round-9, the sweep's third item) Tier 2's own degenerate
+    // value, rendered by what it DOES like every clause above it.
+    // `ThermalGovernor::current_duty_delay_ms` starts at `duty_delay_ms`
+    // and the ratchet only ever MULTIPLIES it, so at `duty_delay_ms = 0`
+    // the whole escalating back-off is a permanent no-op — `0 * factor`
+    // is 0 for the life of the run. "starts at 0ms and ratchets x2 per
+    // `serious` recovery" is literally true and reads as a live,
+    // escalating tier. A note only: the arithmetic is deliberately left
+    // alone (a governor whose duty delay is zero is a governor the
+    // operator turned off at tier 2, which is a legitimate thing to want).
+    let duty_cycle_clause = if duty_delay_ms == 0 {
+        format!(
+            "duty-cycle at `{resume_at}` is inert (duty_delay_ms=0 — the ratchet only \
+             multiplies, so x{ratchet_factor} of 0 stays 0 for the life of the run; tier 2 adds \
+             no delay)"
+        )
+    } else {
+        format!(
+            "duty-cycle at `{resume_at}` starts at {duty_delay_ms}ms and ratchets \
+             x{ratchet_factor} per `serious` recovery"
+        )
+    };
+
+    // (#2774 round-9 MF1) The three BREAKER-ONLY degenerate-knob checks,
+    // collected HERE — ahead of the band-disarm branch — and emitted
+    // together with it below.
+    //
+    // All three used to sit AFTER that branch, each with its own early
+    // `return`, so ANY disarmed band suppressed all three. None of them
+    // reads `pause_at` or `resume_at`: they are breaker concerns, and the
+    // breaker is precisely the thing a band disarm does NOT touch, which
+    // is what the disarm message says in so many words. The worst
+    // combination that produced — a hand-edited `pause_at == resume_at`
+    // plus `min_cpu_speed_limit_pct > 100` — told the operator "The
+    // breaker is unaffected and still runs", which reads as ordinary
+    // hardware protection, while withholding that the breaker had become
+    // a trip-on-every-dispatch. Measured on that pair: the message named
+    // the 150% floor as a live trigger and said nothing about the 100%
+    // ceiling, and a `ThermalGovernor` with the same floor fed three
+    // `nominal`/100 samples really does emit `Breaker { state: "nominal" }`.
+    //
+    // Collected rather than merely re-ordered, so neither verdict hides
+    // the other in the opposite direction: doctor reports every reason
+    // this config is wrong in ONE pass, the way the multi-note hint
+    // already does for multiple band disarms (round-6 C2). This is the
+    // same fix the `max_pause_ms == 0` / `min_cpu == 0` clauses above
+    // already had; the gap was that it had not been applied uniformly
+    // across this function's control flow.
+    let speed_limit_hold_samples_raw =
+        darkmux_types::config_access::thermal_speed_limit_hold_samples_raw();
+    let ratchet_factor_raw = darkmux_types::config_access::thermal_ratchet_factor_raw();
+    let mut knob_warnings: Vec<(String, String)> = Vec::new();
+
+    // (#2774 round-8) The one knob whose comparison degenerates UPWARD
+    // rather than downward — which is why the family had a hole here.
+    // `cpu_speed_limit_pct` is a percentage, and `100` is what the probe
+    // reports when no cap is recorded at all, so a floor ABOVE 100 makes
+    // `pct < floor` true of every reading a healthy machine produces: the
+    // breaker trips on the `speed_limit_hold_samples`'th sample of EVERY
+    // dispatch and drops a `thermal-critical` STOP file on a cold machine
+    // — a state word naming something that never happened, the same
+    // failure round-6 MF2 ended at the other end of the range.
+    // Warned rather than clamped, consistent with its siblings and with
+    // `min_cpu = 0`'s own documented "no floor" reading: the operator owns
+    // the value, doctor says what it will do (#44).
+    //
+    // First in the list because it is the only one of the three that
+    // changes what the machine DOES on a cold boot; the other two are
+    // knobs that quietly did not take.
+    if min_cpu > 100 {
+        knob_warnings.push((
+            format!(
+                "runtime.thermal.min_cpu_speed_limit_pct is {min_cpu}, above the 100% ceiling of \
+                 the reading it is compared against (`cpu_speed_limit_pct`, where 100 means no \
+                 cap recorded). Every sample is below this floor, so EVERY dispatch trips the \
+                 breaker after its first {speed_limit_hold_samples} samples and drops a \
+                 `thermal-critical` STOP file on a cold machine. Use a value in 1..=100, or 0 to \
+                 disable the floor and leave the `critical`-state check as the only breaker \
+                 trigger."
+            ),
+            "darkmux config set runtime.thermal.min_cpu_speed_limit_pct 50".to_string(),
+        ));
+    }
+
+    // (N2, final re-check) An explicit `0` doesn't achieve "disable"
+    // semantics — it's silently coerced to `1` by
+    // `thermal_speed_limit_hold_samples`'s own `.max(1)` floor (a naive
+    // `streak >= 0` would trip on EVERY sample instead, the opposite of
+    // disable). Warn so the operator knows their `0` didn't do what it
+    // looked like it would.
+    if speed_limit_hold_samples_raw == 0 {
+        knob_warnings.push((
+            "runtime.thermal.speed_limit_hold_samples is 0 — coerced to 1 (trips on the first \
+             low sample). There is no way to disable this signal via 0; disable the thermal \
+             governor overall (runtime.thermal.enabled) if that's the intent."
+                .to_string(),
+            "darkmux config set runtime.thermal.speed_limit_hold_samples 1".to_string(),
+        ));
+    }
+
+    // (#2774) Same shape as the speed-limit-hold-samples check above: a
+    // configured `0` doesn't achieve "no growth" — it's silently coerced to
+    // `1` by `thermal_ratchet_factor`'s own `.max(1)` floor, because a
+    // literal `0` would ZERO the duty-cycle delay on the very first
+    // `serious` recovery, defeating the ratchet's whole purpose (each
+    // recovery should be MORE cautious than the last, never less).
+    if ratchet_factor_raw == 0 {
+        knob_warnings.push((
+            "runtime.thermal.ratchet_factor is 0 — coerced to 1 (the duty-cycle delay holds \
+             steady across a `serious` recovery instead of growing). A literal 0 would zero the \
+             delay on the first escalation, which is never the intent; use 1 explicitly if \
+             \"don't grow it\" is what you want."
+                .to_string(),
+            "darkmux config set runtime.thermal.ratchet_factor 1".to_string(),
+        ));
+    }
+
+    if !bands.disarm_notes().is_empty() || !knob_warnings.is_empty() {
+        let mut sentences: Vec<String> = Vec::new();
+        // (#2774 round-6 C2) EVERY note's remedy, not just the first —
+        // and, since round 9, every KNOB's remedy alongside them. The
+        // message already concatenates every `why`; handing back one
+        // remedy for two problems sends the operator round the loop — on
+        // `pause_at = critical, resume_at = nominal` both tiers are
+        // disarmed for different reasons, so fixing the first and
+        // re-running doctor just produces the second warning. Deduped
+        // because two notes can legitimately share a remedy (one `config
+        // set` line resolving both), and printing it twice reads as two
+        // steps.
+        let mut remedies: Vec<String> = Vec::new();
+
+        if !bands.disarm_notes().is_empty() {
+            sentences.push(format!(
                 "{} DISARMED — {} The breaker is unaffected and still runs: an OS-reported \
                  `critical` state (immediate, always), and {cpu_floor_clause}.",
                 bands
@@ -3352,95 +3499,27 @@ fn check_thermal_governor() -> Check {
                     .map(|n| n.why.as_str())
                     .collect::<Vec<_>>()
                     .join(" Also: "),
-            ),
-            // (#2774 round-6 C2) EVERY note's remedy, not just the first.
-            // The message already concatenates every `why`; handing back
-            // one remedy for two problems sends the operator round the
-            // loop — on `pause_at = critical, resume_at = nominal` both
-            // tiers are disarmed for different reasons, so fixing the
-            // first and re-running doctor just produces the second
-            // warning. Deduped because two notes can legitimately share a
-            // remedy (one `config set` line resolving both), and printing
-            // it twice reads as two steps.
-            hint: Some({
-                let mut seen: Vec<&str> = Vec::new();
-                for note in bands.disarm_notes() {
-                    if !seen.contains(&note.remedy.as_str()) {
-                        seen.push(note.remedy.as_str());
-                    }
-                }
-                seen.join(" ")
-            }),
-        };
-    }
+            ));
+            for note in bands.disarm_notes() {
+                remedies.push(note.remedy.clone());
+            }
+        }
+        for (sentence, remedy) in &knob_warnings {
+            sentences.push(sentence.clone());
+            remedies.push(remedy.clone());
+        }
 
-    // (N2, final re-check) An explicit `0` doesn't achieve "disable"
-    // semantics — it's silently coerced to `1` by
-    // `thermal_speed_limit_hold_samples`'s own `.max(1)` floor (a naive
-    // `streak >= 0` would trip on EVERY sample instead, the opposite of
-    // disable). Warn so the operator knows their `0` didn't do what it
-    // looked like it would.
-    let speed_limit_hold_samples_raw =
-        darkmux_types::config_access::thermal_speed_limit_hold_samples_raw();
-    if speed_limit_hold_samples_raw == 0 {
+        let mut seen: Vec<String> = Vec::new();
+        for remedy in remedies {
+            if !seen.contains(&remedy) {
+                seen.push(remedy);
+            }
+        }
         return Check {
             name: name.into(),
             status: Status::Warn,
-            message: "runtime.thermal.speed_limit_hold_samples is 0 — coerced to 1 (trips on the                        first low sample). There is no way to disable this signal via 0; disable                        the thermal governor overall (runtime.thermal.enabled) if that's the intent."
-                .to_string(),
-            hint: Some(
-                "darkmux config set runtime.thermal.speed_limit_hold_samples 1".to_string(),
-            ),
-        };
-    }
-
-    // (#2774) Same shape as the speed-limit-hold-samples check above: a
-    // configured `0` doesn't achieve "no growth" — it's silently coerced to
-    // `1` by `thermal_ratchet_factor`'s own `.max(1)` floor, because a
-    // literal `0` would ZERO the duty-cycle delay on the very first
-    // `serious` recovery, defeating the ratchet's whole purpose (each
-    // recovery should be MORE cautious than the last, never less).
-    let ratchet_factor_raw = darkmux_types::config_access::thermal_ratchet_factor_raw();
-    if ratchet_factor_raw == 0 {
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: "runtime.thermal.ratchet_factor is 0 — coerced to 1 (the duty-cycle delay \
-                       holds steady across a `serious` recovery instead of growing). A literal \
-                       0 would zero the delay on the first escalation, which is never the \
-                       intent; use 1 explicitly if \"don't grow it\" is what you want."
-                .to_string(),
-            hint: Some("darkmux config set runtime.thermal.ratchet_factor 1".to_string()),
-        };
-    }
-
-    // (#2774 round-8) The same degenerate-threshold class as the two
-    // warnings above, at the one knob whose comparison degenerates UPWARD
-    // rather than downward — which is why the family had a hole here.
-    // `cpu_speed_limit_pct` is a percentage, and `100` is what the probe
-    // reports when no cap is recorded at all, so a floor ABOVE 100 makes
-    // `pct < floor` true of every reading a healthy machine produces: the
-    // breaker trips on the `speed_limit_hold_samples`'th sample of EVERY
-    // dispatch and drops a `thermal-critical` STOP file on a cold machine
-    // — a state word naming something that never happened, the same
-    // failure round-6 MF2 ended at the other end of the range.
-    // Warned rather than clamped, consistent with its siblings and with
-    // `min_cpu = 0`'s own documented "no floor" reading: the operator owns
-    // the value, doctor says what it will do (#44).
-    if min_cpu > 100 {
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!(
-                "runtime.thermal.min_cpu_speed_limit_pct is {min_cpu}, above the 100% ceiling of \
-                 the reading it is compared against (`cpu_speed_limit_pct`, where 100 means no \
-                 cap recorded). Every sample is below this floor, so EVERY dispatch trips the \
-                 breaker after its first {speed_limit_hold_samples} samples and drops a \
-                 `thermal-critical` STOP file on a cold machine. Use a value in 1..=100, or 0 to \
-                 disable the floor and leave the `critical`-state check as the only breaker \
-                 trigger."
-            ),
-            hint: Some("darkmux config set runtime.thermal.min_cpu_speed_limit_pct 50".to_string()),
+            message: sentences.join(" "),
+            hint: Some(seen.join(" ")),
         };
     }
 
@@ -3451,8 +3530,7 @@ fn check_thermal_governor() -> Check {
             "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
              {resume_hold_ms}ms; breaker on an OS-reported `critical` state (immediate, always), \
              {episode_handoff_clause}, and {cpu_floor_clause}; \
-             duty-cycle at `{resume_at}` starts at {duty_delay_ms}ms and ratchets x{ratchet_factor} \
-             per `serious` recovery; tier 4 (indefinite, operator-gated pause) {}",
+             {duty_cycle_clause}; tier 4 (indefinite, operator-gated pause) {}",
             if tier4_enabled {
                 if episode_threshold == 0 {
                     "enabled but unbounded (episode_threshold=0 — never escalates)".to_string()
@@ -10829,6 +10907,176 @@ mod tests {
             check.message.contains("cpu_speed_limit_pct < 100%"),
             "floor=100: {}",
             check.message
+        );
+    }
+
+    /// (#2774 round-9 MF1) A DISARMED band must not suppress the
+    /// breaker-side warnings.
+    ///
+    /// The three breaker-only checks (`min_cpu_speed_limit_pct > 100`,
+    /// `speed_limit_hold_samples = 0`, `ratchet_factor = 0`) each used to
+    /// sit behind their own early `return` AFTER the band-disarm branch,
+    /// so any disarm note reached the operator INSTEAD of all three. On
+    /// `pause_at == resume_at` plus a 150% floor, doctor said "The breaker
+    /// is unaffected and still runs: … after 3 consecutive samples with
+    /// cpu_speed_limit_pct < 150%" — reading as ordinary hardware
+    /// protection while withholding that every sample of a cold machine
+    /// satisfies that comparison. None of the three reads `pause_at` or
+    /// `resume_at`; the breaker is what a band disarm leaves alone.
+    #[test]
+    #[serial_test::serial]
+    fn a_band_disarm_does_not_hide_a_breaker_that_trips_on_every_dispatch() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        // A plausible hand-edit: the two thresholds touching, which
+        // `ThermalBands` refuses and reports as a disarm note.
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "fair");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "150");
+
+        // Pre-check: this really is the suppressing case — the band is
+        // disarmed, so the assertion below is not vacuously satisfied by a
+        // config that simply never reached the disarm branch.
+        assert!(
+            !darkmux_crew::thermal_bands::ThermalBands::resolve("fair", "fair")
+                .disarm_notes()
+                .is_empty(),
+            "this test needs a pair that DOES produce a disarm note"
+        );
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        // Both verdicts, in one pass — neither hides the other.
+        assert!(
+            check.message.contains("DISARMED"),
+            "the band disarm must still be reported: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("min_cpu_speed_limit_pct")
+                && check.message.contains("150")
+                && check.message.contains("EVERY dispatch"),
+            "…and so must the breaker that now trips on every dispatch: {}",
+            check.message
+        );
+        // The "still runs" sentence itself must stop reading as ordinary
+        // protection: the floor clause inside it may not render as a
+        // plain sub-threshold trigger.
+        assert!(
+            !check.message.contains("consecutive samples with cpu_speed_limit_pct < 150%"),
+            "the disarm sentence must not describe a trip-on-every-sample floor as an ordinary \
+             threshold: {}",
+            check.message
+        );
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("min_cpu_speed_limit_pct") && h.contains("resume_at")),
+            "every reason this config is wrong needs its remedy: {:?}",
+            check.hint
+        );
+    }
+
+    /// (#2774 round-9 MF1, the other two hoisted checks) The same
+    /// suppression, at the two knobs that were silently coerced rather
+    /// than mis-triggering. Both are breaker/ratchet concerns that a band
+    /// disarm does not touch, and both used to vanish behind it.
+    #[test]
+    #[serial_test::serial]
+    fn a_band_disarm_does_not_hide_the_silently_coerced_knobs() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "fair");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0");
+        let _ratchet = EnvGuard::set("DARKMUX_THERMAL_RATCHET_FACTOR", "0");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("DISARMED"), "{}", check.message);
+        assert!(
+            check.message.contains("speed_limit_hold_samples is 0"),
+            "the coerced hold-samples knob must survive the disarm: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("ratchet_factor is 0"),
+            "…and so must the coerced ratchet: {}",
+            check.message
+        );
+        let hint = check.hint.clone().unwrap_or_default();
+        for remedy in [
+            "runtime.thermal.speed_limit_hold_samples 1",
+            "runtime.thermal.ratchet_factor 1",
+        ] {
+            assert!(hint.contains(remedy), "missing {remedy:?} from {hint:?}");
+        }
+    }
+
+    /// (#2774 round-9 MF1) The mangled-whitespace half of the same
+    /// message. The hold-samples warning was a plain string literal split
+    /// across source lines WITHOUT a `\` continuation, so its indentation
+    /// shipped as a 24-space run in the middle of the operator's sentence.
+    #[test]
+    #[serial_test::serial]
+    fn the_coerced_hold_samples_warning_is_not_mangled_by_source_indentation() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            !check.message.contains("  "),
+            "no run of consecutive spaces belongs in an operator-facing sentence: {:?}",
+            check.message
+        );
+        assert!(
+            check.message.contains("trips on the first low sample"),
+            "…and the sentence must still read as one: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-9, the sweep's third item) `duty_delay_ms = 0` makes
+    /// tier 3's ratchet a permanent no-op — `current_duty_delay_ms` starts
+    /// at `duty_delay_ms` and the ratchet only ever multiplies, so
+    /// `0 * factor` is 0 for the life of the run. "starts at 0ms and
+    /// ratchets x2 per `serious` recovery" is literally true and reads as
+    /// a live escalating tier. A note, not an arithmetic change: a zero
+    /// duty delay is a legitimate "tier 2 tracks but adds no rest".
+    #[test]
+    #[serial_test::serial]
+    fn a_zero_duty_delay_reads_as_inert_not_as_a_ratcheting_tier() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _duty = EnvGuard::set("DARKMUX_THERMAL_DUTY_DELAY_MS", "0");
+        let _ratchet = EnvGuard::set("DARKMUX_THERMAL_RATCHET_FACTOR", "2");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            !check.message.contains("starts at 0ms"),
+            "doctor must not describe a permanently-zero delay as a starting point it grows \
+             from: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("duty_delay_ms=0") && check.message.contains("inert"),
+            "…it must say the tier adds no rest, and name the knob that decided it: {}",
+            check.message
+        );
+
+        // The non-degenerate rendering is pinned too, so the branch above
+        // cannot be "fixed" by calling every duty delay inert.
+        let _live = EnvGuard::set("DARKMUX_THERMAL_DUTY_DELAY_MS", "15000");
+        let live = check_thermal_governor();
+        assert_eq!(live.status, Status::Pass, "{}", live.message);
+        assert!(
+            live.message.contains("starts at 15000ms and ratchets x2"),
+            "{}",
+            live.message
         );
     }
 

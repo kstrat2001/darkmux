@@ -165,8 +165,12 @@ pub fn all_rules() -> Vec<RuleDef> {
 /// Inputs needed to evaluate the rule set. Built once per `doctor`/eureka
 /// pass and passed to each evaluator.
 pub struct Context {
-    /// Loaded-model snapshot from `lms ps`.
-    pub loaded_models: Vec<darkmux_types::LoadedModel>,
+    /// Loaded-model snapshot from `lms ps`. `None` if the call failed —
+    /// the SAME convention `available_models` below already uses, and the
+    /// distinction a rule needs to avoid claiming something it cannot see
+    /// (#2774 round-9 review C3). An empty `Some` means the host really
+    /// reported zero residents.
+    pub loaded_models: Option<Vec<darkmux_types::LoadedModel>>,
     /// Downloaded-model catalog from `lms ls`, used for arch-max lookups.
     /// `None` if the call failed.
     pub available_models: Option<Vec<darkmux_profiles::lms::ModelMeta>>,
@@ -179,7 +183,12 @@ impl Context {
     /// failures populate `None` fields rather than erroring out, so the
     /// rule pass can degrade gracefully.
     pub fn collect() -> Self {
-        let loaded_models = darkmux_profiles::lms::list_loaded().unwrap_or_default();
+        // (#2774 round-9 review C3) `.ok()`, not `.unwrap_or_default()`:
+        // since #2774 round-9 MF3 a failed listing is distinguishable from
+        // an empty one, and collapsing them here made the rule pass print
+        // `skipped: no models loaded` under a FAILING `lms` — a reason the
+        // code could not back, stated to the operator as fact.
+        let loaded_models = darkmux_profiles::lms::list_loaded().ok();
         let available_models = darkmux_profiles::lms::list_available().ok();
         let total_ram_gb = darkmux_hardware::detect().total_ram_gb;
         Self {
@@ -240,7 +249,10 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     if ctx.total_ram_gb == 0 {
         return Verdict::Skipped("ram total unavailable".into());
     }
-    if ctx.loaded_models.is_empty() {
+    let Some(loaded_models) = ctx.loaded_models.as_deref() else {
+        return Verdict::Skipped("could not read the loaded-model list".into());
+    };
+    if loaded_models.is_empty() {
         return Verdict::Skipped("no models loaded".into());
     }
     let total_ram_gb = ctx.total_ram_gb;
@@ -253,7 +265,7 @@ fn eval_memory_headroom(ctx: &Context) -> Verdict {
     // total exceeds 80% of unified memory.
     let mut estimated_gb: f64 = 0.0;
     let mut unparseable: Vec<String> = Vec::new();
-    for m in &ctx.loaded_models {
+    for m in loaded_models {
         match darkmux_types::size::parse_size_gb(&m.size) {
             Some(size_gb) => {
                 let kv_gb = 0.5 * (m.context as f64) / 32_768.0;
@@ -361,13 +373,13 @@ mod tests {
         // (#904) An unparseable size must Skip (so the operator sees it),
         // NOT silently contribute 0 and Pass on a system that might be tight.
         let ctx = Context {
-            loaded_models: vec![LoadedModel {
+            loaded_models: Some(vec![LoadedModel {
                 identifier: "weird-model".into(),
                 model: "weird-model".into(),
                 status: "idle".into(),
                 size: "18,45 GB".into(), // localized comma → unparseable
                 context: 32_768,
-            }],
+            }]),
             available_models: None,
             total_ram_gb: 32,
         };
@@ -407,9 +419,43 @@ mod tests {
         }
     }
 
+    /// (#2774 round-9 review C3) "I could not read the list" is not "the
+    /// list was empty", and the operator is told which.
+    ///
+    /// Measured before the fix, under a failing `lms`: `doctor -v` printed
+    /// `✓ eureka: memory-headroom-tight (skipped: no models loaded)` — the
+    /// verdict was harmless (Skipped either way), the stated REASON was a
+    /// claim the code could not back.
+    #[test]
+    fn an_unreadable_model_list_skips_for_a_reason_it_can_actually_back() {
+        let unknown = Context {
+            loaded_models: None,
+            available_models: None,
+            total_ram_gb: 128,
+        };
+        match eval_memory_headroom(&unknown) {
+            Verdict::Skipped(reason) => {
+                assert!(
+                    !reason.contains("no models loaded"),
+                    "a failed listing must not be reported as an empty one: {reason}"
+                );
+                assert!(reason.contains("could not read"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+
+        // …and a host that genuinely has nothing loaded keeps its own,
+        // different reason, so the guard above cannot be satisfied by
+        // renaming every skip.
+        match eval_memory_headroom(&ctx_with(128, vec![])) {
+            Verdict::Skipped(reason) => assert_eq!(reason, "no models loaded"),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
     fn ctx_with(total_ram_gb: u32, loaded_models: Vec<darkmux_types::LoadedModel>) -> Context {
         Context {
-            loaded_models,
+            loaded_models: Some(loaded_models),
             available_models: None,
             total_ram_gb,
         }

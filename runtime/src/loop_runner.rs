@@ -628,8 +628,32 @@ fn absorb_rest_into_soft_inactivity_clock(
 /// A `pause: true` file is left entirely alone here (nothing to duty-cycle
 /// — the caller's while-loop handles the full pause), and staleness is
 /// judged by the SAME `written_at_ms`/`max_pause_ms` heartbeat contract
-/// `pause` uses (`PaceFile::is_expired`) — there is no separate rule for
-/// this field, matching the module doc's "no per-reason opt-out."
+/// `pause` uses — [`pace::PaceReader::pause_is_expired`], the same method
+/// the pause path calls, not the raw [`pace::PaceFile::is_expired`]
+/// underneath it. There is no separate rule for this field, matching the
+/// module doc's "no per-reason opt-out."
+///
+/// (#2774 round-9 MF2) That distinction is the whole of a real defect.
+/// The raw fn computes `now_ms.saturating_sub(written_at)`, which clamps
+/// to `0` for a FUTURE-dated stamp — "maximally fresh, forever, as long
+/// as the SAME future-dated stamp sits there unchanged", in `pace.rs`'s
+/// own words. `pause_is_expired` exists precisely to add the
+/// one-grace-interval guard over that, and it had been wired to ONE of
+/// its two call sites. Measured on the raw fn: a pace file stamped ~10^10
+/// ms in the future, read five times, slept the full 15,000ms every time
+/// with no decay. The container's Docker VM clock running ahead of the
+/// host is a skew direction `pace.rs` documents as real and expected, so
+/// a long crawl could throttle at every turn boundary for the rest of the
+/// dispatch with the governor dead and unable to re-stamp it away.
+///
+/// Sharing the reader's future-skew grace with the pause path is safe
+/// because the two branches are mutually exclusive on any one tick: this
+/// function returns before its staleness check whenever `pause` is true,
+/// and the caller's poll loop breaks on `!pace.pause` before reaching its
+/// own check. So at most ONE of them consults the grace per turn
+/// boundary, and the deliberate double read of the pace file documented
+/// on [`honor_pace_pause`] — which exists to keep these two checks from
+/// interfering — is preserved, not reintroduced.
 #[allow(clippy::too_many_arguments)]
 fn apply_pace_duty_cycle_delay(
     pace_reader: &mut pace::PaceReader,
@@ -649,12 +673,14 @@ fn apply_pace_duty_cycle_delay(
         return;
     }
     let Some(host_delay_ms) = pace.turn_delay_ms.filter(|&d| d > 0) else { return };
-    if pace.is_expired(checkpoint::unix_ms(), max_pause_ms) {
+    if pace_reader.pause_is_expired(&pace, checkpoint::unix_ms(), max_pause_ms) {
         // Abandoned duty-cycle instruction — the writer went dark, same
-        // staleness rule a pause uses. Silent: `honor_pace_pause`'s own
-        // expiry warning covers the "governor went quiet" case for the
-        // pause path; duplicating that warning here (for a NON-pause
-        // instruction that was never blocking anything) would be noise.
+        // staleness rule a pause uses, INCLUDING the stamp-in-the-future
+        // guard (#2774 round-9 MF2; see this fn's own doc). Silent:
+        // `honor_pace_pause`'s own expiry warning covers the "governor
+        // went quiet" case for the pause path; duplicating that warning
+        // here (for a NON-pause instruction that was never blocking
+        // anything) would be noise.
         return;
     }
     let (delay_ms, warning) = resolve_turn_delay_ms(host_delay_ms, inactivity_budget_secs);
@@ -5495,6 +5521,115 @@ mod tests {
         assert!(sleeper.calls.borrow().is_empty(), "an abandoned duty-cycle instruction must not be honored");
     }
 
+    /// (#2774 round-9 MF2) A FUTURE-dated stamp must decay, not be
+    /// honored forever.
+    ///
+    /// `PaceFile::is_expired` computes `now_ms.saturating_sub(written_at)`,
+    /// which clamps to `0` for a stamp ahead of the reader's clock — so
+    /// the file reads as maximally fresh for as long as that same stamp
+    /// sits there, which `pace.rs`'s module doc names as "exactly the
+    /// infinite-hold failure mode the heartbeat design exists to prevent."
+    /// `PaceReader::pause_is_expired` adds the one-grace-interval guard
+    /// over it, and had been wired to ONE of its two call sites: the pause
+    /// path had it, the duty-cycle prelude called the raw fn.
+    ///
+    /// Measured against the raw fn: five reads through a fresh
+    /// `PaceReader` slept the full 15,000ms every time — `calls ==
+    /// [15000; 5]`, no decay. The container's Docker VM clock running
+    /// ahead of the host is a skew direction `pace.rs` documents as real
+    /// and expected, so a long crawl would throttle at every turn boundary
+    /// for the rest of the dispatch with the governor dead and unable to
+    /// re-stamp it away.
+    #[test]
+    fn a_future_dated_duty_cycle_stamp_decays_instead_of_holding_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        // ~10^10 ms ahead of any plausible `unix_ms()` — the same shape a
+        // VM clock running ahead of the host produces.
+        let far_future = checkpoint::unix_ms().saturating_add(10_000_000_000);
+        write_pace(
+            tmp.path(),
+            &format!(
+                r#"{{"pause": false, "turn_delay_ms": 15000, "written_at_ms": {far_future}}}"#
+            ),
+        );
+        // ONE reader across every tick — the grace is tracked on the
+        // reader, exactly as it is in production where `run_with_sleeper`
+        // owns a single `PaceReader` for the whole dispatch.
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        for turn in 0..5 {
+            apply_pace_duty_cycle_delay(
+                &mut reader,
+                tmp.path(),
+                900_000,
+                600,
+                &sleeper,
+                &mut traj,
+                turn,
+                &mut rest_ms,
+                &mut rests,
+                &mut last_pow,
+                &mut soft_fired,
+            );
+        }
+
+        assert_eq!(
+            sleeper.calls.borrow().as_slice(),
+            &[15_000],
+            "one grace interval, then the same unchanged future-dated stamp is treated as an \
+             abandoned instruction — not honored at every turn boundary for the rest of the \
+             dispatch"
+        );
+        assert_eq!(rest_ms, 15_000);
+        assert_eq!(rests, 1);
+    }
+
+    /// The inverse of the test above, so the guard cannot be "fixed" by
+    /// making every duty-cycle instruction expire after one tick. A live,
+    /// correctly-stamped instruction is honored at EVERY turn boundary.
+    #[test]
+    fn a_live_duty_cycle_instruction_is_honored_at_every_turn_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(
+            tmp.path(),
+            &format!(
+                r#"{{"pause": false, "turn_delay_ms": 15000, "written_at_ms": {}}}"#,
+                checkpoint::unix_ms()
+            ),
+        );
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        for turn in 0..5 {
+            apply_pace_duty_cycle_delay(
+                &mut reader,
+                tmp.path(),
+                900_000,
+                600,
+                &sleeper,
+                &mut traj,
+                turn,
+                &mut rest_ms,
+                &mut rests,
+                &mut last_pow,
+                &mut soft_fired,
+            );
+        }
+
+        assert_eq!(sleeper.calls.borrow().as_slice(), &[15_000; 5]);
+    }
+
     #[test]
     fn duty_cycle_delay_records_a_distinguishable_trajectory_event() {
         // (#2774 constraint 1: must not look like a stall) The event must
@@ -5803,6 +5938,97 @@ mod tests {
         assert_eq!(rest_events.len(), 1, "one paced-rest event for the one increment taken");
         assert_eq!(rest_events[0]["ms"], 2_000);
         assert_eq!(rest_events[0]["reason"], "thermal", "the pace file's reason is stamped on the event");
+    }
+
+    /// (#2774 round-9, the sweep's first CONSIDER) The duty-cycle twin of
+    /// the pause test above, through the SAME real mock-server loop.
+    ///
+    /// Seven unit tests called `apply_pace_duty_cycle_delay` directly and
+    /// one called `honor_pace_pause`, but nothing drove tier 2 through
+    /// `run_with_sleeper` the way `pace_file_pause_then_resume_mid_sleep_…`
+    /// drives the pause path — so a defect in which staleness rule the
+    /// prelude uses (round-9 MF2) had no end-to-end test that could see
+    /// it. This one pins both halves of what tier 2 promises: the delay is
+    /// applied at every turn boundary, and the dispatch still RUNS TO
+    /// COMPLETION with its full turn count, because a duty cycle is
+    /// pacing, not a stop.
+    #[test]
+    #[serial_test::serial]
+    fn a_duty_cycle_instruction_paces_every_turn_and_the_dispatch_still_completes() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = crate::test_support::GuardedMockServer::start();
+        register_three_turn_tool_then_stop_script(&server);
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("duty-cycle-e2e").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        // Exactly what `darkmux_crew::thermal_governor` writes on entering
+        // tier 2 — `pause: false` with a `turn_delay_ms`, freshly stamped
+        // so the heartbeat contract reads it as live.
+        std::fs::write(
+            pace::pace_file_path(tmp.path()),
+            format!(
+                r#"{{"pause": false, "reason": "thermal-duty-cycle", "state": "fair", "turn_delay_ms": 15000, "written_at_ms": {}}}"#,
+                checkpoint::unix_ms()
+            ),
+        )
+        .unwrap();
+
+        // A plain recorder: nothing rewrites the pace file, so the
+        // instruction stays live for the whole dispatch — the production
+        // shape while a machine sits in the `fair` band.
+        let sleeper = RecordingSleeper::default();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &sleeper,
+        )
+        .expect("a duty-cycled dispatch still completes");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(
+            outcome.turns, 3,
+            "a duty cycle is PACING, not a stop: every turn still runs, just slower"
+        );
+        let calls = sleeper.calls.borrow().clone();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|&ms| ms == 15_000),
+            "every rest this dispatch took is the host-set duty-cycle delay: {calls:?}"
+        );
+
+        drop(traj);
+        let body =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl")).unwrap();
+        let rest_events: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["type"] == "runtime.rest")
+            .collect();
+        assert_eq!(
+            rest_events.len(),
+            calls.len(),
+            "one runtime.rest artifact event per rest actually taken"
+        );
+        assert!(
+            rest_events.iter().all(|e| e["reason"] == "thermal-duty-cycle"),
+            "the run's own artifact must say it was duty-cycled, not merely that it rested: \
+             {rest_events:?}"
+        );
+        assert!(
+            rest_events.iter().all(|e| e["state"] == "fair"),
+            "…and the reading the governor decided on: {rest_events:?}"
+        );
     }
 
     #[test]

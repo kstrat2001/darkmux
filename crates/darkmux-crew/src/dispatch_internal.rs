@@ -8142,14 +8142,19 @@ fn run_telemetry_sampler(
     // "armed" the ladder, silencing this very warning), and `resume_at =
     // nominal` (which disarms tier 2 alone). These are the same notes
     // doctor renders, so the two surfaces cannot disagree.
-    if darkmux_types::config_access::thermal_enabled() {
-        for note in thermal_governor.disarm_notes() {
-            eprintln!(
-                "darkmux: ⚠ thermal ladder — {} DISARMED for this dispatch: {} The breaker \
-                 (`critical`, and the sustained cpu_speed_limit floor) still runs. Fix with: {}",
-                note.tiers, note.why, note.remedy,
-            );
-        }
+    //
+    // (#2774 round-9 MF1) …and the COMPOSITION of those lines moved onto
+    // the governor itself (`dispatch_start_warnings`), for the same
+    // reason the notes did. The sentence printed here used to assert
+    // unconditionally that "The breaker … still runs", with no
+    // `min_cpu_speed_limit_pct` check anywhere on this path — so a floor
+    // above the reading's own 100% ceiling (a breaker that trips on every
+    // dispatch of a cold machine) was disclosed by neither this surface
+    // nor doctor. This loop now prints whatever the governor says its
+    // config earns, and the `enabled` gate lives in there too so the two
+    // cannot drift apart.
+    for line in thermal_governor.dispatch_start_warnings() {
+        eprintln!("{line}");
     }
     let thermal_stop_file =
         crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
