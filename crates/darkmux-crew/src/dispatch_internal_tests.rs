@@ -13934,6 +13934,75 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    // ─── (#2779) host-derived records outside the `dispatch.rest` family ──
+
+    /// The stamp for records the sampler thread builds outside the two
+    /// `emit_rest` closures. `emit_rest` stamps inline; these could not,
+    /// and were missed by the #2779 retrofit — `thermal.stop_unresolved`
+    /// carries the thermal `state` verbatim, `battery.pause_unsupported`
+    /// carries `charge_pct`, and BOTH are `Level::Warn`. A scenario file
+    /// made either of them indistinguishable from the real thing.
+    #[test]
+    fn host_derived_payload_names_the_scenario_and_leaves_a_real_reading_unmarked() {
+        use crate::host_source::Provenance;
+        let scripted = Provenance::Scripted {
+            path: "/tmp/critical-breaker.jsonl".to_string(),
+            frames: 4,
+            span_ms: 90_000,
+        };
+        let p =
+            super::host_derived_payload(serde_json::json!({ "state": "critical", "charge_pct": 5 }), &scripted);
+        assert_eq!(p["state"], "critical", "the reading still rides the record");
+        assert_eq!(p["charge_pct"], 5);
+        assert_eq!(
+            p["simulated_host_source"], "/tmp/critical-breaker.jsonl",
+            "a record built on scripted readings must name the scenario behind it: {p}"
+        );
+
+        let real = super::host_derived_payload(serde_json::json!({ "state": "critical" }), &Provenance::Real);
+        assert!(
+            real.get("simulated_host_source").is_none(),
+            "real readings must be stamped with nothing at all, not with a null: {real}"
+        );
+
+        let unavailable = super::host_derived_payload(
+            serde_json::json!({ "state": "critical" }),
+            &Provenance::ScriptedUnavailable {
+                path: "/nope.jsonl".to_string(),
+                error: "No such file".to_string(),
+            },
+        );
+        assert!(
+            unavailable.get("simulated_host_source").is_none(),
+            "nothing is simulated when the scenario failed to load, so nothing may be stamped"
+        );
+    }
+
+    /// A physical source check, for the same reason
+    /// `the_dispatch_prints_the_simulated_source_warning_at_sampler_start`
+    /// below is one: all four of these records are built on the sampler
+    /// thread of a LIVE dispatch (or inside `tier5_eject_on_critical`,
+    /// which shells out to `lms` to unload real residents), so no
+    /// in-process test reaches the call sites themselves.
+    ///
+    /// The count is EXACT, not a floor, and deliberately so: adding a fifth
+    /// host-derived record should make someone update this number and say
+    /// which record it is, rather than sliding in under a `>=`.
+    #[test]
+    fn every_host_derived_record_in_this_module_routes_through_the_stamp() {
+        let src = include_str!("dispatch_internal.rs");
+        let call_sites =
+            src.matches("host_derived_payload(").count() - src.matches("fn host_derived_payload(").count();
+        assert_eq!(
+            call_sites, 4,
+            "expected exactly four call sites — the `tier5_eject_on_critical` emit wrapper \
+             (covering thermal.tier5_eject and both thermal.tier5_eject_failed emissions), both \
+             thermal.stop_unresolved builders, and battery.pause_unsupported. Found \
+             {call_sites}. If you added a host-derived record, wire it and update this count; if \
+             you removed one, say which."
+        );
+    }
+
     // ─── (#2779) the dispatch-start warning is actually wired ────────────
 
     /// A physical source check, for the reason

@@ -65,23 +65,25 @@
 //!    scenario path (`describe_host_probe`).
 //! 2. The dispatch prints a warning line at sampler start, beside the
 //!    ladder's own disarm notes.
-//! 3. Every flow record whose payload carries a thermal or battery reading
-//!    carries `simulated_host_source: "<path>"` beside it ([`stamp`]).
-//!    That is four record builders, listed exhaustively because an
-//!    unstamped one is exactly the lie this surface exists to prevent:
-//!    the sampler's own `dispatch.rest` (its plain and its
-//!    extra-carrying emitter, in `run_telemetry_sampler`); the tailer's
-//!    `dispatch.rest` reporting the rest the run ACTUALLY took
-//!    (`dispatch_internal::runtime_rest_payload`); `machine.telemetry`
-//!    ([`crate::host_probe::build_machine_scoped_telemetry_record`] — the
-//!    builder BOTH possible singleton samplers share, a dispatch holding
-//!    `host_sampler_lock` and the serve daemon); and the daemon's
-//!    `machine.thermal` transition record
-//!    (`darkmux-serve::host_sampler::build_thermal_transition_record`).
-//!    The last two matter most: they are machine-SCOPED, so with Redis
-//!    enabled they ride the fleet stream to another machine's machine
-//!    lens, which would otherwise show this laptop hitting `critical`
-//!    with nothing in the data saying otherwise.
+//! 3. Every flow record whose payload carries a host reading — or whose
+//!    very EXISTENCE was decided by one — carries
+//!    `simulated_host_source: "<path>"` beside it ([`stamp`]).
+//!
+//!    **The producers are enumerated in [`HOST_READING_ACTIONS`], not in
+//!    this paragraph, and that move is the point.** This list used to name
+//!    them by hand. It was correct when written and went stale twice:
+//!    `machine.rollup` landed one commit later and was never added,
+//!    `machine.battery` predated the facade and was never retrofitted, and
+//!    the dispatch-side `thermal.stop_unresolved` /
+//!    `thermal.tier5_eject*` / `battery.pause_unsupported` records were
+//!    never in scope at all. Prose cannot fail; the table can, and
+//!    [`audit`] makes it. Read the table for what is stamped, what is
+//!    exempt, and why.
+//!
+//!    The machine-SCOPED records matter most: with Redis enabled they ride
+//!    the fleet stream to another machine's machine lens, which an
+//!    unstamped one would show hitting `critical` with nothing in the data
+//!    saying otherwise.
 //! 4. The run artifact's `host_window` block carries the same field — but
 //!    UNCONDITIONALLY (`null` on a real run), not absent-when-real like
 //!    the flow records. The two surfaces disagree on purpose; see
@@ -468,6 +470,227 @@ pub fn stamp_with(provenance: &Provenance, payload: &mut serde_json::Value) {
     };
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("simulated_host_source".to_string(), serde_json::json!(path));
+    }
+}
+
+// ── The producer registry, and why it is code rather than a paragraph ───
+//
+// The module doc above lists the record builders that must stamp. That
+// list was written by hand, was correct when written, and went stale
+// twice: `machine.rollup` landed one commit after it and was never added,
+// `machine.battery` predated it and was never retrofitted, and the
+// dispatch-side `thermal.*` / `battery.*` records were never in scope at
+// all. Two sweeps each closed the surfaces inside their own frame and
+// missed the siblings outside it — which is how one guarantee reached
+// four unstamped producers.
+//
+// So the enumeration moved into the type system, where adding a producer
+// without CLASSIFYING it fails a test instead of going unnoticed. What the
+// registry enforces is MEMBERSHIP, not stamping: `audit` proves every
+// watched action literal in the producing sources is classified here, and
+// that every entry still has a producer. Whether a `Stamped` entry
+// actually stamps is proven where it belongs — the per-record tests that
+// drive each builder's `_with` split at a `Scripted` provenance. The two
+// halves are deliberately separate, because a textual "is there a stamp
+// call near this literal" check would pass on a stamp applied to the wrong
+// payload, which is exactly the failure being guarded against.
+
+/// What a flow-record producer owes the scripted-source contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampDuty {
+    /// Either the record's CONTENT carries a host reading, or its very
+    /// EXISTENCE is decided by one. A scripted source must be named on it.
+    Stamped,
+    /// The record neither carries a host reading nor can be caused by one.
+    /// The string is the reason, and it is the whole point of the variant:
+    /// the next sweep reads the call that was already made instead of
+    /// re-deriving it and re-flagging the same record.
+    Exempt(&'static str),
+}
+
+/// The action-string families [`audit`] watches in the producing sources.
+///
+/// **The known hole, stated rather than implied:** a producer that invents
+/// a NEW family name (`"power.foo"`) escapes the scan until that prefix is
+/// added here. The scan catches the realistic case — a new record in an
+/// existing family, which is how all four unstamped producers arrived — not
+/// every conceivable one.
+const WATCHED_ACTION_PREFIXES: &[&str] = &["machine.", "thermal.", "battery.", "dispatch.rest"];
+
+/// Every flow-record action, in the sources [`audit`] scans, whose payload
+/// can carry or be caused by a host reading — and what each one owes.
+///
+/// Deliberately does NOT list `machine.online` / `machine.offline`
+/// (`darkmux-flow`'s `presence_reconciler`). Those are presence edges with
+/// `payload: None` — no reading to stamp, and no host source in the crate
+/// that emits them — so listing them would be an entry no scan covers,
+/// which is the rot this table exists to replace.
+pub const HOST_READING_ACTIONS: &[(&str, StampDuty)] = &[
+    // ── machine-scoped: these ride the fleet stream to ANOTHER machine's
+    // machine lens, which is what makes an unstamped one a second machine
+    // being told this one hit critical.
+    ("machine.telemetry", StampDuty::Stamped),
+    ("machine.thermal", StampDuty::Stamped),
+    ("machine.battery", StampDuty::Stamped),
+    ("machine.rollup", StampDuty::Stamped),
+    (
+        "machine.battery_health",
+        StampDuty::Exempt(
+            "battery::health() reads IOKit unconditionally and never consults host_source, on \
+             macOS and on every other target — there is no simulated reading to name, and \
+             stamping would label a real one",
+        ),
+    ),
+    // ── dispatch-scoped: session records, but the reading in them is this
+    // machine's, and two of them are Warn.
+    ("dispatch.rest", StampDuty::Stamped),
+    ("thermal.stop_unresolved", StampDuty::Stamped),
+    ("thermal.tier5_eject", StampDuty::Stamped),
+    ("thermal.tier5_eject_failed", StampDuty::Stamped),
+    ("battery.pause_unsupported", StampDuty::Stamped),
+];
+
+/// What [`audit`] found wrong, if anything.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HostReadingAudit {
+    /// Action literals present in the scanned sources, in a watched
+    /// family, that [`HOST_READING_ACTIONS`] does not classify — a new
+    /// producer nobody decided about.
+    pub unclassified: Vec<String>,
+    /// Entries in [`HOST_READING_ACTIONS`] that no scanned source emits
+    /// any more — a stale classification, which is how a table becomes as
+    /// unreliable as the paragraph it replaced.
+    pub stale: Vec<&'static str>,
+}
+
+/// Scan producing sources for watched action literals and reconcile them
+/// against [`HOST_READING_ACTIONS`].
+///
+/// A plain `pub fn` rather than a `#[cfg(test)]` helper because the caller
+/// is a test in ANOTHER crate (`darkmux-serve`'s `host_sampler`), and
+/// `cfg(test)` items are invisible across a crate boundary. Pure, cheap,
+/// and string-only — the alternative was a second copy of the scanner in
+/// every producing crate, which is the drift this whole section exists to
+/// stop.
+///
+/// Lines whose first non-space characters are `//` or `*` are skipped, so
+/// prose naming an action does not register as a producer. String literals
+/// are taken as the odd-indexed segments of a `"`-split, which is exact for
+/// action strings (none contain an escape) and is not a general Rust lexer.
+pub fn audit(sources: &[&str]) -> HostReadingAudit {
+    let mut found: Vec<String> = Vec::new();
+    for src in sources {
+        // Tests live after this marker in `host_sampler.rs` and assert on
+        // action strings constantly; scanning them would classify every
+        // consumer-side literal as a producer.
+        let body = match src.find("\n#[cfg(test)]\nmod tests") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        for line in body.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            for (i, segment) in line.split('"').enumerate() {
+                if i % 2 == 0 {
+                    continue;
+                }
+                if WATCHED_ACTION_PREFIXES.iter().any(|p| segment.starts_with(p))
+                    && !found.iter().any(|f| f == segment)
+                {
+                    found.push(segment.to_string());
+                }
+            }
+        }
+    }
+    HostReadingAudit {
+        unclassified: found
+            .iter()
+            .filter(|f| !HOST_READING_ACTIONS.iter().any(|(a, _)| a == *f))
+            .cloned()
+            .collect(),
+        stale: HOST_READING_ACTIONS
+            .iter()
+            .filter(|(a, _)| !found.iter().any(|f| f == a))
+            .map(|(a, _)| *a)
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod producer_registry_tests {
+    use super::*;
+
+    /// The three files that BUILD a flow record from a host reading.
+    ///
+    /// `include_str!` rather than a runtime path read, so a file that moves
+    /// breaks the BUILD rather than silently scanning nothing — a scanner
+    /// pointed at a path that no longer exists is the "probe that passes
+    /// without executing" failure, and it would report a clean sweep
+    /// forever. `host_sampler.rs` lives in `darkmux-serve`, which depends on
+    /// this crate rather than the other way round; the file is read at
+    /// compile time and creates no crate dependency in either direction.
+    fn producer_sources() -> Vec<&'static str> {
+        vec![
+            include_str!("dispatch_internal.rs"),
+            include_str!("host_probe/mod.rs"),
+            include_str!("../../darkmux-serve/src/host_sampler.rs"),
+        ]
+    }
+
+    /// The guard the two prior sweeps did not have. A new `machine.*` /
+    /// `thermal.*` / `battery.*` / `dispatch.rest` producer is not allowed
+    /// to exist without someone deciding, in `HOST_READING_ACTIONS`,
+    /// whether a scripted source has to be named on it.
+    #[test]
+    fn every_host_reading_producer_is_classified_and_every_classification_has_a_producer() {
+        let result = audit(&producer_sources());
+        assert_eq!(
+            result,
+            HostReadingAudit::default(),
+            "a flow-record action in a watched family is either stamped or exempt, and the \
+             decision lives in HOST_READING_ACTIONS. `unclassified` = a producer nobody decided \
+             about (add it, with the reason if it is exempt). `stale` = a classification whose \
+             producer is gone (remove it, so this table does not rot the way the module doc \
+             above did)."
+        );
+    }
+
+    /// The scan must actually be scanning. A rule that silently matches
+    /// nothing looks identical to a clean result, so pin the floor: the
+    /// sources contain the specific actions the sweep was about.
+    #[test]
+    fn the_scan_reaches_the_records_the_sweep_was_about() {
+        let sources = producer_sources();
+        let found_but_removed_from_the_table: Vec<&str> = ["machine.rollup", "machine.battery", "machine.thermal"]
+            .into_iter()
+            .filter(|a| audit(&sources).stale.contains(a))
+            .collect();
+        assert!(
+            found_but_removed_from_the_table.is_empty(),
+            "these actions must be visible to the scanner in the producing sources, or the \
+             registry is guarding nothing: {found_but_removed_from_the_table:?}"
+        );
+        assert!(
+            HOST_READING_ACTIONS.len() >= 10,
+            "the enumeration is the deliverable — a shrunken table means a producer was dropped \
+             rather than reclassified"
+        );
+    }
+
+    /// Comments naming an action are prose, not producers. Without this the
+    /// scan would flag every doc comment in `host_source.rs`'s own module
+    /// header and the registry would be unusable.
+    #[test]
+    fn prose_naming_an_action_is_not_a_producer() {
+        let src = "// emits \"machine.invented\" when hot\n    /// see \"thermal.invented\"\n";
+        assert_eq!(audit(&[src]).unclassified, Vec::<String>::new());
+        // …but the same literal in code IS one.
+        assert_eq!(
+            audit(&["let a = \"machine.invented\";\n"]).unclassified,
+            vec!["machine.invented".to_string()]
+        );
     }
 }
 

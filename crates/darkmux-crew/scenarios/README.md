@@ -70,13 +70,19 @@ battery reading (`simulated_host_source`), and the run artifact. That is
 deliberate: a machine reporting `nominal` while it actually cooks is worse
 than no governor at all, so a simulated source is never allowed to be quiet.
 
-The flow-record half is four builders, and the two machine-scoped ones are
-why the list has to be exhaustive: a dispatch run this way acquires the
+Which records those are is enumerated in code, in
+`host_source::HOST_READING_ACTIONS`, with a test that fails if a new
+producer appears unclassified — an earlier hand-written list in the module
+doc went stale twice and left four records unstamped. The machine-scoped
+ones are why it has to be exhaustive: a dispatch run this way acquires the
 machine's host-sampler lock and becomes its sole `machine.telemetry`
 emitter for the run's lifetime, so with Redis enabled those records ride
 the fleet stream to your OTHER machine. Unstamped, that machine's lens
 would show this laptop hitting `critical` with nothing in the data saying
 otherwise.
+
+The marker is not rendered in the viewer yet — read it in the raw flow
+records (`darkmux flow tail`, or the JSON a hooks receiver gets).
 
 | record | emitted by |
 |---|---|
