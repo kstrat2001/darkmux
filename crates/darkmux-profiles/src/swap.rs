@@ -55,6 +55,67 @@ pub fn is_darkmux_owned(identifier: &str) -> bool {
     darkmux_gestalt::is_darkmux_owned(identifier)
 }
 
+/// (#2774 tier 5) One model this sweep ejected (or, under `dry_run`, would
+/// have).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EjectedModel {
+    pub identifier: String,
+    pub context: u64,
+}
+
+/// (#2774 tier 5) Outcome of an [`eject_all_managed`] sweep — everything
+/// `darkmux machine eject`'s own printing needs, and everything the
+/// thermal breaker's tier-5 hard-stop needs to record on its own event,
+/// without either caller re-deriving the managed/user-state split itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EjectSummary {
+    pub ejected: Vec<EjectedModel>,
+    pub user_loaded_count: usize,
+}
+
+/// (#2774 tier 5) Pure split of a `lms ps` listing into darkmux-managed vs
+/// user-loaded, by the namespace contract ([`is_darkmux_owned`]) — pulled
+/// out of [`eject_all_managed`] so the partition itself is testable without
+/// a real `lms` process. `eject_all_managed` and `darkmux machine eject`'s
+/// `cmd_model_eject` both build on this ONE split, per the namespace
+/// contract's "state-mutating operations only touch the namespaced subset"
+/// rule (CLAUDE.md, #1274) — there is exactly one place that decides what
+/// counts as "ours."
+fn partition_by_ownership(loaded: &[darkmux_types::LoadedModel]) -> (Vec<&darkmux_types::LoadedModel>, usize) {
+    let managed: Vec<_> = loaded.iter().filter(|m| is_darkmux_owned(&m.identifier)).collect();
+    let user_loaded_count = loaded.len().saturating_sub(managed.len());
+    (managed, user_loaded_count)
+}
+
+/// (#2774 tier 5) Unload every `darkmux:`-namespaced resident on THIS host
+/// — the SAME mechanism `darkmux machine eject`'s `cmd_model_eject` already
+/// used (this function is that mechanism, factored out so the thermal
+/// breaker's tier-5 hard-stop can call it too, rather than a second
+/// unloader growing beside it). User-loaded models are filtered out by
+/// [`partition_by_ownership`] before anything is touched — structurally
+/// off-limits, per the namespace contract (#1274), not by convention at
+/// each call site.
+///
+/// `dry_run: true` reports what WOULD be ejected without calling
+/// `lms unload` at all — same semantics as `machine eject --dry-run`.
+///
+/// Best-effort per model: a single `lms unload` failure is returned as an
+/// `Err` immediately (matching `cmd_model_eject`'s pre-existing behavior,
+/// `?` on each call) rather than swallowed — an operator/governor relying
+/// on this to actually release RAM needs to know when it didn't.
+pub fn eject_all_managed(dry_run: bool) -> anyhow::Result<EjectSummary> {
+    let loaded = crate::lms::list_loaded()?;
+    let (managed, user_loaded_count) = partition_by_ownership(&loaded);
+    let mut ejected = Vec::with_capacity(managed.len());
+    for m in &managed {
+        if !dry_run {
+            crate::lms::unload(&m.identifier)?;
+        }
+        ejected.push(EjectedModel { identifier: m.identifier.clone(), context: m.context });
+    }
+    Ok(EjectSummary { ejected, user_loaded_count })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +158,32 @@ mod tests {
         // Partial match isn't enough.
         assert!(!is_darkmux_owned("dark:foo"));
         assert!(!is_darkmux_owned("predarkmux:foo"));
+    }
+
+    fn loaded(identifier: &str) -> darkmux_types::LoadedModel {
+        darkmux_types::LoadedModel {
+            identifier: identifier.to_string(),
+            model: identifier.to_string(),
+            status: "loaded".to_string(),
+            size: "18GB".to_string(),
+            context: 100_000,
+        }
+    }
+
+    #[test]
+    fn partition_by_ownership_splits_on_the_namespace_only() {
+        let rows = vec![loaded("darkmux:qwen3.6-35b-a3b"), loaded("user-loaded-model"), loaded("darkmux:coder")];
+        let (managed, user_loaded_count) = partition_by_ownership(&rows);
+        assert_eq!(managed.len(), 2, "only the two darkmux: entries are ours to touch");
+        assert_eq!(user_loaded_count, 1, "the bare identifier is user state, counted but untouched");
+        assert!(managed.iter().all(|m| m.identifier.starts_with("darkmux:")));
+    }
+
+    #[test]
+    fn partition_by_ownership_on_all_user_state_ejects_nothing() {
+        let rows = vec![loaded("user-a"), loaded("user-b")];
+        let (managed, user_loaded_count) = partition_by_ownership(&rows);
+        assert!(managed.is_empty(), "no darkmux: entries — nothing is ours");
+        assert_eq!(user_loaded_count, 2);
     }
 }

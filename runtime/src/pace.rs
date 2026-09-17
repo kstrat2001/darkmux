@@ -132,6 +132,20 @@ pub struct PaceFile {
     /// contract.
     #[serde(default)]
     pub written_at_ms: Option<u64>,
+    /// (#2774 tier 2) The pace file's THIRD state, between plain "run" and
+    /// "pause": a host-set turn delay (ms) the loop should apply at the
+    /// next turn boundary instead of blocking outright. `None`/absent on
+    /// an ordinary pause/resume write, an operator's hand-written
+    /// `{"pause": true}`, or a governor build that predates this field —
+    /// all three read identically as "no duty-cycle instruction," matching
+    /// every other optional field's tolerant-on-read treatment in this
+    /// struct. Honored only while this pace file is fresh (the SAME
+    /// `written_at_ms`/`is_expired` heartbeat contract `pause` uses — no
+    /// separate staleness rule for this field), and clamped through the
+    /// loop's own `resolve_turn_delay_ms` budget guard before being
+    /// applied, never around it.
+    #[serde(default)]
+    pub turn_delay_ms: Option<u64>,
 }
 
 impl PaceFile {
@@ -350,6 +364,27 @@ mod tests {
     }
 
     #[test]
+    fn turn_delay_ms_parses_when_present_and_defaults_to_none() {
+        let out_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pace_file_path(out_dir.path()),
+            r#"{"pause": false, "reason": "thermal-duty-cycle", "state": "fair", "turn_delay_ms": 15000}"#,
+        )
+        .unwrap();
+        let mut reader = PaceReader::new();
+        let pace = reader.read(out_dir.path()).unwrap();
+        assert!(!pace.pause, "a duty-cycle instruction is NOT a pause");
+        assert_eq!(pace.turn_delay_ms, Some(15_000));
+
+        // An older writer's plain pause/resume file, with no field at all,
+        // must parse identically to `turn_delay_ms: None` — forward AND
+        // backward compatible.
+        std::fs::write(pace_file_path(out_dir.path()), r#"{"pause": true}"#).unwrap();
+        let plain = reader.read(out_dir.path()).unwrap();
+        assert_eq!(plain.turn_delay_ms, None);
+    }
+
+    #[test]
     fn malformed_file_is_ignored_not_fatal() {
         let out_dir = tempfile::tempdir().unwrap();
         std::fs::write(pace_file_path(out_dir.path()), "{not json").unwrap();
@@ -359,13 +394,13 @@ mod tests {
 
     #[test]
     fn reason_or_default_falls_back() {
-        let pace = PaceFile { pause: true, reason: None, state: None, written_at_ms: None };
+        let pace = PaceFile { pause: true, reason: None, state: None, written_at_ms: None, turn_delay_ms: None };
         assert_eq!(pace.reason_or_default(), "paused");
     }
 
     #[test]
     fn no_timestamp_never_expires() {
-        let pace = PaceFile { pause: true, reason: None, state: None, written_at_ms: None };
+        let pace = PaceFile { pause: true, reason: None, state: None, written_at_ms: None, turn_delay_ms: None };
         assert!(!pace.is_expired(1_000_000_000, 900_000));
     }
 
@@ -376,6 +411,7 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(1_000_000_000),
+            turn_delay_ms: None,
         };
         assert!(!pace.is_expired(1_000_000_000 + 899_999, 900_000));
     }
@@ -387,6 +423,7 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(1_000_000_000),
+            turn_delay_ms: None,
         };
         assert!(pace.is_expired(1_000_000_000 + 900_001, 900_000));
     }
@@ -400,6 +437,7 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(2_000_000),
+            turn_delay_ms: None,
         };
         assert!(!pace.is_expired(1_000_000, 900_000));
     }
@@ -418,6 +456,7 @@ mod tests {
             reason: Some("thermal-critical".into()),
             state: None,
             written_at_ms: Some(5_000_000),
+            turn_delay_ms: None,
         };
         assert!(
             !pace.is_expired(5_000_000 + 1_000, 900_000),
@@ -437,6 +476,7 @@ mod tests {
             reason: Some("thermal-critical".into()),
             state: None,
             written_at_ms: Some(1_000_000_000),
+            turn_delay_ms: None,
         };
         assert!(pace.is_expired(1_000_000_000 + 900_001, 900_000));
     }
@@ -466,6 +506,7 @@ mod tests {
                 reason: Some("thermal".into()),
                 state: None,
                 written_at_ms: Some(1000),
+                turn_delay_ms: None,
             }),
             "a malformed read while previously paused must return the CACHED pace file, not None"
         );
@@ -533,6 +574,7 @@ mod tests {
             reason: Some("thermal".into()),
             state: None,
             written_at_ms: Some(10_000_000), // way ahead of now_ms below
+            turn_delay_ms: None,
         };
         let now_ms = 1_000_000;
         let max_pause_ms = 900_000;
@@ -557,6 +599,7 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(1_000_100), // 100ms ahead
+            turn_delay_ms: None,
         };
         assert!(!reader.pause_is_expired(&pace, 1_000_000, 900_000));
         assert!(!reader.pause_is_expired(&pace, 1_000_000, 900_000), "stays fine on repeat polls too");
@@ -580,6 +623,7 @@ mod tests {
                 // Deliberately always > max_pause_ms ahead, but a NEW
                 // value each time (a live, if clock-skewed, writer).
                 written_at_ms: Some(now_ms + max_pause_ms + 1 + step),
+                turn_delay_ms: None,
             };
             assert!(
                 !reader.pause_is_expired(&pace, now_ms, max_pause_ms),
@@ -596,6 +640,7 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(10_000_000),
+            turn_delay_ms: None,
         };
         // Use up the future-skew grace.
         assert!(!reader.pause_is_expired(&future, 1_000_000, 900_000));
@@ -607,6 +652,7 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(1_000_000),
+            turn_delay_ms: None,
         };
         assert!(reader.pause_is_expired(&stale, 1_000_000 + 900_001, 900_000));
     }

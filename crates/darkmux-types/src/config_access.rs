@@ -1298,6 +1298,72 @@ pub fn thermal_speed_limit_hold_samples_raw() -> u32 {
     pick_parsed("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", cfg, Some(3)).unwrap()
 }
 
+// ── Thermal escalation ladder, tiers 2-4 (#2774) ──
+// Same `env(DARKMUX_THERMAL_*) > config.runtime.thermal.* > default` chain
+// as the block above. Landed alongside the existing governor/breaker
+// (#2110/#2109) rather than replacing them: tier 3's full pause and the
+// pre-existing max-pause/critical/speed-limit breaker are unchanged: these
+// four knobs only add the duty-cycle (tier 2), the ratchet (tier 3's
+// resume behavior) and the episode-count escalation (tier 4) around them.
+
+/// (#2774 tier 2) Base duty-cycle turn delay (ms) — see
+/// `ThermalConfig::duty_delay_ms`'s own doc. Default `15000`.
+pub fn thermal_duty_delay_ms() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.thermal.as_ref()).and_then(|t| t.duty_delay_ms);
+    pick_parsed("DARKMUX_THERMAL_DUTY_DELAY_MS", cfg, Some(15_000)).unwrap()
+}
+
+/// (#2774 tier 3) The ratchet multiplier applied to the duty-cycle delay on
+/// every `serious`-episode recovery. Default `2`.
+///
+/// Clamped to `.max(1)`: a configured `0` would multiply the delay to
+/// zero on the very first escalation — the opposite of the ratchet's
+/// purpose, which is to make each recovery MORE cautious than the last,
+/// never less. `1` is a legitimate (if unusual) choice — "hold the same
+/// delay, don't grow it" — so it is not itself coerced. See
+/// [`thermal_ratchet_factor_raw`] for the unclamped value a doctor check
+/// would want.
+pub fn thermal_ratchet_factor() -> u32 {
+    thermal_ratchet_factor_raw().max(1)
+}
+
+/// The resolved `runtime.thermal.ratchet_factor` value WITHOUT the
+/// `.max(1)` floor — mirrors [`thermal_speed_limit_hold_samples_raw`]'s own
+/// reasoning: every other caller wants [`thermal_ratchet_factor`].
+pub fn thermal_ratchet_factor_raw() -> u32 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.thermal.as_ref()).and_then(|t| t.ratchet_factor);
+    pick_parsed("DARKMUX_THERMAL_RATCHET_FACTOR", cfg, Some(2)).unwrap()
+}
+
+/// (#2774 tier 4) How many `serious` EPISODES this run tolerates before the
+/// Nth escalates to an indefinite, operator-gated pause. Default `2`.
+///
+/// **`0` means UNBOUNDED — never escalate to tier 4** — matching darkmux's
+/// existing convention that a `0` bound means unbounded, never
+/// "instantly." Deliberately NOT clamped to `.max(1)` the way the two
+/// accessors above are: `0` has its own defined, intentional meaning here,
+/// so coercing it would silently turn "never escalate" into "escalate on
+/// the very first episode" — the opposite of what an operator setting `0`
+/// would mean.
+pub fn thermal_episode_threshold() -> u32 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.thermal.as_ref()).and_then(|t| t.episode_threshold);
+    pick_parsed("DARKMUX_THERMAL_EPISODE_THRESHOLD", cfg, Some(2)).unwrap()
+}
+
+/// (#2774 tier 4) Whether the episode-count escalation is active at all.
+/// Default `true`.
+pub fn thermal_tier4_enabled() -> bool {
+    if let Some(s) = env_str("DARKMUX_THERMAL_TIER4_ENABLED") {
+        return !matches!(s.as_str(), "0" | "false" | "no");
+    }
+    config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.tier4_enabled)
+        .unwrap_or(true)
+}
+
 // ── Battery-charge policy (#2706) ──
 // `env(DARKMUX_POWER_*) > config.power.* > default`, the same wiring the
 // thermal block above uses. See `PowerConfig`'s own doc for why the start

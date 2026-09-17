@@ -36,7 +36,11 @@
       "resume_hold_ms": 60000,
       "max_pause_ms": 900000,
       "min_cpu_speed_limit_pct": 50,
-      "speed_limit_hold_samples": 3
+      "speed_limit_hold_samples": 3,
+      "duty_delay_ms": 15000,
+      "ratchet_factor": 2,
+      "episode_threshold": 2,
+      "tier4_enabled": true
     },
     "liveness_retention_hours": 168
   },

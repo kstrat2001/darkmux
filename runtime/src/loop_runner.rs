@@ -611,6 +611,67 @@ fn absorb_rest_into_soft_inactivity_clock(
     (extend_deadline_by_rest(last_proof_of_work, rest_ms), false)
 }
 
+/// (#2774 tier 2) The host-set turn-delay half of the pace file's THIRD
+/// state — a duty-cycle instruction (`pause: false, turn_delay_ms:
+/// Some(ms)`) rather than a full pause. Reads the pace file ONCE (its
+/// caller, [`honor_pace_pause`], reads it again right after for the
+/// pause branch — see that function's own doc for why this is a
+/// deliberate second read rather than a shared one) and, if the file is
+/// carrying a live, non-expired, non-zero `turn_delay_ms`, sleeps that
+/// duration exactly once — through the SAME `resolve_turn_delay_ms`
+/// budget clamp the operator's own configured `turn_delay_ms` goes
+/// through (#2094), never around it — then records it as a rest through
+/// the SAME `absorb_rest_into_soft_inactivity_clock` path every other
+/// harness-owned rest uses, so a duty-cycled turn never looks like a
+/// stall to the inactivity watchdog.
+///
+/// A `pause: true` file is left entirely alone here (nothing to duty-cycle
+/// — the caller's while-loop handles the full pause), and staleness is
+/// judged by the SAME `written_at_ms`/`max_pause_ms` heartbeat contract
+/// `pause` uses (`PaceFile::is_expired`) — there is no separate rule for
+/// this field, matching the module doc's "no per-reason opt-out."
+#[allow(clippy::too_many_arguments)]
+fn apply_pace_duty_cycle_delay(
+    pace_reader: &mut pace::PaceReader,
+    out_dir: &std::path::Path,
+    max_pause_ms: u64,
+    inactivity_budget_secs: u64,
+    sleeper: &dyn TurnSleeper,
+    trajectory: &mut Trajectory,
+    turns: u32,
+    rest_ms: &mut u64,
+    rests: &mut u32,
+    last_proof_of_work: &mut std::time::Instant,
+    inactivity_soft_warning_fired_in_window: &mut bool,
+) {
+    let Some(pace) = pace_reader.read(out_dir) else { return };
+    if pace.pause {
+        return;
+    }
+    let Some(host_delay_ms) = pace.turn_delay_ms.filter(|&d| d > 0) else { return };
+    if pace.is_expired(checkpoint::unix_ms(), max_pause_ms) {
+        // Abandoned duty-cycle instruction — the writer went dark, same
+        // staleness rule a pause uses. Silent: `honor_pace_pause`'s own
+        // expiry warning covers the "governor went quiet" case for the
+        // pause path; duplicating that warning here (for a NON-pause
+        // instruction that was never blocking anything) would be noise.
+        return;
+    }
+    let (delay_ms, warning) = resolve_turn_delay_ms(host_delay_ms, inactivity_budget_secs);
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    if delay_ms == 0 {
+        return;
+    }
+    sleeper.sleep(delay_ms);
+    *rest_ms = rest_ms.saturating_add(delay_ms);
+    *rests = rests.saturating_add(1);
+    trajectory.append_paced_rest(turns, delay_ms, "thermal-duty-cycle", pace.state.as_deref());
+    (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
+        absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, delay_ms);
+}
+
 /// (#2114 finding 7) The pace-file pause wait, extracted so it can be
 /// called from BOTH the main loop's turn-boundary check AND the resume
 /// catch-up pass (`run_with_sleeper`'s pre-loop block) — a resume into an
@@ -619,11 +680,24 @@ fn absorb_rest_into_soft_inactivity_clock(
 /// pace file each increment; returns once the file says `pause: false`,
 /// is absent/malformed, or has expired past `max_pause_ms` (see
 /// `PaceFile::is_expired` — a stale stamp is treated as abandoned).
+///
+/// (#2774 tier 2) Calls [`apply_pace_duty_cycle_delay`] FIRST, as a
+/// prelude — that function does its own, SEPARATE read of the pace file
+/// rather than sharing this one, deliberately: a shared read would mean
+/// this function's `pause_is_expired` (which mutates the reader's
+/// future-skew-grace tracking, see that method's own doc) and the
+/// prelude's staleness check could consume the SAME grace interval twice
+/// on one tick. Reading twice costs one extra `fs::read_to_string` per
+/// turn boundary — cheap, and it keeps the two staleness checks from ever
+/// interfering with each other. The prelude is a no-op whenever the pace
+/// file is absent, paused, or carries no `turn_delay_ms`, which covers
+/// every dispatch that has never seen a duty-cycle instruction.
 #[allow(clippy::too_many_arguments)]
 fn honor_pace_pause(
     pace_reader: &mut pace::PaceReader,
     out_dir: &std::path::Path,
     max_pause_ms: u64,
+    inactivity_budget_secs: u64,
     pace_expiry_warned: &mut bool,
     sleeper: &dyn TurnSleeper,
     trajectory: &mut Trajectory,
@@ -633,6 +707,20 @@ fn honor_pace_pause(
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
 ) {
+    apply_pace_duty_cycle_delay(
+        pace_reader,
+        out_dir,
+        max_pause_ms,
+        inactivity_budget_secs,
+        sleeper,
+        trajectory,
+        turns,
+        rest_ms,
+        rests,
+        last_proof_of_work,
+        inactivity_soft_warning_fired_in_window,
+    );
+
     const PACE_POLL_INCREMENT_MS: u64 = 2_000;
     while let Some(pace) = pace_reader.read(out_dir) {
         if !pace.pause {
@@ -1811,6 +1899,7 @@ fn run_with_sleeper(
                     &mut pace_reader,
                     out_dir,
                     max_pause_ms,
+                    inactivity_budget_secs,
                     &mut pace_expiry_warned,
                     sleeper,
                     trajectory,
@@ -2293,6 +2382,7 @@ fn run_with_sleeper(
                 &mut pace_reader,
                 out_dir,
                 max_pause_ms,
+                inactivity_budget_secs,
                 &mut pace_expiry_warned,
                 sleeper,
                 trajectory,
@@ -5096,6 +5186,270 @@ mod tests {
             std::time::Duration::ZERO,
             "a deadline extended into the future must never report negative/underflowed elapsed time"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // (#2774 tier 2) `apply_pace_duty_cycle_delay` — the host-set
+    // turn-delay half of the pace file's third state, exercised in
+    // isolation with an injected sleeper (no real sleeps, no wall-clock
+    // assertions — every assertion is on recorded call counts/durations
+    // and on `rest_ms`/`rests`).
+    // ---------------------------------------------------------------
+
+    #[derive(Default)]
+    struct DutyCycleSleeper {
+        calls: std::cell::RefCell<Vec<u64>>,
+    }
+    impl TurnSleeper for DutyCycleSleeper {
+        fn sleep(&self, ms: u64) {
+            self.calls.borrow_mut().push(ms);
+        }
+    }
+
+    fn write_pace(dir: &std::path::Path, body: &str) {
+        std::fs::write(pace::pace_file_path(dir), body).unwrap();
+    }
+
+    #[test]
+    fn duty_cycle_delay_sleeps_once_for_the_host_set_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(
+            tmp.path(),
+            r#"{"pause": false, "reason": "thermal-duty-cycle", "state": "fair", "turn_delay_ms": 15000}"#,
+        );
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600, // inactivity_budget_secs — well above the 15s delay, no clamp
+            &sleeper,
+            &mut traj,
+            3,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert_eq!(sleeper.calls.borrow().as_slice(), &[15_000], "sleeps exactly the host-set duration");
+        assert_eq!(rest_ms, 15_000);
+        assert_eq!(rests, 1);
+    }
+
+    #[test]
+    fn duty_cycle_delay_goes_through_the_same_budget_clamp_as_the_configured_delay() {
+        // budget=10s -> half=5000ms; a host-set 15000ms must clamp exactly
+        // like an operator-configured turn_delay_ms would (#2094's own
+        // clamp, reused rather than duplicated for this new caller).
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(tmp.path(), r#"{"pause": false, "turn_delay_ms": 15000}"#);
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            10,
+            &sleeper,
+            &mut traj,
+            1,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert_eq!(sleeper.calls.borrow().as_slice(), &[5_000], "clamped to half the 10s budget");
+        assert_eq!(rest_ms, 5_000);
+    }
+
+    #[test]
+    fn duty_cycle_delay_is_a_no_op_when_the_pace_file_is_paused() {
+        // pause:true means tier 3, not tier 2 — the caller's own while-loop
+        // owns that case; this prelude must do nothing so it never
+        // double-rests on top of a full pause.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(tmp.path(), r#"{"pause": true, "reason": "thermal", "turn_delay_ms": 15000}"#);
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600,
+            &sleeper,
+            &mut traj,
+            1,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert!(sleeper.calls.borrow().is_empty(), "a paused pace file must never trigger a duty-cycle sleep");
+        assert_eq!(rest_ms, 0);
+        assert_eq!(rests, 0);
+    }
+
+    #[test]
+    fn duty_cycle_delay_is_a_no_op_with_no_turn_delay_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(tmp.path(), r#"{"pause": false}"#);
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600,
+            &sleeper,
+            &mut traj,
+            1,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert!(sleeper.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn duty_cycle_delay_is_a_no_op_when_zero() {
+        // `turn_delay_ms: 0` is written by nothing today, but must be a
+        // true no-op rather than a zero-length "sleep" call — mirrors the
+        // `#2094` static path's own `ms > 0` guard in `RealSleeper::sleep`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(tmp.path(), r#"{"pause": false, "turn_delay_ms": 0}"#);
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600,
+            &sleeper,
+            &mut traj,
+            1,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert!(sleeper.calls.borrow().is_empty());
+        assert_eq!(rests, 0);
+    }
+
+    #[test]
+    fn duty_cycle_delay_is_a_no_op_when_the_pace_file_has_expired() {
+        // A `turn_delay_ms` instruction whose writer went dark past
+        // `max_pause_ms` is abandoned, same staleness rule a pause uses —
+        // must not be honored forever just because nobody re-stamped it.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(
+            tmp.path(),
+            r#"{"pause": false, "turn_delay_ms": 15000, "written_at_ms": 1}"#,
+        );
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            /* max_pause_ms */ 1_000,
+            600,
+            &sleeper,
+            &mut traj,
+            1,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+
+        assert!(sleeper.calls.borrow().is_empty(), "an abandoned duty-cycle instruction must not be honored");
+    }
+
+    #[test]
+    fn duty_cycle_delay_records_a_distinguishable_trajectory_event() {
+        // (#2774 constraint 1: must not look like a stall) The event must
+        // carry a reason a reader can tell apart from an ordinary
+        // operator-configured turn_delay rest AND from a full thermal
+        // pause — "thermal-duty-cycle" is neither "turn_delay" nor
+        // "thermal"/"thermal-critical".
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(
+            tmp.path(),
+            r#"{"pause": false, "state": "fair", "turn_delay_ms": 15000}"#,
+        );
+        let mut reader = pace::PaceReader::new();
+        let sleeper = DutyCycleSleeper::default();
+        let mut traj = Trajectory::open(tmp.path());
+        let mut rest_ms = 0u64;
+        let mut rests = 0u32;
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+
+        apply_pace_duty_cycle_delay(
+            &mut reader,
+            tmp.path(),
+            900_000,
+            600,
+            &sleeper,
+            &mut traj,
+            7,
+            &mut rest_ms,
+            &mut rests,
+            &mut last_pow,
+            &mut soft_fired,
+        );
+        drop(traj);
+
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let body = std::fs::read_to_string(&traj_file).unwrap();
+        let event: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(event["reason"], "thermal-duty-cycle");
+        assert_eq!(event["state"], "fair");
+        assert_eq!(event["seq"], 7);
+        assert_eq!(event["ms"], 15_000);
     }
 
     /// (#2094 finding 3b) The CALL SITE's bundled effect, exercised

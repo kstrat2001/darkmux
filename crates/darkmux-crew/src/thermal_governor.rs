@@ -25,10 +25,11 @@
 //! crawl mission — drop the crawl's `STOP` file so no further unit gets
 //! dispatched. **Never kills the container.** The in-flight unit pauses at
 //! its next turn boundary with its checkpoint persisted (#2114); resume is
-//! the operator's call once #2114's `--resume` CLI flag ships (not wired
-//! yet — see `dispatch_internal.rs`'s `resume_checkpoint` doc). Once
-//! tripped, the governor goes terminal for DECISIONS — it does not un-pause itself on
-//! recovery — but it does NOT go silent: see the heartbeat contract below.
+//! the operator's call — `darkmux dispatch <role> --resume-from <out-dir>`
+//! (wired since #2114's follow-up; see `dispatch_internal.rs`'s
+//! `resume_checkpoint` family). Once tripped, the governor goes terminal
+//! for DECISIONS — it does not un-pause itself on recovery — but it does
+//! NOT go silent: see the heartbeat contract below.
 //!
 //! **Pace file location (operator correction during #2110/#2109 review):**
 //! NOT under the mounted `/workspace` — crawl units mount that read-only,
@@ -56,6 +57,48 @@
 //! stamp — see `on_sample`'s `None` arm (finding 3 of the same review).
 //! Pace-file writes are atomic (tmp file + rename) so the runtime's poll
 //! never observes a partially-written file.
+//!
+//! **The five-tier escalation ladder (#2774, from the operator's own
+//! overnight-crawl thermal experience — kstrat2001/darkmux#2774).** The
+//! governor/breaker above are tiers 1/3/5's mechanism; this module adds
+//! tiers 2 and 4 around them rather than replacing anything:
+//!
+//! | tier | condition | response |
+//! |---|---|---|
+//! | 1 | `nominal` | no delay |
+//! | 2 | `fair` sustained (`resume_at`, held `resume_hold_ms`) | duty-cycle: pace file `pause: false, turn_delay_ms: Some(_)` |
+//! | 3 | `serious` (`pause_at`) | full pause until back to `resume_at`, THEN resume with the duty-cycle delay DOUBLED (`ratchet_factor`) for the rest of the run |
+//! | 4 | the Nth `serious` EPISODE (`episode_threshold`, default 2; `0` = unbounded) | indefinite pause (`reason: "thermal-episode-limit"`) — resumes only on operator intervention, never automatically |
+//! | 5 | `critical` | the pre-existing breaker (unchanged) — PLUS, in `dispatch_internal.rs`, `swap::eject_all_managed` once a turn boundary is reached or a short bound elapses |
+//!
+//! **Tier 2 (`DutyCycle`).** Entering and leaving both require a SUSTAINED
+//! hold at the boundary (reusing `resume_hold_ms` for both directions,
+//! rather than adding a second hold knob for what is the same "how long at
+//! `resume_at`" question) — see `on_sample`'s `Idle`/`DutyCycle` handling.
+//! `current_duty_delay_ms` starts at `duty_delay_ms` and is what actually
+//! rides the pace file; `serious_episodes()`/`current_duty_delay_ms()` are
+//! the getters `dispatch_internal.rs` reads to record both in the run
+//! artifact alongside `above_nominal_ms` (#2774's own citation of #1247's
+//! principle: "was this run throttled, and how hard" answerable from data).
+//!
+//! **Tier 3's ratchet is ONE-WAY for the life of the run.** Recovering to
+//! `resume_at` releases the pause; it never restores the pre-doubling
+//! delay — `current_duty_delay_ms` is multiplied by `ratchet_factor` on
+//! every successful `Paused` -> resume transition and never divided back
+//! down. An episode that goes straight to tier 4 (below) does NOT ratchet
+//! — there is no resume to ratchet on.
+//!
+//! **Tier 4's episode count is a TRANSITION, not a sample.** `serious_episodes`
+//! increments exactly once per `Idle`/`DutyCycle` -> `Paused`-or-`OperatorHold`
+//! transition (`enter_paused`), never per tick spent AT `serious` — a single
+//! sustained stretch at `serious` is one episode, however many samples it
+//! spans. When the Nth transition would be reached (`tier4_enabled &&
+//! episode_threshold != 0 && serious_episodes >= episode_threshold`), that
+//! episode goes straight to `OperatorHold` instead of the ordinary `Paused`
+//! tier-3 flow — no ratchet, no automatic resume, ever. `OperatorHold`
+//! shares `Broken`'s heartbeat-forever mechanics (re-stamps on the same
+//! cadence, terminal for decisions) with its own `reason` string so a flow
+//! reader can tell "the count escalated" from "the machine got critical."
 
 use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
@@ -86,6 +129,13 @@ pub use crate::pace_file::path as pace_file_path;
 /// live in that module now (see its doc for why sharing them is the point).
 fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &str) {
     crate::pace_file::write(host_out, pause, reason, state)
+}
+
+/// (#2774 tier 2) Same as [`write_pace_file`], plus the pace file's third
+/// state — a host-set turn delay for a duty-cycle instruction
+/// (`pause: false`, `turn_delay_ms: Some(ms)`).
+fn write_pace_file_with_delay(host_out: &Path, reason: &'static str, state: &str, turn_delay_ms: u64) {
+    crate::pace_file::write_with_turn_delay(host_out, false, reason, state, Some(turn_delay_ms))
 }
 
 /// (#2109) Best-effort derivation of a crawl mission's `STOP` file path
@@ -449,6 +499,32 @@ pub enum ThermalEvent {
     /// `critical` state, or the CPU speed-limit floor held for
     /// `speed_limit_hold_samples` consecutive samples.
     Breaker { state: String },
+    /// (#2774 tier 2) Entered the duty-cycle state after a sustained hold
+    /// at/above `resume_at` (and below `pause_at`) — the pace file now
+    /// carries `pause: false, turn_delay_ms: Some(delay_ms)`, where
+    /// `delay_ms` is the CURRENT (possibly already-ratcheted)
+    /// `current_duty_delay_ms`.
+    DutyCycleEntered { state: String, delay_ms: u64 },
+    /// (#2774 tier 2) Left the duty-cycle state after a sustained hold
+    /// back at nominal — the pace file now carries a plain
+    /// `pause: false` with no `turn_delay_ms`.
+    DutyCycleExited { state: String },
+    /// (#2774 tier 4) The Nth `serious` EPISODE (`episode_threshold`) —
+    /// escalated straight to an indefinite, operator-gated pause
+    /// (`reason: "thermal-episode-limit"`) instead of the ordinary tier-3
+    /// pause/resume. `episode` is the 1-based count that triggered this.
+    OperatorHold { state: String, episode: u32 },
+}
+
+/// (#2774) The two artifact-worthy numbers a governor accumulates over its
+/// lifetime — see [`ThermalGovernor::ladder_summary`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThermalLadderSummary {
+    /// Count of `serious` EPISODES (transitions, not samples) this run saw.
+    pub serious_episodes: u32,
+    /// The LIVE (possibly-ratcheted) duty-cycle delay at the end of this
+    /// governor's life — `config.duty_delay_ms` if tier 2/3 never engaged.
+    pub current_duty_delay_ms: u64,
 }
 
 /// Resolved thermal-governor tuning (`config_access::thermal_*`).
@@ -464,6 +540,24 @@ pub struct ThermalGovernorConfig {
     /// required before the breaker trips on that signal. Does NOT apply
     /// to the `critical` state check.
     pub speed_limit_hold_samples: u32,
+    /// (#2774 tier 2) Base duty-cycle turn delay (ms) — the value
+    /// `current_duty_delay_ms` starts at and the ratchet (below) grows
+    /// from. Never itself mutated; `ThermalGovernor` tracks the live,
+    /// possibly-ratcheted value separately so a governor can be
+    /// re-inspected against its own unmodified config.
+    pub duty_delay_ms: u64,
+    /// (#2774 tier 3) Multiplier applied to the duty-cycle delay on every
+    /// `serious`-episode recovery. `.max(1)` at the call site — a `0`
+    /// would defeat the ratchet by zeroing the delay on first escalation.
+    pub ratchet_factor: u32,
+    /// (#2774 tier 4) How many `serious` EPISODES (transitions, not
+    /// samples) this run tolerates before the Nth escalates to
+    /// `OperatorHold`. `0` means unbounded — never escalate.
+    pub episode_threshold: u32,
+    /// (#2774 tier 4) Whether the episode-count escalation is active at
+    /// all. `false` makes every episode an ordinary tier-3 pause/resume,
+    /// regardless of `episode_threshold`.
+    pub tier4_enabled: bool,
 }
 
 impl ThermalGovernorConfig {
@@ -478,6 +572,10 @@ impl ThermalGovernorConfig {
             max_pause_ms: darkmux_types::config_access::thermal_max_pause_ms(),
             min_cpu_speed_limit_pct: darkmux_types::config_access::thermal_min_cpu_speed_limit_pct(),
             speed_limit_hold_samples: darkmux_types::config_access::thermal_speed_limit_hold_samples(),
+            duty_delay_ms: darkmux_types::config_access::thermal_duty_delay_ms(),
+            ratchet_factor: darkmux_types::config_access::thermal_ratchet_factor(),
+            episode_threshold: darkmux_types::config_access::thermal_episode_threshold(),
+            tier4_enabled: darkmux_types::config_access::thermal_tier4_enabled(),
         }
     }
 }
@@ -485,12 +583,22 @@ impl ThermalGovernorConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
+    /// (#2774 tier 2) Sustained at/above `resume_at` and below `pause_at` —
+    /// the pace file carries a host-set `turn_delay_ms` rather than a
+    /// pause.
+    DutyCycle,
     Paused,
+    /// (#2774 tier 4) The Nth `serious` episode — terminal for DECISIONS
+    /// exactly like `Broken` (heartbeats forever, never auto-resumes), but
+    /// with its OWN `reason` (`"thermal-episode-limit"`) so a flow reader
+    /// can tell a count-based escalation from a hardware-critical one.
+    OperatorHold,
     /// Terminal for DECISIONS: the breaker tripped and the governor never
     /// un-pauses itself on recovery — resume is out-of-band, the
-    /// operator's call once #2114's `--resume` CLI flag ships. NOT terminal for the
-    /// pace file's freshness: see the module doc's heartbeat contract —
-    /// `on_sample` keeps re-stamping while `Broken`, just as while `Paused`.
+    /// operator's own `--resume-from` call (see the module doc). NOT
+    /// terminal for the pace file's freshness: see the module doc's
+    /// heartbeat contract — `on_sample` keeps re-stamping while `Broken`,
+    /// just as while `Paused`.
     Broken,
 }
 
@@ -512,6 +620,26 @@ pub struct ThermalGovernor {
     /// and the breaker's `STOP`/event state meaningful on a tick where the
     /// OS thermal reading itself came back `None`.
     last_known_state: String,
+    /// (#2774 tier 2) ms the state has continuously held in the OPPOSITE
+    /// band from the current `Idle`/`DutyCycle` state — while `Idle`, ms
+    /// held at/above `resume_at` (candidate to ENTER duty-cycle); while
+    /// `DutyCycle`, ms held below `resume_at` (candidate to LEAVE it).
+    /// Resets to 0 the instant the sample falls back into the "current"
+    /// band, same hysteresis shape `resume_hold_accum_ms` uses for
+    /// `Paused` -> resume. Meaningless (and left untouched) in any other
+    /// state.
+    duty_hold_accum_ms: u64,
+    /// (#2774 tier 3) The LIVE duty-cycle delay this governor applies —
+    /// starts at `config.duty_delay_ms` and is multiplied by
+    /// `config.ratchet_factor` on every `Paused` -> resume transition,
+    /// ONE-WAY for the life of this governor. Never reset by a return to
+    /// `Idle`/nominal.
+    current_duty_delay_ms: u64,
+    /// (#2774 tier 4) Count of `serious` EPISODES this governor has seen —
+    /// incremented exactly once per `Idle`/`DutyCycle` -> `Paused`-or-
+    /// `OperatorHold` TRANSITION (never per sample spent at `serious`).
+    /// See [`ThermalGovernor::serious_episodes`].
+    serious_episodes: u32,
     /// ms accumulated since the pace file's `written_at_ms` was last
     /// refreshed — drives the heartbeat re-stamp cadence (module doc)
     /// while `Paused` or `Broken`. Reset to 0 on every write, including
@@ -564,12 +692,16 @@ pub struct ThermalGovernor {
 
 impl ThermalGovernor {
     pub fn new(config: ThermalGovernorConfig) -> Self {
+        let current_duty_delay_ms = config.duty_delay_ms;
         Self {
             config,
             state: State::Idle,
             pause_episode_ms: 0,
             resume_hold_accum_ms: 0,
             last_known_state: String::new(),
+            duty_hold_accum_ms: 0,
+            current_duty_delay_ms,
+            serious_episodes: 0,
             ms_since_stamp: 0,
             speed_limit_low_streak: 0,
             last_stamp_instant: Instant::now(),
@@ -579,8 +711,40 @@ impl ThermalGovernor {
         }
     }
 
-    /// (#2706) Whether this governor is currently holding the pace file —
-    /// `Paused` or the terminal `Broken`, i.e. anything but `Idle`.
+    /// (#2774) The LIVE duty-cycle delay (post-ratchet) — what
+    /// `dispatch_internal.rs` reads to record "how hard was this run
+    /// throttled" in the run artifact, alongside `above_nominal_ms`
+    /// (#1247's own principle, cited by #2774). Starts at
+    /// `config.duty_delay_ms` and only ever grows for the life of this
+    /// governor.
+    pub fn current_duty_delay_ms(&self) -> u64 {
+        self.current_duty_delay_ms
+    }
+
+    /// (#2774 tier 4) How many `serious` EPISODES (transitions, never
+    /// samples) this governor has counted this run — the artifact field
+    /// alongside [`ThermalGovernor::current_duty_delay_ms`].
+    pub fn serious_episodes(&self) -> u32 {
+        self.serious_episodes
+    }
+
+    /// (#2774) Both artifact fields at once — what `dispatch_internal.rs`
+    /// threads out of the sampler thread (via `run_telemetry_sampler`'s
+    /// return value) into `host_window_json`'s payload, alongside
+    /// `above_nominal_ms`, so "was this run throttled, and how hard" is
+    /// answerable from the run's own data.
+    pub fn ladder_summary(&self) -> ThermalLadderSummary {
+        ThermalLadderSummary {
+            serious_episodes: self.serious_episodes,
+            current_duty_delay_ms: self.current_duty_delay_ms,
+        }
+    }
+
+    /// (#2706; widened #2774) Whether this governor is currently holding
+    /// the pace file — anything but `Idle` (`DutyCycle`, `Paused`,
+    /// `OperatorHold`, or `Broken`). `DutyCycle` counts too: it writes
+    /// `pause: false, turn_delay_ms: Some(_)`, which is just as much "this
+    /// governor owns the pace file right now" as an actual pause is.
     ///
     /// Exists because the pace file has a SECOND writer as of #2706 (the
     /// battery governor) and one file's precedence has to be decided rather
@@ -667,29 +831,29 @@ impl ThermalGovernor {
             return None;
         }
 
-        if self.state == State::Broken {
-            // (finding 2, redesigned for the heartbeat contract) Broken is
+        if self.state == State::Broken || self.state == State::OperatorHold {
+            // (finding 2, redesigned for the heartbeat contract; widened
+            // #2774 to cover tier 4's OperatorHold identically) Both are
             // terminal for DECISIONS but must keep re-stamping — without
             // an active writer the runtime's pure expiry rule (#2114
             // cf1b1993: no `expires` opt-out) would silently resume the
-            // unit on a still-critical machine.
+            // unit on a still-hot/still-escalated machine.
             self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
             if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval() {
                 self.mark_stamped();
-                write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
+                write_pace_file(host_out, true, self.terminal_reason(), &self.last_known_state);
             }
             return None;
         }
 
         // (finding 3) A missing OS thermal reading is "time passed, no new
         // information" — NOT evidence of recovery, and NOT nothing. Only
-        // matters while actively `Paused`: accumulate the elapsed time into
-        // the episode (so `max_pause_ms` escalation still fires on a
-        // machine that stays hot through a reading gap), reset the resume
-        // hold (a gap is not a continuous hold at/below `resume_at`), and
-        // let the periodic heartbeat re-stamp still fire on its own
-        // cadence. `Idle` has nothing to accumulate; a `None` there is
-        // simply a no-op tick.
+        // matters while actively `Paused` or `DutyCycle`: accumulate the
+        // elapsed time / keep the heartbeat alive, and reset whichever
+        // hysteresis hold is in flight (a gap is not a CONTINUOUS hold).
+        // `Idle` resets its own duty-cycle-entry hold for the same reason
+        // but has no heartbeat to keep alive (it owns no pace-file
+        // instruction while `Idle`).
         let thermal = match thermal {
             Some(t) => {
                 self.last_known_state = t.state.clone();
@@ -698,31 +862,56 @@ impl ThermalGovernor {
             None => {
                 // (N4 of the #2110/#2109 review) A missing reading is not
                 // evidence the CPU is throttled — reset the consecutive
-                // low-sample streak unconditionally (Idle included, so a
-                // stale streak never survives into a later real reading),
-                // matching how the None arm already resets
-                // `resume_hold_accum_ms` rather than freezing or extending it.
+                // low-sample streak unconditionally, matching how the None
+                // arm already resets every other hysteresis hold rather
+                // than freezing or extending it.
                 self.speed_limit_low_streak = 0;
-                if self.state == State::Paused {
-                    self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
-                    self.resume_hold_accum_ms = 0;
-                    self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
-                    if self.pause_episode_ms >= self.config.max_pause_ms {
-                        self.state = State::Broken;
-                        self.mark_stamped();
-                        write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
-                        if let Some(stop) = stop_file {
-                            self.last_stop_write_error =
-                                write_stop_file(stop, self.stop_owner.as_deref()).err();
+                match self.state {
+                    State::Paused => {
+                        self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
+                        self.resume_hold_accum_ms = 0;
+                        self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
+                        if self.pause_episode_ms >= self.config.max_pause_ms {
+                            self.state = State::Broken;
+                            self.mark_stamped();
+                            write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
+                            if let Some(stop) = stop_file {
+                                self.last_stop_write_error =
+                                    write_stop_file(stop, self.stop_owner.as_deref()).err();
+                            }
+                            return Some(ThermalEvent::Breaker {
+                                state: self.last_known_state.clone(),
+                            });
                         }
-                        return Some(ThermalEvent::Breaker {
-                            state: self.last_known_state.clone(),
-                        });
+                        if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval()
+                        {
+                            self.mark_stamped();
+                            write_pace_file(host_out, true, "thermal", &self.last_known_state);
+                        }
                     }
-                    if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval() {
-                        self.mark_stamped();
-                        write_pace_file(host_out, true, "thermal", &self.last_known_state);
+                    State::DutyCycle => {
+                        // (#2774 tier 2) A reading gap breaks the
+                        // continuous-hold claim toward EXITING duty-cycle,
+                        // same reasoning `Paused`'s resume hold uses — but
+                        // there's no pause episode to accumulate, only the
+                        // heartbeat and the exit hold.
+                        self.duty_hold_accum_ms = 0;
+                        self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
+                        if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval()
+                        {
+                            self.mark_stamped();
+                            write_pace_file_with_delay(
+                                host_out,
+                                "thermal-duty-cycle",
+                                &self.last_known_state,
+                                self.current_duty_delay_ms,
+                            );
+                        }
                     }
+                    State::Idle => {
+                        self.duty_hold_accum_ms = 0;
+                    }
+                    State::OperatorHold | State::Broken => unreachable!("handled above"),
                 }
                 return None;
             }
@@ -752,17 +941,76 @@ impl ThermalGovernor {
         }
 
         match self.state {
-            State::Idle => {
+            State::Idle | State::DutyCycle => {
                 if sev >= severity(&self.config.pause_at) {
-                    self.state = State::Paused;
-                    self.pause_episode_ms = 0;
-                    self.resume_hold_accum_ms = 0;
-                    self.mark_stamped();
-                    write_pace_file(host_out, true, "thermal", &thermal.state);
-                    Some(ThermalEvent::Paused { state: thermal.state.clone() })
-                } else {
-                    None
+                    return self.enter_paused(&thermal.state, host_out, stop_file);
                 }
+                // (#2774 tier 2) `in_duty_band`: at/above `resume_at` and
+                // (by the check just above) below `pause_at` — the "fair"
+                // range. Entering FROM `Idle` needs a sustained hold IN
+                // this band; leaving FROM `DutyCycle` needs a sustained
+                // hold OUTSIDE it — opposite directions, so which reading
+                // counts as progress toward the transition flips with
+                // `was_duty_cycle`. Both hysteresis holds share
+                // `duty_hold_accum_ms`, since a governor is never in both
+                // states at once.
+                let was_duty_cycle = self.state == State::DutyCycle;
+                let in_duty_band = sev >= severity(&self.config.resume_at);
+                if was_duty_cycle {
+                    self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
+                }
+                let progressing_toward_transition = if was_duty_cycle { !in_duty_band } else { in_duty_band };
+                if progressing_toward_transition {
+                    self.duty_hold_accum_ms = self.duty_hold_accum_ms.saturating_add(elapsed_ms);
+                } else {
+                    // Same reset shape `resume_hold_accum_ms` uses: a
+                    // sample that isn't progress toward the transition
+                    // restarts the clock, it doesn't just pause it —
+                    // otherwise a state bouncing at the boundary would
+                    // eventually cross the hold on ACCUMULATED good ticks
+                    // while still flapping.
+                    self.duty_hold_accum_ms = 0;
+                }
+
+                if !was_duty_cycle && in_duty_band && self.duty_hold_accum_ms >= self.config.resume_hold_ms
+                {
+                    self.state = State::DutyCycle;
+                    self.duty_hold_accum_ms = 0;
+                    self.mark_stamped();
+                    write_pace_file_with_delay(
+                        host_out,
+                        "thermal-duty-cycle",
+                        &thermal.state,
+                        self.current_duty_delay_ms,
+                    );
+                    return Some(ThermalEvent::DutyCycleEntered {
+                        state: thermal.state.clone(),
+                        delay_ms: self.current_duty_delay_ms,
+                    });
+                }
+                if was_duty_cycle && !in_duty_band && self.duty_hold_accum_ms >= self.config.resume_hold_ms
+                {
+                    self.state = State::Idle;
+                    self.duty_hold_accum_ms = 0;
+                    self.mark_stamped();
+                    write_pace_file(host_out, false, "thermal", &thermal.state);
+                    return Some(ThermalEvent::DutyCycleExited { state: thermal.state.clone() });
+                }
+                // No transition this tick — heartbeat the duty-cycle
+                // instruction if that's the state we're still in (`Idle`
+                // owns no pace-file instruction, so it heartbeats nothing).
+                if was_duty_cycle
+                    && (self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval())
+                {
+                    self.mark_stamped();
+                    write_pace_file_with_delay(
+                        host_out,
+                        "thermal-duty-cycle",
+                        &thermal.state,
+                        self.current_duty_delay_ms,
+                    );
+                }
+                None
             }
             State::Paused => {
                 self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
@@ -783,11 +1031,33 @@ impl ThermalGovernor {
                     self.resume_hold_accum_ms = 0;
                 }
                 if self.resume_hold_accum_ms >= self.config.resume_hold_ms {
-                    self.state = State::Idle;
+                    // (#2774 tier 3) The ratchet: applied on EVERY
+                    // successful recovery, one-way for the life of this
+                    // governor. Multiplied, never divided; nothing else in
+                    // this function ever lowers `current_duty_delay_ms`.
+                    self.current_duty_delay_ms = self
+                        .current_duty_delay_ms
+                        .saturating_mul(u64::from(self.config.ratchet_factor.max(1)));
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
                     self.mark_stamped();
-                    write_pace_file(host_out, false, "thermal", &thermal.state);
+                    // Land in `DutyCycle` if the recovering sample is
+                    // still in the fair band, `Idle` if it's fully
+                    // nominal — the SAME `in_duty_band` test the
+                    // Idle/DutyCycle branch uses, so "where do we land"
+                    // never disagrees with "when would we leave again."
+                    if sev >= severity(&self.config.resume_at) {
+                        self.state = State::DutyCycle;
+                        write_pace_file_with_delay(
+                            host_out,
+                            "thermal-duty-cycle",
+                            &thermal.state,
+                            self.current_duty_delay_ms,
+                        );
+                    } else {
+                        self.state = State::Idle;
+                        write_pace_file(host_out, false, "thermal", &thermal.state);
+                    }
                     return Some(ThermalEvent::Resumed { state: thermal.state.clone() });
                 }
                 if self.pause_episode_ms >= self.config.max_pause_ms {
@@ -808,7 +1078,54 @@ impl ThermalGovernor {
                 }
                 None
             }
-            State::Broken => unreachable!("returned early above"),
+            State::OperatorHold | State::Broken => unreachable!("returned early above"),
+        }
+    }
+
+    /// (#2774 tiers 3/4) Common entry point for BOTH `Idle` and
+    /// `DutyCycle` crossing into `serious` (`>= pause_at`). Counts the
+    /// EPISODE — exactly once per call, i.e. once per TRANSITION, never
+    /// once per sample spent at `serious` (a caller only reaches this
+    /// method on the tick severity first crosses the threshold; every
+    /// later tick still at `serious` stays inside `State::Paused`'s own
+    /// match arm and never calls this again) — and decides whether this
+    /// episode is an ordinary tier-3 pause or, having reached
+    /// `episode_threshold`, an immediate tier-4 `OperatorHold`.
+    fn enter_paused(&mut self, state: &str, host_out: &Path, stop_file: Option<&Path>) -> Option<ThermalEvent> {
+        self.serious_episodes = self.serious_episodes.saturating_add(1);
+        self.pause_episode_ms = 0;
+        self.resume_hold_accum_ms = 0;
+        self.duty_hold_accum_ms = 0;
+        if self.config.tier4_enabled
+            && self.config.episode_threshold != 0
+            && self.serious_episodes >= self.config.episode_threshold
+        {
+            self.state = State::OperatorHold;
+            self.mark_stamped();
+            write_pace_file(host_out, true, "thermal-episode-limit", state);
+            if let Some(stop) = stop_file {
+                self.last_stop_write_error = write_stop_file(stop, self.stop_owner.as_deref()).err();
+            }
+            return Some(ThermalEvent::OperatorHold {
+                state: state.to_string(),
+                episode: self.serious_episodes,
+            });
+        }
+        self.state = State::Paused;
+        self.mark_stamped();
+        write_pace_file(host_out, true, "thermal", state);
+        Some(ThermalEvent::Paused { state: state.to_string() })
+    }
+
+    /// The `reason` string for the terminal-state heartbeat re-stamp at
+    /// the top of [`ThermalGovernor::on_sample`] — `Broken` and
+    /// `OperatorHold` share that re-stamp loop but carry different
+    /// reasons so a flow reader can tell a count-based tier-4 escalation
+    /// from a hardware-critical tier-5/legacy-breaker one.
+    fn terminal_reason(&self) -> &'static str {
+        match self.state {
+            State::OperatorHold => "thermal-episode-limit",
+            _ => "thermal-critical",
         }
     }
 }
@@ -830,7 +1147,18 @@ mod tests {
             max_pause_ms: 900_000,
             min_cpu_speed_limit_pct: 50,
             speed_limit_hold_samples: 3,
+            duty_delay_ms: 15_000,
+            ratchet_factor: 2,
+            episode_threshold: 2,
+            tier4_enabled: true,
         }
+    }
+
+    /// Tier-4 escalation off — for tests exercising the pre-existing
+    /// tier-3/breaker behavior in isolation, unaffected by the episode
+    /// count.
+    fn cfg_tier4_disabled() -> ThermalGovernorConfig {
+        ThermalGovernorConfig { tier4_enabled: false, ..cfg() }
     }
 
     fn read_pace(host_out: &Path) -> serde_json::Value {
@@ -1911,5 +2239,412 @@ mod tests {
         let ctx = serde_json::json!({ "workspace": "   ", "unit": "unit-1" });
         assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
         assert!(stop_file_unresolved_reason(Some(&ctx)).is_some());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // (#2774) The five-tier escalation ladder
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── Tier 2: duty-cycle entry/exit hysteresis ──
+
+    #[test]
+    fn duty_cycle_entry_requires_a_sustained_hold_at_fair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+
+        // 29 ticks * 2000ms = 58000ms < 60000ms hold — never enters.
+        for _ in 0..29 {
+            assert_eq!(gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None), None);
+        }
+        assert!(!pace_file_path(dir.path()).exists(), "no pace file until the hold completes");
+
+        // 30th tick crosses 60000ms — enters, with the CONFIGURED delay
+        // (never ratcheted yet).
+        assert_eq!(
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::DutyCycleEntered { state: "fair".to_string(), delay_ms: 15_000 })
+        );
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false), "duty-cycle is NOT a pause");
+        assert_eq!(pace["turn_delay_ms"], serde_json::json!(15_000));
+        assert_eq!(pace["reason"], serde_json::json!("thermal-duty-cycle"));
+    }
+
+    #[test]
+    fn duty_cycle_never_engages_below_resume_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..100 {
+            assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+        }
+        assert!(!pace_file_path(dir.path()).exists(), "nominal must never engage the duty cycle");
+    }
+
+    #[test]
+    fn a_tick_back_to_nominal_resets_the_duty_cycle_entry_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..29 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        // One nominal tick must reset the hold, not just pause it.
+        assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+        for _ in 0..29 {
+            assert_eq!(
+                gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None),
+                None,
+                "the hold restarted at the nominal tick — 58s of fair since then is not enough"
+            );
+        }
+        assert_eq!(
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::DutyCycleEntered { state: "fair".to_string(), delay_ms: 15_000 }),
+            "enters only after a FRESH continuous 60s hold"
+        );
+    }
+
+    #[test]
+    fn duty_cycle_exit_requires_a_sustained_hold_at_nominal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(read_pace(dir.path())["turn_delay_ms"], serde_json::json!(15_000));
+
+        for _ in 0..29 {
+            assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+        }
+        assert_eq!(
+            read_pace(dir.path())["turn_delay_ms"],
+            serde_json::json!(15_000),
+            "still duty-cycling — the exit hold has not completed"
+        );
+        assert_eq!(
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::DutyCycleExited { state: "nominal".to_string() })
+        );
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false));
+        assert!(
+            pace.get("turn_delay_ms").is_none(),
+            "leaving duty-cycle must not leave a stale turn_delay_ms behind: {pace}"
+        );
+    }
+
+    #[test]
+    fn a_tick_back_to_fair_resets_the_duty_cycle_exit_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        for _ in 0..29 {
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None), None);
+        for _ in 0..29 {
+            assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+        }
+        assert_eq!(
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::DutyCycleExited { state: "nominal".to_string() }),
+            "exits only after a FRESH continuous 60s hold at nominal"
+        );
+    }
+
+    #[test]
+    fn duty_cycle_heartbeats_the_pace_file_while_sustained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        let first_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        // restamp_interval_ms = max_pause_ms/4 = 225_000ms. Drive it past
+        // that with fair ticks (no transition — still duty-cycling).
+        let mut elapsed = 0u64;
+        while elapsed < 230_000 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+            elapsed += 2000;
+        }
+        let later_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert!(later_stamp >= first_stamp, "the heartbeat must keep re-stamping while duty-cycling");
+        assert_eq!(read_pace(dir.path())["turn_delay_ms"], serde_json::json!(15_000));
+    }
+
+    // ── Tier 3: the ratchet is one-way for the life of the run ──
+
+    /// (Mutation self-check target) If the ratchet were applied only ONCE
+    /// (e.g. gated on `serious_episodes == 1`) rather than on EVERY
+    /// recovery, this test would go red at the second doubling — proving
+    /// the "every recovery" clause is load-bearing, not just documented.
+    #[test]
+    fn the_ratchet_doubles_on_every_recovery_and_never_goes_back_down() {
+        let dir = tempfile::tempdir().unwrap();
+        // tier 4 disabled and a high threshold so this test can run several
+        // full pause/recover cycles without escalating to OperatorHold.
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled());
+        assert_eq!(gov.current_duty_delay_ms(), 15_000, "starts at the configured base");
+
+        // Cycle 1: serious -> resume_hold_ms of fair -> resume.
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(gov.current_duty_delay_ms(), 30_000, "doubled after the FIRST recovery");
+
+        // Cycle 2: back to serious, then recover again.
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(gov.current_duty_delay_ms(), 60_000, "doubled AGAIN after the SECOND recovery");
+
+        // Now drop all the way to nominal — the ratchet must NOT reset.
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(
+            gov.current_duty_delay_ms(),
+            60_000,
+            "recovering to full nominal must not restore the pre-doubling delay"
+        );
+    }
+
+    #[test]
+    fn a_ratchet_factor_of_one_holds_the_delay_steady() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ThermalGovernorConfig { ratchet_factor: 1, tier4_enabled: false, ..cfg() };
+        let mut gov = ThermalGovernor::new(cfg);
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(gov.current_duty_delay_ms(), 15_000, "a factor of 1 holds steady, doesn't grow");
+    }
+
+    #[test]
+    fn a_ratchet_factor_of_zero_is_coerced_to_one_not_zeroed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ThermalGovernorConfig { ratchet_factor: 0, tier4_enabled: false, ..cfg() };
+        let mut gov = ThermalGovernor::new(cfg);
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(
+            gov.current_duty_delay_ms(),
+            15_000,
+            "a configured 0 must never zero the delay — that would defeat the ratchet entirely"
+        );
+    }
+
+    #[test]
+    fn resume_lands_in_idle_when_the_recovering_sample_is_fully_nominal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled());
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        // Hold the resume window at NOMINAL (better than fair) so the
+        // recovering sample itself reads as fully cool.
+        for _ in 0..29 {
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(
+            gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Resumed { state: "nominal".to_string() })
+        );
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false));
+        assert!(
+            pace.get("turn_delay_ms").is_none(),
+            "landing in Idle must not carry a stray turn_delay_ms: {pace}"
+        );
+        // Confirm it's genuinely Idle, not DutyCycle: one more nominal tick
+        // must be a pure no-op (no re-stamp, no event).
+        assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+    }
+
+    #[test]
+    fn resume_lands_in_duty_cycle_when_the_recovering_sample_is_still_fair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled());
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false));
+        assert_eq!(
+            pace["turn_delay_ms"],
+            serde_json::json!(30_000),
+            "lands DIRECTLY in duty-cycle, at the already-ratcheted delay"
+        );
+    }
+
+    // ── Tier 4: the episode count is a TRANSITION, never a sample ──
+
+    /// (Mutation self-check target) If episode counting were driven by
+    /// SAMPLES at `serious` instead of the TRANSITION into it, this test
+    /// (100 consecutive ticks continuously at `serious`, never recovering)
+    /// would report `serious_episodes() == 100`, not `1`, and — with
+    /// `episode_threshold: 2` — would incorrectly escalate to
+    /// `OperatorHold` on the second tick rather than staying an ordinary
+    /// tier-3 pause for the entire sustained stretch.
+    #[test]
+    fn a_single_sustained_serious_stretch_is_exactly_one_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        let first = gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        assert_eq!(first, Some(ThermalEvent::Paused { state: "serious".to_string() }));
+        assert_eq!(gov.serious_episodes(), 1);
+        for _ in 0..100 {
+            let ev = gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+            assert_eq!(ev, None, "still the SAME episode — no transition, no event");
+            assert_eq!(gov.serious_episodes(), 1, "100 samples at serious is still ONE episode");
+        }
+    }
+
+    #[test]
+    fn the_nth_serious_episode_escalates_straight_to_operator_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg()); // episode_threshold: 2
+
+        // Episode 1: ordinary tier-3 pause + resume.
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Paused { state: "serious".to_string() })
+        );
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(gov.serious_episodes(), 1);
+
+        // Episode 2 (== episode_threshold): straight to OperatorHold, no
+        // ordinary Paused event at all.
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::OperatorHold { state: "serious".to_string(), episode: 2 })
+        );
+        assert_eq!(gov.serious_episodes(), 2);
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(true));
+        assert_eq!(pace["reason"], serde_json::json!("thermal-episode-limit"));
+    }
+
+    #[test]
+    fn operator_hold_never_auto_resumes_even_at_full_nominal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ThermalGovernorConfig { episode_threshold: 1, ..cfg() };
+        let mut gov = ThermalGovernor::new(cfg);
+        assert_eq!(
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::OperatorHold { state: "serious".to_string(), episode: 1 })
+        );
+        // Feed a LONG stretch of nominal — far past resume_hold_ms — and
+        // confirm it NEVER resumes automatically. Every tick heartbeats
+        // the SAME reason.
+        for _ in 0..100 {
+            assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
+        }
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(true), "OperatorHold never releases itself");
+        assert_eq!(pace["reason"], serde_json::json!("thermal-episode-limit"));
+    }
+
+    #[test]
+    fn episode_threshold_zero_means_unbounded_never_escalates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ThermalGovernorConfig { episode_threshold: 0, ..cfg() };
+        let mut gov = ThermalGovernor::new(cfg);
+        // Three full pause/recover cycles — never once escalates to
+        // OperatorHold, no matter how many episodes accumulate.
+        for _ in 0..3 {
+            let ev = gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+            assert!(matches!(ev, Some(ThermalEvent::Paused { .. })), "{ev:?}");
+            for _ in 0..30 {
+                gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+            }
+        }
+        assert_eq!(gov.serious_episodes(), 3, "count still accumulates — only the escalation is off");
+    }
+
+    #[test]
+    fn tier4_disabled_never_escalates_regardless_of_episode_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ThermalGovernorConfig { tier4_enabled: false, episode_threshold: 1, ..cfg() };
+        let mut gov = ThermalGovernor::new(cfg);
+        for _ in 0..3 {
+            let ev = gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+            assert!(
+                matches!(ev, Some(ThermalEvent::Paused { .. })),
+                "tier4_enabled=false must keep every episode an ordinary tier-3 pause: {ev:?}"
+            );
+            for _ in 0..30 {
+                gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn ladder_summary_reports_episodes_and_the_live_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled());
+        assert_eq!(gov.ladder_summary(), ThermalLadderSummary { serious_episodes: 0, current_duty_delay_ms: 15_000 });
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(
+            gov.ladder_summary(),
+            ThermalLadderSummary { serious_episodes: 1, current_duty_delay_ms: 30_000 }
+        );
+    }
+
+    // ── Tier 5: critical is unaffected by the ladder additions ──
+
+    #[test]
+    fn critical_still_trips_the_pre_existing_breaker_unconditionally() {
+        // The ladder's new tiers must never intercept `critical` — it goes
+        // straight to the SAME `Breaker` event tier 3/4 never touch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        assert_eq!(
+            gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Breaker { state: "critical".to_string() })
+        );
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["reason"], serde_json::json!("thermal-critical"));
+        assert!(pace.get("turn_delay_ms").is_none());
+    }
+
+    #[test]
+    fn critical_trips_immediately_even_mid_duty_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(
+            gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Breaker { state: "critical".to_string() })
+        );
+    }
+
+    // ── A reading gap (`None`) mid-duty-cycle: heartbeat, not a transition ──
+
+    #[test]
+    fn a_reading_gap_while_duty_cycling_keeps_the_heartbeat_alive_without_exiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        for _ in 0..30 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        // A gap must not be read as "recovered to nominal" — the exit hold
+        // resets, it doesn't advance toward exit.
+        assert_eq!(gov.on_sample(None, 2000, dir.path(), None), None);
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(false));
+        assert_eq!(pace["turn_delay_ms"], serde_json::json!(15_000), "the instruction survives the gap");
     }
 }

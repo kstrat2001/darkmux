@@ -5078,6 +5078,39 @@
         assert!(!crate::thermal_governor::pace_file_path(dir.path()).exists());
     }
 
+    // ─── (#2774 tier 5) checkpoint_is_fresh_since — the pure boundary the
+    // eject-wait loop decides on ───
+
+    #[test]
+    fn a_checkpoint_modified_after_the_trip_is_fresh() {
+        let trip = std::time::SystemTime::now();
+        let after = trip + std::time::Duration::from_millis(500);
+        assert!(super::checkpoint_is_fresh_since(Some(after), trip));
+    }
+
+    #[test]
+    fn a_checkpoint_modified_exactly_at_the_trip_counts_as_fresh() {
+        // `>=`, not `>` — a checkpoint write racing the breaker's own trip
+        // instant must not be treated as stale by a hair.
+        let trip = std::time::SystemTime::now();
+        assert!(super::checkpoint_is_fresh_since(Some(trip), trip));
+    }
+
+    #[test]
+    fn a_checkpoint_modified_before_the_trip_is_not_fresh() {
+        // A checkpoint from an EARLIER turn boundary — the runtime has not
+        // reached a fresh one since the breaker tripped.
+        let trip = std::time::SystemTime::now();
+        let before = trip - std::time::Duration::from_millis(500);
+        assert!(!super::checkpoint_is_fresh_since(Some(before), trip));
+    }
+
+    #[test]
+    fn no_checkpoint_at_all_is_not_fresh() {
+        let trip = std::time::SystemTime::now();
+        assert!(!super::checkpoint_is_fresh_since(None, trip));
+    }
+
     // ─── #1187: agentic-remote argv emission ─────────────────────
 
     #[test]
@@ -11531,6 +11564,7 @@ fn a_detection_reaches_the_envelope() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
@@ -11549,6 +11583,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["detections"].is_array(), "must be present: {out}");
@@ -11575,6 +11610,7 @@ fn bounds_argument_survives_into_the_envelope() {
         &no_extras(),
         no_findings_dir(),
         distinctive_bounds.clone(),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -11605,6 +11641,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
 }
@@ -11687,6 +11724,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
@@ -11709,6 +11747,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -11729,6 +11768,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
                 &no_extras(),
                 no_findings_dir(),
                 serde_json::json!({}),
+                crate::thermal_governor::ThermalLadderSummary::default(),
             ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
@@ -11842,6 +11882,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
@@ -11895,6 +11936,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &extras,
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
@@ -11917,6 +11959,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
     for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
@@ -11936,6 +11979,7 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["host"]["cpu"]["peak_pct"].is_number(), "the #2107 block still lands");
@@ -11958,6 +12002,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
@@ -12011,6 +12056,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         &no_extras(),
         td.path(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 3, "the caller's next action turns on this: {out}");
@@ -12032,6 +12078,7 @@ fn a_trailing_newline_is_not_a_finding() {
         &no_extras(),
         td.path(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 1, "records, not lines: {out}");
@@ -12051,6 +12098,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &no_extras(),
         no_findings_dir(),
     serde_json::json!({}),
+        crate::thermal_governor::ThermalLadderSummary::default(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
@@ -12595,7 +12643,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // Local alias so the guard-then-panic-then-capture pattern's
         // `Arc<Mutex<Option<JoinHandle<...>>>>` scaffolding doesn't trip
         // clippy's `type_complexity` lint.
-        type SamplerHandleSlot = Arc<Mutex<Option<thread::JoinHandle<(HostStats, HostExtras)>>>>;
+        type SamplerHandleSlot = Arc<
+            Mutex<Option<thread::JoinHandle<(HostStats, HostExtras, crate::thermal_governor::ThermalLadderSummary)>>>,
+        >;
 
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -13559,6 +13609,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             no_findings_dir(),
             serde_json::json!({}),
+            crate::thermal_governor::ThermalLadderSummary::default(),
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host_window"]["thermal_worst_state"], "serious");
@@ -13589,6 +13640,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             no_findings_dir(),
             serde_json::json!({}),
+            crate::thermal_governor::ThermalLadderSummary::default(),
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("host_window").is_none(), "unsampled must omit host_window, never zero it");
@@ -13631,6 +13683,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             &None,
             None,
+            crate::thermal_governor::ThermalLadderSummary::default(),
         );
         assert_eq!(
             payload["host_window"]["thermal_worst_state"], "serious",
@@ -13693,6 +13746,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             &None,
             None,
+            crate::thermal_governor::ThermalLadderSummary::default(),
         );
         assert_eq!(payload["prompt_tokens"], 100);
         assert_eq!(payload["completion_tokens"], 600);
@@ -13743,6 +13797,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             &None,
             None,
+            crate::thermal_governor::ThermalLadderSummary::default(),
         );
         assert_eq!(payload["result_class"], "error");
         assert_eq!(payload["endpoint"], "azure/gpt-x");
@@ -13773,6 +13828,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             &None,
             None,
+            crate::thermal_governor::ThermalLadderSummary::default(),
         );
         assert!(
             payload.get("host_window").is_none(),

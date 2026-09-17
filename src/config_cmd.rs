@@ -165,6 +165,12 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.thermal.max_pause_ms", Ty::Uint),
     ("runtime.thermal.min_cpu_speed_limit_pct", Ty::Uint),
     ("runtime.thermal.speed_limit_hold_samples", Ty::Uint),
+    // (#2774) Tiers 2-4 of the operator's thermal escalation ladder — see
+    // `ThermalConfig`'s own field docs.
+    ("runtime.thermal.duty_delay_ms", Ty::Uint),
+    ("runtime.thermal.ratchet_factor", Ty::Uint),
+    ("runtime.thermal.episode_threshold", Ty::Uint),
+    ("runtime.thermal.tier4_enabled", Ty::Bool),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
@@ -790,6 +796,30 @@ mod tests {
         assert!(get_at(f.path(), "runtime.thermal.pause_at").unwrap().contains("serious"));
         set_at(f.path(), "runtime.thermal.resume_at", "fair").unwrap();
         assert!(get_at(f.path(), "runtime.thermal.resume_at").unwrap().contains("fair"));
+    }
+
+    #[test]
+    fn thermal_ladder_keys_are_settable_and_typed() {
+        // (#2774) The escalation ladder's own knobs — same registry-driven
+        // path the pre-existing thermal keys use, no bespoke plumbing.
+        let f = tmp();
+        set_at(f.path(), "runtime.thermal.duty_delay_ms", "20000").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.duty_delay_ms").unwrap().contains("20000"));
+        set_at(f.path(), "runtime.thermal.ratchet_factor", "3").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.ratchet_factor").unwrap().contains('3'));
+        set_at(f.path(), "runtime.thermal.episode_threshold", "0").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.episode_threshold").unwrap().contains('0'));
+        set_at(f.path(), "runtime.thermal.tier4_enabled", "false").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.tier4_enabled").unwrap().contains("false"));
+
+        assert!(
+            set_at(f.path(), "runtime.thermal.duty_delay_ms", "not-a-number").is_err(),
+            "still typed as Ty::Uint — a non-numeric value must be rejected"
+        );
+        assert!(
+            set_at(f.path(), "runtime.thermal.tier4_enabled", "yes").is_err(),
+            "still typed as Ty::Bool — strict true/false"
+        );
     }
 
     #[test]

@@ -672,6 +672,35 @@ pub struct ThermalConfig {
     /// not a sustained condition. Does NOT apply to the `critical` state
     /// check, which still trips immediately. Default `3`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub speed_limit_hold_samples: Option<u32>,
+    /// (#2774 tier 2) Base duty-cycle turn delay (ms) applied between turns
+    /// once the state has held at or above `resume_at` (and below
+    /// `pause_at`) for `resume_hold_ms` — the SAME hysteresis hold used to
+    /// clear a pause, reused here for symmetry rather than adding a second
+    /// hold knob for what is conceptually the same "sustained at fair"
+    /// question. Default `15000` (15s), per the operator's own suggestion.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub duty_delay_ms: Option<u64>,
+    /// (#2774 tier 3) Multiplier applied to the duty-cycle delay every time
+    /// a `serious` episode recovers back to `resume_at` — one-way for the
+    /// life of the run; recovering never restores the pre-doubling value.
+    /// Default `2`. A configured `0` is coerced to `1` (no growth) rather
+    /// than zeroing the delay on the first escalation, which would defeat
+    /// the ratchet entirely — see `thermal_ratchet_factor`'s own doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub ratchet_factor: Option<u32>,
+    /// (#2774 tier 4) How many `serious` EPISODES (transitions into
+    /// `serious`, not samples at it) this run tolerates before the Nth one
+    /// escalates straight to an indefinite, operator-gated pause instead of
+    /// the ordinary tier-3 pause/resume. Default `2`. `0` means unbounded —
+    /// never escalate to tier 4 — matching darkmux's existing convention
+    /// that a `0` bound means unbounded, never "instantly" (see
+    /// `runtime.step_command_timeout_seconds`'s own doc for the same rule
+    /// applied elsewhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub episode_threshold: Option<u32>,
+    /// (#2774 tier 4) Whether the episode-count escalation is active at
+    /// all. `false` keeps tiers 1-3 (and the pre-existing tier-5-adjacent
+    /// breaker) exactly as before, with every `serious` episode handled as
+    /// an ordinary tier-3 pause/resume regardless of how many have
+    /// happened this run. Default `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub tier4_enabled: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1283,6 +1312,12 @@ impl DarkmuxConfig {
                     max_pause_ms: Some(900_000),
                     min_cpu_speed_limit_pct: Some(50),
                     speed_limit_hold_samples: Some(3),
+                    // (#2774) Tiers 2-4 of the operator's thermal escalation
+                    // ladder — see `ThermalConfig`'s own field docs.
+                    duty_delay_ms: Some(15_000),
+                    ratchet_factor: Some(2),
+                    episode_threshold: Some(2),
+                    tier4_enabled: Some(true),
                     extras: Default::default(),
                 }),
                 // (#2653) Visible `168` (7 days) — the built-in default,

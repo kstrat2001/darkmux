@@ -51,6 +51,16 @@ struct PaceFile<'a> {
     reason: &'a str,
     state: String,
     written_at_ms: u64,
+    /// (#2774 tier 2) The pace file's THIRD state, between plain "run" and
+    /// "pause": a host-set turn delay the runtime applies at the next turn
+    /// boundary (through its own budget clamp) instead of blocking
+    /// entirely. Absent on every write that carries no duty-cycle
+    /// instruction — a plain pause, a plain resume, or a governor build
+    /// that predates this field — which the runtime-side reader treats
+    /// identically to `None` (see `runtime/src/pace.rs`'s own
+    /// `turn_delay_ms` field doc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_delay_ms: Option<u64>,
 }
 
 /// UNIX epoch milliseconds. `0` on the vanishingly rare
@@ -79,7 +89,23 @@ fn now_epoch_ms() -> u64 {
 /// runtime treats it as opaque text it echoes back, so a new governor adds
 /// a word without a cross-crate type change.
 pub(crate) fn write(host_out: &Path, pause: bool, reason: &str, state: &str) {
-    let pace = PaceFile { pause, reason, state: state.to_string(), written_at_ms: now_epoch_ms() };
+    write_with_turn_delay(host_out, pause, reason, state, None)
+}
+
+/// (#2774 tier 2) Same atomic write as [`write`], plus the pace file's
+/// third state: a host-set turn delay (`turn_delay_ms`), for a writer that
+/// wants the runtime to keep working but pace itself between turns rather
+/// than stop outright. `write` is a thin `None` alias over this so its nine
+/// existing call sites (pure pause/resume) never had to change shape.
+pub(crate) fn write_with_turn_delay(
+    host_out: &Path,
+    pause: bool,
+    reason: &str,
+    state: &str,
+    turn_delay_ms: Option<u64>,
+) {
+    let pace =
+        PaceFile { pause, reason, state: state.to_string(), written_at_ms: now_epoch_ms(), turn_delay_ms };
     let _ = std::fs::create_dir_all(host_out);
     let Ok(json) = serde_json::to_string(&pace) else { return };
     // Unique per-write tmp name (pid + epoch-ns) — with two governors now
@@ -132,6 +158,28 @@ mod tests {
             .filter(|n| n.starts_with(".pace.json.tmp."))
             .collect();
         assert!(leftovers.is_empty(), "the rename must consume the temp file: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_with_turn_delay_carries_the_third_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_with_turn_delay(dir.path(), false, "thermal-duty-cycle", "fair", Some(15_000));
+        let raw = std::fs::read_to_string(path(dir.path())).expect("pace file written");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(v["pause"], false, "duty-cycle is NOT a pause");
+        assert_eq!(v["turn_delay_ms"], 15_000);
+    }
+
+    #[test]
+    fn plain_write_omits_turn_delay_ms_entirely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), true, "thermal", "serious");
+        let raw = std::fs::read_to_string(path(dir.path())).expect("pace file written");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert!(
+            v.get("turn_delay_ms").is_none(),
+            "an ordinary pause/resume write must not carry a stale or spurious turn_delay_ms key: {raw}"
+        );
     }
 
     #[test]

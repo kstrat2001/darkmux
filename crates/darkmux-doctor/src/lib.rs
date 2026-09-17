@@ -3139,6 +3139,14 @@ fn check_thermal_governor() -> Check {
     let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
     let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
     let speed_limit_hold_samples = darkmux_types::config_access::thermal_speed_limit_hold_samples();
+    // (#2774) The escalation ladder's own three tier-2/3/4 knobs — surfaced
+    // in the Pass message below so `darkmux doctor` answers "what would
+    // actually happen" for the whole ladder, not just the pre-existing
+    // pause/breaker half of it.
+    let duty_delay_ms = darkmux_types::config_access::thermal_duty_delay_ms();
+    let ratchet_factor = darkmux_types::config_access::thermal_ratchet_factor();
+    let episode_threshold = darkmux_types::config_access::thermal_episode_threshold();
+    let tier4_enabled = darkmux_types::config_access::thermal_tier4_enabled();
 
     // (#2110/#2109 review finding 6) `darkmux config set` rejects an
     // unrecognized thermal-state token going forward, but a hand-edited
@@ -3195,13 +3203,44 @@ fn check_thermal_governor() -> Check {
         };
     }
 
+    // (#2774) Same shape as the speed-limit-hold-samples check above: a
+    // configured `0` doesn't achieve "no growth" — it's silently coerced to
+    // `1` by `thermal_ratchet_factor`'s own `.max(1)` floor, because a
+    // literal `0` would ZERO the duty-cycle delay on the very first
+    // `serious` recovery, defeating the ratchet's whole purpose (each
+    // recovery should be MORE cautious than the last, never less).
+    let ratchet_factor_raw = darkmux_types::config_access::thermal_ratchet_factor_raw();
+    if ratchet_factor_raw == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: "runtime.thermal.ratchet_factor is 0 — coerced to 1 (the duty-cycle delay \
+                       holds steady across a `serious` recovery instead of growing). A literal \
+                       0 would zero the delay on the first escalation, which is never the \
+                       intent; use 1 explicitly if \"don't grow it\" is what you want."
+                .to_string(),
+            hint: Some("darkmux config set runtime.thermal.ratchet_factor 1".to_string()),
+        };
+    }
+
     Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
             "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
              {resume_hold_ms}ms, breaker after {max_pause_ms}ms of one pause episode or \
-             {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < {min_cpu}%"
+             {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < {min_cpu}%; \
+             duty-cycle at `{resume_at}` starts at {duty_delay_ms}ms and ratchets x{ratchet_factor} \
+             per `serious` recovery; tier 4 (indefinite, operator-gated pause) {}",
+            if tier4_enabled {
+                if episode_threshold == 0 {
+                    "enabled but unbounded (episode_threshold=0 — never escalates)".to_string()
+                } else {
+                    format!("enabled after {episode_threshold} `serious` episode(s)")
+                }
+            } else {
+                "disabled".to_string()
+            }
         ),
         hint: None,
     }

@@ -1895,39 +1895,39 @@ fn render_residents(
 }
 
 fn cmd_model_eject(dry_run: bool) -> Result<i32> {
-    let loaded = lms::list_loaded()?;
-    let managed: Vec<_> = loaded
-        .iter()
-        .filter(|m| swap::is_darkmux_owned(&m.identifier))
-        .collect();
-    let user_count = loaded.len() - managed.len();
-    if managed.is_empty() {
+    // (#2774 tier 5) `swap::eject_all_managed` is the one unloader now —
+    // the thermal breaker's tier-5 hard-stop calls the SAME function
+    // rather than a second copy of this filter+unload loop. One
+    // `lms::list_loaded()` call total: `summary.user_loaded_count` already
+    // carries what the old "nothing to eject" message needed, so there is
+    // no separate peek to keep in sync with it.
+    let summary = swap::eject_all_managed(dry_run)?;
+    if summary.ejected.is_empty() {
         println!("no darkmux-managed loads to eject");
-        if user_count > 0 {
+        if summary.user_loaded_count > 0 {
             println!(
                 "({} user-loaded model(s) untouched — use `lms unload <identifier>` for those)",
-                user_count
+                summary.user_loaded_count
             );
         }
         return Ok(0);
     }
-    for m in &managed {
+    for m in &summary.ejected {
         if dry_run {
             println!("would eject {} (ctx={})", m.identifier, m.context);
         } else {
             println!("eject {} (ctx={})", m.identifier, m.context);
-            lms::unload(&m.identifier)?;
         }
     }
     let verb = if dry_run { "would eject" } else { "ejected" };
-    let mut summary = format!("{verb} {} model(s)", managed.len());
-    if user_count > 0 {
-        summary.push_str(&format!(", respected {user_count} user-loaded model(s)"));
+    let mut line = format!("{verb} {} model(s)", summary.ejected.len());
+    if summary.user_loaded_count > 0 {
+        line.push_str(&format!(", respected {} user-loaded model(s)", summary.user_loaded_count));
     }
     if dry_run {
-        summary.push_str(" [DRY RUN]");
+        line.push_str(" [DRY RUN]");
     }
-    println!("{summary}");
+    println!("{line}");
     Ok(0)
 }
 
