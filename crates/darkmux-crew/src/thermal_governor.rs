@@ -150,6 +150,27 @@ use std::time::{Instant, SystemTime};
 // need one: `SoftReading::of` returns `None` for exactly the readings the
 // breaker owns (`critical`, and any name this build does not recognize), so
 // `on_sample` matches on that `None` rather than ranking anything.
+//
+// (#2774 round-8) The breaker's own two NUMERIC thresholds are therefore
+// outside what `ThermalBands` can make unrepresentable, and each has a
+// degenerate end that has to be handled somewhere else:
+//
+// - `max_pause_ms = 0` is UNBOUNDED, handled here in
+//   `pause_episode_exhausted` (round-6 MF2) and substituted for the knob's
+//   other role in `config_access::thermal_pace_staleness_ceiling_ms`.
+// - `min_cpu_speed_limit_pct` degenerates at BOTH ends, and UPWARD is the
+//   direction that kept this class open: `0` disables the floor (`pct < 0`
+//   is unsatisfiable) and anything above `100` makes it tautological,
+//   because `cpu_speed_limit_pct` is a percentage whose "no cap recorded"
+//   reading is exactly 100 — so every sample of every dispatch trips the
+//   breaker on a cold machine.
+//
+// Neither is clamped: the operator owns the value (#44), and `0` has a
+// defined meaning at both knobs. What closes the class instead is that
+// `darkmux doctor` states what each degenerate value WILL DO rather than
+// interpolating the number into a sentence describing a trigger that
+// cannot fire (`check_thermal_governor`), and the boundary sweep in this
+// module's tests enumerates every one of these values against the readings.
 
 /// `<host_out>/pace.json`, re-exported from [`crate::pace_file`] — this
 /// module was the pace file's only writer until #2706 added the battery
@@ -2371,6 +2392,67 @@ mod tests {
         );
     }
 
+    /// (#2774 round-8) The DEFAULT-substitution inside
+    /// [`ThermalGovernor::restamp_interval_ms`], which round 6 added with
+    /// no test of its own: reverting it to the bare
+    /// `(self.config.max_pause_ms / 4).max(1)` left 2443/2443 green.
+    ///
+    /// At `max_pause_ms = 0` — an UNBOUNDED episode, the config on which a
+    /// pause lasts LONGEST — the bare form yields `(0 / 4).max(1)` = **1
+    /// ms**, so every single sampler tick re-stamps the pace file for the
+    /// life of the pause. Measured: a 225 000 ms heartbeat gap collapsing
+    /// to one write per 2 s tick, ~113x the writes, potentially for hours.
+    /// Correctness survives (an over-eager heartbeat still holds the
+    /// pause), which is exactly why nothing caught it.
+    ///
+    /// Both halves are pinned: the interval arithmetic directly, and the
+    /// behavior it buys — an unbounded pause does not rewrite the file on
+    /// every tick.
+    #[test]
+    fn an_unbounded_max_pause_restamps_on_the_default_cadence_not_every_tick() {
+        let unbounded = ThermalGovernor::new(ThermalGovernorConfig { max_pause_ms: 0, ..cfg() });
+        assert_eq!(
+            unbounded.restamp_interval_ms(),
+            darkmux_types::config_access::THERMAL_MAX_PAUSE_MS_DEFAULT / 4,
+            "`0` is an unbounded EPISODE, not a zero staleness ceiling — the heartbeat cadence \
+             must fall back to the same default `thermal_pace_staleness_ceiling_ms` forwards to \
+             the container, so host and runtime agree on the window"
+        );
+        assert_ne!(
+            unbounded.restamp_interval_ms(),
+            1,
+            "`(0 / 4).max(1)` — the bare form this substitution replaced — busy-restamps every \
+             tick for the whole life of the longest possible pause"
+        );
+
+        // The finite case is unchanged, pinned so the substitution cannot
+        // be "fixed" by ignoring the configured value entirely.
+        let finite =
+            ThermalGovernor::new(ThermalGovernorConfig { max_pause_ms: 100_000, ..cfg() });
+        assert_eq!(finite.restamp_interval_ms(), 25_000);
+
+        // ── Behavioral half: no rewrite per tick during an unbounded pause.
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(ThermalGovernorConfig { max_pause_ms: 0, ..cfg() });
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let first_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+
+        // 20 further sampler ticks — 40 000 accounted ms, an order of
+        // magnitude inside the 225 000 ms cadence, and a real elapsed wall
+        // time (the `real_age_past_interval` half of the same condition)
+        // of well under a second. Nothing here has earned a re-stamp.
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(
+            read_pace(dir.path())["written_at_ms"].as_u64().unwrap(),
+            first_stamp,
+            "an unbounded pause must heartbeat on the default cadence, not rewrite the pace \
+             file on every sampler tick"
+        );
+    }
+
     // ── N1 (final re-check): real age, not accounted ticks ──
 
     #[test]
@@ -3977,6 +4059,18 @@ mod tests {
             ("speed_limit_hold_samples=1", |c| c.speed_limit_hold_samples = 1),
             ("speed_limit_hold_samples=MAX", |c| c.speed_limit_hold_samples = u32::MAX),
             ("min_cpu_speed_limit_pct=0", |c| c.min_cpu_speed_limit_pct = 0),
+            // (#2774 round-8) The two values either side of this knob's
+            // real ceiling. `cpu_speed_limit_pct` is a percentage whose
+            // "no cap recorded" reading is 100, so `100` is the top
+            // SATISFIABLE floor and `101` is the first tautological one —
+            // the degenerate end nobody had enumerated because this is the
+            // one knob in the block that degenerates UPWARD. `darkmux
+            // doctor` now warns above 100 (it is the operator's value, so
+            // it is not clamped); the governor's own behavior at both is
+            // pinned here, and the `speed_floor_trips` allowance below is
+            // what keeps 101's earned breaker from reading as manufactured.
+            ("min_cpu_speed_limit_pct=100", |c| c.min_cpu_speed_limit_pct = 100),
+            ("min_cpu_speed_limit_pct=101", |c| c.min_cpu_speed_limit_pct = 101),
             ("min_cpu_speed_limit_pct=MAX", |c| c.min_cpu_speed_limit_pct = u64::MAX),
         ];
 

@@ -3148,6 +3148,44 @@ fn check_thermal_governor() -> Check {
     let episode_threshold = darkmux_types::config_access::thermal_episode_threshold();
     let tier4_enabled = darkmux_types::config_access::thermal_tier4_enabled();
 
+    // (#2774 round-8 MF1) The breaker's two CONFIGURABLE triggers, rendered
+    // by what they DO at their degenerate values rather than by
+    // interpolating the raw number into a sentence that then describes a
+    // trigger which cannot fire.
+    //
+    // Both knobs degenerate, in opposite directions, and both used to be
+    // spelled out raw here:
+    //
+    // - `max_pause_ms = 0` means an UNBOUNDED episode (round-6 MF2 —
+    //   `pause_episode_exhausted` returns `false` forever at `0`), so the
+    //   handoff never happens. Interpolated raw, doctor said "breaker after
+    //   0ms of one pause episode" — the exact opposite, and in the same
+    //   sentence where `episode_threshold = 0` IS correctly spelled out as
+    //   unbounded.
+    // - `min_cpu_speed_limit_pct = 0` disables the floor outright (the
+    //   comparison is `pct < floor` and no reading is below zero — the
+    //   honest reading of "no floor", and why the knob is not clamped; see
+    //   `docs/ENVIRONMENT.md`). Interpolated raw, doctor said "3
+    //   consecutive samples with cpu_speed_limit_pct < 0%".
+    //
+    // An operator who sets either one runs `doctor` to confirm what would
+    // actually happen — that is what this surface is for (#44) — and was
+    // told a false thing about their own config.
+    let episode_handoff_clause = if max_pause_ms == 0 {
+        "never from a pause episode (max_pause_ms=0 — unbounded, rest as long as it takes)"
+            .to_string()
+    } else {
+        format!("after {max_pause_ms}ms of one pause episode")
+    };
+    let cpu_floor_clause = if min_cpu == 0 {
+        "never from the CPU floor (min_cpu_speed_limit_pct=0 — no reading is below 0%)".to_string()
+    } else {
+        format!(
+            "after {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < \
+             {min_cpu}%"
+        )
+    };
+
     // (#2774 round-4) EVERY arming verdict comes from the same value the
     // GOVERNOR runs on: `ThermalBands`, whose only band constructor
     // refuses a band no reading can satisfy and one that every reading
@@ -3188,8 +3226,7 @@ fn check_thermal_governor() -> Check {
             status: Status::Warn,
             message: format!(
                 "{} DISARMED — {} The breaker is unaffected and still runs: an OS-reported \
-                 `critical` state, and {speed_limit_hold_samples} consecutive samples with \
-                 cpu_speed_limit_pct < {min_cpu}%.",
+                 `critical` state (immediate, always), and {cpu_floor_clause}.",
                 bands
                     .disarm_notes()
                     .iter()
@@ -3264,13 +3301,43 @@ fn check_thermal_governor() -> Check {
         };
     }
 
+    // (#2774 round-8) The same degenerate-threshold class as the two
+    // warnings above, at the one knob whose comparison degenerates UPWARD
+    // rather than downward — which is why the family had a hole here.
+    // `cpu_speed_limit_pct` is a percentage, and `100` is what the probe
+    // reports when no cap is recorded at all, so a floor ABOVE 100 makes
+    // `pct < floor` true of every reading a healthy machine produces: the
+    // breaker trips on the `speed_limit_hold_samples`'th sample of EVERY
+    // dispatch and drops a `thermal-critical` STOP file on a cold machine
+    // — a state word naming something that never happened, the same
+    // failure round-6 MF2 ended at the other end of the range.
+    // Warned rather than clamped, consistent with its siblings and with
+    // `min_cpu = 0`'s own documented "no floor" reading: the operator owns
+    // the value, doctor says what it will do (#44).
+    if min_cpu > 100 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "runtime.thermal.min_cpu_speed_limit_pct is {min_cpu}, above the 100% ceiling of \
+                 the reading it is compared against (`cpu_speed_limit_pct`, where 100 means no \
+                 cap recorded). Every sample is below this floor, so EVERY dispatch trips the \
+                 breaker after its first {speed_limit_hold_samples} samples and drops a \
+                 `thermal-critical` STOP file on a cold machine. Use a value in 1..=100, or 0 to \
+                 disable the floor and leave the `critical`-state check as the only breaker \
+                 trigger."
+            ),
+            hint: Some("darkmux config set runtime.thermal.min_cpu_speed_limit_pct 50".to_string()),
+        };
+    }
+
     Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
             "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
-             {resume_hold_ms}ms, breaker after {max_pause_ms}ms of one pause episode or \
-             {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < {min_cpu}%; \
+             {resume_hold_ms}ms; breaker on an OS-reported `critical` state (immediate, always), \
+             {episode_handoff_clause}, and {cpu_floor_clause}; \
              duty-cycle at `{resume_at}` starts at {duty_delay_ms}ms and ratchets x{ratchet_factor} \
              per `serious` recovery; tier 4 (indefinite, operator-gated pause) {}",
             if tier4_enabled {
@@ -9761,6 +9828,185 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_THERMAL_RESUME_AT"),
             }
         }
+    }
+
+    /// Restores one env var to its prior value on drop — the #2774
+    /// round-8 tests below each mutate two or three of them and every
+    /// early `assert!` between the set and the restore would otherwise
+    /// leak the mutation into the next `#[serial]` test in this module.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: every caller is `#[serial_test::serial]`.
+            unsafe { std::env::set_var(key, value) };
+            EnvGuard { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller is `#[serial_test::serial]`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// (#2774 round-8 MF1, first half) `max_pause_ms = 0` means an
+    /// UNBOUNDED episode — `pause_episode_exhausted` returns `false`
+    /// forever at `0`, so the breaker never takes the handoff. Doctor
+    /// interpolated the raw number and told the operator the opposite:
+    /// "breaker after 0ms of one pause episode", in the same sentence
+    /// where `episode_threshold = 0` was correctly spelled out as
+    /// unbounded.
+    #[test]
+    #[serial_test::serial]
+    fn a_zero_max_pause_ms_reads_as_unbounded_not_as_an_instant_handoff() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _max = EnvGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", "0");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            !check.message.contains("after 0ms"),
+            "doctor must not claim a handoff that `pause_episode_exhausted` makes unreachable: \
+             {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("never from a pause episode")
+                && check.message.contains("max_pause_ms=0"),
+            "…it must say the handoff never happens, and name the knob that decided it: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-8 MF1, second half) `min_cpu_speed_limit_pct = 0`
+    /// disables the CPU-floor trigger outright — the comparison is
+    /// `pct < floor` and no reading is below zero. Doctor rendered it as
+    /// "3 consecutive samples with cpu_speed_limit_pct < 0%", a condition
+    /// no sample can satisfy, described as a live trigger.
+    #[test]
+    #[serial_test::serial]
+    fn a_zero_cpu_floor_reads_as_disabled_not_as_a_live_sub_zero_trigger() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "0");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            !check.message.contains("< 0%"),
+            "doctor must not print an unsatisfiable comparison as a trigger: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("never from the CPU floor")
+                && check.message.contains("min_cpu_speed_limit_pct=0"),
+            "…it must say the floor is off, and name the knob that decided it: {}",
+            check.message
+        );
+        // …and must still say what DOES run, or "never / never" reads as
+        // "no breaker at all" — which is false: the `critical`-state check
+        // is unconditional.
+        assert!(
+            check.message.contains("`critical` state (immediate, always)"),
+            "the one unconditional breaker trigger must survive both disables: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-8 MF1) The NON-degenerate rendering, pinned so the
+    /// branch above cannot be "fixed" by making every config read as
+    /// disabled. A shipped-default pair must still name both live
+    /// triggers with their actual numbers.
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_breaker_values_still_render_as_live_triggers_with_their_numbers() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+        let _max = EnvGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", "900000");
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "50");
+        let _hold = EnvGuard::set("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "3");
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("after 900000ms of one pause episode"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check.message.contains("after 3 consecutive samples with cpu_speed_limit_pct < 50%"),
+            "{}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("never from"),
+            "no trigger is disabled in this config: {}",
+            check.message
+        );
+    }
+
+    /// (#2774 round-8) The one knob that degenerates UPWARD.
+    /// `cpu_speed_limit_pct` is a percentage whose "no cap recorded"
+    /// reading is 100, so a floor above 100 makes `pct < floor` true of
+    /// every sample: the breaker trips on the `speed_limit_hold_samples`th
+    /// sample of EVERY dispatch and drops a `thermal-critical` STOP file
+    /// on a cold machine. `darkmux config set … 500` accepted it silently
+    /// and doctor reported **Pass**.
+    #[test]
+    #[serial_test::serial]
+    fn a_cpu_floor_above_100_warns_that_every_sample_trips_the_breaker() {
+        let _enabled = EnvGuard::set("DARKMUX_THERMAL_ENABLED", "true");
+        let _pause = EnvGuard::set("DARKMUX_THERMAL_PAUSE_AT", "serious");
+        let _resume = EnvGuard::set("DARKMUX_THERMAL_RESUME_AT", "fair");
+
+        for value in ["101", "500"] {
+            let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", value);
+            let check = check_thermal_governor();
+            assert_eq!(check.status, Status::Warn, "floor={value}: {}", check.message);
+            assert!(
+                check.message.contains("min_cpu_speed_limit_pct") && check.message.contains(value),
+                "floor={value}: the warning must name the knob and the value in force: {}",
+                check.message
+            );
+            assert!(
+                check.message.contains("EVERY dispatch"),
+                "floor={value}: …and what it will actually do: {}",
+                check.message
+            );
+            assert!(
+                check.hint.as_deref().is_some_and(|h| h.contains("min_cpu_speed_limit_pct")),
+                "floor={value}: the remedy must point at the knob that is wrong: {:?}",
+                check.hint
+            );
+        }
+
+        // 100 is the TOP legal value, not a degenerate one: `pct < 100` is
+        // satisfiable (a throttled machine reads below 100) and a machine
+        // with no cap recorded reads exactly 100, which is NOT below it.
+        // Pinned so the guard above cannot drift down onto a real setting.
+        let _floor = EnvGuard::set("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", "100");
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Pass, "floor=100: {}", check.message);
+        assert!(
+            check.message.contains("cpu_speed_limit_pct < 100%"),
+            "floor=100: {}",
+            check.message
+        );
     }
 
     #[test]
