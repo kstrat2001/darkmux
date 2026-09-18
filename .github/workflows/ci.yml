@@ -78,7 +78,13 @@ jobs:
   build-test-lint:
     name: build + test + lint (macos-latest)
     runs-on: macos-latest
-    timeout-minutes: 15
+    # (#2790) Raised 15 -> 25. The 15-minute bound was measured at ~14m25s on
+    # 2026-09-17 — 35 seconds of headroom — and the very next change to the root
+    # binary crate tripped it: PR #2791 was CANCELLED at exactly 15m01s with no
+    # step having failed, which `gh pr checks` renders indistinguishably from a
+    # real test failure. A timeout this tight stops being a runaway guard and
+    # becomes a coin flip on job scheduling; 25 still bounds a genuine hang.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
