@@ -143,10 +143,43 @@ pub fn soft_trim_body(body: &str) -> Option<String> {
     Some(format!("{head}{marker}{tail}"))
 }
 
-/// Walk the transcript and soft-trim every OLD oversized tool-result body.
-/// The last [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages are skipped so
-/// the active thread stays intact. Mutates in place; returns what it
-/// reclaimed for the caller's observability. (#1391)
+/// (#2792) Elide a body's middle down toward `floor_bytes`, keeping a head
+/// and tail around the same marker [`soft_trim_body`] uses.
+///
+/// Split out so the HARD path can choose its own floor. `soft_trim_body`
+/// hard-codes the #1391 constants, which are tuned for "never disturb an
+/// ordinary short result" — a correct goal for the soft pass and the exact
+/// reason the hard pass reclaimed nothing on a thread made entirely of
+/// medium-sized results.
+///
+/// Returns `None` only when the body is already elided (idempotent) or is too
+/// small for head + marker + tail to be shorter than what it replaces.
+pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
+    if body.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL) {
+        return None;
+    }
+    // Split the floor between head and tail, leaving room for the marker.
+    let side = floor_bytes.saturating_sub(200) / 2;
+    if side == 0 {
+        return None;
+    }
+    let head_end = floor_char_boundary(body, side);
+    let tail_start = ceil_char_boundary(body, body.len().saturating_sub(side));
+    if head_end >= tail_start {
+        return None;
+    }
+    let elided = tail_start - head_end;
+    let head = &body[..head_end];
+    let tail = &body[tail_start..];
+    let marker = elision_marker(elided, head_end, body.len() - tail_start);
+    let out = format!("{head}{marker}{tail}");
+    // Only worth it if it actually shrinks.
+    if out.len() >= body.len() {
+        return None;
+    }
+    Some(out)
+}
+
 /// (#2792) LAST-RESORT trim to bring an assembled prompt under a hard
 /// context-window bound, overriding the recent-window protection that
 /// [`soft_trim_old_tool_results`] deliberately honors.
@@ -173,7 +206,11 @@ pub fn soft_trim_body(body: &str) -> Option<String> {
 /// reclaimed; a caller that gets `results_trimmed == 0` on an over-window
 /// thread has a thread whose weight is NOT in tool results and must say so
 /// rather than pretend it acted.
-pub fn hard_trim_to_fit(messages: &mut [Message], target_bytes: usize) -> ToolTrimStats {
+pub fn hard_trim_to_fit(
+    messages: &mut [Message],
+    target_bytes: usize,
+    min_body_bytes: usize,
+) -> ToolTrimStats {
     let mut stats = ToolTrimStats::default();
     let mut current: usize = messages
         .iter()
@@ -206,11 +243,24 @@ pub fn hard_trim_to_fit(messages: &mut [Message], target_bytes: usize) -> ToolTr
         if current <= target_bytes {
             break;
         }
+        // `candidates` was built by `filter_map` on `content.as_ref()` and
+        // nothing clears a body in between, so this is always `Some`.
         let Some(body) = messages[idx].content.as_deref() else {
             continue;
         };
-        let Some(trimmed) = soft_trim_body(body) else {
-            continue; // already trimmed, or too small to be worth it
+        // (#2792 round-2) Do NOT delegate the floor to `soft_trim_body`. Its
+        // 4,000-byte threshold was chosen for the SOFT path's purpose —
+        // "ordinary short results are never disturbed" — which is right for
+        // delaying a compaction and wrong for a last-resort bound. Measured:
+        // 40 results of 3,000 bytes each, 120,000 bytes against a 32,000
+        // budget, reclaimed ZERO and sent the lot, because no single body
+        // cleared 4,000. That is the modal long-agentic shape (many grep /
+        // read / bash outputs), not a corner.
+        if body.len() <= min_body_bytes {
+            continue;
+        }
+        let Some(trimmed) = trim_body_to(body, min_body_bytes) else {
+            continue; // already trimmed
         };
         let reclaimed = body.len().saturating_sub(trimmed.len());
         messages[idx].content = Some(trimmed);
@@ -221,6 +271,10 @@ pub fn hard_trim_to_fit(messages: &mut [Message], target_bytes: usize) -> ToolTr
     stats
 }
 
+/// Walk the transcript and soft-trim every OLD oversized tool-result body.
+/// The last [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages are skipped so
+/// the active thread stays intact. Mutates in place; returns what it
+/// reclaimed for the caller's observability. (#1391)
 pub fn soft_trim_old_tool_results(messages: &mut [Message]) -> ToolTrimStats {
     let n = messages.len();
     let protect_from = n.saturating_sub(TOOL_RESULT_TRIM_PRESERVE_RECENT);
