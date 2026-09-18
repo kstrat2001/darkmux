@@ -2009,8 +2009,15 @@ fn run_with_sleeper(
                 trim_stats.results_trimmed, trim_stats.bytes_reclaimed
             );
         }
-        let (sys_chars, prompt_chars) = measure_request_context(&messages);
-        let resume_estimate_tokens = ((sys_chars + prompt_chars) / 4) as u32;
+        // (#2792) The same occupancy measure the main loop uses. This path
+        // was ALREADY correct — it has always measured the current thread
+        // rather than consulting a reported count, because after a resume
+        // there is no reported count to consult. That made it the one place
+        // in the loop that could not exhibit the #2792 overshoot, and the
+        // reason the fix is a collapse onto existing behavior rather than a
+        // new policy. `0` for the reported count: nothing has been sent yet
+        // this invocation, so the estimate is necessarily the larger.
+        let resume_estimate_tokens = effective_prompt_occupancy(&messages, 0);
         if compaction::needs_compaction(resume_estimate_tokens, messages.len(), compaction_cfg) {
             let before_count = messages.len();
             compactions = compactions.saturating_add(1);
@@ -3599,37 +3606,65 @@ fn run_with_sleeper(
 
                 // (#854) When the endpoint's reported count is stale (frozen
                 // across turns while the thread grew), it can't gate compaction
-                // — it silently suppressed it into a degenerate cycle. Substitute
-                // a local chars/4 size estimate as the EFFECTIVE occupancy and
-                // let the SAME threshold decide: this changes nothing in normal
-                // operation (frozen=0 → effective == reported), and even when
-                // stale it only compacts if real occupancy actually warrants it
-                // (no needless compaction if the conversation genuinely
-                // plateaued). The endpoint misreport is surfaced regardless.
-                let effective_prompt_tokens = if frozen_prompt_turns >= STALE_PROMPT_TOKENS_TURNS {
+                // — it silently suppressed it into a degenerate cycle. A local
+                // chars/4 size estimate stands in as the EFFECTIVE occupancy
+                // and the SAME threshold decides; even when stale it only
+                // compacts if real occupancy actually warrants it (no needless
+                // compaction if the conversation genuinely plateaued). The
+                // endpoint misreport is surfaced regardless.
+                //
+                // (#2792 — supersedes this entry's original scope) That text
+                // used to add "this changes nothing in normal operation
+                // (frozen=0 → effective == reported)". That is no longer true
+                // and the sentence is removed rather than left to rot: the
+                // estimate is now computed unconditionally, so `effective` can
+                // exceed `reported` on any turn, which is the whole point.
+                // What #854 still owns exclusively is the SIGNAL below — the
+                // stale-count eureka is emitted only at the staleness crossing.
+                //
+                // (#2792) The local estimate is computed on EVERY turn, not
+                // only on the stale path above. `latest_prompt_tokens` is the
+                // count the endpoint reported for the request that ALREADY
+                // WENT OUT — it predates the tool results appended since, so
+                // gating compaction on it alone decides using a number that
+                // describes a smaller conversation than the one about to be
+                // sent. Measured: a turn reporting 6,290 was followed, after
+                // one large tool result, by a request of 38,446 against a
+                // declared 32,000 window. Nothing compacted in between,
+                // because 6,290 is below the trigger.
+                //
+                // The consequence is not cosmetic. On a model loaded at the
+                // window its profile DECLARES, LMStudio rejects the oversized
+                // request outright — HTTP 400, "the number of tokens to keep
+                // from the initial prompt is greater than the context length"
+                // — so the dispatch dies. The overshoot was invisible in
+                // testing only because the loaded instance happened to be
+                // larger than the declared window.
+                //
+                // The estimator was already here and already trusted for this
+                // exact decision; it was fenced behind the staleness case. The
+                // `max` keeps the endpoint's own count authoritative whenever
+                // it is the larger number, so this can only ever compact
+                // EARLIER than before, never later.
+                let effective_prompt_tokens =
+                    effective_prompt_occupancy(&messages, latest_prompt_tokens);
+                if frozen_prompt_turns == STALE_PROMPT_TOKENS_TURNS {
                     let (sys_chars, prompt_chars) = measure_request_context(&messages);
                     let estimate = ((sys_chars + prompt_chars) / 4) as u32;
-                    // Emit the eureka signal once, at the staleness crossing,
-                    // so a stuck-but-low count doesn't spam the trajectory.
-                    if frozen_prompt_turns == STALE_PROMPT_TOKENS_TURNS {
-                        eprintln!(
-                            "darkmux-runtime: the endpoint's context token count has been frozen \
-                             at {latest_prompt_tokens} for {frozen_prompt_turns} turns while the \
-                             message thread grew — substituting a local estimate ({estimate}) for \
-                             the compaction decision (the reported count can't gate it). (#854)"
-                        );
-                        trajectory.append_stale_context_tokens(
-                            turns,
-                            latest_prompt_tokens,
-                            frozen_prompt_turns,
-                            estimate,
-                            messages.len(),
-                        );
-                    }
-                    estimate.max(latest_prompt_tokens)
-                } else {
-                    latest_prompt_tokens
-                };
+                    eprintln!(
+                        "darkmux-runtime: the endpoint's context token count has been frozen \
+                         at {latest_prompt_tokens} for {frozen_prompt_turns} turns while the \
+                         message thread grew — substituting a local estimate ({estimate}) for \
+                         the compaction decision (the reported count can't gate it). (#854)"
+                    );
+                    trajectory.append_stale_context_tokens(
+                        turns,
+                        latest_prompt_tokens,
+                        frozen_prompt_turns,
+                        estimate,
+                        messages.len(),
+                    );
+                }
 
                 // Phase 6: check whether the most recent prompt's
                 // token count crossed the compaction threshold, AND
@@ -4988,6 +5023,37 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
     }
     let bytes = std::fs::read(&path).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// (#2792) The occupancy the compaction decision is made against.
+///
+/// `latest_prompt_tokens` is what the endpoint reported for the request that
+/// ALREADY WENT OUT. By the time this is consulted, the loop has appended the
+/// assistant turn and every tool result it produced, so that number describes
+/// a SMALLER conversation than the one about to be sent. Deciding on it alone
+/// lets one large tool result carry the next request straight past the
+/// declared context window with nothing compacting in between — measured on a
+/// real run as a turn reporting 6,290 followed by a request of 38,446 against
+/// a declared 32,000.
+///
+/// That is a hard failure, not a slow one: a model loaded at the window its
+/// profile declares answers the oversized request with HTTP 400 ("the number
+/// of tokens to keep from the initial prompt is greater than the context
+/// length"). It went unnoticed only because the loaded instance was larger
+/// than the declared window and the request fit anyway.
+///
+/// So the local chars/4 estimate over the CURRENT thread is taken every turn,
+/// and the larger of the two wins. Taking the max — rather than preferring the
+/// estimate — keeps the endpoint's own count authoritative whenever it is the
+/// bigger number (it is the ground truth for everything already sent, and
+/// chars/4 under-counts some tokenizations), so this can only ever move a
+/// compaction EARLIER, never later. #854 introduced this estimate for the
+/// narrower stale-count case; the estimate was always the right input, and the
+/// staleness gate was the accident.
+fn effective_prompt_occupancy(messages: &[Message], latest_prompt_tokens: u32) -> u32 {
+    let (sys_chars, prompt_chars) = measure_request_context(messages);
+    let estimate = ((sys_chars + prompt_chars) / 4) as u32;
+    estimate.max(latest_prompt_tokens)
 }
 
 fn measure_request_context(messages: &[Message]) -> (usize, usize) {
@@ -7891,6 +7957,86 @@ mod tests {
         let out = dummy_structured_output(2);
         // Should NOT panic.
         persist_structured_compaction_output(&runtime_dir, 2, &out);
+    }
+
+    // ─── effective_prompt_occupancy (#2792) ─────────────────────────
+
+    /// The defect, reproduced at its own grain: the endpoint reported a small
+    /// count for the request that already went out, the loop then appended a
+    /// large tool result, and the compaction decision saw only the stale
+    /// number. Measured on a real run as 6,290 reported followed by a 38,446
+    /// request against a declared 32,000 window — which a correctly-loaded
+    /// model answers with HTTP 400.
+    #[test]
+    fn a_big_tool_result_appended_after_the_last_report_raises_the_occupancy() {
+        let reported: u32 = 6_290;
+        // ~32k tokens of tool output arriving AFTER `reported` was measured.
+        let big_tool_result = "x".repeat(128_000);
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("do the thing"),
+            Message::user(&big_tool_result),
+        ];
+
+        let occupancy = effective_prompt_occupancy(&messages, reported);
+
+        assert!(
+            occupancy > reported,
+            "occupancy must reflect the thread about to be SENT, not the last \
+             request's report: got {occupancy}, reported {reported}"
+        );
+        assert!(
+            occupancy >= 32_000,
+            "a ~32k-token tool result must push occupancy past a 32,000 window \
+             so compaction can fire BEFORE the oversized request goes out: {occupancy}"
+        );
+    }
+
+    /// The endpoint's own count stays authoritative when it is the larger
+    /// number — it is ground truth for everything already sent, and chars/4
+    /// under-counts some tokenizations. This is what makes the change
+    /// strictly compact-earlier and never compact-later.
+    #[test]
+    fn the_endpoint_count_still_wins_when_it_is_larger_than_the_estimate() {
+        let reported: u32 = 50_000;
+        let messages = vec![Message::system("sys"), Message::user("tiny")];
+        assert_eq!(
+            effective_prompt_occupancy(&messages, reported),
+            reported,
+            "a larger reported count must not be lowered by a small local estimate"
+        );
+    }
+
+    /// No messages and no report is zero, not a panic — the loop consults this
+    /// on turn one before anything has been reported.
+    #[test]
+    fn occupancy_of_an_empty_thread_with_no_report_is_zero() {
+        assert_eq!(effective_prompt_occupancy(&[], 0), 0);
+    }
+
+    /// (#2792 cost check) The occupancy walk now runs every turn, so its cost
+    /// is on the hot path. Measured here rather than asserted: a transcript far
+    /// larger than a real dispatch's must still cost orders of magnitude less
+    /// than the model call it precedes.
+    #[test]
+    fn occupancy_cost_is_negligible_against_a_model_turn() {
+        // ~2 MB of transcript — well beyond a real dispatch at any window.
+        let chunk = "y".repeat(20_000);
+        let messages: Vec<Message> =
+            (0..100).map(|_| Message::user(&chunk)).collect();
+
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(effective_prompt_occupancy(&messages, 0));
+        }
+        let per_call = start.elapsed() / 100;
+
+        eprintln!("effective_prompt_occupancy over ~2MB: {per_call:?} per call");
+        assert!(
+            per_call < std::time::Duration::from_millis(10),
+            "the per-turn occupancy walk must stay far below a model turn's \
+             seconds-scale cost: {per_call:?}"
+        );
     }
 
     // ─── measure_request_context (#361 fix) ─────────────────────────
@@ -11676,7 +11822,32 @@ mod tests {
             stale_events.len()
         );
         assert_eq!(stale_events[0]["frozen_value"], 4000);
-        assert!(stale_events[0]["estimate"].as_u64().unwrap() >= 5000);
+
+        // (3) The estimate is a real measurement of the thread AT THE
+        // CROSSING, not a stand-in constant.
+        //
+        // (#2792) This assertion used to require `estimate >= 5000`, i.e. that
+        // the estimate at the staleness crossing was itself above the
+        // threshold — because under the old design the stale path was the ONLY
+        // way the estimate reached the compaction decision, so the first
+        // compaction could not happen until the crossing. That is no longer
+        // the mechanism: the estimate is now consulted every turn, so this
+        // thread is ALREADY compacted by the time turn 3 crosses, and the
+        // measured estimate is correspondingly smaller (observed: 2497).
+        //
+        // The bound is dropped rather than lowered to a number that happens to
+        // pass today. What #854 actually claims is asserted above and still
+        // holds, more strongly than before: assertion (1) — a frozen
+        // below-threshold count does not suppress compaction — now passes
+        // because occupancy is measured unconditionally, not because a
+        // staleness heuristic rescued it. This event is now a DIAGNOSTIC that
+        // the endpoint is misreporting, which is what its message says.
+        let estimate = stale_events[0]["estimate"].as_u64().unwrap();
+        assert!(
+            estimate > 0,
+            "the stale-tokens event must carry a real local measurement of the \
+             current thread, not a placeholder: got {estimate}"
+        );
     }
 
     /// (#377) When `bail_after_compactions = N` is set and N
