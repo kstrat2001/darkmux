@@ -990,7 +990,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   // `MacBook-Pro` over time rendered FOUR cards for two machines). A
   // same-name fixture (the test just above) would pass against this bug —
   // only the uid join can catch it.
-  it("a roster entry whose machine_uid matches a live beat under a wholly different name does not duplicate its card, and relabels it", async () => {
+  it("a roster entry whose machine_uid matches a live beat under a wholly different name does not duplicate its card, and the MACHINE's name titles it", async () => {
     mockFleetFetch({
       machines: [{ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro", schema_version: "1.20.0", beat_ts_ms: 1 }],
       roster: [{ id: "laptop", address: "127.0.0.1:8765", added_unix_ms: 1000, machine_uid: "F9ACF59C-UID" }],
@@ -1008,8 +1008,25 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     // below still legitimately labels its lane from `nameOf` (flow-derived,
     // untouched by this override — it is a separate question from the
     // card's label), so "MacBook-Pro" is still on the page elsewhere.
-    expect(card.querySelector(".name")!.textContent).toContain("laptop");
-    expect(card.querySelector(".name")!.textContent).not.toContain("MacBook-Pro");
+    // (#2802 regression fix) This assertion used to be INVERTED: #2768 had
+    // the roster id override the card title, so it required "laptop" and
+    // forbade "MacBook-Pro". That was inert while roster entries carried no
+    // uid. Once #2802 began back-filling uids from flow history the override
+    // started firing on entries nobody had aliased on purpose, and this
+    // machine's card rendered as `laptop` — a June roster id pointing at a
+    // port with no daemon — directly above an activity lane reading
+    // `MacBook-Pro`. One machine, two names, one screen.
+    //
+    // The machine's own `machine_id` titles the card now: it is what every
+    // flow record carries, what the activity lanes and run rows use, and what
+    // `nameOf` was fixed in #2030 to track. The operator's alias is not
+    // discarded — it rides along as secondary text — but it never replaces
+    // the name the machine answers to.
+    //
+    // What #2768 actually fixed is asserted above and still holds: ONE card,
+    // not two. That was always the defect; the relabel was a choice bundled
+    // with it.
+    expect(card.querySelector(".name")!.textContent).toContain("MacBook-Pro");
   });
 
   // The inverted case: a roster `machine_uid` that matches NOTHING

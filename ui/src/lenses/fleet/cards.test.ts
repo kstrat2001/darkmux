@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, rosterOnlyEntries, rosterLabelFor, specUnknownLabel } from "./cards";
+import { machActive, specOf, buildFleetCard, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 
@@ -548,27 +548,47 @@ describe("rosterOnlyEntries", () => {
   });
 });
 
-describe("rosterLabelFor", () => {
-  // (#2768) The positive half of the fix: a roster entry's declared `id`
-  // becomes the LABEL for the uid it names, rather than the flow-derived
-  // `nameOf` guess — this is what a caller applies to the card built for
-  // that uid so a renamed machine shows the operator's chosen name, not
-  // whatever `machine_id` its most recent record happened to carry.
-  it("returns the roster id declared for a matching uid", () => {
+describe("rosterAliasFor", () => {
+  // (#2802 regression fix) This replaces `rosterLabelFor`, which returned the
+  // same string to OVERRIDE a card's title. That override was inert while
+  // roster entries carried no uid; once #2802 began back-filling uids from
+  // flow history it started firing on entries nobody had aliased on purpose,
+  // and the card for this machine rendered as `laptop` while the activity
+  // lane beneath it said `MacBook-Pro`.
+  it("returns the operator's alias when it differs from the machine's own name", () => {
     const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
-    expect(rosterLabelFor("F9ACF59C-UID", roster)).toBe("laptop");
+    expect(rosterAliasFor("F9ACF59C-UID", roster, "MacBook-Pro")).toBe("laptop");
   });
 
-  // Inverted case: no roster entry names this uid — never invent a label.
+  // THE REGRESSION, pinned: the alias must never become the title. A caller
+  // applies this as secondary text; the machine's own name is the title.
+  it("does not return an alias equal to the machine's own name", () => {
+    const roster = [rosterEntry({ id: "MacBook-Pro", machine_uid: "F9ACF59C-UID" })];
+    expect(
+      rosterAliasFor("F9ACF59C-UID", roster, "MacBook-Pro"),
+    ).toBeUndefined();
+  });
+
+  // Same machine, same name, different spelling — `.local` and case are the
+  // two aliases a single machine legitimately carries (see `nameOf`'s #2030
+  // doc), and showing either beside the other is noise, not provenance.
+  it("folds a .local or case variant rather than showing the name twice", () => {
+    const roster = [rosterEntry({ id: "macbook-pro.local", machine_uid: "F9ACF59C-UID" })];
+    expect(
+      rosterAliasFor("F9ACF59C-UID", roster, "MacBook-Pro"),
+    ).toBeUndefined();
+  });
+
+  // Inverted case: no roster entry names this uid — never invent an alias.
   it("returns undefined when no roster entry names this uid", () => {
     const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
-    expect(rosterLabelFor("some-other-uid", roster)).toBeUndefined();
+    expect(rosterAliasFor("some-other-uid", roster, "MacBook-Pro")).toBeUndefined();
   });
 
   // An entry with no machine_uid at all never matches any uid.
   it("returns undefined for a roster with no resolved uids", () => {
     const roster = [rosterEntry({ id: "laptop" })];
-    expect(rosterLabelFor("F9ACF59C-UID", roster)).toBeUndefined();
+    expect(rosterAliasFor("F9ACF59C-UID", roster, "MacBook-Pro")).toBeUndefined();
   });
 });
 

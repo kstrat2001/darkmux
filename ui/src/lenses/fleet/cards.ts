@@ -296,8 +296,40 @@ export function rosterOnlyEntries(
  *
  * Returns `undefined` when no roster entry names this uid — callers keep
  * whatever name they already derived; this never invents one. */
-export function rosterLabelFor(uid: string, roster: RosterMachineEntry[]): string | undefined {
-  return roster.find((entry) => entry.machine_uid === uid)?.id;
+/** (#2802 regression fix) The operator's roster name for a uid, when it adds
+ * information — i.e. when they declared one and it is NOT already what the
+ * machine calls itself.
+ *
+ * This REPLACES `rosterLabelFor`, which returned the same string for a
+ * different purpose: #2768 used it to OVERRIDE the card's title, so a roster
+ * entry whose `machine_uid` matched a card renamed that card. That was inert
+ * while roster entries carried no uid. #2802 then began back-filling uids
+ * from flow history — correctly, to stop stale entries drawing phantom cards
+ * — and the override started firing on entries nobody had aliased on
+ * purpose. Live result: the card for this machine was titled `laptop` (a
+ * roster id from June, pointing at a port with no daemon) while the activity
+ * lane directly beneath it said `MacBook-Pro`. One machine, two names, one
+ * screen.
+ *
+ * The machine's own `machine_id` wins the TITLE now. It is what every flow
+ * record carries, what the activity lanes and run rows use, what `nameOf` was
+ * fixed in #2030 to track, and it is current in a way an operator-typed alias
+ * from four months ago is not. The alias is not discarded — it rides along as
+ * secondary text, so "which of my roster entries is this?" stays answerable
+ * without the view contradicting itself.
+ *
+ * Returns `undefined` when the alias equals the machine's own name, because
+ * showing a name twice is noise rather than provenance. */
+export function rosterAliasFor(
+  uid: string,
+  roster: RosterMachineEntry[],
+  machineName: string,
+): string | undefined {
+  const declared = roster.find((entry) => entry.machine_uid === uid)?.id;
+  if (!declared) return undefined;
+  return normalizeMachineAlias(declared) === normalizeMachineAlias(machineName)
+    ? undefined
+    : declared;
 }
 
 /** (#1855) WHY a card has no hardware line. `""` from `specOf` is not one
@@ -331,6 +363,12 @@ export function specUnknownLabel(reason: SpecUnknownReason): string {
 }
 
 export interface FleetCard {
+  /** (#2802 regression fix) The operator's own roster name for this machine,
+   * when they declared one AND it differs from what the machine calls
+   * itself. Rendered as secondary text, never as the title — see
+   * `rosterAliasFor`. `undefined` when there is no roster entry, or when the
+   * alias already agrees with the machine's own id and would be noise. */
+  rosterAlias?: string;
   uid: string;
   name: string;
   /** "" means the `specdim` fallback — `specUnknown` below says which one. */

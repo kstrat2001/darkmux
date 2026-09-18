@@ -14,7 +14,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, rosterOnlyEntries, rosterLabelFor, specUnknownLabel } from "./cards";
+import { buildFleetCard, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -552,12 +552,14 @@ export function FleetLens({
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
         );
-        // (#2768) A roster entry whose declared hardware identity matches
-        // this uid updates the card's LABEL rather than drawing a second
-        // card — `rosterOnlyEntries` (below) is what keeps that same
-        // roster entry from ALSO rendering its own "offline" card.
-        const rosterLabel = rosterLabelFor(m, roster);
-        return rosterLabel ? { ...card, name: rosterLabel } : card;
+        // (#2768, corrected by the #2802 regression fix) A roster entry
+        // whose declared hardware identity matches this uid still prevents a
+        // SECOND card — that is `rosterOnlyEntries` below — but it no longer
+        // overrides this card's TITLE. The machine's own name wins; the
+        // operator's alias rides along as secondary text. See
+        // `rosterAliasFor` for why.
+        const rosterAlias = rosterAliasFor(m, roster, card.name);
+        return rosterAlias ? { ...card, rosterAlias } : card;
       }),
       // (#1855) A rostered entry with no known identity is, by definition,
       // not currently beating — `machAbsent` is forced `true` rather than
