@@ -1832,6 +1832,10 @@ fn run_with_sleeper(
     let mut inactivity_soft_warning_fired_in_window = false;
     // (#2792) One over-window warning per dispatch — see its emission site.
     let mut over_window_warning_fired = false;
+    // (#2797 merge-gate) Set when a compaction was triggered and then refused,
+    // so the over-window diagnostic knows the trigger firing did NOT mean the
+    // thread was going to shrink.
+    let mut compaction_skipped_last_turn = false;
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -2022,14 +2026,26 @@ fn run_with_sleeper(
         let resume_estimate_tokens = effective_prompt_occupancy(&messages, 0);
         if compaction::needs_compaction(resume_estimate_tokens, messages.len(), compaction_cfg) {
             let before_count = messages.len();
-            compactions = compactions.saturating_add(1);
+            // (#2792 merge-gate, second pass) The RESUME catch-up site gets
+            // the same treatment as the main loop: a refusal is a recorded
+            // skip, not a dispatch kill, and `compactions` counts only what
+            // actually installed.
+            //
+            // An earlier revision converted the main loop alone and left this
+            // one propagating with `?`. That is the WORSE of the two places
+            // to leave it: a resume starts from a checkpoint whose thread is
+            // already large, so it is exactly where a middle too small to
+            // compact meets a thread big enough to trigger — and killing the
+            // dispatch there discards the work the checkpoint existed to
+            // preserve.
+            let attempted_generation = compactions.saturating_add(1);
             let summary_chars = match compaction_cfg.strategy {
                 compaction::CompactionStrategy::Narrative => compaction::compact(
                     compactor_client,
                     &mut messages,
-                    compactions,
+                    attempted_generation,
                     compaction_cfg,
-                )?,
+                ),
                 compaction::CompactionStrategy::StructuredSlot => {
                     let budget = compaction::BudgetSnapshot {
                         turns_used: turns,
@@ -2038,48 +2054,72 @@ fn run_with_sleeper(
                         max_cumulative_completion_tokens: max_cumulative_tokens,
                         max_tokens_per_call: answer_max_tokens,
                     };
-                    let (parsed, summary_chars) = compaction::structured_compact(
+                    compaction::structured_compact(
                         compactor_client,
                         &mut messages,
-                        compactions,
+                        attempted_generation,
                         compaction_cfg,
                         Some(budget),
-                    )?;
-                    persist_structured_compaction_output(
-                        &crate::trajectory::runtime_dir(),
-                        compactions,
-                        &parsed,
-                    );
-                    summary_chars
+                    )
+                    .map(|(parsed, summary_chars)| {
+                        persist_structured_compaction_output(
+                            &crate::trajectory::runtime_dir(),
+                            attempted_generation,
+                            &parsed,
+                        );
+                        summary_chars
+                    })
                 }
             };
-            let after_count = messages.len();
-            let (sys_chars_after, prompt_chars_after) = measure_request_context(&messages);
-            let tokens_after = ((sys_chars_after + prompt_chars_after) / 4) as u32;
-            trajectory.append_compaction(
-                compactions,
-                before_count,
-                after_count,
-                summary_chars,
-                resume_estimate_tokens,
-                tokens_after,
-            );
-            eprintln!(
-                "darkmux-runtime: compacted after the resume catch-up pass ({before_count} → \
-                 {after_count} messages) before the first post-resume request. (#2114)"
-            );
+            let installed_summary_chars = match summary_chars {
+                Ok(chars) => {
+                    compactions = attempted_generation;
+                    Some(chars)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "darkmux-runtime: resume catch-up compaction #{attempted_generation} \
+                         was refused and SKIPPED, not installed — the conversation is \
+                         unchanged and the dispatch continues: {e}"
+                    );
+                    trajectory.append_compaction_skipped(
+                        turns,
+                        attempted_generation,
+                        messages.len(),
+                        &e.to_string(),
+                    );
+                    None
+                }
+            };
+            if let Some(summary_chars) = installed_summary_chars {
+                let after_count = messages.len();
+                let (sys_chars_after, prompt_chars_after) = measure_request_context(&messages);
+                let tokens_after = ((sys_chars_after + prompt_chars_after) / 4) as u32;
+                trajectory.append_compaction(
+                    compactions,
+                    before_count,
+                    after_count,
+                    summary_chars,
+                    resume_estimate_tokens,
+                    tokens_after,
+                );
+                eprintln!(
+                    "darkmux-runtime: compacted after the resume catch-up pass ({before_count} → \
+                     {after_count} messages) before the first post-resume request. (#2114)"
+                );
 
-            // (#2114 finding 1) Resume-compaction parity with the main
-            // loop's `tool_calls` arm (~:2680-2722): a compaction here is
-            // the SAME event with the SAME consequences, whichever site
-            // triggered it. Queue the same post-compaction feedback nudge,
-            // reset proof-of-work + the soft-warning flag the same way,
-            // and run the SAME `bail_after_compactions` escalation check
-            // — without this, a resume that immediately compacts past the
-            // operator's bound would silently send one more request
-            // instead of escalating to the frontier the way a live
-            // (never-killed) run in the identical position would.
-            feedback_injector.queue_post_compaction(turns);
+                // (#2114 finding 1) Resume-compaction parity with the main
+                // loop's `tool_calls` arm (~:2680-2722): a compaction here is
+                // the SAME event with the SAME consequences, whichever site
+                // triggered it. Queue the same post-compaction feedback nudge,
+                // reset proof-of-work + the soft-warning flag the same way,
+                // and run the SAME `bail_after_compactions` escalation check
+                // — without this, a resume that immediately compacts past the
+                // operator's bound would silently send one more request
+                // instead of escalating to the frontier the way a live
+                // (never-killed) run in the identical position would.
+                feedback_injector.queue_post_compaction(turns);
+            }
             last_proof_of_work = std::time::Instant::now();
             inactivity_soft_warning_fired_in_window = false;
             if let Some(bail) = compaction_cfg.bail_after_compactions {
@@ -3660,24 +3700,52 @@ fn run_with_sleeper(
                 // about a number they never configured. Once per dispatch:
                 // the condition persists across turns and a per-turn line
                 // would bury the run's real output.
+                // NOTE the condition is "nothing will REDUCE it", not "nothing
+                // will be attempted" (#2797 merge-gate). Gating on
+                // `!needs_compaction` alone meant the diagnostic could not fire
+                // in the case this PR introduced: a compaction that IS
+                // triggered and then REFUSED leaves `needs_compaction` true and
+                // the thread unchanged, so the oversized request went out with
+                // no darkmux-voice line at all — precisely the scenario the
+                // warning exists for. `compaction_skipped_this_turn` carries
+                // that fact forward from the refusal below.
                 if let Some(window) = compaction_cfg.context_window {
-                    if effective_prompt_tokens > window
-                        && !over_window_warning_fired
-                        && !compaction::needs_compaction(
+                    let nothing_will_reduce_it = compaction_skipped_last_turn
+                        || !compaction::needs_compaction(
                             effective_prompt_tokens,
                             messages.len(),
                             compaction_cfg,
-                        )
+                        );
+                    if effective_prompt_tokens > window
+                        && !over_window_warning_fired
+                        && nothing_will_reduce_it
                     {
                         over_window_warning_fired = true;
                         eprintln!(
                             "darkmux-runtime: the next request is ~{effective_prompt_tokens} \
                              tokens against the {window}-token context window this profile \
-                             DECLARES, and no compaction will run to reduce it ({} messages, \
-                             compaction needs {}). If the model is loaded at the declared \
-                             window the endpoint will REFUSE this request. (#2792)",
-                            messages.len(),
-                            compaction::MIN_MESSAGES_TO_COMPACT,
+                             DECLARES, and nothing will reduce it before it is sent ({}). \
+                             If the model is loaded at the declared window the endpoint \
+                             will REFUSE this request. (#2792)",
+                            // Name the ACTUAL reason. `needs_compaction` can be
+                            // false for three different causes and an earlier
+                            // revision printed the thread-too-short one
+                            // unconditionally — so an operator with no
+                            // compactor bound read "40 messages, compaction
+                            // needs 7", a sentence that contradicts itself.
+                            if compaction_skipped_last_turn {
+                                "a compaction was attempted and refused".to_string()
+                            } else if compaction_cfg.compactor_model.is_none() {
+                                "no compactor model is bound".to_string()
+                            } else if messages.len() < compaction::MIN_MESSAGES_TO_COMPACT {
+                                format!(
+                                    "only {} messages; compaction needs {}",
+                                    messages.len(),
+                                    compaction::MIN_MESSAGES_TO_COMPACT
+                                )
+                            } else {
+                                "the compaction threshold has not been reached".to_string()
+                            },
                         );
                     }
                 }
@@ -3799,9 +3867,11 @@ fn run_with_sleeper(
                     let installed_summary_chars = match summary_chars {
                         Ok(chars) => {
                             compactions = attempted_generation;
+                            compaction_skipped_last_turn = false;
                             Some(chars)
                         }
                         Err(e) => {
+                            compaction_skipped_last_turn = true;
                             eprintln!(
                                 "darkmux-runtime: compaction #{attempted_generation} was \
                                  refused and SKIPPED, not installed — the conversation is \
@@ -8189,6 +8259,19 @@ mod tests {
             outcome.turns >= 1,
             "the dispatch must have continued doing work after the refused compaction"
         );
+        // (#2797 merge-gate) A refused attempt must NOT burn the operator's
+        // `bail_after_compactions` budget. Unpinned in the first revision:
+        // restoring the pre-fix "count attempts" increment left all 703 tests
+        // green, and that increment is the one deciding whether an operator's
+        // escalation bound is spent on work that never happened.
+        // (#2797 merge-gate) A refused attempt must NOT burn the operator's
+        // `bail_after_compactions` budget. Unpinned in the first revision:
+        // restoring the pre-fix "count attempts" increment left all 703 tests
+        // green, and that increment decides whether an escalation bound is
+        // spent on work that never happened. Asserted against the trajectory
+        // rather than a fixed number, because this scenario legitimately
+        // installs a later compaction once the middle has re-grown — the claim
+        // is that the counter tracks INSTALLS, not attempts.
 
         // The skip is recorded — an invisible refusal would leave a run that
         // declines to compact indistinguishable from one that never needed to.
@@ -8209,6 +8292,23 @@ mod tests {
             skipped[0]["reason"].as_str().unwrap_or("").contains("less than"),
             "the recorded reason must name the guard that refused it: {:?}",
             skipped[0]["reason"]
+        );
+
+        let installed = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "compaction")
+            .count();
+        assert_eq!(
+            outcome.compactions as usize, installed,
+            "the counter must equal INSTALLED compactions ({installed}), not \
+             installs + the {} refused attempt(s) that changed nothing",
+            skipped.len()
+        );
+        assert!(
+            !skipped.is_empty() && outcome.compactions as usize != installed + skipped.len(),
+            "the scenario must contain at least one refusal that is excluded from \
+             the count, else this pins nothing"
         );
     }
 
