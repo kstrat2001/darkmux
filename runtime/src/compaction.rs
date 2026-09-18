@@ -1092,15 +1092,17 @@ pub fn structured_compact(
     // because the budget block is REAL installed cost — refusing to grow the
     // thread for it is the correct call.
     //
-    // MERGE-ORDER DEPENDENCY, stated because an earlier revision of this
-    // comment asserted it in the present tense while the tree lacked it: a
-    // refusal here becomes a RECORDED SKIP only once #2797 lands. On this
-    // branch both call sites still propagate with `?`
-    // (`loop_runner.rs`), so a refusal ends the dispatch — meaning the band
-    // below the render floor is, until then, a dispatch-killing band rather
-    // than a skip. That is why this must not merge first. With #2797 in, a
-    // turn cap merely makes small-middle compactions less likely to help,
-    // and the skip record says so.
+    // and because a refusal here is a RECORDED SKIP rather than a dead
+    // dispatch: both call sites in `loop_runner.rs` match on the result and
+    // emit `compaction.skipped`, leaving the conversation untouched (#2792,
+    // merged). So a turn cap makes small-middle compactions less likely to
+    // HELP; it cannot make them fatal.
+    //
+    // That ordering was load-bearing and is recorded because an earlier
+    // revision of this comment asserted the skip behavior while the tree
+    // still propagated with `?` — before #2792 landed, this band was a
+    // dispatch-killing band, and merging this first would have shipped
+    // exactly that.
     let middle_cost = occupancy_cost_of(&middle_messages);
     if markdown.len() >= middle_cost {
         return Err(anyhow!(
