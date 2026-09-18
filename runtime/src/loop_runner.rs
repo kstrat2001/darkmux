@@ -5203,7 +5203,7 @@ fn effective_prompt_occupancy(messages: &[Message], latest_prompt_tokens: u32) -
     estimate.max(latest_prompt_tokens)
 }
 
-fn measure_request_context(messages: &[Message]) -> (usize, usize) {
+pub(crate) fn measure_request_context(messages: &[Message]) -> (usize, usize) {
     let mut system_chars = 0usize;
     let mut prompt_chars = 0usize;
     for m in messages {

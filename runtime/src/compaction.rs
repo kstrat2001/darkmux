@@ -1090,16 +1090,17 @@ pub fn structured_compact(
     // narrowed, not removed: the affected band is now middles below ~712
     // chars rather than every middle. It is left in rather than papered over
     // because the budget block is REAL installed cost — refusing to grow the
-    // thread for it is the correct call — and because post-#2797 a refusal is
-    // a recorded skip, not a dead dispatch. The honest framing is that a turn
-    // cap makes small-middle compactions less likely to help, and the skip
-    // record says so.
+    // thread for it is the correct call.
     //
-    // Refusal is NOT fatal: the caller records the skip and continues with
-    // the conversation untouched (#2792 merge-gate). Before that, this Err
-    // propagated through `?` and killed the dispatch — on the very run this
-    // fix was written from, it would have died at compaction 3 of 8 instead
-    // of completing.
+    // MERGE-ORDER DEPENDENCY, stated because an earlier revision of this
+    // comment asserted it in the present tense while the tree lacked it: a
+    // refusal here becomes a RECORDED SKIP only once #2797 lands. On this
+    // branch both call sites still propagate with `?`
+    // (`loop_runner.rs`), so a refusal ends the dispatch — meaning the band
+    // below the render floor is, until then, a dispatch-killing band rather
+    // than a skip. That is why this must not merge first. With #2797 in, a
+    // turn cap merely makes small-middle compactions less likely to help,
+    // and the skip record says so.
     let middle_cost = occupancy_cost_of(&middle_messages);
     if markdown.len() >= middle_cost {
         return Err(anyhow!(
@@ -1938,6 +1939,154 @@ mod tests {
             Message::user("turn 7 stuff"),
             Message::user("turn 8 stuff"),
         ]
+    }
+
+    /// (#2793 round-3) Distinguish the COST rule from the ROUND-2 RENDER
+    /// rule, which nothing else did — swapping `occupancy_cost_of(..)` back
+    /// to `middle_rendered.len()` left the whole suite green, caught only by
+    /// a dead-code lint that any revert keeping the function referenced
+    /// would evade.
+    ///
+    /// A tool-bearing middle is what separates them: `render_messages_as_excerpt`
+    /// adds `[role]: ` prefixes, a `tool_call:` line and a
+    /// `(tool result for: ...)` marker per message, none of which enter the
+    /// thread, so the render overstates the cost by 16-31% on this shape.
+    /// Sized so the replacement sits BETWEEN the two — above the true cost
+    /// (must refuse) and below the inflated render (the round-2 rule would
+    /// have installed it, growing the thread).
+    #[test]
+    #[serial_test::serial]
+    fn a_tool_bearing_middle_refuses_on_cost_where_the_render_rule_would_have_installed() {
+        let call = |id: &str| crate::lmstudio::ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: "{\"path\":\"/workspace/x.txt\"}".into(),
+            },
+            extra_content: None,
+        };
+        let assistant_with_call = |id: &str| Message {
+            role: "assistant".into(),
+            content: Some("short".into()),
+            tool_calls: Some(vec![call(id)]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("seed"),
+            assistant_with_call("c1"),
+            Message::tool_result("c1", "read", "result one"),
+            assistant_with_call("c2"),
+            Message::tool_result("c2", "read", "result two"),
+            Message::user("tail 1"),
+            Message::user("tail 2"),
+            Message::user("tail 3"),
+            Message::user("tail 4"),
+        ];
+        let n = messages.len();
+        let middle = &messages[2..n - 4];
+        let cost = occupancy_cost_of(middle);
+        let rendered = render_messages_as_excerpt(middle).len();
+
+        // The premise: the two rulers genuinely disagree on this shape.
+        // Measured for this fixture: cost 92, rendered 226 — the render is
+        // 2.5x the cost because tool-call framing dominates when message
+        // content is short.
+        assert!(
+            rendered > cost * 2,
+            "the render must substantially overstate a tool-bearing middle for \
+             this test to separate the rules: rendered={rendered} cost={cost}"
+        );
+
+        // A compactor output that lands BETWEEN the two rulers.
+        let server = GuardedMockServer::start();
+        let body = format!(
+            r#"{{"objective":"{}","current_truth":{{"active_files":"x.ts"}},"compaction_metadata":{{"schema_version":"0.1","generation":13,"source_message_count":2}}}}"#,
+            "summarized ".repeat(6)
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut msgs = messages.clone();
+        let cfg = CompactionConfig::never_compact_with_model();
+
+        let err = structured_compact(&client, &mut msgs, 13, &cfg, None).expect_err(
+            "a replacement costing more than the middle must be REFUSED — the \
+             round-2 rule compared against the inflated render and would have \
+             installed this, growing the thread",
+        );
+        let reported: usize = err
+            .to_string()
+            .split("-> a ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("size is reported");
+        assert!(
+            reported >= cost && reported < rendered,
+            "the fixture must land between the rulers, else it cannot tell them \
+             apart: cost={cost} reported={reported} rendered={rendered}"
+        );
+        assert_eq!(msgs.len(), messages.len(), "refusal must not mutate the thread");
+    }
+
+    /// (#2793 round-3) The "MUST stay identical" invariant between
+    /// `occupancy_cost_of` and `loop_runner::measure_request_context` is a
+    /// claim in a doc comment and nothing enforced it. Both directions of
+    /// drift were shown to leave the whole suite green: dropping the
+    /// tool-call term here, and adding `reasoning_content` to the twin —
+    /// the likelier drift, given thinking models. `loop_runner.rs` is not in
+    /// this PR's diff, so the in-diff mutation job would not have caught it
+    /// either.
+    ///
+    /// The corpus exercises every field either function could disagree on.
+    #[test]
+    fn occupancy_cost_matches_the_runtime_ruler_field_for_field() {
+        let msgs = vec![
+            Message::system("sys prompt"),
+            Message::user("plain user"),
+            Message {
+                role: "assistant".into(),
+                content: Some("assistant text".into()),
+                tool_calls: Some(vec![crate::lmstudio::ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: crate::lmstudio::FunctionCall {
+                        name: "read".into(),
+                        arguments: "{\"path\":\"/workspace/x.txt\"}".into(),
+                    },
+                    extra_content: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+                // Set deliberately: neither ruler counts it, and a drift that
+                // starts counting it is the realistic one.
+                reasoning_content: Some("a long private reasoning trace".into()),
+            },
+            Message::tool_result("call_1", "read", "the file contents"),
+            Message {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let (sys, prompt) = crate::loop_runner::measure_request_context(&msgs);
+        assert_eq!(
+            occupancy_cost_of(&msgs),
+            sys + prompt,
+            "the compaction guard must measure exactly what the runtime measures; \
+             a divergence here means the guard is again judging against a ruler \
+             nothing else uses"
+        );
     }
 
     /// (#2793 merge-gate) The test that tells the NEW rule apart from the OLD
