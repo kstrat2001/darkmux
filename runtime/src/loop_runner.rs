@@ -323,6 +323,24 @@ pub enum EscalationReason {
     /// flows through `LoopOutcome` as with the other escalation
     /// reasons.
     CumulativeTokensExceeded,
+    /// (#2805) Compaction is running every turn and cannot get the thread
+    /// below the occupancy that triggers it — so every remaining turn will
+    /// pay a compactor dispatch and none will buy a turn without one.
+    ///
+    /// Distinct from [`CompactionLimitReached`], which fires on a COUNT the
+    /// operator set. This fires on a STATE the runtime can prove: N
+    /// consecutive compactions installed and each left occupancy at or above
+    /// the trigger. #2793 added the detection; this escalates on it, because
+    /// naming a runaway is not the same as ending one.
+    ///
+    /// Measured twice on the same workload before this existed: 50 turns /
+    /// 1.05M prompt tokens, then 124 turns / 2.25M, neither converging,
+    /// both stopped by hand. Every bound that could have ended them is
+    /// absent by default — `max_turns` uncapped, `bail_after_compactions`
+    /// disabled, and the inactivity deadline never fires on a dispatch that
+    /// is busy. This is the one that does not need the operator to have
+    /// predicted the failure in advance.
+    CompactionUnproductive,
     /// (#414 PR A) Intra-turn stall recovery budget
     /// ([`MAX_STALL_RECOVERIES`], operator-overridable via
     /// `runtime.max_stall_recoveries` — #2190) exhausted. Fires when the
@@ -390,6 +408,7 @@ pub enum EscalationReason {
 pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
     match reason {
         EscalationReason::CompactionLimitReached => "escalation_compaction_limit_reached",
+        EscalationReason::CompactionUnproductive => "escalation_compaction_unproductive",
         EscalationReason::CumulativeTokensExceeded => "escalation_cumulative_tokens_exceeded",
         EscalationReason::IntraTurnStallExhausted => "escalation_intra_turn_stall_exhausted",
         // (#2190) Deliberately NOT `..._exhausted` — the issue's own spec
@@ -1843,9 +1862,9 @@ fn run_with_sleeper(
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
     // (#2793) Consecutive compactions that installed and still left occupancy
-    // above the trigger; latched warning so one episode says it once.
+    // above the trigger. (#2805) No latch — reaching the bound escalates and
+    // returns, so the episode cannot repeat within a dispatch.
     let mut consecutive_unproductive_compactions: u32 = 0;
-    let mut unproductive_compaction_warning_fired = false;
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -3904,22 +3923,25 @@ fn run_with_sleeper(
                         } else {
                             consecutive_unproductive_compactions = 0;
                         }
+                        // (#2805) No "fire once" latch any more: this block
+                        // RETURNS, so the condition cannot recur within a
+                        // dispatch. #2793 needed the latch because it reported
+                        // and carried on, and a per-turn line would have buried
+                        // the run it was describing.
                         if consecutive_unproductive_compactions
                             >= UNPRODUCTIVE_COMPACTION_TURNS
-                            && !unproductive_compaction_warning_fired
                         {
-                            unproductive_compaction_warning_fired = true;
                             eprintln!(
                                 "darkmux-runtime: {consecutive_unproductive_compactions} \
                                  compactions in a row have left the thread at \
                                  ~{tokens_after} tokens, still at or above the \
-                                 {trigger}-token compaction trigger — so the next turn \
-                                 will compact again, and so will the one after. The \
-                                 compactor cannot reduce this thread below its own \
-                                 trigger: the context window is too small for this \
-                                 workload's per-turn output. Raise the profile's n_ctx, \
-                                 reduce per-turn tool output, or set \
-                                 compaction.bail_after_compactions to bound it. (#2793)"
+                                 {trigger}-token compaction trigger — the compactor \
+                                 cannot reduce this thread below its own trigger, so \
+                                 every remaining turn would pay a compactor dispatch \
+                                 and none would buy a turn without one. ESCALATING to \
+                                 the frontier rather than burning the difference. Raise \
+                                 the profile's n_ctx or reduce per-turn tool output to \
+                                 let this workload run locally. (#2805)"
                             );
                             trajectory.append_compaction_unproductive(
                                 turns,
@@ -3927,6 +3949,59 @@ fn run_with_sleeper(
                                 tokens_after,
                                 trigger,
                             );
+                            // (#2805) ESCALATE, do not just report.
+                            //
+                            // #2793 added this detection and stopped at saying
+                            // it. Measured twice on the same workload with only
+                            // the report in place: 50 turns / 1.05M prompt
+                            // tokens, then 124 turns / 2.25M, neither
+                            // converging, both stopped by hand. Naming a
+                            // runaway is not ending one — and the signal went
+                            // to stderr and the trajectory, so an operator who
+                            // started a long dispatch and walked away (the
+                            // whole point of the local tier) came back to an
+                            // unbounded burn and a diagnostic they never saw.
+                            //
+                            // This is a GRACEFUL terminal, not a kill: the same
+                            // `EscalationTriggered` shape `bail_after_compactions`
+                            // uses, carrying every banked turn and the partial
+                            // answer out through `LoopOutcome` for the
+                            // `darkmux-escalation-handler` hand-off. The
+                            // difference from that bound is that it does not
+                            // require the operator to have predicted this
+                            // failure and set a number in advance.
+                            trajectory.append_escalation_triggered(
+                                turns,
+                                escalation_reason_str(
+                                    EscalationReason::CompactionUnproductive,
+                                ),
+                                model,
+                                latest_prompt_tokens,
+                            );
+                            return Ok(LoopOutcome {
+                                final_answer: None,
+                                terminal_reason: TerminalReason::EscalationTriggered(
+                                    EscalationReason::CompactionUnproductive,
+                                ),
+                                messages,
+                                turns,
+                                total_prompt_tokens,
+                                total_completion_tokens,
+                                total_reasoning_tokens,
+                                total_cached_tokens,
+                                compactions,
+                                turns_this_run: this_run_delta(resume_seed_turns, turns),
+                                total_prompt_tokens_this_run: this_run_delta(
+                                    resume_seed_prompt_tokens, total_prompt_tokens),
+                                total_completion_tokens_this_run: this_run_delta(
+                                    resume_seed_completion_tokens, total_completion_tokens),
+                                compactions_this_run: this_run_delta(
+                                    resume_seed_compactions, compactions),
+                                rest_ms,
+                                rests,
+                                turn_delay_effective_ms: turn_delay_ms,
+                                failed_to_run: failed_to_run.clone(),
+                            });
                         }
 
                         // (#854) The thread just shrank, so the next report should
@@ -12521,9 +12596,29 @@ mod tests {
             .collect();
         let tools = [Tool::Read];
 
-        let _ = run(
+        let outcome = run(
             &client, &client, "test-primary", initial, &tools, &mut traj, false,
             &cfg, Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("escalation is a graceful terminal, not an error");
+
+        // (#2805) The state is now ESCALATED, not merely reported. #2793
+        // detected it and let the run continue; measured twice, that meant 50
+        // turns / 1.05M prompt tokens and then 124 / 2.25M, neither
+        // converging, both stopped by hand. `max_turns` here is 12 — if the
+        // loop ran to that bound instead of escalating at 5, this assertion
+        // is what catches it.
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionUnproductive),
+            "an unproductive-compaction episode must hand off to the frontier, \
+             not keep burning turns"
+        );
+        assert!(
+            outcome.turns < 12,
+            "it must escalate BEFORE max_turns, else it is not bounding anything: \
+             turns={}",
+            outcome.turns
         );
 
         let raw = std::fs::read_to_string(
