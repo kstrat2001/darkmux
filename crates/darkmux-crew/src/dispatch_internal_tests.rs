@@ -6732,6 +6732,7 @@
                 tailer_deadline,
                 inactivity_secs,
                 None,
+                None, // (#2794) compactor_model
                 None,
             )
         });
@@ -12477,6 +12478,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             Arc::new(AtomicBool::new(false)),
             inactivity_deadline,
             600,
+            None, // (#2794) compactor_model
             None,
             None,
         );
@@ -12831,6 +12833,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 inactivity_deadline_for_closure,
                 600,
                 None,
+                None, // (#2794) compactor_model
                 None,
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
@@ -14806,3 +14809,83 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     assert!(err.contains("4096"), "message must name the resident's context, got: {err}");
     assert!(err.contains("262144"), "message must name the declared n_ctx, got: {err}");
 }
+
+    /// (#2794) A compaction record must name the model that did the
+    /// compaction, not the specialist the dispatch is for.
+    ///
+    /// Confirmed live on a dogfood run: 44 compaction records all carried
+    /// `handle: "coder"` and the 35B specialist's id, while a 4B utility
+    /// agent did the work — and the compactor's identity appeared in NONE of
+    /// the three artifacts (flow record, `compaction-N.json` metadata,
+    /// trajectory event). CLAUDE.md's work-unit contract names this emitter
+    /// as the violator: a utility invocation inside a role execution is
+    /// "attributed to their OWN role and model, never blended into the
+    /// primary's metrics".
+    #[test]
+    #[serial_test::serial]
+    fn a_compaction_record_names_the_compactor_not_the_specialist() {
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "coder".into(),
+            "darkmux:qwen3.6-35b-a3b".into(),
+            Arc::clone(&shared),
+            600,
+        )
+        .with_compactor_model(Some("darkmux:qwen3-4b-instruct-2507".into()));
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"compaction","seq":1,"generation":1,"before_messages":40,"after_messages":7,"summary_chars":1500,"tokens_before":38446,"tokens_after":18155}}"#
+        )
+        .unwrap();
+        drop(f);
+        state.poll_and_emit();
+
+        let flows = darkmux_types::config_access::flows_dir();
+        let mut found = None;
+        if let Ok(entries) = std::fs::read_dir(&flows) {
+            for e in entries.flatten() {
+                for line in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if v.get("action").and_then(|a| a.as_str()) == Some("dispatch.compaction") {
+                        found = Some(v);
+                    }
+                }
+            }
+        }
+        if let Some(p) = prev {
+            unsafe { std::env::set_var("DARKMUX_HOME", p) };
+        } else {
+            unsafe { std::env::remove_var("DARKMUX_HOME") };
+        }
+
+        let rec = found.expect("a dispatch.compaction record must be emitted");
+        let payload = rec.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            payload.get("compactor_model").and_then(|v| v.as_str()),
+            Some("darkmux:qwen3-4b-instruct-2507"),
+            "the record must name the UTILITY model that performed the compaction: {rec}"
+        );
+        assert_eq!(
+            payload.get("parent_model").and_then(|v| v.as_str()),
+            Some("darkmux:qwen3.6-35b-a3b"),
+            "and must still carry the parent execution's model, so nothing is lost: {rec}"
+        );
+        assert_ne!(
+            payload.get("compactor_model"),
+            payload.get("parent_model"),
+            "the whole point is that these are two different models"
+        );
+    }
+
