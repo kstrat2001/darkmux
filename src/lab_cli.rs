@@ -357,6 +357,16 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             }
             println!("turns:       {}", report.turns);
             println!("compactions: {}", report.compactions);
+            // (#2494) The workload's OWN result, distinct from the dispatch
+            // path's `ok`. Printed unconditionally when known so a failed
+            // verify cannot be missed; the "not checked" case says so in
+            // those words rather than being silently omitted, which would
+            // read as a pass.
+            match &report.verify {
+                Some(v) if v.passed => println!("verify:      ok"),
+                Some(v) => println!("verify:      FAILED — {}", v.details),
+                None => println!("verify:      not checked"),
+            }
             if !report.tokens_before.is_empty() {
                 let listed: Vec<String> =
                     report.tokens_before.iter().map(|n| n.to_string()).collect();

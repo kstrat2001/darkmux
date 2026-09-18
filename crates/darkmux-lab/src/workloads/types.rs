@@ -248,7 +248,24 @@ pub struct InspectionReport {
     pub tokens_before: Vec<u64>,
     pub summary_chars: Vec<u64>,
     pub mode: Option<RunMode>,
+    /// (#2494) The workload's own verify outcome, read back from the run
+    /// manifest. `None` is a THIRD state, distinct from pass and fail: the
+    /// manifest predates schema v4, or the workload declared no verify
+    /// command, so nothing was checked. A consumer must not render `None`
+    /// as a pass — that conflation is the defect this field closes, where
+    /// a run whose tests failed still read green because the only recorded
+    /// signal was `ok` (the DISPATCH path's result).
+    pub verify: Option<VerifyReport>,
     pub notes: Vec<String>,
+}
+
+/// (#2494) The public, manifest-read twin of the crate-internal
+/// `VerifyOutcome`. Separate type because `InspectionReport` is public
+/// API and `VerifyOutcome` is `pub(crate)`.
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    pub passed: bool,
+    pub details: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

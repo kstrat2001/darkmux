@@ -156,6 +156,14 @@ impl WorkloadProvider for PromptProvider {
             tokens_before: vec![],
             summary_chars: vec![],
             mode: None,
+            // (#2494) This provider already had the outcome in hand and was
+            // only formatting it into a note string; the note stays (it is
+            // what the text view renders) and the typed field makes it
+            // machine-readable alongside it.
+            verify: Some(crate::workloads::types::VerifyReport {
+                passed: verify_outcome.passed,
+                details: verify_outcome.details.clone(),
+            }),
             notes: vec![
                 format!("provider={}", self.id()),
                 format!(

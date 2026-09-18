@@ -1097,15 +1097,24 @@ pub(crate) enum MissionConfigCmd {
     Show {
         /// Mission config id to show (e.g. `review`, `coder-phase`).
         id: String,
-        /// A per-run `ROLE=PROFILE` binding override.
+        /// DEAD SURFACE — accepted, parsed, and then ignored on EVERY
+        /// config. Kept only so an existing invocation does not hard-fail;
+        /// `show` prints a warning naming the override it discarded.
         ///
-        /// Applied exactly as `mission launch <id> --param <role>=<profile>`
-        /// would apply it, which is ONLY on the review-route configs
-        /// (`review`, and any variant whose graph uses the review step
-        /// kinds). On any other config (e.g. `coder-phase`), `mission
-        /// launch` ignores `--param <role>=<profile>` entirely, and `show`
-        /// mirrors that: the override is neutered and a warning names why,
-        /// rather than claiming a parity that doesn't hold. Repeatable.
+        /// (#2523) An earlier version of this text said the override applied
+        /// "ONLY on the review-route configs", which implied it still worked
+        /// there. It does not: the bespoke review launcher that consumed
+        /// role->profile bindings was deleted in #2310 P4d, and
+        /// `effective_overrides_and_warnings` now returns empty overrides for
+        /// every config, `review` included.
+        ///
+        /// What actually resolves a role's profile: the `role_profiles` map
+        /// in `config.json` (`darkmux config set role_profiles.<role>
+        /// <profile>`), with `default_profile` as the floor.
+        ///
+        /// Not to be confused with `mission launch --param <name>=<value>`,
+        /// which is a REAL mechanism for a config's declared INPUTS — a
+        /// different thing that happens to share the flag name. Repeatable.
         #[arg(long = "param", value_name = "ROLE=PROFILE")]
         params: Vec<String>,
         #[command(flatten)]
