@@ -1010,11 +1010,30 @@ pub fn structured_compact(
     // so the installed SYSTEM message can't prime the next turn into emitting
     // a fake block. Applied to the fully-rendered markdown: our own template
     // headers (`###`, `**`) aren't in the delimiter set, so only slot content
-    // is touched. The floor + min-reduction guards are deliberately NOT
-    // applied to the structured path — its degenerate-output class is already
-    // handled by the parse -> lexical-repair -> schema-patch -> retry chain
-    // (#401), and a naive length floor would fight that intentional
-    // partial-salvage and false-positive on the fixed markdown boilerplate.
+    // is touched.
+    //
+    // (#2793) The FLOOR stays deliberately unapplied here, for the reason
+    // this comment has always given: a fixed char minimum would fight the
+    // #401 parse -> lexical-repair -> schema-patch -> retry chain's
+    // intentional partial-salvage, and would false-positive on the fixed
+    // markdown boilerplate this path always emits.
+    //
+    // The MIN-REDUCTION check is a different question and is now applied
+    // below. It was exempted alongside the floor, but the rationale above
+    // only ever argued the floor's case: a reduction check says nothing
+    // about whether output is degenerate, it says the replacement must be
+    // smaller than what it replaces. The #401 chain does not address that,
+    // and a partial salvage that is genuinely shorter passes it untouched —
+    // only a replacement that FAILS TO SHRINK is refused.
+    //
+    // Measured on a real run (profile strategy `structured-slot`, the one
+    // the shipped `balanced` / `deep` profiles use): 2 of 8 compactions grew
+    // the thread instead of shrinking it — 17,592 -> 18,570 and
+    // 25,410 -> 28,452 tokens. Each cost a compactor call, replaced real
+    // messages with a lossy summary, AND raised occupancy, which guarantees
+    // the next turn compacts too. That is the compaction loop
+    // `MIN_REDUCTION_RATIO`'s own doc warns about, reached by the one path
+    // the guard was not watching.
     let markdown = sanitize_compactor_summary(&render_structured_output_as_markdown(
         &capped,
         middle_count,
@@ -1025,6 +1044,76 @@ pub fn structured_compact(
     // (#885) Capture the rendered summary's char count before `markdown`
     // moves into the synthetic message, so the caller reports its true
     // length rather than reading a fixed `messages` index.
+    // (#2793) Refuse a replacement that would GROW the thread.
+    //
+    // This deliberately does NOT reuse the narrative path's
+    // `insufficient_reduction` / `MIN_REDUCTION_RATIO`, and an earlier
+    // revision of this fix that did was wrong. The two paths' numerators are
+    // not the same kind of string: the narrative replacement carries 14
+    // chars of non-summary framing (`[compacted:N] `), while this path's
+    // rendered markdown carries ~661 — of which ~585 is the #439 BUDGET
+    // BLOCK, pacing text emitted for the model and not a summary of
+    // anything. Charging the compactor for it turned a nominal 20% bar into
+    // `20% + 661/M`: 53% at a 2,000-char middle, 42% at 3,000. Identical
+    // summary content was accepted on the narrative path (31.2% reduction)
+    // and refused here (9.3%) — so "the same threshold" was the opposite of
+    // what the code did.
+    //
+    // Worse, the budget block renders only when `max_turns` is set, so an
+    // unrelated operator knob silently moved the threshold: the same thread
+    // and the same compactor could pass or fail on whether a turn cap was
+    // configured. That fails "the operator never has to wonder where a
+    // decision came from".
+    //
+    // The rule that survives all of it: the installed artifact must cost
+    // LESS than what it replaces, measured on the SAME ruler the rest of the
+    // runtime uses (`occupancy_cost_of`, which mirrors
+    // `loop_runner::measure_request_context`). `markdown` IS the message
+    // spliced in, so if its cost is not lower the thread grows — never worth
+    // a compactor call, a lossy replacement, and higher occupancy.
+    //
+    // A second revision of this guard compared `markdown` against
+    // `middle_rendered`, the excerpt built for the compactor's PROMPT. That
+    // render carries role prefixes, tool-call lines and separators that never
+    // enter the thread, so it overstates the middle by 16-31% on tool-bearing
+    // threads — slack that let a replacement growing the thread by 669 chars
+    // through. Comparing a cost against a render is the same mistake as
+    // comparing two differently-framed strings, one revision on.
+    //
+    // WHAT THIS STILL DOES NOT DO, stated because the previous revision of
+    // this comment claimed otherwise and was wrong: it is NOT immune to the
+    // renderer. `render_structured_output_as_markdown` emits a fixed floor
+    // even with empty slots — measured 76 chars without a budget block and
+    // 656 with one — so a middle cheaper than that floor can never be
+    // replaced, and `runtime.max_turns` moves the floor by 8.6x because the
+    // #439 budget block renders only when a turn cap is set. That coupling is
+    // narrowed, not removed: the affected band is now middles below ~712
+    // chars rather than every middle. It is left in rather than papered over
+    // because the budget block is REAL installed cost — refusing to grow the
+    // thread for it is the correct call.
+    //
+    // and because a refusal here is a RECORDED SKIP rather than a dead
+    // dispatch: both call sites in `loop_runner.rs` match on the result and
+    // emit `compaction.skipped`, leaving the conversation untouched (#2792,
+    // merged). So a turn cap makes small-middle compactions less likely to
+    // HELP; it cannot make them fatal.
+    //
+    // That ordering was load-bearing and is recorded because an earlier
+    // revision of this comment asserted the skip behavior while the tree
+    // still propagated with `?` — before #2792 landed, this band was a
+    // dispatch-killing band, and merging this first would have shipped
+    // exactly that.
+    let middle_cost = occupancy_cost_of(&middle_messages);
+    if markdown.len() >= middle_cost {
+        return Err(anyhow!(
+            "structured compaction #{generation} would not shrink the thread \
+             ({middle_cost} chars of middle -> a {} char replacement) — skipping it \
+             rather than installing a replacement at least as large as what it \
+             replaces (#2793)",
+            markdown.len()
+        ));
+    }
+
     let summary_chars = markdown.len();
     let replacement = Message {
         role: "system".to_string(),
@@ -1549,6 +1638,44 @@ pub fn render_structured_output_as_markdown(
 /// can read. Each message gets a `[role]:` prefix and tool_calls are
 /// serialized in a human-readable form. Tool results are tagged with
 /// the tool name.
+/// (#2793 merge-gate) The occupancy cost of a set of messages, measured the
+/// way the runtime measures it everywhere else.
+///
+/// This MUST stay identical to `loop_runner::measure_request_context`'s
+/// accounting — `content` plus each tool call's `name` + `arguments`, and
+/// nothing else. That function is the instrument behind `needs_compaction`'s
+/// estimate and behind `trajectory.append_compaction`'s `tokens_before` /
+/// `tokens_after`, so it is the ruler that produced the negative-reclaim rows
+/// this fix exists to eliminate.
+///
+/// The first revision of the guard compared against
+/// `render_messages_as_excerpt` instead. That render is built for the
+/// COMPACTOR'S PROMPT: it adds `[role]: ` prefixes, `tool_call:` lines,
+/// `(tool result for: ...)` markers and blank-line separators, none of which
+/// ever enter the thread. It is therefore strictly larger than the cost, and
+/// the difference was slack the guard silently allowed — measured at 16.7% on
+/// a 20-message tool-bearing middle and 31.0% on a 40-message one, enough to
+/// ACCEPT a replacement that grew the thread by 669 chars under
+/// `measure_request_context`. Comparing a cost against a render is the same
+/// class of mistake as comparing two differently-framed strings, which is
+/// what the 20% ratio bar got wrong one revision earlier.
+fn occupancy_cost_of(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.content.as_ref().map(|s| s.len()).unwrap_or(0)
+                + m.tool_calls
+                    .as_ref()
+                    .map(|tcs| {
+                        tcs.iter()
+                            .map(|tc| tc.function.name.len() + tc.function.arguments.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+        })
+        .sum()
+}
+
 fn render_messages_as_excerpt(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -1742,6 +1869,361 @@ mod tests {
             Message::user("turn 7 stuff"),
             Message::user("turn 8 stuff"),
         ]
+    }
+
+    /// (#2793) A structured compaction whose rendered replacement is NOT
+    /// smaller than the middle it replaces must be refused, not installed.
+    ///
+    /// Measured on a real run using the `structured-slot` strategy — the one
+    /// the shipped `balanced` and `deep` profiles select — 2 of 8 compactions
+    /// GREW the thread (17,592 -> 18,570 and 25,410 -> 28,452 tokens). Each
+    /// paid a compactor call, replaced real messages with a lossy summary,
+    /// and raised occupancy, which guarantees the next turn compacts too.
+    /// The narrative path had guarded this since #1389; the structured path
+    /// was exempted alongside the (correctly exempted) length FLOOR.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_refuses_a_replacement_that_does_not_shrink_the_middle() {
+        let server = GuardedMockServer::start();
+        // Slot values far larger than the middle they would replace — the
+        // shape that produced a negative reduction on the real run.
+        let bloat = "verbose restatement of everything that happened ".repeat(200);
+        let body = format!(
+            r#"{{"objective":"{bloat}","current_truth":{{"active_files":"{bloat}"}},"compaction_metadata":{{"schema_version":"0.1","generation":9,"source_message_count":4}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let before = messages.clone();
+        let cfg = CompactionConfig::never_compact_with_model();
+
+        let result = structured_compact(&client, &mut messages, 9, &cfg, None);
+
+        let err = result.expect_err(
+            "a replacement larger than the middle it replaces must be refused, never installed",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("would not shrink the thread"),
+            "the refusal must name what it refused, got: {msg}"
+        );
+
+        // The function's own contract: messages are NOT mutated on error.
+        assert_eq!(
+            messages.len(),
+            before.len(),
+            "a refused compaction must leave the conversation intact"
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            before.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            "a refused compaction must not alter any message content"
+        );
+    }
+
+    /// A thread whose compactable middle costs `per_msg * 4` chars. Sized
+    /// deliberately: see `..._in_the_band_the_old_ratio_bar_would_have_refused`.
+    fn messages_with_middle_cost(per_msg: usize) -> Vec<Message> {
+        let filler = "m".repeat(per_msg);
+        vec![
+            Message::system("you are an agent"),
+            Message::user("initial task framing"),
+            Message::user(&filler),
+            Message::user(&filler),
+            Message::user(&filler),
+            Message::user(&filler),
+            Message::user("turn 5 stuff"),
+            Message::user("turn 6 stuff"),
+            Message::user("turn 7 stuff"),
+            Message::user("turn 8 stuff"),
+        ]
+    }
+
+    /// (#2793 round-3) Distinguish the COST rule from the ROUND-2 RENDER
+    /// rule, which nothing else did — swapping `occupancy_cost_of(..)` back
+    /// to `middle_rendered.len()` left the whole suite green, caught only by
+    /// a dead-code lint that any revert keeping the function referenced
+    /// would evade.
+    ///
+    /// A tool-bearing middle is what separates them: `render_messages_as_excerpt`
+    /// adds `[role]: ` prefixes, a `tool_call:` line and a
+    /// `(tool result for: ...)` marker per message, none of which enter the
+    /// thread, so the render overstates the cost by 16-31% on this shape.
+    /// Sized so the replacement sits BETWEEN the two — above the true cost
+    /// (must refuse) and below the inflated render (the round-2 rule would
+    /// have installed it, growing the thread).
+    #[test]
+    #[serial_test::serial]
+    fn a_tool_bearing_middle_refuses_on_cost_where_the_render_rule_would_have_installed() {
+        let call = |id: &str| crate::lmstudio::ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: "{\"path\":\"/workspace/x.txt\"}".into(),
+            },
+            extra_content: None,
+        };
+        let assistant_with_call = |id: &str| Message {
+            role: "assistant".into(),
+            content: Some("short".into()),
+            tool_calls: Some(vec![call(id)]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("seed"),
+            assistant_with_call("c1"),
+            Message::tool_result("c1", "read", "result one"),
+            assistant_with_call("c2"),
+            Message::tool_result("c2", "read", "result two"),
+            Message::user("tail 1"),
+            Message::user("tail 2"),
+            Message::user("tail 3"),
+            Message::user("tail 4"),
+        ];
+        let n = messages.len();
+        let middle = &messages[2..n - 4];
+        let cost = occupancy_cost_of(middle);
+        let rendered = render_messages_as_excerpt(middle).len();
+
+        // The premise: the two rulers genuinely disagree on this shape.
+        // Measured for this fixture: cost 92, rendered 226 — the render is
+        // 2.5x the cost because tool-call framing dominates when message
+        // content is short.
+        assert!(
+            rendered > cost * 2,
+            "the render must substantially overstate a tool-bearing middle for \
+             this test to separate the rules: rendered={rendered} cost={cost}"
+        );
+
+        // A compactor output that lands BETWEEN the two rulers.
+        let server = GuardedMockServer::start();
+        let body = format!(
+            r#"{{"objective":"{}","current_truth":{{"active_files":"x.ts"}},"compaction_metadata":{{"schema_version":"0.1","generation":13,"source_message_count":2}}}}"#,
+            "summarized ".repeat(6)
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut msgs = messages.clone();
+        let cfg = CompactionConfig::never_compact_with_model();
+
+        let err = structured_compact(&client, &mut msgs, 13, &cfg, None).expect_err(
+            "a replacement costing more than the middle must be REFUSED — the \
+             round-2 rule compared against the inflated render and would have \
+             installed this, growing the thread",
+        );
+        let reported: usize = err
+            .to_string()
+            .split("-> a ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("size is reported");
+        assert!(
+            reported >= cost && reported < rendered,
+            "the fixture must land between the rulers, else it cannot tell them \
+             apart: cost={cost} reported={reported} rendered={rendered}"
+        );
+        assert_eq!(msgs.len(), messages.len(), "refusal must not mutate the thread");
+    }
+
+    /// (#2793 round-3) The "MUST stay identical" invariant between
+    /// `occupancy_cost_of` and `loop_runner::measure_request_context` is a
+    /// claim in a doc comment and nothing enforced it. Both directions of
+    /// drift were shown to leave the whole suite green: dropping the
+    /// tool-call term here, and adding `reasoning_content` to the twin —
+    /// the likelier drift, given thinking models. `loop_runner.rs` is not in
+    /// this PR's diff, so the in-diff mutation job would not have caught it
+    /// either.
+    ///
+    /// The corpus exercises every field either function could disagree on.
+    #[test]
+    fn occupancy_cost_matches_the_runtime_ruler_field_for_field() {
+        let msgs = vec![
+            Message::system("sys prompt"),
+            Message::user("plain user"),
+            Message {
+                role: "assistant".into(),
+                content: Some("assistant text".into()),
+                tool_calls: Some(vec![crate::lmstudio::ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: crate::lmstudio::FunctionCall {
+                        name: "read".into(),
+                        arguments: "{\"path\":\"/workspace/x.txt\"}".into(),
+                    },
+                    extra_content: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+                // Set deliberately: neither ruler counts it, and a drift that
+                // starts counting it is the realistic one.
+                reasoning_content: Some("a long private reasoning trace".into()),
+            },
+            Message::tool_result("call_1", "read", "the file contents"),
+            Message {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let (sys, prompt) = crate::loop_runner::measure_request_context(&msgs);
+        assert_eq!(
+            occupancy_cost_of(&msgs),
+            sys + prompt,
+            "the compaction guard must measure exactly what the runtime measures; \
+             a divergence here means the guard is again judging against a ruler \
+             nothing else uses"
+        );
+    }
+
+    /// (#2793 merge-gate) The test that tells the NEW rule apart from the OLD
+    /// one. Without a fixture inside the band where the two disagree, the
+    /// whole change reverts with the suite green — which is exactly what the
+    /// first attempt at this test did (it sat at 56.5% reduction, accepted by
+    /// both rules).
+    ///
+    /// Sized so the two verdicts diverge, with the production render (budget
+    /// block present, ~656 chars of framing):
+    ///
+    /// ```text
+    ///   middle cost      = 1880   (what the thread actually pays)
+    ///   middle rendered  = 1920   (the compactor-prompt excerpt)
+    ///   markdown         = 1722   (slot caps bound it here)
+    ///
+    ///   OLD (ratio vs rendered): refuse when md > 0.8 * 1920 = 1536  -> REFUSES
+    ///   NEW (cost vs cost):      accept when md < 1880               -> ACCEPTS
+    /// ```
+    ///
+    /// The compaction genuinely shrinks the thread by 158 chars and the old
+    /// bar threw it away, because it charged the compactor for render framing
+    /// the thread never pays. Red-prove by restoring
+    /// `insufficient_reduction(middle_rendered.len(), markdown.len())` — NOT
+    /// by deleting the guard, which can never redden an accept-test.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_installs_a_shrink_in_the_band_the_old_ratio_bar_would_have_refused() {
+        let server = GuardedMockServer::start();
+        // Enough slot content to hit the cap, so `markdown` lands at its
+        // ceiling rather than varying with wording.
+        let body_text = "concise but not tiny restatement ".repeat(65);
+        let body = format!(
+            r#"{{"objective":"{body_text}","current_truth":{{"active_files":"a.ts"}},"compaction_metadata":{{"schema_version":"0.1","generation":11,"source_message_count":4}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = messages_with_middle_cost(470);
+        let n = messages.len();
+        let middle_cost = occupancy_cost_of(&messages[2..n - 4]);
+        let middle_rendered = render_messages_as_excerpt(&messages[2..n - 4]).len();
+        let original_len = messages.len();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let budget = BudgetSnapshot {
+            turns_used: 7,
+            max_turns: Some(40),
+            cumulative_completion_tokens_used: 1_000,
+            max_cumulative_completion_tokens: Some(50_000),
+            max_tokens_per_call: 1_000,
+        };
+
+        let (_out, summary_chars) =
+            structured_compact(&client, &mut messages, 11, &cfg, Some(budget)).expect(
+                "a replacement that costs less than the middle it replaces must be \
+                 INSTALLED — the old ratio bar refused this exact case",
+            );
+
+        assert!(messages.len() < original_len, "the middle must have been replaced");
+
+        // The fixture must actually sit in the disputed band, else this test
+        // pins nothing. Asserted rather than trusted to a comment.
+        assert!(
+            summary_chars < middle_cost,
+            "must shrink on the COST ruler: {summary_chars} vs {middle_cost}"
+        );
+        assert!(
+            summary_chars as f32 > middle_rendered as f32 * (1.0 - MIN_REDUCTION_RATIO),
+            "the fixture must land where the OLD ratio bar would have REFUSED \
+             ({summary_chars} must exceed 80% of rendered {middle_rendered}), \
+             otherwise both rules agree and this test cannot tell them apart"
+        );
+    }
+
+    /// (#2793 merge-gate) The production render path — with a budget block —
+    /// is the one that actually ships, and every existing structured test
+    /// passes `budget: None`, which renders ~76 chars of framing instead of
+    /// the ~661 production emits whenever `max_turns` is set. Exercise the
+    /// real shape so the guard is pinned against what operators run.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_guard_holds_on_the_production_render_with_a_budget_block() {
+        let server = GuardedMockServer::start();
+        let bloat = "verbose restatement of everything that happened ".repeat(200);
+        let body = format!(
+            r#"{{"objective":"{bloat}","current_truth":{{"active_files":"{bloat}"}},"compaction_metadata":{{"schema_version":"0.1","generation":12,"source_message_count":4}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let before = messages.clone();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let budget = BudgetSnapshot {
+            turns_used: 7,
+            max_turns: Some(40),
+            cumulative_completion_tokens_used: 1_000,
+            max_cumulative_completion_tokens: Some(50_000),
+            max_tokens_per_call: 1_000,
+        };
+
+        let err = structured_compact(&client, &mut messages, 12, &cfg, Some(budget))
+            .expect_err("a growing replacement must be refused on the production render too");
+        let msg = err.to_string();
+        assert!(msg.contains("would not shrink the thread"));
+        assert_eq!(
+            messages.len(),
+            before.len(),
+            "a refused compaction must leave the conversation intact"
+        );
+
+        // (#2793 merge-gate) Pin the PREMISE, not just the verdict. This test
+        // exists to exercise the production render — the one with the #439
+        // budget block, ~656 chars of framing rather than the ~76 that
+        // `budget: None` produces. Without this assertion the fixture could
+        // silently degrade to the no-budget shape (the block renders only
+        // when BOTH `turns_used` and `max_turns` are Some) and the test would
+        // stay green while testing the thing it was written to avoid.
+        let reported: usize = msg
+            .split("-> a ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("the refusal message reports the replacement size");
+        assert!(
+            reported > 4_000,
+            "the replacement must be the BUDGET-BEARING production render; a \
+             no-budget render would be far smaller: got {reported}"
+        );
     }
 
     #[test]
