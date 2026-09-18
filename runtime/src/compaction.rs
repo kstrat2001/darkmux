@@ -645,8 +645,19 @@ pub fn needs_compaction(
 /// messages to have something meaningful to replace. The compact()
 /// pre-flight uses this independently of any token threshold.
 fn conversation_long_enough_to_compact(message_count: usize) -> bool {
-    message_count >= PRESERVE_HEAD + 1 + PRESERVE_TAIL
+    message_count >= MIN_MESSAGES_TO_COMPACT
 }
+
+/// (#2792) The shortest conversation compaction can act on at all: the
+/// preserved head, at least one middle message to replace, and the preserved
+/// tail. DERIVED from the two `PRESERVE_*` constants rather than restated, so
+/// a change to either cannot leave this behind.
+///
+/// Private: the operator-facing consumer that justified making this public
+/// was the over-window diagnostic, cut from this PR (see the #2792 follow-up).
+/// Kept as a named derivation rather than inlined, because
+/// `conversation_long_enough_to_compact` reads better against a name.
+const MIN_MESSAGES_TO_COMPACT: usize = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
 
 /// Snap the middle-replace boundaries off any tool-call/tool-result group
 /// they would otherwise split, growing the summarized middle outward on
