@@ -448,7 +448,17 @@ fn enrich_manifest_with_fixture_info(
 
     if let Some(obj) = manifest.as_object_mut() {
         obj.insert("fixture".to_string(), fixture);
-        obj.insert("schema_version".to_string(), serde_json::json!(4));
+        // (#2494) RAISE to 4, never lower. This enricher mints v4 to mean
+        // "has a `fixture` block", but it runs AFTER the provider, which
+        // may already have written a HIGHER version for a field of its own
+        // (v5 = "has `verify`"). An unconditional insert here silently
+        // downgraded that, stamping v4 onto a manifest that really is v5.
+        let bumped = obj
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .max(4);
+        obj.insert("schema_version".to_string(), serde_json::json!(bumped));
     } else {
         return Err(anyhow!("manifest is not a JSON object"));
     }
@@ -1340,6 +1350,42 @@ mod tests {
             !msg.contains(&bypassed_project_registry.display().to_string()),
             "must not name the project-local registry that was never consulted: {msg}"
         );
+    }
+
+    /// (#2494) The enricher RAISES schema_version, never lowers it. It
+    /// mints v4 to mean "has a `fixture` block", but runs AFTER the
+    /// provider, which writes v5 when it recorded a `verify` object. An
+    /// unconditional `insert(4)` silently downgraded those manifests, so a
+    /// consumer gating on `>= 5` stopped believing a `verify` that was
+    /// right there in the file.
+    #[test]
+    fn enrich_never_lowers_a_higher_schema_version_the_provider_wrote() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-v5");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let source_sandbox = tmp.path().join("source-sandbox");
+        std::fs::create_dir_all(&source_sandbox).unwrap();
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"schema_version": 5, "run_id": "r", "verify": {"passed": false, "details": "3 failing"}}"#,
+        )
+        .unwrap();
+
+        enrich_manifest_with_fixture_info(&run_dir, Some("blake3:h"), &source_sandbox).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(run_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["schema_version"], 5,
+            "the enricher must not stamp its own v4 over a provider's v5"
+        );
+        assert_eq!(
+            parsed["verify"]["passed"], false,
+            "the verify object must survive enrichment"
+        );
+        assert!(parsed.get("fixture").is_some(), "fixture still added");
     }
 
     /// (#489) Phase 2 — `enrich_manifest_with_fixture_info` adds the

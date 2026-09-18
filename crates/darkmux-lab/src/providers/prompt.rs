@@ -160,9 +160,19 @@ impl WorkloadProvider for PromptProvider {
             // only formatting it into a note string; the note stays (it is
             // what the text view renders) and the typed field makes it
             // machine-readable alongside it.
-            verify: Some(crate::workloads::types::VerifyReport {
-                passed: verify_outcome.passed,
-                details: verify_outcome.details.clone(),
+            // (#2494, merge-gate finding 4) `run_verify` returns
+            // `passed: true, details: "no verify spec"` when the workload
+            // declares no verify at all — a sentinel, not a result. Mapping
+            // that to `Some(passed: true)` would render a bare `verify: ok`
+            // for a run NOTHING verified, defeating the tri-state at the
+            // producer and making `lab_cli`'s "not checked" arm unreachable
+            // for every prompt workload. Only a real verify spec yields
+            // `Some`.
+            verify: loaded.manifest.workload.verify.as_ref().map(|_| {
+                crate::workloads::types::VerifyReport {
+                    passed: verify_outcome.passed,
+                    details: verify_outcome.details.clone(),
+                }
             }),
             notes: vec![
                 format!("provider={}", self.id()),

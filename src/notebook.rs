@@ -267,6 +267,23 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
         .get("ok")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // (#2494) The workload's OWN verify outcome. `ok` above is the DISPATCH
+    // path's result, and the scribe writes NARRATIVE prose from this block —
+    // so omitting verify did not merely drop a field, it let the scribe
+    // confabulate "completed successfully" about a run whose tests failed,
+    // into the durable cross-machine notebook entry. `None` = not checked
+    // (pre-v5 manifest, or no verify spec), which is stated as such rather
+    // than rendered as a pass.
+    let verify_passed = manifest
+        .get("verify")
+        .and_then(|v| v.get("passed"))
+        .and_then(|v| v.as_bool());
+    let verify_details = manifest
+        .get("verify")
+        .and_then(|v| v.get("details"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Trajectory-derived metrics (best effort). The prompt provider doesn't
     // write a trajectory file — its runs are structurally single-turn, so we
@@ -318,7 +335,13 @@ fn build_run_data_summary(run_dir: &Path, manifest: &Value) -> Result<String> {
 
     let mut summary = String::new();
     summary.push_str(&format!(
-        "- run: {session_id}\n- workload: {workload}\n- provider: {provider}\n- profile: {profile}\n- ok: {ok}\n- wall: {}s\n- turns: {turns}\n- compactions: {compactions}\n",
+        "- run: {session_id}\n- workload: {workload}\n- provider: {provider}\n- profile: {profile}\n- ok: {ok}\n- verify: {}\n- wall: {}s\n- turns: {turns}\n- compactions: {compactions}\n",
+        match verify_passed {
+            Some(true) => "passed".to_string(),
+            Some(false) if verify_details.is_empty() => "FAILED".to_string(),
+            Some(false) => format!("FAILED — {verify_details}"),
+            None => "not checked".to_string(),
+        },
         duration_ms / 1000
     ));
     if !tokens_before.is_empty() {

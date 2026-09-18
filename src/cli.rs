@@ -1089,16 +1089,25 @@ pub(crate) enum MissionConfigCmd {
     /// whether this binary can construct it (the same check `mission
     /// launch` exits `4` against, surfaced before launch instead of at
     /// it); and, per task with a `role_id`, the profile and model that
-    /// role resolves to right now, with the resolution's provenance (a
-    /// launch override, the `role_profiles` map, or the `default_profile`
-    /// fallback, so the operator never has to wonder where a decision came
-    /// from, #44) and whether that model is currently loaded. Read-only:
+    /// role resolves to right now, with the resolution's provenance (the
+    /// `role_profiles` map or the `default_profile` fallback, so the
+    /// operator never has to wonder where a decision came from, #44) and
+    /// whether that model is currently loaded. (#2523: this sentence used
+    /// to list "a launch override" as a third provenance tier. There is no
+    /// such tier — `effective_overrides_and_warnings` returns an empty map
+    /// for every config, so `RoleProfileSource::Overridden` is
+    /// production-unreachable. Leaving it here printed "a launch override"
+    /// on the same screen as the `--param` doc calling itself dead.)
+    /// Read-only:
     /// resolves state, mutates nothing.
     Show {
         /// Mission config id to show (e.g. `review`, `coder-phase`).
         id: String,
         /// DEAD SURFACE — accepted, parsed, and then ignored on EVERY
-        /// config. Kept only so an existing invocation does not hard-fail;
+        /// config. A WELL-FORMED value is accepted and discarded so an
+        /// existing invocation does not break; a malformed one still hard-
+        /// fails at parse (`parse_role_overrides`), because a typo is worth
+        /// surfacing even for a surface that does nothing.
         /// `show` prints a warning naming the override it discarded.
         ///
         /// (#2523) An earlier version of this text said the override applied

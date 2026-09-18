@@ -422,7 +422,12 @@ impl WorkloadProvider for CodingTaskProvider {
         let manifest_json = serde_json::json!({
             // v2 added: run_id, profile (now the profile NAME), profile_description.
             // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
-            // v4 (#2494) added: verify. `ok` above is the DISPATCH path's
+            // v4 (#489 Phase 2) is minted by `enrich_manifest_with_fixture_info`,
+            // NOT here: it means "has a `fixture` block". 57 manifests in the
+            // operator's own run store are v4 with no `verify`, so v4 cannot
+            // also mean "has verify" without destroying the version's ability
+            // to tell "not checked" from "predates the feature".
+            // v5 (#2494) added: verify. `ok` above is the DISPATCH path's
             // result (did the runtime complete), which is a different
             // question from whether the workload's own verify command
             // passed — a run can dispatch cleanly and still fail verify.
@@ -431,7 +436,7 @@ impl WorkloadProvider for CodingTaskProvider {
             // whose tests failed. `null` here is a THIRD state, distinct
             // from pass and fail: the workload declared no verify command,
             // so nothing was checked.
-            "schema_version": 4,
+            "schema_version": 5,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),

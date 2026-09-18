@@ -118,7 +118,16 @@ pub(crate) fn cmd_lab(sub: LabCmd) -> Result<i32> {
                         println!("  {} — {}", o.run_id, o.notes.join(" | "));
                     }
                 }
-                Ok(if outcomes.iter().all(|o| o.ok) { 0 } else { 1 })
+                // (#2494) Gate on BOTH the dispatch path and the workload's
+                // own verify. `o.ok` alone meant `darkmux lab run <w> &&
+                // echo PASS` printed PASS on a run whose tests failed — the
+                // most machine-readable green available, and the one CI
+                // keys on. `verify_passed == Some(false)` is a failure; a
+                // `None` (nothing declared a verify) is not.
+                let all_ok = outcomes
+                    .iter()
+                    .all(|o| o.ok && o.verify_passed != Some(false));
+                Ok(if all_ok { 0 } else { 1 })
             }
         },
         LabCmd::Eval {
@@ -364,6 +373,7 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             // read as a pass.
             match &report.verify {
                 Some(v) if v.passed => println!("verify:      ok"),
+                Some(v) if v.details.is_empty() => println!("verify:      FAILED"),
                 Some(v) => println!("verify:      FAILED — {}", v.details),
                 None => println!("verify:      not checked"),
             }
