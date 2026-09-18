@@ -985,6 +985,33 @@ impl Trajectory {
         }));
     }
 
+    /// (#2793) `compaction.unproductive` — compaction ran, installed, and
+    /// still left the thread ABOVE the occupancy that triggers compaction.
+    ///
+    /// Emitted once per episode after several consecutive turns of it, not
+    /// per turn: the condition persists by construction, so a per-turn event
+    /// would bury the run. It is the difference between "compaction is
+    /// working" and "compaction is running" — in this state every turn pays a
+    /// compactor dispatch and none of them buys a turn without one, which is
+    /// invisible from the compaction records alone because each individual
+    /// compaction looks successful.
+    pub fn append_compaction_unproductive(
+        &mut self,
+        turn: u32,
+        consecutive: u32,
+        tokens_after: u32,
+        trigger_tokens: u32,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "compaction.unproductive",
+            "turn": turn,
+            "ts": unix_ms(),
+            "consecutive": consecutive,
+            "tokens_after": tokens_after,
+            "trigger_tokens": trigger_tokens,
+        }));
+    }
+
     /// dispatch.complete — last event in the trajectory. Records the
     /// terminal outcome + wall time.
     pub fn append_dispatch_complete(&mut self, result: &str, wall_ms: u128) {

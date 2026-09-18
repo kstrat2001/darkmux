@@ -245,6 +245,18 @@ const MAX_CONSECUTIVE_MALFORMED_TURNS: u32 = 3;
 /// surfaces on real workloads.
 const STALE_PROMPT_TOKENS_TURNS: u32 = 3;
 
+/// (#2793) How many CONSECUTIVE compactions may leave the thread above the
+/// occupancy that triggers compaction before the runtime says so out loud.
+///
+/// Five rather than two: a couple of unproductive compactions in a row is
+/// ordinary on a thread whose per-turn tool output happens to match what the
+/// compactor can reclaim, and calling that out would be noise. Five in a row
+/// is a shape — the compactor's achievable floor is above its own trigger,
+/// so every remaining turn pays a compactor dispatch and none of them buys a
+/// turn without one. Measured on the dogfood run that produced #2793: 44
+/// compactions across 50 turns.
+const UNPRODUCTIVE_COMPACTION_TURNS: u32 = 5;
+
 /// (#854) Update the consecutive-frozen-turns counter for the endpoint's
 /// reported prompt-token count. Incremented when `current` equals the previous
 /// turn's value (frozen); reset to 0 on any change — growth is healthy, and a
@@ -1830,6 +1842,10 @@ fn run_with_sleeper(
     // actually stuck, purely because the laptop's lid was closed a while.
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
+    // (#2793) Consecutive compactions that installed and still left occupancy
+    // above the trigger; latched warning so one episode says it once.
+    let mut consecutive_unproductive_compactions: u32 = 0;
+    let mut unproductive_compaction_warning_fired = false;
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -3873,6 +3889,46 @@ fn run_with_sleeper(
                             tokens_before,
                             tokens_after,
                         );
+                        // (#2793) Did this compaction get BELOW the line that
+                        // summoned it? If not, `needs_compaction` is already
+                        // true again for the next turn on a thread this
+                        // compactor cannot reduce further — every remaining
+                        // turn will pay a compactor dispatch and none will buy
+                        // a turn without one. Each individual compaction looks
+                        // successful, which is exactly why this is invisible
+                        // from the compaction records alone.
+                        let trigger = compaction_cfg.effective_trigger_tokens();
+                        if tokens_after >= trigger {
+                            consecutive_unproductive_compactions =
+                                consecutive_unproductive_compactions.saturating_add(1);
+                        } else {
+                            consecutive_unproductive_compactions = 0;
+                        }
+                        if consecutive_unproductive_compactions
+                            >= UNPRODUCTIVE_COMPACTION_TURNS
+                            && !unproductive_compaction_warning_fired
+                        {
+                            unproductive_compaction_warning_fired = true;
+                            eprintln!(
+                                "darkmux-runtime: {consecutive_unproductive_compactions} \
+                                 compactions in a row have left the thread at \
+                                 ~{tokens_after} tokens, still at or above the \
+                                 {trigger}-token compaction trigger — so the next turn \
+                                 will compact again, and so will the one after. The \
+                                 compactor cannot reduce this thread below its own \
+                                 trigger: the context window is too small for this \
+                                 workload's per-turn output. Raise the profile's n_ctx, \
+                                 reduce per-turn tool output, or set \
+                                 compaction.bail_after_compactions to bound it. (#2793)"
+                            );
+                            trajectory.append_compaction_unproductive(
+                                turns,
+                                consecutive_unproductive_compactions,
+                                tokens_after,
+                                trigger,
+                            );
+                        }
+
                         // (#854) The thread just shrank, so the next report should
                         // move again — restart staleness tracking so a fresh freeze
                         // is detected cleanly and this episode isn't re-flagged.
@@ -3944,6 +4000,14 @@ fn run_with_sleeper(
                             });
                         }
                     }
+                } else {
+                    // (#2793) A turn that did not compact at all ends the
+                    // episode: the counter tracks a CONSECUTIVE run of
+                    // unproductive compactions, and an intervening turn that
+                    // needed none means the thread came back under the line
+                    // on its own. Without this the count would carry across a
+                    // resolved episode and fire early on the next one.
+                    consecutive_unproductive_compactions = 0;
                 }
 
                 // Loop back and call chat() again.
@@ -12383,6 +12447,123 @@ mod tests {
     /// catch-up's compaction path didn't run the `bail_after_compactions`
     /// check at all, so it would silently issue one MORE request past the
     /// operator's bound instead of escalating to the frontier.
+    /// (#2793) Compaction that runs every turn and never gets below its own
+    /// trigger is a distinct, nameable state, and it must be named.
+    ///
+    /// Measured on the dogfood run this issue came from: 44 compactions
+    /// across 50 turns, 1,047,519 prompt tokens against 10,327 completion —
+    /// every turn paying a compactor dispatch, none of them buying a turn
+    /// without one. Each individual compaction looked successful, which is
+    /// why it was invisible from the compaction records.
+    ///
+    /// Loop-grain by design: the previous two merge-gate rounds both proved
+    /// that unit tests on the pieces leave the wiring unpinned.
+    #[test]
+    #[serial_test::serial]
+    fn compaction_that_never_gets_below_its_own_trigger_is_reported_once() {
+        // Trigger well ABOVE anything a compaction of this thread can reach,
+        // so every compaction is "successful" and still unproductive.
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 1,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let pad = "tool output ".repeat(200);
+        let _primary = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                9_000,
+                50,
+            ));
+        });
+        let _compactor = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some(&format!("Summary of prior work. {pad}")),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("unproductive").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let filler = "seed content ".repeat(80);
+        let initial: Vec<Message> = (0..10)
+            .map(|i| {
+                if i == 0 {
+                    Message::system("test system")
+                } else {
+                    Message::user(format!("turn {i}: {filler}"))
+                }
+            })
+            .collect();
+        let tools = [Tool::Read];
+
+        let _ = run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(12), None, None, None, std::collections::BTreeMap::new(), None,
+        );
+
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .expect("trajectory must exist");
+        let events: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let unproductive: Vec<_> = events
+            .iter()
+            .filter(|v| v["type"] == "compaction.unproductive")
+            .collect();
+        let compactions = events.iter().filter(|v| v["type"] == "compaction").count();
+
+        assert!(
+            compactions >= UNPRODUCTIVE_COMPACTION_TURNS as usize,
+            "the scenario must actually compact repeatedly, else it pins nothing: \
+             {compactions} compactions"
+        );
+        assert_eq!(
+            unproductive.len(),
+            1,
+            "an episode is reported ONCE, not per turn — a per-turn line would \
+             bury the run it is describing. got {} events",
+            unproductive.len()
+        );
+        let ev = unproductive[0];
+        assert!(
+            ev["tokens_after"].as_u64().unwrap() >= ev["trigger_tokens"].as_u64().unwrap(),
+            "the reported state IS 'still at or above the trigger': {ev}"
+        );
+        assert_eq!(
+            ev["consecutive"].as_u64().unwrap(),
+            UNPRODUCTIVE_COMPACTION_TURNS as u64,
+            "it fires at the threshold, not later"
+        );
+    }
+
     /// (#2792 round-3) The RESUME catch-up site must skip a refused
     /// compaction, not kill the dispatch — and must not count it.
     ///
