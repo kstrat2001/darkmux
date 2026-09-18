@@ -257,6 +257,17 @@ const STALE_PROMPT_TOKENS_TURNS: u32 = 3;
 /// compactions across 50 turns.
 const UNPRODUCTIVE_COMPACTION_TURNS: u32 = 5;
 
+/// (#2792) Smallest tool-result body the LAST-RESORT pre-send trim will touch.
+///
+/// Deliberately far below the soft path's 4,000-byte threshold. That constant
+/// protects ordinary short results from a trim whose purpose is reclaiming
+/// slack; this one runs only when the request is already over the declared
+/// window and the alternative is sending something known to be refused. 512
+/// keeps head + marker + tail meaningfully shorter than what it replaces while
+/// still reaching the many-medium-results shape that made the first revision
+/// of this bound reclaim nothing.
+const HARD_TRIM_MIN_BODY_BYTES: usize = 512;
+
 /// (#854) Update the consecutive-frozen-turns counter for the endpoint's
 /// reported prompt-token count. Incremented when `current` equals the previous
 /// turn's value (frozen); reset to 0 on any change — growth is healthy, and a
@@ -2577,6 +2588,97 @@ fn run_with_sleeper(
         // `promote_terminal_reasoning` strips before this line but returns
         // to its caller for exactly this reason. See the detector's
         // firing site below for the actual condition.
+
+        // (#2792) PRE-SEND BOUND. The last thing before the request is built:
+        // is what is about to go out actually inside the window the profile
+        // DECLARES?
+        //
+        // Everything upstream is a trigger, not a bound. `needs_compaction`
+        // decides whether to compact BETWEEN turns; the growth that breaks the
+        // window happens WITHIN one, when a tool result lands after the last
+        // compaction and before this line. Measured with the trigger fix
+        // already in: 14 of 124 turns went out at up to 39,973 against a
+        // declared 32,000, because a result in the protected recent window is
+        // untouchable by both compaction and the soft trim.
+        //
+        // MEASURE WHAT IS SENT, NOT JUST THE MESSAGES (round-2 merge gate).
+        // `measure_request_context` sums message content and tool-call args.
+        // The request also carries the TOOLS SCHEMA — 12,050 bytes for the
+        // default 8-tool palette, ~3,000 tokens on this ruler, present on
+        // every single request. Budgeting without it certified `fits: true`
+        // on a body 36% over the window, which is the defect this bound
+        // exists to prevent, wearing a record that says it was checked.
+        if let Some(window) = compaction_cfg.context_window {
+            let budget_bytes = (window as usize).saturating_mul(4);
+            let tools_bytes = serde_json::to_string(&tool_defs).map(|t| t.len()).unwrap_or(0);
+            let (sys_c, prompt_c) = measure_request_context(&messages);
+            if sys_c + prompt_c + tools_bytes > budget_bytes {
+                let before_tokens = ((sys_c + prompt_c + tools_bytes) / 4) as u32;
+                // The messages must fit in what the tools leave behind.
+                let message_budget = budget_bytes.saturating_sub(tools_bytes);
+                // Floor chosen for THIS path, not inherited from the soft
+                // trim's 4,000 — see `hard_trim_to_fit`'s own note on why that
+                // constant made the bound inert on the modal shape.
+                let stats = crate::tool_result_prune::hard_trim_to_fit(
+                    &mut messages,
+                    message_budget,
+                    HARD_TRIM_MIN_BODY_BYTES,
+                );
+                let (sys_a, prompt_a) = measure_request_context(&messages);
+                let after_tokens = ((sys_a + prompt_a + tools_bytes) / 4) as u32;
+                let fits = after_tokens <= window;
+                if stats.results_trimmed > 0 {
+                    eprintln!(
+                        "darkmux-runtime: the next request was ~{before_tokens} tokens against \
+                         the {window}-token window this profile DECLARES (including \
+                         ~{} for the tool schemas) — hard-trimmed {} tool result(s), \
+                         reclaiming {} bytes, to ~{after_tokens}. Each trimmed result keeps \
+                         its head and tail around an elision marker. (#2792)",
+                        tools_bytes / 4, stats.results_trimmed, stats.bytes_reclaimed
+                    );
+                }
+                if !fits {
+                    // Say WHICH fact is true. An earlier revision always
+                    // claimed "the weight is not in tool results", which was
+                    // a false factual claim on the shape where every result
+                    // is merely below the trim floor — and sent the operator
+                    // to raise n_ctx when clearing results would have worked.
+                    let trimmable = messages
+                        .iter()
+                        .filter(|m| m.role == "tool")
+                        .filter_map(|m| m.content.as_ref())
+                        .filter(|b| b.len() > HARD_TRIM_MIN_BODY_BYTES)
+                        .count();
+                    let why = if stats.results_trimmed > 0 {
+                        "every trimmable tool result has already been elided"
+                    } else if trimmable == 0 {
+                        "no single tool result is large enough to trim, so the weight is \
+                         spread across many small ones"
+                    } else {
+                        "the weight is not in tool results"
+                    };
+                    eprintln!(
+                        "darkmux-runtime: the next request is ~{after_tokens} tokens and the \
+                         {window}-token window this profile DECLARES cannot be met — {why}. \
+                         If the model is loaded at the declared window the endpoint will \
+                         REFUSE this request. Raise the profile's n_ctx, or reduce what this \
+                         role puts in context. (#2792)"
+                    );
+                }
+                trajectory.append_pre_send_bound(
+                    // (#2792 round-2) `turns` has NOT been incremented yet at
+                    // this point — the sequence for this request is computed
+                    // six lines down. Stamping the raw `turns` put the event
+                    // one behind the `model.completed` it pairs with, which is
+                    // the #1221 off-by-one this file already learned once.
+                    if resuming_after_checkpoint { turns } else { turns + 1 },
+                    before_tokens,
+                    after_tokens,
+                    window,
+                    stats.results_trimmed,
+                );
+            }
+        }
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -8243,6 +8345,140 @@ mod tests {
         let out = dummy_structured_output(2);
         // Should NOT panic.
         persist_structured_compaction_output(&runtime_dir, 2, &out);
+    }
+
+    /// (#2792) Captures request bodies for the pre-send bound test. A static
+    /// because httpmock's matcher is a `fn` pointer and cannot close over
+    /// local state.
+    static PRE_SEND_WIRE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::OnceLock::new();
+
+    fn capture_pre_send_wire(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        if let Some(cell) = PRE_SEND_WIRE.get() {
+            let body = req.body.as_ref().map(|b| String::from_utf8_lossy(b).to_string());
+            if let Some(b) = body {
+                cell.lock().unwrap().push(b);
+            }
+        }
+        true
+    }
+
+    /// (#2792 reopened) darkmux must not SEND a request it has already
+    /// computed is over the window its profile declares.
+    ///
+    /// The first fix made the compaction TRIGGER see the thread about to be
+    /// sent, which was necessary and not sufficient: re-running the dogfood on
+    /// that fix measured 4 of 27 turns still going out at ~38.4-38.9k against a
+    /// declared 32,000. Compaction runs BETWEEN turns; a tool result landing
+    /// after the last compaction and before the send grows the thread WITHIN
+    /// one, and the soft trim protects exactly that recent window. On a
+    /// correctly-loaded model each of those four requests is an HTTP 400 and
+    /// the dispatch dies.
+    ///
+    /// This pins the bound at the only point it can be right: immediately
+    /// before the request is built, when nothing further will reduce it.
+    #[test]
+    #[serial_test::serial]
+    fn an_over_window_prompt_is_trimmed_before_it_is_sent() {
+        let cfg = compaction::CompactionConfig {
+            // Compaction OFF, so this can only pass via the pre-send bound.
+            compactor_model: None,
+            threshold_tokens: u32::MAX,
+            threshold_ratio: None,
+            context_window: Some(8_000),
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        // Capture the REAL request body. `MockMatcherFunction` is a plain
+        // `fn` pointer, not a closure, so the capture has to go through a
+        // module-level static — an earlier revision of this test tried a
+        // closure, could not, and left the dead `Arc` behind as a
+        // clippy-silencer while asserting only on the trajectory. That is
+        // precisely the gap this now closes: a trajectory-only assertion
+        // cannot tell "trimmed the wire" from "recorded the event and sent
+        // the original".
+        PRE_SEND_WIRE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        PRE_SEND_WIRE.get().unwrap().lock().unwrap().clear();
+        let _primary = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(capture_pre_send_wire);
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 100, 10));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("presend").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+
+        // One tool result in the PROTECTED recent window, far over the
+        // 8,000-token (32,000-byte) budget. Neither compaction nor the soft
+        // trim can touch it.
+        let huge = "x".repeat(200_000);
+        let initial = vec![
+            Message::system("test system"),
+            Message::user("seed"),
+            Message::tool_result("call_1", "read", &huge),
+        ];
+        let tools = [Tool::Read];
+
+        run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(1), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the dispatch must proceed, not fail");
+
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .expect("trajectory must exist");
+        let bound: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.pre_send_bound")
+            .collect();
+
+        assert!(
+            !bound.is_empty(),
+            "an over-window prompt must be recorded at the pre-send bound"
+        );
+        let ev = &bound[0];
+        assert!(
+            ev["tokens_before"].as_u64().unwrap() > 8_000,
+            "the fixture must actually be over the declared window: {ev}"
+        );
+        assert!(
+            ev["results_trimmed"].as_u64().unwrap() >= 1,
+            "the oversized tool result must be trimmed even though it sits in \
+             the protected recent window — that protection is what leaves this \
+             case unhandled: {ev}"
+        );
+        assert!(
+            ev["tokens_after"].as_u64().unwrap() < ev["tokens_before"].as_u64().unwrap(),
+            "the trim must actually reduce the prompt: {ev}"
+        );
+        assert_eq!(
+            ev["fits"].as_bool(), Some(true),
+            "after trimming, the request must be inside the declared window: {ev}"
+        );
+
+        // THE WIRE, not just the record. Two implementations pass a
+        // trajectory-only assertion and fail here: trimming a CLONE and
+        // sending the original, and running the bound AFTER the request is
+        // built. Both were demonstrated green against the previous revision.
+        let bodies = PRE_SEND_WIRE.get().unwrap().lock().unwrap().clone();
+        assert!(!bodies.is_empty(), "no request was captured");
+        let body = &bodies[0];
+        assert!(
+            body.len() < 200_000,
+            "the oversized result must not have reached the wire: {} bytes",
+            body.len()
+        );
+        assert!(
+            body.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL),
+            "the body on the wire must carry the elision marker, proving the \
+             TRIMMED thread was sent rather than the original"
+        );
     }
 
     /// (#2792 merge-gate, loop grain) A thread whose weight is a huge TAIL
