@@ -1044,18 +1044,45 @@ pub fn structured_compact(
     // (#885) Capture the rendered summary's char count before `markdown`
     // moves into the synthetic message, so the caller reports its true
     // length rather than reading a fixed `messages` index.
-    // (#2793) Refuse a replacement that does not shrink the middle it
-    // replaces. Same guard, same threshold and same error shape as the
-    // narrative path's (`compact`), so the two strategies cannot disagree
-    // about what "worth installing" means. `messages` is untouched at this
-    // point, so the Err leaves the conversation intact for the caller's
-    // error path — the contract this function's own doc already states.
-    if insufficient_reduction(middle_rendered.len(), markdown.len()) {
+    // (#2793) Refuse a replacement that would GROW the thread.
+    //
+    // This deliberately does NOT reuse the narrative path's
+    // `insufficient_reduction` / `MIN_REDUCTION_RATIO`, and an earlier
+    // revision of this fix that did was wrong. The two paths' numerators are
+    // not the same kind of string: the narrative replacement carries 14
+    // chars of non-summary framing (`[compacted:N] `), while this path's
+    // rendered markdown carries ~661 — of which ~585 is the #439 BUDGET
+    // BLOCK, pacing text emitted for the model and not a summary of
+    // anything. Charging the compactor for it turned a nominal 20% bar into
+    // `20% + 661/M`: 53% at a 2,000-char middle, 42% at 3,000. Identical
+    // summary content was accepted on the narrative path (31.2% reduction)
+    // and refused here (9.3%) — so "the same threshold" was the opposite of
+    // what the code did.
+    //
+    // Worse, the budget block renders only when `max_turns` is set, so an
+    // unrelated operator knob silently moved the threshold: the same thread
+    // and the same compactor could pass or fail on whether a turn cap was
+    // configured. That fails "the operator never has to wonder where a
+    // decision came from".
+    //
+    // The rule that survives all of it is the one the defect actually calls
+    // for: the installed artifact must be SMALLER than what it replaces.
+    // `markdown` IS the message spliced in, so if it is not smaller the
+    // thread grows — which is never worth a compactor call, a lossy
+    // replacement, and a higher occupancy. It cannot false-positive, it is
+    // immune to how much framing the renderer adds, and it needs no
+    // threshold to argue about.
+    //
+    // Refusal is NOT fatal: the caller records the skip and continues with
+    // the conversation untouched (#2792 merge-gate). Before that, this Err
+    // propagated through `?` and killed the dispatch — on the very run this
+    // fix was written from, it would have died at compaction 3 of 8 instead
+    // of completing.
+    if markdown.len() >= middle_rendered.len() {
         return Err(anyhow!(
-            "structured compaction #{generation} shrank the middle by less than {}% \
-             ({} -> {} chars) — discarding rather than installing a replacement that \
-             does not reduce the thread (#2793)",
-            (MIN_REDUCTION_RATIO * 100.0) as u32,
+            "structured compaction #{generation} would not shrink the thread \
+             ({} chars of middle -> a {} char replacement) — skipping it rather than \
+             installing a replacement at least as large as what it replaces (#2793)",
             middle_rendered.len(),
             markdown.len()
         ));
@@ -1817,8 +1844,8 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("shrank the middle by less than"),
-            "the refusal must name the reduction guard, got: {msg}"
+            msg.contains("would not shrink the thread"),
+            "the refusal must name what it refused, got: {msg}"
         );
 
         // The function's own contract: messages are NOT mutated on error.
@@ -1831,6 +1858,81 @@ mod tests {
             messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
             before.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
             "a refused compaction must not alter any message content"
+        );
+    }
+
+    /// (#2793 merge-gate) The guard must NOT refuse a compaction that
+    /// genuinely shrinks the thread, even modestly.
+    ///
+    /// The first revision of this fix reused the narrative path's 20%
+    /// `MIN_REDUCTION_RATIO`, which charged this path's ~661 chars of render
+    /// framing against the summary and turned the bar into `20% + 661/M` —
+    /// 53% at a 2,000-char middle. A replacement that shrank the thread by
+    /// 275 chars was refused. This pins the opposite: shrinking is enough.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_accepts_a_replacement_that_shrinks_the_thread_only_modestly() {
+        let server = GuardedMockServer::start();
+        // Slot content sized to land BELOW the middle but nowhere near 20%
+        // below it once the fixed framing is included.
+        let modest = "concise but not tiny restatement ".repeat(45);
+        let body = format!(
+            r#"{{"objective":"{modest}","current_truth":{{"active_files":"a.ts"}},"compaction_metadata":{{"schema_version":"0.1","generation":11,"source_message_count":4}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let original_len = messages.len();
+        let cfg = CompactionConfig::never_compact_with_model();
+
+        let (_out, summary_chars) = structured_compact(&client, &mut messages, 11, &cfg, None)
+            .expect("a replacement that shrinks the thread must be INSTALLED, not refused");
+
+        assert!(messages.len() < original_len, "the middle must have been replaced");
+        assert!(summary_chars > 0, "an installed summary has a real length");
+    }
+
+    /// (#2793 merge-gate) The production render path — with a budget block —
+    /// is the one that actually ships, and every existing structured test
+    /// passes `budget: None`, which renders ~76 chars of framing instead of
+    /// the ~661 production emits whenever `max_turns` is set. Exercise the
+    /// real shape so the guard is pinned against what operators run.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_guard_holds_on_the_production_render_with_a_budget_block() {
+        let server = GuardedMockServer::start();
+        let bloat = "verbose restatement of everything that happened ".repeat(200);
+        let body = format!(
+            r#"{{"objective":"{bloat}","current_truth":{{"active_files":"{bloat}"}},"compaction_metadata":{{"schema_version":"0.1","generation":12,"source_message_count":4}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let before = messages.clone();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let budget = BudgetSnapshot {
+            turns_used: 7,
+            max_turns: Some(40),
+            cumulative_completion_tokens_used: 1_000,
+            max_cumulative_completion_tokens: Some(50_000),
+            max_tokens_per_call: 1_000,
+        };
+
+        let err = structured_compact(&client, &mut messages, 12, &cfg, Some(budget))
+            .expect_err("a growing replacement must be refused on the production render too");
+        assert!(err.to_string().contains("would not shrink the thread"));
+        assert_eq!(
+            messages.len(),
+            before.len(),
+            "a refused compaction must leave the conversation intact"
         );
     }
 
