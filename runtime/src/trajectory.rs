@@ -1012,6 +1012,36 @@ impl Trajectory {
         }));
     }
 
+    /// (#2792) `dispatch.pre_send_bound` — the assembled prompt exceeded the
+    /// profile's DECLARED context window, and what darkmux did about it at the
+    /// last point where it still could.
+    ///
+    /// `trimmed == 0` with `after > window` is the honest failure case: the
+    /// weight was not in tool results, so nothing here could reduce it and the
+    /// request goes out knowing it may be refused. Recorded either way, because
+    /// "darkmux sent a request it had already computed was too big" is exactly
+    /// the fact an operator needs and could not previously get from any
+    /// surface.
+    pub fn append_pre_send_bound(
+        &mut self,
+        turn: u32,
+        tokens_before: u32,
+        tokens_after: u32,
+        window: u32,
+        trimmed: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.pre_send_bound",
+            "turn": turn,
+            "ts": unix_ms(),
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+            "declared_window": window,
+            "results_trimmed": trimmed,
+            "fits": tokens_after <= window,
+        }));
+    }
+
     /// dispatch.complete — last event in the trajectory. Records the
     /// terminal outcome + wall time.
     pub fn append_dispatch_complete(&mut self, result: &str, wall_ms: u128) {

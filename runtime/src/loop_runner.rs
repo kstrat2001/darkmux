@@ -2559,6 +2559,72 @@ fn run_with_sleeper(
         // to its caller for exactly this reason. See the detector's
         // firing site below for the actual condition.
 
+        // (#2792) PRE-SEND BOUND. The last thing before the request is built:
+        // is the thread about to go out actually inside the window the profile
+        // DECLARES?
+        //
+        // Everything upstream is a trigger, not a bound. `needs_compaction`
+        // decides whether to compact BETWEEN turns; the growth that breaks the
+        // window happens WITHIN one, when a tool result lands after the last
+        // compaction and before this line. Measured on a real run with the
+        // trigger fix already in: 4 of 27 turns went out at ~38.4-38.9k against
+        // a declared 32,000, because one result in the protected recent window
+        // is untouchable by both compaction and the soft trim.
+        //
+        // On a model loaded at its declared window that request is refused
+        // outright and the dispatch dies, so there is no version of "send it
+        // anyway" that is better. Trim the largest tool results until it fits —
+        // each keeps its head and tail around an explicit elision marker, so
+        // the model reads a visibly-excerpted result rather than a silently
+        // altered one.
+        //
+        // If it still does not fit, the weight is not in tool results and
+        // darkmux cannot fix it from here. Say so, in darkmux's own voice and
+        // naming darkmux's own budget, so the operator reads "darkmux exceeded
+        // the window its profile declares" instead of a provider error about a
+        // number they never configured. This is the diagnostic cut from the
+        // first attempt at this fix, now at the ONE point where it cannot be
+        // wrong: the prompt is final, nothing further will reduce it.
+        if let Some(window) = compaction_cfg.context_window {
+            // chars/4 is the same ruler every other occupancy decision uses.
+            let budget_bytes = (window as usize).saturating_mul(4);
+            let (sys_c, prompt_c) = measure_request_context(&messages);
+            if sys_c + prompt_c > budget_bytes {
+                let before_tokens = ((sys_c + prompt_c) / 4) as u32;
+                let stats = crate::tool_result_prune::hard_trim_to_fit(
+                    &mut messages,
+                    budget_bytes,
+                );
+                let (sys_a, prompt_a) = measure_request_context(&messages);
+                let after_tokens = ((sys_a + prompt_a) / 4) as u32;
+                if stats.results_trimmed > 0 {
+                    eprintln!(
+                        "darkmux-runtime: the next request was ~{before_tokens} tokens against \
+                         the {window}-token window this profile DECLARES — hard-trimmed {} tool \
+                         result(s), reclaiming {} bytes, to ~{after_tokens} tokens. Each trimmed \
+                         result keeps its head and tail around an elision marker. (#2792)",
+                        stats.results_trimmed, stats.bytes_reclaimed
+                    );
+                }
+                if after_tokens > window {
+                    eprintln!(
+                        "darkmux-runtime: the next request is ~{after_tokens} tokens and the \
+                         {window}-token window this profile DECLARES cannot be met — the weight \
+                         is not in trimmable tool results. If the model is loaded at the declared \
+                         window the endpoint will REFUSE this request. Raise the profile's n_ctx, \
+                         or reduce what this role puts in context. (#2792)"
+                    );
+                }
+                trajectory.append_pre_send_bound(
+                    turns,
+                    before_tokens,
+                    after_tokens,
+                    window,
+                    stats.results_trimmed,
+                );
+            }
+        }
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: messages.clone(),
@@ -8168,6 +8234,100 @@ mod tests {
         let out = dummy_structured_output(2);
         // Should NOT panic.
         persist_structured_compaction_output(&runtime_dir, 2, &out);
+    }
+
+    /// (#2792 reopened) darkmux must not SEND a request it has already
+    /// computed is over the window its profile declares.
+    ///
+    /// The first fix made the compaction TRIGGER see the thread about to be
+    /// sent, which was necessary and not sufficient: re-running the dogfood on
+    /// that fix measured 4 of 27 turns still going out at ~38.4-38.9k against a
+    /// declared 32,000. Compaction runs BETWEEN turns; a tool result landing
+    /// after the last compaction and before the send grows the thread WITHIN
+    /// one, and the soft trim protects exactly that recent window. On a
+    /// correctly-loaded model each of those four requests is an HTTP 400 and
+    /// the dispatch dies.
+    ///
+    /// This pins the bound at the only point it can be right: immediately
+    /// before the request is built, when nothing further will reduce it.
+    #[test]
+    #[serial_test::serial]
+    fn an_over_window_prompt_is_trimmed_before_it_is_sent() {
+        let cfg = compaction::CompactionConfig {
+            // Compaction OFF, so this can only pass via the pre-send bound.
+            compactor_model: None,
+            threshold_tokens: u32::MAX,
+            threshold_ratio: None,
+            context_window: Some(8_000),
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen_w = std::sync::Arc::clone(&seen);
+        let _primary = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            let _ = &seen_w;
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 100, 10));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("presend").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+
+        // One tool result in the PROTECTED recent window, far over the
+        // 8,000-token (32,000-byte) budget. Neither compaction nor the soft
+        // trim can touch it.
+        let huge = "x".repeat(200_000);
+        let initial = vec![
+            Message::system("test system"),
+            Message::user("seed"),
+            Message::tool_result("call_1", "read", &huge),
+        ];
+        let tools = [Tool::Read];
+
+        let outcome = run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(1), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the dispatch must proceed, not fail");
+        let _ = outcome;
+
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .expect("trajectory must exist");
+        let bound: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.pre_send_bound")
+            .collect();
+
+        assert!(
+            !bound.is_empty(),
+            "an over-window prompt must be recorded at the pre-send bound"
+        );
+        let ev = &bound[0];
+        assert!(
+            ev["tokens_before"].as_u64().unwrap() > 8_000,
+            "the fixture must actually be over the declared window: {ev}"
+        );
+        assert!(
+            ev["results_trimmed"].as_u64().unwrap() >= 1,
+            "the oversized tool result must be trimmed even though it sits in \
+             the protected recent window — that protection is what leaves this \
+             case unhandled: {ev}"
+        );
+        assert!(
+            ev["tokens_after"].as_u64().unwrap() < ev["tokens_before"].as_u64().unwrap(),
+            "the trim must actually reduce the prompt: {ev}"
+        );
+        assert_eq!(
+            ev["fits"].as_bool(), Some(true),
+            "after trimming, the request must be inside the declared window: {ev}"
+        );
     }
 
     /// (#2792 merge-gate, loop grain) A thread whose weight is a huge TAIL

@@ -147,6 +147,80 @@ pub fn soft_trim_body(body: &str) -> Option<String> {
 /// The last [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages are skipped so
 /// the active thread stays intact. Mutates in place; returns what it
 /// reclaimed for the caller's observability. (#1391)
+/// (#2792) LAST-RESORT trim to bring an assembled prompt under a hard
+/// context-window bound, overriding the recent-window protection that
+/// [`soft_trim_old_tool_results`] deliberately honors.
+///
+/// The soft trim exists to reclaim transcript without touching what the model
+/// just asked for, so it protects the last
+/// [`TOOL_RESULT_TRIM_PRESERVE_RECENT`] messages. That protection is correct
+/// for its purpose and is precisely what leaves this case unhandled: measured
+/// on a real run, ONE tool result landing in the protected window carried the
+/// next request to 38,439 tokens against a declared 32,000, four times in 27
+/// turns. Compaction cannot help — it runs BETWEEN turns, and this growth
+/// happens WITHIN one, after the last compaction and before the send.
+///
+/// On a model loaded at the window its profile declares, that request is
+/// refused outright (HTTP 400, "the number of tokens to keep from the initial
+/// prompt is greater than the context length") and the dispatch dies. So the
+/// choice here is not "trim or keep" — it is "trim, or send something already
+/// known to fail". Trimming wins, and it is not silent: every trimmed body
+/// keeps its head and tail around an explicit elision marker, so the model can
+/// see that it is reading an excerpt.
+///
+/// Largest first, so the fewest bodies are touched to get under the bound, and
+/// it stops the moment it fits. Returns the bodies trimmed and bytes
+/// reclaimed; a caller that gets `results_trimmed == 0` on an over-window
+/// thread has a thread whose weight is NOT in tool results and must say so
+/// rather than pretend it acted.
+pub fn hard_trim_to_fit(messages: &mut [Message], target_bytes: usize) -> ToolTrimStats {
+    let mut stats = ToolTrimStats::default();
+    let mut current: usize = messages
+        .iter()
+        .map(|m| {
+            m.content.as_ref().map(|s| s.len()).unwrap_or(0)
+                + m.tool_calls
+                    .as_ref()
+                    .map(|tcs| {
+                        tcs.iter()
+                            .map(|tc| tc.function.name.len() + tc.function.arguments.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+        })
+        .sum();
+    if current <= target_bytes {
+        return stats;
+    }
+
+    // Index the trimmable tool results by body size, largest first.
+    let mut candidates: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool")
+        .filter_map(|(i, m)| m.content.as_ref().map(|b| (i, b.len())))
+        .collect();
+    candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+
+    for (idx, _) in candidates {
+        if current <= target_bytes {
+            break;
+        }
+        let Some(body) = messages[idx].content.as_deref() else {
+            continue;
+        };
+        let Some(trimmed) = soft_trim_body(body) else {
+            continue; // already trimmed, or too small to be worth it
+        };
+        let reclaimed = body.len().saturating_sub(trimmed.len());
+        messages[idx].content = Some(trimmed);
+        stats.results_trimmed += 1;
+        stats.bytes_reclaimed += reclaimed;
+        current = current.saturating_sub(reclaimed);
+    }
+    stats
+}
+
 pub fn soft_trim_old_tool_results(messages: &mut [Message]) -> ToolTrimStats {
     let n = messages.len();
     let protect_from = n.saturating_sub(TOOL_RESULT_TRIM_PRESERVE_RECENT);
