@@ -37,17 +37,23 @@
 //!   a re-derived approximation here that diverged from both); this module
 //!   now defers to `decide_residency` rather than adding a fourth.
 //!
-//! **`--param ROLE=PROFILE` applies only where `mission launch` would apply
-//! it.** Role→profile overrides used to be converted into launch bindings
-//! ONLY on the review route (the now-deleted dedicated review launcher,
-//! gated structurally by the since-removed `mission_launch::
-//! config_uses_review_kinds`) — for any other config (e.g.
-//! `coder-phase`), `mission launch` ignores `--param <role>=<profile>`
-//! entirely (a coder-phase `--param role=<id>` instead REBINDS the task's
-//! `role_id`, a different knob `show` can't express). `show` mirrors this
-//! exactly: on a non-review-route config, a supplied `--param` is neutered
-//! (never stamped as `launch override (--param)` provenance) and surfaces a
-//! warning instead of silently claiming a parity that doesn't exist.
+//! **`--param ROLE=PROFILE` is DEAD SURFACE on every config (#2523).** It
+//! is accepted, parsed, and then discarded — `show` neuters it (never
+//! stamping `launch override (--param)` provenance) and surfaces a warning.
+//! Role→profile overrides used to be converted into launch bindings on the
+//! review route alone, via the dedicated review launcher gated by
+//! `mission_launch::config_uses_review_kinds`; BOTH were deleted (#2310
+//! P4d), so there is no longer a config — `review` included — where the
+//! override does anything. An earlier version of this paragraph said it
+//! applied "ONLY on the review route", which read as "it still works
+//! there"; that is the drift #2523 was filed against.
+//!
+//! What actually resolves a role's profile: `role_profiles` in
+//! `config.json`, with `default_profile` as the floor. Unrelated to
+//! `mission launch --param <name>=<value>`, which is a real mechanism for
+//! a config's declared INPUTS and merely shares the flag name. (A
+//! coder-phase `--param role=<id>` is a third thing again — it REBINDS the
+//! task's `role_id`, a knob `show` cannot express.)
 //!
 //! **Structure: pure builders + thin printers.** [`build_list`] and
 //! [`build_show`] take already-loaded data and return plain, `Serialize`

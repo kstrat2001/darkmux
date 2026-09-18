@@ -422,7 +422,21 @@ impl WorkloadProvider for CodingTaskProvider {
         let manifest_json = serde_json::json!({
             // v2 added: run_id, profile (now the profile NAME), profile_description.
             // v3 (#488) added: final_hash (Phase 1). baseline_hash added in Phase 2.
-            "schema_version": 3,
+            // v4 (#489 Phase 2) is minted by `enrich_manifest_with_fixture_info`,
+            // NOT here: it means "has a `fixture` block". 57 manifests in the
+            // operator's own run store are v4 with no `verify`, so v4 cannot
+            // also mean "has verify" without destroying the version's ability
+            // to tell "not checked" from "predates the feature".
+            // v5 (#2494) added: verify. `ok` above is the DISPATCH path's
+            // result (did the runtime complete), which is a different
+            // question from whether the workload's own verify command
+            // passed — a run can dispatch cleanly and still fail verify.
+            // Recording only `ok` left the smoke's real result in
+            // scrollback, so `lab run inspect` could read green on a run
+            // whose tests failed. `null` here is a THIRD state, distinct
+            // from pass and fail: the workload declared no verify command,
+            // so nothing was checked.
+            "schema_version": 5,
             "run_id": run_id,
             "workload": loaded.manifest.workload.id,
             "provider": self.id(),
@@ -430,6 +444,10 @@ impl WorkloadProvider for CodingTaskProvider {
             "profile_description": profile.description.clone().unwrap_or_default(),
             "duration_ms": duration_ms,
             "ok": ok,
+            "verify": verify_outcome.as_ref().map(|v| serde_json::json!({
+                "passed": v.passed,
+                "details": v.details,
+            })),
             "session_id": session_id,
             // Always store the sandbox path as absolute in the
             // manifest. Prior to #359 (QA finding), this stored a
@@ -654,6 +672,19 @@ impl WorkloadProvider for CodingTaskProvider {
                     .map(|s| s.to_string())
             })
             .unwrap_or_else(|| "(unknown)".to_string());
+        // (#2494) Read the verify outcome back from the manifest. Absent
+        // on a pre-v4 manifest, or when the workload declared no verify.
+        let verify = meta.get("verify").and_then(|v| {
+            Some(crate::workloads::types::VerifyReport {
+                passed: v.get("passed")?.as_bool()?,
+                details: v
+                    .get("details")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        });
+
         Ok(InspectionReport {
             run_id,
             workload_id: loaded.manifest.workload.id.clone(),
@@ -670,6 +701,7 @@ impl WorkloadProvider for CodingTaskProvider {
             tokens_before,
             summary_chars,
             mode,
+            verify,
             notes,
         })
     }
@@ -2088,6 +2120,52 @@ not-valid-json
         assert_eq!(report.walltime_ms, 12345);
         assert_eq!(report.turns, 0);
         assert_eq!(report.compactions, 0);
+    }
+
+    /// (#2494) A FAILED verify must survive into the report. Before the
+    /// fix the manifest recorded only `ok` — the DISPATCH path's result —
+    /// so a run whose tests failed was indistinguishable from a clean one
+    /// once the console scrollback was gone.
+    #[test]
+    fn inspect_reads_a_failed_verify_outcome_from_the_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"schema_version":4,"run_id":"r1","duration_ms":10,"ok":true,
+                "verify":{"passed":false,"details":"3 failing tests"}}"#,
+        )
+        .unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        let verify = report
+            .verify
+            .expect("a v4 manifest naming a verify outcome must produce one");
+        assert!(!verify.passed, "a failed verify must not read as passed");
+        assert_eq!(verify.details, "3 failing tests");
+    }
+
+    /// (#2494) The tri-state contract: a manifest with NO verify is "not
+    /// checked", which is distinct from a pass. Asserted explicitly because
+    /// collapsing absent into pass is the exact misread the field exists to
+    /// prevent.
+    #[test]
+    fn inspect_reports_a_missing_verify_as_none_never_as_a_pass() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            r#"{"schema_version":3,"run_id":"r2","duration_ms":10,"ok":true}"#,
+        )
+        .unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert!(
+            report.verify.is_none(),
+            "a pre-v4 manifest must report `not checked`, never a pass"
+        );
     }
 
     /// Forward-compat: a v2-shaped manifest with `run_id` should be returned

@@ -146,10 +146,10 @@ darkmux machine list</code></pre>
       <li><strong>Observability:</strong> any daemon hosts the live viewer at <code>http://localhost:8765/</code>; with Redis configured it aggregates events from every machine on the shared stream. The <a href="../demo/">demo at darkmux.com/demo</a> shows the bundled showcase. <code>darkmux machine list --deep</code> is the same per-machine view from the terminal.</li>
     </ul>
     <pre><code>darkmux machine list --deep</code></pre>
-    <pre><code>MACHINE        ADDRESS                PROBE      RAM-FREE    OS              VERSION  MODELS
+    <pre><code>MACHINE        ADDRESS                PROBE      AI-HEADROOM OS              VERSION  MODELS
 laptop         laptop:8765            ✓ 23ms     78 GB       macos aarch64   1.17.0   darkmux:qwen3.6-35b-a3b-mlx
 studio         studio:8765            ✓ 45ms     12 GB       macos aarch64   1.17.0   darkmux:qwen3-4b-instruct</code></pre>
-    <p>Bounded at ~1s per peer on <code>--deep</code>; degraded peers render with <code>specs?</code> rather than failing the whole command. (Only machines running a daemon, meaning Part 2 workers or the hub, appear here; Part 1 observability peers show their records in the viewer but not in this live probe.)</p>
+    <p><code>AI-HEADROOM</code> is the RAM the peer reports as available for model residency (<code>ram_free_for_ai_bytes</code>) — not the machine’s total free RAM, which is larger. Bounded at ~1s per peer on <code>--deep</code>; degraded peers render with <code>specs?</code> rather than failing the whole command. (Only machines running a daemon, meaning Part 2 workers or the hub, appear here; Part 1 observability peers show their records in the viewer but not in this live probe.)</p>
 
     <div class="callout warn">
       <strong>Scope: single operator, multiple machines.</strong>

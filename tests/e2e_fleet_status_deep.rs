@@ -131,7 +131,7 @@ fn fleet_status_deep_aggregates_specs_from_reachable_peers() {
     // returns). Either is sufficient — the test just needs to verify
     // that --deep is actually fetching the specs payload.
     let has_ram_signal =
-        stdout.contains("ram-free") || stdout.contains("ram_free") || stdout.contains("RAM");
+        stdout.contains("AI-HEADROOM") || stdout.contains("ai_headroom") || stdout.contains("ram_free");
     let has_version_signal = stdout.contains(env!("CARGO_PKG_VERSION"));
     assert!(
         has_ram_signal || has_version_signal,

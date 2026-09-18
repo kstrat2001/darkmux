@@ -409,7 +409,7 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
             "{}",
             style::dim(&format!(
                 "{:<14} {:<22} {:<10} {:<11} {:<10} VERSION  MODELS",
-                "MACHINE", "ADDRESS", "PROBE", "RAM-FREE", "OS"
+                "MACHINE", "ADDRESS", "PROBE", "AI-HEADROOM", "OS"
             ))
         );
     } else {
@@ -606,7 +606,7 @@ fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
 
 /// Format a byte count as a human-friendly "N GB" string for the
 /// `fleet status --deep` table. Round to whole GB — the precision the
-/// `RAM-FREE` column wants. (#275 PR-B)
+/// `AI-HEADROOM` column wants. (#275 PR-B)
 fn human_gb(bytes: u64) -> String {
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     format!("{:.0} GB", gb.round())

@@ -1401,6 +1401,7 @@ impl WorkloadProvider for ToolBenchProvider {
             tokens_before: vec![],
             summary_chars: vec![],
             mode: None,
+            verify: None,
             notes,
         })
     }

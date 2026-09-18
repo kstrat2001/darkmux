@@ -19,6 +19,13 @@ pub struct RunSummary {
     pub profile: String,
     pub duration_ms: u128,
     pub ok: bool,
+    /// (#2494) The workload's OWN verify outcome, read from the manifest.
+    /// `None` means "not checked" — the manifest predates schema v5, or
+    /// the workload declares no verify. Separate from `ok`, which is the
+    /// DISPATCH path's result; a run can dispatch cleanly and still fail
+    /// its tests, and listing only `ok` printed that run as a plain green
+    /// tick in the discovery verb.
+    pub verify_passed: Option<bool>,
     pub modified: SystemTime,
     pub run_dir: PathBuf,
 }
@@ -81,6 +88,10 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u128;
         let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let verify_passed = parsed
+            .get("verify")
+            .and_then(|v| v.get("passed"))
+            .and_then(|v| v.as_bool());
 
         summaries.push(RunSummary {
             run_id,
@@ -88,6 +99,7 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
             profile,
             duration_ms,
             ok,
+            verify_passed,
             modified,
             run_dir: path,
         });
@@ -120,18 +132,25 @@ pub fn format_table(rows: &[RunSummary], runs_dir: &std::path::Path) -> String {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<id_w$}  {:<wl_w$}  {:<pf_w$}  {:>7}  {:>3}\n",
-        "RUN ID", "WORKLOAD", "PROFILE", "WALL", "OK",
+        "{:<id_w$}  {:<wl_w$}  {:<pf_w$}  {:>7}  {:>3}  {:>6}\n",
+        "RUN ID", "WORKLOAD", "PROFILE", "WALL", "OK", "VERIFY",
         id_w = id_w, wl_w = wl_w, pf_w = pf_w
     ));
     for r in rows {
         out.push_str(&format!(
-            "{:<id_w$}  {:<wl_w$}  {:<pf_w$}  {:>6}s  {:>3}\n",
+            "{:<id_w$}  {:<wl_w$}  {:<pf_w$}  {:>6}s  {:>3}  {:>6}\n",
             r.run_id,
             r.workload,
             r.profile,
             r.duration_ms / 1000,
             if r.ok { "✓" } else { "✗" },
+            // (#2494) Three states, never two: a failed verify must be
+            // visible HERE, in the verb an operator reaches for first.
+            match r.verify_passed {
+                Some(true) => "✓",
+                Some(false) => "FAIL",
+                None => "—",
+            },
             id_w = id_w, wl_w = wl_w, pf_w = pf_w
         ));
     }
@@ -307,6 +326,56 @@ mod tests {
         assert!(!names.contains(&"bad"));
     }
 
+    /// (#2494) The discovery verb must show a FAILED verify. Before the
+    /// fix `lab run list` rendered only `ok` — the DISPATCH result — so a
+    /// run whose tests failed printed a plain green tick in the one view
+    /// that shows many runs at once. Asserted on the RENDERED text, because
+    /// the rendering is the defect.
+    #[test]
+    fn format_table_shows_a_failed_verify_and_never_renders_it_as_a_tick() {
+        let now = SystemTime::now();
+        let rows = vec![
+            RunSummary {
+                run_id: "dispatched-fine-tests-failed".into(),
+                workload: "quick-coding".into(),
+                profile: "coder-qwen38".into(),
+                duration_ms: 42_000,
+                ok: true,
+                verify_passed: Some(false),
+                modified: now,
+                run_dir: PathBuf::from("/tmp/x"),
+            },
+            RunSummary {
+                run_id: "nothing-to-check".into(),
+                workload: "quick-q".into(),
+                profile: "fast".into(),
+                duration_ms: 1_000,
+                ok: true,
+                verify_passed: None,
+                modified: now,
+                run_dir: PathBuf::from("/tmp/y"),
+            },
+        ];
+        let out = format_table(&rows, std::path::Path::new("/tmp/x/runs"));
+        assert!(out.contains("VERIFY"), "the column must exist:\n{out}");
+        let failed_line = out
+            .lines()
+            .find(|l| l.contains("dispatched-fine-tests-failed"))
+            .expect("row present");
+        assert!(
+            failed_line.contains("FAIL"),
+            "a failed verify must say so on its own row:\n{failed_line}"
+        );
+        let unchecked = out
+            .lines()
+            .find(|l| l.contains("nothing-to-check"))
+            .expect("row present");
+        assert!(
+            unchecked.contains("\u{2014}"),
+            "an unchecked run must render as \u{2014}, never a tick:\n{unchecked}"
+        );
+    }
+
     #[test]
     fn format_table_renders_header_and_rows() {
         let now = SystemTime::now();
@@ -317,6 +386,7 @@ mod tests {
                 profile: "deep".into(),
                 duration_ms: 198_000,
                 ok: true,
+                verify_passed: Some(true),
                 modified: now,
                 run_dir: PathBuf::from("/tmp/abc"),
             },
@@ -326,6 +396,7 @@ mod tests {
                 profile: "fast".into(),
                 duration_ms: 60_000,
                 ok: false,
+                verify_passed: None,
                 modified: now,
                 run_dir: PathBuf::from("/tmp/def"),
             },
