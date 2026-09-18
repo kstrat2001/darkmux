@@ -716,10 +716,93 @@ const ROSTER_READ_FAILED: &str = "the fleet roster file exists but could not be 
 /// [`ROSTER_READ_FAILED`]'s own doc on why, not the underlying error text)
 /// rather than silently discarding the roster and answering as if nothing
 /// were ever added.
+/// (#2796) Resolve each roster entry's `machine_uid` from the daemon's OWN
+/// flow history when the entry does not declare one.
+///
+/// The operator, looking at the FLEET lens: *"it looks like 4 separate
+/// machines but it's only 2. There would have to be a detector for
+/// consolidation so the number of cards is equal to the number of physical
+/// machines. Unique ID should solve that."* It does, and the machinery for it
+/// already shipped — `cards.ts::rosterOnlyEntries` folds away any roster entry
+/// whose declared `machine_uid` matches a known one (#2768). The gap is that
+/// entries created before that resolution existed declare no uid, so the UI
+/// falls back to matching NAMES.
+///
+/// Names cannot close it, and `cards.ts` says so in its own doc: it
+/// "structurally cannot resolve a roster id that shares no substring with what
+/// the peer actually beats as". Worse, the alias set it compares against is
+/// rebuilt from the records in the CURRENT WINDOW — so identity is durable
+/// while alias knowledge is not, and a roster entry whose last record under
+/// that name is months old becomes its own permanently-offline card for a
+/// machine that is online and already rendered.
+///
+/// Measured on the operator's real store: ten distinct `machine_id` values
+/// resolve to two `machine_uid`s, and the two roster entries (`laptop`,
+/// `studio`) were last seen 2026-06-10 and 2026-05-16 — far outside any
+/// window, while the machine `laptop` names was beating that same minute
+/// under a different name.
+///
+/// The daemon has what the window does not: every flow file on disk. Reading
+/// them for an id -> uid pairing is a durable answer to a question the UI can
+/// only ask of recent memory.
+///
+/// DERIVED, NOT PERSISTED: `fleet.json` is operator state and is not rewritten
+/// here. An entry that already declares a uid is left exactly as it is — the
+/// operator's own declaration always wins over anything inferred.
+fn backfill_roster_machine_uids(
+    machines: &mut [darkmux_fleet::MachineEntry],
+    flows_dir: &std::path::Path,
+) {
+    use std::io::BufRead;
+    if machines.iter().all(|m| m.machine_uid.is_some()) {
+        return;
+    }
+    let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(flows_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let (Some(id), Some(uid)) = (
+                v.get("machine_id").and_then(|x| x.as_str()),
+                v.get("machine_uid").and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            by_id.entry(id.to_string()).or_insert_with(|| uid.to_string());
+        }
+    }
+    for m in machines.iter_mut() {
+        if m.machine_uid.is_none() {
+            if let Some(uid) = by_id.get(&m.id) {
+                m.machine_uid = Some(uid.clone());
+            }
+        }
+    }
+}
+
 async fn fleet_roster_handler() -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(darkmux_fleet::load_roster).await;
     let (machines, error) = match result {
-        Ok(Ok(roster)) => (roster.machines.into_values().collect::<Vec<_>>(), None),
+        Ok(Ok(roster)) => {
+            let mut machines = roster.machines.into_values().collect::<Vec<_>>();
+            // (#2796) Fill in uids the entry itself does not declare, so the
+            // viewer's uid-based consolidation has something to consolidate on.
+            backfill_roster_machine_uids(
+                &mut machines,
+                &darkmux_types::config_access::flows_dir(),
+            );
+            (machines, None)
+        }
         Ok(Err(e)) => {
             eprintln!("darkmux serve: GET /fleet/roster — reading the roster failed ({e:#})");
             (Vec::new(), Some(ROSTER_READ_FAILED.to_string()))

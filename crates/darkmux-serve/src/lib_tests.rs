@@ -7199,4 +7199,74 @@ mod fleet_cache_wall_clock {
              silently UNDER-report how old the snapshot actually is, the same failure class \
              this audit exists to close"
         );
-    }}
+    }
+    /// (#2796) A roster entry that declares no `machine_uid` gets one resolved
+    /// from the daemon's own flow history, so the viewer's uid-based
+    /// consolidation (#2768) can fold it into the machine it names.
+    ///
+    /// The operator's real store is the motivating case: ten distinct
+    /// `machine_id` values across two `machine_uid`s, with the roster's
+    /// `laptop` entry last seen months ago — outside any window the UI can
+    /// rebuild aliases from, while that same machine was beating under a
+    /// different name.
+    #[test]
+    fn roster_uids_are_backfilled_from_flow_history_when_the_entry_declares_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-06-10.jsonl"),
+            concat!(
+                r#"{"machine_id":"laptop","machine_uid":"UID-A","action":"x"}"#,
+                "\n",
+                r#"{"machine_id":"MacBook-Pro","machine_uid":"UID-A","action":"x"}"#,
+                "\n",
+                r#"{"machine_id":"m1-max-32gb-studio","machine_uid":"UID-B","action":"x"}"#,
+                "\n",
+                r#"{"machine_id":"no-uid-anywhere","action":"x"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut machines = vec![
+            darkmux_fleet::MachineEntry {
+                id: "laptop".into(),
+                address: "127.0.0.1:8765".into(),
+                description: None,
+                added_unix_ms: 1,
+                machine_uid: None,
+            },
+            darkmux_fleet::MachineEntry {
+                id: "studio".into(),
+                address: "studio:8765".into(),
+                description: None,
+                added_unix_ms: 2,
+                // The operator's own declaration must never be overwritten.
+                machine_uid: Some("DECLARED-WINS".into()),
+            },
+            darkmux_fleet::MachineEntry {
+                id: "no-uid-anywhere".into(),
+                address: "nowhere:8765".into(),
+                description: None,
+                added_unix_ms: 3,
+                machine_uid: None,
+            },
+        ];
+
+        super::backfill_roster_machine_uids(&mut machines, tmp.path());
+
+        assert_eq!(
+            machines[0].machine_uid.as_deref(),
+            Some("UID-A"),
+            "an undeclared entry must take the uid its own name carried in history"
+        );
+        assert_eq!(
+            machines[1].machine_uid.as_deref(),
+            Some("DECLARED-WINS"),
+            "a declared uid is the operator's and is never replaced by an inferred one"
+        );
+        assert_eq!(
+            machines[2].machine_uid, None,
+            "a name that never appeared with a uid stays unresolved rather than guessing"
+        );
+    }
+}
