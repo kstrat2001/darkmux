@@ -5819,6 +5819,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Arc::clone(&inactivity_deadline),
         inactivity_secs,
         compaction_threshold,
+        // (#2794) The utility model that performs compaction, so its records
+        // name it rather than the specialist this dispatch is for.
+        compaction.compactor_model.clone(),
         opts.record_context.clone(),
     );
 
@@ -7389,6 +7392,7 @@ fn spawn_guarded_tailer(
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
     compaction_threshold: Option<u32>,
+    compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
@@ -7411,6 +7415,7 @@ fn spawn_guarded_tailer(
             inactivity_deadline,
             inactivity_secs,
             compaction_threshold,
+            compactor_model,
             record_context,
         )
     });
@@ -7443,6 +7448,7 @@ fn run_tailer(
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
     compaction_threshold: Option<u32>,
+    compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
@@ -7459,6 +7465,7 @@ fn run_tailer(
     .with_mission(mission_id, phase_id)
     .with_step(step_id)
     .with_compaction_threshold(compaction_threshold)
+    .with_compactor_model(compactor_model)
     .with_record_context(record_context);
 
     loop {
@@ -8959,6 +8966,10 @@ struct TailerState {
     /// runtime triggers compaction at — forwarded on every context telemetry
     /// record so the viewer can draw the trigger line. `None` in tests / when
     /// no window is configured.
+    /// (#2794) The UTILITY model that performs compaction — the registry's
+    /// `internal.utility` binding — as distinct from `model` above, which is
+    /// the SPECIALIST this dispatch is for. `None` when no compactor is bound.
+    compactor_model: Option<String>,
     compaction_threshold: Option<u32>,
     /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
     /// forwarded from the call site — provenance the runtime cannot know
@@ -9025,6 +9036,7 @@ impl TailerState {
         inactivity_secs: u64,
     ) -> Self {
         Self {
+            compactor_model: None,
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
@@ -9082,6 +9094,15 @@ impl TailerState {
         self
     }
 
+
+    /// (#2794) Forward the compactor's own model id so compaction records can
+    /// name whose work they describe. Builder-style; a caller that does not
+    /// opt in keeps `None` and the records read exactly as before.
+    fn with_compactor_model(mut self, compactor_model: Option<String>) -> Self {
+        self.compactor_model = compactor_model;
+        self
+    }
+
     /// Test-only constructor — no inactivity-deadline plumbing. Used by
     /// the unit tests that exercise event-handling shape without
     /// spawning a watchdog thread.
@@ -9093,6 +9114,7 @@ impl TailerState {
         model: String,
     ) -> Self {
         Self {
+            compactor_model: None,
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
@@ -9418,11 +9440,36 @@ impl TailerState {
                         Instant::now() + Duration::from_secs(self.inactivity_secs);
                     *lock_deadline(deadline) = new_deadline;
                 }
+                // (#2794) Name the model that actually did this work.
+                //
+                // `emit` stamps the record's `model` with `self.model` — the
+                // SPECIALIST this dispatch is for. Compaction is not the
+                // specialist's work: it is a SUB-EXECUTION performed by the
+                // utility agent bound to `internal.utility`, typically a 4B
+                // model where the specialist is 35B. Confirmed live on a
+                // dogfood run, where 44 compaction records all carried
+                // `handle: "coder"` and the 35B's id while a 4B did the work,
+                // and the compactor's identity appeared in NONE of the three
+                // artifacts — not the flow record, not `compaction-N.json`'s
+                // metadata, not the trajectory event.
+                //
+                // CLAUDE.md's work-unit contract is explicit that a utility
+                // invocation inside a role execution is "attributed to their
+                // OWN role and model, never blended into the primary's
+                // metrics", and names this emitter as the violator.
+                //
+                // The record-level `model` stays the specialist: it is the
+                // parent execution's identity, four consumers key on it, and
+                // the stream is append-only. The payload carries the
+                // sub-execution's model alongside, so cost attribution has
+                // the number it was missing rather than a wrong one.
                 let payload = serde_json::json!({
                     "generation": event.get("generation"),
                     "before_messages": event.get("before_messages"),
                     "after_messages": event.get("after_messages"),
                     "summary_chars": event.get("summary_chars"),
+                    "compactor_model": self.compactor_model,
+                    "parent_model": self.model,
                 });
                 self.emit("dispatch.compaction", darkmux_flow::Level::Info, payload);
                 // (#557 slice 3) Compaction token telemetry — the drop in
@@ -9435,6 +9482,10 @@ impl TailerState {
                 self.emit_telemetry("compaction", "telemetry.compaction", serde_json::json!({
                     "from": event.get("tokens_before"),
                     "to": event.get("tokens_after"),
+                    // (#2794) Same correction as the record above: the tokens
+                    // in this telemetry were spent by the COMPACTOR, and a
+                    // consumer summing per-model cost needs to know that.
+                    "compactor_model": self.compactor_model,
                 }));
             }
             "dispatch.checkpoint" => {
