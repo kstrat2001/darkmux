@@ -957,6 +957,34 @@ impl Trajectory {
         }));
     }
 
+    /// (#2792) `compaction.skipped` — a compaction was TRIGGERED and then
+    /// REFUSED by the compactor's own guards, so nothing was installed and
+    /// the conversation is byte-identical to before the attempt.
+    ///
+    /// Recorded as its own event type rather than as a `compaction` with a
+    /// zero delta, because the two are different facts and a consumer
+    /// summing `compaction` events must not count this one: no summary
+    /// exists, no messages were replaced, and the generation number was not
+    /// consumed. It is emitted so the attempt is not invisible — a run that
+    /// silently declines to compact while occupancy stays high would
+    /// otherwise look identical to one that never needed to.
+    pub fn append_compaction_skipped(
+        &mut self,
+        turn: u32,
+        attempted_generation: u32,
+        message_count: usize,
+        reason: &str,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "compaction.skipped",
+            "turn": turn,
+            "attempted_generation": attempted_generation,
+            "ts": unix_ms(),
+            "messages": message_count,
+            "reason": reason,
+        }));
+    }
+
     /// dispatch.complete — last event in the trajectory. Records the
     /// terminal outcome + wall time.
     pub fn append_dispatch_complete(&mut self, result: &str, wall_ms: u128) {

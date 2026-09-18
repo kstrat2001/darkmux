@@ -1830,6 +1830,8 @@ fn run_with_sleeper(
     // actually stuck, purely because the laptop's lid was closed a while.
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
+    // (#2792) One over-window warning per dispatch — see its emission site.
+    let mut over_window_warning_fired = false;
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -3648,6 +3650,37 @@ fn run_with_sleeper(
                 // EARLIER than before, never later.
                 let effective_prompt_tokens =
                     effective_prompt_occupancy(&messages, latest_prompt_tokens);
+
+                // (#2792 merge-gate) When occupancy exceeds the DECLARED
+                // window but nothing will compact to bring it down, the
+                // request goes out anyway and the endpoint answers with its
+                // own 400. Say it in darkmux's voice first, naming darkmux's
+                // own budget, so the operator reads "darkmux exceeded the
+                // window its profile declares" rather than a provider error
+                // about a number they never configured. Once per dispatch:
+                // the condition persists across turns and a per-turn line
+                // would bury the run's real output.
+                if let Some(window) = compaction_cfg.context_window {
+                    if effective_prompt_tokens > window
+                        && !over_window_warning_fired
+                        && !compaction::needs_compaction(
+                            effective_prompt_tokens,
+                            messages.len(),
+                            compaction_cfg,
+                        )
+                    {
+                        over_window_warning_fired = true;
+                        eprintln!(
+                            "darkmux-runtime: the next request is ~{effective_prompt_tokens} \
+                             tokens against the {window}-token context window this profile \
+                             DECLARES, and no compaction will run to reduce it ({} messages, \
+                             compaction needs {}). If the model is loaded at the declared \
+                             window the endpoint will REFUSE this request. (#2792)",
+                            messages.len(),
+                            compaction::MIN_MESSAGES_TO_COMPACT,
+                        );
+                    }
+                }
                 if frozen_prompt_turns == STALE_PROMPT_TOKENS_TURNS {
                     let (sys_chars, prompt_chars) = measure_request_context(&messages);
                     let estimate = ((sys_chars + prompt_chars) / 4) as u32;
@@ -3677,7 +3710,11 @@ fn run_with_sleeper(
                     compaction_cfg,
                 ) {
                     let before_count = messages.len();
-                    compactions = compactions.saturating_add(1);
+                    // (#2792 merge-gate) `compactions` is incremented only
+                    // AFTER a compaction actually installs. It used to be
+                    // bumped here, before the attempt, so a refused
+                    // compaction still counted toward `bail_after_compactions`.
+                    let attempted_generation = compactions.saturating_add(1);
                     // (#372 T2-C) Route by strategy. Narrative is
                     // today's default (prose summary as synthetic
                     // USER message). StructuredSlot is tier-2 (typed
@@ -3689,9 +3726,9 @@ fn run_with_sleeper(
                         compaction::CompactionStrategy::Narrative => compaction::compact(
                             compactor_client,
                             &mut messages,
-                            compactions,
+                            attempted_generation,
                             compaction_cfg,
-                        )?,
+                        ),
                         compaction::CompactionStrategy::StructuredSlot => {
                             // (#439) Build budget snapshot so the
                             // compacted SYSTEM message can surface
@@ -3709,77 +3746,142 @@ fn run_with_sleeper(
                                 max_cumulative_completion_tokens: max_cumulative_tokens,
                                 max_tokens_per_call: per_call_cap,
                             };
-                            let (parsed, summary_chars) = compaction::structured_compact(
+                            compaction::structured_compact(
                                 compactor_client,
                                 &mut messages,
-                                compactions,
+                                attempted_generation,
                                 compaction_cfg,
                                 Some(budget),
-                            )?;
-                            // Persist the JSON for downstream
-                            // consumers (replay, methodology
-                            // research, cross-phase memory). Best-
-                            // effort: a write failure logs but does
-                            // NOT fail the dispatch — observability,
-                            // not correctness.
-                            persist_structured_compaction_output(
-                                &crate::trajectory::runtime_dir(),
-                                compactions,
-                                &parsed,
-                            );
-                            summary_chars
+                            )
+                            .map(|(parsed, summary_chars)| {
+                                // Persist the JSON for downstream
+                                // consumers (replay, methodology
+                                // research, cross-phase memory). Best-
+                                // effort: a write failure logs but does
+                                // NOT fail the dispatch — observability,
+                                // not correctness.
+                                persist_structured_compaction_output(
+                                    &crate::trajectory::runtime_dir(),
+                                    attempted_generation,
+                                    &parsed,
+                                );
+                                summary_chars
+                            })
                         }
                     };
-                    let after_count = messages.len();
-                    // (#885) summary_chars now comes directly from the
-                    // compaction fn — the inserted summary's true length —
-                    // rather than guessing it from a fixed `messages` index.
-                    // (#557 Slice-3) Token occupancy across the compaction
-                    // drop. `tokens_before` is the EXACT prompt-token count
-                    // that triggered this compaction (the prior turn's
-                    // usage.prompt_tokens). `tokens_after` is a chars/4
-                    // ESTIMATE of the now-compacted `messages` buffer — the
-                    // runtime has no tokenizer, so we measure chars via the
-                    // same helper the dispatch.start event uses and divide
-                    // by 4. The EXACT post-compaction count lands on the
-                    // next turn's `dispatch.context` `used`.
-                    // (#854) `effective_prompt_tokens` == reported in normal
-                    // operation, and the local estimate when the endpoint count
-                    // was stale — so the event's before-size reflects occupancy
-                    // rather than a frozen value. Note: in the stale case the
-                    // estimate is measured AFTER this turn's pushes, so it's the
-                    // NEXT prompt's occupancy (one turn ahead of what the frozen
-                    // reported metric described), not a restatement of it.
-                    let tokens_before = effective_prompt_tokens;
-                    let (sys_chars, prompt_chars) = measure_request_context(&messages);
-                    let tokens_after = ((sys_chars + prompt_chars) / 4) as u32;
-                    trajectory.append_compaction(
-                        compactions,
-                        before_count,
-                        after_count,
-                        summary_chars,
-                        tokens_before,
-                        tokens_after,
-                    );
-                    // (#854) The thread just shrank, so the next report should
-                    // move again — restart staleness tracking so a fresh freeze
-                    // is detected cleanly and this episode isn't re-flagged.
-                    frozen_prompt_turns = 0;
-                    prev_prompt_tokens = None;
 
-                    // (#457 Step 3) Post-compaction feedback nudge.
-                    // The model's working state was just compressed
-                    // (compactions of 26+ messages → ~1500-char
-                    // summary); orient it toward the smallest concrete
-                    // next step rather than re-reading everything
-                    // (Beat 45's retrace pattern). Fires once per
-                    // compaction event; drains at the top of the next
-                    // loop iteration alongside any cycle/cascade
-                    // signals from this turn.
-                    feedback_injector.queue_post_compaction(turns);
-                    // (#466) Compaction is a proof-of-work signal for
-                    // the inactivity-approach detector. Same trigger
-                    // set as #468 on the host-side reset.
+                    // (#2792 merge-gate) A compaction that cannot help must
+                    // not kill the dispatch.
+                    //
+                    // Both compactors return `Err` when their guards refuse
+                    // the result — most commonly the #1389 min-reduction
+                    // guard, which fires on a SIZE RELATIONSHIP between the
+                    // summary and the middle it replaces. That relationship
+                    // is a property of the THREAD SHAPE, not a transient
+                    // model failure: a thread whose weight sits in the
+                    // preserved head and the preserved 4-message tail has a
+                    // middle too small to yield the required reduction, and
+                    // re-trying cannot change that.
+                    //
+                    // Propagating that `Err` with `?` killed the whole
+                    // dispatch — every banked turn lost, `result: "error"`,
+                    // no envelope — which is the failure class #1221 already
+                    // taught this loop once. It became reachable far more
+                    // often once occupancy started being measured every turn
+                    // (above), so the two changes had to land together.
+                    //
+                    // The refusal itself is right: a summary that does not
+                    // shrink the thread should not be installed. What was
+                    // wrong was the consequence. The attempt is now recorded
+                    // and skipped, leaving `messages` exactly as the
+                    // compactor found them — the pre-#2792 behavior for this
+                    // thread shape — and the loop continues.
+                    let installed_summary_chars = match summary_chars {
+                        Ok(chars) => {
+                            compactions = attempted_generation;
+                            Some(chars)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "darkmux-runtime: compaction #{attempted_generation} was \
+                                 refused and SKIPPED, not installed — the conversation is \
+                                 unchanged and the dispatch continues: {e}"
+                            );
+                            trajectory.append_compaction_skipped(
+                                turns,
+                                attempted_generation,
+                                messages.len(),
+                                &e.to_string(),
+                            );
+                            // Leave the thread untouched and carry on. NOT a
+                            // `continue`: the per-turn liveness bookkeeping
+                            // below (proof-of-work stamp, inactivity window)
+                            // must still run, because a refused compaction
+                            // still spent a real compactor call and skipping
+                            // those updates would let the inactivity deadline
+                            // fire on a dispatch that was working.
+                            None
+                        }
+                    };
+                    // (#2792 merge-gate) Everything in this block describes a
+                    // compaction that ACTUALLY INSTALLED — the trajectory record,
+                    // the staleness-counter reset, the post-compaction nudge. A
+                    // refused attempt did none of those things to the thread, so
+                    // none of them may claim it did. The liveness stamp below is
+                    // deliberately OUTSIDE: a refused attempt still spent a real
+                    // compactor call, and it is real proof of work.
+                    if let Some(summary_chars) = installed_summary_chars {
+                        let after_count = messages.len();
+                        // (#885) summary_chars now comes directly from the
+                        // compaction fn — the inserted summary's true length —
+                        // rather than guessing it from a fixed `messages` index.
+                        // (#557 Slice-3) Token occupancy across the compaction
+                        // drop. `tokens_before` is the EXACT prompt-token count
+                        // that triggered this compaction (the prior turn's
+                        // usage.prompt_tokens). `tokens_after` is a chars/4
+                        // ESTIMATE of the now-compacted `messages` buffer — the
+                        // runtime has no tokenizer, so we measure chars via the
+                        // same helper the dispatch.start event uses and divide
+                        // by 4. The EXACT post-compaction count lands on the
+                        // next turn's `dispatch.context` `used`.
+                        // (#854) `effective_prompt_tokens` == reported in normal
+                        // operation, and the local estimate when the endpoint count
+                        // was stale — so the event's before-size reflects occupancy
+                        // rather than a frozen value. Note: in the stale case the
+                        // estimate is measured AFTER this turn's pushes, so it's the
+                        // NEXT prompt's occupancy (one turn ahead of what the frozen
+                        // reported metric described), not a restatement of it.
+                        let tokens_before = effective_prompt_tokens;
+                        let (sys_chars, prompt_chars) = measure_request_context(&messages);
+                        let tokens_after = ((sys_chars + prompt_chars) / 4) as u32;
+                        trajectory.append_compaction(
+                            compactions,
+                            before_count,
+                            after_count,
+                            summary_chars,
+                            tokens_before,
+                            tokens_after,
+                        );
+                        // (#854) The thread just shrank, so the next report should
+                        // move again — restart staleness tracking so a fresh freeze
+                        // is detected cleanly and this episode isn't re-flagged.
+                        frozen_prompt_turns = 0;
+                        prev_prompt_tokens = None;
+
+                        // (#457 Step 3) Post-compaction feedback nudge.
+                        // The model's working state was just compressed
+                        // (compactions of 26+ messages → ~1500-char
+                        // summary); orient it toward the smallest concrete
+                        // next step rather than re-reading everything
+                        // (Beat 45's retrace pattern). Fires once per
+                        // compaction event; drains at the top of the next
+                        // loop iteration alongside any cycle/cascade
+                        // signals from this turn.
+                        feedback_injector.queue_post_compaction(turns);
+                        // (#466) Compaction is a proof-of-work signal for
+                        // the inactivity-approach detector. Same trigger
+                        // set as #468 on the host-side reset.
+                    }
                     last_proof_of_work = std::time::Instant::now();
                     inactivity_soft_warning_fired_in_window = false;
 
@@ -5050,6 +5152,32 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
 /// compaction EARLIER, never later. #854 introduced this estimate for the
 /// narrower stale-count case; the estimate was always the right input, and the
 /// staleness gate was the accident.
+///
+/// **What this does NOT guarantee, stated so the bound is not mistaken for a
+/// promise (#2792 merge-gate).** Measuring occupancy correctly is necessary
+/// and not sufficient: the compaction it asks for can still be vetoed, and
+/// then the oversized request goes out anyway. Each of these was proven
+/// against a declared 32,000 window:
+///
+/// - `conversation_long_enough_to_compact` needs `PRESERVE_HEAD + 1 +
+///   PRESERVE_TAIL` = 7 messages. Turn 2 after a large first read is 4
+///   messages, so nothing compacts — and "read this large file and summarize
+///   it" is the modal opening move for a coder role.
+/// - Weight sitting in the PRESERVED TAIL is untouchable. Measured: a thread
+///   at 50,047 still measured 50,009 after annihilating its entire
+///   compactable middle — better than any real compaction could do.
+/// - `compactor_model: None` vetoes unconditionally.
+/// - Turn 1 has no compaction gate at all.
+/// - The `"length"` (#1221 checkpoint) arm re-enters the request build with
+///   no occupancy check.
+///
+/// So this narrows the window; it does not close it. Closing it needs a
+/// pre-send bound against `context_window` with a defined non-fatal
+/// behavior, tracked separately. What IS now true is the thing #2792 was
+/// filed about: the compaction trigger sees the thread about to be SENT
+/// rather than the one already sent. The diagnostic at the call site names
+/// the remaining case out loud rather than letting it surface as a provider
+/// error.
 fn effective_prompt_occupancy(messages: &[Message], latest_prompt_tokens: u32) -> u32 {
     let (sys_chars, prompt_chars) = measure_request_context(messages);
     let estimate = ((sys_chars + prompt_chars) / 4) as u32;
@@ -7957,6 +8085,131 @@ mod tests {
         let out = dummy_structured_output(2);
         // Should NOT panic.
         persist_structured_compaction_output(&runtime_dir, 2, &out);
+    }
+
+    /// (#2792 merge-gate, loop grain) A thread whose weight is a huge TAIL
+    /// message and whose compactable MIDDLE is tiny must not kill the
+    /// dispatch.
+    ///
+    /// Measuring occupancy every turn makes this shape trip the compaction
+    /// trigger far more often; the compactor then cannot reach the #1389
+    /// min-reduction bar, because the middle it is allowed to touch is
+    /// `messages[2 .. n-4]` while the weight sits in the preserved tail.
+    /// Before the refusal was made non-fatal, the resulting `Err` propagated
+    /// through `?` and ended the whole dispatch — every banked turn lost,
+    /// `result: "error"`, no envelope. That is #1221's lesson, and the
+    /// occupancy change is what made it reachable.
+    ///
+    /// This is deliberately a LOOP-grain test. The pure-function tests above
+    /// pass even when the call site is reverted, so they cannot pin the
+    /// wiring; this one drives `run()` end to end.
+    #[test]
+    #[serial_test::serial]
+    fn a_tiny_middle_under_a_huge_tail_skips_the_compaction_instead_of_killing_the_dispatch() {
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 5000,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let _primary = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                1000, // an honest report for a request that was small when sent
+                50,
+            ));
+        });
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some(
+                    "Summary: the assistant issued a read tool call against the workspace \
+                     file and inspected the returned contents. No decisions were finalized \
+                     and no files were modified. The next concrete action is to continue \
+                     reading and then act on what the file contains.",
+                ),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("tiny-middle").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+
+        // n = 7: head 0..2, preserved tail 3..7, so the compactable middle is
+        // exactly index 2 — one tiny message. The weight is the huge message
+        // at the TAIL, which neither the soft-trim (last 6 never trimmed) nor
+        // compaction (PRESERVE_TAIL = 4) may touch.
+        let huge = "x".repeat(120_000); // ~30k tokens by chars/4
+        let initial = vec![
+            Message::system("test system"),
+            Message::user("seed"),
+            Message::user("tiny middle"),
+            Message::assistant("ok"),
+            Message::user("go"),
+            Message::assistant("sure"),
+            Message::user(&huge),
+        ];
+        let tools = [Tool::Read];
+
+        let outcome = run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(4), None, None, None, std::collections::BTreeMap::new(), None,
+        );
+
+        let outcome = outcome.expect(
+            "a compaction the thread shape makes impossible must be SKIPPED, not fatal — \
+             propagating it ends the dispatch and discards every banked turn (#1221)",
+        );
+        assert!(
+            compactor_mock.hits() >= 1,
+            "the scenario must actually have attempted a compaction, else it pins nothing"
+        );
+        assert!(
+            outcome.turns >= 1,
+            "the dispatch must have continued doing work after the refused compaction"
+        );
+
+        // The skip is recorded — an invisible refusal would leave a run that
+        // declines to compact indistinguishable from one that never needed to.
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .expect("trajectory must exist");
+        let skipped: Vec<_> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "compaction.skipped")
+            .collect();
+        assert!(
+            !skipped.is_empty(),
+            "a refused compaction must be recorded as `compaction.skipped`"
+        );
+        assert!(
+            skipped[0]["reason"].as_str().unwrap_or("").contains("less than"),
+            "the recorded reason must name the guard that refused it: {:?}",
+            skipped[0]["reason"]
+        );
     }
 
     // ─── effective_prompt_occupancy (#2792) ─────────────────────────
@@ -11843,10 +12096,31 @@ mod tests {
         // staleness heuristic rescued it. This event is now a DIAGNOSTIC that
         // the endpoint is misreporting, which is what its message says.
         let estimate = stale_events[0]["estimate"].as_u64().unwrap();
+        let reported_messages = stale_events[0]["message_count"]
+            .as_u64()
+            .or_else(|| stale_events[0]["messages"].as_u64())
+            .expect("the event must report the thread size it measured");
+        // (#2792 merge-gate) `estimate > 0` was vacuous — a hardcoded `1`
+        // passed it while its own message forbade placeholders. Two bounds
+        // that are properties of a REAL measurement, without re-encoding the
+        // old `>= 5000` mechanism:
+        //
+        // 1. Every message carries content, so a genuine chars/4 measure of
+        //    N messages exceeds N.
+        // 2. This fixture's padded messages are ~630 chars each and the
+        //    preserved head + tail alone is 6 of them, so any honest
+        //    measurement here is far above 250 tokens (~1,000 chars). A
+        //    placeholder small enough to be convenient fails this; a real
+        //    measurement cannot.
         assert!(
-            estimate > 0,
-            "the stale-tokens event must carry a real local measurement of the \
-             current thread, not a placeholder: got {estimate}"
+            estimate > reported_messages,
+            "a chars/4 measure of {reported_messages} messages must exceed the \
+             message count itself: got {estimate}"
+        );
+        assert!(
+            estimate >= 250,
+            "the event must carry a real measurement of this fixture's padded \
+             thread, not a placeholder: got {estimate}"
         );
     }
 
