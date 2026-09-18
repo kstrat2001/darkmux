@@ -1830,12 +1830,6 @@ fn run_with_sleeper(
     // actually stuck, purely because the laptop's lid was closed a while.
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
-    // (#2792) One over-window warning per dispatch — see its emission site.
-    let mut over_window_warning_fired = false;
-    // (#2797 merge-gate) Set when a compaction was triggered and then refused,
-    // so the over-window diagnostic knows the trigger firing did NOT mean the
-    // thread was going to shrink.
-    let mut compaction_skipped_last_turn = false;
 
     // (#2114) Reads + parses `pace.json` on demand (not once at startup
     // like `turn_delay_ms` below — the pace file is meant to change
@@ -3691,64 +3685,13 @@ fn run_with_sleeper(
                 let effective_prompt_tokens =
                     effective_prompt_occupancy(&messages, latest_prompt_tokens);
 
-                // (#2792 merge-gate) When occupancy exceeds the DECLARED
-                // window but nothing will compact to bring it down, the
-                // request goes out anyway and the endpoint answers with its
-                // own 400. Say it in darkmux's voice first, naming darkmux's
-                // own budget, so the operator reads "darkmux exceeded the
-                // window its profile declares" rather than a provider error
-                // about a number they never configured. Once per dispatch:
-                // the condition persists across turns and a per-turn line
-                // would bury the run's real output.
-                // NOTE the condition is "nothing will REDUCE it", not "nothing
-                // will be attempted" (#2797 merge-gate). Gating on
-                // `!needs_compaction` alone meant the diagnostic could not fire
-                // in the case this PR introduced: a compaction that IS
-                // triggered and then REFUSED leaves `needs_compaction` true and
-                // the thread unchanged, so the oversized request went out with
-                // no darkmux-voice line at all — precisely the scenario the
-                // warning exists for. `compaction_skipped_this_turn` carries
-                // that fact forward from the refusal below.
-                if let Some(window) = compaction_cfg.context_window {
-                    let nothing_will_reduce_it = compaction_skipped_last_turn
-                        || !compaction::needs_compaction(
-                            effective_prompt_tokens,
-                            messages.len(),
-                            compaction_cfg,
-                        );
-                    if effective_prompt_tokens > window
-                        && !over_window_warning_fired
-                        && nothing_will_reduce_it
-                    {
-                        over_window_warning_fired = true;
-                        eprintln!(
-                            "darkmux-runtime: the next request is ~{effective_prompt_tokens} \
-                             tokens against the {window}-token context window this profile \
-                             DECLARES, and nothing will reduce it before it is sent ({}). \
-                             If the model is loaded at the declared window the endpoint \
-                             will REFUSE this request. (#2792)",
-                            // Name the ACTUAL reason. `needs_compaction` can be
-                            // false for three different causes and an earlier
-                            // revision printed the thread-too-short one
-                            // unconditionally — so an operator with no
-                            // compactor bound read "40 messages, compaction
-                            // needs 7", a sentence that contradicts itself.
-                            if compaction_skipped_last_turn {
-                                "a compaction was attempted and refused".to_string()
-                            } else if compaction_cfg.compactor_model.is_none() {
-                                "no compactor model is bound".to_string()
-                            } else if messages.len() < compaction::MIN_MESSAGES_TO_COMPACT {
-                                format!(
-                                    "only {} messages; compaction needs {}",
-                                    messages.len(),
-                                    compaction::MIN_MESSAGES_TO_COMPACT
-                                )
-                            } else {
-                                "the compaction threshold has not been reached".to_string()
-                            },
-                        );
-                    }
-                }
+                // (#854) The endpoint's reported count going STALE — frozen
+                // across turns while the thread grew — is surfaced as its own
+                // signal, once at the crossing. It no longer gates the
+                // compaction decision (the estimate above is unconditional
+                // now), so this is purely the eureka: the endpoint is
+                // misreporting, and that is worth telling the operator even
+                // though darkmux now compacts correctly regardless.
                 if frozen_prompt_turns == STALE_PROMPT_TOKENS_TURNS {
                     let (sys_chars, prompt_chars) = measure_request_context(&messages);
                     let estimate = ((sys_chars + prompt_chars) / 4) as u32;
@@ -3867,11 +3810,9 @@ fn run_with_sleeper(
                     let installed_summary_chars = match summary_chars {
                         Ok(chars) => {
                             compactions = attempted_generation;
-                            compaction_skipped_last_turn = false;
                             Some(chars)
                         }
                         Err(e) => {
-                            compaction_skipped_last_turn = true;
                             eprintln!(
                                 "darkmux-runtime: compaction #{attempted_generation} was \
                                  refused and SKIPPED, not installed — the conversation is \
@@ -5245,9 +5186,17 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
 /// pre-send bound against `context_window` with a defined non-fatal
 /// behavior, tracked separately. What IS now true is the thing #2792 was
 /// filed about: the compaction trigger sees the thread about to be SENT
-/// rather than the one already sent. The diagnostic at the call site names
-/// the remaining case out loud rather than letting it surface as a provider
-/// error.
+/// rather than the one already sent.
+///
+/// An operator-facing diagnostic for the remaining cases was written and then
+/// CUT from this PR (round-3 merge gate). Placed before the compaction it
+/// described, it predicted that compaction's outcome from the previous turn's
+/// and printed a confident falsehood on this PR's own fixture — "~30084
+/// tokens … the endpoint will REFUSE this request" on a turn whose next
+/// request was 146 tokens — and burned its once-per-dispatch latch doing so,
+/// silencing the genuine case it existed for. It belongs AFTER the compaction
+/// block with occupancy recomputed, which is a different change; tracked
+/// separately rather than landed half-right on a release blocker.
 fn effective_prompt_occupancy(messages: &[Message], latest_prompt_tokens: u32) -> u32 {
     let (sys_chars, prompt_chars) = measure_request_context(messages);
     let estimate = ((sys_chars + prompt_chars) / 4) as u32;
@@ -12434,6 +12383,150 @@ mod tests {
     /// catch-up's compaction path didn't run the `bail_after_compactions`
     /// check at all, so it would silently issue one MORE request past the
     /// operator's bound instead of escalating to the frontier.
+    /// (#2792 round-3) The RESUME catch-up site must skip a refused
+    /// compaction, not kill the dispatch — and must not count it.
+    ///
+    /// Round 2 converted this site and round 3 proved the conversion was
+    /// pinned by NOTHING: restoring the fatal `?` OR the count-attempts
+    /// increment here both left the full suite green. This is the worse of
+    /// the two sites to leave unguarded, because a resume begins from a
+    /// checkpoint whose thread is already large — exactly where a middle too
+    /// small to compact meets a thread big enough to trigger — and killing
+    /// the dispatch there discards the banked work the checkpoint exists to
+    /// preserve.
+    #[test]
+    #[serial_test::serial]
+    fn resume_catch_up_skips_a_refused_compaction_instead_of_killing_the_dispatch() {
+        let cfg = compaction::CompactionConfig {
+            threshold_tokens: 5_000,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let _primary = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 900, 20));
+        });
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some(
+                    "Summary: the assistant issued a read against the workspace and \
+                     inspected the result. Nothing was finalized and no files changed. \
+                     The next action is to continue reading and then act on the contents.",
+                ),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-skip").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+
+        // Weight in the PRESERVED TAIL, tiny compactable middle — the shape
+        // whose middle cannot reach the min-reduction bar however good the
+        // compactor is.
+        let huge = "x".repeat(120_000);
+        let assistant_turn = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{\"path\":\"/workspace/x.txt\"}".into(),
+                },
+                extra_content: None,
+            }]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let checkpoint_messages = vec![
+            Message::system("test system"),
+            Message::user("seed"),
+            Message::user("tiny middle"),
+            Message::assistant("ok"),
+            Message::user("go"),
+            assistant_turn,
+            Message::tool_result("call_1", "read", &huge),
+        ];
+
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".into(),
+            messages: checkpoint_messages,
+            turns: 2,
+            total_prompt_tokens: 900,
+            total_completion_tokens: 40,
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: None,
+            // The catch-up block runs only when the checkpoint carries an
+            // undispatched call — that is what "catch-up" means.
+            pending_tool_calls: Some(vec![ToolCall {
+                id: "call_2".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{\"path\":\"/workspace/y.txt\"}".into(),
+                },
+                extra_content: None,
+            }]),
+            pending_tool_calls_seq_base: 1,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
+            Some(4), None, None, None, Some(u32::MAX), None,
+            std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect(
+            "a resume catch-up compaction the thread shape makes impossible must be \
+             SKIPPED, not fatal — propagating it discards the checkpoint's banked work",
+        );
+
+        assert!(
+            compactor_mock.hits() >= 1,
+            "the scenario must actually have attempted a catch-up compaction"
+        );
+
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .expect("trajectory must exist");
+        let events: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let skipped = events.iter().filter(|v| v["type"] == "compaction.skipped").count();
+        let installed = events.iter().filter(|v| v["type"] == "compaction").count();
+
+        assert!(skipped >= 1, "the refused catch-up compaction must be recorded");
+        assert_eq!(
+            outcome.compactions as usize, installed,
+            "the counter must equal INSTALLED compactions ({installed}), not installs \
+             plus the {skipped} refused catch-up attempt(s)"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn resume_catch_up_compaction_honors_bail_after_compactions() {

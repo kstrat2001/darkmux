@@ -653,11 +653,11 @@ fn conversation_long_enough_to_compact(message_count: usize) -> bool {
 /// tail. DERIVED from the two `PRESERVE_*` constants rather than restated, so
 /// a change to either cannot leave this behind.
 ///
-/// Public because the loop needs to TELL THE OPERATOR why no compaction ran
-/// when occupancy is over the declared window — a thread shorter than this
-/// cannot compact no matter how large it is, which is the difference between
-/// "darkmux declined" and "darkmux could not".
-pub const MIN_MESSAGES_TO_COMPACT: usize = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
+/// Private: the operator-facing consumer that justified making this public
+/// was the over-window diagnostic, cut from this PR (see the #2792 follow-up).
+/// Kept as a named derivation rather than inlined, because
+/// `conversation_long_enough_to_compact` reads better against a name.
+const MIN_MESSAGES_TO_COMPACT: usize = PRESERVE_HEAD + 1 + PRESERVE_TAIL;
 
 /// Snap the middle-replace boundaries off any tool-call/tool-result group
 /// they would otherwise split, growing the summarized middle outward on
