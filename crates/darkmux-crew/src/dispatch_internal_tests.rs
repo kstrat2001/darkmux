@@ -14824,9 +14824,20 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     #[test]
     #[serial_test::serial]
     fn a_compaction_record_names_the_compactor_not_the_specialist() {
+        // Pin BOTH tiers, matching this file's established pattern: the
+        // record path resolves through `DARKMUX_FLOWS_DIR` when set, so
+        // pinning `DARKMUX_HOME` alone leaves the sink wherever an earlier
+        // test (or the CI environment) last pointed it. That difference is
+        // exactly why an earlier revision of this test passed locally and
+        // failed on the workspace run.
         let home = tempfile::tempdir().unwrap();
+        let flows_dir = tempfile::tempdir().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
-        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let traj_path = tmp.path().join("trajectory.jsonl");
@@ -14850,7 +14861,7 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         drop(f);
         state.poll_and_emit();
 
-        let flows = darkmux_types::config_access::flows_dir();
+        let flows = flows_dir.path().to_path_buf();
         let mut found = None;
         if let Ok(entries) = std::fs::read_dir(&flows) {
             for e in entries.flatten() {
@@ -14864,10 +14875,15 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
                 }
             }
         }
-        if let Some(p) = prev {
-            unsafe { std::env::set_var("DARKMUX_HOME", p) };
-        } else {
-            unsafe { std::env::remove_var("DARKMUX_HOME") };
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("DARKMUX_HOME", p),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(p) => std::env::set_var("DARKMUX_FLOWS_DIR", p),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
         }
 
         let rec = found.expect("a dispatch.compaction record must be emitted");
