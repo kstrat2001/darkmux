@@ -1010,11 +1010,30 @@ pub fn structured_compact(
     // so the installed SYSTEM message can't prime the next turn into emitting
     // a fake block. Applied to the fully-rendered markdown: our own template
     // headers (`###`, `**`) aren't in the delimiter set, so only slot content
-    // is touched. The floor + min-reduction guards are deliberately NOT
-    // applied to the structured path — its degenerate-output class is already
-    // handled by the parse -> lexical-repair -> schema-patch -> retry chain
-    // (#401), and a naive length floor would fight that intentional
-    // partial-salvage and false-positive on the fixed markdown boilerplate.
+    // is touched.
+    //
+    // (#2793) The FLOOR stays deliberately unapplied here, for the reason
+    // this comment has always given: a fixed char minimum would fight the
+    // #401 parse -> lexical-repair -> schema-patch -> retry chain's
+    // intentional partial-salvage, and would false-positive on the fixed
+    // markdown boilerplate this path always emits.
+    //
+    // The MIN-REDUCTION check is a different question and is now applied
+    // below. It was exempted alongside the floor, but the rationale above
+    // only ever argued the floor's case: a reduction check says nothing
+    // about whether output is degenerate, it says the replacement must be
+    // smaller than what it replaces. The #401 chain does not address that,
+    // and a partial salvage that is genuinely shorter passes it untouched —
+    // only a replacement that FAILS TO SHRINK is refused.
+    //
+    // Measured on a real run (profile strategy `structured-slot`, the one
+    // the shipped `balanced` / `deep` profiles use): 2 of 8 compactions grew
+    // the thread instead of shrinking it — 17,592 -> 18,570 and
+    // 25,410 -> 28,452 tokens. Each cost a compactor call, replaced real
+    // messages with a lossy summary, AND raised occupancy, which guarantees
+    // the next turn compacts too. That is the compaction loop
+    // `MIN_REDUCTION_RATIO`'s own doc warns about, reached by the one path
+    // the guard was not watching.
     let markdown = sanitize_compactor_summary(&render_structured_output_as_markdown(
         &capped,
         middle_count,
@@ -1025,6 +1044,23 @@ pub fn structured_compact(
     // (#885) Capture the rendered summary's char count before `markdown`
     // moves into the synthetic message, so the caller reports its true
     // length rather than reading a fixed `messages` index.
+    // (#2793) Refuse a replacement that does not shrink the middle it
+    // replaces. Same guard, same threshold and same error shape as the
+    // narrative path's (`compact`), so the two strategies cannot disagree
+    // about what "worth installing" means. `messages` is untouched at this
+    // point, so the Err leaves the conversation intact for the caller's
+    // error path — the contract this function's own doc already states.
+    if insufficient_reduction(middle_rendered.len(), markdown.len()) {
+        return Err(anyhow!(
+            "structured compaction #{generation} shrank the middle by less than {}% \
+             ({} -> {} chars) — discarding rather than installing a replacement that \
+             does not reduce the thread (#2793)",
+            (MIN_REDUCTION_RATIO * 100.0) as u32,
+            middle_rendered.len(),
+            markdown.len()
+        ));
+    }
+
     let summary_chars = markdown.len();
     let replacement = Message {
         role: "system".to_string(),
@@ -1742,6 +1778,60 @@ mod tests {
             Message::user("turn 7 stuff"),
             Message::user("turn 8 stuff"),
         ]
+    }
+
+    /// (#2793) A structured compaction whose rendered replacement is NOT
+    /// smaller than the middle it replaces must be refused, not installed.
+    ///
+    /// Measured on a real run using the `structured-slot` strategy — the one
+    /// the shipped `balanced` and `deep` profiles select — 2 of 8 compactions
+    /// GREW the thread (17,592 -> 18,570 and 25,410 -> 28,452 tokens). Each
+    /// paid a compactor call, replaced real messages with a lossy summary,
+    /// and raised occupancy, which guarantees the next turn compacts too.
+    /// The narrative path had guarded this since #1389; the structured path
+    /// was exempted alongside the (correctly exempted) length FLOOR.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compact_refuses_a_replacement_that_does_not_shrink_the_middle() {
+        let server = GuardedMockServer::start();
+        // Slot values far larger than the middle they would replace — the
+        // shape that produced a negative reduction on the real run.
+        let bloat = "verbose restatement of everything that happened ".repeat(200);
+        let body = format!(
+            r#"{{"objective":"{bloat}","current_truth":{{"active_files":"{bloat}"}},"compaction_metadata":{{"schema_version":"0.1","generation":9,"source_message_count":4}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let before = messages.clone();
+        let cfg = CompactionConfig::never_compact_with_model();
+
+        let result = structured_compact(&client, &mut messages, 9, &cfg, None);
+
+        let err = result.expect_err(
+            "a replacement larger than the middle it replaces must be refused, never installed",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shrank the middle by less than"),
+            "the refusal must name the reduction guard, got: {msg}"
+        );
+
+        // The function's own contract: messages are NOT mutated on error.
+        assert_eq!(
+            messages.len(),
+            before.len(),
+            "a refused compaction must leave the conversation intact"
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            before.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            "a refused compaction must not alter any message content"
+        );
     }
 
     #[test]
