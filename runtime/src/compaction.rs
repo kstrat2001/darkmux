@@ -464,6 +464,23 @@ impl CompactionConfig {
     /// Returns `None` when the formula trigger is disabled (either
     /// input absent). The result is the prompt-token level at which
     /// the formula trigger would fire.
+    /// (#2793) The occupancy at which `needs_compaction` will fire — the
+    /// LOWER of the two independent triggers, since either one firing is
+    /// enough.
+    ///
+    /// Exposed so the loop can answer a question neither trigger can answer
+    /// alone: did the compaction that just ran get the thread BELOW the line
+    /// that summoned it? When it did not, the next turn compacts again on
+    /// the same thread, and the turn after that, with the compactor paid
+    /// every time. That is a distinct, nameable state rather than a slow
+    /// one, and the operator cannot see it from either number in isolation.
+    pub fn effective_trigger_tokens(&self) -> u32 {
+        match self.formula_trigger_tokens() {
+            Some(formula) => formula.min(self.threshold_tokens),
+            None => self.threshold_tokens,
+        }
+    }
+
     pub fn formula_trigger_tokens(&self) -> Option<u32> {
         match (self.threshold_ratio, self.context_window) {
             (Some(share), Some(window)) => {
