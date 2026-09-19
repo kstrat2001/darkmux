@@ -67,6 +67,32 @@ import { describeBootError } from "./lib/bootError";
  * every one of its early returns, so a suppressed or deduplicated error is
  * still in the console with its original object and stack.
  */
+/**
+ * (#2816) Does this rejection come from a browser extension rather than from
+ * darkmux?
+ *
+ * Extensions inject scripts into every page, and a rejection they never
+ * handle surfaces in OUR `unhandledrejection` listener with no way to opt
+ * out. The only signal distinguishing it is the origin in the stack: an
+ * `-extension://` URL cannot come from code we shipped.
+ *
+ * Deliberately conservative — it reads only the stack, and anything it cannot
+ * read falls through to being treated as ours. A false negative paints an
+ * error the operator can dismiss; a false positive would swallow a real
+ * darkmux failure silently, which is much worse. The suppressed rejection is
+ * still logged in full.
+ */
+export function isExtensionOrigin(reason: unknown): boolean {
+  const stack =
+    reason instanceof Error
+      ? reason.stack
+      : typeof reason === "object" && reason !== null && "stack" in reason
+        ? String((reason as { stack: unknown }).stack)
+        : undefined;
+  if (!stack) return false;
+  return /\b(?:chrome|moz|safari-web|ms-browser)-extension:\/\//.test(stack);
+}
+
 export function mountApp(): void {
   window.addEventListener("error", (event) => {
     // A cross-origin script error carries NO information: the browser sets
@@ -87,6 +113,34 @@ export function mountApp(): void {
     paintBootError(event.error, "script error");
   });
   window.addEventListener("unhandledrejection", (event: PromiseRejectionEvent) => {
+    // (#2816) A rejection thrown by a browser EXTENSION is not darkmux
+    // failing, and must not paint over a working viewer.
+    //
+    // The `error` listener above already suppresses its own version of this —
+    // see its comment about "any extension throwing on the page painted a
+    // full-page 'darkmux failed to start' over a working viewer". This
+    // listener was the sibling that never got the same treatment, and its
+    // case is not detectable the same way: a cross-origin SCRIPT error
+    // arrives informationless (`event.error == null`), but a rejected promise
+    // carries a real reason with a real stack. The stack is what identifies
+    // it.
+    //
+    // Reported from a browser with MetaMask installed, which fails to connect
+    // on pages that have nothing to do with wallets and rejects into the
+    // page's handlers:
+    //
+    //   Failed to connect to MetaMask
+    //     at Object.connect (chrome-extension://nkbihfbeogaeaoehlefnkodbefgpgknn/scripts/inpage.js)
+    //
+    // darkmux then told the operator IT had hit an unexpected error, over a
+    // viewer that was running perfectly.
+    if (isExtensionOrigin(event.reason)) {
+      console.error(
+        "[darkmux] ignoring an unhandled rejection from a browser extension — not ours",
+        event.reason,
+      );
+      return;
+    }
     paintBootError(event.reason, "unhandled promise rejection");
   });
 

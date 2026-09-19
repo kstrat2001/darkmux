@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { mountApp } from "./mountApp";
+import { mountApp, isExtensionOrigin } from "./mountApp";
 
 /**
  * These exercise `mountApp()` — the real entry-point logic `main.tsx`
@@ -168,5 +168,92 @@ describe("mountApp — a later-tick throw over a LIVE app is escapable", () => {
 
     const buttons = [...document.querySelectorAll(".bootcrash-overlay button")].map((b) => b.textContent);
     expect(buttons).toEqual(["reload"]);
+  });
+});
+
+describe("a browser extension's rejection is not darkmux failing (#2816)", () => {
+  // Reported by the operator opening the viewer in Chrome with MetaMask
+  // installed: a full-page "darkmux hit an unexpected error — unhandled
+  // promise rejection / Failed to connect to MetaMask" over a viewer that was
+  // running perfectly. MetaMask injects into every page and rejects on ones
+  // that have nothing to do with wallets, so this lands on a large share of
+  // Chrome installs, on FIRST OPEN, before the operator has done anything.
+  //
+  // The `error` listener had been fixed for its own version of this. This one
+  // is the sibling that was missed, and its case is not detectable the same
+  // way — a cross-origin script error arrives informationless, a rejected
+  // promise carries a real reason with a real stack.
+  const metaMaskRejection = () => {
+    const e = new Error("Failed to connect to MetaMask");
+    e.stack =
+      "Error: Failed to connect to MetaMask\n    at Object.connect " +
+      "(chrome-extension://nkbihfbeogaeaoehlefnkodbefgpgknn/scripts/inpage.js:7:84292)";
+    return e;
+  };
+
+  // THE WIRING, not just the predicate. Testing `isExtensionOrigin` alone
+  // left the listener free to ignore it: disabling the suppression at the
+  // call site kept all 14 tests green. This drives the real
+  // `unhandledrejection` listener and asserts NO overlay is painted, which is
+  // the behavior the operator actually reported.
+  it("paints NO overlay when the rejection came from an extension", () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mountApp();
+
+    const event = new Event("unhandledrejection") as Event & { reason?: unknown };
+    event.reason = metaMaskRejection();
+    window.dispatchEvent(event);
+
+    expect(
+      document.querySelector('[role="alert"]'),
+      "an extension's failure must not put a darkmux error over a working viewer",
+    ).toBeNull();
+  });
+
+  it("still paints for a rejection that IS darkmux's", () => {
+    // The guard against over-suppression, at the same grain.
+    document.body.innerHTML = '<div id="root"></div>';
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    mountApp();
+
+    const ours = new Error("a poll's rejected fetch");
+    ours.stack = "Error: a poll's rejected fetch\n    at loadRuns (http://macbook-pro:8090/assets/next.js:1:1)";
+    const event = new Event("unhandledrejection") as Event & { reason?: unknown };
+    event.reason = ours;
+    window.dispatchEvent(event);
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toMatch(/rejected fetch/);
+  });
+
+  it("suppresses a rejection whose stack comes from an extension", () => {
+    expect(isExtensionOrigin(metaMaskRejection())).toBe(true);
+  });
+
+  it("recognises the other vendors' extension schemes too", () => {
+    for (const scheme of ["moz-extension", "safari-web-extension", "ms-browser-extension"]) {
+      const e = new Error("boom");
+      e.stack = `Error: boom\n    at x (${scheme}://abc/inpage.js:1:1)`;
+      expect(isExtensionOrigin(e), scheme).toBe(true);
+    }
+  });
+
+  it("NEVER suppresses a rejection from darkmux's own code", () => {
+    // The dangerous direction. A false negative paints an error the operator
+    // can dismiss; a false positive swallows a real failure silently.
+    const ours = new Error("fetch failed");
+    ours.stack = "Error: fetch failed\n    at loadRuns (http://macbook-pro:8090/assets/next.js:1:1)";
+    expect(isExtensionOrigin(ours)).toBe(false);
+  });
+
+  it("treats an unreadable reason as ours rather than guessing", () => {
+    expect(isExtensionOrigin("just a string")).toBe(false);
+    expect(isExtensionOrigin(null)).toBe(false);
+    expect(isExtensionOrigin(undefined)).toBe(false);
+    expect(isExtensionOrigin({ nope: 1 })).toBe(false);
+    // An Error with no stack at all: cannot attribute it, so it is ours.
+    const bare = new Error("no stack");
+    bare.stack = undefined;
+    expect(isExtensionOrigin(bare)).toBe(false);
   });
 });

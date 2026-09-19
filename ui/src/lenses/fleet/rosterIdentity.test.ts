@@ -28,7 +28,15 @@ const UID_A = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
 const UID_B = "382A2016-41FD-5729-BF22-9C1A91F1BEDD";
 
 function beat(uid: string, name: string): [string, PresenceBeat] {
-  return [uid, { machine_uid: uid, display_name: name, ts: Date.now() } as PresenceBeat];
+  return [
+    uid,
+    {
+      machine_uid: uid,
+      display_name: name,
+      schema_version: "1.51.0",
+      beat_ts_ms: Date.now(),
+    } as PresenceBeat,
+  ];
 }
 
 function record(uid: string, machineId: string): FlowRecord {
