@@ -828,15 +828,16 @@ pub fn compact(
     // primary's window — and not, as before, to nothing at all.
     let fit = fit_excerpt_to_compactor(&mut middle_messages, cfg, framing_chars);
     if let Some(fit) = &fit {
-        if fit.results_trimmed > 0 {
+        if fit.results_trimmed > 0 || fit.arguments_trimmed > 0 {
             eprintln!(
                 "darkmux-runtime: compaction #{generation} — the excerpt was {} characters \
                  against the ~{} the compactor's {}-token window leaves for it; elided {} \
-                 oversized tool result(s) down to {}. (#2808)",
+                 tool result(s) and {} tool-call argument(s) down to {}. (#2808)",
                 fit.before_chars,
                 fit.budget_chars,
                 fit.window,
                 fit.results_trimmed,
+                fit.arguments_trimmed,
                 fit.after_chars
             );
         }
@@ -1044,15 +1045,16 @@ pub fn structured_compact(
     // (#2808) Size the excerpt to the model that has to READ it, not to the
     // primary's window — and not, as before, to nothing at all.
     if let Some(fit) = fit_excerpt_to_compactor(&mut middle_messages, cfg, framing_chars) {
-        if fit.results_trimmed > 0 {
+        if fit.results_trimmed > 0 || fit.arguments_trimmed > 0 {
             eprintln!(
                 "darkmux-runtime: compaction #{generation} — the excerpt was {} characters \
                  against the ~{} the compactor's {}-token window leaves for it; elided {} \
-                 oversized tool result(s) down to {}. (#2808)",
+                 tool result(s) and {} tool-call argument(s) down to {}. (#2808)",
                 fit.before_chars,
                 fit.budget_chars,
                 fit.window,
                 fit.results_trimmed,
+                fit.arguments_trimmed,
                 fit.after_chars
             );
         }
@@ -1889,6 +1891,14 @@ pub(crate) struct ExcerptFit {
     pub(crate) before_chars: usize,
     pub(crate) after_chars: usize,
     pub(crate) results_trimmed: usize,
+    /// Tool-CALL arguments elided, counted separately: calling one a "tool
+    /// result" in the operator's message is simply wrong, and the combined
+    /// count did exactly that.
+    pub(crate) arguments_trimmed: usize,
+    /// Tool-result bodies still above the floor after the elision. When this
+    /// is non-zero the weight IS in tool results, whatever else the message
+    /// might have been tempted to say.
+    pub(crate) bodies_still_large: usize,
     /// The MEASURED size of everything wrapped around the excerpt.
     pub(crate) framing_chars: usize,
 }
@@ -1922,6 +1932,8 @@ pub(crate) fn fit_excerpt_to_compactor(
             before_chars,
             after_chars: before_chars,
             results_trimmed: 0,
+            arguments_trimmed: 0,
+            bodies_still_large: 0,
             framing_chars,
         });
     }
@@ -1950,7 +1962,8 @@ pub(crate) fn fit_excerpt_to_compactor(
     // compactor to read — it is never sent as structured `tool_calls`, and
     // the splice back into the thread uses the ORIGINAL messages — so
     // truncating an argument here cannot produce malformed JSON on any wire.
-    let mut results_trimmed = stats.results_trimmed;
+    let results_trimmed = stats.results_trimmed;
+    let mut arguments_trimmed = 0usize;
     let mut after_chars = render_messages_as_excerpt(middle).len();
     while after_chars > budget_chars {
         let overshoot = after_chars - budget_chars;
@@ -1970,7 +1983,7 @@ pub(crate) fn fit_excerpt_to_compactor(
             break;
         };
         calls[ci].function.arguments = trimmed;
-        results_trimmed += 1;
+        arguments_trimmed += 1;
         after_chars = render_messages_as_excerpt(middle).len();
     }
 
@@ -1980,6 +1993,13 @@ pub(crate) fn fit_excerpt_to_compactor(
         before_chars,
         after_chars,
         results_trimmed,
+        arguments_trimmed,
+        bodies_still_large: middle
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .filter(|b| b.len() > EXCERPT_MIN_BODY_BYTES)
+            .count(),
         framing_chars,
     })
 }
@@ -2010,15 +2030,27 @@ fn excerpt_too_large_error(fit: &ExcerptFit, compactor_model: &str) -> anyhow::E
             fit.framing_chars,
         );
     }
+    // SAY WHICH FACT IS TRUE. This used to end "The weight is not in
+    // tool-result bodies, so eliding them further will not help" on every
+    // refusal — false whenever a body over the floor was simply declined,
+    // which the review measured with 20 results at the floor against an
+    // 8,000-token window. It also reported elided tool-CALL ARGUMENTS as
+    // "tool result(s)", which they are not.
+    let why = if fit.bodies_still_large > 0 {
+        "some tool-result bodies could not be reduced any further"
+    } else {
+        "the remaining weight is message content, not tool results or tool-call arguments"
+    };
     anyhow!(
-        "compaction excerpt is {} characters after eliding {} oversized tool result(s), and \
-         the compactor `{compactor_model}` loads at {} tokens — about {} characters of excerpt \
-         once its own {}-token summary and {} characters of instruction framing are reserved. \
-         The weight is not in tool-result bodies, so eliding them further will not help. Raise \
-         the compactor's `n_ctx` in the active profile, or lower the compaction threshold so \
-         the middle is smaller when it fires. (#2808)",
+        "compaction excerpt is {} characters after eliding {} tool result(s) and {} \
+         tool-call argument(s), and the compactor `{compactor_model}` loads at {} tokens — \
+         about {} characters of excerpt once its own {}-token summary and {} characters of \
+         instruction framing are reserved. {why}. Raise the compactor's `n_ctx` in the \
+         active profile, or lower the compaction threshold so the middle is smaller when it \
+         fires. (#2808)",
         fit.after_chars,
         fit.results_trimmed,
+        fit.arguments_trimmed,
         fit.window,
         fit.budget_chars,
         COMPACTOR_OUTPUT_RESERVE_TOKENS,
@@ -2353,8 +2385,9 @@ mod tests {
 
         assert!(msg.contains("8000"), "the compactor's window must be named: {msg}");
         assert!(
-            msg.contains("not in tool-result bodies"),
-            "and it must say why eliding further will not help: {msg}"
+            msg.contains("remaining weight is message content"),
+            "and it must name the REAL reason — this middle's weight is assistant \
+             content, so there is nothing in tool results left to elide: {msg}"
         );
         assert!(
             msg.contains("n_ctx"),
@@ -2464,6 +2497,104 @@ mod tests {
         assert!(installed > 0, "a summary must actually be installed");
     }
 
+    /// (#2808 round-3) THE BOUND MUST WORK ON A THREAD THE LOOP HAS ALREADY
+    /// SOFT-TRIMMED — which is every real thread by the time it compacts.
+    ///
+    /// `soft_trim_old_tool_results` (#1391) runs EVERY TURN, before the
+    /// compaction check, stamping the elision sentinel on every result over
+    /// 4,000 bytes outside the protected recent window. `trim_body_to` then
+    /// refused any sentinel-bearing body outright, so by the time compaction
+    /// ran, the entire middle was untouchable to the hard bound.
+    ///
+    /// The result was the bound reporting "the weight is not in tool-result
+    /// bodies" about a middle that was ~100% tool-result bodies, and refusing
+    /// — non-fatally, without incrementing the unproductive counter, so #2805
+    /// never escalates and the thread runs away. That is #2808's own outcome,
+    /// reached through its fix, on the modal long-agentic shape.
+    ///
+    /// EVERY fixture in this arc built its middle fresh, so none of them ever
+    /// handed the bound a sentinel-bearing body. This one soft-trims first,
+    /// exactly as the loop does.
+    #[test]
+    fn a_middle_the_loop_already_soft_trimmed_is_still_elided_to_fit() {
+        let body = "q".repeat(6_000);
+        let mut messages = vec![Message::system("sys"), Message::user("go")];
+        for n in 0..12 {
+            messages.push(Message::assistant("calling read"));
+            messages.push(Message::tool_result(format!("c{n}"), "read", &body));
+        }
+        for n in 0..4 {
+            messages.push(Message::user(format!("tail {n}")));
+        }
+
+        // What the loop did on every prior turn.
+        let soft = crate::tool_result_prune::soft_trim_old_tool_results(&mut messages);
+        assert!(
+            soft.results_trimmed > 0,
+            "fixture guard: the soft pass must actually have marked bodies, \
+             else this pins nothing"
+        );
+
+        let n = messages.len();
+        let mut middle: Vec<Message> = messages[2..n - 4].to_vec();
+        assert!(
+            middle.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|b| b.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL))),
+            "fixture guard: the middle must carry sentinel-bearing bodies"
+        );
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(16_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+        let framing = NARRATIVE_COMPACTOR_SYSTEM_PROMPT.len() + narrative_user_message("").len();
+
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg, framing).expect("window configured");
+
+        assert!(
+            fit.fits(),
+            "an already-soft-trimmed middle must still be reducible to the \
+             compactor's budget: {} chars against {}, {} elided",
+            fit.after_chars,
+            fit.budget_chars,
+            fit.results_trimmed
+        );
+    }
+
+    /// (#2808 round-3) The STRUCTURED path's refusal guard, which was
+    /// vacuous: deleting `if !fit.fits() { return Err(...) }` from
+    /// `structured_compact` left all 104 compaction tests green. The one
+    /// structured test in the arc drove a SHRINKABLE middle and discarded the
+    /// result. With the guard gone an unshrinkable excerpt is posted and the
+    /// compactor answers HTTP 400 — the original #2808 symptom, on the
+    /// strategy the shipped `balanced` and `deep` profiles select.
+    #[test]
+    #[serial_test::serial]
+    fn the_structured_path_refuses_an_excerpt_it_cannot_shrink() {
+        let server = GuardedMockServer::start();
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        // Weight in ASSISTANT content: nothing the elision can touch.
+        let huge = "y".repeat(20_000);
+        let mut messages = vec![Message::system("sys"), Message::user("go")];
+        for _ in 0..3 {
+            messages.push(Message::assistant(&huge));
+        }
+        for n in 0..4 {
+            messages.push(Message::user(format!("tail {n}")));
+        }
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(8_000),
+            strategy: CompactionStrategy::StructuredSlot,
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let err = structured_compact(&client, &mut messages, 1, &cfg, None)
+            .expect_err("an excerpt that cannot fit must not be posted");
+        assert!(err.to_string().contains("8000"), "must name the window: {err}");
+    }
+
     /// (#2808, found by the live run) THE WEIGHT IS NOT ONLY IN TOOL RESULTS.
     ///
     /// `hard_trim_to_fit` elides `role == "tool"` bodies and nothing else. A
@@ -2517,8 +2648,14 @@ mod tests {
             fit.budget_chars
         );
         assert!(
-            fit.results_trimmed > 0,
-            "and the elision must be reported, not silent"
+            fit.arguments_trimmed > 0,
+            "and it must be reported as an ARGUMENT elision — counting it as a \
+             tool result is what the operator-facing message did, and a tool-call \
+             argument is not a tool result"
+        );
+        assert_eq!(
+            fit.results_trimmed, 0,
+            "this middle has no oversized tool RESULT, so that count stays zero"
         );
     }
 

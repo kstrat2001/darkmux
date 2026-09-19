@@ -155,7 +155,29 @@ pub fn soft_trim_body(body: &str) -> Option<String> {
 /// Returns `None` only when the body is already elided (idempotent) or is too
 /// small for head + marker + tail to be shorter than what it replaces.
 pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
-    if body.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL) {
+    // AN ALREADY-ELIDED BODY MAY BE ELIDED FURTHER, and refusing to was what
+    // made #2808's bound inert on the modal thread.
+    //
+    // `soft_trim_old_tool_results` (#1391) runs EVERY TURN, before the
+    // compaction check, and stamps the sentinel on every result over 4,000
+    // bytes outside the protected recent window — which is most of the
+    // compaction middle by the time a threshold trips. A flat "contains the
+    // sentinel, refuse" guard therefore made every one of those bodies
+    // untouchable to the hard bound, so a middle that was ~100% tool-result
+    // bytes reported "the weight is not in tool-result bodies" and refused
+    // the compaction. Measured: 12 reads of 6,000 bytes each, soft-trimmed
+    // to ~3,180, left a 36,502-character excerpt against a ~32,000 budget
+    // with `results_trimmed = 1`. Without the prior soft trim, the identical
+    // thread fit.
+    //
+    // The guard's PURPOSE is idempotency — the soft pass asking for 4,000 on
+    // a body already at 3,180 must not churn it. That purpose is served by
+    // comparing the ask to the body, not by the sentinel's mere presence: a
+    // floor at or above the current size has nothing to gain and still
+    // refuses. A floor BELOW it is a genuine request for a smaller body, and
+    // the re-elision is honest — the head and tail shrink around a fresh
+    // marker, and the previous marker falls inside the newly elided middle.
+    if body.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL) && floor_bytes >= body.len() {
         return None;
     }
     // Split the floor between head and tail, leaving room for the marker.
