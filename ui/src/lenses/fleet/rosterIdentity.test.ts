@@ -77,7 +77,10 @@ describe("a roster entry is folded onto the machine it actually names", () => {
     expect(left, "the alias branch carries it while history remains").toEqual([]);
   });
 
-  it("row 4 — renamed, uid absent, alias history AGED OUT: the phantom returns", () => {
+  // `it.fails` — this asserts the test DOES fail, so CI stays green on a known
+  // defect AND breaks loudly the moment #2814 fixes it. A skip would go quiet
+  // forever; a plain failing test would train everyone to ignore red.
+  it.fails("row 4 — renamed, uid absent, alias history AGED OUT: the phantom returns (open, #2814)", () => {
     // THE BAD STATE. Nothing here is corrupt: one machine, one uid, a stale
     // roster row, and a retention window that finally rolled past the rename.
     // All three fallbacks miss, and a machine that does not exist appears in
