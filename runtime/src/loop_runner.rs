@@ -9207,6 +9207,14 @@ mod tests {
             Some(PromptAnchor { chars: 60_000, tokens: 40_000 }),
             Some(PromptAnchor { chars: 70_000, tokens: 33_000 }),
             Some(PromptAnchor { chars: 50_000, tokens: 32_000 }),
+            // AN ANCHOR WHOSE CHARS EXCEED THE chars/4 BUDGET. Every anchor
+            // above sits below `4 * window - tools` (75,950 here), so the
+            // `flat_budget.min(...)` cap never binds and dropping it survived
+            // a mutation sweep. With 200,000 characters the cap is the only
+            // thing standing between the budget and a target the estimate
+            // measures at 77,109 against a 32,000 window — the bound trimming
+            // and then certifying its own failure.
+            Some(PromptAnchor { chars: 200_000, tokens: 40_000 }),
         ] {
             let budget = message_chars_budget(32_000, 12_050, anchor);
             let est = estimate_prompt_tokens(budget, 12_050, anchor);
