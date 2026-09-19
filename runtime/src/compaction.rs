@@ -863,7 +863,7 @@ pub fn compact(
         tools: Vec::new(),
         tool_choice: None,
         temperature: 0.1,
-        max_tokens: Some(4096),
+        max_tokens: Some(COMPACTOR_OUTPUT_RESERVE_TOKENS),
         response_format: None,
     };
 
@@ -1309,7 +1309,7 @@ fn build_structured_compaction_request(
         tools: Vec::new(),
         tool_choice: None,
         temperature: 0.1,
-        max_tokens: Some(4096),
+        max_tokens: Some(COMPACTOR_OUTPUT_RESERVE_TOKENS),
         // (#375) Schema-enforced JSON via LMStudio's `json_schema`
         // response-format. LMStudio's API rejects `"type": "json_object"`
         // (OpenAI's generic-JSON mode) with `'response_format.type'
@@ -1821,8 +1821,11 @@ fn occupancy_cost_of(messages: &[Message]) -> usize {
 // running and degrades instead of stopping.
 
 /// The summary the compactor is asked to GENERATE. Its window has to hold
-/// this alongside the excerpt — both compactor requests set
-/// `max_tokens: 4096`, and these must move together.
+/// this alongside the excerpt.
+///
+/// Both compactor requests take their `max_tokens` FROM this constant rather
+/// than repeating the literal. A comment saying "these must move together"
+/// is not a mechanism; one definition is.
 const COMPACTOR_OUTPUT_RESERVE_TOKENS: u32 = 4096;
 
 // (Round-2 merge gate) A FLAT 512-token framing reserve used to live here,
@@ -2085,12 +2088,15 @@ fn largest_tool_call_argument(messages: &[Message]) -> Option<(usize, usize, usi
         };
         for (ci, c) in calls.iter().enumerate() {
             let len = c.function.arguments.len();
-            if c.function
-                .arguments
-                .contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
-            {
-                continue; // already elided; trim_body_to would decline anyway
-            }
+            // NO SENTINEL SKIP. An earlier revision skipped any argument
+            // containing the marker, which made an argument that merely
+            // MENTIONS it — a model writing back a file it read, or editing
+            // `tool_result_prune.rs` itself — permanently un-elidable.
+            //
+            // Termination does not depend on the skip: `trim_body_to` returns
+            // `Some` only when the result is strictly shorter, and the
+            // `len <= EXCERPT_MIN_BODY_BYTES` break below bounds the descent,
+            // so each iteration strictly reduces one argument toward a floor.
             if best.is_none() || best.is_some_and(|(_, _, b)| len > b) {
                 best = Some((mi, ci, len));
             }
@@ -2495,6 +2501,265 @@ mod tests {
             )
         });
         assert!(installed > 0, "a summary must actually be installed");
+    }
+
+    /// (#2808 round-3) The STRUCTURED path's must-shrink denominator, which
+    /// was vacuous: swapping `middle_span_cost` (captured before elision) for
+    /// `occupancy_cost_of(&middle_messages)` (after it) left all 725 tests
+    /// green. That is the exact defect the round-2 review measured on the
+    /// NARRATIVE side, surviving one guard over because every structured test
+    /// set no compactor window, so the two denominators never diverged.
+    ///
+    /// The replacement is spliced in place of the ORIGINAL middle, so that is
+    /// what it must be cheaper than. Measured against the elided excerpt, a
+    /// real reduction reads as growth and is refused — repeatedly, without
+    /// incrementing the unproductive counter, so #2805 never escalates.
+    ///
+    /// The slot payload is sized into the band where the two denominators
+    /// DISAGREE: comfortably under the real middle, over the elided one.
+    #[test]
+    #[serial_test::serial]
+    fn the_structured_guard_measures_the_span_being_replaced() {
+        let server = GuardedMockServer::start();
+        let slot = "s".repeat(16_000);
+        let body = format!(
+            r#"{{"objective":"{slot}","current_truth":{{"active_files":"{slot}"}},"compaction_metadata":{{"schema_version":"0.1","generation":1,"source_message_count":2}}}}"#
+        );
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(&body));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        let (mut messages, original) = one_dominant_result_thread(60_000);
+        let cfg = CompactionConfig {
+            // MEASURED, not guessed. The renderer caps the installed markdown
+            // near 5,200 characters whatever the slots hold, so the fixture
+            // cannot make the replacement large — it has to make the ELIDED
+            // excerpt small. At this window the measured numbers are: real
+            // middle 60,012, elided excerpt ~3,900, replacement ~5,234. The
+            // replacement is a genuine reduction against the span it replaces
+            // and reads as growth against the excerpt, which is exactly the
+            // disagreement this pins. Two earlier windows (16,000 then 8,000)
+            // left the two denominators on the same side of the replacement,
+            // and the mutation survived both.
+            compactor_context_window: Some(6_000),
+            strategy: CompactionStrategy::StructuredSlot,
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let out = structured_compact(&client, &mut messages, 1, &cfg, None);
+        let (_, summary_chars) = out.unwrap_or_else(|e| {
+            panic!(
+                "this replacement is a real reduction against the {original}-character \
+                 span it replaces. Measuring it against the ELIDED excerpt instead is \
+                 what refuses it: {e}"
+            )
+        });
+        assert!(summary_chars > 0, "a summary must be installed");
+    }
+
+    /// (#2808 round-3) THE FRAMING PASSED AT THE CALL SITES MUST BE REAL.
+    ///
+    /// `the_excerpt_budget_shrinks_by_the_framing_it_is_actually_wrapped_in`
+    /// pins the ARITHMETIC — that the helper subtracts what it is handed. It
+    /// says nothing about what the call sites hand it, and setting
+    /// `framing_chars = 0` at EITHER site left all 104 compaction tests
+    /// green. Zero framing means the budget is oversized by the whole system
+    /// prompt, so the assembled request goes over the compactor's window
+    /// while `fits()` reports true — the HTTP 400 this fix exists to remove.
+    ///
+    /// This pins both sites against their own builders.
+    /// The call-site pin: what actually goes ON THE WIRE must fit the
+    /// compactor's window INCLUDING its framing. A call site passing zero
+    /// framing budgets an excerpt that is too big by exactly the system
+    /// prompt, and only a wire assertion can see that.
+    #[test]
+    #[serial_test::serial]
+    fn the_narrative_call_site_budgets_for_its_own_framing() {
+        NARRATIVE_WIRE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        NARRATIVE_WIRE.get().unwrap().lock().unwrap().clear();
+        let server = GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(capture_narrative_wire);
+            then.status(200).json_body(chat_response_with_json_content("tiny summary"));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        let window = 16_000u32;
+        let (mut messages, _) = one_dominant_result_thread(60_000);
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(window),
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let _ = compact(&client, &mut messages, 1, &cfg);
+
+        let bodies = NARRATIVE_WIRE.get().unwrap().lock().unwrap().clone();
+        assert!(!bodies.is_empty(), "the compactor was never called");
+        let sent: usize = serde_json::from_str::<serde_json::Value>(&bodies[0])
+            .expect("the request body is JSON")["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["content"].as_str().map(str::len).unwrap_or(0))
+            .sum();
+
+        // Everything the compactor must read, against everything its window
+        // leaves once its own summary is reserved.
+        let usable = ((window - COMPACTOR_OUTPUT_RESERVE_TOKENS) as f64
+            * EXCERPT_CHARS_PER_TOKEN) as usize;
+        assert!(
+            sent <= usable,
+            "the assembled request is {sent} characters against the {usable} the \
+             {window}-token window leaves — the call site budgeted an excerpt without \
+             reserving room for its own system prompt and wrapper"
+        );
+    }
+
+    static NARRATIVE_WIRE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::OnceLock::new();
+
+    fn capture_narrative_wire(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        if let Some(cell) = NARRATIVE_WIRE.get() {
+            if let Some(b) = req.body.as_ref() {
+                cell.lock().unwrap().push(String::from_utf8_lossy(b).to_string());
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn both_call_sites_measure_their_real_framing() {
+        // Narrative: system prompt + the user wrapper around an empty excerpt.
+        let narrative = NARRATIVE_COMPACTOR_SYSTEM_PROMPT.len() + narrative_user_message("").len();
+        assert!(
+            narrative > 500,
+            "the narrative framing is a real system prompt, not zero: {narrative}"
+        );
+        assert!(
+            narrative_user_message("").len() < narrative_user_message("xxxx").len(),
+            "the wrapper must be measurable independently of the excerpt"
+        );
+
+        // Structured: the REAL request builder with an empty excerpt, which is
+        // what makes the slot schema and the operator's custom instructions
+        // part of the measurement.
+        let bare = CompactionConfig {
+            strategy: CompactionStrategy::StructuredSlot,
+            ..CompactionConfig::never_compact_with_model()
+        };
+        let measure = |cfg: &CompactionConfig| {
+            build_structured_compaction_request(cfg, "m", 1, 4, "")
+                .messages
+                .iter()
+                .map(|m| m.content.as_deref().map(str::len).unwrap_or(0))
+                .sum::<usize>()
+        };
+        let structured = measure(&bare);
+        assert!(
+            structured > 1_000,
+            "the structured framing is a slot schema plus a prompt, not zero: {structured}"
+        );
+
+        // And the operator's unbounded custom instructions are INSIDE it —
+        // the specific thing a flat reserve could not account for.
+        let guided = CompactionConfig {
+            custom_instructions: Some("g".repeat(3_000)),
+            ..bare.clone()
+        };
+        assert!(
+            measure(&guided) >= structured + 3_000,
+            "custom_instructions must be counted; they are unbounded free text \
+             and a flat reserve cannot cover them"
+        );
+    }
+
+    /// (#2808 round-3) The argument loop's FLOOR is a real behavior guard.
+    ///
+    /// Without it, `allowed = len - overshoot` underflows to 0 when one
+    /// argument cannot absorb the whole overshoot, `trim_body_to` declines a
+    /// floor under 200, the loop breaks, and a middle the floor would have
+    /// fit is refused instead. The existing argument test uses a single 40 KB
+    /// argument where `len - overshoot` sits far above the floor, so it
+    /// cannot see this.
+    #[test]
+    fn the_argument_floor_lets_several_small_arguments_share_the_overshoot() {
+        let arg = |n: usize| {
+            let body = "w".repeat(5_000);
+            Message {
+                role: "assistant".into(),
+                content: Some("x".repeat(3_000)),
+                tool_calls: Some(vec![crate::lmstudio::ToolCall {
+                    id: format!("c{n}"),
+                    kind: "function".into(),
+                    function: crate::lmstudio::FunctionCall {
+                        name: "write".into(),
+                        arguments: format!(r#"{{"path":"f{n}","content":"{body}"}}"#),
+                    },
+                    extra_content: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            }
+        };
+        let mut middle = vec![arg(0), arg(1)];
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(8_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg, 1_300).expect("window configured");
+
+        assert!(
+            fit.arguments_trimmed >= 2,
+            "no single argument can absorb the overshoot, so BOTH must be \
+             elided toward the floor rather than the first one underflowing \
+             and breaking the loop: trimmed {}",
+            fit.arguments_trimmed
+        );
+    }
+
+    /// (#2808 round-3) An argument that merely MENTIONS the elision marker
+    /// must still be elidable. A model writing back a file it read — or
+    /// editing `tool_result_prune.rs` itself — puts that string in a
+    /// tool-call argument, and skipping such arguments made them permanently
+    /// untouchable.
+    #[test]
+    fn an_argument_that_mentions_the_marker_is_still_elidable() {
+        let sentinel = crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL;
+        let body = format!("{}{sentinel}{}", "a".repeat(20_000), "b".repeat(20_000));
+        let mut middle = vec![Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![crate::lmstudio::ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: crate::lmstudio::FunctionCall {
+                    name: "write".into(),
+                    arguments: body,
+                },
+                extra_content: None,
+            }]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }];
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(16_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg, 1_300).expect("window configured");
+
+        assert!(
+            fit.fits(),
+            "an argument containing the marker in its CONTENT is not an \
+             already-elided argument: {} chars against {}",
+            fit.after_chars,
+            fit.budget_chars
+        );
     }
 
     /// (#2808 round-3) THE BOUND MUST WORK ON A THREAD THE LOOP HAS ALREADY
