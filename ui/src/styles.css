@@ -2637,6 +2637,39 @@ body {
 .savlead {
   flex: 0 0 auto;
 }
+/* (#2817) WAITING IS NOT ZERO.
+   Before the flow window arrives, every figure in the hero computes to 0 and
+   renders as a measurement — "0 cloud tokens" reads as a fact about the
+   fleet, and it holds for long enough to be believed. The digits are hidden
+   behind a silhouette until the window has settled.
+   Implemented as a mask over the EXISTING elements rather than by swapping
+   them for placeholders: #2068 measured CLS 1.21 from a tile whose mounting
+   moved the layout, and a loading state that reflows would be the same
+   defect wearing a different hat. Geometry is identical in both states. */
+.savings[data-settled="false"] .savnum,
+.savings[data-settled="false"] .scv {
+  color: transparent;
+  position: relative;
+}
+.savings[data-settled="false"] .savnum::after,
+.savings[data-settled="false"] .scv::after {
+  content: "";
+  position: absolute;
+  inset: 0.12em 0 0.18em 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--border) 25%, var(--panel-2) 50%, var(--border) 75%);
+  background-size: 200% 100%;
+  animation: sk-wait 1.4s ease-in-out infinite;
+}
+@keyframes sk-wait {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .savings[data-settled="false"] .savnum::after,
+  .savings[data-settled="false"] .scv::after { animation: none; }
+}
+
 .savnum {
   /* Fluid, because this number is the one element whose WIDTH is data.
      A fixed size assumes a digit count, and the count grows with the
