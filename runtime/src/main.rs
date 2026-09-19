@@ -965,8 +965,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         compactor_model,
         compact_threshold_ratio,
         compaction::CompactionWindows {
-            primary: context_window,
-            compactor: compactor_context_window,
+            primary: context_window.map(compaction::PrimaryWindow),
+            compactor: compactor_context_window.map(compaction::CompactorWindow),
         },
         compact_strategy,
         bail_after_compactions,

@@ -1788,6 +1788,51 @@
 
     // ─── #1616: the compactor loads at ITS OWN declared n_ctx ──────────
 
+    /// (#2808 round-2 merge gate) The window RECORDED for the runtime must be
+    /// the compactor's, and this is asserted through the real function rather
+    /// than by sweeping the source for the spelling of an assignment.
+    ///
+    /// The source sweep this replaces caught only its own mutation: rewriting
+    /// what FEEDS `load_window` — the shape #1616 originally had — reverted
+    /// #2808 and #1616 together and left the sweep plus all 1,929 tests green.
+    #[test]
+    fn apply_compactor_window_records_the_compactors_own_window_not_the_primarys() {
+        let mut args = crate::dispatch::CompactionDispatchArgs {
+            context_window: Some(32_000),
+            compactor_context_window: None,
+            ..Default::default()
+        };
+
+        let (returned, used_fallback) = super::apply_compactor_window(&mut args, Some(16_000));
+
+        assert_eq!(
+            args.compactor_context_window,
+            Some(16_000),
+            "the COMPACTOR's declared n_ctx must be recorded, not the primary's 32,000 — \
+             recording the primary's is the defect #2808 is about"
+        );
+        assert_ne!(args.compactor_context_window, args.context_window);
+        assert_eq!(returned, Some(16_000));
+        assert!(!used_fallback, "the compactor declared its own window; no fallback");
+    }
+
+    /// (#2808) A compactor that declares no `n_ctx` falls back to the
+    /// primary's, and says so — #1616's named-fallback contract, which the
+    /// recorded value must honor too.
+    #[test]
+    fn apply_compactor_window_falls_back_to_the_primary_and_reports_it() {
+        let mut args = crate::dispatch::CompactionDispatchArgs {
+            context_window: Some(32_000),
+            compactor_context_window: None,
+            ..Default::default()
+        };
+
+        let (_, used_fallback) = super::apply_compactor_window(&mut args, None);
+
+        assert_eq!(args.compactor_context_window, Some(32_000));
+        assert!(used_fallback, "a fallback must be reported, never silent (#44)");
+    }
+
     #[test]
     fn resolve_compactor_load_window_prefers_the_compactor_s_own_n_ctx() {
         // THE bug: a two-model profile (a big-context primary, a

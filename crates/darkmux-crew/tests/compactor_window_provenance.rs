@@ -1,45 +1,55 @@
-//! (#2808) Conformance: the compactor's window must come from the COMPACTOR
-//! resolver, never from the primary's `context_window`.
+//! (#2808) Conformance: the compactor window reaches the dispatch through the
+//! resolver, not by some other route.
 //!
-//! The defect this fix closes is a confusion between two windows that are
-//! both `Option<u32>` and sit two lines apart: the primary model's declared
-//! `n_ctx` and the compactor's. Compaction bounded its excerpt by neither,
-//! posted the whole middle, and a 32,000-token primary beside a 16,000-token
-//! compactor refused every compaction with HTTP 400 — 69 in a row on the
-//! measured run, zero successes, thread running away to 49,000.
+//! **What this guards, narrowly.** `apply_compactor_window` is the one place
+//! that resolves the compactor's window and records it for the runtime, and it
+//! is unit-tested behaviorally (`apply_compactor_window_records_the_compactors_
+//! own_window_not_the_primarys`). What a unit test on that function cannot see
+//! is somebody ceasing to CALL it — inlining the assignment back into
+//! `dispatch_via_internal`'s residency block, which needs a live LMStudio and a
+//! real profile to reach, so no test observes it. That is the gap this file
+//! covers, and the only one.
 //!
-//! **Why a source sweep and not a behavioral test.** The assignment lives
-//! inside `dispatch_via_internal`'s residency block, which needs a live
-//! LMStudio and a real profile on disk to reach, so no unit test observes it.
-//! The argv test one module over pins that the FLAG is emitted, but it builds
-//! `CompactionDispatchArgs` literally, so it cannot see where the value came
-//! from — mutating the assignment to `compaction.context_window` (the
-//! primary's) leaves the entire 1,929-test crate suite green. That mutation
-//! is precisely the bug, re-introduced, so it needs a guard.
-//!
-//! **What this does and does not prove.** It proves the assignment's
-//! right-hand side is the resolver's output. It does not prove the resolver
-//! is correct — that is `resolve_compactor_load_window`'s own unit tests,
-//! which pin that it prefers the compactor's declared `n_ctx` and falls back
-//! to the primary's only as a NAMED fallback (#1616).
+//! **What an earlier version of this file claimed, and why it was wrong.** It
+//! swept for the spelling of the assignment's right-hand side and said it
+//! "proves the assignment's right-hand side is the resolver's output".
+//! Literally true, and it invited a reader to believe far more. A realistic
+//! regression walks past it: rewriting what FEEDS the resolver, one line up,
+//! while leaving `= load_window` byte-identical, reverts #2808 and #1616
+//! together and left that sweep plus all 1,929 crate tests green. The
+//! behavioral test now catches that; this file covers only the wiring.
 
 use std::fs;
 
-/// The one production site that may set this field.
 const SITE: &str = "src/dispatch_internal.rs";
 
 #[test]
-fn the_compactor_window_is_assigned_from_the_compactor_resolver() {
+fn the_dispatch_path_still_routes_through_the_compactor_window_seam() {
     let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/dispatch_internal.rs"))
         .expect("dispatch_internal.rs must be readable");
 
-    let assignments: Vec<&str> = src
+    let calls = src
         .lines()
         .map(str::trim)
         .filter(|l| !l.starts_with("//"))
-        // The field must be on the LEFT of the `=`: `if let Some(w) =
-        // compaction.compactor_context_window` READS it and is not a site
-        // this guard is about.
+        .filter(|l| l.contains("apply_compactor_window(&mut compaction"))
+        .count();
+
+    assert_eq!(
+        calls, 1,
+        "{SITE} must call `apply_compactor_window` exactly once on the dispatch path. \
+         Without it the runtime gets no `--compactor-context-window`, bounds its \
+         compaction excerpt by nothing, and posts a ~30,000-token excerpt to a \
+         16,000-token compactor — HTTP 400 on every compaction, silently, because \
+         each refusal is a non-fatal skip record (#2808)."
+    );
+
+    // And nothing else may write the field: a second writer would race the
+    // seam and make the unit test's guarantee local rather than total.
+    let writers: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//"))
         .filter(|l| !l.starts_with("if let") && !l.starts_with("let "))
         .filter(|l| !l.contains("=="))
         .filter(|l| match l.split_once('=') {
@@ -48,20 +58,11 @@ fn the_compactor_window_is_assigned_from_the_compactor_resolver() {
         })
         .collect();
 
-    assert!(
-        !assignments.is_empty(),
-        "{SITE} no longer assigns `compactor_context_window` at all — the runtime \
-         is back to bounding its compaction excerpt by nothing (#2808)"
+    assert_eq!(
+        writers.len(),
+        1,
+        "exactly one assignment to `compactor_context_window` may exist, and it belongs \
+         inside `apply_compactor_window` where it is tested. Found:\n    {}",
+        writers.join("\n    ")
     );
-
-    for line in &assignments {
-        assert!(
-            line.contains("load_window"),
-            "`compactor_context_window` must be assigned from \
-             `resolve_compactor_load_window`'s output, which prefers the COMPACTOR's own \
-             declared n_ctx. This line assigns something else, and if that something is \
-             `compaction.context_window` it is the primary's window — the exact confusion \
-             #2808 is about, and one the whole crate suite stays green under:\n    {line}"
-        );
-    }
 }

@@ -250,14 +250,26 @@ impl CompactionStrategy {
 /// very different things: one is the model producing the conversation, the
 /// other is the small model asked to summarize it. Passing the primary's
 /// where the compactor's belongs is exactly the defect #2808 is about, and
-/// as two positional arguments nothing would have caught it. As named
-/// fields, that mistake has to be written out loud.
+/// as two positional arguments nothing would have caught it.
+///
+/// NAMED FIELDS WERE NOT ENOUGH (round-2 merge gate). An earlier revision of
+/// this doc claimed the mistake "has to be written out loud" — it was written
+/// out loud, by swapping the two field values at the one production
+/// construction site, and the whole suite plus clippy stayed green. Legibility
+/// in review is not structure. The two windows are now DISTINCT TYPES, so the
+/// swap is a compile error rather than a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryWindow(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactorWindow(pub u32);
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompactionWindows {
     /// The PRIMARY model's `n_ctx`. Consulted for the trigger only.
-    pub primary: Option<u32>,
+    pub primary: Option<PrimaryWindow>,
     /// The COMPACTOR's own `n_ctx`. Bounds what compaction may SEND.
-    pub compactor: Option<u32>,
+    pub compactor: Option<CompactorWindow>,
 }
 
 #[derive(Debug, Clone)]
@@ -375,7 +387,7 @@ impl CompactionConfig {
             threshold_ratio,
             // (#2808) The compactor's window is resolved at dispatch time by
             // the host, not derivable from these overrides.
-            CompactionWindows { primary: context_window, compactor: None },
+            CompactionWindows { primary: context_window.map(PrimaryWindow), compactor: None },
             strategy,
             None,
             None,
@@ -463,8 +475,8 @@ impl CompactionConfig {
         //      that rejects this combination at startup; the panic
         //      here is defense-in-depth for direct callers that
         //      bypass the validator.
-        let CompactionWindows { primary: context_window, compactor: compactor_context_window } =
-            windows;
+        let context_window = windows.primary.map(|w| w.0);
+        let compactor_context_window = windows.compactor.map(|w| w.0);
         let resolved_threshold_tokens = match (threshold_tokens, threshold_ratio, context_window) {
             (Some(t), _, _) => t,
             (None, Some(r), Some(w)) => ((w as f32) * r).floor() as u32,
@@ -805,9 +817,17 @@ pub fn compact(
     let middle_count = middle_end - middle_start;
 
     let mut middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+
+    let compactor_system = Message::system(NARRATIVE_COMPACTOR_SYSTEM_PROMPT);
+    // (#2808, round 2) MEASURE the framing rather than reserving a constant
+    // for it: build the real user message with an EMPTY excerpt and add the
+    // system prompt. This cannot drift from what is actually sent.
+    let framing_chars = NARRATIVE_COMPACTOR_SYSTEM_PROMPT.len() + narrative_user_message("").len();
+
     // (#2808) Size the excerpt to the model that has to READ it, not to the
     // primary's window — and not, as before, to nothing at all.
-    if let Some(fit) = fit_excerpt_to_compactor(&mut middle_messages, cfg) {
+    let fit = fit_excerpt_to_compactor(&mut middle_messages, cfg, framing_chars);
+    if let Some(fit) = &fit {
         if fit.results_trimmed > 0 {
             eprintln!(
                 "darkmux-runtime: compaction #{generation} — the excerpt was {} characters \
@@ -821,24 +841,20 @@ pub fn compact(
             );
         }
         if !fit.fits() {
-            return Err(excerpt_too_large_error(&fit, &compactor_model));
+            return Err(excerpt_too_large_error(fit, &compactor_model));
         }
     }
     let middle_rendered = render_messages_as_excerpt(&middle_messages);
+    // (#2808 round-2 merge gate) THE REDUCTION GUARD MEASURES AGAINST THE
+    // SPAN BEING REPLACED, not against the elided excerpt the compactor read.
+    // `middle_rendered` is now post-elision, so using it as #1389's
+    // denominator compares the summary to a fraction of what it replaces and
+    // refuses a compaction that would have succeeded. Measured: one 45 KB
+    // tool result, 16,000-token compactor — `None` installed 6,014 chars,
+    // `Some(16000)` refused with "shrank by less than 20% (612 -> 6014)".
+    let middle_span_chars = fit.as_ref().map_or(middle_rendered.len(), |f| f.before_chars);
 
-    let compactor_system = Message::system(
-        "You are a conversation compactor. Read the conversation excerpt below \
-         and produce a concise summary that preserves: (1) what's been decided, \
-         (2) what tools have been called and what they returned, (3) what state \
-         changes have been made (files written, commands run, edits applied), \
-         (4) what's currently in progress. Be specific and dense — this summary \
-         REPLACES the excerpt in the agent's working memory. Do not editorialize. \
-         Do not add framing language. Just the summary.",
-    );
-    let compactor_user = Message::user(format!(
-        "Summarize the following conversation excerpt:\n\n\
-         ---\n{middle_rendered}\n---\n\nSummary:"
-    ));
+    let compactor_user = Message::user(narrative_user_message(&middle_rendered));
 
     let request = ChatRequest {
         model: compactor_model,
@@ -917,13 +933,13 @@ pub fn compact(
     // same-size result — a wasted call). `messages` is untouched at this
     // point, so the Err leaves the conversation intact for the caller's
     // error path.
-    if insufficient_reduction(middle_rendered.len(), replacement_content.len()) {
+    if insufficient_reduction(middle_span_chars, replacement_content.len()) {
         return Err(anyhow!(
             "compaction #{generation} shrank the middle by less than {}% \
              ({} -> {} chars) — discarding and escalating rather than looping another \
              pass on the same input (#1389)",
             (MIN_REDUCTION_RATIO * 100.0) as u32,
-            middle_rendered.len(),
+            middle_span_chars,
             replacement_content.len()
         ));
     }
@@ -1005,9 +1021,29 @@ pub fn structured_compact(
     let middle_count = middle_end - middle_start;
 
     let mut middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+    // (#2808 round-2 merge gate) THE COST OF THE SPAN BEING REPLACED, taken
+    // BEFORE any elision. The must-shrink guard below compares the installed
+    // markdown against this. Reading it after the elision compares the
+    // replacement to a fraction of what it replaces, which refuses
+    // compactions that would have succeeded — the same denominator defect the
+    // narrative path had, one guard over.
+    let middle_span_cost = occupancy_cost_of(&middle_messages);
+    // (#2808, round 2) MEASURE the framing rather than reserving a constant
+    // for it. Built from the REAL request builder with an EMPTY excerpt, so
+    // it accounts for the slot schema AND the operator's unbounded
+    // `custom_instructions`, and cannot drift from what is sent.
+    let framing_chars = {
+        let probe =
+            build_structured_compaction_request(cfg, &compactor_model, generation, middle_count, "");
+        probe
+            .messages
+            .iter()
+            .map(|m| m.content.as_deref().map(str::len).unwrap_or(0))
+            .sum::<usize>()
+    };
     // (#2808) Size the excerpt to the model that has to READ it, not to the
     // primary's window — and not, as before, to nothing at all.
-    if let Some(fit) = fit_excerpt_to_compactor(&mut middle_messages, cfg) {
+    if let Some(fit) = fit_excerpt_to_compactor(&mut middle_messages, cfg, framing_chars) {
         if fit.results_trimmed > 0 {
             eprintln!(
                 "darkmux-runtime: compaction #{generation} — the excerpt was {} characters \
@@ -1195,7 +1231,7 @@ pub fn structured_compact(
     // still propagated with `?` — before #2792 landed, this band was a
     // dispatch-killing band, and merging this first would have shipped
     // exactly that.
-    let middle_cost = occupancy_cost_of(&middle_messages);
+    let middle_cost = middle_span_cost;
     if markdown.len() >= middle_cost {
         return Err(anyhow!(
             "structured compaction #{generation} would not shrink the thread \
@@ -1787,12 +1823,20 @@ fn occupancy_cost_of(messages: &[Message]) -> usize {
 /// `max_tokens: 4096`, and these must move together.
 const COMPACTOR_OUTPUT_RESERVE_TOKENS: u32 = 4096;
 
-/// The instruction text wrapped around the excerpt (system prompt, the
-/// "Summarize the following" framing, and for the structured path its slot
-/// schema and custom instructions). Rounded generously upward — under-
-/// reserving here costs an HTTP 400, over-reserving costs a slightly smaller
-/// excerpt.
-const COMPACTOR_FRAMING_RESERVE_TOKENS: u32 = 512;
+// (Round-2 merge gate) A FLAT 512-token framing reserve used to live here,
+// doc'd as "rounded generously upward". Measured: the structured path's system
+// prompt plus wrapper is 1,321 characters with NO custom instructions — 480
+// tokens on the ruler below, 94% of the reserve consumed before the operator
+// writes a character. And `custom_instructions` is unbounded free text
+// appended straight onto that system prompt, capped nowhere in the chain. A
+// short paragraph of slot guidance put the assembled request over a
+// 16,000-token window while this code reported `fits() == true` right up to
+// the send: the exact HTTP 400 this fix exists to eliminate, re-introduced by
+// the fix.
+//
+// So the framing is no longer estimated. Each call site builds its REAL
+// request with an EMPTY excerpt and measures it, which cannot drift from what
+// is actually sent, because it is the same builder.
 
 /// Chars-per-token ruler for the excerpt.
 ///
@@ -1808,11 +1852,10 @@ const EXCERPT_CHARS_PER_TOKEN: f64 = 2.75;
 const EXCERPT_MIN_BODY_BYTES: usize = 512;
 
 /// How many characters of rendered excerpt the compactor can actually read.
-fn excerpt_budget_chars(compactor_window: u32) -> usize {
-    let usable = compactor_window
-        .saturating_sub(COMPACTOR_OUTPUT_RESERVE_TOKENS)
-        .saturating_sub(COMPACTOR_FRAMING_RESERVE_TOKENS);
-    (usable as f64 * EXCERPT_CHARS_PER_TOKEN) as usize
+fn excerpt_budget_chars(compactor_window: u32, framing_chars: usize) -> usize {
+    let usable_tokens = compactor_window.saturating_sub(COMPACTOR_OUTPUT_RESERVE_TOKENS);
+    let usable_chars = (usable_tokens as f64 * EXCERPT_CHARS_PER_TOKEN) as usize;
+    usable_chars.saturating_sub(framing_chars)
 }
 
 /// Content bytes of a message slice, on the basis `hard_trim_to_fit` counts.
@@ -1838,9 +1881,16 @@ fn raw_message_bytes(messages: &[Message]) -> usize {
 pub(crate) struct ExcerptFit {
     pub(crate) window: u32,
     pub(crate) budget_chars: usize,
+    /// The middle as it stood BEFORE any elision. This is the span the summary
+    /// replaces in the thread, so it is the denominator the #1389
+    /// min-reduction guard must use — not the elided excerpt the compactor
+    /// happened to read. Measuring against the elided one turned a compaction
+    /// that succeeded before this fix into a refusal (round-2 merge gate).
     pub(crate) before_chars: usize,
     pub(crate) after_chars: usize,
     pub(crate) results_trimmed: usize,
+    /// The MEASURED size of everything wrapped around the excerpt.
+    pub(crate) framing_chars: usize,
 }
 
 impl ExcerptFit {
@@ -1860,9 +1910,10 @@ impl ExcerptFit {
 pub(crate) fn fit_excerpt_to_compactor(
     middle: &mut [Message],
     cfg: &CompactionConfig,
+    framing_chars: usize,
 ) -> Option<ExcerptFit> {
     let window = cfg.compactor_context_window?;
-    let budget_chars = excerpt_budget_chars(window);
+    let budget_chars = excerpt_budget_chars(window, framing_chars);
     let before_chars = render_messages_as_excerpt(middle).len();
     if before_chars <= budget_chars {
         return Some(ExcerptFit {
@@ -1871,6 +1922,7 @@ pub(crate) fn fit_excerpt_to_compactor(
             before_chars,
             after_chars: before_chars,
             results_trimmed: 0,
+            framing_chars,
         });
     }
     // `hard_trim_to_fit` counts raw content bytes; the excerpt adds per-message
@@ -1888,6 +1940,7 @@ pub(crate) fn fit_excerpt_to_compactor(
         before_chars,
         after_chars: render_messages_as_excerpt(middle).len(),
         results_trimmed: stats.results_trimmed,
+        framing_chars,
     })
 }
 
@@ -1901,14 +1954,53 @@ pub(crate) fn fit_excerpt_to_compactor(
 /// sovereignty (#44): darkmux knows which model it addressed and how large it
 /// is, so it says so.
 fn excerpt_too_large_error(fit: &ExcerptFit, compactor_model: &str) -> anyhow::Error {
+    // SAY WHICH FACT IS TRUE (round-2 merge gate). When the reserves alone
+    // consume the window there is no excerpt budget at all, and telling the
+    // operator "the weight is not in tool-result bodies" is false — the weight
+    // is irrelevant; the compactor is simply too small to summarize anything.
+    // `budget_chars` is 0 for every window at or below roughly 4,600.
+    if fit.budget_chars == 0 {
+        return anyhow!(
+            "the compactor `{compactor_model}` loads at {} tokens, which its own {}-token \
+             summary and {} characters of instruction framing consume entirely — there is no \
+             room left for ANY excerpt, whatever the thread looks like. Raise the compactor's \
+             `n_ctx` in the active profile. (#2808)",
+            fit.window,
+            COMPACTOR_OUTPUT_RESERVE_TOKENS,
+            fit.framing_chars,
+        );
+    }
     anyhow!(
-        "compaction excerpt is {} characters after eliding {} oversized tool result(s), and          the compactor `{compactor_model}` loads at {} tokens — about {} characters of          excerpt once its own {}-token summary and instruction framing are reserved. The          weight is not in tool-result bodies, so eliding them further will not help. Raise          the compactor's `n_ctx` in the active profile, or lower the compaction threshold so          the middle is smaller when it fires. (#2808)",
+        "compaction excerpt is {} characters after eliding {} oversized tool result(s), and \
+         the compactor `{compactor_model}` loads at {} tokens — about {} characters of excerpt \
+         once its own {}-token summary and {} characters of instruction framing are reserved. \
+         The weight is not in tool-result bodies, so eliding them further will not help. Raise \
+         the compactor's `n_ctx` in the active profile, or lower the compaction threshold so \
+         the middle is smaller when it fires. (#2808)",
         fit.after_chars,
         fit.results_trimmed,
         fit.window,
         fit.budget_chars,
         COMPACTOR_OUTPUT_RESERVE_TOKENS,
+        fit.framing_chars,
     )
+}
+
+/// The narrative compactor's system prompt, hoisted so its size can be
+/// measured against the compactor's window before the excerpt is built.
+const NARRATIVE_COMPACTOR_SYSTEM_PROMPT: &str =
+    "You are a conversation compactor. Read the conversation excerpt below \
+     and produce a concise summary that preserves: (1) what's been decided, \
+     (2) what tools have been called and what they returned, (3) what state \
+     changes have been made (files written, commands run, edits applied), \
+     (4) what's currently in progress. Be specific and dense — this summary \
+     REPLACES the excerpt in the agent's working memory. Do not editorialize. \
+     Do not add framing language. Just the summary.";
+
+/// The narrative compactor's user message. A function so the FRAMING alone
+/// can be measured by passing an empty excerpt.
+fn narrative_user_message(excerpt: &str) -> String {
+    format!("Summarize the following conversation excerpt:\n\n---\n{excerpt}\n---\n\nSummary:")
 }
 
 fn render_messages_as_excerpt(messages: &[Message]) -> String {
@@ -2141,7 +2233,7 @@ mod tests {
             compactor_context_window: Some(8_000),
             ..CompactionConfig::never_compact_with_model()
         };
-        let budget = excerpt_budget_chars(8_000);
+        let budget = excerpt_budget_chars(8_000, 0);
 
         let _ = compact(&client, &mut messages, 1, &cfg);
 
@@ -2206,6 +2298,198 @@ mod tests {
         );
     }
 
+    /// Middle = one dominant tool result. Returns (messages, original render
+    /// length of the middle span).
+    fn one_dominant_result_thread(body_len: usize) -> (Vec<Message>, usize) {
+        let huge = "x".repeat(body_len);
+        let mut v = vec![Message::system("you are an agent"), Message::user("do the thing")];
+        v.push(Message::assistant("calling read"));
+        v.push(Message::tool_result("c1", "read", &huge));
+        for n in 0..4 {
+            v.push(Message::user(format!("tail {n}")));
+        }
+        let original = render_messages_as_excerpt(&v[2..4]).len();
+        (v, original)
+    }
+
+    /// (#2808 round-2 merge gate, half 1 of 2) THE ELISION MUST SPEND THE
+    /// BUDGET IT WAS GIVEN.
+    ///
+    /// `hard_trim_to_fit` cuts largest-body-first and checks the target only
+    /// BETWEEN bodies, so a middle whose weight is ONE large tool result
+    /// overshot catastrophically: measured 45,121 characters against a
+    /// 31,328-character budget reduced to 612 — **2% of the budget used**,
+    /// 98% of the middle discarded where ~30% would have done. The compactor
+    /// was then asked to summarize a middle it had seen a fiftieth of.
+    ///
+    /// A single large tool result is not a corner: it is one `read` of a
+    /// 45 KB file, or one captured test run.
+    #[test]
+    #[serial_test::serial]
+    fn the_elision_spends_the_budget_it_was_given() {
+        let (mut messages, original) = one_dominant_result_thread(45_000);
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(16_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+        let mut middle: Vec<Message> = messages.drain(2..4).collect();
+        let framing = NARRATIVE_COMPACTOR_SYSTEM_PROMPT.len() + narrative_user_message("").len();
+
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg, framing)
+            .expect("a window is configured");
+
+        assert_eq!(fit.before_chars, original, "before_chars must be the PRE-elision span");
+        assert!(fit.fits(), "the elided excerpt must be inside the budget");
+        let used = fit.after_chars as f64 / fit.budget_chars as f64;
+        assert!(
+            used > 0.5,
+            "the elision must USE the budget, not collapse to the 512-byte floor: \
+             {} of {} characters ({:.1}%)",
+            fit.after_chars,
+            fit.budget_chars,
+            used * 100.0
+        );
+    }
+
+    /// (#2808 round-2 merge gate, half 2 of 2) THE REDUCTION GUARD MUST
+    /// MEASURE THE SPAN BEING REPLACED, NOT THE ELIDED EXCERPT.
+    ///
+    /// Compaction splices the summary in place of the ORIGINAL middle, so
+    /// that is what #1389's min-reduction guard must compare against. Once
+    /// the excerpt is elided for the compactor's benefit, reading
+    /// `middle_rendered` as the denominator compares the summary to a
+    /// fraction of what it replaces and refuses a compaction that would have
+    /// succeeded. Measured on one identical thread and mock response: no
+    /// compactor window installed 6,014 chars; a 16,000-token window refused
+    /// with "shrank the middle by less than 20% (612 -> 6014)".
+    ///
+    /// The refusal is non-fatal (#2797) and does NOT increment
+    /// `consecutive_unproductive_compactions` — that counts only INSTALLED
+    /// compactions — so #2805's escalation never fires on it either. Repeated
+    /// refusals, zero successful compactions, thread runs away: #2808's own
+    /// pathology, reached through its fix, with no HTTP 400 required.
+    ///
+    /// The summary is deliberately sized into the band where the two
+    /// denominators DISAGREE — a big enough reduction against the real span,
+    /// too small against the elided excerpt — so reverting either fix alone
+    /// reds this.
+    #[test]
+    #[serial_test::serial]
+    fn the_reduction_guard_measures_the_span_being_replaced() {
+        let server = GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_with_json_content(&"summary text. ".repeat(2_150)));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        let (mut messages, original) = one_dominant_result_thread(45_000);
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(16_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let installed = compact(&client, &mut messages, 1, &cfg).unwrap_or_else(|e| {
+            panic!(
+                "this summary is a real reduction against the {original}-character span it \
+                 replaces, and must be accepted. Measuring it against the ELIDED excerpt \
+                 instead is what refused it: {e}"
+            )
+        });
+        assert!(installed > 0, "a summary must actually be installed");
+    }
+
+    /// (#2808 round-2 merge gate) The framing reserve must be MEASURED.
+    ///
+    /// A flat 512-token reserve was doc'd as "rounded generously upward".
+    /// Measured, the structured path's system prompt plus wrapper is 1,321
+    /// characters — 480 tokens on this ruler — with NO custom instructions.
+    /// And `custom_instructions` is unbounded operator free text appended to
+    /// that system prompt. With a short paragraph of slot guidance the
+    /// assembled request went OVER a 16,000-token window while
+    /// `fit_excerpt_to_compactor` reported `fits() == true` right up to the
+    /// send: the HTTP 400 this fix exists to eliminate, re-introduced by it.
+    #[test]
+    fn the_excerpt_budget_shrinks_by_the_framing_it_is_actually_wrapped_in() {
+        let bare = excerpt_budget_chars(16_000, 0);
+        let with_prompt = excerpt_budget_chars(16_000, 1_321);
+        let with_guidance = excerpt_budget_chars(16_000, 1_321 + 3_000);
+
+        assert_eq!(
+            bare - with_prompt,
+            1_321,
+            "the budget must fall by exactly the framing it was given"
+        );
+        assert_eq!(
+            with_prompt - with_guidance,
+            3_000,
+            "including the operator's unbounded custom instructions"
+        );
+
+        // And the whole window can be consumed by the reserves alone, which
+        // must not be reported as a tool-result problem.
+        assert_eq!(
+            excerpt_budget_chars(4_096, 0),
+            0,
+            "a compactor at or below its own max_tokens has no excerpt budget"
+        );
+    }
+
+    /// (#2808 round-2 merge gate) THE STRUCTURED PATH'S COPY OF THE BOUND WAS
+    /// UNPINNED. Deleting it wholesale left all 714 tests green — every test
+    /// exercised `compact()`, none touched `structured_compact()`. It is also
+    /// the path whose framing is largest, so it is the half that most needed
+    /// a test.
+    #[test]
+    #[serial_test::serial]
+    fn the_structured_path_elides_its_excerpt_before_it_is_sent() {
+        STRUCTURED_WIRE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        STRUCTURED_WIRE.get().unwrap().lock().unwrap().clear();
+        let server = GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(capture_structured_wire);
+            then.status(200).json_body(chat_response_with_json_content(
+                r#"{"objective":"o","current_truth":{"active_files":"f"},"compaction_metadata":{"schema_version":"0.1","generation":1,"source_message_count":4}}"#,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        let mut messages = messages_with_a_heavy_tool_middle(20_000);
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(8_000),
+            strategy: CompactionStrategy::StructuredSlot,
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let _ = structured_compact(&client, &mut messages, 1, &cfg, None);
+
+        let bodies = STRUCTURED_WIRE.get().unwrap().lock().unwrap().clone();
+        assert!(!bodies.is_empty(), "the structured compactor was never called");
+        let body = &bodies[0];
+        assert!(
+            body.len() < 40_000,
+            "the un-elided 40,000-character middle reached the structured wire: {} bytes",
+            body.len()
+        );
+        assert!(
+            body.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL),
+            "the structured path must post the SHRUNK middle, not the original"
+        );
+    }
+
+    static STRUCTURED_WIRE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::OnceLock::new();
+
+    fn capture_structured_wire(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        if let Some(cell) = STRUCTURED_WIRE.get() {
+            if let Some(b) = req.body.as_ref() {
+                cell.lock().unwrap().push(String::from_utf8_lossy(b).to_string());
+            }
+        }
+        true
+    }
+
     /// (#2808) No resolved compactor window ⇒ unbounded, exactly as before.
     /// The bound is not allowed to invent a window and start refusing
     /// compactions on hosts that never told the runtime one.
@@ -2216,7 +2500,7 @@ mod tests {
         let cfg = CompactionConfig::never_compact_with_model();
         assert!(cfg.compactor_context_window.is_none(), "fixture guard");
 
-        let fit = fit_excerpt_to_compactor(&mut middle, &cfg);
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg, 0);
 
         assert!(fit.is_none(), "no window resolved ⇒ no bound applied");
         assert_eq!(

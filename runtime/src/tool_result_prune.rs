@@ -259,7 +259,30 @@ pub fn hard_trim_to_fit(
         if body.len() <= min_body_bytes {
             continue;
         }
-        let Some(trimmed) = trim_body_to(body, min_body_bytes) else {
+        // (#2808 round-2) TAKE ONLY WHAT IS NEEDED. This cut every candidate
+        // straight to `min_body_bytes`, checking the target only BETWEEN
+        // bodies, so a middle whose weight is ONE large tool result
+        // overshot catastrophically: measured 45,121 characters against a
+        // 31,328-character budget reduced to 612 — 2% of the budget used,
+        // 98% of the middle discarded when ~30% would have done.
+        //
+        // That is not merely wasteful. The compaction excerpt is built from
+        // this, so the summary was asked to stand in for a middle it had
+        // barely seen, and the #1389 min-reduction guard then refused the
+        // compaction outright. Same thread, same mock: no compactor window
+        // installed 6,014 chars; a 16,000-token window refused. The fix for
+        // #2808 made compaction FAIL on a shape it had handled, which is the
+        // pathology #2808 is about, reached through its own fix.
+        //
+        // This was landed once before as a #2792 follow-up and reverted,
+        // because precision here holds the thread closer to the window and
+        // that starved a compactor whose excerpt was bounded by nothing. The
+        // two changes fix each other and belong together: bound the excerpt
+        // (this PR) and stop over-eliding it (this hunk). Do not split them
+        // again.
+        let overshoot = current.saturating_sub(target_bytes);
+        let allowed = body.len().saturating_sub(overshoot).max(min_body_bytes);
+        let Some(trimmed) = trim_body_to(body, allowed) else {
             continue; // already trimmed
         };
         let reclaimed = body.len().saturating_sub(trimmed.len());
