@@ -1934,12 +1934,52 @@ pub(crate) fn fit_excerpt_to_compactor(
     let raw_target = budget_chars.saturating_sub(framing);
     let stats =
         crate::tool_result_prune::hard_trim_to_fit(middle, raw_target, EXCERPT_MIN_BODY_BYTES);
+
+    // THE WEIGHT IS NOT ONLY IN TOOL RESULTS (measured on the live dogfood
+    // run). `hard_trim_to_fit` elides `role == "tool"` bodies and nothing
+    // else, so a coder thread whose middle carries a `write` or `edit` call
+    // with a 40 KB file body in its ARGUMENTS stayed far over budget after
+    // eliding everything it could: "excerpt is 48,962 characters after
+    // eliding 5 oversized tool result(s)" against a ~31,000 budget, and
+    // compaction refused every time. Honest refusal is better than an HTTP
+    // 400, but the thread still runs away, which is the outcome #2808 exists
+    // to prevent.
+    //
+    // Tool-call arguments are elided HERE and nowhere else. This is a copy of
+    // the middle that is only ever rendered into a prose excerpt for the
+    // compactor to read — it is never sent as structured `tool_calls`, and
+    // the splice back into the thread uses the ORIGINAL messages — so
+    // truncating an argument here cannot produce malformed JSON on any wire.
+    let mut results_trimmed = stats.results_trimmed;
+    let mut after_chars = render_messages_as_excerpt(middle).len();
+    while after_chars > budget_chars {
+        let overshoot = after_chars - budget_chars;
+        let Some((mi, ci, len)) = largest_tool_call_argument(middle) else {
+            break;
+        };
+        if len <= EXCERPT_MIN_BODY_BYTES {
+            break;
+        }
+        let allowed = len.saturating_sub(overshoot).max(EXCERPT_MIN_BODY_BYTES);
+        let Some(calls) = middle[mi].tool_calls.as_mut() else {
+            break;
+        };
+        let Some(trimmed) =
+            crate::tool_result_prune::trim_body_to(&calls[ci].function.arguments, allowed)
+        else {
+            break;
+        };
+        calls[ci].function.arguments = trimmed;
+        results_trimmed += 1;
+        after_chars = render_messages_as_excerpt(middle).len();
+    }
+
     Some(ExcerptFit {
         window,
         budget_chars,
         before_chars,
-        after_chars: render_messages_as_excerpt(middle).len(),
-        results_trimmed: stats.results_trimmed,
+        after_chars,
+        results_trimmed,
         framing_chars,
     })
 }
@@ -2001,6 +2041,30 @@ const NARRATIVE_COMPACTOR_SYSTEM_PROMPT: &str =
 /// can be measured by passing an empty excerpt.
 fn narrative_user_message(excerpt: &str) -> String {
     format!("Summarize the following conversation excerpt:\n\n---\n{excerpt}\n---\n\nSummary:")
+}
+
+/// The largest tool-call argument string in the span that is not already
+/// elided, as `(message index, call index, length)`.
+fn largest_tool_call_argument(messages: &[Message]) -> Option<(usize, usize, usize)> {
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (mi, m) in messages.iter().enumerate() {
+        let Some(calls) = m.tool_calls.as_ref() else {
+            continue;
+        };
+        for (ci, c) in calls.iter().enumerate() {
+            let len = c.function.arguments.len();
+            if c.function
+                .arguments
+                .contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
+            {
+                continue; // already elided; trim_body_to would decline anyway
+            }
+            if best.is_none() || best.is_some_and(|(_, _, b)| len > b) {
+                best = Some((mi, ci, len));
+            }
+        }
+    }
+    best
 }
 
 fn render_messages_as_excerpt(messages: &[Message]) -> String {
@@ -2398,6 +2462,64 @@ mod tests {
             )
         });
         assert!(installed > 0, "a summary must actually be installed");
+    }
+
+    /// (#2808, found by the live run) THE WEIGHT IS NOT ONLY IN TOOL RESULTS.
+    ///
+    /// `hard_trim_to_fit` elides `role == "tool"` bodies and nothing else. A
+    /// coder thread whose middle carries a `write` or `edit` call with a large
+    /// file body in its ARGUMENTS stayed far over budget after eliding
+    /// everything it could — measured on the dogfood run: "excerpt is 48,962
+    /// characters after eliding 5 oversized tool result(s)" against a ~31,000
+    /// budget, refused every time. An honest refusal beats an HTTP 400, but
+    /// the thread still runs away, which is the outcome #2808 exists to stop.
+    ///
+    /// Every unit test here used tool RESULTS, so all of them passed while
+    /// this shape was broken. It took a real dispatch to surface.
+    #[test]
+    fn a_middle_whose_weight_is_tool_call_arguments_is_elided_too() {
+        let huge = "z".repeat(40_000);
+        let args = format!(r#"{{"path":"a.rs","content":"{huge}"}}"#);
+        let mut middle = vec![
+            Message {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: Some(vec![crate::lmstudio::ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: crate::lmstudio::FunctionCall {
+                        name: "write".into(),
+                        arguments: args.clone(),
+                    },
+                    extra_content: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+            Message::tool_result("c1", "write", "ok"),
+        ];
+        let before = render_messages_as_excerpt(&middle).len();
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(16_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg, 1_300)
+            .expect("a window is configured");
+
+        assert_eq!(fit.before_chars, before);
+        assert!(
+            fit.fits(),
+            "a middle carrying a 40 KB tool-call ARGUMENT must still be brought inside \
+             the compactor's budget: {} chars against a {}-char budget",
+            fit.after_chars,
+            fit.budget_chars
+        );
+        assert!(
+            fit.results_trimmed > 0,
+            "and the elision must be reported, not silent"
+        );
     }
 
     /// (#2808 round-2 merge gate) The framing reserve must be MEASURED.
