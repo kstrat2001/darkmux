@@ -1741,6 +1741,10 @@ fn run_with_sleeper(
     let mut rest_ms: u64 = resume_seed.as_ref().map(|c| c.rest_ms).unwrap_or(0);
     let mut rests: u32 = resume_seed.as_ref().map(|c| c.rests).unwrap_or(0);
     let mut latest_prompt_tokens: u32 = 0;
+    // (#2792 round-4) The endpoint's own count paired with the characters it
+    // counted, carried across turns so the next estimate only has to guess
+    // what was ADDED since. `None` until the first response reports usage.
+    let mut prompt_anchor: Option<PromptAnchor> = None;
     // (#854) Endpoint stale-token detection state. `prev_prompt_tokens` is the
     // prior turn's reported count; `frozen_prompt_turns` counts consecutive
     // turns it hasn't changed. When it sticks (the count can't gate compaction),
@@ -2063,7 +2067,7 @@ fn run_with_sleeper(
         // reason the fix is a collapse onto existing behavior rather than a
         // new policy. `0` for the reported count: nothing has been sent yet
         // this invocation, so the estimate is necessarily the larger.
-        let resume_estimate_tokens = effective_prompt_occupancy(&messages, 0);
+        let resume_estimate_tokens = effective_prompt_occupancy(&messages, 0, prompt_anchor);
         if compaction::needs_compaction(resume_estimate_tokens, messages.len(), compaction_cfg) {
             let before_count = messages.len();
             // (#2792 merge-gate, second pass) The RESUME catch-up site gets
@@ -2608,14 +2612,25 @@ fn run_with_sleeper(
         // every single request. Budgeting without it certified `fits: true`
         // on a body 36% over the window, which is the defect this bound
         // exists to prevent, wearing a record that says it was checked.
+        let tools_bytes = serde_json::to_string(&tool_defs).map(|t| t.len()).unwrap_or(0);
         if let Some(window) = compaction_cfg.context_window {
-            let budget_bytes = (window as usize).saturating_mul(4);
-            let tools_bytes = serde_json::to_string(&tool_defs).map(|t| t.len()).unwrap_or(0);
             let (sys_c, prompt_c) = measure_request_context(&messages);
-            if sys_c + prompt_c + tools_bytes > budget_bytes {
-                let before_tokens = ((sys_c + prompt_c + tools_bytes) / 4) as u32;
-                // The messages must fit in what the tools leave behind.
-                let message_budget = budget_bytes.saturating_sub(tools_bytes);
+            // MEASURE AGAINST THE ENDPOINT'S OWN COUNT (round-4 merge gate).
+            // The previous revision divided every character by 4 and compared
+            // to the window. Measured on the dogfood run that reopened this
+            // issue: the overflowing turn estimated 30,132 against a 32,000
+            // budget — under, so nothing trimmed — and the endpoint counted
+            // the request it then sent at 38,434. A 27% under-count at
+            // exactly the turn that overflows means the bound was silent on
+            // the only send it exists to catch, and fired one turn late.
+            // `estimate_prompt_tokens` carries `usage.prompt_tokens` forward
+            // instead, so only this turn's new characters are guessed.
+            let before_tokens = estimate_prompt_tokens(sys_c + prompt_c, tools_bytes, prompt_anchor);
+            if before_tokens > window {
+                // Derived by INVERTING the same estimator the line above
+                // decided with. A budget on a different ruler would trim to a
+                // target that still measures over.
+                let message_budget = message_chars_budget(window, tools_bytes, prompt_anchor);
                 // Floor chosen for THIS path, not inherited from the soft
                 // trim's 4,000 — see `hard_trim_to_fit`'s own note on why that
                 // constant made the bound inert on the modal shape.
@@ -2625,7 +2640,8 @@ fn run_with_sleeper(
                     HARD_TRIM_MIN_BODY_BYTES,
                 );
                 let (sys_a, prompt_a) = measure_request_context(&messages);
-                let after_tokens = ((sys_a + prompt_a + tools_bytes) / 4) as u32;
+                let after_tokens =
+                    estimate_prompt_tokens(sys_a + prompt_a, tools_bytes, prompt_anchor);
                 let fits = after_tokens <= window;
                 if stats.results_trimmed > 0 {
                     eprintln!(
@@ -2634,7 +2650,9 @@ fn run_with_sleeper(
                          ~{} for the tool schemas) — hard-trimmed {} tool result(s), \
                          reclaiming {} bytes, to ~{after_tokens}. Each trimmed result keeps \
                          its head and tail around an elision marker. (#2792)",
-                        tools_bytes / 4, stats.results_trimmed, stats.bytes_reclaimed
+                        (tools_bytes as f64 / UNCOUNTED_CHARS_PER_TOKEN) as u32,
+                        stats.results_trimmed,
+                        stats.bytes_reclaimed
                     );
                 }
                 if !fits {
@@ -2679,6 +2697,16 @@ fn run_with_sleeper(
                 );
             }
         }
+
+        // (#2792 round-4) The characters this request carries, measured AFTER
+        // the bound above may have trimmed them. Paired with the
+        // `usage.prompt_tokens` the endpoint reports for this very request,
+        // it becomes the next turn's anchor — the one exact number in the
+        // whole estimate.
+        let request_message_chars = {
+            let (s_c, p_c) = measure_request_context(&messages);
+            s_c + p_c
+        };
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -2869,6 +2897,16 @@ fn run_with_sleeper(
                 update_frozen_prompt_turns(prev_prompt_tokens, usage.prompt_tokens, frozen_prompt_turns);
             prev_prompt_tokens = Some(usage.prompt_tokens);
             latest_prompt_tokens = usage.prompt_tokens;
+            // (#2792 round-4) Ground truth for the request that just went
+            // out, paired with the characters it carried. Everything the
+            // local ruler cannot see — the chat template's per-message
+            // envelope, the tools schema, this model's actual tokenization —
+            // is inside this number, so the next turn estimates only what it
+            // adds on top.
+            prompt_anchor = Some(PromptAnchor {
+                chars: request_message_chars,
+                tokens: usage.prompt_tokens,
+            });
             // (#557 Slice-3) Per-turn context-window occupancy sawtooth.
             // Emitted ONCE per turn, only when a real `usage` was seen
             // (so a no-usage turn doesn't write a stale/zero context).
@@ -3820,7 +3858,7 @@ fn run_with_sleeper(
                 // it is the larger number, so this can only ever compact
                 // EARLIER than before, never later.
                 let effective_prompt_tokens =
-                    effective_prompt_occupancy(&messages, latest_prompt_tokens);
+                    effective_prompt_occupancy(&messages, latest_prompt_tokens, prompt_anchor);
 
                 // (#854) The endpoint's reported count going STALE — frozen
                 // across turns while the thread grew — is surfaced as its own
@@ -5438,10 +5476,132 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
 /// silencing the genuine case it existed for. It belongs AFTER the compaction
 /// block with occupancy recomputed, which is a different change; tracked
 /// separately rather than landed half-right on a release blocker.
-fn effective_prompt_occupancy(messages: &[Message], latest_prompt_tokens: u32) -> u32 {
+fn effective_prompt_occupancy(
+    messages: &[Message],
+    latest_prompt_tokens: u32,
+    anchor: Option<PromptAnchor>,
+) -> u32 {
     let (sys_chars, prompt_chars) = measure_request_context(messages);
-    let estimate = ((sys_chars + prompt_chars) / 4) as u32;
+    // `tools_chars: 0` — this decision never had access to the tools schema
+    // and still doesn't. It matters only on the anchor-less first turn; with
+    // an anchor the schema's real cost is already inside `anchor.tokens`.
+    let estimate = estimate_prompt_tokens(sys_chars + prompt_chars, 0, anchor);
     estimate.max(latest_prompt_tokens)
+}
+
+/// (#2792 round-4) Chars-per-token ruler for content the endpoint has not
+/// counted yet.
+///
+/// Deliberately below chars/4, and the number is measured rather than picked.
+/// On the dogfood run that reopened #2792, one turn added 94,312 characters
+/// and the endpoint's prompt count grew by 32,144 tokens — **2.93 characters
+/// per token**. That is what a thread of tool results and tool-call arguments
+/// costs; chars/4 is a prose ruler (3.94 on this project's own TypeScript
+/// fixture) applied to content that is mostly not prose.
+///
+/// The conservatism is nearly free BECAUSE of the anchor below: it is applied
+/// only to one turn's new characters, never to the whole thread, so erring
+/// low here does not shrink the usable window the way a flat 2.75 ruler over
+/// everything would.
+const UNCOUNTED_CHARS_PER_TOKEN: f64 = 2.75;
+
+/// (#2792 round-4) What the endpoint counted, for exactly which characters.
+///
+/// `usage.prompt_tokens` is ground truth — the tokenizer's own answer for the
+/// request that just went out, including the system message, the chat
+/// template's per-message envelope, and the tools schema, none of which
+/// `measure_request_context` can see. Pairing it with the characters measured
+/// for that same request turns the next turn's estimate from "guess the whole
+/// thread" into "carry an exact number forward and guess only the delta".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PromptAnchor {
+    /// Message characters measured for the request that was sent, on the same
+    /// basis `measure_request_context` returns. Deliberately EXCLUDES the
+    /// tools schema: the schema is constant across a dispatch, so leaving it
+    /// out of both sides cancels in the delta, while `tokens` below already
+    /// carries its true cost.
+    pub(crate) chars: usize,
+    /// `usage.prompt_tokens` the endpoint reported for that request.
+    pub(crate) tokens: u32,
+}
+
+/// (#2792 round-4) Estimate the prompt tokens of the thread about to be sent.
+///
+/// With an anchor, everything up to the last send is exact and only the new
+/// characters are estimated. Against the measured dogfood turn this lands
+/// within 6% (40,585 estimated vs 38,434 actual) where chars/4 was 27% low
+/// (30,132) — low enough that the bound did not fire on the one send it
+/// existed to catch.
+///
+/// Without an anchor (turn 1, or a thread that SHRANK since the last send
+/// because something trimmed it, which invalidates the delta) it falls back
+/// to the flat ruler over everything, tools schema included.
+///
+/// In every case the chars/4 estimate this decision used BEFORE the anchor
+/// existed is kept as a floor, so an endpoint that freezes or under-reports
+/// its count cannot talk the bound down. See the body.
+pub(crate) fn estimate_prompt_tokens(
+    message_chars: usize,
+    tools_chars: usize,
+    anchor: Option<PromptAnchor>,
+) -> u32 {
+    let total = message_chars + tools_chars;
+    let anchored = match anchor {
+        Some(a) if message_chars >= a.chars => {
+            let added = (message_chars - a.chars) as f64 / UNCOUNTED_CHARS_PER_TOKEN;
+            a.tokens.saturating_add(added as u32)
+        }
+        _ => (total as f64 / UNCOUNTED_CHARS_PER_TOKEN) as u32,
+    };
+    // THE ANCHOR MAY NEVER LOWER AN ESTIMATE. `usage.prompt_tokens` is ground
+    // truth only while the endpoint is telling the truth, and #854 exists
+    // because it sometimes FREEZES — reporting the same count turn after turn
+    // while the thread grows. An anchor built on a frozen count has its
+    // `chars` refreshed every turn and its `tokens` stuck, so the delta
+    // collapses to nothing and the estimate follows it down. Two #854
+    // regression tests caught exactly that, which is the whole reason this
+    // floor is here.
+    //
+    // chars/4 is the ruler this decision used before the anchor existed, so
+    // keeping it as a FLOOR makes the change one-directional: never lower
+    // than it was, higher whenever ground truth says the thread is heavier
+    // than characters suggest. A lying endpoint degrades to the old behavior
+    // instead of defeating the bound.
+    let flat_floor = (total / 4) as u32;
+    anchored.max(flat_floor)
+}
+
+/// (#2792 round-4) The inverse of [`estimate_prompt_tokens`]: how many MESSAGE
+/// characters fit in `window` tokens, which is what `hard_trim_to_fit` takes.
+///
+/// Inverting the same function the bound decided with is the point — a budget
+/// derived on a different ruler than the measurement would either trim to a
+/// target that still measures over (an infinite no-op) or over-trim.
+///
+/// When the anchor alone already meets or exceeds the window, there is no
+/// headroom to spend and the anchor cannot be reasoned down (a trim removes
+/// characters the endpoint already counted, so the pairing no longer holds);
+/// the flat ruler is the honest degradation.
+pub(crate) fn message_chars_budget(
+    window: u32,
+    tools_chars: usize,
+    anchor: Option<PromptAnchor>,
+) -> usize {
+    let anchored = match anchor {
+        Some(a) if window > a.tokens => {
+            let headroom = (window - a.tokens) as f64 * UNCOUNTED_CHARS_PER_TOKEN;
+            a.chars.saturating_add(headroom as usize)
+        }
+        _ => ((window as f64 * UNCOUNTED_CHARS_PER_TOKEN) as usize)
+            .saturating_sub(tools_chars),
+    };
+    // The estimate is the MAX of the anchored figure and the chars/4 floor,
+    // so the budget is the MIN of their inverses — whichever constraint binds
+    // first. Inverting only one half would hand back a target that the other
+    // half still measures over, and the bound would trim and then certify its
+    // own failure.
+    let floor_budget = (window as usize).saturating_mul(4).saturating_sub(tools_chars);
+    anchored.min(floor_budget)
 }
 
 pub(crate) fn measure_request_context(messages: &[Message]) -> (usize, usize) {
@@ -8481,6 +8641,118 @@ mod tests {
         );
     }
 
+    /// (#2792 round-4) The bound must measure against the endpoint's OWN
+    /// count, not a flat chars/4 guess.
+    ///
+    /// Measured on a real dogfood run with the #2804 bound already in: the
+    /// turn that overflows estimated 30,132 tokens against a 32,000 budget —
+    /// under, so nothing trimmed — and the request the endpoint then counted
+    /// was 38,434. The estimate under-shot by 27% at exactly the turn that
+    /// matters, so the bound stayed silent on the only send it exists to
+    /// catch and fired a turn later, once the thread was already over.
+    ///
+    /// chars/4 is not wrong about prose — measured 3.94 chars/token on this
+    /// project's own TypeScript fixture. It is wrong about a thread whose
+    /// mass is tool results and tool-call arguments, which tokenize nearer
+    /// 2.9. The fix is to stop guessing the part darkmux already knows
+    /// exactly: `usage.prompt_tokens` is ground truth for everything that was
+    /// in the LAST request, so only the characters added SINCE that request
+    /// need a ruler at all.
+    ///
+    /// This fixture makes the two rulers disagree in the direction that
+    /// matters. The endpoint reports 20,000 tokens for a nearly empty thread,
+    /// then one turn adds ~90,000 characters. Under chars/4 the next request
+    /// measures ~22,000 and sails through a 32,000 window; anchored on what
+    /// the endpoint actually counted it is ~52,000 and gets bounded.
+    #[test]
+    #[serial_test::serial]
+    fn the_bound_measures_growth_against_the_endpoints_own_count() {
+        let cfg = compaction::CompactionConfig {
+            // Compaction OFF, so this can only pass via the pre-send bound.
+            compactor_model: None,
+            threshold_tokens: u32::MAX,
+            threshold_ratio: None,
+            context_window: Some(32_000),
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        // Every turn: one echo tool call carrying ~45,000 characters of
+        // argument, echoed straight back as a ~45,000-character result. Both
+        // halves are counted by `measure_request_context`, so one turn grows
+        // the thread by ~90,000 characters.
+        let filler = "x".repeat(45_000);
+        let tool_calls = serde_json::json!([{
+            "id": "call_echo",
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "arguments": serde_json::json!({ "text": filler }).to_string(),
+            },
+        }]);
+        let _primary = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(tool_calls),
+                "tool_calls",
+                // The ground truth the estimate has to respect. A thread this
+                // small is ~4 tokens on the chars ruler; the endpoint says
+                // 20,000. Whichever number the bound believes is the whole
+                // question this test asks.
+                20_000,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("anchored").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+
+        let initial = vec![Message::system("test system"), Message::user("seed")];
+        let tools = [Tool::Echo];
+
+        run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(2), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the dispatch must proceed, not fail");
+
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .expect("trajectory must exist");
+        let bound: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.pre_send_bound")
+            .collect();
+
+        assert!(
+            !bound.is_empty(),
+            "the second request grew ~90,000 characters past a thread the \
+             endpoint already counted at 20,000 tokens, so it is over the \
+             declared 32,000 window and must be bounded. A flat chars/4 ruler \
+             measures the same request at ~22,000 and sends it — which is the \
+             27% under-count measured on the dogfood run"
+        );
+        let ev = &bound[0];
+        assert!(
+            ev["tokens_before"].as_u64().unwrap() > 32_000,
+            "the estimate must carry the endpoint's own 20,000 forward rather \
+             than re-deriving the whole thread from characters: {ev}"
+        );
+        assert!(
+            ev["results_trimmed"].as_u64().unwrap() >= 1,
+            "the oversized echo result must be trimmed: {ev}"
+        );
+        assert!(
+            ev["tokens_after"].as_u64().unwrap() < ev["tokens_before"].as_u64().unwrap(),
+            "the trim must actually reduce the estimate: {ev}"
+        );
+    }
+
     /// (#2792 merge-gate, loop grain) A thread whose weight is a huge TAIL
     /// message and whose compactable MIDDLE is tiny must not kill the
     /// dispatch.
@@ -8655,7 +8927,14 @@ mod tests {
             Message::user(&big_tool_result),
         ];
 
-        let occupancy = effective_prompt_occupancy(&messages, reported);
+        // The anchor as the loop builds it: the characters of the request
+        // that reported `reported`, which is everything before the tool
+        // result landed.
+        let anchor = Some(PromptAnchor {
+            chars: "sys".len() + "do the thing".len(),
+            tokens: reported,
+        });
+        let occupancy = effective_prompt_occupancy(&messages, reported, anchor);
 
         assert!(
             occupancy > reported,
@@ -8678,7 +8957,7 @@ mod tests {
         let reported: u32 = 50_000;
         let messages = vec![Message::system("sys"), Message::user("tiny")];
         assert_eq!(
-            effective_prompt_occupancy(&messages, reported),
+            effective_prompt_occupancy(&messages, reported, None),
             reported,
             "a larger reported count must not be lowered by a small local estimate"
         );
@@ -8688,7 +8967,82 @@ mod tests {
     /// on turn one before anything has been reported.
     #[test]
     fn occupancy_of_an_empty_thread_with_no_report_is_zero() {
-        assert_eq!(effective_prompt_occupancy(&[], 0), 0);
+        assert_eq!(effective_prompt_occupancy(&[], 0, None), 0);
+    }
+
+    /// (#2792 round-4) The estimator reproduces the measured dogfood turn.
+    ///
+    /// Real numbers from the instrumented run: the endpoint counted 6,290
+    /// tokens for a request carrying 14,166 message characters, the next turn
+    /// added 94,312 characters, and the endpoint counted the result at
+    /// 38,434. chars/4 said 30,132 — under a 32,000 window, so the bound
+    /// stayed silent. The anchored estimate has to land above the window.
+    #[test]
+    fn the_estimator_reproduces_the_measured_overflow_turn() {
+        let anchor = Some(PromptAnchor { chars: 14_166, tokens: 6_290 });
+        let est = estimate_prompt_tokens(14_166 + 94_312, 12_050, anchor);
+
+        let flat_chars_over_four = ((14_166 + 94_312 + 12_050) / 4) as u32;
+        assert_eq!(
+            flat_chars_over_four, 30_132,
+            "the fixture must be the measured turn, not a rounded retelling"
+        );
+        assert!(
+            est > 32_000,
+            "the turn the endpoint counted at 38,434 must measure over a \
+             32,000 window: got {est}"
+        );
+        // Within 10% of ground truth, and on the SAFE side of it.
+        assert!(
+            (38_434..=42_277).contains(&est),
+            "the estimate must track the endpoint's 38,434 closely and err \
+             high, never low: got {est}"
+        );
+    }
+
+    /// (#2792 round-4) The budget is the estimator's inverse. A target derived
+    /// on a different ruler would leave the trimmed thread still measuring
+    /// over — the bound trimming and then certifying its own failure.
+    #[test]
+    fn the_chars_budget_inverts_the_estimate() {
+        for anchor in [
+            None,
+            Some(PromptAnchor { chars: 14_166, tokens: 6_290 }),
+            Some(PromptAnchor { chars: 1_000, tokens: 100 }),
+            // An endpoint reporting far FEWER tokens than the characters it
+            // was sent. Here the anchored budget alone exceeds the chars/4
+            // budget, so this is the case where taking the min actually
+            // binds — without it the bound trims to a target the floor still
+            // measures over, and certifies a failure as a fix.
+            Some(PromptAnchor { chars: 30_000, tokens: 100 }),
+        ] {
+            let budget = message_chars_budget(32_000, 12_050, anchor);
+            let est = estimate_prompt_tokens(budget, 12_050, anchor);
+            assert!(
+                est <= 32_000,
+                "a thread trimmed exactly to the budget must measure inside \
+                 the window: budget {budget} chars -> {est} tokens ({anchor:?})"
+            );
+        }
+    }
+
+    /// (#2792 round-4) An anchor whose own count already meets the window
+    /// leaves no headroom to spend, and trimming removes characters the
+    /// endpoint already counted — so the pairing no longer holds and the flat
+    /// ruler takes over. Pinned because the arithmetic underflows otherwise.
+    #[test]
+    fn an_anchor_at_or_past_the_window_falls_back_to_the_flat_ruler() {
+        let anchor = Some(PromptAnchor { chars: 100_000, tokens: 40_000 });
+        let budget = message_chars_budget(32_000, 12_050, anchor);
+        assert!(
+            budget > 0 && budget < 100_000,
+            "the budget must be a real target below the anchor, not zero and \
+             not the anchor itself: {budget}"
+        );
+        // And a thread that SHRANK below its anchor is estimated flat too,
+        // rather than by a negative delta.
+        let est = estimate_prompt_tokens(50_000, 12_050, anchor);
+        assert_eq!(est, ((50_000 + 12_050) as f64 / UNCOUNTED_CHARS_PER_TOKEN) as u32);
     }
 
     /// (#2792 cost check) The occupancy walk now runs every turn, so its cost
@@ -8704,7 +9058,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for _ in 0..100 {
-            std::hint::black_box(effective_prompt_occupancy(&messages, 0));
+            std::hint::black_box(effective_prompt_occupancy(&messages, 0, None));
         }
         let per_call = start.elapsed() / 100;
 
