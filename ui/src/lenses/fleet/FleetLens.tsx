@@ -122,6 +122,7 @@ function SavingsHero({
   liveMode,
   data,
   nowMs,
+  settled,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
   note: ReturnType<typeof hybridNote>;
@@ -131,10 +132,25 @@ function SavingsHero({
    *  from, not a second, differently-scoped fetch. */
   data: FlowRecord[];
   nowMs: number;
+  /** (#2817) False while the flow window is still loading. A zero is a
+   *  MEASUREMENT — "this fleet used no cloud tokens" — and rendering one
+   *  before the window has arrived states a fact nobody has established.
+   *  The figures are silhouetted until this is true.
+   *
+   *  `settled && 0` stays a literal "0": a fresh fleet with no dispatches
+   *  genuinely has none, and that is worth saying. Only the not-yet-known
+   *  case is silhouetted. */
+  settled: boolean;
 }) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   return (
-    <div className="savings">
+    // The silhouette is applied in CSS off this one attribute so the figures
+    // keep their exact geometry — same elements, same sizes, digits hidden.
+    // #2068 measured CLS 1.21 from a tile that mounted and unmounted with
+    // transient data; a loading state that changes the layout would
+    // reintroduce exactly that. `aria-busy` tells a screen reader the region
+    // is pending rather than reading placeholder digits as values.
+    <div className="savings" data-settled={settled ? "true" : "false"} aria-busy={!settled}>
       {/* (operator) "tokens · last 24h" rather than "by your fleet · last 24h",
           to match the event pane's "events last 24h". Two panels counting two
           things over the same window should say so the same way; "by your
@@ -612,7 +628,14 @@ export function FleetLens({
 
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
-      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={scopedData} nowMs={nowMs} />
+      <SavingsHero
+        tokens={tokens}
+        note={note}
+        liveMode={liveMode}
+        data={scopedData}
+        nowMs={nowMs}
+        settled={flowWindow.settled}
+      />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
       <div className="fleet">

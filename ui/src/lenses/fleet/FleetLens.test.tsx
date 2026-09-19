@@ -1096,3 +1096,52 @@ describe("FleetLens — hero grid-switch breakpoint accounts for the eventlog pa
     expect(Number(match![1])).toBe(1180);
   });
 });
+
+// ── (#2817) waiting is not zero ──────────────────────────────────────────
+//
+// Operator: "the dashboard/fleet view shows all zeros for the token data as
+// if it's waiting for the first flow record to initiate the values. but for
+// at least a few seconds it reads as legit."
+//
+// Every figure in the hero computes to 0 from an empty window, and 0 is a
+// MEASUREMENT — "this fleet used no cloud tokens" — held long enough to be
+// believed. Same class as the other integrity defects in this area: stating
+// a fact the data does not support.
+//
+// The distinction these two tests protect is what makes the fix correct
+// rather than merely quiet. A SETTLED zero is real and must still read "0";
+// a fresh fleet that has genuinely run nothing deserves to be told so.
+describe("FleetLens — the token hero distinguishes waiting from zero (#2817)", () => {
+  it("silhouettes the figures while the flow window is still loading", async () => {
+    // A fetch that never resolves: the window stays pending, which is the
+    // several seconds the operator saw reading as legitimate data.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+
+    renderFleetLens();
+
+    const hero = await waitFor(() => {
+      const el = document.querySelector(".savings");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(hero.getAttribute("data-settled")).toBe("false");
+    expect(hero.getAttribute("aria-busy")).toBe("true");
+  });
+
+  it("shows a real 0 once the window settles with no dispatches", async () => {
+    mockFleetFetch({ flowToday: [], flowYesterday: [] });
+
+    renderFleetLens();
+
+    const hero = await waitFor(() => {
+      const el = document.querySelector('.savings[data-settled="true"]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(hero.getAttribute("aria-busy")).not.toBe("true");
+    expect(
+      hero.textContent,
+      "a settled empty fleet HAS used no tokens — that zero is a measurement and must survive",
+    ).toMatch(/0/);
+  });
+});

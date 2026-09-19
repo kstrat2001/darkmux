@@ -15539,3 +15539,169 @@ mod tests {
     }
 
 }
+
+// ─── (#2796) roster identity ──────────────────────────────────────────────
+
+/// One roster row, reduced to what the identity check needs. A view rather
+/// than `darkmux_fleet::MachineEntry` so this crate stays a pure evaluator
+/// with no dependency on the fleet crate.
+#[derive(Debug, Clone)]
+pub struct RosterEntryView {
+    pub id: String,
+    /// The hardware uid the entry declares, when it has one. `None` is the
+    /// whole subject of this check.
+    pub machine_uid: Option<String>,
+}
+
+/// What the fleet currently knows about itself, gathered by the caller from
+/// presence beats and the flow window.
+#[derive(Debug, Clone, Default)]
+pub struct FleetIdentityKnowledge {
+    /// Hardware uids that are beating, or that appear in the flow window.
+    pub known_uids: std::collections::BTreeSet<String>,
+    /// EVERY name any known uid has appeared under — not just its current
+    /// one. A rename is normal and the older names stay valid evidence.
+    pub known_names: std::collections::BTreeSet<String>,
+}
+
+/// (#2796) Find roster entries that can no longer be joined to any machine
+/// the fleet knows about, and say so before they become a phantom card.
+///
+/// **Why this needs surfacing rather than fixing silently.** The viewer folds
+/// a roster entry onto a real machine by three fallbacks, in order: the uid it
+/// declares, its name, then a normalized form of its name. A stale entry —
+/// a machine renamed after `machine add`, which is ordinary — survives on the
+/// SECOND fallback, because the old name is still in the flow window as an
+/// alias of the same uid. That is not durable. Flow files age out. When the
+/// last record carrying the old name rolls past retention, all three fallbacks
+/// miss and one physical machine starts rendering as two.
+///
+/// Nothing is corrupt when that happens, nothing changed, and the operator did
+/// nothing wrong — which is exactly why it needs a check. The failure arrives
+/// months after its cause, with no event to connect it to.
+///
+/// **What is NOT flagged.** An entry that DECLARES a uid is never flagged,
+/// even when that uid is nowhere in the window: a peer that is switched off
+/// is a machine the operator deliberately added, not a phantom. Only an entry
+/// with no uid AND no name the fleet recognises is unjoinable, and only that
+/// is reported.
+pub fn check_roster_identity(
+    entries: &[RosterEntryView],
+    known: &FleetIdentityKnowledge,
+) -> Check {
+    let unjoinable: Vec<&RosterEntryView> = entries
+        .iter()
+        .filter(|e| e.machine_uid.is_none())
+        .filter(|e| !known.known_names.contains(&e.id))
+        .collect();
+
+    if unjoinable.is_empty() {
+        return Check {
+            name: "roster identity".into(),
+            status: Status::Pass,
+            message: format!(
+                "{} roster entr{} resolve to a known machine",
+                entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" }
+            ),
+            hint: None,
+        };
+    }
+
+    let names: Vec<&str> = unjoinable.iter().map(|e| e.id.as_str()).collect();
+    Check {
+        name: "roster identity".into(),
+        status: Status::Warn,
+        message: format!(
+            "{} roster entr{} declare no hardware uid and match no name this fleet \
+             knows — {}. Each will render as a machine of its own.",
+            unjoinable.len(),
+            if unjoinable.len() == 1 { "y" } else { "ies" },
+            names.join(", ")
+        ),
+        hint: Some(format!(
+            "This is what a rename leaves behind: `machine add {first}` recorded a \
+             name but no uid, the machine was later renamed, and the old name has now \
+             aged out of the flow window that was joining them. Remove the stale entry \
+             with `darkmux machine remove {first}`, or re-add the machine so its uid is \
+             recorded and the name stops mattering.",
+            first = names[0]
+        )),
+    }
+}
+
+#[cfg(test)]
+mod roster_identity_tests {
+    use super::*;
+
+    fn known(uids: &[&str], names: &[&str]) -> FleetIdentityKnowledge {
+        FleetIdentityKnowledge {
+            known_uids: uids.iter().map(|s| s.to_string()).collect(),
+            known_names: names.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn entry(id: &str, uid: Option<&str>) -> RosterEntryView {
+        RosterEntryView { id: id.into(), machine_uid: uid.map(str::to_string) }
+    }
+
+    /// The live shape this check was written for: one machine renamed
+    /// `laptop` -> `MacBook-Pro`, the old self-entry still in the roster, and
+    /// the flow window no longer carrying the old name.
+    #[test]
+    fn a_renamed_machines_stale_entry_is_reported_once_its_old_name_ages_out() {
+        let check = check_roster_identity(
+            &[entry("laptop", None), entry("MacBook-Pro", Some("UID-A"))],
+            &known(&["UID-A"], &["MacBook-Pro"]),
+        );
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("laptop"), "{}", check.message);
+        assert!(
+            check.hint.as_deref().is_some_and(|h| h.contains("machine remove laptop")),
+            "the hint must name the exact command: {:?}",
+            check.hint
+        );
+    }
+
+    /// While the old name is still in the window the viewer folds the entry
+    /// correctly, so there is nothing to report yet. This is the state the
+    /// live fleet is in today — and the reason the defect is invisible until
+    /// retention rolls past the rename.
+    #[test]
+    fn the_same_entry_is_silent_while_its_old_name_is_still_in_the_window() {
+        let check = check_roster_identity(
+            &[entry("laptop", None), entry("MacBook-Pro", Some("UID-A"))],
+            &known(&["UID-A"], &["MacBook-Pro", "laptop"]),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    /// THE FALSE POSITIVE THIS MUST NOT HAVE. A peer the operator added on
+    /// purpose, switched off, with a uid recorded: not a phantom, and warning
+    /// about it would teach the operator to ignore this check.
+    #[test]
+    fn a_declared_peer_that_is_merely_offline_is_never_reported() {
+        let check = check_roster_identity(
+            &[entry("studio", Some("UID-B"))],
+            &known(&["UID-A"], &["MacBook-Pro"]),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    /// An entry whose NAME still matches is joinable even with no uid — the
+    /// viewer's second fallback — so it is not reported either.
+    #[test]
+    fn an_entry_whose_name_still_matches_is_not_reported() {
+        let check = check_roster_identity(
+            &[entry("MacBook-Pro", None)],
+            &known(&["UID-A"], &["MacBook-Pro"]),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[test]
+    fn an_empty_roster_passes_without_claiming_anything() {
+        let check = check_roster_identity(&[], &known(&[], &[]));
+        assert_eq!(check.status, Status::Pass);
+    }
+}

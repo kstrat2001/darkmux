@@ -125,9 +125,21 @@ test('activity lane: drilling a session.end-only session does not throw', async 
 
   await expect(page.locator('.session-run')).toBeVisible();
   await expect.poll(() => page.evaluate(() => location.hash)).toContain('dispatch=sess-ended-via-sessionend');
-  // The regression gate itself: CANCELED (the fallback for "closed, but not
-  // by a clean dispatch.complete"), never COMPLETE.
-  await expect(page.locator('.session-run .pill')).toHaveText('CANCELED');
+  // The regression gate itself: the fallback for "closed, but not by a clean
+  // dispatch.complete", never COMPLETE.
+  //
+  // (#2813) The WORD changed, the state did not. This read `CANCELED` until
+  // the viewer's two status vocabularies were collapsed onto the server's
+  // `RunStatus`: `canceled` was never a status the system had, only a label
+  // the pre-React viewer invented for `abandoned` with no ending recorded.
+  // `runStatusLabel` in the runs lens had been rendering that same state as
+  // "no ending recorded" all along, so the session lens now agrees with it.
+  // The element's class is unchanged (`s-canceled`), which is why this is a
+  // rename and not a behavior change.
+  //
+  // This gate caught the rename when 1,800 unit tests did not — it is the
+  // only check that reads the rendered page.
+  await expect(page.locator('.session-run .pill')).toHaveText('NO ENDING RECORDED');
   await expect(page.locator('.session-run .pill')).not.toHaveText('COMPLETE');
 
   expect(pageErrors, `viewer threw: ${pageErrors.join('; ')}`).toHaveLength(0);

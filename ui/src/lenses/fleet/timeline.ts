@@ -65,6 +65,7 @@ import {
   sessEnd,
   sessionRunning,
   statusLabel,
+  runStateFrom,
   lastTs,
   nameOf,
 } from "../../lib/flow";
@@ -197,7 +198,7 @@ export function buildActivityTimeline(
       const errored = done && dispatchErrored(term);
       const killed = dispatchKilled(term);
       const clean = done && !!term && !dispatchErrored(term);
-      const lbl = statusLabel({ open: !done, errored, killed, clean });
+      const lbl = statusLabel(runStateFrom({ open: !done, errored, killed, clean }));
       const cls: TimelineBar["cls"] = !done ? "run" : errored ? "err" : clean ? "done" : "canceled";
       const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid, missionId) || playheadT;
       if (end < tlMin) continue; // ended entirely before the window
