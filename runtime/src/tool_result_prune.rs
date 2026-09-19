@@ -259,22 +259,28 @@ pub fn hard_trim_to_fit(
         if body.len() <= min_body_bytes {
             continue;
         }
-        // (#2792 round-4) TAKE ONLY WHAT IS NEEDED. This used to cut every
-        // candidate straight down to `min_body_bytes`, so shedding a few
-        // thousand bytes flattened the largest result — usually the file the
-        // agent just read and is working from — to 512. Measured on the live
-        // dogfood run: a request estimated at 40,585 tokens against a 32,000
-        // window came back at 18,244, throwing away 44% of the window the
-        // trim was budgeted to fill along with the context that filled it.
+        // (#2792 round-4) DELIBERATELY CUTS TO THE FLOOR, not to the
+        // overshoot. Trimming only what was needed is the obviously better
+        // behavior and was implemented here — then measured, and reverted.
         //
-        // The floor is the LAST resort, not the first move: shed the
-        // overshoot, no more, and never below the floor. A target that
-        // genuinely demands the floor still reaches it, and the loop moves on
-        // to the next candidate when one body cannot cover the overshoot
-        // alone.
-        let overshoot = current.saturating_sub(target_bytes);
-        let allowed = body.len().saturating_sub(overshoot).max(min_body_bytes);
-        let Some(trimmed) = trim_body_to(body, allowed) else {
+        // The live dogfood run with the precise version: 0 successful
+        // compactions, 70 over-window sends, the thread running away to
+        // 49,000 tokens against a 32,000 window. The same workload with this
+        // floor: 62 successful compactions and 0 over-window sends.
+        //
+        // The reason is that compaction does not bound its own input to the
+        // COMPACTOR's context window — only the primary's, which is all
+        // `CompactionConfig::context_window` holds. Keeping the thread near
+        // the primary's 32,000 hands a ~30,000-token excerpt to a 16,000-token
+        // compactor, which answers HTTP 400 ("the number of tokens to keep
+        // from the initial prompt is greater than the context length") every
+        // time. Compaction then never runs, and the bound is left trimming a
+        // thread nothing else is reducing. This floor's wastefulness was
+        // accidentally holding the thread inside the compactor's window.
+        //
+        // So the precision fix is correct and BLOCKED on bounding compaction
+        // input by the compactor's window (#2808). Do not re-land it first.
+        let Some(trimmed) = trim_body_to(body, min_body_bytes) else {
             continue; // already trimmed
         };
         let reclaimed = body.len().saturating_sub(trimmed.len());
@@ -442,71 +448,6 @@ mod tests {
         let stats = soft_trim_old_tool_results(&mut messages);
         assert_eq!(stats.results_trimmed, 0, "only role=='tool' bodies are eligible");
         assert_eq!(messages[0].content.as_deref().unwrap().len(), big.len());
-    }
-    /// (#2792 round-4) The bound must take only what it needs.
-    ///
-    /// Each candidate was cut straight down to `min_body_bytes` regardless of
-    /// how much was actually over, so the largest result — usually the one
-    /// the agent just read and is working from — was flattened to 512 bytes
-    /// to reclaim a few thousand. Measured on the live dogfood run this fix
-    /// was validated against: a request estimated at 40,585 tokens against a
-    /// 32,000 window came back at 18,244, so 44% of the window the trim was
-    /// budgeted to fill was thrown away with it.
-    ///
-    /// The floor is a LAST resort, not the first move.
-    #[test]
-    fn the_hard_trim_takes_only_what_it_needs() {
-        let body = "x".repeat(10_000);
-        let mut messages = vec![
-            Message::system("sys"),
-            Message::tool_result("c1", "read", &body),
-        ];
-        let total = 3 + 10_000;
-        // Ask it to shed 1,000 bytes out of 10,000.
-        let stats = hard_trim_to_fit(&mut messages, total - 1_000, 512);
-
-        assert_eq!(stats.results_trimmed, 1, "the oversized result must be trimmed");
-        let kept = messages[1].content.as_deref().unwrap().len();
-        assert!(
-            kept >= 8_000,
-            "trimming 1,000 bytes off a 10,000-byte result must not flatten it \
-             to the 512-byte floor: kept {kept}"
-        );
-        let after: usize = messages
-            .iter()
-            .map(|m| m.content.as_deref().map(|b| b.len()).unwrap_or(0))
-            .sum();
-        assert!(
-            after <= total - 1_000,
-            "and it must still actually meet the target: {after}"
-        );
-    }
-
-    /// The floor still applies when the target genuinely demands it — taking
-    /// only what is needed must not become "never trim deeply".
-    #[test]
-    fn the_hard_trim_still_reaches_the_floor_when_the_target_demands_it() {
-        let body = "x".repeat(10_000);
-        let mut messages = vec![
-            Message::system("sys"),
-            Message::tool_result("c1", "read", &body),
-        ];
-        // The target has to demand MORE than the body can give above the
-        // floor, or the floor never binds and this asserts nothing. At 600 it
-        // did not: the needed size landed at 597, just above 512, so dropping
-        // the floor entirely left this test green. Caught by mutation.
-        let stats = hard_trim_to_fit(&mut messages, 100, 512);
-        assert_eq!(
-            stats.results_trimmed, 1,
-            "without the floor the needed size underruns what `trim_body_to` \
-             can produce, it declines, and NOTHING is trimmed"
-        );
-        let kept = messages[1].content.as_deref().unwrap().len();
-        assert!(
-            (400..=700).contains(&kept),
-            "a target this tight must drive the body down to the floor, and \
-             the floor must still hold it above zero: {kept}"
-        );
     }
 
 }
