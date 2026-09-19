@@ -1453,6 +1453,10 @@ fn apply_compaction_flags(
         args.push("--context-window".to_string());
         args.push(window.to_string());
     }
+    if let Some(window) = compaction.compactor_context_window {
+        args.push("--compactor-context-window".to_string());
+        args.push(window.to_string());
+    }
     // (#372 T2-C) Strategy → `--compact-strategy <kebab>`. Runtime
     // parses it back to its local enum; None ⇒ flag omitted ⇒
     // runtime uses Narrative default.
@@ -5457,7 +5461,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 &compactor_id,
             )?;
             let (load_window, used_fallback) =
-                resolve_compactor_load_window(compactor_n_ctx, compaction.context_window);
+                apply_compactor_window(&mut compaction, compactor_n_ctx);
             if let Some(window) = load_window {
                 if used_fallback {
                     eprintln!(
@@ -11157,6 +11161,30 @@ fn resolve_compactor_n_ctx_internal(
 /// say so in the load message — operator sovereignty, #44, never a silent
 /// substitution). Pure so the precedence itself is unit-testable without a
 /// live registry.
+/// (#2808 round-2 merge gate) Resolve the compactor's window AND record it on
+/// the dispatch args, as one testable step.
+///
+/// The assignment used to sit inline in `dispatch_via_internal`'s residency
+/// block, which needs a live LMStudio and a real profile to reach — so no test
+/// observed it, and a source-sweep guard had to stand in. That guard asserted
+/// the SPELLING of the assignment's right-hand side, which a realistic
+/// regression walks straight past: rewriting what FEEDS `load_window` (the
+/// shape #1616 originally had) left the sweep and all 1,929 crate tests green
+/// while reverting #2808 and #1616 together.
+///
+/// So the three lines became a function over data. `#2536`'s own blocker note,
+/// eight lines below the call site, says this is the fix the last defect in
+/// this exact function needed; this applies it rather than quoting it.
+fn apply_compactor_window(
+    compaction: &mut crate::dispatch::CompactionDispatchArgs,
+    compactor_n_ctx: Option<u32>,
+) -> (Option<u32>, bool) {
+    let (load_window, used_fallback) =
+        resolve_compactor_load_window(compactor_n_ctx, compaction.context_window);
+    compaction.compactor_context_window = load_window;
+    (load_window, used_fallback)
+}
+
 fn resolve_compactor_load_window(
     compactor_n_ctx: Option<u32>,
     primary_context_window: Option<u32>,

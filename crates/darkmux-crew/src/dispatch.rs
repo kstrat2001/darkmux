@@ -611,6 +611,17 @@ pub struct CompactionDispatchArgs {
     /// compaction outright rather than addressing an identifier nothing
     /// loaded. See [`Self::unset_compactor_warning`].
     pub compactor_model: Option<String>,
+    /// (#2808) The window the COMPACTOR itself loads at — its own declared
+    /// `n_ctx` from the active profile, or the primary's as a named fallback,
+    /// whichever `resolve_compactor_load_window` picked. Distinct from
+    /// `context_window`, which is the PRIMARY's.
+    ///
+    /// Without it the runtime builds a compaction excerpt against the
+    /// primary's budget and posts it to a model that may be a quarter the
+    /// size, which LMStudio answers with HTTP 400 every time. Measured on the
+    /// dogfood profile (32,000 primary, 16,000 compactor): 69 consecutive
+    /// refusals, zero successful compactions, thread running away to 49,000.
+    pub compactor_context_window: Option<u32>,
     /// Adaptive-trigger fraction (0.1-0.9). Set from typed
     /// `profile.runtime.compaction.threshold_ratio` (#368 T2-A).
     pub threshold_ratio: Option<f32>,
@@ -689,6 +700,11 @@ impl CompactionDispatchArgs {
         Self {
             threshold_tokens,
             compactor_model,
+            // (#2808) Resolved at dispatch time, not from the profile blob:
+            // it depends on which model `internal.utility` actually bound,
+            // which `from_profile` does not know. `apply_compactor_residency`
+            // fills it in beside the identifier it loads.
+            compactor_context_window: None,
             threshold_ratio,
             context_window,
             strategy,

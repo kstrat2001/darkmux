@@ -155,7 +155,29 @@ pub fn soft_trim_body(body: &str) -> Option<String> {
 /// Returns `None` only when the body is already elided (idempotent) or is too
 /// small for head + marker + tail to be shorter than what it replaces.
 pub fn trim_body_to(body: &str, floor_bytes: usize) -> Option<String> {
-    if body.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL) {
+    // AN ALREADY-ELIDED BODY MAY BE ELIDED FURTHER, and refusing to was what
+    // made #2808's bound inert on the modal thread.
+    //
+    // `soft_trim_old_tool_results` (#1391) runs EVERY TURN, before the
+    // compaction check, and stamps the sentinel on every result over 4,000
+    // bytes outside the protected recent window — which is most of the
+    // compaction middle by the time a threshold trips. A flat "contains the
+    // sentinel, refuse" guard therefore made every one of those bodies
+    // untouchable to the hard bound, so a middle that was ~100% tool-result
+    // bytes reported "the weight is not in tool-result bodies" and refused
+    // the compaction. Measured: 12 reads of 6,000 bytes each, soft-trimmed
+    // to ~3,180, left a 36,502-character excerpt against a ~32,000 budget
+    // with `results_trimmed = 1`. Without the prior soft trim, the identical
+    // thread fit.
+    //
+    // The guard's PURPOSE is idempotency — the soft pass asking for 4,000 on
+    // a body already at 3,180 must not churn it. That purpose is served by
+    // comparing the ask to the body, not by the sentinel's mere presence: a
+    // floor at or above the current size has nothing to gain and still
+    // refuses. A floor BELOW it is a genuine request for a smaller body, and
+    // the re-elision is honest — the head and tail shrink around a fresh
+    // marker, and the previous marker falls inside the newly elided middle.
+    if body.contains(TOOL_RESULT_TRIM_MARKER_SENTINEL) && floor_bytes >= body.len() {
         return None;
     }
     // Split the floor between head and tail, leaving room for the marker.
@@ -259,41 +281,30 @@ pub fn hard_trim_to_fit(
         if body.len() <= min_body_bytes {
             continue;
         }
-        // (#2792 round-4) DELIBERATELY CUTS TO THE FLOOR, not to the
-        // overshoot. Trimming only what was needed is the obviously better
-        // behavior and was implemented here — then measured, and reverted.
+        // (#2808 round-2) TAKE ONLY WHAT IS NEEDED. This cut every candidate
+        // straight to `min_body_bytes`, checking the target only BETWEEN
+        // bodies, so a middle whose weight is ONE large tool result
+        // overshot catastrophically: measured 45,121 characters against a
+        // 31,328-character budget reduced to 612 — 2% of the budget used,
+        // 98% of the middle discarded when ~30% would have done.
         //
-        // The live dogfood run with the precise version: 0 successful
-        // compactions, 70 over-window sends, the thread running away to
-        // 49,000 tokens against a 32,000 window. The same workload with this
-        // floor: 62 successful compactions and 0 over-window sends.
+        // That is not merely wasteful. The compaction excerpt is built from
+        // this, so the summary was asked to stand in for a middle it had
+        // barely seen, and the #1389 min-reduction guard then refused the
+        // compaction outright. Same thread, same mock: no compactor window
+        // installed 6,014 chars; a 16,000-token window refused. The fix for
+        // #2808 made compaction FAIL on a shape it had handled, which is the
+        // pathology #2808 is about, reached through its own fix.
         //
-        // The reason is that compaction does not bound its input AT ALL —
-        // not by the compactor's window, and not by the primary's either.
-        // `CompactionConfig::context_window` is the primary's n_ctx and is
-        // consulted only for the trigger; `compact()` builds its excerpt from
-        // the whole middle with no window check anywhere. (An earlier wording
-        // here said "only the primary's", which would send a reader grepping
-        // `compact()` for a bound that does not exist.) Keeping the thread near
-        // the primary's 32,000 hands a ~30,000-token excerpt to a 16,000-token
-        // compactor, which answers HTTP 400 ("the number of tokens to keep
-        // from the initial prompt is greater than the context length") every
-        // time. Compaction then never runs, and the bound is left trimming a
-        // thread nothing else is reducing. This floor's wastefulness was
-        // accidentally holding the thread inside the compactor's window.
-        //
-        // So the precision fix is correct and BLOCKED on bounding compaction
-        // input by the compactor's window (#2808). Do not re-land it first.
-        //
-        // And the dependency is wider than that one commit: this floor is
-        // load-bearing BY ACCIDENT, so ANY change that makes the bound hold
-        // the thread closer to the window re-opens the same starvation. #2808
-        // gates all of them, not just the trim.
-        //
-        // Note the loop still `break`s once `current <= target_bytes`, so the
-        // function stops early — it is each individual body that goes to the
-        // floor rather than to its own overshoot.
-        let Some(trimmed) = trim_body_to(body, min_body_bytes) else {
+        // This was landed once before as a #2792 follow-up and reverted,
+        // because precision here holds the thread closer to the window and
+        // that starved a compactor whose excerpt was bounded by nothing. The
+        // two changes fix each other and belong together: bound the excerpt
+        // (this PR) and stop over-eliding it (this hunk). Do not split them
+        // again.
+        let overshoot = current.saturating_sub(target_bytes);
+        let allowed = body.len().saturating_sub(overshoot).max(min_body_bytes);
+        let Some(trimmed) = trim_body_to(body, allowed) else {
             continue; // already trimmed
         };
         let reclaimed = body.len().saturating_sub(trimmed.len());

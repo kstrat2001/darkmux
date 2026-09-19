@@ -8646,6 +8646,7 @@ mod tests {
     #[serial_test::serial]
     fn an_over_window_prompt_is_trimmed_before_it_is_sent() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             // Compaction OFF, so this can only pass via the pre-send bound.
             compactor_model: None,
             threshold_tokens: u32::MAX,
@@ -8781,6 +8782,7 @@ mod tests {
     #[serial_test::serial]
     fn the_bound_measures_growth_against_the_endpoints_own_count() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             // Compaction OFF, so this can only pass via the pre-send bound.
             compactor_model: None,
             threshold_tokens: u32::MAX,
@@ -8886,6 +8888,7 @@ mod tests {
     #[serial_test::serial]
     fn a_tiny_middle_under_a_huge_tail_skips_the_compaction_instead_of_killing_the_dispatch() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 5000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -12701,6 +12704,7 @@ mod tests {
     #[test]
     fn loop_triggers_compaction_when_threshold_crossed() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 1000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -12846,6 +12850,7 @@ mod tests {
     #[test]
     fn compaction_uses_compactor_client_not_primary_client() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 1000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -12951,6 +12956,7 @@ mod tests {
     #[test]
     fn stale_frozen_prompt_tokens_forces_compaction_and_fires_event_once() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 5000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -13118,6 +13124,7 @@ mod tests {
     #[test]
     fn loop_bails_with_escalation_when_compaction_limit_reached() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 1000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -13220,6 +13227,7 @@ mod tests {
     #[test]
     fn loop_does_not_bail_when_bail_after_compactions_is_none() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 1000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -13329,6 +13337,7 @@ mod tests {
         // Trigger well ABOVE anything a compaction of this thread can reach,
         // so every compaction is "successful" and still unproductive.
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 1,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -13464,6 +13473,7 @@ mod tests {
     #[serial_test::serial]
     fn resume_catch_up_skips_a_refused_compaction_instead_of_killing_the_dispatch() {
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 5_000,
             compactor_model: Some("test-compactor".to_string()),
             threshold_ratio: None,
@@ -13604,6 +13614,7 @@ mod tests {
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
 
         let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
             // Low enough that the resume catch-up's local chars/4 estimate
             // trips it unconditionally once the message-count floor (7) is
             // met — isolates the bail check from needing a precise token
