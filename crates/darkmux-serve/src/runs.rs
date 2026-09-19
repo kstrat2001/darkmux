@@ -7222,11 +7222,14 @@ mod tests {
     /// would then report a healthy sort key for precisely the rows #2812
     /// makes invisible.
     fn activity_key(r: &Run) -> u64 {
-        for candidate in [r.updated_ts, r.completed_ts, r.started_ts] {
-            if let Some(ts) = candidate {
-                if ts != 0 {
-                    return ts;
-                }
+        // `.flatten()` (clippy::manual_flatten) is safe here and `.or(...)`
+        // is not: flatten only skips `None`, leaving the `ts != 0` test to
+        // reject the falsy zero. An `.or()` chain would ACCEPT `Some(0)` as a
+        // value and report a healthy sort key for exactly the rows #2812
+        // makes invisible.
+        for ts in [r.updated_ts, r.completed_ts, r.started_ts].into_iter().flatten() {
+            if ts != 0 {
+                return ts;
             }
         }
         0
