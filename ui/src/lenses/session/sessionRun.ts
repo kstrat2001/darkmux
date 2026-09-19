@@ -53,7 +53,7 @@
  * golden moves — asserted directly in `lib/format.test.ts`.
  */
 
-import { T, dispatchErrored, dispatchKilled, statusLabel, computeTMax } from "../../lib/flow";
+import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
@@ -594,12 +594,14 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const wall = wallBase + wallLoud;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();
-  const svLabel = statusLabel({
-    open: !done,
-    errored: !!c && dispatchErrored(c),
-    killed: !!c && dispatchKilled(c),
-    clean: done && !!c && !dispatchErrored(c),
-  });
+  const svLabel = statusLabel(
+    runStateFrom({
+      open: !done,
+      errored: !!c && dispatchErrored(c),
+      killed: !!c && dispatchKilled(c),
+      clean: done && !!c && !dispatchErrored(c),
+    }),
+  );
 
   const sp = (d?.payload ?? {}) as DispatchStartPayload;
   const dp = (c?.payload ?? {}) as DispatchCompletePayload;

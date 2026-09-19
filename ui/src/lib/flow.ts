@@ -20,6 +20,11 @@
  */
 
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+// (#2813) The canonical status axis, generated from the Rust enum. Importing
+// it here is the point: the label below is a total function of it, so the two
+// cannot drift apart again.
+import type { RunStatus } from "../types/generated/RunStatus";
+import type { AbandonReason } from "../types/generated/AbandonReason";
 import { isPlainObject } from "./guards";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
@@ -587,11 +592,84 @@ export function sessionRunning(
 
 /** `statusVisual()` — viewer.html:1140-1145. Only `lbl` is consumed here —
  * `cls`/`pill` are CSS class names in legacy, invisible to `innerText`. */
-export function statusLabel(args: { open: boolean; errored: boolean; killed: boolean; clean: boolean }): string {
-  if (args.open) return "running";
-  if (args.errored) return args.killed ? "killed" : "errored";
-  if (args.clean) return "complete";
-  return "canceled";
+export interface RunStatePredicates {
+  open: boolean;
+  errored: boolean;
+  killed: boolean;
+  clean: boolean;
+}
+
+/** What a lens is allowed to say about a run: one canonical status, plus the
+ * payload facts a LABEL may render it with. */
+export interface RunState {
+  status: RunStatus;
+  /** `error` only. The terminal record reported a kill/timeout rather than a
+   * plain failure — a rendering nuance of `error`, not a status of its own. */
+  killed: boolean;
+  /** `abandoned` only. Mirrors `Run.abandoned_reason` on the wire. */
+  abandonReason?: AbandonReason;
+}
+
+/**
+ * (#2813) Map a lens's locally-derived predicates onto the CANONICAL
+ * `RunStatus`. This is the only place the flow-record lenses are allowed to
+ * decide a status, and it can only ever return one of the six the server
+ * defines.
+ *
+ * The predicates themselves stay where they are — each lens derives them from
+ * a different slice of the flow stream and they are not interchangeable. What
+ * changes is that they now SELECT a status instead of inventing one.
+ *
+ * The old mapping, preserved exactly: `open` -> running; `errored` -> error
+ * (with `killed` as a nuance WITHIN error, which is what the legacy
+ * `killed ? "killed" : "errored"` meant — `killed` was never a peer of
+ * `abandoned`); `clean` -> complete; anything else -> abandoned with no
+ * ending recorded, which is what the legacy `"canceled"` described.
+ */
+export function runStateFrom(p: RunStatePredicates): RunState {
+  if (p.open) return { status: "running", killed: false };
+  if (p.errored) return { status: "error", killed: p.killed };
+  if (p.clean) return { status: "complete", killed: false };
+  return { status: "abandoned", killed: false, abandonReason: "noterminal" };
+}
+
+/**
+ * (#2813) The word a lens shows for a run. A TOTAL function of the canonical
+ * status — a lens may choose WORDS, it may never choose STATES.
+ *
+ * This used to take four booleans and return `running | killed | errored |
+ * complete | canceled`, a vocabulary that overlapped the server's
+ * `RunStatus` in only two values and had no total function between them. It
+ * was a faithful port of `viewer.html`, written before a typed API existed;
+ * the enum arrived afterwards and this never went back. Meanwhile
+ * `runStatusLabel` in the runs lens had been doing it correctly all along —
+ * status verbatim, `abandoned` split on its reason.
+ *
+ * The `never` binding below is the part that keeps this true: adding a
+ * `RunStatus` variant is a COMPILE ERROR here until it is handled. The
+ * generated-types drift guard in CI keeps `RunStatus` current with Rust; this
+ * keeps the LABELS current with `RunStatus`. Without it, CI is happy while a
+ * lens quietly ignores the enum, which is how the two vocabularies coexisted.
+ */
+export function statusLabel(state: RunState): string {
+  switch (state.status) {
+    case "planned":
+      return "planned";
+    case "running":
+      return "running";
+    case "complete":
+      return "complete";
+    case "error":
+      return state.killed ? "killed" : "errored";
+    case "abandoned":
+      return state.abandonReason === "aborted" ? "aborted" : "no ending recorded";
+    case "unparseable":
+      return "unknown";
+    default: {
+      const unhandled: never = state.status;
+      return unhandled;
+    }
+  }
 }
 
 /** `machPresent()` — viewer.html:1321-1327. true=present, false=absent,
@@ -727,12 +805,14 @@ export function buildMachineRuns(
     const errClose = !!c && T(c.ts) === closeTs && dispatchErrored(c);
     const liveNow = liveSet.has(sid);
     const killed = dispatchKilled(c);
-    const lbl = statusLabel({
-      open: !closedBy && !machAbsent && (liveNow || closeTs != null),
-      errored: closedBy && errClose,
-      killed,
-      clean: closedBy && cleanClose,
-    });
+    const lbl = statusLabel(
+      runStateFrom({
+        open: !closedBy && !machAbsent && (liveNow || closeTs != null),
+        errored: closedBy && errClose,
+        killed,
+        clean: closedBy && cleanClose,
+      }),
+    );
     const startTs = s ? T(s.ts) : null;
     const donePayload = c?.payload ?? null;
 
