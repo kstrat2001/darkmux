@@ -27,7 +27,12 @@
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
-import { nameOf, machineNames, machineUids } from "../../lib/flow";
+// (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
+// `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
+// machine lens and the app shell need the identical self-identity rule and a
+// second copy of it is how the two surfaces disagree about which machine
+// they are on.
+import { machineNames, machineUids, isSelfMachine, displayNameOf } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
@@ -97,7 +102,13 @@ export function specOf(
   // (the query is live-only) so the branch never runs there. If a static
   // machine-specs source is ever wired in, this alias lookup must read the
   // snapshot too.
-  if (specs && specs.machine_id && machineNames(data, liveMachines, m).has(specs.machine_id) && specs.cpu_brand) {
+  // (#2814) The identity half of this condition moved into `isSelfMachine`,
+  // which joins on `specs.machine_uid` when the daemon reports one — no
+  // `data`, no `liveMachines`, no window. See that function's own doc for
+  // why the alias set could not answer this question durably. The
+  // `cpu_brand` half stays here: it is about whether there is anything to
+  // SHOW, not about who this is.
+  if (isSelfMachine(data, liveMachines, specs, m) && specs?.cpu_brand) {
     const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
     return specs.cpu_brand + gb;
   }
@@ -263,6 +274,16 @@ export function rosterOnlyEntries(
     for (const name of machineNames(data, liveMachines, uid)) knownNames.add(name);
   }
   if (specs?.machine_id) knownNames.add(specs.machine_id);
+  // (#2814) The uid half of the same F1 self-check, and it is now load-bearing
+  // rather than belt-and-braces: `FleetLens` puts this machine's own uid into
+  // the card list unconditionally once specs report one, so a roster entry the
+  // operator declared under a name this machine NO LONGER USES — `laptop` for
+  // a machine that now calls itself `MacBook-Pro`, the live #2796 shape — is
+  // no longer caught by any name check and would draw a second, "offline"
+  // card beside the machine's own live one. The uid is the join that survives
+  // a rename; a uid-less entry still falls through to the name checks below
+  // exactly as #2768 requires.
+  if (specs?.machine_uid) knownUids.add(specs.machine_uid);
 
   const normalizedKnown = new Set([...knownNames].map(normalizeMachineAlias));
   return roster.filter((entry) => {
@@ -488,9 +509,14 @@ export function buildFleetCard(
   // "does that map hold an entry for this uid" — not a second, parallel
   // notion of presence that could disagree with the one the spec came from.
   const specUnknown: SpecUnknownReason | null = spec ? null : specBeats.has(m) ? "not-reported" : "not-seen";
+  // (#2814) `nameOf` plus the self-identity floor — see `displayNameOf`'s own
+  // doc for why a card titled with a raw 36-character UUID is the display
+  // half of "self is unknown", and why the floor can never outvote a name the
+  // window actually observed.
+  const name = displayNameOf(data, liveMachines, specs, m);
   return {
     uid: m,
-    name: nameOf(data, liveMachines, m),
+    name,
     spec,
     specUnknown,
     active,

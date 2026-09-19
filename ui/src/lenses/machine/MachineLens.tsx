@@ -4,7 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { localMachineUid, nameOf } from "../../lib/flow";
+import { localMachineUid, displayNameOf } from "../../lib/flow";
 import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
@@ -207,8 +207,16 @@ export function MachineLens({
 
   const specs = staticMachine ? staticMachine.specs : specsQuery.data?.ok ? specsQuery.data.data : null;
 
+  // (#2814) The reported hardware uid first — `isLocalSpecs` below compares
+  // this against a drilled-in `routeUid`, and on a quiet window the name path
+  // returned the NAME as if it were a uid, so that comparison was false and
+  // the machine classified ITSELF as remote (no residency ledger, no utility
+  // model, and a note advising the operator to visit the machine they were
+  // already sitting on). Note `specs` here may be a STATIC fixture's, not
+  // this daemon's — that fixture describes the machine the page is about, so
+  // the identity it reports is still the right one to resolve against.
   const localUid = useMemo(
-    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
+    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null, specs?.machine_uid ?? null),
     [flowWindow.data, liveMachines, specs],
   );
   // The machine THIS page is showing — the route's explicit uid (a
@@ -355,7 +363,14 @@ export function MachineLens({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLocalMach, resourcesQuery.dataUpdatedAt, staticMachineQuery.dataUpdatedAt]);
 
-  const label = targetUid != null ? nameOf(flowWindow.data, liveMachines, targetUid) : "this machine";
+  // (#2814) `displayNameOf`, not `nameOf`: once self-identity resolves by
+  // hardware uid, `targetUid` on an empty window is a real 36-character UUID
+  // rather than (as before) the machine's own name arriving through
+  // `localMachineUid`'s `?? machineId` fallback. `nameOf` has nothing to
+  // answer with there and echoes the uid, so "runs on MacBook-Pro" would
+  // become "runs on F9ACF59C-…". The floor only fills that gap; an observed
+  // name still wins. See `displayNameOf`'s own doc.
+  const label = targetUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid) : "this machine";
   // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
   // reused rather than re-derived here) — the local daemon's own
   // `/machine/specs` probe (cpu + RAM) when this page IS that machine;

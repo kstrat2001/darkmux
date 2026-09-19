@@ -6,6 +6,7 @@ import {
   machineNames,
   localMachineUid,
   nameOf,
+  displayNameOf,
   buildFlowWindow,
   liveSessionSet,
   flowLiveSessions,
@@ -235,6 +236,66 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
     // A freshly booted daemon — the case the `?? machineId` fallback exists for.
     expect(localMachineUid([], new Map(), "MacBook-Pro")).toBe("MacBook-Pro");
     expect(localMachineUid([], new Map(), null)).toBeNull();
+  });
+
+  // (#2814) SELF IS NEVER UNKNOWN. Every assertion above resolves this
+  // machine's identity through the flow window — the set of names a uid has
+  // been OBSERVED under — so all of them inherit the window's lifetime. The
+  // machine you are STANDING ON needs no window and no network to identify
+  // itself: `/machine/specs` reads its own hardware uid directly.
+  it("(#2814) answers with the uid /machine/specs reports, on an empty window with no beats", () => {
+    // The state a fresh install, a quiet machine with Redis off, or a rename
+    // whose old records have aged out is actually in. Pre-#2814 this returned
+    // the NAME as if it were a uid, and every downstream uid comparison was
+    // false from there.
+    expect(localMachineUid([], new Map(), "MacBook-Pro", UID)).toBe(UID);
+  });
+
+  it("(#2814) the reported uid outranks a name that ANOTHER machine's records also carry", () => {
+    // The inverted case, and the one that proves the reported uid is doing
+    // the work rather than the name lookup happening to agree with it: a
+    // different machine's uid holds the alias `MacBook-Pro` in this window,
+    // so the name path resolves to OTHER. Self is still UID — `/machine/specs`
+    // is the daemon's own probe of its own hardware, not an observation.
+    const data = [rec(OTHER, "MacBook-Pro")];
+    const live = new Map([beat(OTHER, "MacBook-Pro")]);
+    expect(localMachineUid(data, live, "MacBook-Pro")).toBe(OTHER);
+    expect(localMachineUid(data, live, "MacBook-Pro", UID)).toBe(UID);
+  });
+
+  // (#2814) The display half. `localMachineUid` now answers with a real
+  // hardware uid where it used to answer with the machine's own NAME (via
+  // `?? machineId`), so every label derived from `nameOf(thatUid)` would
+  // start printing a 36-character UUID on an empty window. These two ship
+  // together; the first without the second is a regression.
+  it("(#2814) displayNameOf names THIS machine from specs when the window knows nothing", () => {
+    expect(nameOf([], new Map(), UID)).toBe(UID); // the gap, stated
+    expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, UID)).toBe("MacBook-Pro");
+  });
+
+  it("(#2814) displayNameOf is a FLOOR — an observed name still outranks the specs name", () => {
+    const data = [rec(UID, "MacBook-Pro.local")];
+    expect(displayNameOf(data, new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, UID)).toBe("MacBook-Pro.local");
+  });
+
+  it("(#2814) displayNameOf does not lend this machine's name to a DIFFERENT uid", () => {
+    expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, OTHER)).toBe(OTHER);
+  });
+
+  it("(#2814) displayNameOf with no specs is exactly nameOf", () => {
+    const data = [rec(UID, "MacBook-Pro")];
+    expect(displayNameOf(data, new Map(), null, UID)).toBe(nameOf(data, new Map(), UID));
+    expect(displayNameOf([], new Map(), null, UID)).toBe(UID);
+  });
+
+  it("(#2814) keeps the name path when specs reports no uid (non-macOS, or an older build)", () => {
+    // The probe is macOS-only and best-effort, and a peer built before the
+    // field existed answers without it. Absence must degrade to today's
+    // behavior, never to "cannot identify myself".
+    const data = [rec(UID, "MacBook-Pro")];
+    const live = new Map([beat(UID, "MacBook-Pro")]);
+    expect(localMachineUid(data, live, "MacBook-Pro", null)).toBe(UID);
+    expect(localMachineUid(data, live, "MacBook-Pro", undefined)).toBe(UID);
   });
 });
 

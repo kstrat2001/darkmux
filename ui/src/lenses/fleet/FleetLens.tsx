@@ -536,7 +536,27 @@ export function FleetLens({
     () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs, liveMode),
     [flowWindow.data, liveSessionIds, nowMs, liveMode],
   );
-  const uids = useMemo(() => machineUids(flowWindow.data, liveMachines), [flowWindow.data, liveMachines]);
+  // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
+  //
+  // `machineUids` unions flow-derived uids with currently-beating presence
+  // keys. Both are empty on a fresh install, on a machine whose Redis is off
+  // (presence self-disables — `darkmux-flow/src/presence.rs`), and on any
+  // machine whose last record has aged out of the retained window. The
+  // roster could not cover the gap either: `rosterOnlyEntries`' F1
+  // self-check correctly suppresses this machine's own entry as
+  // already-accounted-for, so in that state NOTHING accounted for it and the
+  // daemon answering the request rendered no card about itself at all.
+  //
+  // The uid the daemon probes for itself is not an observation and does not
+  // belong to the window, so it is appended unconditionally when specs
+  // report one. Deduped against the derived set, so the ordinary case — this
+  // machine has records, as it does whenever anything has run — is unchanged.
+  // No replay concern: `specs` is null unless `livePolling`.
+  const uids = useMemo(() => {
+    const derived = machineUids(flowWindow.data, liveMachines);
+    const selfUid = specs?.machine_uid;
+    return selfUid && !derived.includes(selfUid) ? [...derived, selfUid] : derived;
+  }, [flowWindow.data, liveMachines, specs]);
   // (#1855) The roster entries with NO known identity anywhere in this
   // window — not beating, no flow history under this name either, not this
   // machine's own `/machine/specs` identity, not a normalized near-miss of

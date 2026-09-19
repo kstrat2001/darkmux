@@ -171,6 +171,100 @@ describe("MachineLens", () => {
     expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
   });
 
+  // (#2814) The same OR-gate, with the flow window EMPTY — the state this
+  // machine is in on a fresh install, with presence off, or once its last
+  // record has aged out of retention.
+  //
+  // The test above resolves `localUid` from a flow record; that is an
+  // OBSERVATION and it expires. With no record to observe, `localMachineUid`
+  // used to fall through to `?? machineId` and hand back the NAME as if it
+  // were a uid, so `targetUid === localUid` compared a uid to a name, was
+  // false, and this machine classified ITSELF as remote: no residency
+  // ledger, no utility model, and a note advising the operator to open the
+  // machine page on the machine they were already sitting on.
+  //
+  // `/machine/specs` reporting `machine_uid` makes the comparison a uid-to-uid
+  // one with no window involved. This exercises the CALL-SITE WIRING, not the
+  // helper — a mutation sweep found `localMachineUid`'s own unit tests all
+  // stayed green while both of its call sites dropped the argument entirely.
+  it("(#2814) self-corrects on an EMPTY flow window, from the uid /machine/specs reports", async () => {
+    const resourcesCalled = mockMachineFetch({
+      specs: {
+        machine_id: "MacBook-Pro",
+        machine_uid: "self-uid",
+        cpu_brand: "M5 Max",
+        ram_total_bytes: 137438953472,
+      },
+      // No flow records, no presence beats. Only the daemon's own probe.
+    });
+    renderMachine("self-uid");
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(resourcesCalled.value).toBe(true);
+    expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
+    expect(document.querySelector(".machine-lens__health")?.getAttribute("data-state")).not.toBe("remote");
+  });
+
+  // (#2814) The other half of resolving self by uid, and it is a regression
+  // the uid fix CREATES if nothing catches it: every name on this page comes
+  // from `nameOf(targetUid)`, which answers with the raw uid when the window
+  // holds no record naming it. Before the uid fix, `targetUid` on an empty
+  // window WAS the machine's name (via `localMachineUid`'s `?? machineId`
+  // fallback), so the label read correctly by accident. Resolving the real
+  // uid is right, and it turns "runs on MacBook-Pro" into
+  // "runs on F9ACF59C-..." unless the name gets the same floor.
+  it("(#2814) labels this machine by its NAME on an empty window, never by its raw uid", async () => {
+    mockMachineFetch({
+      specs: {
+        machine_id: "MacBook-Pro",
+        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+        cpu_brand: "M5 Max",
+        ram_total_bytes: 137438953472,
+      },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(screen.getByText(/runs on MacBook-Pro/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("F9ACF59C");
+  });
+
+  // Inverted: a name the window DID observe still wins, so the specs name is
+  // a floor rather than an override (#2030 — a value that cannot be outvoted
+  // is the defect).
+  it("(#2814) an observed alias still outranks the specs name in the label", async () => {
+    mockMachineFetch({
+      specs: {
+        machine_id: "MacBook-Pro",
+        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+        cpu_brand: "M5 Max",
+        ram_total_bytes: 137438953472,
+      },
+      flowToday: [
+        {
+          ts: `${todayUTC()}T00:00:00Z`,
+          machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+          machine_id: "MacBook-Pro.local",
+        },
+      ],
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(screen.getByText(/runs on MacBook-Pro\.local/)).toBeInTheDocument();
+  });
+
+  // Inverted, so the fix cannot be "treat every drilled uid as local": a
+  // genuinely remote uid on the same empty window must still read remote.
+  it("(#2814) a remote uid on an empty window still reads remote, with specs reporting its own uid", async () => {
+    const resourcesCalled = mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "self-uid", cpu_brand: "M5 Max" },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+    });
+    renderMachine("remote-uid");
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__health")?.getAttribute("data-state")).toBe("remote"),
+    );
+    expect(resourcesCalled.value).toBe(false);
+  });
+
   it("(#1833) shows live CPU/GPU/MEM now/avg/max for this machine's own telemetry.process samples", async () => {
     // (rolling-window fix) The 10-minute window is measured against REAL
     // `Date.now()`, not the test's nominal "today" — a midnight-UTC
