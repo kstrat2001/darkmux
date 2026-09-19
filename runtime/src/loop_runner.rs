@@ -2676,11 +2676,24 @@ fn run_with_sleeper(
                         "the weight is not in tool results"
                     };
                     eprintln!(
-                        "darkmux-runtime: the next request is ~{after_tokens} tokens and the \
-                         {window}-token window this profile DECLARES cannot be met — {why}. \
-                         If the model is loaded at the declared window the endpoint will \
-                         REFUSE this request. Raise the profile's n_ctx, or reduce what this \
-                         role puts in context. (#2792)"
+                        // SAY ESTIMATE, NOT PROPHECY (#2792 round-4). This
+                        // used to end "the endpoint will REFUSE this
+                        // request". On the live dogfood run validating the
+                        // anchored estimator it printed exactly that for a
+                        // request the endpoint then counted at 27,745 against
+                        // the same 32,000 window — a proven falsehood, and
+                        // the second diagnostic on this path to state a
+                        // certainty its own input cannot support. The
+                        // estimate errs HIGH by design, which is right for
+                        // deciding to trim and wrong for predicting a
+                        // refusal, so the message reports what was measured
+                        // and what follows from it, conditionally.
+                        "darkmux-runtime: the next request ESTIMATES at ~{after_tokens} \
+                         tokens against the {window}-token window this profile DECLARES, \
+                         and nothing further can reduce it — {why}. This estimate errs \
+                         high on purpose so the bound never misses an overflow, so the \
+                         request may still fit; if the endpoint refuses it, raise the \
+                         profile's n_ctx or reduce what this role puts in context. (#2792)"
                     );
                 }
                 trajectory.append_pre_send_bound(
