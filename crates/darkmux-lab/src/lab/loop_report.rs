@@ -594,6 +594,7 @@ mod tests {
         let mut args = CompactionDispatchArgs {
             threshold_tokens: Some(50_000),
             compactor_model: None,
+            compactor_context_window: None,
             threshold_ratio: Some(0.7),
             context_window: Some(100_000),
             strategy: None,
