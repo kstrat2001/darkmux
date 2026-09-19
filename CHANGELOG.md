@@ -12,6 +12,100 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.8.0] - 2026-09-19
+
+Schema contracts: `FLOW_SCHEMA` 1.42.0 to 1.51.0, `CONFIG_SCHEMA` 1.22 to 1.26.
+Both are additive minor bumps, lenient on read. `RULES_SCHEMA` is unchanged at
+3.0.0. No breaking changes to any payload, so an older peer on the fleet stream
+degrades to ignoring fields it does not know rather than rejecting records.
+
+### Added
+
+- **Serve address block** ([#2765](https://github.com/kstrat2001/darkmux/issues/2765)).
+  `serve.port` and `serve.bind` are visible fields in `config.json`, resolved as
+  `env > config > default`. `darkmux doctor` prints the resolved value with its
+  provenance. A non-default daemon port no longer lives only in an invocation flag.
+- **Battery sampling and a run gate** ([#2705](https://github.com/kstrat2001/darkmux/issues/2705), [#2706](https://github.com/kstrat2001/darkmux/issues/2706)).
+  Charge rides the host sample beside CPU and thermal. Health (cycle count,
+  capacity against design, condition, temperature) is polled hourly and recorded
+  on change. A dispatch can be gated on an operator-set charge floor, and
+  `darkmux doctor` reports the values. Tracked internally and readable at
+  `/machine/resources` under `load.battery_health`. A viewer surface follows in a
+  later patch release ([#2821](https://github.com/kstrat2001/darkmux/issues/2821)).
+- **Doctor reports over-readable state files** ([#2452](https://github.com/kstrat2001/darkmux/issues/2452)).
+  Any darkmux state file readable by group or world is named in the report.
+- **Host-source facade and scenario library** ([#2779](https://github.com/kstrat2001/darkmux/issues/2779)).
+  Thermal and power inputs come through a seam that fixtures can drive, so ladder
+  tiers that cannot be elicited safely on real hardware are still testable.
+- **Machine rollup on the fleet lens** ([#2775](https://github.com/kstrat2001/darkmux/issues/2775)).
+- **Mutation gate across `crates/`** on the PR diff ([#2499](https://github.com/kstrat2001/darkmux/issues/2499)).
+
+### Enhanced
+
+- **Thermal escalation ladder**, tiers 1 through 4 ([#2774](https://github.com/kstrat2001/darkmux/issues/2774)).
+  Sustained thermal or power pressure now escalates through defined tiers instead
+  of being reported and ignored.
+- **Compaction is bounded by the compactor's own context window** ([#2808](https://github.com/kstrat2001/darkmux/issues/2808)),
+  and the pre-send bound is measured against the endpoint's own token count rather
+  than a character estimate ([#2792](https://github.com/kstrat2001/darkmux/issues/2792)).
+  Verified on an 88 minute dispatch: 0 of 76 requests over window, 66 compactions,
+  run completed.
+- **Local dispatches address the darkmux-namespaced instance on the wire**
+  ([#2240](https://github.com/kstrat2001/darkmux/issues/2240), [#2539](https://github.com/kstrat2001/darkmux/issues/2539), [#2575](https://github.com/kstrat2001/darkmux/issues/2575)).
+  Under co-residency a bare model key could resolve to a user-loaded copy with
+  unknown load config. The dispatch now names the instance it loaded.
+- **Signal guards on nine dispatching verbs** ([#2463](https://github.com/kstrat2001/darkmux/issues/2463), [#2467](https://github.com/kstrat2001/darkmux/issues/2467)).
+  Container children are reaped when the host takes a signal.
+- **One run-status vocabulary** across CLI, viewer and records ([#2813](https://github.com/kstrat2001/darkmux/issues/2813)).
+  The viewer no longer derives its own status labels from booleans.
+
+### Fixed
+
+273 issues closed in this release. The full list, filterable and permanent:
+[closed 2026-09-07 to 2026-09-19](https://github.com/kstrat2001/darkmux/issues?q=is%3Aissue+is%3Aclosed+closed%3A2026-09-07..2026-09-19).
+
+The areas where the fixes change day to day use:
+
+**Seeing work that is actually running.** The runs board hid in-flight lab runs
+entirely ([#2812](https://github.com/kstrat2001/darkmux/issues/2812)). A task admitted to a wave but not yet dispatched read
+running instead of waiting ([#2557](https://github.com/kstrat2001/darkmux/issues/2557)). A finalized mission that abandoned every
+phase read Complete ([#1564](https://github.com/kstrat2001/darkmux/issues/1564)). A running phase whose dispatch session was dead
+went unflagged ([#2682](https://github.com/kstrat2001/darkmux/issues/2682)). A peer machine's mission never appeared on the CLI
+board at all ([#2652](https://github.com/kstrat2001/darkmux/issues/2652)).
+
+**Long runs finishing.** Compaction could run every turn without ever getting
+below its own trigger ([#2793](https://github.com/kstrat2001/darkmux/issues/2793)), and a structured compaction that did not shrink
+the middle it replaced is now refused ([#2798](https://github.com/kstrat2001/darkmux/issues/2798)). A bash tool call leaving a
+process holding its pipe is bounded ([#2215](https://github.com/kstrat2001/darkmux/issues/2215)). `--timeout` now actually bounds
+the container dispatch path ([#2547](https://github.com/kstrat2001/darkmux/issues/2547)).
+
+**The fleet showing one card per machine.** The roster joins live cards by
+hardware uid rather than name ([#2768](https://github.com/kstrat2001/darkmux/issues/2768)), a machine's own name titles its card
+([#2806](https://github.com/kstrat2001/darkmux/issues/2806)), and a rostered but silent machine renders offline rather than
+vanishing ([#1855](https://github.com/kstrat2001/darkmux/issues/1855)).
+
+**Being told the truth about state.** `doctor` stopped reporting problems on a
+correct install and stopped printing an unverified destructive remedy
+([#2149](https://github.com/kstrat2001/darkmux/issues/2149), [#1715](https://github.com/kstrat2001/darkmux/issues/1715)). The presence headline is caveated and a silent stream is no
+longer called live ([#2683](https://github.com/kstrat2001/darkmux/issues/2683)). Savings verdicts key on a run rather than a
+recurring session id ([#2690](https://github.com/kstrat2001/darkmux/issues/2690)), and gauges stopped claiming a scope they did not
+have ([#2559](https://github.com/kstrat2001/darkmux/issues/2559)).
+
+**Nothing left behind on exit.** Dispatch children are reaped on a signal to the
+host ([#2463](https://github.com/kstrat2001/darkmux/issues/2463)), orphaned grandchildren are reaped via `--init` ([#2481](https://github.com/kstrat2001/darkmux/issues/2481)), and a
+signal-interrupted run archives as interrupted rather than as a failure
+([#2555](https://github.com/kstrat2001/darkmux/issues/2555)).
+
+**The viewer on a phone.** The mission graph stacks vertically in portrait and
+re-fits on rotation ([#2376](https://github.com/kstrat2001/darkmux/issues/2376)), the sticky tab row covers the safe-area band
+([#2760](https://github.com/kstrat2001/darkmux/issues/2760), [#2764](https://github.com/kstrat2001/darkmux/issues/2764)), and a viewer failure is visible and diagnosable rather than a
+black screen ([#1709](https://github.com/kstrat2001/darkmux/issues/1709)).
+
+The remainder is internal hardening: test isolation, CI mutation coverage, and
+state-permission tightening. Those change no behavior you drive directly.
+
+[3.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.8.0
+
 ## [3.7.1] - 2026-09-07
 
 ### Fixed
