@@ -244,6 +244,22 @@ impl CompactionStrategy {
     }
 }
 
+/// (#2808) The two context windows compaction needs, as NAMED fields.
+///
+/// They are both `Option<u32>`, they sit next to each other, and they mean
+/// very different things: one is the model producing the conversation, the
+/// other is the small model asked to summarize it. Passing the primary's
+/// where the compactor's belongs is exactly the defect #2808 is about, and
+/// as two positional arguments nothing would have caught it. As named
+/// fields, that mistake has to be written out loud.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactionWindows {
+    /// The PRIMARY model's `n_ctx`. Consulted for the trigger only.
+    pub primary: Option<u32>,
+    /// The COMPACTOR's own `n_ctx`. Bounds what compaction may SEND.
+    pub compactor: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     /// Absolute token threshold. When `latest_prompt_tokens` reaches
@@ -299,6 +315,21 @@ pub struct CompactionConfig {
     /// active profile's primary model `n_ctx`. `None` disables the
     /// formula trigger entirely (back-compat / absolute-only mode).
     pub context_window: Option<u32>,
+    /// (#2808) The window the COMPACTOR loads at — its own declared `n_ctx`,
+    /// or the primary's as a named fallback. Distinct from `context_window`
+    /// above, which is the PRIMARY's and is consulted only for the trigger.
+    ///
+    /// This is the bound on what compaction may SEND. Without it the excerpt
+    /// is bounded by nothing at all: `compact()` renders the whole middle and
+    /// posts it, so a 32,000-token primary paired with a 16,000-token
+    /// compactor — the small-dedicated-compactor pairing this project's own
+    /// docs recommend — refuses every compaction with HTTP 400 once the
+    /// thread outgrows the compactor. Measured: 69 consecutive refusals, zero
+    /// successes, thread running away to 49,000 against a 32,000 window.
+    ///
+    /// `None` means the host did not resolve one; the excerpt is then
+    /// unbounded exactly as before, rather than guessing a window.
+    pub compactor_context_window: Option<u32>,
     /// (#377) Escalation bound: after this many compactions, the
     /// runtime bails with `TerminalReason::EscalationTriggered`
     /// (reason `CompactionLimitReached`) instead of continuing the
@@ -342,7 +373,9 @@ impl CompactionConfig {
             threshold_tokens,
             compactor_model,
             threshold_ratio,
-            context_window,
+            // (#2808) The compactor's window is resolved at dispatch time by
+            // the host, not derivable from these overrides.
+            CompactionWindows { primary: context_window, compactor: None },
             strategy,
             None,
             None,
@@ -368,6 +401,7 @@ impl CompactionConfig {
         Self {
             threshold_tokens: u32::MAX,
             compactor_model: None,
+            compactor_context_window: None,
             threshold_ratio: None,
             context_window: None,
             strategy: CompactionStrategy::Narrative,
@@ -406,7 +440,7 @@ impl CompactionConfig {
         threshold_tokens: Option<u32>,
         compactor_model: Option<String>,
         threshold_ratio: Option<f32>,
-        context_window: Option<u32>,
+        windows: CompactionWindows,
         strategy: Option<CompactionStrategy>,
         bail_after_compactions: Option<u32>,
         custom_instructions: Option<String>,
@@ -429,6 +463,8 @@ impl CompactionConfig {
         //      that rejects this combination at startup; the panic
         //      here is defense-in-depth for direct callers that
         //      bypass the validator.
+        let CompactionWindows { primary: context_window, compactor: compactor_context_window } =
+            windows;
         let resolved_threshold_tokens = match (threshold_tokens, threshold_ratio, context_window) {
             (Some(t), _, _) => t,
             (None, Some(r), Some(w)) => ((w as f32) * r).floor() as u32,
@@ -451,6 +487,7 @@ impl CompactionConfig {
             // now treats that as compaction being off, not as license to
             // invent a model id to address.
             compactor_model,
+            compactor_context_window,
             threshold_ratio,
             context_window,
             strategy: strategy.unwrap_or_default(),
@@ -767,7 +804,26 @@ pub fn compact(
         snap_boundaries_off_tool_groups(messages, PRESERVE_HEAD, n - PRESERVE_TAIL);
     let middle_count = middle_end - middle_start;
 
-    let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+    let mut middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+    // (#2808) Size the excerpt to the model that has to READ it, not to the
+    // primary's window — and not, as before, to nothing at all.
+    if let Some(fit) = fit_excerpt_to_compactor(&mut middle_messages, cfg) {
+        if fit.results_trimmed > 0 {
+            eprintln!(
+                "darkmux-runtime: compaction #{generation} — the excerpt was {} characters \
+                 against the ~{} the compactor's {}-token window leaves for it; elided {} \
+                 oversized tool result(s) down to {}. (#2808)",
+                fit.before_chars,
+                fit.budget_chars,
+                fit.window,
+                fit.results_trimmed,
+                fit.after_chars
+            );
+        }
+        if !fit.fits() {
+            return Err(excerpt_too_large_error(&fit, &compactor_model));
+        }
+    }
     let middle_rendered = render_messages_as_excerpt(&middle_messages);
 
     let compactor_system = Message::system(
@@ -948,7 +1004,26 @@ pub fn structured_compact(
         snap_boundaries_off_tool_groups(messages, PRESERVE_HEAD, n - PRESERVE_TAIL);
     let middle_count = middle_end - middle_start;
 
-    let middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+    let mut middle_messages: Vec<Message> = messages[middle_start..middle_end].to_vec();
+    // (#2808) Size the excerpt to the model that has to READ it, not to the
+    // primary's window — and not, as before, to nothing at all.
+    if let Some(fit) = fit_excerpt_to_compactor(&mut middle_messages, cfg) {
+        if fit.results_trimmed > 0 {
+            eprintln!(
+                "darkmux-runtime: compaction #{generation} — the excerpt was {} characters \
+                 against the ~{} the compactor's {}-token window leaves for it; elided {} \
+                 oversized tool result(s) down to {}. (#2808)",
+                fit.before_chars,
+                fit.budget_chars,
+                fit.window,
+                fit.results_trimmed,
+                fit.after_chars
+            );
+        }
+        if !fit.fits() {
+            return Err(excerpt_too_large_error(&fit, &compactor_model));
+        }
+    }
     let middle_rendered = render_messages_as_excerpt(&middle_messages);
 
     let request = build_structured_compaction_request(
@@ -1693,6 +1768,149 @@ fn occupancy_cost_of(messages: &[Message]) -> usize {
         .sum()
 }
 
+// ─── (#2808) Bounding the excerpt by the COMPACTOR's own window ──────────
+//
+// `compact()` renders the middle of the thread and posts it to the compactor.
+// Nothing sized that against what the compactor can read, so the
+// small-dedicated-compactor pairing this project's docs recommend — a 4B
+// utility model beside a much larger primary — refused EVERY compaction with
+// HTTP 400 once the thread outgrew it. Measured on the dogfood profile
+// (32,000 primary / 16,000 compactor): 69 consecutive refusals, zero
+// successes, and with compaction dead the thread ran away to 49,000.
+//
+// The failure was silent by construction: each refusal is a
+// `compaction.skipped` record (non-fatal since #2797), so the dispatch keeps
+// running and degrades instead of stopping.
+
+/// The summary the compactor is asked to GENERATE. Its window has to hold
+/// this alongside the excerpt — both compactor requests set
+/// `max_tokens: 4096`, and these must move together.
+const COMPACTOR_OUTPUT_RESERVE_TOKENS: u32 = 4096;
+
+/// The instruction text wrapped around the excerpt (system prompt, the
+/// "Summarize the following" framing, and for the structured path its slot
+/// schema and custom instructions). Rounded generously upward — under-
+/// reserving here costs an HTTP 400, over-reserving costs a slightly smaller
+/// excerpt.
+const COMPACTOR_FRAMING_RESERVE_TOKENS: u32 = 512;
+
+/// Chars-per-token ruler for the excerpt.
+///
+/// Deliberately below chars/4, and for the same measured reason as the
+/// pre-send bound's ruler: an agent transcript is tool results, tool-call
+/// arguments and JSON, which tokenize near 2.9 characters per token, not the
+/// ~3.9 of prose. Erring low here trims a little more than strictly needed;
+/// erring high sends a request the compactor refuses outright.
+const EXCERPT_CHARS_PER_TOKEN: f64 = 2.75;
+
+/// Floor an individual tool-result body is elided to when the excerpt has to
+/// shrink. Matches the pre-send bound's floor.
+const EXCERPT_MIN_BODY_BYTES: usize = 512;
+
+/// How many characters of rendered excerpt the compactor can actually read.
+fn excerpt_budget_chars(compactor_window: u32) -> usize {
+    let usable = compactor_window
+        .saturating_sub(COMPACTOR_OUTPUT_RESERVE_TOKENS)
+        .saturating_sub(COMPACTOR_FRAMING_RESERVE_TOKENS);
+    (usable as f64 * EXCERPT_CHARS_PER_TOKEN) as usize
+}
+
+/// Content bytes of a message slice, on the basis `hard_trim_to_fit` counts.
+fn raw_message_bytes(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.content.as_ref().map(|s| s.len()).unwrap_or(0)
+                + m.tool_calls
+                    .as_ref()
+                    .map(|tcs| {
+                        tcs.iter()
+                            .map(|tc| tc.function.name.len() + tc.function.arguments.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// What bounding the excerpt did, for the caller's message and records.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExcerptFit {
+    pub(crate) window: u32,
+    pub(crate) budget_chars: usize,
+    pub(crate) before_chars: usize,
+    pub(crate) after_chars: usize,
+    pub(crate) results_trimmed: usize,
+}
+
+impl ExcerptFit {
+    fn fits(&self) -> bool {
+        self.after_chars <= self.budget_chars
+    }
+}
+
+/// Shrink `middle` in place until the excerpt rendered from it fits the
+/// compactor's own window. `None` when the host resolved no compactor window,
+/// which leaves the excerpt unbounded exactly as before rather than guessing.
+///
+/// Only tool-result BODIES are elided — every message in the span stays, so
+/// the summary still covers the whole middle it is about to replace. Dropping
+/// messages instead would lose them outright: compaction replaces this span,
+/// so anything not summarized is simply gone.
+pub(crate) fn fit_excerpt_to_compactor(
+    middle: &mut [Message],
+    cfg: &CompactionConfig,
+) -> Option<ExcerptFit> {
+    let window = cfg.compactor_context_window?;
+    let budget_chars = excerpt_budget_chars(window);
+    let before_chars = render_messages_as_excerpt(middle).len();
+    if before_chars <= budget_chars {
+        return Some(ExcerptFit {
+            window,
+            budget_chars,
+            before_chars,
+            after_chars: before_chars,
+            results_trimmed: 0,
+        });
+    }
+    // `hard_trim_to_fit` counts raw content bytes; the excerpt adds per-message
+    // framing on top. Subtract the framing so the target it is given is a
+    // target on the thing actually being measured. The framing is invariant
+    // under body trimming — same messages, same roles, same tool names — so
+    // one measurement is enough.
+    let framing = before_chars.saturating_sub(raw_message_bytes(middle));
+    let raw_target = budget_chars.saturating_sub(framing);
+    let stats =
+        crate::tool_result_prune::hard_trim_to_fit(middle, raw_target, EXCERPT_MIN_BODY_BYTES);
+    Some(ExcerptFit {
+        window,
+        budget_chars,
+        before_chars,
+        after_chars: render_messages_as_excerpt(middle).len(),
+        results_trimmed: stats.results_trimmed,
+    })
+}
+
+/// The error a compaction that still cannot fit returns, phrased so the
+/// operator can act on it.
+///
+/// Before this, the excerpt was posted anyway and the operator saw the
+/// endpoint's own words — "the number of tokens to keep from the initial
+/// prompt is greater than the context length" — naming neither the compactor
+/// nor its window, on a request they never knew was being built. Operator
+/// sovereignty (#44): darkmux knows which model it addressed and how large it
+/// is, so it says so.
+fn excerpt_too_large_error(fit: &ExcerptFit, compactor_model: &str) -> anyhow::Error {
+    anyhow!(
+        "compaction excerpt is {} characters after eliding {} oversized tool result(s), and          the compactor `{compactor_model}` loads at {} tokens — about {} characters of          excerpt once its own {}-token summary and instruction framing are reserved. The          weight is not in tool-result bodies, so eliding them further will not help. Raise          the compactor's `n_ctx` in the active profile, or lower the compaction threshold so          the middle is smaller when it fires. (#2808)",
+        fit.after_chars,
+        fit.results_trimmed,
+        fit.window,
+        fit.budget_chars,
+        COMPACTOR_OUTPUT_RESERVE_TOKENS,
+    )
+}
+
 fn render_messages_as_excerpt(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -1861,6 +2079,151 @@ mod tests {
                 "total_tokens": 580,
             },
         })
+    }
+
+    /// (#2808) Captures the compactor request body. httpmock's matcher is a
+    /// plain `fn` pointer and cannot close over local state.
+    static EXCERPT_WIRE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+        std::sync::OnceLock::new();
+
+    fn capture_excerpt_wire(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        if let Some(cell) = EXCERPT_WIRE.get() {
+            if let Some(b) = req.body.as_ref() {
+                cell.lock().unwrap().push(String::from_utf8_lossy(b).to_string());
+            }
+        }
+        true
+    }
+
+    /// A middle with tool results paired to their calls, so
+    /// `snap_boundaries_off_tool_groups` leaves the span where we put it.
+    fn messages_with_a_heavy_tool_middle(body_len: usize) -> Vec<Message> {
+        let huge = "x".repeat(body_len);
+        let mut v = vec![Message::system("you are an agent"), Message::user("do the thing")];
+        for n in 0..2 {
+            let id = format!("call_{n}");
+            v.push(Message::assistant("calling read"));
+            v.push(Message::tool_result(&id, "read", &huge));
+        }
+        for n in 0..4 {
+            v.push(Message::user(format!("tail {n}")));
+        }
+        v
+    }
+
+    /// (#2808) The excerpt must be sized to the model that has to READ it.
+    ///
+    /// `compact()` rendered the whole middle and posted it, bounded by
+    /// nothing. On the dogfood profile — 32,000 primary beside a 16,000
+    /// compactor, which is the small-dedicated-compactor pairing this
+    /// project's docs recommend — that meant a ~30,000-token excerpt into a
+    /// 16,000-token window: HTTP 400, every time, 69 times in a row, zero
+    /// successful compactions. With compaction dead the thread ran away to
+    /// 49,000 against its own 32,000 window.
+    ///
+    /// Asserted on THE WIRE, not on a log line: an implementation that
+    /// measures a copy and posts the original passes any record-only check.
+    #[test]
+    #[serial_test::serial]
+    fn a_middle_larger_than_the_compactor_is_elided_before_it_is_sent() {
+        EXCERPT_WIRE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        EXCERPT_WIRE.get().unwrap().lock().unwrap().clear();
+        let server = GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(capture_excerpt_wire);
+            then.status(200).json_body(chat_response_with_json_content("a short summary"));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        let mut messages = messages_with_a_heavy_tool_middle(20_000);
+        let cfg = CompactionConfig {
+            // Small enough that the 40,000-character middle cannot fit.
+            compactor_context_window: Some(8_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+        let budget = excerpt_budget_chars(8_000);
+
+        let _ = compact(&client, &mut messages, 1, &cfg);
+
+        let bodies = EXCERPT_WIRE.get().unwrap().lock().unwrap().clone();
+        assert!(!bodies.is_empty(), "the compactor was never called at all");
+        let body = &bodies[0];
+        assert!(
+            body.len() < 40_000,
+            "the un-elided 40,000-character middle reached the wire: {} bytes",
+            body.len()
+        );
+        assert!(
+            body.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL),
+            "the posted excerpt must carry the elision marker, proving the SHRUNK \
+             middle was sent rather than the original"
+        );
+        assert!(
+            body.len() < budget + 4_000,
+            "and it must land near the {budget}-character budget the compactor's \
+             8,000-token window leaves: {} bytes",
+            body.len()
+        );
+    }
+
+    /// (#2808) When the weight is NOT in tool-result bodies there is nothing
+    /// to elide, and the operator must be told which model refused and how
+    /// large it is — not handed the endpoint's own words about a request they
+    /// never knew was being built.
+    #[test]
+    #[serial_test::serial]
+    fn an_excerpt_that_cannot_shrink_names_the_compactor_and_its_window() {
+        let server = GuardedMockServer::start();
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+
+        // Weight in ASSISTANT content: `hard_trim_to_fit` only elides tool
+        // results, so this span cannot be shrunk.
+        let huge = "y".repeat(20_000);
+        let mut messages = vec![Message::system("sys"), Message::user("go")];
+        for _ in 0..3 {
+            messages.push(Message::assistant(&huge));
+        }
+        for n in 0..4 {
+            messages.push(Message::user(format!("tail {n}")));
+        }
+        let cfg = CompactionConfig {
+            compactor_context_window: Some(8_000),
+            ..CompactionConfig::never_compact_with_model()
+        };
+
+        let err = compact(&client, &mut messages, 1, &cfg)
+            .expect_err("an excerpt that cannot fit the compactor must not be posted");
+        let msg = err.to_string();
+
+        assert!(msg.contains("8000"), "the compactor's window must be named: {msg}");
+        assert!(
+            msg.contains("not in tool-result bodies"),
+            "and it must say why eliding further will not help: {msg}"
+        );
+        assert!(
+            msg.contains("n_ctx"),
+            "and point at the knob that fixes it: {msg}"
+        );
+    }
+
+    /// (#2808) No resolved compactor window ⇒ unbounded, exactly as before.
+    /// The bound is not allowed to invent a window and start refusing
+    /// compactions on hosts that never told the runtime one.
+    #[test]
+    fn with_no_compactor_window_the_excerpt_is_left_alone() {
+        let mut middle = messages_with_a_heavy_tool_middle(20_000);
+        let before = render_messages_as_excerpt(&middle).len();
+        let cfg = CompactionConfig::never_compact_with_model();
+        assert!(cfg.compactor_context_window.is_none(), "fixture guard");
+
+        let fit = fit_excerpt_to_compactor(&mut middle, &cfg);
+
+        assert!(fit.is_none(), "no window resolved ⇒ no bound applied");
+        assert_eq!(
+            render_messages_as_excerpt(&middle).len(),
+            before,
+            "and nothing may be elided"
+        );
     }
 
     fn dummy_messages_long_enough_to_compact() -> Vec<Message> {
@@ -3026,6 +3389,7 @@ mod tests {
     #[test]
     fn needs_compaction_uses_per_cfg_threshold() {
         let cfg_low = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 5_000,
             compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: None,
@@ -3035,6 +3399,7 @@ mod tests {
             custom_instructions: None,
         };
         let cfg_high = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 100_000,
             compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: None,
@@ -3063,6 +3428,7 @@ mod tests {
     #[test]
     fn needs_compaction_refuses_when_no_compactor_is_configured_even_past_every_threshold() {
         let cfg = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 1, // already crossed by any nonzero input
             compactor_model: None,
             threshold_ratio: Some(0.1), // and the formula trigger too
@@ -3132,6 +3498,7 @@ mod tests {
         // Absolute threshold deliberately high (won't trip); formula
         // (0.35 of 100K = 35K) trips at 36K prompt tokens.
         let cfg = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 60_000,
             compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: Some(0.35),
@@ -3276,6 +3643,7 @@ mod tests {
         // Formula trigger high (60K of 100K = 60K, requires 60K
         // prompt). Absolute lower at 40K — trips first.
         let cfg = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 40_000,
             compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: Some(0.6),
@@ -3295,6 +3663,7 @@ mod tests {
         // fires first. With absolute=50K and formula=35K (0.35*100K),
         // the formula's lower trigger should fire at 36K.
         let cfg = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 50_000,
             compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: Some(0.35),
@@ -3519,6 +3888,7 @@ mod tests {
     #[test]
     fn request_hyperparameters_v0_pinned() {
         let cfg = CompactionConfig {
+            compactor_context_window: None,
             threshold_tokens: 60_000,
             compactor_model: Some(DEFAULT_COMPACTOR_MODEL.to_string()),
             threshold_ratio: None,
@@ -3623,6 +3993,7 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig {
+            compactor_context_window: None,
             custom_instructions: Some("operator-test-guidance-string-7c4a".to_string()),
             ..CompactionConfig::never_compact_with_model()
         };

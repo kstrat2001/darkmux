@@ -4053,6 +4053,9 @@
             json: true,
             allowed_tools: Some(vec!["exec".to_string(), "edit".to_string()]),
             compaction: crate::dispatch::CompactionDispatchArgs {
+                // (#2808) The compactor's OWN window, distinct from the
+                // primary's 32,000 below — the whole point of the flag.
+                compactor_context_window: Some(16_000),
                 threshold_tokens: Some(4096),
                 compactor_model: Some("util-model".to_string()),
                 threshold_ratio: Some(0.75),
@@ -4231,18 +4234,26 @@
         assert_eq!(argv[55], "0.75");
         assert_eq!(argv[56], "--context-window");
         assert_eq!(argv[57], "32000");
-        assert_eq!(argv[58], "--compact-strategy");
-        assert_eq!(argv[59], "structured-slot");
-        assert_eq!(argv[60], "--bail-after-compactions");
-        assert_eq!(argv[61], "10");
-        assert_eq!(argv[62], "--compactor-custom-instructions");
-        assert_eq!(argv[63], "Be terse.");
+        // (#2808) The COMPACTOR's own window, and it must be DISTINCT from
+        // the primary's 32,000 above — passing the primary's here would be
+        // the defect, not the fix. Without this flag the runtime bounds its
+        // compaction excerpt by nothing and posts a ~30,000-token excerpt to
+        // a 16,000-token model, which LMStudio refuses with HTTP 400 every
+        // time.
+        assert_eq!(argv[58], "--compactor-context-window");
+        assert_eq!(argv[59], "16000");
+        assert_eq!(argv[60], "--compact-strategy");
+        assert_eq!(argv[61], "structured-slot");
+        assert_eq!(argv[62], "--bail-after-compactions");
+        assert_eq!(argv[63], "10");
+        assert_eq!(argv[64], "--compactor-custom-instructions");
+        assert_eq!(argv[65], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[64], "--feedback-templates-json");
+        assert_eq!(argv[66], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[65].contains("error"));
-        assert!(argv[65].contains("An error occurred"));
+        assert!(argv[67].contains("error"));
+        assert!(argv[67].contains("An error occurred"));
 
         // Total arg count: 66 (0..=65) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
@@ -4251,7 +4262,8 @@
         // +2 for `--role-id <id>` (security audit, #2114 resume follow-up), +2 for
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
         // +2 for `--session-id <id>` (#2386). +1 for `--init` (#2481).
-        assert_eq!(argv.len(), 66);
+        // +2 for `--compactor-context-window <n>` (#2808).
+        assert_eq!(argv.len(), 68);
     }
 
     #[test]
@@ -5671,6 +5683,7 @@
     fn apply_compaction_flags_emits_threshold_when_set() {
         let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
+                compactor_context_window: None,
             threshold_tokens: Some(35_000),
             ..Default::default()
         };
@@ -5732,6 +5745,7 @@
     fn apply_compaction_flags_emits_all_when_set() {
         let mut args: Vec<String> = Vec::new();
         let compaction = crate::dispatch::CompactionDispatchArgs {
+            compactor_context_window: None,
             threshold_tokens: Some(45_000),
             compactor_model: Some("custom-compactor".to_string()),
             threshold_ratio: Some(0.35),

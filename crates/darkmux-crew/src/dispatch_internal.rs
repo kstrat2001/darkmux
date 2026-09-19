@@ -1453,6 +1453,10 @@ fn apply_compaction_flags(
         args.push("--context-window".to_string());
         args.push(window.to_string());
     }
+    if let Some(window) = compaction.compactor_context_window {
+        args.push("--compactor-context-window".to_string());
+        args.push(window.to_string());
+    }
     // (#372 T2-C) Strategy → `--compact-strategy <kebab>`. Runtime
     // parses it back to its local enum; None ⇒ flag omitted ⇒
     // runtime uses Narrative default.
@@ -5458,6 +5462,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             )?;
             let (load_window, used_fallback) =
                 resolve_compactor_load_window(compactor_n_ctx, compaction.context_window);
+            // (#2808) The runtime needs this to size its compaction excerpt.
+            // It was resolved here for the LOAD since #1616 and then thrown
+            // away, so the runtime bounded its excerpt by the primary's window
+            // — or, in fact, by nothing — and handed a ~30,000-token excerpt
+            // to a 16,000-token compactor. Set before the residency call
+            // below, so an early return from that path cannot drop it.
+            compaction.compactor_context_window = load_window;
             if let Some(window) = load_window {
                 if used_fallback {
                     eprintln!(

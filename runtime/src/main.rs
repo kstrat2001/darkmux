@@ -74,6 +74,7 @@ fn main() -> ExitCode {
             println!("    [--no-stream] [--json] [--allowed-tools csv]");
             println!("    [--compact-threshold-tokens N] [--compactor-model id]");
             println!("    [--compact-threshold-ratio 0.1-0.9] [--context-window N]");
+            println!("    [--compactor-context-window N]");
             println!("    [--compact-strategy narrative|structured-slot]");
             println!("    [--bail-after-compactions N]");
             println!();
@@ -226,6 +227,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // are NOT consulted.
     let mut compact_threshold_tokens: Option<u32> = None;
     let mut compactor_model: Option<String> = None;
+    // (#2808) The window the COMPACTOR loads at, resolved host-side by
+    // `resolve_compactor_load_window` and passed through so compaction can
+    // size its excerpt to the model that has to READ it. Absent ⇒ unbounded,
+    // exactly as before.
+    let mut compactor_context_window: Option<u32> = None;
     // (#368) Formula-based trigger: max_history_share fraction +
     // loaded context_window. Mirrors openclaw's `maxHistoryShare`.
     // Both must be set for the formula trigger to activate; either
@@ -479,6 +485,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     }
                 } else {
                     eprintln!("--compact-threshold-ratio requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--compactor-context-window" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            compactor_context_window = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--compactor-context-window requires a positive integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--compactor-context-window requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -939,7 +964,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         compact_threshold_tokens,
         compactor_model,
         compact_threshold_ratio,
-        context_window,
+        compaction::CompactionWindows {
+            primary: context_window,
+            compactor: compactor_context_window,
+        },
         compact_strategy,
         bail_after_compactions,
         compactor_custom_instructions,
