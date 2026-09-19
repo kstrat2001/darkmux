@@ -2202,6 +2202,16 @@ pub(crate) struct LabRunSummary {
     /// artifact-and-staleness inference, so this is additive, not a migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
+    /// (#2812) The lifecycle record's own `started_at_ms` — the run's real
+    /// START, written before the provider is ever called. `LabRunSummary`
+    /// carried no start timestamp at all before this, which is why
+    /// `runs::lab_summary_to_run` set `started_ts: None` on every lab row
+    /// and why `runActivity`'s `updated_ts || completed_ts || started_ts`
+    /// fallback chain had nothing left to fall back TO when the artifact
+    /// mtime was missing. `None` for a run recorded before the lifecycle
+    /// record existed, same additive posture as `lifecycle_status`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle_started_at_ms: Option<u64>,
     /// (#2462 review) The lifecycle record's own `error` string, carried
     /// alongside the status because the status ALONE cannot say which of
     /// `Interrupted`'s two writers produced it. `finish_interrupted` (the
@@ -2376,10 +2386,47 @@ fn build_lab_run_summary(
         .to_string_lossy()
         .replace('\\', "/");
 
+    // (#2812) The newest mtime among the run's own artifacts, found by
+    // READING the directory rather than by a fixed list of filenames.
+    //
+    // The list this replaces named three files — `scores.json`,
+    // `funnels.json`, `funnel-events.jsonl` — and every one of them is
+    // written only by a REVIEW-FUNNEL workload. A `coding-task` or `prompt`
+    // run writes none of them (`lifecycle.json`, `manifest.json`,
+    // `metrics.json`, `trajectory.jsonl` are its artifacts), so `mtime_ms`
+    // stayed 0 for such a run's entire life. Downstream that is not a
+    // missing nicety, it is two defects at once:
+    //
+    // * `runs::lab_summary_to_run` published `updated_ts: Some(0)`. Zero is
+    //   falsy in the viewer's `runActivity` sort key
+    //   (`ui/src/lenses/runs/format.ts`), so the row sorts below every run
+    //   that has any timestamp at all, forever — and `RUNS_CAP = 25` then
+    //   makes it permanently unreachable however recent it is.
+    // * `runs::lab_run_status` measures idle time as `now - mtime_ms`, so a
+    //   run that started ten seconds ago measured as decades stale and
+    //   reported `abandoned` while it was live.
+    //
+    // Measured on the operator's machine when #2812 was filed: 39 of 336
+    // lab runs, every one of them a coding-task run, including BOTH
+    // dispatches that were in flight at that moment. Hence "the fleet card
+    // says 2 running and its own run list shows nothing for 11 hours".
+    //
+    // Reading the directory is clean-by-construction: the next workload
+    // kind that invents an artifact name is covered without anyone
+    // remembering this list exists. Subdirectories (`sandbox/`,
+    // `worktrees/`) are skipped deliberately — a directory's mtime moves
+    // when entries are added or removed but NOT when a file inside it is
+    // edited, so it is a misleading activity signal, and every artifact a
+    // provider writes for the run itself sits at this top level.
     let mut mtime_ms = 0u64;
-    for name in ["scores.json", "funnels.json", "funnel-events.jsonl"] {
-        if let Ok(ms) = mtime_ms_of(&dir.join(name)) {
-            mtime_ms = mtime_ms.max(ms);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if let Ok(ms) = mtime_ms_of(&entry.path()) {
+                mtime_ms = mtime_ms.max(ms);
+            }
         }
     }
 
@@ -2529,6 +2576,7 @@ fn build_lab_run_summary(
         // inconsistency, same as the `status`/`error` pairing this comment
         // already covers.
         lifecycle_status: lifecycle_record.as_ref().map(|r| r.status),
+        lifecycle_started_at_ms: lifecycle_record.as_ref().map(|r| r.started_at_ms),
         lifecycle_error: lifecycle_record.and_then(|r| r.error),
         has_funnels,
         has_events,

@@ -440,7 +440,19 @@ pub fn build_runs(
             if let Some(sid) = &summary.session_id {
                 known_session_ids.insert(sid.clone());
             }
-            runs.push(lab_summary_to_run(&summary, lab_machine.clone(), now_ms));
+            // (#2812) Judge the lab run's liveness by the SAME
+            // `session_is_live` gate every other `/runs` source uses,
+            // whenever the run named a session this index actually holds.
+            // `None` — no session recorded, or one that has aged out of
+            // the bounded flow-scan window — leaves `lab_run_status` on
+            // its artifact-mtime fallback, which is the honest degradation
+            // rather than a fabricated verdict.
+            let session_live = summary
+                .session_id
+                .as_deref()
+                .and_then(|sid| flow_index.get(sid))
+                .map(|agg| session_is_live(agg, now_ms));
+            runs.push(lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live));
         }
     }
 
@@ -1693,9 +1705,14 @@ pub fn local_dispatch_status(
 /// [`Run`]. `machine` is resolved ONCE by the caller ([`build_runs`]) and
 /// passed in — every lab run shares the same daemon-declared machine
 /// (#1523 gate CONSIDER 7).
-fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: u64) -> Run {
+fn lab_summary_to_run(
+    summary: &LabRunSummary,
+    machine: Option<String>,
+    now_ms: u64,
+    session_live: Option<bool>,
+) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
-    let status = lab_run_status(summary, now_ms);
+    let status = lab_run_status(summary, now_ms, session_live);
     // (#1907, corrected #2462/#1946) `lab_run_status` used to have no abort
     // concept at all — every `Abandoned` arm was the staleness gate (the
     // run's artifact trail went quiet past the budget with no
@@ -1742,11 +1759,16 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         route,
         role,
         model,
-        // `LabRunSummary` carries no run-START timestamp today (only the
-        // newest-artifact `mtime_ms`) — leaving `started_ts` absent is
-        // honest; a wrong guess (e.g. mtime as start) would be worse than
-        // no value. `mtime_ms` becomes `completed_ts` once the run reached
-        // its terminal artifact write (`scores.json`).
+        // (#2812) `LabRunSummary` used to carry no run-START timestamp at
+        // all, so this was unconditionally `None` and the viewer's
+        // `runActivity` fallback chain (`updated_ts || completed_ts ||
+        // started_ts`) had nothing to fall back TO. It does now: the
+        // lifecycle record's `started_at_ms`, written before the provider
+        // is called, is the run's REAL start — not a guess derived from an
+        // artifact mtime, which is what the previous comment here rightly
+        // refused to do. `None` stays `None` for a run predating the
+        // lifecycle record. `mtime_ms` becomes `completed_ts` once the run
+        // reached its terminal artifact write (`scores.json`).
         //
         // (#2462 review) One narrow window can still produce the
         // self-contradicting row #1946 named — `status: Abandoned` with a
@@ -1764,8 +1786,8 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // its own fallible steps (`cow_clone_dir_excluding`,
         // `create_dir_all`) all run BEFORE the provider, when no terminal
         // artifact can exist yet.
-        started_ts: None,
-        completed_ts: if summary.finished {
+        started_ts: summary.lifecycle_started_at_ms.map(|ms| ms / 1000),
+        completed_ts: if summary.finished && summary.mtime_ms > 0 {
             Some(summary.mtime_ms / 1000)
         } else {
             None
@@ -1774,7 +1796,14 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // "last active" — and it's the ONLY time an unfinished lab run has.
         // Using it as `completed_ts` for such a run would claim a completion
         // that never happened; as `updated_ts` it's simply true.
-        updated_ts: Some(summary.mtime_ms / 1000),
+        //
+        // (#2812) Guarded on `> 0`. A zero mtime means the scan found no
+        // artifact to read a time from, and `Some(0)` publishes that
+        // absence as the affirmative claim "last active at the Unix
+        // epoch" — a lie that the viewer then treats as falsy anyway,
+        // silently. `None` says the true thing, and lets `started_ts`
+        // above carry the ordering instead.
+        updated_ts: (summary.mtime_ms > 0).then_some(summary.mtime_ms / 1000),
         tracked: true,
         // (#1915, corrected #1982, wired #2511) A lab run DOES have a flow
         // session — `summary.session_id`, resolved manifest-first /
@@ -1799,7 +1828,24 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
 /// `Error` (there's no separate "degraded" value in this view-model — the
 /// step-4 lens can special-case `degenerate` directly off the richer
 /// `/lab/runs` payload if finer granularity turns out to matter).
-fn lab_run_status(summary: &LabRunSummary, now_ms: u64) -> RunStatus {
+///
+/// (#2812) `session_live` is the run's OWN flow session judged by
+/// [`session_is_live`] — `Some(true)`/`Some(false)` when the run named a
+/// session id and that session is in the flow index, `None` when it named
+/// none or the session has aged out of the scan window. It is POSITIVE
+/// evidence and outranks the artifact-mtime heuristic below, because the
+/// heuristic's premise ("a live run keeps writing artifacts") is simply
+/// false for the providers that write everything at the end: a
+/// `coding-task` run emits hundreds of flow records an hour while its run
+/// directory sits untouched. Judging it by mtime alone read it as
+/// abandoned while the events pane was streaming from it — which is how
+/// `/runs` returned ZERO `running` rows with two dispatches in flight.
+///
+/// This is the same `session_is_live` call `mission_run_status`,
+/// `flow_mission_to_run` and `ghost_runs` already make. Lab was the one
+/// `/runs` source not participating in the liveness axis that function's
+/// own doc claims every source shares.
+fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<bool>) -> RunStatus {
     // (#1930) The run's OWN terminal record wins over every inference below.
     // `finished` only ever meant "scores.json exists", so a run that ERRORED
     // never set it and fell through to the idle heuristic — reporting
@@ -1820,6 +1866,16 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64) -> RunStatus {
     }
     if summary.finished {
         return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
+    }
+    // (#2812) The run's own flow session, when there is one, answers the
+    // liveness question directly — see this function's doc for why it
+    // outranks the artifact heuristic below rather than merely feeding it.
+    // `Some(false)` is just as load-bearing as `Some(true)`: a session that
+    // IS indexed and has gone quiet past the same `stale_after_ms()` budget
+    // is observed-dead, and falling through to the mtime heuristic for it
+    // would only re-derive the same verdict from worse evidence.
+    if let Some(live) = session_live {
+        return if live { RunStatus::Running } else { RunStatus::Abandoned };
     }
     // (#1621) Unfinished is NOT the same as running, and treating it as such
     // is what made the `running` filter useless: 49 of 52 rows it returned
@@ -4003,6 +4059,7 @@ mod tests {
         LabRunSummary {
             lifecycle_status,
             lifecycle_error: lifecycle_error.map(str::to_string),
+            lifecycle_started_at_ms: None,
             dir: dir.to_string(),
             mtime_ms: 1_700_000_000_000,
             case_ids: vec![],
@@ -4040,29 +4097,29 @@ mod tests {
         // Without a record this is `Running` (asserted last, as the control).
         let errored = lab_summary_with_lifecycle("d", false, false, Some(Lc::Error));
         assert_eq!(
-            lab_run_status(&errored, now),
+            lab_run_status(&errored, now, None),
             RunStatus::Error,
             "an errored run must not read as live just because it died recently"
         );
 
         let interrupted = lab_summary_with_lifecycle("d", false, false, Some(Lc::Interrupted));
-        assert_eq!(lab_run_status(&interrupted, now), RunStatus::Abandoned);
+        assert_eq!(lab_run_status(&interrupted, now, None), RunStatus::Abandoned);
 
         // Complete without `scores.json` — a lab run that finished but whose
         // bench artifacts were never part of its shape.
         let done = lab_summary_with_lifecycle("d", false, false, Some(Lc::Complete));
-        assert_eq!(lab_run_status(&done, now), RunStatus::Complete);
+        assert_eq!(lab_run_status(&done, now, None), RunStatus::Complete);
 
         // `degenerate` still downgrades a completed run.
         let degen = lab_summary_with_lifecycle("d", false, true, Some(Lc::Complete));
-        assert_eq!(lab_run_status(&degen, now), RunStatus::Error);
+        assert_eq!(lab_run_status(&degen, now, None), RunStatus::Error);
 
         // CONTROL — the same summary with no record keeps the old behavior.
         // Without this the four assertions above could all pass against a
         // function that ignored the record and happened to agree.
         let no_record = lab_summary_with_lifecycle("d", false, false, None);
         assert_eq!(
-            lab_run_status(&no_record, now),
+            lab_run_status(&no_record, now, None),
             RunStatus::Running,
             "a pre-lifecycle run keeps the artifact-and-staleness inference"
         );
@@ -4079,11 +4136,11 @@ mod tests {
 
         for st in [Lc::Running, Lc::Unknown] {
             let fresh = lab_summary_with_lifecycle("d", false, false, Some(st));
-            assert_eq!(lab_run_status(&fresh, now), RunStatus::Running, "{st:?} fresh");
+            assert_eq!(lab_run_status(&fresh, now, None), RunStatus::Running, "{st:?} fresh");
 
             let old = lab_summary_with_lifecycle("d", false, false, Some(st));
             assert_eq!(
-                lab_run_status(&old, stale),
+                lab_run_status(&old, stale, None),
                 RunStatus::Abandoned,
                 "{st:?} whose trail stopped is abandoned, not eternally live"
             );
@@ -4093,15 +4150,15 @@ mod tests {
     #[test]
     fn lab_run_status_maps_finished_and_degenerate() {
         let now = FIXTURE_NOW_MS;
-        assert_eq!(lab_run_status(&minimal_lab_summary("d1", false, false), now), RunStatus::Running);
-        assert_eq!(lab_run_status(&minimal_lab_summary("d2", true, false), now), RunStatus::Complete);
-        assert_eq!(lab_run_status(&minimal_lab_summary("d3", true, true), now), RunStatus::Error);
+        assert_eq!(lab_run_status(&minimal_lab_summary("d1", false, false), now, None), RunStatus::Running);
+        assert_eq!(lab_run_status(&minimal_lab_summary("d2", true, false), now, None), RunStatus::Complete);
+        assert_eq!(lab_run_status(&minimal_lab_summary("d3", true, true), now, None), RunStatus::Error);
     }
 
     #[test]
     fn lab_summary_to_run_uses_dir_as_id_and_kind_lab() {
         let summary = minimal_lab_summary("live/case-1", true, false);
-        let run = lab_summary_to_run(&summary, Some("studio".to_string()), FIXTURE_NOW_MS);
+        let run = lab_summary_to_run(&summary, Some("studio".to_string()), FIXTURE_NOW_MS, None);
         assert_eq!(run.id, "live/case-1");
         assert_eq!(run.kind, RunKind::Lab);
         assert_eq!(run.status, RunStatus::Complete);
@@ -4123,7 +4180,7 @@ mod tests {
     fn lab_summary_to_run_carries_the_summarys_session_id_through() {
         let mut summary = minimal_lab_summary("live/case-2", false, false);
         summary.session_id = Some("sess-live-2".to_string());
-        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS);
+        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.session_id.as_deref(), Some("sess-live-2"));
     }
 
@@ -4134,7 +4191,7 @@ mod tests {
     fn lab_summary_to_run_carries_no_session_id_when_the_summary_has_none() {
         let summary = minimal_lab_summary("live/case-3", false, false);
         assert_eq!(summary.session_id, None, "this test's own premise");
-        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS);
+        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.session_id, None);
     }
 
@@ -4147,7 +4204,7 @@ mod tests {
         let summary = minimal_lab_summary("dead/case-1", false, false);
         // Comfortably past `stale_after_ms()` from `mtime_ms`.
         let far_future_ms = summary.mtime_ms + stale_after_ms() + 5_000;
-        let run = lab_summary_to_run(&summary, None, far_future_ms);
+        let run = lab_summary_to_run(&summary, None, far_future_ms, None);
         assert_eq!(run.status, RunStatus::Abandoned);
         assert_eq!(run.abandoned_reason, Some(AbandonReason::NoTerminal));
     }
@@ -4172,7 +4229,7 @@ mod tests {
             Some(Lc::Interrupted),
             Some("hosted dispatch interrupted by an operator signal (SIGINT/SIGTERM/SIGHUP)"),
         );
-        let run = lab_summary_to_run(&summary, None, summary.mtime_ms);
+        let run = lab_summary_to_run(&summary, None, summary.mtime_ms, None);
         assert_eq!(run.status, RunStatus::Abandoned);
         assert_eq!(
             run.abandoned_reason,
@@ -4199,7 +4256,7 @@ mod tests {
         use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
         let summary =
             lab_summary_with_lifecycle_error("dead/case-3", false, false, Some(Lc::Interrupted), None);
-        let run = lab_summary_to_run(&summary, None, summary.mtime_ms);
+        let run = lab_summary_to_run(&summary, None, summary.mtime_ms, None);
         assert_eq!(run.status, RunStatus::Abandoned);
         assert_eq!(
             run.abandoned_reason,
@@ -4222,7 +4279,7 @@ mod tests {
     #[test]
     fn lab_summary_to_run_always_carries_an_activity_ts() {
         let unfinished =
-            lab_summary_to_run(&minimal_lab_summary("live/wip", false, false), None, FIXTURE_NOW_MS);
+            lab_summary_to_run(&minimal_lab_summary("live/wip", false, false), None, FIXTURE_NOW_MS, None);
         assert_eq!(unfinished.status, RunStatus::Running);
         assert_eq!(unfinished.started_ts, None);
         assert_eq!(unfinished.completed_ts, None, "an unfinished run never completed");
@@ -4233,7 +4290,7 @@ mod tests {
         );
 
         let finished =
-            lab_summary_to_run(&minimal_lab_summary("live/done", true, false), None, FIXTURE_NOW_MS);
+            lab_summary_to_run(&minimal_lab_summary("live/done", true, false), None, FIXTURE_NOW_MS, None);
         assert_eq!(finished.updated_ts, Some(1_700_000_000));
         assert_eq!(finished.completed_ts, Some(1_700_000_000));
     }
@@ -4265,7 +4322,7 @@ mod tests {
 
         // Just now: still live. The floor must not break a real in-flight run.
         assert_eq!(
-            lab_run_status(&summary, FIXTURE_NOW_MS),
+            lab_run_status(&summary, FIXTURE_NOW_MS, None),
             RunStatus::Running,
             "a run whose artifact was just written IS live"
         );
@@ -4273,14 +4330,14 @@ mod tests {
         // One second inside the window: still live. A live run legitimately
         // goes quiet between marker artifacts.
         let inside = FIXTURE_NOW_MS + stale_after_ms() - 1_000;
-        assert_eq!(lab_run_status(&summary, inside), RunStatus::Running);
+        assert_eq!(lab_run_status(&summary, inside, None), RunStatus::Running);
 
         // Past the window: it left a trail and the trail STOPS. The runtime's
         // inactivity watchdog would have killed anything live by now, so there
         // is nothing left that could have written it.
         let outside = FIXTURE_NOW_MS + stale_after_ms() + 1_000;
         assert_eq!(
-            lab_run_status(&summary, outside),
+            lab_run_status(&summary, outside, None),
             RunStatus::Abandoned,
             "a run untouched for longer than the watchdog budget cannot be live"
         );
@@ -4288,7 +4345,7 @@ mod tests {
         // The operator's actual data: the FRESHEST of 49 stuck runs was 2.6h
         // old. Every one of them must fall out of `running`.
         let two_point_six_hours = FIXTURE_NOW_MS + (2.6 * 3_600_000.0) as u64;
-        assert_eq!(lab_run_status(&summary, two_point_six_hours), RunStatus::Abandoned);
+        assert_eq!(lab_run_status(&summary, two_point_six_hours, None), RunStatus::Abandoned);
     }
 
     /// Staleness must never override a run's OWN terminal verdict — a finished
@@ -4298,11 +4355,11 @@ mod tests {
     fn a_finished_lab_run_keeps_its_verdict_no_matter_how_old() {
         let ancient = FIXTURE_NOW_MS + 400 * 24 * 3_600_000;
         assert_eq!(
-            lab_run_status(&minimal_lab_summary("old/done", true, false), ancient),
+            lab_run_status(&minimal_lab_summary("old/done", true, false), ancient, None),
             RunStatus::Complete
         );
         assert_eq!(
-            lab_run_status(&minimal_lab_summary("old/degen", true, true), ancient),
+            lab_run_status(&minimal_lab_summary("old/degen", true, true), ancient, None),
             RunStatus::Error
         );
     }
@@ -5007,7 +5064,7 @@ mod tests {
             // drift is precisely the class this test exists to prevent.
             ("exactly at the budget", ref_ms + stale_after_ms(), RunStatus::Running),
         ] {
-            assert_eq!(lab_run_status(&lab_summary, now_ms), want, "lab disagreed {label}");
+            assert_eq!(lab_run_status(&lab_summary, now_ms, None), want, "lab disagreed {label}");
             assert_eq!(mission_run_status(&mission, &[&session], now_ms), want, "mission disagreed {label}");
             let ghosts = ghost_runs(&ghost_idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
             assert_eq!(ghosts[0].status, want, "ghost disagreed {label}");
@@ -5368,17 +5425,28 @@ mod tests {
         );
         assert_eq!(runs[0].id, "crawl-error-discard-live-1");
         assert_eq!(runs[0].kind, RunKind::Lab);
-        // Deliberately not asserting `status` here: `lab_run_status`'s
-        // staleness gate reads `LabRunSummary::mtime_ms`, which this crate
-        // only derives from `scores.json`/`funnels.json`/
-        // `funnel-events.jsonl` — none of which `coding-task`/`prompt` write
-        // before they finish, so a fixture like this one (lifecycle-only,
-        // real wall-clock "now") reads `Abandoned` from the very first
-        // instant, independent of the lifecycle record's own `Running`
-        // status. That mismatch predates this PR and is a separate,
-        // out-of-scope gap in what counts as "fresh" for a lab run's
-        // liveness signal — not something #2511's session-id join touches.
-        // What this test exists to pin is the ROW COUNT, not the label.
+        // (#2812) This comment used to say `status` was deliberately not
+        // asserted, because `lab_run_status` read `mtime_ms` — derived
+        // only from `scores.json`/`funnels.json`/`funnel-events.jsonl`,
+        // none of which `coding-task`/`prompt` write before they finish —
+        // so a lifecycle-only fixture read `Abandoned` from its very first
+        // instant regardless of the lifecycle record's own `Running`. It
+        // called that "a separate, out-of-scope gap". It was neither
+        // separate nor out of scope: it IS #2812, and it shipped to the
+        // operator as a fleet card reading `2 running` beside its own run
+        // list showing nothing for eleven hours.
+        //
+        // The status is now assertable, and this fixture's answer is
+        // `Abandoned` for a REASON rather than by accident: its flow
+        // records are dated 2026-07-24, so the run's own session is long
+        // past `stale_after_ms()` and is observed-dead. The live twin of
+        // this fixture is
+        // `build_runs_a_live_lifecycle_only_lab_run_reads_running_not_abandoned`.
+        assert_eq!(
+            runs[0].status,
+            RunStatus::Abandoned,
+            "this fixture's session stopped emitting in July — observed-dead, not live: {runs:?}"
+        );
         assert!(runs[0].tracked);
         assert_eq!(
             runs[0].session_id.as_deref(),
@@ -7127,5 +7195,449 @@ mod tests {
             1,
             "a record in both sinks must not produce two runs"
         );
+    }
+
+    // ─── (#2813 / #2812) The run-state matrix, at the `/runs` BOUNDARY ────
+    //
+    // The UI half of this matrix lives in `ui/src/lib/runMatrix.ts` and its
+    // tests, and it covers what the UI owns: badge text, sort position,
+    // kind filtering. It cannot cover THIS half. Every one of those tests
+    // builds a `Run` by hand, so a `Run` the server never actually
+    // produces — or produces with a field missing — is invisible to all of
+    // them. #2812's first defect was exactly that shape: the sort function
+    // was correct, well tested, and fed a row whose three timestamps were
+    // all absent.
+    //
+    // So the assertion that belongs on this side is the one a UI fixture
+    // cannot make: EVERY row `/runs` emits, of every kind, in every status,
+    // carries something to sort on.
+
+    /// The server-side twin of `runActivity` (`ui/src/lenses/runs/
+    /// format.ts`): `updated_ts || completed_ts || started_ts || 0`.
+    ///
+    /// Written with JavaScript's falsiness, deliberately — `Some(0)` is
+    /// falsy there, so a row carrying an epoch-zero timestamp sorts
+    /// identically to one carrying none at all. A Rust-idiomatic
+    /// `.or(...)` chain would treat `Some(0)` as a value and this helper
+    /// would then report a healthy sort key for precisely the rows #2812
+    /// makes invisible.
+    fn activity_key(r: &Run) -> u64 {
+        for candidate in [r.updated_ts, r.completed_ts, r.started_ts] {
+            if let Some(ts) = candidate {
+                if ts != 0 {
+                    return ts;
+                }
+            }
+        }
+        0
+    }
+
+    /// Which `/runs` mapper reaches which status. The `match` is
+    /// EXHAUSTIVE over both generated enums with no wildcard arm, so
+    /// adding a `RunKind` or a `RunStatus` variant fails this crate's
+    /// build until somebody decides what the new cell means — the same
+    /// property `ui/src/lib/runMatrix.ts`'s typed table has, on the side
+    /// of the wire that actually produces the values.
+    ///
+    /// Kept in sync with `REACHABLE` / `REACHABLE_UNTRACKED` in that file.
+    /// The two are deliberately separate rather than generated from one
+    /// another: a cross-language codegen step for a table this small buys
+    /// less than it costs, and the CI drift guard already pins the ENUMS
+    /// (which is the part that can silently diverge) while this function
+    /// and its TS twin each state reachability in terms their own side can
+    /// actually assert.
+    fn tracked_cell_is_reachable(kind: RunKind, status: RunStatus) -> bool {
+        match (kind, status) {
+            // `mission_run_status` — missions, and dispatches, which are a
+            // SHAPE of mission (`classify_mission`) and share its mapper.
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Planned) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Running) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Complete) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Error) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Abandoned) => true,
+            (RunKind::Mission | RunKind::Dispatch, RunStatus::Unparseable) => true,
+            // `lab_run_status` — no `Planned` (a lab run directory exists
+            // because the run was dispatched) and no `Unparseable` (that
+            // verdict is read off a mission envelope a lab run has none of).
+            (RunKind::Lab, RunStatus::Planned) => false,
+            (RunKind::Lab, RunStatus::Running) => true,
+            (RunKind::Lab, RunStatus::Complete) => true,
+            (RunKind::Lab, RunStatus::Error) => true,
+            (RunKind::Lab, RunStatus::Abandoned) => true,
+            (RunKind::Lab, RunStatus::Unparseable) => false,
+        }
+    }
+
+    /// The UNTRACKED axis, which is NOT "any kind can be a ghost".
+    /// `ghost_runs` synthesizes `RunKind::Dispatch` and nothing else;
+    /// `flow_mission_to_run` synthesizes `RunKind::Mission` and nothing
+    /// else; there is no untracked lab row at all, because a lab row
+    /// exists only when this daemon can see the run directory.
+    fn untracked_cell_is_reachable(kind: RunKind, status: RunStatus) -> bool {
+        match (kind, status) {
+            // `ghost_runs`: `terminal_status_for_action` yields Complete
+            // (`dispatch complete`), Error (`dispatch error`) and
+            // Abandoned (`session.end`); the staleness gate yields Running
+            // or Abandoned.
+            (RunKind::Dispatch, RunStatus::Running) => true,
+            (RunKind::Dispatch, RunStatus::Complete) => true,
+            (RunKind::Dispatch, RunStatus::Error) => true,
+            (RunKind::Dispatch, RunStatus::Abandoned) => true,
+            (RunKind::Dispatch, RunStatus::Planned | RunStatus::Unparseable) => false,
+            // `flow_mission_to_run`: a peer's mission, judged only by its
+            // own terminal record and its sessions' liveness. It has no
+            // envelope to read here, so no Error and no Unparseable.
+            (RunKind::Mission, RunStatus::Running) => true,
+            (RunKind::Mission, RunStatus::Complete) => true,
+            (RunKind::Mission, RunStatus::Abandoned) => true,
+            (RunKind::Mission, RunStatus::Planned | RunStatus::Error | RunStatus::Unparseable) => {
+                false
+            }
+            (RunKind::Lab, _) => false,
+        }
+    }
+
+    const ALL_KINDS: [RunKind; 3] = [RunKind::Mission, RunKind::Dispatch, RunKind::Lab];
+    const ALL_STATUSES: [RunStatus; 6] = [
+        RunStatus::Planned,
+        RunStatus::Running,
+        RunStatus::Complete,
+        RunStatus::Error,
+        RunStatus::Abandoned,
+        RunStatus::Unparseable,
+    ];
+
+    /// The cell count is asserted so that a silent change to either
+    /// reachability function shows up as a number, not as a quietly
+    /// smaller loop. `abandoned` splits on `AbandonReason` on the wire, so
+    /// the UI matrix counts more cells than this; this one counts
+    /// (kind, status) pairs per tracked-ness.
+    #[test]
+    fn run_state_matrix_cell_count_is_pinned() {
+        let tracked = ALL_KINDS
+            .iter()
+            .flat_map(|k| ALL_STATUSES.iter().map(move |s| (*k, *s)))
+            .filter(|(k, s)| tracked_cell_is_reachable(*k, *s))
+            .count();
+        let untracked = ALL_KINDS
+            .iter()
+            .flat_map(|k| ALL_STATUSES.iter().map(move |s| (*k, *s)))
+            .filter(|(k, s)| untracked_cell_is_reachable(*k, *s))
+            .count();
+        assert_eq!(tracked, 16, "tracked cells: mission 6 + dispatch 6 + lab 4");
+        assert_eq!(untracked, 7, "untracked cells: ghost dispatch 4 + peer mission 3");
+    }
+
+    /// A `RunStatus` that no mapper can reach is dead vocabulary on the
+    /// wire — every consumer has to handle it and nothing will ever send
+    /// it. The inverse of the reachability tables, stated as a property.
+    #[test]
+    fn every_run_status_is_reachable_by_some_kind() {
+        for status in ALL_STATUSES {
+            let reachable = ALL_KINDS.iter().any(|k| {
+                tracked_cell_is_reachable(*k, status) || untracked_cell_is_reachable(*k, status)
+            });
+            assert!(reachable, "{status:?} is on the wire but no /runs mapper produces it");
+        }
+    }
+
+    // ─── (#2812) A lab run that writes no review-funnel artifact ──────────
+
+    /// Write the run directory a `coding-task`/`prompt` workload actually
+    /// leaves on disk: a lifecycle record and nothing else. Not a
+    /// contrived fixture — this is byte-for-byte the shape of all 39 rows
+    /// #2812 measured on the operator's machine (`~/.darkmux/runs/
+    /// long-agentic-dogfood-compact-*`), including both dispatches that
+    /// were in flight at the moment it was filed.
+    fn write_lifecycle_only_lab_run(
+        lab_dir: &StdPath,
+        dir: &str,
+        status: &str,
+        session_id: Option<&str>,
+    ) {
+        let run_dir = lab_dir.join(dir);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // A sandbox subdirectory, because the real ones have one and
+        // because `mtime_ms` must not be read off a DIRECTORY (a
+        // directory's mtime does not move when a file inside it is
+        // edited, so it is a misleading activity signal).
+        std::fs::create_dir_all(run_dir.join("sandbox")).unwrap();
+        let mut rec = serde_json::json!({
+            "schema_version": "1.1",
+            "run_id": dir,
+            "kind": "lab",
+            "workload": "long-agentic",
+            "profile": "dogfood-compact",
+            "started_at_ms": 1_700_000_000_000u64,
+            "status": status,
+        });
+        if let Some(sid) = session_id {
+            rec["session_id"] = serde_json::Value::String(sid.to_string());
+        }
+        std::fs::write(
+            run_dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Backdate a lab run's artifacts so the run LOOKS idle on disk while
+    /// remaining whatever its flow session says it is.
+    ///
+    /// This is the real shape of a long `coding-task` run and the reason
+    /// the artifact-mtime heuristic could not answer the liveness question
+    /// for one: its host-side artifacts are written at start and at end,
+    /// so a run in its third hour has a directory that has not been
+    /// touched since hour one, while it emits flow records continuously.
+    /// A fixture whose artifacts were written a moment ago cannot
+    /// distinguish the two signals — red-proving caught exactly that, with
+    /// the liveness gate disabled and the test still green because the
+    /// fresh artifact happened to agree.
+    fn backdate_lab_run_artifacts(lab_dir: &StdPath, dir: &str) {
+        let when = std::time::SystemTime::now()
+            - std::time::Duration::from_millis(stale_after_ms() + 60_000);
+        for entry in std::fs::read_dir(lab_dir.join(dir)).unwrap().flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let f = std::fs::File::options().write(true).open(entry.path()).unwrap();
+                f.set_modified(when).unwrap();
+            }
+        }
+    }
+
+    /// #2812, defect 1. The row was unreachable, not merely mis-sorted:
+    /// `RUNS_CAP = 25` cuts a newest-first list, and a row whose sort key
+    /// is 0 sits below every row that has any timestamp at all — forever,
+    /// however recent it is.
+    ///
+    /// The mechanism was `build_lab_run_summary` deriving `mtime_ms` from
+    /// a fixed list of three filenames, every one of which only a
+    /// REVIEW-FUNNEL workload writes. This asserts the property the fix
+    /// restores rather than the list: a lab run that exists at all is
+    /// orderable.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lifecycle_only_lab_run_has_a_non_zero_sort_key() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_lifecycle_only_lab_run(lab.path(), "long-agentic-dogfood-compact-1-1", "running", None);
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_ne!(
+            activity_key(row),
+            0,
+            "a lab run with no review-funnel artifact still has to be orderable — a zero key \
+             puts it below every other row forever and RUNS_CAP hides it: {row:?}"
+        );
+        assert_ne!(
+            row.updated_ts,
+            Some(0),
+            "`Some(0)` is not an improvement on `None`: it publishes 'last active at the Unix \
+             epoch' as an affirmative claim and is falsy in the viewer's sort key anyway"
+        );
+        // The assertion that actually pins the `mtime_ms` half of the fix,
+        // and the reason it is separate from the two above.
+        //
+        // Red-proving revealed this test's first draft to be vacuous:
+        // reverting `build_lab_run_summary` to its three-filename list left
+        // every assertion green, because the `started_ts` half of the fix
+        // ALSO rescues the sort key. Two fixes covering one symptom is good
+        // in production and useless in a test — the mutation proved the
+        // suite could not tell them apart.
+        //
+        // `updated_ts` means LAST ACTIVE, which `started_ts` structurally
+        // cannot stand in for: the fixture's lifecycle record is written
+        // now and declares `started_at_ms` in November 2023, so an
+        // `updated_ts` that does not sit far ahead of `started_ts` is one
+        // that was never read off an artifact at all.
+        let updated = row.updated_ts.expect(
+            "a lab run's newest-artifact time comes from READING its directory — a fixed list of \
+             review-funnel filenames finds nothing in a coding-task run and leaves this absent",
+        );
+        let started = row.started_ts.expect("the fixture's lifecycle record declares a start");
+        assert!(
+            updated > started,
+            "`updated_ts` ({updated}) must track the run's newest artifact, which this fixture \
+             wrote just now — falling back to the recorded start ({started}) means the artifact \
+             scan found nothing: {row:?}"
+        );
+    }
+
+    /// #2812, defect 2. The operator's symptom was a fleet card reading
+    /// `2 running` next to its own run list showing nothing for eleven
+    /// hours, and `/runs` returning ZERO rows with status `running` while
+    /// the events pane streamed from one of the two live sessions.
+    ///
+    /// The mechanism: `lab_run_status` judged liveness ONLY by how fresh
+    /// the newest artifact in the run directory was. For a `coding-task`
+    /// run that premise is simply false — it emits hundreds of flow
+    /// records an hour while its run directory sits untouched. Judged by
+    /// its own flow session, which is the evidence every other `/runs`
+    /// source already uses, it is plainly live.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_live_lifecycle_only_lab_run_reads_running_not_abandoned() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let sid = "darkmux-coding-long-agentic-1789797003515";
+        write_lifecycle_only_lab_run(lab.path(), "long-agentic-dogfood-compact-2-1", "running", Some(sid));
+        // The run is HOURS in: its host-side artifacts have not moved
+        // since it started, which is what makes the artifact heuristic
+        // and the session evidence actually disagree here. Without this
+        // the test passes for the wrong reason (see this helper's doc).
+        backdate_lab_run_artifacts(lab.path(), "long-agentic-dogfood-compact-2-1");
+        // `ts_utc_now()` rather than a literal: `session_is_live` measures
+        // against the real clock, so a fixed timestamp would make this
+        // test's verdict depend on the day it runs.
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": sid, "handle": "coder"}),
+                serde_json::json!({"ts": now, "action": "dispatch.tool", "session_id": sid, "handle": "coder"}),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!(
+            row.status,
+            RunStatus::Running,
+            "a lab run whose own flow session is emitting RIGHT NOW is running — reading it as \
+             abandoned is what made /runs return zero running rows with two dispatches in \
+             flight: {row:?}"
+        );
+        assert_eq!(row.abandoned_reason, None, "a running row carries no abandonment reason");
+        assert_ne!(activity_key(row), 0, "and it must still be orderable: {row:?}");
+    }
+
+    /// The inverted case, and the reason `session_live` is a three-valued
+    /// signal rather than a boolean. Without this, the test above would
+    /// pass just as well if `lab_run_status` had been changed to return
+    /// `Running` for every lifecycle-only run — which would resurrect
+    /// #1621 (49 of 52 rows the `running` filter returned were long-dead
+    /// bench runs) for exactly this class of run.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lifecycle_only_lab_run_whose_session_went_quiet_is_abandoned() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        let sid = "darkmux-coding-long-agentic-dead-1";
+        write_lifecycle_only_lab_run(lab.path(), "long-agentic-dogfood-compact-3-1", "running", Some(sid));
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[serde_json::json!({
+                "ts": "2026-01-01T00:00:00Z",
+                "action": "dispatch start",
+                "session_id": sid,
+                "handle": "coder",
+            })],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!(
+            row.status,
+            RunStatus::Abandoned,
+            "a session that stopped emitting long ago is observed-dead, not live: {row:?}"
+        );
+        assert_ne!(
+            activity_key(row),
+            0,
+            "an abandoned row is still a row the operator has to be able to FIND: {row:?}"
+        );
+    }
+
+    /// The boundary property, over a fixture holding all three kinds at
+    /// once. Stated as a sweep rather than per-kind assertions because the
+    /// defect it guards is a row class nobody thought to build a fixture
+    /// for — a per-kind test only covers the kinds somebody remembered.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_every_row_of_every_kind_is_orderable() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+
+        // lab: the lifecycle-only shape, live and dead.
+        write_lifecycle_only_lab_run(lab.path(), "lab-live-1", "running", Some("lab-live-sess"));
+        write_lifecycle_only_lab_run(lab.path(), "lab-dead-1", "interrupted", None);
+        // lab: the review-funnel shape, which has always been orderable —
+        // present so a regression that broke IT would show up here too.
+        write_lab_run_with_dispatch_session(lab.path(), "lab-funnel-1", "lab-funnel-sess");
+
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": "lab-live-sess", "handle": "coder"}),
+                // an untracked ghost, still running
+                serde_json::json!({"ts": now, "action": "dispatch start", "session_id": "ghost-live", "handle": "reviewer"}),
+                // an untracked ghost that completed
+                serde_json::json!({"ts": "2026-07-24T09:00:00Z", "action": "dispatch start", "session_id": "ghost-done", "handle": "reviewer"}),
+                serde_json::json!({"ts": "2026-07-24T09:10:00Z", "action": "dispatch complete", "session_id": "ghost-done", "handle": "reviewer"}),
+                // a peer's mission this daemon does not own
+                serde_json::json!({"ts": "2026-07-24T08:00:00Z", "action": "mission start", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
+                serde_json::json!({"ts": "2026-07-24T08:40:00Z", "action": "mission close", "session_id": "peer-sess", "mission_id": "peer-mission-1", "machine_id": "studio"}),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        assert!(runs.len() >= 5, "the fixture must actually produce rows of several kinds: {runs:?}");
+        for row in &runs {
+            assert_ne!(
+                activity_key(row),
+                0,
+                "every /runs row must carry something to sort on, whatever its kind or status \
+                 — this is the assertion that would have caught #2812: {row:?}"
+            );
+        }
+        // The fixture's own premise: it really does span kinds and
+        // tracked-ness, so the sweep above is not vacuously scoped to one.
+        assert!(runs.iter().any(|r| r.kind == RunKind::Lab), "fixture premise: a lab row: {runs:?}");
+        assert!(
+            runs.iter().any(|r| r.kind == RunKind::Dispatch),
+            "fixture premise: a ghost dispatch row: {runs:?}"
+        );
+        assert!(runs.iter().any(|r| !r.tracked), "fixture premise: an untracked row: {runs:?}");
+    }
+
+    /// `started_ts` was unconditionally `None` for every lab run, so
+    /// `runActivity`'s `updated_ts || completed_ts || started_ts` chain
+    /// had nothing left to fall back TO. The lifecycle record's
+    /// `started_at_ms` is the run's real start — written before the
+    /// provider is called — and is not a guess derived from an artifact
+    /// mtime, which is what the old comment here rightly refused to do.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_a_lab_row_carries_the_lifecycle_records_own_start() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_lifecycle_only_lab_run(lab.path(), "lab-start-1", "running", None);
+
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        assert_eq!(
+            row.started_ts,
+            Some(1_700_000_000),
+            "the fixture's lifecycle `started_at_ms` is 1_700_000_000_000 ms: {row:?}"
+        );
+    }
+
+    /// The other half: a run recorded before the lifecycle record existed
+    /// has no start to report, and must not have one invented for it.
+    #[test]
+    fn lab_summary_with_no_lifecycle_start_reports_no_start() {
+        let summary = minimal_lab_summary("legacy/no-lifecycle", true, false);
+        assert_eq!(summary.lifecycle_started_at_ms, None, "this test's own premise");
+        let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
+        assert_eq!(run.started_ts, None, "no record, no claim");
     }
 }
