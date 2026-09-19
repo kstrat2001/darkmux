@@ -366,7 +366,16 @@ describe("FleetLens", () => {
       ],
     });
     renderFleetLens();
-    await waitFor(() => expect(screen.getByText("local tokens")).toBeInTheDocument());
+    // (#2830) Wait for SETTLEMENT, not for a label. `"local tokens"` renders
+    // in both states, so the original anchor let the figure assertion below
+    // run against an unsettled hero. That was invisible while `.savnum`
+    // rendered "0" in both states; now that the figure is withheld until
+    // settled, the incidental anchor reads "" instead. Anchoring on
+    // `data-settled="true"` asserts the state this test always meant --
+    // `settled && 0` is a literal "0" (see `SavingsHero`'s own doc).
+    await waitFor(() =>
+      expect(document.querySelector('.savings[data-settled="true"]')).toBeTruthy(),
+    );
     const label = screen.getByText("unattributed");
     const tile = label.closest(".savlead")!;
     expect(tile.className).toMatch(/\bunknown\b/);
@@ -1222,5 +1231,48 @@ describe("FleetLens — the token hero distinguishes waiting from zero (#2817)",
       hero.textContent,
       "a settled empty fleet HAS used no tokens — that zero is a measurement and must survive",
     ).toMatch(/0/);
+  });
+});
+
+// (#2830) While the hero is loading, the real figures must not be visible.
+//
+// #2817 tried to achieve that with `color: transparent` plus a `::after`
+// skeleton. Both halves fail. The colour is a specificity TIE against
+// `.savlead.cloud .savnum` and `.savlead.unknown .savnum` (all three are
+// (0,3,0)) which the variant rules win on source order, so the cloud and
+// unattributed figures are never made transparent. And the skeleton is inset
+// `0.12em/0.18em` inside a box whose `line-height: 1` is already shorter than
+// the glyphs it paints, so whatever is still painted shows above and below it.
+// The operator saw exactly that on a phone: local clean, cloud bleeding teal,
+// unattributed bleeding grey.
+//
+// This test asserts the property that actually matters and that jsdom CAN
+// judge: while unsettled, no tile renders figure text at all. "Is it visually
+// covered" needs layout and is untestable here, which is precisely why the
+// CSS-only approach shipped broken.
+//
+// It deliberately checks EVERY tile. An assertion written against the local
+// tile alone passes on the broken build, because local is the one tile with no
+// variant colour rule to beat it.
+describe("savings hero: nothing leaks while loading (#2830)", () => {
+  it("renders no figure text in any tile while the window is unsettled", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    renderFleetLens();
+
+    const hero = await waitFor(() => {
+      const el = document.querySelector('.savings[data-settled="false"]');
+      expect(el, "the hero should be mounted and unsettled").toBeTruthy();
+      return el as HTMLElement;
+    });
+
+    const figures = Array.from(hero.querySelectorAll(".savnum, .scv"));
+    // Guard against a vacuous pass: if the selectors ever stop matching, an
+    // empty list would satisfy the assertion below while proving nothing.
+    expect(figures.length, "expected the hero's figure elements to exist").toBeGreaterThan(0);
+
+    const leaked = figures
+      .filter((el) => (el.textContent ?? "").trim() !== "")
+      .map((el) => `${el.className}="${el.textContent}"`);
+    expect(leaked, "no figure text may render while unsettled").toEqual([]);
   });
 });

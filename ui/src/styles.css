@@ -2648,9 +2648,23 @@ body {
    defect wearing a different hat. Geometry is identical in both states. */
 .savings[data-settled="false"] .savnum,
 .savings[data-settled="false"] .scv {
-  color: transparent;
   position: relative;
 }
+/* (#2830) The figure text is NOT RENDERED while unsettled (see `SavingsHero`),
+   so these boxes would collapse to zero height without an explicit floor, and
+   #2068 measured CLS 1.21 from exactly that kind of reflow. Each value is the
+   element's OWN line box: `.savnum` is `/1`, `.savc .scv` is `/1.1`.
+
+   This replaces a `color: transparent` that could not work. It tied on
+   specificity (0,3,0) with `.savlead.cloud .savnum`, `.savlead.unknown
+   .savnum`, `.savc.gen .scv` and `.savc.uncls .scv`, all of which are declared
+   LATER and therefore won on source order — so every tile except plain local
+   kept painting its figure, and the glyphs showed above and below a skeleton
+   that is inset inside a `line-height: 1` box. Not rendering the text removes
+   the whole class: there is no colour left to race, and a new tile variant
+   cannot silently reintroduce it. */
+.savings[data-settled="false"] .savnum { min-height: 1em; }
+.savings[data-settled="false"] .scv { min-height: 1.1em; }
 .savings[data-settled="false"] .savnum::after,
 .savings[data-settled="false"] .scv::after {
   content: "";
