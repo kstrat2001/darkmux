@@ -134,6 +134,21 @@ export interface MachineSpecs {
   darkmux_version: string;
   flow_schema_version: string;
   machine_id: string;
+  /** (#2814) THIS daemon's stable hardware identity —
+   * `darkmux_hardware::machine_uid()`, the same probe that keys every
+   * presence beat and stamps every flow record's `machine_uid`. It is what
+   * makes "is this card the machine serving the page?" answerable WITHOUT
+   * the flow window: a name-based answer (`machine_id` matched against the
+   * aliases a uid has been OBSERVED under) inherits the window's lifetime,
+   * so an empty window, a fresh install, or a rename whose old records aged
+   * out leaves the local machine unable to recognise itself.
+   *
+   * OPTIONAL on read, and it has to stay that way: the probe is macOS-only
+   * and best-effort (`None` elsewhere, or when `ioreg` fails), and a peer —
+   * or a committed static fixture — built before this field existed answers
+   * without it. Every consumer keeps the name-based path as its fallback
+   * rather than treating absence as "not this machine". */
+  machine_uid?: string | null;
   os: string;
   ram_total_bytes: number | null;
   ram_free_for_ai_bytes: number | null;

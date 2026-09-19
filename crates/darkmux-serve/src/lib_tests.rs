@@ -878,6 +878,12 @@
             "darkmux_version",
             "flow_schema_version",
             "machine_id",
+            // (#2814) The KEY must be present even where the probe answers
+            // `None` (non-macOS CI, a failed `ioreg`) — the viewer's
+            // "self is never unknown" join reads `machine_uid ?? fall back to
+            // the name path", and a missing key and a null value have to mean
+            // the same thing to it.
+            "machine_uid",
             "os",
             "ram_total_bytes",
             "ram_free_for_ai_bytes",

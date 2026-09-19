@@ -430,6 +430,90 @@ export function machineNames(
   return names;
 }
 
+/** (#2814) Is `m` the machine whose `/machine/specs` response this is —
+ * i.e. the machine serving the page?
+ *
+ * SELF IS NEVER UNKNOWN. That is an invariant, not a preference: the machine
+ * you are standing on has its own config and its own hardware probe and
+ * needs no network, no peer and no history to identify itself.
+ *
+ * It did not hold, because `MachineSpecs` carried only `machine_id` — a
+ * NAME. With no identity to join on, the answer had to be derived from
+ * names: "is the name specs reports one of the names this uid has been
+ * OBSERVED under" (`machineNames`). Observations live in the rolling flow
+ * window, so the answer inherited the window's lifetime and expired with
+ * retention. Three states reach it with nothing exotic happening — a fresh
+ * install, a machine whose Redis is off (presence self-disables, the
+ * off-by-default state), and a rename whose old records have aged out. In
+ * all three the machine failed to recognise itself and rendered "hardware
+ * not reported" about hardware sitting in the very response used to draw the
+ * page.
+ *
+ * `specs.machine_uid` is the same `darkmux_hardware::machine_uid()` probe
+ * that keys every presence beat and stamps every flow record, so when it is
+ * present the join is an identity comparison and needs no window at all. The
+ * name path stays as the FALLBACK, not as a co-equal: it is what a peer or a
+ * committed static fixture built before the field existed answers with, and
+ * off macOS the probe legitimately has no value.
+ *
+ * Note the fallback is also strictly WEAKER, which is the second defect this
+ * closes rather than merely routes around: a remote peer logging under the
+ * same name this daemon reports passes the name join and gets credited with
+ * this host's CPU and RAM. The uid join cannot make that mistake. */
+export function isSelfMachine(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  m: string,
+): boolean {
+  if (!specs) return false;
+  if (specs.machine_uid) return specs.machine_uid === m;
+  return !!specs.machine_id && machineNames(data, liveMachines, m).has(specs.machine_id);
+}
+
+/** The identity fields of `MachineSpecs` this module needs — structurally
+ * typed rather than importing the whole interface, so `lib/flow.ts` (the
+ * identity module every lens depends on) does not take a dependency on the
+ * shape of one HTTP endpoint's whole response. Any `MachineSpecs` satisfies
+ * it. */
+export interface SelfIdentity {
+  machine_id?: string | null;
+  machine_uid?: string | null;
+}
+
+/** (#2814) `nameOf` with the self-identity FLOOR applied — what to TITLE a
+ * machine with, as opposed to `nameOf`'s "what has this uid been called".
+ *
+ * `nameOf` answers with the raw uid when the window holds no record naming
+ * the machine. That is honest for a uid nothing is known about, and wrong
+ * for the one uid the daemon can name out of its own config — a page titled
+ * with a 36-character UUID is the display half of "self is unknown".
+ *
+ * This became REQUIRED, not merely nicer, the moment self-identity resolved
+ * by uid: before that, `localMachineUid` fell through to `?? machineId` on
+ * an empty window and handed back the NAME as a uid, so `nameOf` echoed it
+ * and every label read correctly by accident. Resolving the real uid is the
+ * fix, and on its own it turns "runs on MacBook-Pro" into
+ * "runs on F9ACF59C-…". Both halves ship together or the second one is a
+ * regression.
+ *
+ * A FLOOR, not an override, and the shape of the condition is what makes it
+ * one: it fires only where `nameOf` returned the uid itself, i.e. where it
+ * had nothing. Any observed name — including an alias older than the one
+ * specs reports — still wins, because #2030's lesson is that a value which
+ * cannot be outvoted is the defect rather than the fix. */
+export function displayNameOf(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: SelfIdentity | null,
+  m: string,
+): string {
+  const derived = nameOf(data, liveMachines, m);
+  if (derived !== m) return derived;
+  if (!specs?.machine_id) return derived;
+  return isSelfMachine(data, liveMachines, specs, m) ? specs.machine_id : derived;
+}
+
 /** `localMachineUid()` — viewer.html:2642-2644. Which uid IS this daemon,
  * for the nav-tab/deep-link entry into the machine page.
  *
@@ -444,12 +528,30 @@ export function machineNames(
  *
  * The `?? machineId` fallback stays for the case it was written for: a freshly
  * booted daemon that has produced no records or beats of its own yet, where
- * there is no uid to find and the raw name is the best available handle. */
+ * there is no uid to find and the raw name is the best available handle.
+ *
+ * (#2814) SELF IS NEVER UNKNOWN. `reportedUid` short-circuits all of the
+ * above, and has to, because everything above is an OBSERVATION: it asks
+ * which uid has been seen carrying this name, and that evidence lives in the
+ * expiring flow window. The machine you are STANDING ON is not an
+ * observation — `/machine/specs` reads its own hardware uid from its own
+ * probe, with no network and no history. Routing self-identity through the
+ * window meant a fresh install, a machine with presence off, or a rename
+ * whose old records aged out could not identify itself, and the
+ * `?? machineId` fallback then handed back a NAME as if it were a uid, so
+ * every downstream uid comparison was false from there.
+ *
+ * It is a floor, not an override: it answers only the question "which uid am
+ * I", which nothing else on this page can answer more authoritatively. When
+ * it is absent — off macOS, a failed probe, a peer or static fixture built
+ * before the field existed — the name path below runs exactly as before. */
 export function localMachineUid(
   data: FlowRecord[],
   liveMachines: Map<string, PresenceBeat>,
   machineId: string | null | undefined,
+  reportedUid?: string | null,
 ): string | null {
+  if (reportedUid) return reportedUid;
   if (!machineId) return null;
   return machineUids(data, liveMachines).find((x) => machineNames(data, liveMachines, x).has(machineId)) ?? machineId;
 }

@@ -2858,7 +2858,7 @@ async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
 
 /// GET /machine/specs — local-machine spec sheet for `darkmux machine list
 /// --deep` aggregation. Composes:
-/// - identity (machine_id from env)
+/// - identity (machine_id from env; machine_uid from the hardware probe, #2814)
 /// - hardware (ram_total_bytes, ram_free_for_ai_bytes, cpu_brand, os)
 /// - software (darkmux_version, flow_schema_version)
 /// - state (loaded_models from lms ps; redacted Redis URL from env)
@@ -2891,6 +2891,26 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         .flatten();
 
     let machine_id = darkmux_flow::resolve_machine_id();
+    // (#2814) The stable HARDWARE identity beside the NAME. `machine_id` is a
+    // label — it defaults to the hostname, macOS reports both the short and
+    // the mDNS `.local` form depending on how the daemon started, and the
+    // operator can rename it at any time. That made "is this card the machine
+    // serving the page?" a question the viewer could only answer by matching
+    // the name against the set of names this uid had been OBSERVED under —
+    // which lives in the rolling flow window, so the answer expired with
+    // retention. A fresh install, a quiet machine with presence off, or a
+    // rename whose old records aged out all left the local machine unable to
+    // recognise itself, rendering "hardware not reported" about hardware
+    // sitting in this very response.
+    //
+    // Same probe that keys every presence beat and stamps every flow record
+    // (`darkmux_hardware::machine_uid`), so the value joins directly against
+    // `FlowRecord.machine_uid` and `PresenceBeat.machine_uid` with no
+    // translation. Best-effort and macOS-only, like every other probe here:
+    // `null` off macOS or when `ioreg` fails, and consumers keep the
+    // name-based path as their fallback rather than reading absence as "not
+    // this machine".
+    let machine_uid = darkmux_hardware::machine_uid();
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5); `Display` on
     // `RawRedisUrl` is the redacted form, so this stays password-safe.
     let redis_url_redacted = darkmux_flow::redis_url().map(|u| u.to_string());
@@ -2925,6 +2945,7 @@ async fn machine_specs_handler() -> axum::Json<serde_json::Value> {
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "flow_schema_version": darkmux_flow::FLOW_SCHEMA_VERSION,
         "machine_id": machine_id,
+        "machine_uid": machine_uid,
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         "ram_total_bytes": ram_total,
         "ram_free_for_ai_bytes": ram_free,

@@ -1072,6 +1072,85 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
   });
 });
 
+// ── (#2814) SELF IS NEVER UNKNOWN — the rendered fixture ──────────────
+describe("FleetLens — this machine identifies itself without the flow window (#2814)", () => {
+  //
+  // The operator's own acceptance test, verbatim: an EMPTY flow window, no
+  // presence beats, no roster, with only `/machine/specs` answering. This is
+  // not a contrived state — it is a fresh install, a machine whose Redis is
+  // off (presence self-disables, the off-by-default case), and any machine
+  // whose last flow record has aged out of the retained window. Time passing
+  // is enough to reach it.
+  //
+  // Pre-#2814 this rendered ZERO cards. `machineUids` unions flow-derived
+  // uids with beating presence keys and both are empty, and the F1
+  // self-check inside `rosterOnlyEntries` correctly suppresses the self
+  // roster entry as already-accounted-for — so nothing accounts for it. The
+  // daemon answering the request drew nothing at all about itself.
+  it("(#2814) renders THIS machine's own card from /machine/specs alone — empty window, no beats, no roster", async () => {
+    mockFleetFetch({
+      specs: {
+        machine_id: "MacBook-Pro",
+        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
+        cpu_brand: "Apple M5 Max",
+        ram_total_bytes: 137438953472,
+      },
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const cards = [...document.querySelectorAll(".mach")];
+    expect(cards.length).toBe(1);
+    // Its own name — not the raw uid `nameOf` falls back to.
+    expect(cards[0].textContent).toContain("MacBook-Pro");
+    expect(cards[0].textContent).not.toContain("F9ACF59C");
+    // Its own hardware — read directly, never "hardware not reported".
+    expect(cards[0].textContent).toContain("Apple M5 Max · 128 GB");
+    expect(cards[0].textContent).not.toContain("hardware not reported");
+    expect(cards[0].textContent).not.toContain("hardware unknown");
+  });
+
+  // The inverted case. Without it, a fix that unconditionally drew a card
+  // for `specs.machine_uid` would pass the test above AND keep drawing a
+  // duplicate beside the machine's real, live card once the window has
+  // records again — which is the #2796 phantom, reintroduced from the other
+  // direction.
+  it("(#2814) does NOT draw a second card when the window already knows this machine's uid", async () => {
+    const today = todayUTC();
+    const uid = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: uid, machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      specs: { machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" },
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelectorAll(".mach").length).toBe(1);
+  });
+
+  // And the roster half: an entry the operator declared under a name this
+  // machine no longer uses, carrying its uid. #2814 puts the self uid in the
+  // card list unconditionally, so without the uid join in `rosterOnlyEntries`
+  // that stale entry draws an "offline" phantom beside the live self card.
+  it("(#2814) a stale roster entry carrying this machine's uid does not draw a phantom", async () => {
+    const uid = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+    mockFleetFetch({
+      roster: [{ id: "laptop", machine_uid: uid, address: "100.64.1.2:8765", added_unix_ms: 1000 }],
+      specs: { machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" },
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, queryClient);
+    await waitForFleetQueriesSettled(queryClient);
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    expect(document.querySelectorAll(".mach").length).toBe(1);
+    expect(document.querySelector(".mach")!.textContent).toContain("MacBook-Pro");
+  });
+});
+
 // ── (#2108, operator finding — "hero local/cloud figure collision") ──
 //
 // `.eventlog` is a fixed 380px side panel shown whenever the viewport is

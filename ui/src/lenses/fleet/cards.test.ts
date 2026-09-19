@@ -167,6 +167,48 @@ describe("specOf", () => {
   it("the unknown bucket with no claimed names reads 'unidentified'", () => {
     expect(specOf([], new Map(), null, "unknown")).toBe("unidentified (no hardware uid)");
   });
+
+  // ── (#2814) SELF IS NEVER UNKNOWN ────────────────────────────────────
+  //
+  // Every `specOf` assertion above hands the self branch a window that
+  // already carries the machine's own records, which is what let the
+  // `machineNames(...)` join look correct. It is not correct: that set is
+  // the names the uid has been OBSERVED under, it lives in the expiring
+  // flow window, and it is empty on a fresh install, on a quiet machine
+  // with presence off, and after a rename whose old records aged out. The
+  // machine standing on its own hardware then reports "hardware not
+  // reported" about hardware it read directly.
+  const specsWithUid = { ...specs, machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2" };
+
+  it("(#2814) recognises THIS machine on an empty window with no beats, via the reported uid", () => {
+    expect(specOf([], new Map(), specsWithUid, "F9ACF59C-0E8B-5092-A6B4-7C07070737D2")).toBe("Apple M5 Max · 128 GB");
+  });
+
+  it("(#2814) recognises THIS machine when the window knows the uid ONLY under a stale name", () => {
+    // The live #2796 shape: one uid, renamed `laptop` -> `MacBook-Pro`. Here
+    // only the old name survives in the window, so the alias set holds
+    // `laptop` and specs reports `MacBook-Pro` — the name join misses, the
+    // uid join cannot.
+    const data: FlowRecord[] = [rec({ machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2", machine_id: "laptop" })];
+    expect(specOf(data, new Map(), specsWithUid, "F9ACF59C-0E8B-5092-A6B4-7C07070737D2")).toBe("Apple M5 Max · 128 GB");
+  });
+
+  it("(#2814) a reported uid does NOT credit a different machine with this host's hardware", () => {
+    // The inverted case. A remote peer that happens to log under the same
+    // NAME this daemon reports would pass the old alias join; it must not
+    // pass the uid join.
+    const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "MacBook-Pro" })];
+    const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "MacBook-Pro", specs: "M1 Max · 32 GB" })]]);
+    expect(specOf(data, live, specsWithUid, "u2")).toBe("M1 Max · 32 GB");
+  });
+
+  it("(#2814) keeps the alias join when specs reports no uid at all", () => {
+    // Non-macOS, a failed `ioreg`, or a peer/static fixture built before the
+    // field existed. Absence degrades to the pre-#2814 behavior; it never
+    // means "not this machine".
+    const data: FlowRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
+    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
+  });
 });
 
 describe("buildFleetCard", () => {
@@ -396,6 +438,37 @@ describe("buildFleetCard", () => {
     // genuinely never heard from this machine.
     expect(card.spec).toBe("");
   });
+
+  // (#2814) The whole card for THIS machine on an empty window. `nameOf`
+  // answers with the raw uid when the window holds no record naming it —
+  // correct for a uid nothing is known about, and wrong for the one uid the
+  // daemon can name from its own config. A card titled with a 36-character
+  // UUID is the display half of "self is unknown".
+  it("(#2814) this machine's own card carries its name and hardware on an empty window", () => {
+    const uid = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+    const specs = machineSpecs({
+      machine_id: "MacBook-Pro",
+      machine_uid: uid,
+      cpu_brand: "Apple M5 Max",
+      ram_total_bytes: 137438953472,
+    });
+    const card = buildFleetCard([], new Map(), specs, new Set(), /* machAbsent */ false, uid, true, T_MAX);
+    expect(card.name).toBe("MacBook-Pro");
+    expect(card.spec).toBe("Apple M5 Max · 128 GB");
+    expect(card.specUnknown).toBeNull();
+  });
+
+  // Inverted: an OBSERVED name still wins the title. The specs name is a
+  // floor for the gap `nameOf` cannot fill, never an override of live
+  // observation (#2030 — a value that cannot be outvoted is the defect, not
+  // the fix).
+  it("(#2814) a name the window actually observed still outranks the specs name", () => {
+    const uid = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: uid, cpu_brand: "Apple M5 Max" });
+    const data: FlowRecord[] = [rec({ machine_uid: uid, machine_id: "MacBook-Pro.local" })];
+    const card = buildFleetCard(data, new Map(), specs, new Set(), false, uid, true, T_MAX);
+    expect(card.name).toBe("MacBook-Pro.local");
+  });
 });
 
 describe("rosterOnlyEntries", () => {
@@ -545,6 +618,26 @@ describe("rosterOnlyEntries", () => {
     const live = new Map([["F9ACF59C-UID", beat({ machine_uid: "F9ACF59C-UID", display_name: "MacBook-Pro" })]]);
     // No uid to join on, and the names share nothing — still reported.
     expect(rosterOnlyEntries([], live, roster)).toEqual(roster);
+  });
+
+  // (#2814) The F1 self-check above already suppresses a roster entry whose
+  // id equals `specs.machine_id`. It cannot suppress one the operator
+  // declared under an OLD name — `laptop` for a machine that now calls
+  // itself `MacBook-Pro` — and since #2814 puts the self uid into the card
+  // list unconditionally, that entry would draw a second, "offline" card
+  // beside the machine's own live one. The uid is the join that survives
+  // the rename.
+  it("(#2814) excludes a roster entry declaring THIS machine's uid under a stale name, on an empty window", () => {
+    const roster = [rosterEntry({ id: "laptop", machine_uid: "F9ACF59C-UID" })];
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "F9ACF59C-UID" });
+    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual([]);
+  });
+
+  it("(#2814) still reports a roster entry whose uid is NOT this machine's, on the same empty window", () => {
+    // Inverted: the self uid must suppress only the entry that names it.
+    const roster = [rosterEntry({ id: "studio", machine_uid: "OTHER-UID" })];
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "F9ACF59C-UID" });
+    expect(rosterOnlyEntries([], new Map(), roster, specs)).toEqual(roster);
   });
 });
 

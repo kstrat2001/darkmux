@@ -29,7 +29,7 @@ import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
-import { T, asRecordArray, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, nameOf, todayUTC } from "./lib/flow";
+import { T, asRecordArray, displayNameOf, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -469,18 +469,29 @@ export function App() {
   });
   const specs = isLiveRoute(route) && specsQuery.data?.ok ? specsQuery.data.data : null;
 
+  // (#2814) `specs.machine_uid` is the daemon's own hardware probe, so it
+  // answers "which uid am I" without the flow window. Absent (off macOS, an
+  // older build), `localMachineUid` falls back to the name path unchanged.
   const localUid = useMemo(
-    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
+    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null, specs?.machine_uid ?? null),
     [flowWindow.data, liveMachines, specs],
   );
-  const localName = localUid != null ? nameOf(flowWindow.data, liveMachines, localUid) : null;
+  // (#2814) `displayNameOf`, not `nameOf` — see that function's own doc.
+  // `localUid` is a real hardware uid now even on an empty window, and
+  // `nameOf` echoes a uid it has never seen named, so the crumb would read
+  // `F9ACF59C-…` where it used to read `MacBook-Pro`.
+  const localName = localUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, localUid) : null;
   // (drill-in packet) The MACHINE route's own target — the local machine
   // for `uid: null`, or the drilled uid's own name otherwise. `nameOf` is
   // uid-generic (works for a remote uid too, via its presence beat or flow
   // records — see `lib/flow.ts`), so this is the same lookup `MachineLens`
   // itself does for its header, not a second implementation.
   const targetMachineName =
-    route.kind === "machine" ? (route.uid != null ? nameOf(flowWindow.data, liveMachines, route.uid) : localName) : null;
+    route.kind === "machine"
+      ? route.uid != null
+        ? displayNameOf(flowWindow.data, liveMachines, specs, route.uid)
+        : localName
+      : null;
 
   // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
   // computed from `flowWindow` (the live rolling window) on every route, so a

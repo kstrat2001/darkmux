@@ -15,6 +15,12 @@ darkmux-flow = { path = "../darkmux-flow" }
 darkmux-profiles = { path = "../darkmux-profiles" }
 darkmux-crew = { path = "../darkmux-crew" }
 darkmux-fleet = { path = "../darkmux-fleet" }
+# (#2814) `machine_uid()` — the stable hardware identity `/machine/specs` now
+# reports, so a viewer can answer "is this card the machine serving the page?"
+# without the expiring flow window. Already in this crate's dependency tree
+# transitively (darkmux-flow, darkmux-crew and darkmux-lab all depend on it);
+# promoted to direct because this crate now names it.
+darkmux-hardware = { path = "../darkmux-hardware" }
 darkmux-doctor = { path = "../darkmux-doctor" }
 # (#1247 Part 3) Lab observer lens — reuses `lab::review::ReviewEnvelope` +
 # `lab::scores::{ScoresDoc, read_scores}` so the daemon parses the SAME
