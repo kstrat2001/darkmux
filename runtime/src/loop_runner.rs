@@ -2067,7 +2067,11 @@ fn run_with_sleeper(
         // reason the fix is a collapse onto existing behavior rather than a
         // new policy. `0` for the reported count: nothing has been sent yet
         // this invocation, so the estimate is necessarily the larger.
-        let resume_estimate_tokens = effective_prompt_occupancy(&messages, 0, prompt_anchor);
+        // `None` for the anchor, and it is not an omission: this block runs
+        // BEFORE the turn loop, so nothing has been sent this invocation and
+        // `prompt_anchor` is provably still `None`. Passing the variable read
+        // as though it could be `Some`.
+        let resume_estimate_tokens = effective_prompt_occupancy(&messages, 0, None);
         if compaction::needs_compaction(resume_estimate_tokens, messages.len(), compaction_cfg) {
             let before_count = messages.len();
             // (#2792 merge-gate, second pass) The RESUME catch-up site gets
@@ -2612,8 +2616,11 @@ fn run_with_sleeper(
         // every single request. Budgeting without it certified `fits: true`
         // on a body 36% over the window, which is the defect this bound
         // exists to prevent, wearing a record that says it was checked.
-        let tools_bytes = serde_json::to_string(&tool_defs).map(|t| t.len()).unwrap_or(0);
         if let Some(window) = compaction_cfg.context_window {
+            // Serialized inside the guard, not above it: it is used nowhere
+            // else, and hoisting it cost a ~12KB serialization every turn on
+            // dispatches that declare no window at all.
+            let tools_bytes = serde_json::to_string(&tool_defs).map(|t| t.len()).unwrap_or(0);
             let (sys_c, prompt_c) = measure_request_context(&messages);
             // MEASURE AGAINST THE ENDPOINT'S OWN COUNT (round-4 merge gate).
             // The previous revision divided every character by 4 and compared
@@ -2667,14 +2674,29 @@ fn run_with_sleeper(
                         .filter_map(|m| m.content.as_ref())
                         .filter(|b| b.len() > HARD_TRIM_MIN_BODY_BYTES)
                         .count();
-                    let why = if stats.results_trimmed > 0 {
-                        "every trimmable tool result has already been elided"
-                    } else if trimmable == 0 {
-                        "no single tool result is large enough to trim, so the weight is \
-                         spread across many small ones"
-                    } else {
-                        "the weight is not in tool results"
-                    };
+                    // (round-5 merge gate) The `else` arm used to read "the
+                    // weight is not in tool results", which is reached when
+                    // there ARE trimmable results and none were trimmed — and
+                    // is false there. Measured by the review: a turn printed
+                    // it while holding results the very next turn trimmed
+                    // 44,000 bytes out of. It sent the operator to raise
+                    // n_ctx when clearing results would have worked, which is
+                    // the same false-reason defect the arm above it was added
+                    // to fix.
+                    let already_elided = messages
+                        .iter()
+                        .filter(|m| m.role == "tool")
+                        .filter_map(|m| m.content.as_ref())
+                        .filter(|b| b.len() > HARD_TRIM_MIN_BODY_BYTES)
+                        .filter(|b| {
+                            b.contains(crate::tool_result_prune::TOOL_RESULT_TRIM_MARKER_SENTINEL)
+                        })
+                        .count();
+                    let why = why_the_bound_could_not_fit(
+                        stats.results_trimmed,
+                        trimmable,
+                        already_elided,
+                    );
                     eprintln!(
                         // SAY ESTIMATE, NOT PROPHECY (#2792 round-4). This
                         // used to end "the endpoint will REFUSE this
@@ -5496,9 +5518,23 @@ fn effective_prompt_occupancy(
 ) -> u32 {
     let (sys_chars, prompt_chars) = measure_request_context(messages);
     // `tools_chars: 0` — this decision never had access to the tools schema
-    // and still doesn't. It matters only on the anchor-less first turn; with
-    // an anchor the schema's real cost is already inside `anchor.tokens`.
-    let estimate = estimate_prompt_tokens(sys_chars + prompt_chars, 0, anchor);
+    // and still doesn't. With an anchor the schema's real cost is already
+    // inside `anchor.tokens`.
+    //
+    // THE ANCHORLESS PATH KEEPS chars/4 (round-5 merge gate). The 2.75 ruler
+    // is right for the pre-send BOUND, a last-resort guard that must err
+    // high. Letting it reach this decision as well would move the compaction
+    // TRIGGER 45% earlier on every turn with no ground truth to justify it —
+    // turn one, any usage-less turn, every post-compaction and post-trim turn
+    // — which is a real behavior change to the thing that actually keeps the
+    // thread bounded, and nothing here measured it. So the anchored estimate
+    // is used exactly where the anchored branch applies, and this decision is
+    // otherwise left on the ruler it has always used.
+    let message_chars = sys_chars + prompt_chars;
+    let estimate = match anchor {
+        Some(a) if message_chars >= a.chars => estimate_prompt_tokens(message_chars, 0, anchor),
+        _ => (message_chars / 4) as u32,
+    };
     estimate.max(latest_prompt_tokens)
 }
 
@@ -5595,25 +5631,81 @@ pub(crate) fn estimate_prompt_tokens(
 /// headroom to spend and the anchor cannot be reasoned down (a trim removes
 /// characters the endpoint already counted, so the pairing no longer holds);
 /// the flat ruler is the honest degradation.
+/// (#2792 round-5) Why the bound could not bring the request inside the
+/// window, as a pure selection over what the trim actually found.
+///
+/// Extracted so the four arms can be tested. The one that mattered was
+/// unreachable from any test: it needed a thread holding trimmable results
+/// that the trimmer declined, which the round-4 budget defect produced and
+/// the round-5 fix removes.
+///
+/// The arm this function exists to keep honest is the last one. It used to
+/// read "the weight is not in tool results", and it is reached precisely when
+/// there ARE trimmable tool results — so it asserted the opposite of its own
+/// condition, and sent the operator to raise `n_ctx` when clearing results
+/// would have worked. That is the second time this diagnostic has stated
+/// something its inputs contradict.
+pub(crate) fn why_the_bound_could_not_fit(
+    results_trimmed: usize,
+    trimmable: usize,
+    already_elided: usize,
+) -> &'static str {
+    if results_trimmed > 0 {
+        "even after this trim, what remains does not fit"
+    } else if trimmable == 0 {
+        "no single tool result is large enough to trim, so the weight is \
+         spread across many small ones"
+    } else if already_elided == trimmable {
+        "every trimmable tool result has already been elided"
+    } else {
+        "the trimmer could not reduce the remaining results any further"
+    }
+}
+
 pub(crate) fn message_chars_budget(
     window: u32,
     tools_chars: usize,
     anchor: Option<PromptAnchor>,
 ) -> usize {
+    // Inverse of the flat branch, and of the chars/4 floor.
+    let flat_budget =
+        ((window as f64 * UNCOUNTED_CHARS_PER_TOKEN) as usize).saturating_sub(tools_chars);
+    let floor_budget = (window as usize).saturating_mul(4).saturating_sub(tools_chars);
     let anchored = match anchor {
         Some(a) if window > a.tokens => {
             let headroom = (window - a.tokens) as f64 * UNCOUNTED_CHARS_PER_TOKEN;
             a.chars.saturating_add(headroom as usize)
         }
-        _ => ((window as f64 * UNCOUNTED_CHARS_PER_TOKEN) as usize)
-            .saturating_sub(tools_chars),
+        // THE TWO FUNCTIONS MUST BRANCH ON THE SAME REGION (round-5 merge
+        // gate). This arm used to fall through to `flat_budget` alone, which
+        // branches on a DIFFERENT predicate than the estimate does: the
+        // estimate takes its anchored branch whenever `message_chars >=
+        // a.chars`, regardless of how `a.tokens` compares to the window. So
+        // for an anchor at or past the window the budget handed back
+        // 2.75 x window characters — larger than the thread — and
+        // `hard_trim_to_fit` returned at its `current <= target_bytes` early
+        // exit having trimmed NOTHING, while the estimate above still read
+        // 59% over. The bound went inert, printed its over-window figure, and
+        // sent the request.
+        //
+        // That is reachable, and specifically in the configuration this bound
+        // was written to police: `a.tokens` is verbatim `usage.prompt_tokens`,
+        // so `a.tokens >= window` means the endpoint ACCEPTED a request at or
+        // past the declared window — which is what happens when the loaded
+        // n_ctx exceeds the n_ctx the profile declares. This file's own note
+        // on `effective_prompt_occupancy` records that as the observed state.
+        //
+        // When the anchor alone meets the window, no char count at or above
+        // `a.chars` can get under it on the anchored ruler. The only region
+        // that can is BELOW the anchor, where the flat branch applies — so
+        // the budget is the flat inverse, capped strictly under `a.chars` so
+        // the estimate actually lands in that branch.
+        Some(a) => flat_budget.min(a.chars.saturating_sub(1)),
+        None => flat_budget,
     };
     // The estimate is the MAX of the anchored figure and the chars/4 floor,
     // so the budget is the MIN of their inverses — whichever constraint binds
-    // first. Inverting only one half would hand back a target that the other
-    // half still measures over, and the bound would trim and then certify its
-    // own failure.
-    let floor_budget = (window as usize).saturating_mul(4).saturating_sub(tools_chars);
+    // first.
     anchored.min(floor_budget)
 }
 
@@ -8672,11 +8764,19 @@ mod tests {
     /// in the LAST request, so only the characters added SINCE that request
     /// need a ruler at all.
     ///
-    /// This fixture makes the two rulers disagree in the direction that
-    /// matters. The endpoint reports 20,000 tokens for a nearly empty thread,
-    /// then one turn adds ~90,000 characters. Under chars/4 the next request
-    /// measures ~22,000 and sails through a 32,000 window; anchored on what
-    /// the endpoint actually counted it is ~52,000 and gets bounded.
+    /// THE FIXTURE MUST ISOLATE THE ANCHOR (round-5 merge gate). Its first
+    /// version added ~90,000 characters per turn, which crosses a 32,000
+    /// window on the 2.75 ruler ALONE — so it pinned "the ruler is not
+    /// chars/4" and not "the estimate carries the endpoint's own count".
+    /// Proven vacuous by mutation: deleting the anchor from the estimator, and
+    /// even deleting the production line that INSTALLS the anchor, left it
+    /// green.
+    ///
+    /// So the numbers are chosen to make only the anchored estimate cross. The
+    /// endpoint reports 28,000 tokens for a nearly empty thread, then one turn
+    /// adds ~20,000 characters. Every anchorless ruler stays far under the
+    /// 32,000 window — chars/2.75 is ~7,400, chars/4 is ~5,100 — while
+    /// 28,000 carried forward plus that delta is ~35,000 and must be bounded.
     #[test]
     #[serial_test::serial]
     fn the_bound_measures_growth_against_the_endpoints_own_count() {
@@ -8695,7 +8795,7 @@ mod tests {
         // argument, echoed straight back as a ~45,000-character result. Both
         // halves are counted by `measure_request_context`, so one turn grows
         // the thread by ~90,000 characters.
-        let filler = "x".repeat(45_000);
+        let filler = "x".repeat(10_000);
         let tool_calls = serde_json::json!([{
             "id": "call_echo",
             "type": "function",
@@ -8710,11 +8810,11 @@ mod tests {
                 None,
                 Some(tool_calls),
                 "tool_calls",
-                // The ground truth the estimate has to respect. A thread this
-                // small is ~4 tokens on the chars ruler; the endpoint says
-                // 20,000. Whichever number the bound believes is the whole
-                // question this test asks.
-                20_000,
+                // The ground truth the estimate has to respect, and the
+                // reason the fixture is sized the way it is. See the doc
+                // comment: 28,000 reported against ~20,000 characters added,
+                // so ONLY the anchored estimate crosses the window.
+                28_000,
                 10,
             ));
         });
@@ -8744,16 +8844,16 @@ mod tests {
 
         assert!(
             !bound.is_empty(),
-            "the second request grew ~90,000 characters past a thread the \
-             endpoint already counted at 20,000 tokens, so it is over the \
-             declared 32,000 window and must be bounded. A flat chars/4 ruler \
-             measures the same request at ~22,000 and sends it — which is the \
-             27% under-count measured on the dogfood run"
+            "the second request adds ~20,000 characters on top of a thread \
+             the endpoint already counted at 28,000 tokens, so it is over the \
+             declared 32,000 window and must be bounded. NO ruler that ignores \
+             that 28,000 gets there: chars/2.75 measures this request at \
+             ~7,400 and chars/4 at ~5,100, and both would send it"
         );
         let ev = &bound[0];
         assert!(
             ev["tokens_before"].as_u64().unwrap() > 32_000,
-            "the estimate must carry the endpoint's own 20,000 forward rather \
+            "the estimate must carry the endpoint's own 28,000 forward rather \
              than re-deriving the whole thread from characters: {ev}"
         );
         assert!(
@@ -9013,6 +9113,72 @@ mod tests {
         );
     }
 
+    /// (#2792 round-5) The compaction TRIGGER keeps the ruler it has always
+    /// used when there is no ground truth to justify changing it.
+    ///
+    /// Round 4 routed this decision through the bound's estimator, whose 2.75
+    /// ruler is deliberately conservative. On every anchorless turn — turn
+    /// one, any usage-less turn, every post-compaction and post-trim turn —
+    /// that silently moved the trigger 45% earlier, with no measurement
+    /// behind it, on the mechanism the revert commit found was what actually
+    /// keeps the thread bounded. The bound may err high; this decision may
+    /// not drift.
+    #[test]
+    fn the_anchorless_compaction_trigger_keeps_its_own_ruler() {
+        let chunk = "y".repeat(40_000);
+        let messages = vec![Message::system("sys"), Message::user(&chunk)];
+        let chars = "sys".len() + 40_000;
+
+        let occupancy = effective_prompt_occupancy(&messages, 0, None);
+        let bounds_ruler = (chars as f64 / UNCOUNTED_CHARS_PER_TOKEN) as u32;
+
+        assert!(
+            occupancy < bounds_ruler,
+            "the trigger must not adopt the pre-send bound's conservative \
+             ruler on a turn with no endpoint count to anchor against: got \
+             {occupancy}, the bound's ruler would say {bounds_ruler}"
+        );
+        assert_eq!(
+            occupancy,
+            (chars / 4) as u32,
+            "and the ruler it keeps is the chars/4 one it has always used"
+        );
+    }
+
+    /// (#2792 round-5) Each arm of the bound's "why it could not fit" reason
+    /// must match the condition that selects it.
+    ///
+    /// The last arm read "the weight is not in tool results" and is reached
+    /// exactly when trimmable tool results EXIST — so it stated the opposite
+    /// of its own condition. Measured by the review: a turn printed it while
+    /// holding results that the very next turn trimmed 44,000 bytes out of,
+    /// sending the operator to raise n_ctx when clearing results would have
+    /// worked.
+    #[test]
+    fn every_arm_of_the_bounds_reason_matches_its_own_condition() {
+        // Trimmed something and still over.
+        let s = why_the_bound_could_not_fit(2, 5, 0);
+        assert!(s.contains("after this trim"), "{s}");
+
+        // Nothing big enough to trim: the weight really is spread thin.
+        let s = why_the_bound_could_not_fit(0, 0, 0);
+        assert!(s.contains("spread across many small ones"), "{s}");
+
+        // Trimmable results exist and every one is already elided.
+        let s = why_the_bound_could_not_fit(0, 4, 4);
+        assert!(s.contains("already been elided"), "{s}");
+
+        // Trimmable results exist, not all elided, and none were trimmed.
+        // THE ARM THAT LIED. It must not claim the weight is elsewhere.
+        let s = why_the_bound_could_not_fit(0, 4, 1);
+        assert!(
+            !s.contains("not in tool results"),
+            "this arm is selected BECAUSE trimmable tool results exist; it \
+             cannot tell the operator the weight is not in them: {s}"
+        );
+        assert!(s.contains("could not reduce"), "{s}");
+    }
+
     /// (#2792 round-4) The budget is the estimator's inverse. A target derived
     /// on a different ruler would leave the trimmed thread still measuring
     /// over — the bound trimming and then certifying its own failure.
@@ -9028,6 +9194,16 @@ mod tests {
             // binds — without it the bound trims to a target the floor still
             // measures over, and certifies a failure as a fix.
             Some(PromptAnchor { chars: 30_000, tokens: 100 }),
+            // ANCHORS AT OR PAST THE WINDOW. Every anchor above has
+            // `tokens < window`, so none of them reaches the branch where the
+            // two functions used to disagree — the budget took its flat
+            // branch while the estimate took its anchored one, handing back a
+            // target larger than the thread. These three red without the fix.
+            // Reachable whenever the loaded n_ctx exceeds the declared one,
+            // which is the configuration the bound exists for.
+            Some(PromptAnchor { chars: 60_000, tokens: 40_000 }),
+            Some(PromptAnchor { chars: 70_000, tokens: 33_000 }),
+            Some(PromptAnchor { chars: 50_000, tokens: 32_000 }),
         ] {
             let budget = message_chars_budget(32_000, 12_050, anchor);
             let est = estimate_prompt_tokens(budget, 12_050, anchor);
@@ -9053,9 +9229,20 @@ mod tests {
              not the anchor itself: {budget}"
         );
         // And a thread that SHRANK below its anchor is estimated flat too,
-        // rather than by a negative delta.
+        // rather than by a negative delta. Asserted as BEHAVIOR, not as the
+        // expression under test restated: an earlier revision asserted
+        // equality against `(chars / UNCOUNTED_CHARS_PER_TOKEN)`, which reds
+        // for any change to the constant and pins nothing about the branch.
         let est = estimate_prompt_tokens(50_000, 12_050, anchor);
-        assert_eq!(est, ((50_000 + 12_050) as f64 / UNCOUNTED_CHARS_PER_TOKEN) as u32);
+        assert!(
+            est < 40_000,
+            "half the anchor's characters must not still be charged the \
+             anchor's full 40,000-token count: {est}"
+        );
+        assert!(
+            est > (62_050 / 4),
+            "and it must not fall below the chars/4 floor either: {est}"
+        );
     }
 
     /// (#2792 cost check) The occupancy walk now runs every turn, so its cost

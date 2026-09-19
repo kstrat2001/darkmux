@@ -268,9 +268,13 @@ pub fn hard_trim_to_fit(
         // 49,000 tokens against a 32,000 window. The same workload with this
         // floor: 62 successful compactions and 0 over-window sends.
         //
-        // The reason is that compaction does not bound its own input to the
-        // COMPACTOR's context window — only the primary's, which is all
-        // `CompactionConfig::context_window` holds. Keeping the thread near
+        // The reason is that compaction does not bound its input AT ALL —
+        // not by the compactor's window, and not by the primary's either.
+        // `CompactionConfig::context_window` is the primary's n_ctx and is
+        // consulted only for the trigger; `compact()` builds its excerpt from
+        // the whole middle with no window check anywhere. (An earlier wording
+        // here said "only the primary's", which would send a reader grepping
+        // `compact()` for a bound that does not exist.) Keeping the thread near
         // the primary's 32,000 hands a ~30,000-token excerpt to a 16,000-token
         // compactor, which answers HTTP 400 ("the number of tokens to keep
         // from the initial prompt is greater than the context length") every
@@ -280,6 +284,15 @@ pub fn hard_trim_to_fit(
         //
         // So the precision fix is correct and BLOCKED on bounding compaction
         // input by the compactor's window (#2808). Do not re-land it first.
+        //
+        // And the dependency is wider than that one commit: this floor is
+        // load-bearing BY ACCIDENT, so ANY change that makes the bound hold
+        // the thread closer to the window re-opens the same starvation. #2808
+        // gates all of them, not just the trim.
+        //
+        // Note the loop still `break`s once `current <= target_bytes`, so the
+        // function stops early — it is each individual body that goes to the
+        // floor rather than to its own overshoot.
         let Some(trimmed) = trim_body_to(body, min_body_bytes) else {
             continue; // already trimmed
         };
@@ -449,5 +462,4 @@ mod tests {
         assert_eq!(stats.results_trimmed, 0, "only role=='tool' bodies are eligible");
         assert_eq!(messages[0].content.as_deref().unwrap().len(), big.len());
     }
-
 }
