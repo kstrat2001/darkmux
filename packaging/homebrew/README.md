@@ -40,7 +40,7 @@ gets pushed into the tap repo) live at `tap-bootstrap/` in this directory.
 The source-of-truth formula is here at `packaging/homebrew/darkmux.rb`; the
 tap is downstream. Two paths:
 
-**A. Automated sync via `.github/workflows/sync-homebrew-tap.yml`**
+**A. Automated sync — the tap PULLS this file (`sync-from-upstream.yml` in `kstrat2001/homebrew-tap`)**
 (default; runs on every push to main that touches the formula):
 The workflow opens a PR in the tap repo with the updated formula. Requires
 a repository secret named `HOMEBREW_TAP_TOKEN`:

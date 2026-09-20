@@ -363,12 +363,32 @@ gh pr create --title "feat(homebrew): pin formula to stable vNEW" --body "Stable
 
 ## 5. Sync the tap
 
-Merging the formula PR fires `.github/workflows/sync-homebrew-tap.yml`, which opens a PR on `kstrat2001/homebrew-tap`. Merge it:
+The tap PULLS the formula now; nothing pushes to it. Trigger the pull and
+merge the PR it opens:
+
 ```bash
-gh run list --workflow sync-homebrew-tap.yml --limit 1 --json status,conclusion
+gh workflow run sync-from-upstream.yml --repo kstrat2001/homebrew-tap
+sleep 10
+gh run list --repo kstrat2001/homebrew-tap --workflow sync-from-upstream.yml \
+  --limit 1 --json status,conclusion,url
 gh pr list --repo kstrat2001/homebrew-tap --json number,title
 gh pr merge <N> --repo kstrat2001/homebrew-tap --squash
 ```
+
+**Why the direction reversed (kstrat2001/homebrew-tap#62).** The old design
+lived in this repo and PUSHED to the tap with a cross-repo token. On
+2026-09-19 that token expired, the push workflow died with `Bad credentials`
+and opened no PR, and v3.8.0 was tagged, released and had its GHCR image
+published while the tap kept serving v3.7.1 — every other signal green, and
+`brew upgrade darkmux` handing users the old version (#2825). A pull needs no
+credential at all: `packaging/homebrew/darkmux.rb` is in a PUBLIC repo, so the
+tap reads it with an unauthenticated fetch and the whole class of
+expired-token silence goes away.
+
+The tap also polls every 6 hours as a backstop, so a release where you forget
+this step self-corrects within 6 hours rather than never. **Do not rely on
+that** — dispatch it here so the tap is correct when you verify, not hours
+later.
 
 ## 6. Verify
 
