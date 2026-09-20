@@ -1025,7 +1025,8 @@ export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now:
   const d = stepDisplayMetrics(m);
   if (d.turns) fields.push({ key: "turns", label: "turns", value: String(d.turns) });
   if (d.tools) fields.push({ key: "tools", label: "tool calls", value: String(d.tools) });
-  if (d.tokens) fields.push({ key: "tokens", label: "tokens", value: fmtTok(d.tokens) + (d.cloud ? " cloud" : "") });
+  // (#2834) The " cloud" suffix is withdrawn — see MissionGraphLens.
+  if (d.tokens) fields.push({ key: "tokens", label: "tokens", value: fmtTok(d.tokens) });
 
   const findings = pick(["findings", "finding_count", "findings_count"]);
   if (findings) fields.push({ key: "findings", label: "findings", value: findings });

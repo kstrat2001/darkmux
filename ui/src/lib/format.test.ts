@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MISSING, clkrange, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { MISSING, clkrange, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -295,5 +295,31 @@ describe("age formatters — three surfaces, and a fourth cannot arrive quietly"
       // rather than reporting `2 !== 1` with no address.
       expect(`${f}: ${ladders}`).toBe(`${f}: 1`);
     }
+  });
+});
+
+describe("fmtC — compact token counts (#2842)", () => {
+  it("keeps two decimals in the thousands, so hundreds are not rounded away", () => {
+    // The tile used to read `7k` for all of these. Across 102 real values
+    // from one night of runs, rounding to the nearest thousand hid 256
+    // tokens on average and 497 at worst — per tile.
+    expect(fmtC(7432)).toBe("7.43k");
+    expect(fmtC(7000)).toBe("7.00k");
+    expect(fmtC(7499)).toBe("7.50k");
+    expect(fmtC(29_184)).toBe("29.18k");
+    expect(fmtC(352_190)).toBe("352.19k");
+  });
+
+  it("does not round a sub-thousand count into the thousands", () => {
+    // 999.6 -> "1.00k" would claim a thousand tokens that were not spent.
+    expect(fmtC(999)).toBe("999");
+    expect(fmtC(1000)).toBe("1.00k");
+  });
+
+  it("leaves the millions and sub-thousand arms alone", () => {
+    expect(fmtC(0)).toBe("0");
+    expect(fmtC(984)).toBe("984");
+    expect(fmtC(1.2e6)).toBe("1.2M");
+    expect(fmtC(1.2e7)).toBe("12M");
   });
 });

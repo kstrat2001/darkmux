@@ -18,24 +18,20 @@ github
 fleet
 
 === stage ===
-TOKENS · LAST 24H
-20,778
-LOCAL TOKENS
-396,926
-CLOUD TOKENS
-2,209
-UNATTRIBUTED
-93k
+DARKMUX TOKENS
+419,913
+ALL TOKENS · LAST 24H
+92.82k
 GENERATED
-19k
+18.81k
 FRESH INPUT
 320
 RE-READ
-308k
+307.96k
 UNCLASSIFIED
 19
 DISPATCHES
-Orchestrator note: 15 dispatches local + 3 via cloud. The hybrid loop is humming, keep it up.
+Orchestrator note: 19 dispatches done. The fleet is humming, keep it up.
 MacBook-Pro
 Apple M5 Max · 128 GB
 idle

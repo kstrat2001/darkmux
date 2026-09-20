@@ -151,8 +151,8 @@ describe("FleetLens", () => {
     // Two "0" values (local + cloud tokens) render rather than the card
     // disappearing — the "hides late, pops in" defect this port guards
     // against (see `SavingsHero`'s own doc).
-    expect(screen.getByText("local tokens")).toBeInTheDocument();
-    expect(screen.getByText("cloud tokens")).toBeInTheDocument();
+    expect(screen.getByText("darkmux tokens")).toBeInTheDocument(); // the section eyebrow
+    // (#2834) The cloud tile is withdrawn; one figure is the hero now.
   });
 
   it("sums a locally-run session's telemetry into local tokens, and renders its machine card", async () => {
@@ -366,7 +366,7 @@ describe("FleetLens", () => {
       ],
     });
     renderFleetLens();
-    // (#2830) Wait for SETTLEMENT, not for a label. `"local tokens"` renders
+    // (#2830) Wait for SETTLEMENT, not for a label. `"darkmux tokens"` renders
     // in both states, so the original anchor let the figure assertion below
     // run against an unsettled hero. That was invisible while `.savnum`
     // rendered "0" in both states; now that the figure is withheld until
@@ -376,11 +376,16 @@ describe("FleetLens", () => {
     await waitFor(() =>
       expect(document.querySelector('.savings[data-settled="true"]')).toBeTruthy(),
     );
-    const label = screen.getByText("unattributed");
-    const tile = label.closest(".savlead")!;
-    expect(tile.className).toMatch(/\bunknown\b/);
-    expect(tile.className).toMatch(/\bzero\b/);
-    expect(tile.querySelector(".savnum")!.textContent).toBe("0");
+    // (#2834) There is one tile now, so #2068's concern is satisfied by
+    // construction rather than by remembering to render a zero: with nothing
+    // to appear or vanish, an in-flight dispatch cannot change the hero's
+    // geometry. The property is still asserted — exactly one lead tile,
+    // present and settled — because "one tile" is the thing that makes the
+    // reflow impossible, and a future split would silently reintroduce it.
+    const tiles = document.querySelectorAll(".savings .savlead");
+    expect(tiles).toHaveLength(1);
+    expect(screen.getByText("darkmux tokens")).toBeInTheDocument(); // the section eyebrow
+    expect(tiles[0].querySelector(".savnum")!.textContent).toBe("0");
   });
 
   /** (U5-1) The gap the `historical` test below could not see: `App.tsx`
@@ -485,7 +490,7 @@ describe("FleetLens", () => {
     }
   });
 
-  it("honesty about incomplete data: a session with no dispatch bookend renders as 'unattributed', not silently local", async () => {
+  it("(#2834) a session whose endpoint is unknown still counts: darkmux dispatched those tokens either way", async () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
@@ -500,14 +505,25 @@ describe("FleetLens", () => {
       ],
     });
     renderFleetLens();
-    // (#2068) The label is always mounted now; the FIGURE is what proves the
-    // tokens landed as unattributed rather than local.
+    // (#2834) This session has telemetry but no dispatch bookend, so nothing
+    // names its endpoint. It used to be quarantined in an "unattributed"
+    // tile and EXCLUDED from the figure, so the hero would not imply the
+    // tokens had run free.
+    //
+    // That quarantine only made sense while the figure claimed locality. It
+    // no longer does: "darkmux tokens" is true of these tokens whether the
+    // model ran on this machine, a fleet peer, or a hosted endpoint — which
+    // is precisely why the claim was narrowed to one darkmux can actually
+    // make. So they are counted, and nothing about where they ran is
+    // asserted anywhere in the hero.
     await waitFor(() => expect(screen.getByText("1,000")).toBeInTheDocument());
-    expect(screen.getByText("1,000").parentElement!.className).toMatch(/\bunknown\b/);
-    expect(screen.getByText("1,000").parentElement!.className).not.toMatch(/\bzero\b/);
-    // Local tokens must NOT have absorbed it — it's excluded, not credited.
-    const localBlock = screen.getByText("local tokens").previousSibling;
-    expect(localBlock?.textContent).toBe("0");
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("1,000");
+    expect(document.querySelectorAll(".savings .savlead")).toHaveLength(1);
+    // The withdrawn vocabulary must not survive anywhere in the hero.
+    const hero = document.querySelector(".savings")!.textContent ?? "";
+    for (const claim of ["local tokens", "cloud", "unattributed"]) {
+      expect(hero.toLowerCase()).not.toContain(claim);
+    }
   });
 
   // (drill-in packet, split by locality in #1809) The fleet-card click —
@@ -841,7 +857,7 @@ describe("FleetLens", () => {
     // The playhead marker DID move, to the left edge of that fixed axis.
     expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("0%");
     // The hero moved too — the completion is no longer visible at tMin.
-    expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("0");
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
   });
 });
 

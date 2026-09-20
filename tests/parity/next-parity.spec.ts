@@ -634,12 +634,20 @@ test("next: blank daemon fails the two-day fleet golden comparison", async ({ pa
  * is the load-bearing one: the SAME mutation, served to the SAME app,
  * *moves* the two-day golden and leaves `fleet.txt` BYTE-IDENTICAL.
  *
- * The mutation stamps an `endpoint` onto `task-review-probe-high-task`'s
- * YESTERDAY completions (02:09:43Z–06:03:33Z), which reclassifies that
- * session's yesterday runs from local to hosted. Every one of those records
- * is outside `fleet.txt`'s own 24h boundary (2026-08-07T16:40:59Z), so the
- * one-day golden structurally cannot observe the change — which is the
- * property being demonstrated, not an accident of this fixture.
+ * The mutation adds tokens to YESTERDAY's token-bearing `dispatch complete`
+ * records, which raises the two-day window's GENERATED and ALL TOKENS
+ * figures. Every one of those records is outside `fleet.txt`'s own 24h
+ * boundary (2026-08-07T16:40:59Z), so the one-day golden structurally cannot
+ * observe the change — which is the property being demonstrated, not an
+ * accident of this fixture.
+ *
+ * This mutation used to stamp an `endpoint` onto those completions instead,
+ * reclassifying them from local to hosted. That stopped moving any rendered
+ * text when #2834's stop-gap consolidated the hero's local/cloud/unattributed
+ * tiles into one `ALL TOKENS` figure: `savings.ts` still computes the split,
+ * but the sum it feeds is invariant under reclassification, so the mutation
+ * no longer bit the render. The claim under test is about the WINDOW, not
+ * about attribution, so the mechanism moved to one the lens still shows.
  *
  * WHAT THIS DOES *NOT* CLAIM, measured and stated because the next reader
  * will assume otherwise from #2702's wording. On the CURRENT lens there is
@@ -660,19 +668,24 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   const yesterday = JSON.parse(readFileSync(path.join(CORPUS_DIR, "flow-yesterday.json"), "utf8"));
   let stamped = 0;
   for (const r of yesterday) {
-    if (r?.session_id !== "task-review-probe-high-task") continue;
     // BOTH spellings — `darkmux-crew` emits the spaced form, the runtime the
     // dotted one (`crates/darkmux-flow/src/schema.rs`'s own doc), and a
     // mutation that matched only one would quietly stamp nothing.
-    if (r.action !== "dispatch complete" && r.action !== "dispatch.complete") continue;
+    if (r?.action !== "dispatch complete" && r?.action !== "dispatch.complete") continue;
     if (!r.payload || typeof r.payload !== "object") continue;
-    if (r.payload.endpoint) continue;
-    r.payload.endpoint = "azure:parity-nonvacuity-probe";
+    if (typeof r.payload.completion_tokens !== "number") continue;
+    // ONLY records outside `fleet.txt`'s own 24h boundary. That window is
+    // ROLLING, not calendar-day, so it already reaches back into yesterday's
+    // afternoon — mutating a record inside it moves BOTH goldens and
+    // collapses the second assertion, which is the load-bearing half.
+    if (Date.parse(r.ts) >= meta.frozen_clock_ms - 24 * 60 * 60 * 1000) continue;
+    r.payload.completion_tokens += 100_000;
+    if (typeof r.payload.total_tokens === "number") r.payload.total_tokens += 100_000;
     stamped++;
   }
   // The mutation has to BITE, or both assertions below pass vacuously —
   // which is the exact failure this whole test exists to rule out.
-  expect(stamped, "the mutation must reclassify at least one yesterday completion").toBeGreaterThan(0);
+  expect(stamped, "the mutation must add tokens to at least one yesterday completion").toBeGreaterThan(0);
 
   const installMutated = async () => {
     installCorpusRoutes(page, meta);
@@ -690,7 +703,7 @@ test("next: the two-day golden is non-vacuous where fleet.txt is structurally bl
   await page.goto("/index.html");
   await waitSettled(page, expect, FLEET_LOADED);
   const twoDay = await extractLensText(page);
-  expect(twoDay, "NON-VACUITY FAILED: the two-day golden did not move on cross-day evidence that reclassifies a session").not.toBe(readGolden("fleet-two-day"));
+  expect(twoDay, "NON-VACUITY FAILED: the two-day golden did not move on cross-day evidence that changes a session's tokens").not.toBe(readGolden("fleet-two-day"));
 
   await installFrozenClock(page, meta.frozen_clock_ms);
   await page.goto("/index.html");

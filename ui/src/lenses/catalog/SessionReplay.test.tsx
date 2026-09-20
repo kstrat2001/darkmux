@@ -274,10 +274,10 @@ describe("SessionReplay", () => {
     expect(tiles.length).toBeGreaterThan(0);
     const ctx = tiles.find((t) => t.querySelector(".ml")?.textContent === "CTX PEAK");
     expect(ctx, "the CTX PEAK tile").toBeTruthy();
-    expect(ctx?.querySelector(".mv")?.textContent).toBe("35k");
+    expect(ctx?.querySelector(".mv")?.textContent).toBe("35.00k");
     // The defect, verbatim: the label used to BE `CTX PEAK 35K / 262.144K
     // WINDOW` — the value, restated, in a bad number format.
-    expect(ctx?.querySelector(".msub")?.textContent).toBe("of 262k");
+    expect(ctx?.querySelector(".msub")?.textContent).toBe("of 262.14k");
 
     for (const t of tiles) {
       const label = t.querySelector(".ml")?.textContent ?? "";
@@ -423,12 +423,12 @@ describe("SessionReplay", () => {
     };
     await waitFor(() => expect(tileValue("TURNS").value).not.toBe("—"));
     expect(tileValue("TURNS").value).toBe("3");
-    expect(tileValue("TOKENS IN").value).toBe("8k");
-    expect(tileValue("TOKENS OUT").value).toBe("3k");
+    expect(tileValue("TOKENS IN").value).toBe("8.00k");
+    expect(tileValue("TOKENS OUT").value).toBe("3.00k");
     // The run's own attempt is `done` (its own `dispatch.complete` is in
     // view), so this is CTX PEAK, not CTX NOW.
-    expect(tileValue("CTX PEAK").value).toBe("8k");
-    expect(tileValue("CTX PEAK").sub).toBe("of 262k");
+    expect(tileValue("CTX PEAK").value).toBe("8.00k");
+    expect(tileValue("CTX PEAK").sub).toBe("of 262.14k");
 
     // The "loaded models" track: real data, not the own-session placeholder.
     expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();

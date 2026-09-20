@@ -611,7 +611,7 @@ describe("tokensOffMeter", () => {
     expect(t.cloud).toBe(0);
     expect(t.unknown).toBe(0);
     // And the sentence the operator reads is no longer "1 dispatch via cloud".
-    expect(hybridNote(data, t).text).toBe("1 local dispatch. The hybrid loop is humming, keep it up.");
+    expect(hybridNote(data, t).text).toBe("1 dispatch done. The fleet is humming, keep it up.");
   });
 
   // (#2690, shape K1) The live rolling window's LEFT boundary is what makes
@@ -749,7 +749,7 @@ describe("tokensOffMeter", () => {
     // And the sentence an operator actually reads, beside CLOUD 2,000.
     // This is the archived-record case and it stays this way: an
     // append-only archive cannot grow a field it was written without.
-    expect(hybridNote(data, t).text).toBe("2 local dispatches. The hybrid loop is humming, keep it up.");
+    expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   // (#2690, K2 — the 1.49.0 wire.) The contradiction #2690 opens with, on
@@ -779,7 +779,7 @@ describe("tokensOffMeter", () => {
     // The two halves of the screen now agree: 2 local dispatches, 2,000
     // local tokens.
     expect(t.runs - t.cloudRuns - t.unknownRuns).toBe(2);
-    expect(hybridNote(data, t).text).toBe("2 local dispatches. The hybrid loop is humming, keep it up.");
+    expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   // (#2690) The INVERTED case, which is the one this change may never get
@@ -1751,7 +1751,14 @@ describe("tokensOffMeter — run-scoped evidence (the recurring session id)", ()
     // note claim local while main did not and cloud tokens are nonzero
     // (0 of 657 + 1,416 + 3,648 + 2,073 + 709).
     const note = hybridNote(data, t);
-    expect(note.text).toBe("3 local dispatches. The hybrid loop is humming, keep it up.");
+    expect(note.text).toBe(// (#2834) FOUR, not three: three completed local runs plus the
+      // in-flight hosted one. The note counts dispatches, and the fourth is
+      // one. It used to be excluded because the line claimed LOCALITY and
+      // an in-flight run has no endpoint evidence yet; with the claim gone
+      // the exclusion has no purpose. The classification assertions above
+      // are unchanged — savings.ts still tracks the split, the UI just
+      // stopped rendering it as a cost claim.
+      "4 dispatches done. The fleet is humming, keep it up.");
   });
 
   /**
@@ -1978,7 +1985,7 @@ describe("tokensOffMeter — the three gaps #2701 pinned, now closed (#2709)", (
     expect(t.cloud).toBe(100);
     expect(t.local).toBe(0);
     // And the hero no longer reports the hosted seat's work as local.
-    expect(hybridNote(arrivals, t).text).toBe("1 dispatch local + 1 via cloud. The hybrid loop is humming, keep it up.");
+    expect(hybridNote(arrivals, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   /**
@@ -2244,7 +2251,7 @@ describe("tokensOffMeter — run-count terms (#2709)", () => {
     //
     // When this assertion starts failing, that decision has changed — update
     // it deliberately, don't delete it.
-    expect(hybridNote(data, t).text).toBe("1 dispatch local + 1 via cloud. The hybrid loop is humming, keep it up.");
+    expect(hybridNote(data, t).text).toBe("2 dispatches done. The fleet is humming, keep it up.");
   });
 
   /** The mirror, so the two halves of the pair are visibly symmetric rather
