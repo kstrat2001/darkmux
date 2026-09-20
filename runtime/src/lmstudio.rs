@@ -1823,13 +1823,41 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
-            // Drain the request head so the client's write completes.
+            // Drain the request head AND BODY so the client's write
+            // completes and nothing is left unread on this socket.
+            //
+            // Reading the body is not politeness, it is what stops the test
+            // from flaking. This handler finishes by returning, which drops
+            // `sock` and closes it. Closing a socket that still has unread
+            // data in its RECEIVE buffer makes the kernel send RST instead
+            // of FIN (BSD sockets, so macOS and Linux both), and a client
+            // still reading the response then fails with ECONNRESET rather
+            // than seeing a clean end of stream. ureq POSTs a JSON body, so
+            // skipping it left exactly that unread remainder.
+            //
+            // It surfaced as `SSE read failed: Connection reset by peer
+            // (os error 54)` on the release-profile gate (#2828 run,
+            // 2026-09-20) while debug had been green -- the race is between
+            // the client finishing its read and the RST landing, so a
+            // profile change is enough to flip it. Diagnosed rather than
+            // margin-bumped: the doc above prescribes `#[ignore]` for a
+            // FIFTH timing flake, and this was not one. It is a fixture
+            // defect with a specific mechanism, and the bound under test
+            // never fired.
             let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut content_length = 0usize;
             loop {
                 let mut line = String::new();
                 if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                     break;
                 }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                let _ = std::io::Read::read_exact(&mut head, &mut body);
             }
             let _ = sock.write_all(
                 b"HTTP/1.1 200 OK\r\n\
