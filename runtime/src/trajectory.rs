@@ -1169,13 +1169,34 @@ impl Trajectory {
         partial_count: u32,
         total_content_chars: usize,
         tool_calls_count: usize,
+        observations: u32,
+        chars_per_token: Option<f32>,
     ) {
+        // (#2836) `observations` is how many times the runtime looked at
+        // this call's output WITHOUT touching it. Folded into the existing
+        // per-call record rather than emitted per boundary on purpose: a
+        // 2-second host sampler once grew to 66% of a day's flow records and
+        // pushed every `dispatch.start` outside the 10k read window, so the
+        // activity chart drew nothing while nine dispatches ran. An
+        // observability record that evicts the work record is the observer
+        // joining the observed. One field on a record that already fires
+        // once per call costs nothing and answers the same question.
+        //
+        // `chars_per_token` is this call's MEASURED ratio (generated chars
+        // over the endpoint's own `completion_tokens`). The observation
+        // cadence is converted from the operator's token-denominated
+        // interval using a constant; this is what makes that constant
+        // checkable against reality instead of assumed. `None` when the
+        // endpoint reported no usage, or on a runtime abort, where no final
+        // usage chunk ever arrives.
         self.write_event(&serde_json::json!({
             "type": "model.streaming.end",
             "seq": seq,
             "partial_count": partial_count,
             "total_content_chars": total_content_chars,
             "tool_calls_count": tool_calls_count,
+            "observations": observations,
+            "chars_per_token": chars_per_token,
             "ts": unix_ms(),
         }));
     }

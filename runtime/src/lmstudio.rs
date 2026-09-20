@@ -1856,19 +1856,27 @@ mod tests {
     /// ~20 tok/s measured on this hardware, which the overall bound would
     /// have killed mid-generation as `SSE read failed`.
     ///
-    /// This fixture is that shape in miniature: four chunks at 250ms apart
-    /// is ~1s of streaming against a 500ms bound. Every individual gap is
+    /// This fixture is that shape in miniature: 20 chunks at 100ms apart is
+    /// ~2s of streaming against a 1.5s bound. Every individual gap is
     /// comfortably inside the bound; only the TOTAL exceeds it.
+    ///
+    /// The margins are deliberately lopsided (15x per gap, 1.3x on the
+    /// total) because this is the one test here whose correctness depends on
+    /// wall-clock. An earlier revision used 250ms gaps against a 500ms bound
+    /// and passed alone while failing inside the full suite, where 750
+    /// parallel tests stretch a sleep well past its nominal value. A timing
+    /// test has to survive a loaded machine or it is a flake that reports as
+    /// a regression.
     #[test]
     fn a_stream_that_keeps_delivering_survives_past_the_bound() {
-        let url = sse_server_with_gaps(4, std::time::Duration::from_millis(250));
+        let url = sse_server_with_gaps(20, std::time::Duration::from_millis(100));
         let client =
-            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(500));
+            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(1500));
         let seen = drain(&client).expect(
             "an active stream must not be killed by a bound it never went idle against \
              — an Err here means the bound is still a deadline (#2836)",
         );
-        assert_eq!(seen, 4, "every chunk the server sent must arrive");
+        assert_eq!(seen, 20, "every chunk the server sent must arrive");
     }
 
     /// The other half of the same claim: the bound must still FIRE. An idle
@@ -1877,10 +1885,12 @@ mod tests {
     /// no envelope.
     #[test]
     fn a_stream_that_goes_silent_past_the_bound_still_errors() {
-        let url = sse_server_with_gaps(2, std::time::Duration::from_millis(900));
+        // Load only ever makes the gap LONGER, so this direction cannot
+        // flake the way its sibling above did.
+        let url = sse_server_with_gaps(2, std::time::Duration::from_millis(1200));
         let client =
             LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(300));
-        let err = drain(&client).expect_err("a 900ms gap against a 300ms bound must not succeed");
+        let err = drain(&client).expect_err("a 1200ms gap against a 300ms bound must not succeed");
         assert!(
             err.to_string().contains("SSE read failed"),
             "a read timeout must surface as a read failure, got: {err}"

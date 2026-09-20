@@ -159,9 +159,318 @@ impl CutSource {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Stage 1 — the observer
+// ─────────────────────────────────────────────────────────────────────────
+
+/// How much generated text separates two observations, expressed in the
+/// token interval the operator configured.
+///
+/// **Not chunks.** The staged plan proposed counting the cadence in SSE
+/// chunks, on a measurement that chunks track tokens about 1:1 on Splash.
+/// Measured across 61 real calls on 2026-09-20 that ratio ran **0.02 to
+/// 1.00, median 0.61 — a 43x spread**, because Splash is a speculative
+/// engine: one chunk carries however many drafted tokens the verify step
+/// accepted, and acceptance is content dependent (0.45-0.51 measured, with
+/// 76-78% of emitted tokens coming from the draft model). A chunk is not a
+/// token on any speculative engine, and the 1:1 reading came from a single
+/// run that did not generalize.
+///
+/// Characters are counted directly off the deltas, so they need no proxy at
+/// all. `CHARS_PER_TOKEN` converts the operator's token-denominated interval
+/// into one, and the real ratio for each completed call is stamped into the
+/// trajectory so the constant is checkable rather than assumed. It matches
+/// the ruler the rest of the runtime already uses for generated prose.
+///
+/// Being wrong here costs CADENCE, never correctness: the verdict function
+/// judges the text it is handed, and a boundary landing early or late only
+/// changes how often a clean stream is looked at for free.
+pub const CHARS_PER_TOKEN: usize = 4;
+
+/// What the driver should do with the chunk it just fed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAction {
+    /// Keep reading. No observation boundary, or one was reached and
+    /// deliberately skipped. **This is the common case and it costs nothing
+    /// the model can see** — no truncation, no round trip, no prefill.
+    Continue,
+    /// A boundary was reached and the slice judged clean. Keep reading;
+    /// record the observation.
+    Observed { slice_chars: usize },
+    /// A boundary was reached and the slice is degenerate. Stop reading.
+    Degenerate { slice_chars: usize },
+}
+
+/// Watches one streamed call and decides, without ever truncating a healthy
+/// one, whether it has started repeating.
+///
+/// **The inversion this is.** The loop used to intervene unconditionally and
+/// then decide: send `max_tokens` at the check-in interval, let the server
+/// truncate whatever was in flight, inspect what came back, hand it back
+/// open or closed. The cut was never the point of the feature; it was how a
+/// decision point got extracted from a stateless request/response. Here the
+/// interval stops riding the wire and becomes an OBSERVATION CADENCE. A
+/// clean turn is never interrupted at all.
+///
+/// The runtime is already positioned for it: it streams, and it already sees
+/// every delta including tool-call fragments. Degeneracy detection never
+/// needed truncation, only visibility.
+pub struct StreamGate {
+    interval_chars: usize,
+    /// Passed to the verdict function for tail SIZING, which is
+    /// token-denominated (`tail_sample_tokens`). Kept separate from
+    /// `interval_chars` so the conversion above cannot silently change how
+    /// wide a tail the detector samples.
+    interval_tokens: u32,
+    judge: fn(&str, u32) -> bool,
+    /// Everything this call has generated, reasoning and content alike. The
+    /// pre-Stage-1 gate judged the same union (`carried`), so the verdict
+    /// sees exactly what it used to.
+    slice: String,
+    since_boundary: usize,
+    observations: u32,
+    tool_call_seen: bool,
+}
+
+impl StreamGate {
+    pub fn new(interval_tokens: u32, judge: fn(&str, u32) -> bool) -> Self {
+        Self {
+            interval_chars: (interval_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
+            interval_tokens,
+            judge,
+            slice: String::new(),
+            since_boundary: 0,
+            observations: 0,
+            tool_call_seen: false,
+        }
+    }
+
+    pub fn observations(&self) -> u32 {
+        self.observations
+    }
+
+    pub fn slice_chars(&self) -> usize {
+        self.slice.chars().count()
+    }
+
+    /// Feed one chunk. Call this for every chunk, in order.
+    pub fn ingest(&mut self, chunk: &crate::lmstudio::ChatChunk) -> GateAction {
+        for choice in &chunk.choices {
+            let d = &choice.delta;
+            if d.tool_calls.as_ref().is_some_and(|t| !t.is_empty()) {
+                self.tool_call_seen = true;
+            }
+            for text in [d.reasoning_content.as_deref(), d.content.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                self.slice.push_str(text);
+                self.since_boundary += text.chars().count();
+            }
+        }
+
+        if self.since_boundary < self.interval_chars {
+            return GateAction::Continue;
+        }
+        // Carry the remainder rather than zeroing. A chunk can deliver far
+        // more than one interval's worth of text (on a speculative engine a
+        // single chunk carries every draft token the verify step accepted),
+        // and discarding the overflow would let the cadence drift later and
+        // later behind the configured interval. At most one observation per
+        // chunk either way: judging the same accumulated slice twice in a
+        // row would return the same verdict.
+        self.since_boundary -= self.interval_chars;
+
+        // **Never judge a call that has begun emitting a tool call.**
+        //
+        // Two independent reasons, either sufficient. The metric is wrong on
+        // JSON: measured at the shipped threshold, an enum-valued JSON array
+        // scores 0.003 and a block of identical match arms 0.003 — both
+        // "degenerate", neither pathological. And a call that is emitting a
+        // tool call is productive by definition; the entire point of #2836 is
+        // that cutting one destroys work that cannot be recovered, because
+        // the model reads a thread where the action never happened and
+        // concludes it has already answered.
+        //
+        // Deliberately wider than "while the arguments are still open": once
+        // a tool call has STARTED, judging is suspended for the rest of the
+        // call. A model that emits a call and then degenerates in a long
+        // answer is left to the ceiling rather than risked here. Suspending
+        // is cheap; a false positive costs real work.
+        if self.tool_call_seen {
+            return GateAction::Continue;
+        }
+
+        self.observations += 1;
+        let chars = self.slice.chars().count();
+        if (self.judge)(&self.slice, self.interval_tokens) {
+            GateAction::Degenerate { slice_chars: chars }
+        } else {
+            GateAction::Observed { slice_chars: chars }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Stage 1: the observer ───────────────────────────────────────
+
+    use crate::lmstudio::{ChatChunk, ChoiceDelta, Delta, ToolCallDelta};
+
+    fn chunk(reasoning: Option<&str>, content: Option<&str>, tool: bool) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            choices: vec![ChoiceDelta {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: content.map(str::to_string),
+                    reasoning_content: reasoning.map(str::to_string),
+                    tool_calls: tool.then(|| {
+                        vec![ToolCallDelta {
+                            index: Some(0),
+                            id: Some("call_1".into()),
+                            kind: Some("function".into()),
+                            function: None,
+                            extra_content: None,
+                        }]
+                    }),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    const NEVER: fn(&str, u32) -> bool = |_, _| false;
+    const ALWAYS: fn(&str, u32) -> bool = |_, _| true;
+
+    /// The headline claim, and the one the whole redesign exists to make:
+    /// **a turn that is behaving well is never interrupted.** Before Stage 1
+    /// this stream would have been truncated four times by the server, each
+    /// cut costing a round trip and a re-sent prefill, and any one of them
+    /// could have landed mid-tool-call.
+    #[test]
+    fn a_clean_stream_is_never_interrupted_however_long_it_runs() {
+        let mut g = StreamGate::new(10, NEVER); // 40-char cadence
+        let mut observed = 0;
+        for _ in 0..40 {
+            match g.ingest(&chunk(Some("some ordinary reasoning text "), None, false)) {
+                GateAction::Continue => {}
+                GateAction::Observed { .. } => observed += 1,
+                GateAction::Degenerate { .. } => panic!("a clean stream must never be cut"),
+            }
+        }
+        assert!(observed > 0, "the gate must actually be looking, not just passing");
+    }
+
+    /// Below the cadence the gate does nothing at all — not "looks and says
+    /// fine", literally nothing. That is what makes observation free.
+    #[test]
+    fn nothing_happens_before_the_first_boundary() {
+        let mut g = StreamGate::new(100, ALWAYS); // 400-char cadence
+        for _ in 0..3 {
+            assert_eq!(g.ingest(&chunk(None, Some("short"), false)), GateAction::Continue);
+        }
+        assert_eq!(g.observations(), 0, "no boundary reached, so nothing was judged");
+    }
+
+    /// Reasoning delivered on the separate field is the bulk of what a
+    /// thinking model emits, so a cadence that only counted `content` would
+    /// never fire on exactly the models this feature is for.
+    #[test]
+    fn reasoning_channel_text_advances_the_cadence() {
+        let mut g = StreamGate::new(5, NEVER); // 20-char cadence
+        let a = g.ingest(&chunk(Some("0123456789012345678901234"), None, false));
+        assert!(matches!(a, GateAction::Observed { .. }), "got {a:?}");
+        assert_eq!(g.observations(), 1);
+    }
+
+    #[test]
+    fn a_degenerate_slice_at_a_boundary_stops_the_stream() {
+        let mut g = StreamGate::new(5, ALWAYS);
+        let a = g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
+        assert!(matches!(a, GateAction::Degenerate { .. }), "got {a:?}");
+    }
+
+    /// **The guard #2836 is about.** A call that has begun emitting a tool
+    /// call is never judged, so it can never be cut by this gate — even with
+    /// a verdict function that calls everything degenerate.
+    ///
+    /// Two reasons the real detector needs this: JSON scores 0.003 against a
+    /// 0.25 threshold (the documented false-degenerate class), and a call
+    /// emitting a tool call is productive by definition. Measured cost of
+    /// getting it wrong: 9 destroyed `edit` calls across 4 runs, each one
+    /// leaving the model reading a thread where the action never happened.
+    #[test]
+    fn a_call_that_started_a_tool_call_is_never_judged_again() {
+        let mut g = StreamGate::new(5, ALWAYS); // would cut at every boundary
+        assert_eq!(g.ingest(&chunk(None, None, true)), GateAction::Continue);
+        for _ in 0..20 {
+            assert_eq!(
+                g.ingest(&chunk(None, Some("0123456789012345678901234"), false)),
+                GateAction::Continue,
+                "the gate must stay silent for the rest of a call that is emitting a tool call"
+            );
+        }
+        assert_eq!(
+            g.observations(),
+            0,
+            "not merely 'judged and continued' — never judged at all"
+        );
+    }
+
+    /// The suspension is not retroactive: boundaries BEFORE the tool call
+    /// are judged normally. Otherwise a model that reasons degenerately for
+    /// a long time and then emits one call would be exempt from the gate
+    /// entirely.
+    #[test]
+    fn boundaries_before_the_tool_call_are_still_judged() {
+        let mut g = StreamGate::new(5, ALWAYS);
+        let a = g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
+        assert!(matches!(a, GateAction::Degenerate { .. }), "got {a:?}");
+        assert_eq!(g.observations(), 1);
+    }
+
+    /// A chunk can deliver several intervals' worth of text at once — on a
+    /// speculative engine one chunk carries every accepted draft token. The
+    /// overflow has to carry, or the cadence drifts further behind the
+    /// configured interval with every oversized chunk.
+    #[test]
+    fn an_oversized_chunk_carries_its_remainder_into_the_next_boundary() {
+        let mut g = StreamGate::new(5, NEVER); // 20-char cadence
+        // 38 chars: one boundary now, 18 left over.
+        let a = g.ingest(&chunk(None, Some(&"x".repeat(38)), false));
+        assert!(matches!(a, GateAction::Observed { .. }), "got {a:?}");
+        // 2 more chars reaches 20 again only if the 18 carried.
+        let b = g.ingest(&chunk(None, Some("yy"), false));
+        assert!(
+            matches!(b, GateAction::Observed { .. }),
+            "the remainder must carry; zeroing it would need 20 fresh chars here. got {b:?}"
+        );
+        assert_eq!(g.observations(), 2);
+    }
+
+    /// The verdict sees the WHOLE call, not just the slice since the last
+    /// boundary — same scope the pre-Stage-1 gate judged (`carried`), so a
+    /// repetition spanning two boundaries is still visible.
+    #[test]
+    fn the_judged_slice_accumulates_across_boundaries() {
+        let seen: std::cell::Cell<usize> = std::cell::Cell::new(0);
+        // fn-pointer judges cannot capture, so assert via the gate's own view.
+        let mut g = StreamGate::new(5, NEVER);
+        g.ingest(&chunk(None, Some("aaaaaaaaaaaaaaaaaaaaa"), false));
+        let after_first = g.slice_chars();
+        g.ingest(&chunk(None, Some("bbbbbbbbbbbbbbbbbbbbb"), false));
+        assert!(
+            g.slice_chars() > after_first,
+            "the slice must grow, not reset, between boundaries"
+        );
+        seen.set(g.slice_chars());
+        assert_eq!(seen.get(), 42);
+    }
 
     #[test]
     fn a_turn_the_model_ended_itself_is_nobody_s_cut() {
