@@ -681,6 +681,49 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.gate.observation — one look at the stream, and what it
+    /// measured (#2844).
+    ///
+    /// **Why every look and not just the cuts.** A detector threshold is
+    /// only defensible against the distribution it was set on, and darkmux
+    /// could not see its own. `tail_ratio` reached the trajectory only when
+    /// a checkpoint FIRED, so an engine the gate never cuts contributed
+    /// nothing: four clean runs on one engine produced zero samples while a
+    /// second engine produced 58 — the exact inverse of what is needed to
+    /// ask whether one threshold suits both.
+    ///
+    /// The concrete question this exists to answer: `DEGENERATE_TAIL_RATIO`
+    /// is documented as sitting with "enormous margin" between real
+    /// reasoning at 1.000 and synthetic loops at 0.013-0.015. That margin
+    /// was measured on ONE engine's output. If another engine produces a
+    /// continuous distribution across the threshold rather than two
+    /// clusters around it, the margin does not exist for that engine and
+    /// the threshold is cutting a population nobody characterized. This
+    /// record is how that is checked with data instead of asserted.
+    ///
+    /// `ratio` is `None` when the slice was too short for the token metric;
+    /// the char fallback may still have produced `degenerate`.
+    pub fn append_gate_observation(
+        &mut self,
+        seq: u32,
+        observation: u32,
+        slice_chars: usize,
+        ratio: Option<f32>,
+        interval_tokens: u32,
+        degenerate: bool,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.gate.observation",
+            "seq": seq,
+            "ts": unix_ms(),
+            "observation": observation,
+            "slice_chars": slice_chars,
+            "tail_ratio": ratio,
+            "interval_tokens": interval_tokens,
+            "degenerate": degenerate,
+        }));
+    }
+
     /// dispatch.gate.abort — the in-stream observer ended a call itself
     /// (#2836).
     ///

@@ -5127,7 +5127,7 @@ fn run_streaming_turn(
     let mut last_content_bytes: usize = 0;
     let mut gate = StreamGate::new(
         crate::stream_gate::GateBounds { interval_tokens: watch.interval },
-        crate::reasoning_loop::slice_is_degenerate,
+        crate::reasoning_loop::measure_and_judge,
         watch.carried,
     );
     let mut cut = CutSource::None;
@@ -5177,9 +5177,39 @@ fn run_streaming_turn(
         // Intervention happens ONLY on detection, which is the inversion
         // this issue is about: the loop used to cut first and decide after.
         match gate.ingest(&chunk) {
-            crate::stream_gate::GateAction::Continue
-            | crate::stream_gate::GateAction::Observed { .. } => {}
-            crate::stream_gate::GateAction::Degenerate { slice_chars, generated_chars } => {
+            crate::stream_gate::GateAction::Continue => {}
+            // (#2844) A clean observation is RECORDED, not discarded.
+            //
+            // The ratio used to reach the trajectory only when the gate cut,
+            // so an engine the gate never cuts produced no samples at all:
+            // four clean LMStudio runs yielded zero, while splash yielded 58.
+            // That is backwards from what is needed to ask whether one
+            // threshold suits both engines, and it is why darkmux could not
+            // answer that question about its own detector.
+            //
+            // These are cheap — one small record per observation boundary,
+            // a few per call — and they are the only way the threshold's
+            // margin can be checked against a distribution rather than
+            // against the corpus it was originally set on.
+            crate::stream_gate::GateAction::Observed { slice_chars, ratio } => {
+                trajectory.append_gate_observation(
+                    seq,
+                    gate.observations(),
+                    slice_chars,
+                    ratio,
+                    watch.interval,
+                    false,
+                );
+            }
+            crate::stream_gate::GateAction::Degenerate { slice_chars, ratio, generated_chars } => {
+                trajectory.append_gate_observation(
+                    seq,
+                    gate.observations(),
+                    slice_chars,
+                    ratio,
+                    watch.interval,
+                    true,
+                );
                 eprintln!(
                     "darkmux-runtime: ⏹ observation {} — the output is repeating \
                      (degeneracy gate) after {slice_chars} characters ({generated_chars} \

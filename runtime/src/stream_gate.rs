@@ -189,18 +189,25 @@ impl CutSource {
 pub const CHARS_PER_TOKEN: usize = 4;
 
 /// What the driver should do with the chunk it just fed in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Eq`: it carries a measured `f32` ratio. `PartialEq` is enough for
+/// the tests, which compare against `Continue` or match on the variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateAction {
     /// Keep reading. No observation boundary, or one was reached and
     /// deliberately skipped. **This is the common case and it costs nothing
     /// the model can see** — no truncation, no round trip, no prefill.
     Continue,
     /// A boundary was reached and the slice judged clean. Keep reading;
-    /// record the observation.
-    Observed { slice_chars: usize },
+    /// record the observation — including the measured ratio, which is the
+    /// point (see `Measured` below).
+    Observed { slice_chars: usize, ratio: Option<f32> },
     /// A boundary was reached and the slice is degenerate. Stop reading.
     Degenerate {
         slice_chars: usize,
+        /// The repetition ratio this verdict was computed from. `None` when
+        /// the slice was too short for the token metric to judge.
+        ratio: Option<f32>,
         /// Characters of that slice this CALL produced, the rest being the
         /// carried prefix. Recorded so a reader can tell a turn that has
         /// been repeating for four continuations from one that started
@@ -239,7 +246,21 @@ pub struct StreamGate {
     /// `interval_chars` so the conversion above cannot silently change how
     /// wide a tail the detector samples.
     interval_tokens: u32,
-    judge: fn(&str, u32) -> bool,
+    /// Returns the measured repetition ratio and the verdict derived from
+    /// it. The RATIO is why this is not just a predicate.
+    ///
+    /// (#2844) A threshold is only defensible against the distribution it
+    /// was set on, and darkmux could not see its own: the ratio was recorded
+    /// only when a checkpoint FIRED, so an engine the gate never cuts
+    /// produced no samples at all. Four clean LMStudio runs yielded zero
+    /// data points while splash yielded 58 — which is exactly backwards
+    /// from what is needed to ask whether the threshold suits both.
+    ///
+    /// Recording it on every observation, clean or not, turns "the gate
+    /// fired N times" into a per-engine distribution. That is the difference
+    /// between asserting the detector is engine-neutral and being able to
+    /// show it.
+    judge: fn(&str, u32) -> (Option<f32>, bool),
     /// Everything this call has generated, reasoning and content alike. The
     /// pre-Stage-1 gate judged the same union (`carried`), so the verdict
     /// sees exactly what it used to.
@@ -282,7 +303,11 @@ impl StreamGate {
     /// The cadence still counts only NEW characters — `since_boundary` starts
     /// at zero — so a long carried prefix does not immediately trip a
     /// boundary.
-    pub fn new(bounds: GateBounds, judge: fn(&str, u32) -> bool, carried: &str) -> Self {
+    pub fn new(
+        bounds: GateBounds,
+        judge: fn(&str, u32) -> (Option<f32>, bool),
+        carried: &str,
+    ) -> Self {
         Self {
             interval_chars: (bounds.interval_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
             interval_tokens: bounds.interval_tokens,
@@ -407,13 +432,15 @@ impl StreamGate {
 
         self.observations += 1;
         let chars = self.slice.chars().count();
-        if (self.judge)(&self.slice, self.interval_tokens) {
+        let (ratio, degenerate) = (self.judge)(&self.slice, self.interval_tokens);
+        if degenerate {
             GateAction::Degenerate {
                 slice_chars: chars,
+                ratio,
                 generated_chars: self.generated_chars(),
             }
         } else {
-            GateAction::Observed { slice_chars: chars }
+            GateAction::Observed { slice_chars: chars, ratio }
         }
     }
 }
@@ -451,7 +478,11 @@ mod tests {
         }
     }
 
-    fn gate(interval: u32, judge: fn(&str, u32) -> bool, carried: &str) -> StreamGate {
+    fn gate(
+        interval: u32,
+        judge: fn(&str, u32) -> (Option<f32>, bool),
+        carried: &str,
+    ) -> StreamGate {
         StreamGate::new(
             GateBounds { interval_tokens: interval },
             judge,
@@ -486,8 +517,8 @@ mod tests {
         }
     }
 
-    const NEVER: fn(&str, u32) -> bool = |_, _| false;
-    const ALWAYS: fn(&str, u32) -> bool = |_, _| true;
+    const NEVER: fn(&str, u32) -> (Option<f32>, bool) = |_, _| (Some(1.0), false);
+    const ALWAYS: fn(&str, u32) -> (Option<f32>, bool) = |_, _| (Some(0.01), true);
 
     /// The headline claim, and the one the whole redesign exists to make:
     /// **a turn that is behaving well is never interrupted.** Before Stage 1
@@ -574,6 +605,52 @@ mod tests {
         let a = g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
         assert!(matches!(a, GateAction::Degenerate { .. }), "got {a:?}");
         assert_eq!(g.observations(), 1);
+    }
+
+    /// (#2844) Every observation reports the ratio it measured, not only the
+    /// ones that cut.
+    ///
+    /// This is the instrumentation that lets the threshold be checked
+    /// against a distribution instead of against the corpus it was set on.
+    /// Without it an engine the gate never cuts contributes nothing: four
+    /// clean runs on one engine produced zero samples while another produced
+    /// 58, which is the inverse of what the comparison needs.
+    #[test]
+    fn a_clean_observation_still_reports_what_it_measured() {
+        const SCORES: fn(&str, u32) -> (Option<f32>, bool) = |_, _| (Some(0.87), false);
+        let mut g = gate(5, SCORES, "");
+        match g.ingest(&chunk(None, Some("0123456789012345678901234"), false)) {
+            GateAction::Observed { ratio, .. } => {
+                assert_eq!(ratio, Some(0.87), "a clean look must carry its number");
+            }
+            other => panic!("expected Observed, got {other:?}"),
+        }
+    }
+
+    /// And a cut reports the ratio it cut ON — so the two populations are
+    /// directly comparable rather than one being inferred from the other.
+    #[test]
+    fn a_degenerate_verdict_reports_the_ratio_it_cut_on() {
+        const LOW: fn(&str, u32) -> (Option<f32>, bool) = |_, _| (Some(0.02), true);
+        let mut g = gate(5, LOW, "");
+        match g.ingest(&chunk(None, Some("0123456789012345678901234"), false)) {
+            GateAction::Degenerate { ratio, .. } => assert_eq!(ratio, Some(0.02)),
+            other => panic!("expected Degenerate, got {other:?}"),
+        }
+    }
+
+    /// A slice the token metric cannot judge reports `None` rather than a
+    /// number it did not measure. A fabricated 0.0 would read as "maximally
+    /// repetitive" — the exact inverse of "too short to tell" — and would
+    /// poison any distribution built from these records.
+    #[test]
+    fn an_unmeasurable_slice_reports_no_ratio_rather_than_a_zero() {
+        const BLIND: fn(&str, u32) -> (Option<f32>, bool) = |_, _| (None, false);
+        let mut g = gate(5, BLIND, "");
+        match g.ingest(&chunk(None, Some("0123456789012345678901234"), false)) {
+            GateAction::Observed { ratio, .. } => assert_eq!(ratio, None),
+            other => panic!("expected Observed, got {other:?}"),
+        }
     }
 
     /// `tool_call_in_flight` is the field an abort record reports, so it has

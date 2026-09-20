@@ -879,6 +879,23 @@ pub fn slice_is_degenerate(slice: &str, checkpoint_interval: u32) -> bool {
     }
 }
 
+/// (#2844) The measured ratio AND the verdict, so the ratio can be recorded
+/// on every observation rather than only when the gate cuts.
+///
+/// `slice_is_degenerate` is the boolean this wraps and remains the single
+/// place the verdict is decided — this adds visibility, never a second
+/// opinion. The ratio returned is the TOKEN metric's; `None` means the slice
+/// was too short for it to judge, in which case the char fallback inside
+/// `slice_is_degenerate` may still have produced a verdict.
+pub fn measure_and_judge(slice: &str, checkpoint_interval: u32) -> (Option<f32>, bool) {
+    let ratio = tail_repetition_ratio(
+        slice,
+        TAIL_WINDOW_TOKENS,
+        tail_sample_tokens(checkpoint_interval),
+    );
+    (ratio, slice_is_degenerate(slice, checkpoint_interval))
+}
+
 #[cfg(test)]
 mod degeneracy_tests {
     use super::*;
