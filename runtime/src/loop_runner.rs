@@ -8467,6 +8467,108 @@ mod tests {
         );
     }
 
+    /// Build an SSE body whose text arrives on the separate REASONING field,
+    /// which is how the qwen3.x / Splash family delivers thinking.
+    fn sse_reasoning(pieces: &[&str], finish: &str, completion_tokens: u32) -> String {
+        let mut out = String::new();
+        for p in pieces {
+            out.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"id":"c","choices":[{"index":0,
+                    "delta":{"reasoning_content": p}}]})
+            ));
+        }
+        out.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"c",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish}],
+                "usage":{"prompt_tokens":100,"completion_tokens":completion_tokens,
+                         "total_tokens":100+completion_tokens}
+            })
+        ));
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    /// (#2839) A model that will not stop repeating is HANDED OFF after the
+    /// one remedy fails — it does not spin until a budget runs out.
+    ///
+    /// The sequence this pins, which is two calls and not seven:
+    ///
+    ///   call 1  degenerate, thought open   -> close_thought(), hand back
+    ///   call 2  degenerate, thought closed -> escalate, everything banked
+    ///
+    /// The handler for the second line already existed (`degenerate &&
+    /// !writing_thought`). It was UNREACHABLE for this model shape, because
+    /// closing the thought flips the judged region to the answer, a
+    /// separate-field reasoner never writes an answer, and the judge then
+    /// read `""` and returned "not degenerate" forever. Measured live before
+    /// the fix: six consecutive `judged_chars: 0, verdict: continue` records
+    /// on one turn, ~270s of a 273s run, ending on an exhausted generation
+    /// budget rather than on the repetition that actually caused it.
+    ///
+    /// So this test is the proof that fixing the vacuous pass reconnected an
+    /// existing remedy, rather than the proof of new machinery.
+    #[test]
+    #[serial_test::serial]
+    fn a_model_that_keeps_repeating_after_the_conclude_is_handed_off_not_spun() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
+        let body = sse_reasoning(&pieces, "stop", 2_000);
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("handoff").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(20), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a non-converging turn is handed off, never fatal");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "the handoff must name the REPETITION, not a budget that ran out \
+             downstream of it",
+        );
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        let checkpoints: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.checkpoint")
+            .collect();
+        assert_eq!(
+            checkpoints.len(),
+            2,
+            "exactly two: the conclude, then the handoff. More than that is the \
+             spin this fixes; the live failure produced seven. Got:\n{}",
+            checkpoints.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("\n")
+        );
+        assert_eq!(checkpoints[0]["verdict"], "conclude");
+        assert_eq!(checkpoints[1]["verdict"], "conclude");
+        for c in &checkpoints {
+            assert!(
+                c["judged_chars"].as_u64().unwrap_or(0) > 0,
+                "and neither verdict may be a pass over nothing: {c}"
+            );
+        }
+    }
+
     /// (#2836, found by a live run rather than by the suite) The
     /// calibration figure must be absent on a tool-calling call.
     ///
