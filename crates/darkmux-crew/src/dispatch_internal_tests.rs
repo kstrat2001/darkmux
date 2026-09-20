@@ -8553,6 +8553,42 @@
             detail.contains("edit"),
             "detail must name the tool that was lost; got {detail:?}"
         );
+        // The live run is what surfaced this: a swallowed line continuation
+        // in the source literal shipped "of arguments<22 spaces>(cut=..."
+        // straight onto the flow stream. Every assertion above passed on
+        // that string, because `contains` does not care about the gap
+        // between the words it finds.
+        assert!(
+            !detail.contains("  "),
+            "operator-facing prose must not carry the source's own indentation; \
+             got {detail:?}"
+        );
+        assert!(
+            detail.contains("1 character of"),
+            "one character is not '1 characters'; got {detail:?}"
+        );
+    }
+
+    /// The plural arm of the same sentence. Worth its own case because the
+    /// singular is what the proof run actually produced (the model had
+    /// emitted `{` and nothing else), so a fixture built only from the
+    /// observed shape would never exercise the other branch.
+    #[test]
+    fn a_discarded_tool_call_detail_pluralizes_above_one_character() {
+        let event = serde_json::json!({
+            "type": "dispatch.tool_call.discarded",
+            "seq": 3,
+            "name": "write",
+            "arguments_chars": 42,
+            "cut": "runtime_abort:degenerate",
+        });
+        let payload = detector_telemetry_payload("dispatch.tool_call.discarded", &event)
+            .expect("maps discarded_tool_call");
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(detail.contains("42 characters of"), "got {detail:?}");
+        assert!(!detail.contains("  "), "got {detail:?}");
+        // A Stage 1 cut source must read through this path untouched.
+        assert_eq!(payload["cut"], "runtime_abort:degenerate");
     }
 
     // ─── #2169 malformed structured tool-call names ────────────────────

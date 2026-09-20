@@ -10197,6 +10197,7 @@ fn detector_telemetry_payload(
         "dispatch.tool_call.discarded" => {
             let name = str_field("name");
             let chars = u64_field("arguments_chars");
+            let plural = if chars == 1 { "" } else { "s" };
             let cut = event
                 .get("cut")
                 .and_then(|v| v.as_str())
@@ -10205,7 +10206,9 @@ fn detector_telemetry_payload(
                 "discarded_tool_call",
                 "warn",
                 format!(
-                    "tool call `{name}` was cut after {chars} characters of arguments                      (cut={cut}) — the JSON does not parse, so it was neither dispatched                      nor sent back; that turn's work is gone (#2836)"
+                    "tool call `{name}` was cut after {chars} character{plural} of \
+                     arguments (cut={cut}) — the JSON does not parse, so it was neither \
+                     dispatched nor sent back; that turn's work is gone (#2836)"
                 ),
             )
         }
