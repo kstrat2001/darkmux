@@ -1860,28 +1860,36 @@ mod tests {
     /// 4s of streaming against a 3s bound. Every individual gap is inside
     /// the bound; only the TOTAL exceeds it.
     ///
-    /// **Sized by the ABSOLUTE stall it has to survive, not by a ratio**, and
-    /// it took three tries to get that right. 250ms against 500ms flaked in
-    /// the full suite; 100ms against 1500ms flaked again; 10ms against 1000ms
-    /// flaked a third time. Chasing the ratio was the error — scheduling
-    /// stalls under load are absolute (tens to hundreds of ms), not
-    /// multiplicative, so a 100x margin on a 10ms sleep still only survives
-    /// 990ms, and shrinking the gap multiplies the number of scheduling
-    /// points that can stall. This shape survives a 2.5s stall at any of
-    /// only 8 points.
+    /// **Sized by the ABSOLUTE stall it has to survive, and serialized.**
+    /// Four shapes flaked before this one: 250ms/500ms, 100ms/1500ms,
+    /// 10ms/1000ms, 500ms/3000ms — each in the full suite, twice against a
+    /// concurrent container build or lint on the same machine. Chasing the
+    /// RATIO was the error: scheduling stalls under load are absolute (tens
+    /// to hundreds of ms, occasionally seconds), so a 100x margin on a 10ms
+    /// sleep still only survives 990ms, and shrinking the gap multiplies the
+    /// number of points that can stall.
+    ///
+    /// This shape survives a **3.5s** stall at any of 10 points, and
+    /// `#[serial_test::serial]` keeps it from competing with the rest of the
+    /// suite for the scheduler in the first place — the contention is the
+    /// cause, so removing the contention is the fix that margins were
+    /// standing in for.
     ///
     /// A timing test that flakes under load reports a regression that is not
-    /// there, which is worse than having no test.
+    /// there, which is worse than having no test. If it flakes again, the
+    /// honest move is `#[ignore]` plus a documented manual run, not a fifth
+    /// margin.
     #[test]
+    #[serial_test::serial]
     fn a_stream_that_keeps_delivering_survives_past_the_bound() {
-        let url = sse_server_with_gaps(8, std::time::Duration::from_millis(500));
+        let url = sse_server_with_gaps(10, std::time::Duration::from_millis(500));
         let client =
-            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(3000));
+            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(4000));
         let seen = drain(&client).expect(
             "an active stream must not be killed by a bound it never went idle against \
              — an Err here means the bound is still a deadline (#2836)",
         );
-        assert_eq!(seen, 8, "every chunk the server sent must arrive");
+        assert_eq!(seen, 10, "every chunk the server sent must arrive");
     }
 
     /// The other half of the same claim: the bound must still FIRE. An idle
@@ -1889,6 +1897,7 @@ mod tests {
     /// endpoint would then hang until the host's hard kill, which produces
     /// no envelope.
     #[test]
+    #[serial_test::serial]
     fn a_stream_that_goes_silent_past_the_bound_still_errors() {
         // Load only ever makes the gap LONGER, so this direction cannot
         // flake the way its sibling above did.

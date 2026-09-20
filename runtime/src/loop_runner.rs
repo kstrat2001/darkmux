@@ -85,6 +85,31 @@ use crate::trajectory::Trajectory;
 /// reasoning is discarded entirely), so reasoning-heavy dispatches raise it
 /// explicitly. No fixed number wins both ways — content-based stopping is
 /// the tracked real fix; this knob is the near-term control.
+/// (#2836 stage 2) How far past `answer_max_tokens` the runtime will wait for
+/// an in-flight tool call to finish writing its arguments.
+///
+/// **Why a grace exists at all.** The ceiling used to ride the wire as
+/// `max_tokens`, so the SERVER enforced it and cut wherever the model
+/// happened to be. Stage 1 removed the check-in from the wire and the
+/// check-in discards went to zero; the ceiling kept the same defect at a
+/// tenth the rate, because 10,000 tokens is a rarer place to be mid-call
+/// than 1,000. Measured live once stage 1 had cleared the noise:
+/// `DISCARDED name=edit chars=1 cut=server_length` at `completion_tokens:
+/// 10000` — a tool call destroyed by the ceiling alone.
+///
+/// The wire now carries `answer_max_tokens + CEILING_GRACE_TOKENS` and the
+/// runtime enforces the real ceiling itself, so the server is a backstop
+/// rather than the thing doing the cutting.
+///
+/// **Why 2000.** Sized to cover a real tool call's arguments rather than
+/// guessed: the arguments actually observed on this fixture ran to 8,513 and
+/// 9,803 characters, about 2,100-2,450 tokens on the measured ~4 chars/token
+/// for generated text. 2000 covers the common case without letting a call
+/// that is not converging run indefinitely — a ceiling that waits forever is
+/// not a ceiling. A call that outlasts the grace is ended anyway, and the
+/// record says it was deferred and for how long.
+const CEILING_GRACE_TOKENS: u32 = 2_000;
+
 /// (#1221) The per-call bound for ANSWER output — the model's committed text,
 /// not its scratch work.
 ///
@@ -2668,7 +2693,13 @@ fn run_with_sleeper(
         // everything. There the server-side bound is still the only
         // check-in that exists, so it stays exactly as it was.
         let wire_max_tokens = if streaming {
-            answer_max_tokens
+            // (#2836 stage 2) A BACKSTOP, not the enforcer. The runtime stops
+            // the call at `answer_max_tokens` itself, at a boundary it chose;
+            // this is what catches a stream the runtime somehow fails to end,
+            // and the grace is the room an in-flight tool call is given to
+            // finish. Saturating: an operator who sets the ceiling near u32
+            // gets no wraparound.
+            answer_max_tokens.saturating_add(CEILING_GRACE_TOKENS)
         } else {
             per_call_cap
         };
@@ -2878,7 +2909,11 @@ fn run_with_sleeper(
                 trajectory,
                 &mut last_proof_of_work,
                 &mut inactivity_soft_warning_fired_in_window,
-                Watch { interval: per_call_cap, carried: turn.carried() },
+                Watch {
+                    interval: per_call_cap,
+                    carried: turn.carried(),
+                    ceiling: answer_max_tokens,
+                },
             )?;
             (outcome.response, outcome.cut)
         } else {
@@ -5041,6 +5076,10 @@ struct Watch<'a> {
     /// The turn's accumulation from earlier continuations, so the in-stream
     /// verdict judges the same scope the post-hoc one does.
     carried: &'a str,
+    /// The real per-call ceiling (`answer_max_tokens`). The gate enforces it
+    /// so it can land at a safe boundary; the wire carries it plus a grace
+    /// as a backstop.
+    ceiling: u32,
 }
 
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
@@ -5076,7 +5115,11 @@ fn run_streaming_turn(
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
     let mut gate = StreamGate::new(
-        watch.interval,
+        crate::stream_gate::GateBounds {
+            interval_tokens: watch.interval,
+            ceiling_tokens: watch.ceiling,
+            grace_tokens: CEILING_GRACE_TOKENS,
+        },
         crate::reasoning_loop::slice_is_degenerate,
         watch.carried,
     );
@@ -5105,6 +5148,26 @@ fn run_streaming_turn(
         match gate.ingest(&chunk) {
             crate::stream_gate::GateAction::Continue
             | crate::stream_gate::GateAction::Observed { .. } => {}
+            crate::stream_gate::GateAction::Ceiling {
+                generated_chars,
+                deferred_chars,
+            } => {
+                let waited = if deferred_chars > 0 {
+                    format!(
+                        " (waited {deferred_chars} characters for a tool call to \
+                         finish writing)"
+                    )
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "darkmux-runtime: ⏹ per-call ceiling reached after \
+                     {generated_chars} characters{waited}; ending the call here \
+                     rather than letting the endpoint cut it mid-stream. (#2836)"
+                );
+                cut = CutSource::RuntimeAbort(AbortReason::Ceiling);
+                break;
+            }
             crate::stream_gate::GateAction::Degenerate { slice_chars, generated_chars } => {
                 eprintln!(
                     "darkmux-runtime: ⏹ observation {} — the output is repeating \
@@ -8370,8 +8433,15 @@ mod tests {
     /// the model happened to be — measured over four runs, 9 of 14 firings
     /// (64%) landed mid-`arguments` and destroyed an `edit`.
     ///
-    /// The mock matches on `max_tokens: 9000` and would 404 on the old
-    /// `1000`, so reverting the wire change reds this test.
+    /// (#2836 stage 2) The wire now carries `answer_max_tokens +
+    /// CEILING_GRACE_TOKENS` — 9000 + 2000 — because the runtime enforces
+    /// the real ceiling itself and the server is a BACKSTOP. The grace is
+    /// the room an in-flight tool call gets to finish writing its arguments
+    /// rather than being cut mid-JSON.
+    ///
+    /// The mock matches on that exact number and would 404 on the check-in
+    /// interval (1000) or on a bare ceiling with no grace (9000), so either
+    /// regression reds this test.
     #[test]
     #[serial_test::serial]
     fn a_streamed_call_carries_the_ceiling_on_the_wire_not_the_check_in_interval() {
@@ -8379,7 +8449,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .json_body_partial(r#"{"max_tokens":9000}"#);
+                .json_body_partial(r#"{"max_tokens":11000}"#);
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(sse(&["done"], "stop", 5));
@@ -8400,8 +8470,10 @@ mod tests {
             tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect(
-            "a streamed request must carry max_tokens=9000 (the ceiling); an Err here \
-             means the check-in interval is still being enforced server-side (#2836)",
+            "a streamed request must carry max_tokens=11000 (ceiling 9000 + grace \
+             2000); an Err here means either the check-in interval is still enforced \
+             server-side, or the grace that protects an in-flight tool call is gone \
+             (#2836)",
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
     }
