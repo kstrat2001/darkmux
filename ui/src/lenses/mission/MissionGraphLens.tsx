@@ -299,18 +299,28 @@ function HelpGlyph() {
   );
 }
 function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
-  // (#2332) One number a person can act on — the mission's cost — plus the
-  // cloud share ONLY when there is one. "unattributed" is bookkeeping (its
-  // cause is #2106/#2188), not a headline; the three-way split stays
-  // reachable in the tooltip. Turns are gone from this scope: a sum of model
-  // calls across every step of every role drives no decision here (they
-  // stay per-step on the run view).
+  // (#2332) One number a person can act on — the mission's token cost.
+  // Turns are gone from this scope: a sum of model calls across every step
+  // of every role drives no decision here (they stay per-step on the run
+  // view).
+  //
+  // (#2834) The local/cloud/unattributed split is withdrawn from the
+  // tooltip as well as from the headline. Moving a claim into a tooltip
+  // does not make it true — the split keyed on endpoint presence, which
+  // says a model was reached over HTTP and nothing about what it cost. A
+  // local inference server has an endpoint. #1521 tracks per-endpoint
+  // attribution with metering declared by the operator rather than guessed
+  // from a URL; until that exists the mission meter states the total, which
+  // darkmux can stand behind.
   if (!tot.total) return null;
-  const split = `${fmtTok(tot.local)} local · ${fmtTok(tot.cloud)} cloud · ${fmtTok(tot.unknown)} unattributed`;
   return (
-    <span className="mmeter" title={split}>
+    <span className="mmeter">
       <b>{fmtTok(tot.total) + " tok"}</b>
-      {tot.cloud ? <span className="cloud">{"(" + fmtTok(tot.cloud) + " cloud)"}</span> : null}
+      {/* (#2834) The "(N cloud)" annotation is withdrawn, not corrected.
+          It was derived from endpoint presence, which is not a cost fact —
+          a local inference server on 127.0.0.1 has an endpoint. #1521
+          tracks per-endpoint attribution with metering declared rather
+          than inferred. */}
     </span>
   );
 }
