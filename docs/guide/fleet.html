@@ -69,7 +69,7 @@ HUB_IP=&lt;hub-tailnet-addr&gt;
 nc -zvw1 "$HUB_IP" 6379                            <span class="comment"># expect "succeeded"</span>
 
 <span class="comment"># 1. Install darkmux.</span>
-brew tap kstrat2001/darkmux
+brew tap kstrat2001/tap
 brew install darkmux
 
 <span class="comment"># 2. Declare this machine a peer and point it at the hub's Redis (password-less).</span>

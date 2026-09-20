@@ -164,11 +164,11 @@ function SavingsHero({
       <div className="saveyebrow">tokens{liveMode ? ` · last ${hours}h` : ""}</div>
       <div className="savrow">
         <div className="savlead">
-          <div className="savnum">{fmtN(t.local)}</div>
+          <div className="savnum">{settled ? fmtN(t.local) : ""}</div>
           <div className="savlbl">local tokens</div>
         </div>
         <div className="savlead cloud">
-          <div className="savnum">{fmtN(t.cloud)}</div>
+          <div className="savnum">{settled ? fmtN(t.cloud) : ""}</div>
           <div className="savlbl">cloud tokens</div>
         </div>
         {/* (#2068) ALWAYS rendered, dimmed at zero. "Unattributed" is the
@@ -183,15 +183,15 @@ function SavingsHero({
           className={`savlead unknown${t.unknown ? "" : " zero"}`}
           title="No dispatch record for these sessions named an endpoint, so darkmux cannot say whether the model ran locally or on a hosted endpoint. They are excluded from the local figure rather than assumed to be free."
         >
-          <div className="savnum">{fmtN(t.unknown)}</div>
+          <div className="savnum">{settled ? fmtN(t.unknown) : ""}</div>
           <div className="savlbl">unattributed</div>
         </div>
         <div className="savclasses">
-          <Chip value={fmtC(t.completion)} label="generated" cls="gen" />
-          <Chip value={fmtC(t.fresh)} label="fresh input" />
-          <Chip value={fmtC(t.reread)} label="re-read" />
-          {t.uncls ? <Chip value={fmtC(t.uncls)} label="unclassified" cls="uncls" /> : null}
-          <Chip value={t.runs} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
+          <Chip value={settled ? fmtC(t.completion) : ""} label="generated" cls="gen" />
+          <Chip value={settled ? fmtC(t.fresh) : ""} label="fresh input" />
+          <Chip value={settled ? fmtC(t.reread) : ""} label="re-read" />
+          {t.uncls ? <Chip value={settled ? fmtC(t.uncls) : ""} label="unclassified" cls="uncls" /> : null}
+          <Chip value={settled ? t.runs : ""} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>
       <div className="hybnote">

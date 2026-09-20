@@ -2,7 +2,7 @@
 
 This directory holds darkmux's Homebrew formula and its companion wrapper
 script. They live here in the main repo as the **source of truth** — the
-actual operator-facing tap (`kstrat2001/homebrew-darkmux`) is a thin repo
+actual operator-facing tap (`kstrat2001/homebrew-tap`) is a thin repo
 that pulls these files in.
 
 Tracking: [#618](https://github.com/kstrat2001/darkmux/issues/618).
@@ -19,11 +19,11 @@ Tracking: [#618](https://github.com/kstrat2001/darkmux/issues/618).
 
 ## Operator install path
 
-The tap exists at [kstrat2001/homebrew-darkmux](https://github.com/kstrat2001/homebrew-darkmux)
+The tap exists at [kstrat2001/homebrew-tap](https://github.com/kstrat2001/homebrew-tap)
 (created 2026-06-04):
 
 ```bash
-brew tap kstrat2001/darkmux
+brew tap kstrat2001/tap
 brew install darkmux                  # stable release (or --HEAD for latest main)
 brew services start darkmux           # optional — runs serve under launchd
 ```
@@ -40,14 +40,14 @@ gets pushed into the tap repo) live at `tap-bootstrap/` in this directory.
 The source-of-truth formula is here at `packaging/homebrew/darkmux.rb`; the
 tap is downstream. Two paths:
 
-**A. Automated sync via `.github/workflows/sync-homebrew-tap.yml`**
+**A. Automated sync — the tap PULLS this file (`sync-from-upstream.yml` in `kstrat2001/homebrew-tap`)**
 (default; runs on every push to main that touches the formula):
 The workflow opens a PR in the tap repo with the updated formula. Requires
 a repository secret named `HOMEBREW_TAP_TOKEN`:
 
 1. Create a fine-grained personal access token at
    https://github.com/settings/personal-access-tokens — Resource owner:
-   your user; Repository access: `kstrat2001/homebrew-darkmux` only;
+   your user; Repository access: `kstrat2001/homebrew-tap` only;
    Permissions: `Contents: Read and write` + `Pull requests: Read and write`.
 2. Add it to this repo's secrets at
    `Settings → Secrets and variables → Actions → New repository secret`
@@ -62,7 +62,7 @@ the new formula on their next `brew upgrade --HEAD darkmux`.
 
 **B. Manual fallback** (when CI is down or the workflow is being edited):
 ```bash
-cd /path/to/homebrew-darkmux           # or wherever you've cloned the tap
+cd /path/to/homebrew-tap           # or wherever you've cloned the tap
 cp /path/to/darkmux-public/packaging/homebrew/darkmux.rb Formula/darkmux.rb
 git diff Formula/darkmux.rb            # sanity check
 git add Formula/darkmux.rb
@@ -91,19 +91,19 @@ caveat updates, etc.):
 2. Test locally:
    ```bash
    # Create a local tap if you don't already have one
-   brew tap-new --no-git kstrat2001/darkmux
-   TAP_DIR=$(brew --repository)/Library/Taps/kstrat2001/homebrew-darkmux
+   brew tap-new --no-git kstrat2001/tap
+   TAP_DIR=$(brew --repository)/Library/Taps/kstrat2001/homebrew-tap
    mkdir -p "$TAP_DIR/Formula"
 
    # Copy your edits into the tap
    cp packaging/homebrew/darkmux.rb "$TAP_DIR/Formula/"
 
    # Audit
-   brew audit --strict kstrat2001/darkmux/darkmux
+   brew audit --strict kstrat2001/tap/darkmux
 
    # Install + verify
    brew uninstall darkmux 2>/dev/null || true
-   brew install --HEAD --build-from-source kstrat2001/darkmux/darkmux
+   brew install --HEAD --build-from-source kstrat2001/tap/darkmux
    brew services info darkmux         # confirm plist generated correctly
    /opt/homebrew/bin/darkmux --version
    ```

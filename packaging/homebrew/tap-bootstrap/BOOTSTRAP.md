@@ -1,14 +1,14 @@
 # Tap repo bootstrap
 
 This directory holds the source-of-truth files for the
-[`kstrat2001/homebrew-darkmux`](https://github.com/kstrat2001/homebrew-darkmux)
+[`kstrat2001/homebrew-tap`](https://github.com/kstrat2001/homebrew-tap)
 GitHub repo, plus the maintainer-facing docs for keeping it in sync.
 
 **Status: tap repo created and seeded 2026-06-04** (commit `610d05b`).
 Anyone can now run:
 
 ```bash
-brew tap kstrat2001/darkmux
+brew tap kstrat2001/tap
 brew install --HEAD darkmux
 ```
 
@@ -16,15 +16,15 @@ brew install --HEAD darkmux
 
 ```bash
 # 1. Create the repo on GitHub (public, MIT license)
-gh repo create kstrat2001/homebrew-darkmux \
+gh repo create kstrat2001/homebrew-tap \
     --public \
     --license MIT \
     --description "Homebrew tap for darkmux (Rust CLI for managing local LLM stacks)" \
     --homepage "https://darkmux.com"
 
 # 2. Clone it locally
-gh repo clone kstrat2001/homebrew-darkmux /tmp/homebrew-darkmux
-cd /tmp/homebrew-darkmux
+gh repo clone kstrat2001/homebrew-tap /tmp/homebrew-tap
+cd /tmp/homebrew-tap
 
 # 3. Copy the bootstrap files (LICENSE overwrites the gh-generated one for
 #    byte-identical match with darkmux's LICENSE)
@@ -54,7 +54,7 @@ After any formula change in the main repo, copy the file into the tap
 repo:
 
 ```bash
-cd /path/to/homebrew-darkmux
+cd /path/to/homebrew-tap
 cp /path/to/darkmux-public/packaging/homebrew/darkmux.rb Formula/darkmux.rb
 git diff Formula/darkmux.rb     # sanity check
 git add Formula/darkmux.rb
