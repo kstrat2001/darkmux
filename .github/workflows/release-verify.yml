@@ -30,7 +30,23 @@ jobs:
   release-verify-workspace:
     name: release verify — workspace (macos-latest)
     runs-on: macos-latest
-    timeout-minutes: 30
+    # 60, not 30. This job has to fit THREE release-profile operations, and
+    # the first one alone is most of the old budget: on 2026-09-20 the
+    # optimized `--all-targets` build took 13m13s cold, leaving under 17
+    # minutes for the full workspace test suite AND release clippy.
+    #
+    # It did not fit, twice in a row -- both runs were killed at the cap
+    # mid-test and recorded as "cancelled", which reads like someone stopped
+    # them rather than a timeout. The one run in this workflow's history that
+    # ever reached a verdict got there at ~28 minutes, and only because it
+    # FAILED fast on two test failures; a passing run was always going to be
+    # slower than a failing one.
+    #
+    # `ci.yml` runs the same `cargo test --workspace` at timeout 15 and is
+    # fine, which is not a counterexample: that job is DEV profile with no
+    # separate build step. Optimized builds are the whole cost here, and they
+    # are the entire point of this gate. See #2828.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
