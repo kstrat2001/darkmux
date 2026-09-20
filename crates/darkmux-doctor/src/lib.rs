@@ -3097,6 +3097,25 @@ fn check_host_sampler() -> Check {
 ///    M1 Max, and a dense 70B on the same hardware runs slower still — so
 ///    this warns before an operator's own hardware/model choice reproduces
 ///    the incident even with the fix merged.
+///
+///    **(#2836) This case is now NARROWER than it reads, and the narrowing
+///    is worth stating rather than leaving the check to imply otherwise.**
+///    On the STREAMING path the interval no longer rides out as
+///    `max_tokens`: it is an observation cadence, and what bounds how long
+///    one call may generate is `max_tokens_per_call`. So on that path this
+///    arithmetic describes the wrong quantity — a call can legitimately run
+///    to the ceiling regardless of the interval, and silence is caught by
+///    the transport's read timeout, which produces an envelope instead of
+///    killing the dispatch.
+///
+///    It is kept, and still computed on the interval, because the case it
+///    was written for is the NON-streaming path (`--no-stream`), where the
+///    interval IS still the wire cap and the #2171 incident is still
+///    reachable exactly as described. A check that warns on the stricter of
+///    the two paths is the safe direction: it can advise lowering an
+///    interval that a streaming operator did not strictly need to lower,
+///    and it cannot stay silent while a non-streaming one reproduces the
+///    incident.
 fn check_generation_checkpoint_interval() -> Check {
     let name = "runtime.generation_checkpoint_interval_tokens";
     let env_raw = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL")
@@ -3197,9 +3216,11 @@ fn check_generation_checkpoint_interval() -> Check {
                  inactivity_timeout_seconds`)"
             ),
             hint: Some(format!(
-                "a single call may generate silently for ~{approx_seconds}s against an \
-                 {inactivity_timeout_seconds}s inactivity budget; lower the interval or raise \
-                 runtime.inactivity_timeout_seconds"
+                "on the non-streaming path a single call may generate silently for \
+                 ~{approx_seconds}s against an {inactivity_timeout_seconds}s inactivity \
+                 budget; lower the interval or raise runtime.inactivity_timeout_seconds. \
+                 (#2836: when streaming — the default — the interval is an observation \
+                 cadence and does not bound a call, so this is advisory there)"
             )),
         };
     }

@@ -311,10 +311,26 @@ fn update_frozen_prompt_turns(prev: Option<u32>, current: u32, frozen: u32) -> u
     }
 }
 
+/// (#2836) No longer says "up to the per-call cap", because that is usually
+/// false now and this is text the MODEL reads.
+///
+/// The message is sent on two paths. One is a call that returned
+/// `tool_calls` with nothing in it. The other is a call the RUNTIME ended
+/// after its own degeneracy check fired — which reached no cap at all; the
+/// runtime stopped reading. Since the ceiling moved to 32,000 and the
+/// check-in came off the wire entirely, a genuine cap hit is now the rare
+/// case rather than the usual one.
+///
+/// A model told it hit a cap it did not hit may reasonably conclude its
+/// output was truncated and that the right response is to be briefer, which
+/// is not what either path is asking for. The wording now states only what
+/// is observably true on both — no tool call, no final answer — and asks
+/// for one of them. Per the model-facing doctrine in CLAUDE.md this stays
+/// directive and literal, and keeps the `[darkmux-runtime]` provenance
+/// prefix.
 const STALL_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
-emitted reasoning tokens up to the per-call cap without producing a tool \
-call or a final answer. Please either invoke a tool to make progress, or \
-provide a direct final answer.";
+ended without a tool call and without a final answer. Please either invoke \
+a tool to make progress, or provide a direct final answer.";
 
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
@@ -15887,7 +15903,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.matches("ended without a tool call and without a final answer").count() == 0
             });
             then.status(200)
                 .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -15896,7 +15912,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+                    && b.matches("ended without a tool call and without a final answer").count() == 1
             });
             then.status(200).json_body(chat_response_json(
                 None,
@@ -15910,7 +15926,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 1
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+                    && b.matches("ended without a tool call and without a final answer").count() == 1
             });
             then.status(200)
                 .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -15919,7 +15935,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 1
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 2
+                    && b.matches("ended without a tool call and without a final answer").count() == 2
             });
             then.status(200).json_body(chat_response_json(
                 None,
@@ -15933,7 +15949,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 2
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 2
+                    && b.matches("ended without a tool call and without a final answer").count() == 2
             });
             then.status(200)
                 .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -16021,7 +16037,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 let tools = b.matches("\"role\":\"tool\"").count();
-                let nudges = b.matches("emitted reasoning tokens up to the per-call cap").count();
+                let nudges = b.matches("ended without a tool call and without a final answer").count();
                 nudges < tools * 2 + 2
             });
             then.status(200)
@@ -16031,7 +16047,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 let tools = b.matches("\"role\":\"tool\"").count();
-                let nudges = b.matches("emitted reasoning tokens up to the per-call cap").count();
+                let nudges = b.matches("ended without a tool call and without a final answer").count();
                 nudges >= tools * 2 + 2
             });
             then.status(200).json_body(chat_response_json(
@@ -16131,7 +16147,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.matches("ended without a tool call and without a final answer").count() == 0
                     && !b.contains("PREFILLMARK")
             });
             then.status(200)
@@ -16141,7 +16157,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.matches("ended without a tool call and without a final answer").count() == 0
                     && b.contains("PREFILLMARK")
             });
             then.status(200)
@@ -16151,7 +16167,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+                    && b.matches("ended without a tool call and without a final answer").count() == 1
             });
             then.status(200).json_body(chat_response_json(
                 None,
