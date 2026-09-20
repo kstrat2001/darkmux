@@ -3209,7 +3209,17 @@ mod tests {
         //           1.50.0. See `schema.rs`'s own entry for why this is a
         //           periodic RECORD rather than a timed hook, and why
         //           entries count transitions rather than samples.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.51.0");
+        //   1.52.0 — a new `telemetry.detector` kind, `discarded_tool_call`,
+        //           with additive payload keys `name`, `arguments_chars`,
+        //           `cut` (#2836). Reports a tool call the runtime threw
+        //           away because the check-in cut inside its `arguments`;
+        //           before it, that loss had no record anywhere. `cut`
+        //           names WHO ended the call — `server_length` versus
+        //           `runtime_abort:*` — which is what lets a reader tell
+        //           pre- and post-#2836 archives apart without inferring it
+        //           from a version number. Minor bump: additive, and a
+        //           consumer that does not know the kind ignores it.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.52.0");
     }
 
     #[test]
