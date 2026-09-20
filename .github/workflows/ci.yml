@@ -679,6 +679,19 @@ jobs:
         run: |
           python3 scripts/engagement-sentinel-guard.py --self-test
           python3 scripts/engagement-sentinel-guard.py
+      - name: Tap-pin checker self-test (#2825)
+        # The checker's LIVE half runs at release time (the point-release
+        # skill's step 6), not here -- a PR has no tag to check against. What
+        # runs here is its pure logic, so the release-time check cannot rot
+        # into something that passes on a tap serving the wrong tag.
+        #
+        # Each of its guards is mutation-proven: dropping the no-url or
+        # no-sha256 branch, inverting the sha comparison, or relaxing the
+        # url's `endswith` to a substring test all turn the self-test red.
+        # The substring mutation SURVIVED the first draft of that suite
+        # (the case in it could not tell the two apart), which is why a
+        # trailing-suffix case exists.
+        run: python3 scripts/verify-tap-pin.py --self-test
       - name: No tracked file is one .gitignore says to ignore
         # Self-maintaining: it needs no list of its own, so it cannot drift
         # from `.gitignore` the way a second pattern list would. It catches
