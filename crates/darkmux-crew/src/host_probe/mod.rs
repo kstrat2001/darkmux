@@ -1543,11 +1543,17 @@ mod tests {
         // `DARKMUX_EXPECT_TIGHT_HOST_BUDGET` overrides the discriminator in
         // either direction (`1` forces tight, `0` forces relaxed) for the
         // case it misjudges a specific host.
-        let (ceiling_ms, tier) = if expect_tight_host_probe_budget(src.ioreport) {
-            (60, "tight (IOReport resolved)")
-        } else {
-            (300, "relaxed (IOReport unresolved — can't vouch for this host)")
-        };
+        // (#2828) Each tier carries a MEAN budget and a separate, generous
+        // MAX ceiling. The mean is the real guard; the max only catches the
+        // pathological. Means measured by this module: ~7.4ms on real Apple
+        // Silicon, ~21.9ms on a GitHub-hosted VM under coverage
+        // instrumentation.
+        let (mean_ceiling_ms, max_ceiling_ms, tier) =
+            if expect_tight_host_probe_budget(src.ioreport) {
+                (20.0_f64, 300_u64, "tight (IOReport resolved)")
+            } else {
+                (100.0_f64, 1500_u64, "relaxed (IOReport unresolved — can't vouch for this host)")
+            };
         // Visibility for the number itself, independent of pass/fail and
         // independent of `--nocapture` (which neither macOS CI job passes,
         // so a bare `eprintln!` here would be silently discarded on a
@@ -1562,15 +1568,46 @@ mod tests {
                 let _ = writeln!(
                     f,
                     "- `host_probe` cost budget: max {max} ms, mean {mean:.1} ms over {} samples \
-                     (tier: {tier}, ceiling {ceiling_ms} ms)",
+                     (tier: {tier}, mean ceiling {mean_ceiling_ms} ms, max ceiling {max_ceiling_ms} ms)",
                     costs.len()
                 );
             }
         }
+        // (#2828) The budget is asserted on the MEAN, with a separate and
+        // deliberately generous ceiling on the max.
+        //
+        // `max < ceiling` alone was a scheduling-noise detector wearing a
+        // cost guard's clothes. It went red on a coverage run at "max 429
+        // ms, mean 21.9 ms over 20 samples" -- one stalled sample out of
+        // twenty, inside an `llvm-cov` instrumented binary on a shared
+        // runner, against a mean an order of magnitude under the ceiling.
+        // Nothing about the probe's cost had changed.
+        //
+        // The mean ceilings are set BELOW the old max ceilings on purpose
+        // (60 -> 20 tight, 300 -> 100 relaxed), so this is a tightening of
+        // the real guard rather than a relaxation dressed up as one. A mean
+        // ceiling at the OLD max number would have been strictly weaker,
+        // since `max >= mean` always.
+        //
+        // That also closes the gap the comment above concedes. The
+        // pre-#2108 shell-out path cost ~780 ms/sample and was caught by
+        // either shape. A PARTIAL reintroduction at ~200 ms/sample sat
+        // under the old 300 ms max forever and is now caught, because it
+        // lands well over a 100 ms mean.
+        //
+        // The max ceilings exist only to catch a sample so slow that
+        // something is structurally wrong, while tolerating the
+        // one-in-twenty stall a shared instrumented runner always produces.
         assert!(
-            max < ceiling_ms,
-            "the observer must stay within its {tier} budget of {ceiling_ms}ms: \
-             max {max} ms, mean {mean:.1} ms over {} samples",
+            mean < mean_ceiling_ms,
+            "the observer must stay within its {tier} budget of {mean_ceiling_ms}ms on the MEAN: \
+             mean {mean:.1} ms, max {max} ms over {} samples",
+            costs.len()
+        );
+        assert!(
+            max < max_ceiling_ms,
+            "one sample was pathologically slow even allowing for scheduling noise \
+             ({tier}, max ceiling {max_ceiling_ms}ms): max {max} ms, mean {mean:.1} ms over {} samples",
             costs.len()
         );
 
