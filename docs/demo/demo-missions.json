@@ -1,10 +1,10 @@
 {
-  "generated_at_ms": 1789815503031,
+  "generated_at_ms": 1789909212227,
   "missions": [
     {
-      "created_ts": 1789811262,
+      "created_ts": 1789904960,
       "description": "PR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)",
-      "finalized_ts": 1789813194,
+      "finalized_ts": 1789906892,
       "id": "demo-review-nameof-recency",
       "phase_ids": [
         "demo-review-nameof-recency-investigate",
@@ -16,7 +16,7 @@
         "inputs_fingerprint": "0866ce12d4",
         "origin": "builtin"
       },
-      "started_ts": 1789811262,
+      "started_ts": 1789904960,
       "status": "finalized"
     }
   ]

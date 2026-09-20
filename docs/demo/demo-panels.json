@@ -8,7 +8,7 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815502996,
+    "captured_ts_ms": 1789909212191,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 3,
@@ -18,13 +18,13 @@
   },
   "doctor": {
     "age_ms": 0,
-    "ansi_text": "darkmux doctor \u2014 63 checks\n\n\u25cf needs attention \u2014 temp residue: 357 darkmux director(ies) under\u2026\n\n  \u2713 build                  darkmux 3.7.1 (acd4aee8) \u00b7 flow schema 1.51.0\n  \u2713 56 more checks passed \u2014 `-v` for detail\n  \u26a0 temp residue           357 darkmux director(ies) under\n                           /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/ (darkmux-out-analyst\n                           x153, darkmux-dispatch-analyst x147, darkmux-out-coder x27,\n                           darkmux-dispatch-coder x13, darkmux-dispatch-pr-reviewer x5)\n        \u2192 each one is a directory darkmux created and left. `darkmux-out-*` and `darkmux-dispatch-*`\n          are a dispatch's out-dir and workspace \u2014 they hold that run's prompt, trajectory and\n          checkpoint, so they are kept deliberately and removing one discards that run's record. The\n          rest are test scratch, which a test process now collects on its own (#2707); any still\n          here predate that. Nothing here is removed for you: review\n          /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/ and delete what you are done with.\n  \u26a0 daemon reachable       daemon not reachable at 127.0.0.1:8765 (connection refused)\n        \u2192 run `darkmux serve` to start the daemon for live viewing features\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 state file permissions 27 of 27 darkmux state file(s) are group- or world-readable \u2014\n                           mission/phase state (26, mode 644), flow records (1, mode 644)\n        \u2192 darkmux sets the mode only when IT creates a file \u2014 one written by an older binary, or\n          loosened by hand afterward, keeps whatever mode it already had. File NAMES are omitted\n          from this report on purpose: `darkmux doctor` output is republished verbatim by the\n          viewer's console lens, and the names in these stores are yours, not darkmux's. List them\n          on this machine, then restrict them:\n        \u2192 find \"/home/demo/.darkmux/crew/missions\"\n          \"/home/demo/.darkmux/flows\" -type f \\( -perm -g+r -o\n          -perm -o+r \\) -print\n        \u2192 find \"/home/demo/.darkmux/crew/missions\"\n          \"/home/demo/.darkmux/flows\" -type f \\( -perm -g+r -o\n          -perm -o+r \\) -exec chmod go-rwx {} +\n  \u26a0 legacy compaction extras profile `analyst` has fields not consumed by the internal runtime:\n                             mode; profile `coder` has fields not consumed by the internal runtime:\n                             mode; profile `reviewer` has fields not consumed by the internal\n                             runtime: mode\n        \u2192 Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed\n          schema deliberately doesn't expose these \u2014 see DESIGN.md Schema isolation).\n  \u26a0 darkmux skills freshness darkmux-* skills: 15 up to date; 1 stale (darkmux-analyze-run)\n        \u2192 content differs from this binary's bundled copy \u2014 an older darkmux installed it, or it was\n          edited locally. `darkmux init` refreshes a copy it can prove darkmux itself wrote (a\n          provenance stamp recorded at install time) and leaves every other one alone, so a skill\n          installed before darkmux started recording provenance stays listed here even after `init`\n          runs. `darkmux init --force` takes this binary's version of ALL of them, discarding any\n          local edit, and records provenance so later runs refresh silently; to take just one,\n          delete that skill's directory and re-run `init`. Either way `init` prunes retired skills\n\n57 pass, 6 warn \u2014 workable but worth a look\n",
+    "ansi_text": "darkmux doctor \u2014 63 checks\n\n\u25cf needs attention \u2014 temp residue: 422 darkmux director(ies) under\u2026\n\n  \u2713 build                  darkmux 3.9.0 (6faa06b8\u2731) \u00b7 flow schema 1.52.0\n  \u2713 55 more checks passed \u2014 `-v` for detail\n  \u26a0 temp residue           422 darkmux director(ies) under\n                           /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/ (darkmux-out-analyst\n                           x163, darkmux-dispatch-analyst x157, darkmux-out-coder x70,\n                           darkmux-dispatch-coder x15, darkmux-dispatch-pr-reviewer x5)\n        \u2192 each one is a directory darkmux created and left. `darkmux-out-*` and `darkmux-dispatch-*`\n          are a dispatch's out-dir and workspace \u2014 they hold that run's prompt, trajectory and\n          checkpoint, so they are kept deliberately and removing one discards that run's record. The\n          rest are test scratch, which a test process now collects on its own (#2707); any still\n          here predate that. Nothing here is removed for you: review\n          /var/folders/92/pj7y333940181t2blq0969wm0000gn/T/ and delete what you are done with.\n  \u26a0 daemon reachable       daemon not reachable at 127.0.0.1:8765 (connection refused)\n        \u2192 run `darkmux serve` to start the daemon for live viewing features\n  \u26a0 darkmux binary         brew/cargo split-brain \u2014 2 darkmux binaries at different versions:\n                           /home/demo/darkmux/target/release/darkmux = 3.9.0;\n                           /home/demo/workspace = 3.8.0\n        \u2192 An interactive shell and a launchd/service daemon can resolve different darkmux binaries\n          (PATH order differs), so the daemon may serve an older flow-schema than the CLI. Align\n          them: reinstall the stale one (`cargo install --path .` or `brew upgrade darkmux`), or\n          remove the duplicate so one version is on PATH.\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 state file permissions 27 of 27 darkmux state file(s) are group- or world-readable \u2014\n                           mission/phase state (26, mode 644), flow records (1, mode 644)\n        \u2192 darkmux sets the mode only when IT creates a file \u2014 one written by an older binary, or\n          loosened by hand afterward, keeps whatever mode it already had. File NAMES are omitted\n          from this report on purpose: `darkmux doctor` output is republished verbatim by the\n          viewer's console lens, and the names in these stores are yours, not darkmux's. List them\n          on this machine, then restrict them:\n        \u2192 find \"/home/demo/.darkmux/crew/missions\"\n          \"/home/demo/.darkmux/flows\" -type f \\( -perm -g+r -o\n          -perm -o+r \\) -print\n        \u2192 find \"/home/demo/.darkmux/crew/missions\"\n          \"/home/demo/.darkmux/flows\" -type f \\( -perm -g+r -o\n          -perm -o+r \\) -exec chmod go-rwx {} +\n  \u26a0 legacy compaction extras profile `analyst` has fields not consumed by the internal runtime:\n                             mode; profile `coder` has fields not consumed by the internal runtime:\n                             mode; profile `reviewer` has fields not consumed by the internal\n                             runtime: mode\n        \u2192 Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed\n          schema deliberately doesn't expose these \u2014 see DESIGN.md Schema isolation).\n  \u26a0 darkmux skills freshness darkmux-* skills: 15 up to date; 1 stale (darkmux-analyze-run)\n        \u2192 content differs from this binary's bundled copy \u2014 an older darkmux installed it, or it was\n          edited locally. `darkmux init` refreshes a copy it can prove darkmux itself wrote (a\n          provenance stamp recorded at install time) and leaves every other one alone, so a skill\n          installed before darkmux started recording provenance stays listed here even after `init`\n          runs. `darkmux init --force` takes this binary's version of ALL of them, discarding any\n          local edit, and records provenance so later runs refresh silently; to take just one,\n          delete that skill's directory and re-run `init`. Either way `init` prunes retired skills\n\n56 pass, 7 warn \u2014 workable but worth a look\n",
     "argv": [
       "doctor"
     ],
     "auto_refresh": false,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815503029,
+    "captured_ts_ms": 1789909212225,
     "cols": 100,
     "exit_code": 0,
     "gather_ms": 3,
@@ -34,14 +34,14 @@
   },
   "flow-status": {
     "age_ms": 0,
-    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       1.51.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    1\n  total_bytes:  3198766\n\nSchema\n  writer:       1.51.0\n  observed:     (none)\n  skew:         false\n\nHooks\n  enabled:      false\n  outbox_dir:   /home/demo/.darkmux/hooks\n  (no rules configured)\n",
+    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       1.52.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    1\n  total_bytes:  3200269\n\nSchema\n  writer:       1.52.0\n  observed:     (none)\n  skew:         false\n\nHooks\n  enabled:      false\n  outbox_dir:   /home/demo/.darkmux/hooks\n  (no rules configured)\n",
     "argv": [
       "flow",
       "status"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815503000,
+    "captured_ts_ms": 1789909212194,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 3,
@@ -51,7 +51,7 @@
   },
   "lab-fixture-list": {
     "age_ms": 0,
-    "ansi_text": "Lab registry: /home/demo/.darkmux/lab-registry.json (1 fixture)\n\n  demo-tiny-py\n    path:       /home/demo/darkmux/templates/builtin/lab-fixtures/demo-tiny-py\n    version:    1.0\n    satisfies:  tiny-python-suite@1.0\n    hash:       blake3:3b3e906155a4a66055be7fd39b4a855fca549f23f0e4fff34060c93c75f61e49\n    hashed_at:  2026-09-19T10:57:54Z\n\n",
+    "ansi_text": "Lab registry: /home/demo/.darkmux/lab-registry.json (1 fixture)\n\n  demo-tiny-py\n    path:       /home/demo/darkmux/templates/builtin/lab-fixtures/demo-tiny-py\n    version:    1.0\n    satisfies:  tiny-python-suite@1.0\n    hash:       blake3:3b3e906155a4a66055be7fd39b4a855fca549f23f0e4fff34060c93c75f61e49\n    hashed_at:  2026-09-20T12:59:32Z\n\n",
     "argv": [
       "lab",
       "fixture",
@@ -59,7 +59,7 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815503004,
+    "captured_ts_ms": 1789909212198,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 3,
@@ -76,7 +76,7 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815502991,
+    "captured_ts_ms": 1789909212187,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 3,
@@ -93,10 +93,10 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815502970,
+    "captured_ts_ms": 1789909212167,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 90,
+    "gather_ms": 62,
     "opts": {
       "all": "recent"
     },
@@ -112,10 +112,10 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815502990,
+    "captured_ts_ms": 1789909212186,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 18,
+    "gather_ms": 17,
     "opts": {},
     "panel": "role-list",
     "stderr_tail": ""
@@ -129,10 +129,10 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1789815503028,
+    "captured_ts_ms": 1789909212223,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 23,
+    "gather_ms": 24,
     "opts": {
       "all": "recent",
       "kind": "all"

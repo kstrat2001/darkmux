@@ -12,6 +12,120 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.9.0] - 2026-09-20
+
+Schema contracts: `FLOW_SCHEMA` 1.51.0 to 1.52.0, an additive minor bump for one
+new detector kind. `CONFIG_SCHEMA` is unchanged at 1.26 and `RULES_SCHEMA` at
+3.0.0. No breaking changes to any payload, so an older peer on the fleet stream
+degrades to ignoring the new record rather than rejecting it.
+
+### Fixed
+
+- **The check-in no longer destroys the tool call it was watching**
+  ([#2836](https://github.com/kstrat2001/darkmux/issues/2836)).
+  The reasoning checkpoint sent `max_tokens` at the check-in interval, so the
+  endpoint stopped generating mid-`arguments`. The truncated JSON would not
+  parse and was dropped with no record, so a tool call the model had genuinely
+  made simply vanished from the run. Measured on a long agentic fixture: **9
+  destroyed tool calls across 64% of check-in firings, now 0**, confirmed on
+  two different local primaries.
+
+  The runtime already streams, so detecting a degenerate turn needs visibility,
+  not truncation. The check-in now observes the stream and judges it in place.
+  Degeneracy is measured as a tail repetition ratio over 12-word windows,
+  calibrated against a real degenerate run at 1.000 and synthetic loops at
+  0.013 to 0.015.
+
+- **A discarded tool call is now recorded rather than silently dropped**
+  ([#2836](https://github.com/kstrat2001/darkmux/issues/2836)).
+  A new `telemetry.detector` kind, `discarded_tool_call`, carries the tool name,
+  the argument length, and `cut` -- which names *who* ended the call,
+  `server_length` when the endpoint stopped generating and `runtime_abort:*`
+  when darkmux did. Both eras appear in the same append-only archive, so a
+  reader can tell them apart without inferring it from a version number. Every
+  degeneracy observation is now recorded, not only the ones that end a turn
+  ([#2846](https://github.com/kstrat2001/darkmux/issues/2846)).
+
+- **A long tool call is no longer cut by the transport**
+  ([#2836](https://github.com/kstrat2001/darkmux/issues/2836)).
+  The per-call ceiling rose from 10,000 to 32,000 tokens and is no longer used
+  as a stand-in for watching the stream. The read timeout was raised to 900s
+  with a 30s connect timeout, and a stream that goes silent is now a typed
+  condition rather than an opaque error.
+
+- **The degeneracy judge was passing verdicts over zero characters**
+  ([#2836](https://github.com/kstrat2001/darkmux/issues/2836)).
+  For reasoners that emit reasoning in a separate field, the carried text was
+  empty after the thought closed, so the judge scored nothing and returned a
+  verdict anyway. It now falls back to the other field, and what each judge
+  actually looked at is recorded.
+
+- **The fleet hero no longer claims a local engine is cloud**
+  ([#2834](https://github.com/kstrat2001/darkmux/issues/2834), [#1607](https://github.com/kstrat2001/darkmux/issues/1607)).
+  The local/cloud/unattributed split keyed on whether an endpoint had a URL,
+  which a local inference server on 127.0.0.1 also has, so work running at zero
+  marginal cost on the operator's own GPU was counted as metered. Whether an
+  endpoint costs money is a property the operator knows and darkmux does not, so
+  the split is withdrawn rather than patched: one figure, every token darkmux
+  dispatched. The unattributable tokens are still counted in it.
+  [#1521](https://github.com/kstrat2001/darkmux/issues/1521) tracks per-endpoint
+  attribution with metering declared rather than guessed from a URL.
+
+- **Token tiles no longer round hundreds away**
+  ([#2845](https://github.com/kstrat2001/darkmux/issues/2845)).
+  Figures in the thousands carry two decimals, so a few hundred tokens are
+  visible instead of disappearing into a bare `k`.
+
+- **The savings hero no longer leaks its figures through the loading skeleton**
+  ([#2830](https://github.com/kstrat2001/darkmux/issues/2830)).
+
+- **The release-mode gate passes again**
+  ([#2828](https://github.com/kstrat2001/darkmux/issues/2828)).
+  `release-verify.yml` is the only workflow that builds and tests in the release
+  profile, and it had never completed successfully. Two tests asserted a
+  `debug_assert!` that compiles out under `--release`; they now assert the debug
+  panic and the release no-panic separately, and the invariant that holds in
+  both. This is also the release build's first real coverage of that production
+  path.
+
+### Added
+
+- **`lab tune` reports the block total**
+  ([#2848](https://github.com/kstrat2001/darkmux/issues/2848)).
+  A multi-run campaign asks how long the whole set took, and the report did not
+  answer it -- the sum was computed to derive the mean and then dropped, and
+  `mean * n` drifts from the truth by integer division. The total is the sum of
+  the runs' own durations, so in-run rest stays inside it: an engine that
+  throttles on the last run shows up as a larger total rather than having the
+  pause subtracted away.
+
+### Known limitation
+
+- **The degeneracy detector's threshold is calibrated on one engine's output
+  distribution** ([#2846](https://github.com/kstrat2001/darkmux/issues/2846)).
+  `DEGENERATE_TAIL_RATIO` was derived from runs on a single local primary. An
+  engine whose reasoning is more repetitive by nature can cross that threshold
+  on healthy output and escalate a run that would have converged. The detection
+  itself is sound -- it measures what it claims to measure -- but the threshold
+  is not yet engine-independent, and the remedy on crossing it is blunter than
+  it should be. If you run a primary other than the one darkmux was tuned
+  against and see unexpected escalations, that issue is the place to say so.
+
+### Packaging
+
+- **The tap is `kstrat2001/tap`**
+  ([#2840](https://github.com/kstrat2001/darkmux/pull/2840)), so the install
+  command reads `brew install kstrat2001/tap/darkmux`.
+- **A tap serving the wrong tag is now detected**
+  ([#2825](https://github.com/kstrat2001/darkmux/issues/2825)).
+  `scripts/verify-tap-pin.py --tag vX.Y.Z` fetches the tap's published formula
+  and the tag's real tarball and compares them. v3.8.0 was tagged and released
+  while the tap kept serving v3.7.1, with every other signal green. The
+  auto-sync workflow was removed with the tap rename, so the tap is now synced
+  by hand and this check is what proves it landed.
+
+[3.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.9.0
+
 ## [3.8.0] - 2026-09-19
 
 Schema contracts: `FLOW_SCHEMA` 1.42.0 to 1.51.0, `CONFIG_SCHEMA` 1.22 to 1.26.
