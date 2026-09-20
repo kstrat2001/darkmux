@@ -37,6 +37,7 @@ use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message, To
 use crate::pace;
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
+use crate::stream_gate::{CutSource, StreamOutcome};
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 
@@ -2770,17 +2771,22 @@ fn run_with_sleeper(
         // one. Read-only from here down.
         let opened_a_new_turn = !resuming_after_checkpoint;
         let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
-        let mut response = if streaming {
-            run_streaming_turn(
+        let (mut response, runtime_cut) = if streaming {
+            let outcome = run_streaming_turn(
                 client,
                 &request,
                 next_seq,
                 trajectory,
                 &mut last_proof_of_work,
                 &mut inactivity_soft_warning_fired_in_window,
-            )?
+            )?;
+            (outcome.response, outcome.cut)
         } else {
-            client.chat(&request)?
+            // (#2836) Nothing to observe on a non-streamed call: the whole
+            // response arrives at once, so the runtime never has the chance
+            // to end it early. The server is the only possible cutter here,
+            // and it stays that way through Stage 1.
+            (client.chat(&request)?, CutSource::None)
         };
         // (#1221) A checkpoint continuation is the SAME logical turn resuming,
         // so it must not consume a turn. It is a new API CALL, which is why
@@ -2990,6 +2996,21 @@ fn run_with_sleeper(
         let mut assistant_message = choice.message;
         let finish_reason = choice.finish_reason;
 
+        // (#2836) Who ended this call. Two predicates below — the #479
+        // salvage and the #1221 cap-cliff — used to answer that by comparing
+        // `completion_tokens` against `per_call_cap` inline, resolving an
+        // absent `usage` in OPPOSITE directions four hundred lines apart with
+        // no name on the distinction. `CutSource` carries the reading once.
+        //
+        // The comparison stays against `per_call_cap` — what THIS request
+        // actually sent — deliberately. An earlier attempt keyed it to
+        // `answer_max_tokens`, which stops recognizing a check-in cut as ours
+        // and drops well-formed tool calls that should have dispatched.
+        let cut = match runtime_cut {
+            CutSource::RuntimeAbort(_) => runtime_cut,
+            _ => CutSource::classify(&finish_reason, this_turn_completion_tokens, per_call_cap),
+        };
+
         // Extract reasoning content from `<think>...</think>` blocks in
         // the assistant message content (#204). Thinking-mode models
         // (qwen 3.x line, in particular) emit reasoning inline; we
@@ -3106,10 +3127,15 @@ fn run_with_sleeper(
         // instead. That looked right and was worse: a reasoning turn cut at the
         // check-in interval stops being recognized as our-cut, and its
         // well-formed tool calls get dropped rather than dispatched.
-        let at_cap = this_turn_completion_tokens
-            .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
+        //
+        // (#2836) `is_ours_confirmed` is the same reading this used to
+        // compute inline, named: an absent `usage` answers NO here, because
+        // salvaging DISPATCHES the tool calls that were in flight, and an
+        // unproven "our cap cut it" costs a truncated call reaching a real
+        // tool. The cap-cliff below asks the other question of the same
+        // uncertainty and gets the opposite answer, on purpose.
         let salvaged_per_turn_cap = finish_reason == "length"
-            && at_cap
+            && cut.is_ours_confirmed()
             && assistant_message_has_well_formed_tool_calls(&assistant_message);
         if salvaged_per_turn_cap {
             // (#2169 merge-gate CONSIDER 6) `salvaged_count` measures ONLY
@@ -4322,9 +4348,13 @@ fn run_with_sleeper(
                 //
                 // The overflow diagnosis needs a MEASURED token count below the
                 // cap; without one there is nothing to diagnose from.
-                let cap_cliff = this_turn_completion_tokens
-                    .map(|t| t.saturating_add(1) >= per_call_cap)
-                    .unwrap_or(true);
+                // (#2836) `is_ours_or_unknown` is this reading, named. The
+                // `unwrap_or(true)` it replaces is load-bearing and stays:
+                // "cannot tell" must not route into the hard `Err` below,
+                // which kills the dispatch and every banked checkpoint with
+                // it, and an overflow diagnosis needs a measured count below
+                // the cap to diagnose FROM.
+                let cap_cliff = cut.is_ours_or_unknown();
                 if !is_useless_stall && !cap_cliff {
                     return Err(anyhow!(
                         "model returned finish_reason=length with partial content \
@@ -4805,6 +4835,46 @@ fn run_with_sleeper(
                              repeating; handing it back OPEN so the model continues. (#1221)"
                         );
                     }
+                    // (#2836) Before the pop: say what it destroys.
+                    //
+                    // Reaching here with tool calls attached means every one
+                    // of them failed #479's JSON check — a well-formed call
+                    // would have taken the salvage branch and dispatched.
+                    // They were cut mid-`arguments`, they cannot be sent
+                    // back (malformed arguments 400 the next request), and
+                    // the pop below is where they cease to exist. The model
+                    // meanwhile keeps its own reasoning announcing the work,
+                    // reads a thread where the call never happened, and
+                    // concludes it already answered — measured: a turn whose
+                    // reasoning said "let me rewrite the entire test file"
+                    // spent its next 54 tokens stopping.
+                    //
+                    // This is the ONLY place a tool call is discarded
+                    // silently. The two sibling pops in the stall-recovery
+                    // arms both guard on the message having no tool calls
+                    // before dropping it, so neither can lose one.
+                    //
+                    // Stage 0 records the loss; it does not prevent it.
+                    // Preventing it is Stage 1, which stops placing the cut
+                    // here at all.
+                    if let Some(dropped) = messages.last() {
+                        for tc in dropped.tool_calls.iter().flatten() {
+                            eprintln!(
+                                "darkmux-runtime: ✖ discarded tool call `{}` — the \
+                                 check-in cut it after {} characters of arguments, \
+                                 which do not parse. The call is NOT dispatched and \
+                                 NOT sent back. (#2836)",
+                                tc.function.name,
+                                tc.function.arguments.chars().count()
+                            );
+                            trajectory.append_tool_call_discarded(
+                                turns,
+                                &sanitize_sample_name_prefix(&tc.function.name),
+                                tc.function.arguments.chars().count(),
+                                cut.wire_label(),
+                            );
+                        }
+                    }
                     // A reasoning turn resumes INSIDE its think block; a
                     // plain-answer turn resumes as itself, with no delimiters
                     // invented around it. Either way the truncated raw response
@@ -4869,7 +4939,7 @@ fn run_streaming_turn(
     // hard kill wouldn't.
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
-) -> Result<crate::lmstudio::ChatResponse> {
+) -> Result<StreamOutcome> {
     let (system_chars, prompt_chars) = measure_request_context(&request.messages);
     trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
     let mut accumulator = ChunkAccumulator::new();
@@ -4913,7 +4983,14 @@ fn run_streaming_turn(
             choice.message.reasoning_content = Some(reasoning);
         }
     }
-    Ok(response)
+    // (#2836) Stage 0 drives the stream to its end and never ends it
+    // itself, so the runtime is never the cutter here. Stage 1 feeds each
+    // chunk to a `StreamGate` and reports `RuntimeAbort` when it
+    // intervenes; the caller already routes on this field.
+    Ok(StreamOutcome {
+        response,
+        cut: CutSource::None,
+    })
 }
 
 /// Measure per-turn context size: returns `(system_chars, prompt_chars)`.
@@ -8042,6 +8119,111 @@ mod tests {
     /// generation knob is left at its production default (unset) the whole
     /// time. Priority is: reasoning bound, then generation bound, then the
     /// raw answer bound.
+    /// (#2836) The cut that lands inside a tool call's arguments destroys
+    /// it, and until now destroyed it SILENTLY.
+    ///
+    /// The shape, taken from the proof run (`long-agentic-splash-qwen36-
+    /// 1789870277-1`, turn 15): the model reasons past the check-in twice,
+    /// starts emitting a tool call on the third slice, and the check-in
+    /// lands mid-`arguments`. The JSON does not parse, so #479's salvage
+    /// correctly declines to dispatch it — sending malformed arguments back
+    /// is what 400s the next request. The turn then proceeds as though
+    /// nothing happened: `messages.pop()` drops the whole assistant message
+    /// and the prefill replaces it.
+    ///
+    /// What was missing is any RECORD of that. The trajectory carried a
+    /// `dispatch.checkpoint` saying "handing back the answer so far" and
+    /// nothing at all about the tool call that went with it — so a run that
+    /// lost eighteen tool calls read, from its own artifacts, like a run
+    /// that simply did not use tools. That is a no-blind-runs violation
+    /// independent of the fix: whatever Stage 1 does about the cut, the
+    /// discard has to be visible.
+    ///
+    /// Deliberately NOT asserting that the call survives. It does not, at
+    /// Stage 0, and a test that pretended otherwise would have to be
+    /// rewritten rather than extended when Stage 1 lands.
+    #[test]
+    #[serial_test::serial]
+    fn a_tool_call_the_checkpoint_cut_in_half_is_recorded_as_discarded() {
+        let server = crate::test_support::GuardedMockServer::start();
+        // Arguments truncated mid-string — exactly what a cut inside the
+        // JSON leaves behind, and unparseable by construction.
+        let half_written = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "edit", "arguments": "{\"path\":\"/workspace/te" },
+        }]);
+        // Call 1: an OPEN think block plus the half-written call, stopped
+        // at the check-in's cap-1 (LMStudio reports cap-1 live).
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                !b.contains("<think>rewrite the test file")
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("<think>rewrite the test file"),
+                Some(half_written.clone()),
+                "length",
+                100,
+                // cap-1 of the GENERATION check-in (4000), which is what
+                // bounds a fresh turn's first call before this dispatch has
+                // shown a closed reasoning region. The proof run was cut by
+                // the reasoning check-in at 1000 instead; the discard is the
+                // same either way, because it is the cut landing mid-JSON
+                // that destroys the call, not which interval placed it.
+                3999,
+            ));
+        });
+        // Call 2 (the continuation, carrying the prefill): conclude.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.contains("<think>rewrite the test file")
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 120, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("discard-record").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("edit the test file")];
+        let tools = [Tool::Read, Tool::Edit];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, None, None, None,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("the dispatch itself must survive the discard");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        let discarded: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.tool_call.discarded")
+            .collect();
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the destroyed call must leave exactly one record; trajectory was:\n{traj_text}"
+        );
+        let rec = &discarded[0];
+        assert_eq!(rec["name"], "edit", "the record must name the tool that was lost");
+        assert_eq!(
+            rec["arguments_chars"], 22,
+            "the record must say how much of the call had been written when the cut landed"
+        );
+        assert_eq!(
+            rec["cut"], "server_length",
+            "and who cut it — the seam Stage 1 changes to a runtime abort"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn reasoning_bound_still_wins_over_the_generation_default() {
@@ -11898,6 +12080,83 @@ mod tests {
         assert!(
             err.to_string().contains("context overflow"),
             "the error must name context overflow, got: {err:#}"
+        );
+    }
+
+    /// (#2836) #479's salvage is gated on the cut having been OURS, and
+    /// that half of the condition had never been tested. Deleting it left
+    /// 742/742 green — found by mutation while re-expressing the predicate
+    /// over `CutSource`.
+    ///
+    /// The gap matters because `finish_reason: "length"` is ambiguous on
+    /// the wire. It is what the server says when our own `max_tokens`
+    /// stopped generation AND when the prompt crossed the model's loaded
+    /// context window. Only the token count separates them. Without the
+    /// gate, an overflow that happens to carry a syntactically complete
+    /// tool call gets DISPATCHED — the runtime acts on a turn the model
+    /// never finished thinking, and the operator sees a tool run instead of
+    /// the diagnosis telling them their context window is too small.
+    ///
+    /// Well-formed arguments are the point of the fixture: they are what
+    /// makes the JSON check pass, so the cap comparison is the only thing
+    /// left standing between an overflow and a dispatch.
+    #[test]
+    #[serial_test::serial]
+    fn a_below_cap_length_is_an_overflow_even_when_its_tool_call_parses() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial content"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\"}"
+                    },
+                }])),
+                "length",
+                100,
+                4000,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("overflow-with-call").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("go")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let err = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(10),
+            None,
+            Some(10_000),
+            Some(10_000),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect_err(
+            "a length finish 6,000 tokens below our own cap is the context window, \
+             not us — a parseable tool call inside it does not change whose cut it was",
+        );
+        assert!(
+            err.to_string().contains("context overflow"),
+            "the error must name context overflow, got: {err:#}"
+        );
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        assert!(
+            !traj_text.contains("tool.started"),
+            "the salvage must not have dispatched anything; trajectory was:\n{traj_text}"
         );
     }
 

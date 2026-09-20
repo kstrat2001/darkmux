@@ -605,6 +605,60 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.tool_call.discarded — fires once per tool call that the
+    /// runtime threw away without dispatching it (#2836).
+    ///
+    /// **Why this event exists.** A cut that lands inside a tool call's
+    /// `arguments` leaves JSON that does not parse. #479's salvage declines
+    /// to dispatch it, which is correct — malformed arguments sent back are
+    /// what 400s the next request — and the turn then continues from a
+    /// prefill, with the whole assistant message popped off the thread. Up
+    /// to this event, NOTHING recorded that. A run that lost eighteen tool
+    /// calls this way read, from its own trajectory, like a run that simply
+    /// had not used tools: a `dispatch.checkpoint` saying "handing back the
+    /// answer so far" and no trace of the work that went with it.
+    ///
+    /// `model.completed` does carry the turn's `tool_calls`, so the loss is
+    /// *inferable* — by noticing that a reported call is never followed by
+    /// a `tool.started`. That is a reconstruction, and nobody performed it
+    /// for four months. This states it.
+    ///
+    /// `cut` is [`crate::stream_gate::CutSource::wire_label`] — who ended
+    /// the call. Today that is always `server_length` (the check-in rides
+    /// out as `max_tokens`); Stage 1 moves the check-in client-side and the
+    /// same field starts reading `runtime_abort:*`, which is how a reader
+    /// tells the two eras apart without guessing from a version number.
+    ///
+    /// `arguments_chars` is how much of the call had been written when the
+    /// cut landed — 1 char in the run that proved this, i.e. the model had
+    /// emitted `{` and nothing else.
+    ///
+    /// One event per discarded call, not coalesced like
+    /// `dispatch.tool.malformed_names`. The count is bounded by the shape:
+    /// this path is only reached when NO call in the turn was well-formed
+    /// (one that was would have engaged the salvage instead), so in
+    /// practice it is the single call that was in flight.
+    ///
+    /// `name` arrives pre-sanitized by
+    /// `loop_runner::sanitize_sample_name_prefix` — the event rides into
+    /// flow records and eventually an HTTP-header-bearing hook delivery.
+    pub fn append_tool_call_discarded(
+        &mut self,
+        seq: u32,
+        name: &str,
+        arguments_chars: usize,
+        cut: &str,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.tool_call.discarded",
+            "seq": seq,
+            "ts": unix_ms(),
+            "name": name,
+            "arguments_chars": arguments_chars,
+            "cut": cut,
+        }));
+    }
+
     /// dispatch.tool.malformed_names — fires ONCE per turn where the
     /// model's structured `tool_calls` carried one or more names that
     /// are not in the runtime's allowlist (#2169). Observed live:

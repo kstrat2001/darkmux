@@ -9619,6 +9619,12 @@ impl TailerState {
             | "dispatch.empty_tool_calls.recovered"
             | "dispatch.per_turn_cap.salvaged"
             | "dispatch.tool.malformed_names"
+            // (#2836) A tool call the runtime threw away because the
+            // check-in cut it mid-`arguments`. Forwarded for the same
+            // reason as its siblings: the runtime already records it, and
+            // the loss is only actionable if it reaches the one stream the
+            // operator actually watches.
+            | "dispatch.tool_call.discarded"
             // (#2190) The escalation record itself — see
             // `detector_telemetry_payload`'s own arm for why this rides the
             // same detector-telemetry path rather than a bespoke one.
@@ -10182,6 +10188,27 @@ fn detector_telemetry_payload(
                 ),
             )
         }
+        // (#2836) A tool call destroyed by the check-in. `warn`, not
+        // `info`: unlike its per-turn-cap sibling (which SALVAGED calls and
+        // dispatched them), nothing here was recovered. The model committed
+        // to an action, the harness deleted it, and the model then read a
+        // thread where the action never happened — measured, it concludes
+        // it has already answered and stops.
+        "dispatch.tool_call.discarded" => {
+            let name = str_field("name");
+            let chars = u64_field("arguments_chars");
+            let cut = event
+                .get("cut")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            (
+                "discarded_tool_call",
+                "warn",
+                format!(
+                    "tool call `{name}` was cut after {chars} characters of arguments                      (cut={cut}) — the JSON does not parse, so it was neither dispatched                      nor sent back; that turn's work is gone (#2836)"
+                ),
+            )
+        }
         "dispatch.tool.malformed_names" => {
             let count = u64_field("count");
             let model = str_field("model");
@@ -10265,6 +10292,19 @@ fn detector_telemetry_payload(
         // field reads as the pre-split meaning.
         payload["reason"] = serde_json::json!(
             event.get("reason").and_then(|v| v.as_str()).unwrap_or("not_a_tool")
+        );
+    }
+
+    // (#2836) Same explicit-field pattern as the block above. `cut` is the
+    // load-bearing one: it is how a reader tells a server-side check-in cut
+    // from the `runtime_abort:*` forms Stage 1 starts emitting, without
+    // inferring it from a runtime version.
+    if event_type == "dispatch.tool_call.discarded" {
+        payload["name"] = event.get("name").cloned().unwrap_or(serde_json::Value::Null);
+        payload["arguments_chars"] =
+            event.get("arguments_chars").cloned().unwrap_or(serde_json::json!(0));
+        payload["cut"] = serde_json::json!(
+            event.get("cut").and_then(|v| v.as_str()).unwrap_or("unknown")
         );
     }
 

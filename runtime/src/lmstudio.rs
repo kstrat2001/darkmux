@@ -22,16 +22,37 @@ use std::time::Duration;
 /// the `--base-url` CLI arg passed to `run`.
 pub const DEFAULT_BASE_URL: &str = "http://host.docker.internal:1234/v1";
 
-/// HTTP timeout for a single chat-completion call. Long-agentic-shape
-/// workloads at 101K context with the bundled-tool-call pattern can
-/// have individual model turns that take 5+ minutes (the model is
-/// reading a large context, reasoning across multiple tool calls, and
-/// generating a response with several tool_calls in one shot). Phase
-/// 6d's first try at 300s timed out mid-generation; 900s gives 15min
-/// of headroom per turn. The container's outer wall-clock guard is a
-/// separate concern; tighten only when measurements show this is
-/// excessive.
-pub const REQUEST_TIMEOUT_SECS: u64 = 900;
+/// How long a chat-completion call may stay SILENT before the runtime
+/// gives up on it — the gap between two reads, not the call's duration.
+///
+/// (#2836) This used to be `AgentBuilder::timeout`, which is ureq's
+/// OVERALL request bound: its own doc says "including DNS resolution,
+/// connection time, redirects, and reading the response body", and that it
+/// "takes precedence over `.timeout_read()`". So 900 bounded how LONG a
+/// turn could take, and a turn that was streaming healthily the whole time
+/// died at 900s as `SSE read failed`.
+///
+/// Nothing hit it while something else kept calls short: the reasoning
+/// check-in chops every call at 1,000 tokens today. That chopping is the
+/// defect #2836 removes — and the lifted-checkpoint proof run contains a
+/// productive 18,875-token call, roughly 940s at the ~20 tok/s measured on
+/// this hardware. Fixing the check-in while leaving an overall bound here
+/// would have traded one failure for another.
+///
+/// As an IDLE bound the same number means what the original comment
+/// intended: a wedged endpoint is caught, a slow one is not punished. It
+/// stays generous deliberately — prompt processing on a large context
+/// delivers no bytes for minutes before the first token, and that silence
+/// is legitimate. A tighter, dispatch-aware version of this bound (the
+/// inactivity soft threshold, which produces an envelope instead of an
+/// error) is Stage 1 of #2836.
+pub const REQUEST_READ_TIMEOUT_SECS: u64 = 900;
+
+/// Bound on establishing the TCP/TLS connection. ureq defaults this to 30s
+/// and honors it independently of every other bound; set explicitly so the
+/// value is readable here rather than inherited from a dependency's
+/// default.
+pub const CONNECT_TIMEOUT_SECS: u64 = 30;
 
 /// One message in the conversation. Mirrors the OpenAI shape exactly so
 /// LMStudio parses it without surprises.
@@ -403,8 +424,26 @@ impl LmStudioClient {
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self::with_base_url_and_read_timeout(
+            base_url,
+            Duration::from_secs(REQUEST_READ_TIMEOUT_SECS),
+        )
+    }
+
+    /// Same client, with the transport bound supplied rather than taken from
+    /// the constant — so a test can express the bound in milliseconds
+    /// instead of waiting out the production value. Production goes through
+    /// [`Self::with_base_url`]; both build the agent here, so a test
+    /// exercises the real builder and not a parallel one.
+    pub fn with_base_url_and_read_timeout(
+        base_url: impl Into<String>,
+        read_timeout: Duration,
+    ) -> Self {
+        // NOT `.timeout()` — that is the overall request bound and it
+        // overrides this one. See `REQUEST_READ_TIMEOUT_SECS`.
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .timeout_read(read_timeout)
+            .timeout_connect(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .build();
         Self {
             base_url: base_url.into(),
@@ -1735,5 +1774,116 @@ mod tests {
         acc.ingest(&tool_call_fragment(0, Some("call"), Some("read"), Some("{}")));
         assert!(acc.has_tool_calls());
     }
-}
+    // ─── (#2836) The transport bound is an IDLE gap, not a deadline ───
 
+    /// Serve one SSE response on a loopback socket, writing `chunks` with
+    /// `gap` between them. Returns the bound address; the thread exits after
+    /// one connection.
+    ///
+    /// Deliberately hand-rolled rather than httpmock: httpmock 0.7 builds
+    /// its response body in full before sending, so it cannot express the
+    /// one property under test — WHEN bytes arrive, not what they are.
+    fn sse_server_with_gaps(chunks: usize, gap: std::time::Duration) -> String {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Drain the request head so the client's write completes.
+            let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: text/event-stream\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            );
+            let _ = sock.flush();
+            for i in 0..chunks {
+                std::thread::sleep(gap);
+                let payload = format!(
+                    "data: {{\"id\":\"c\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"t{i}\"}}}}]}}\n\n"
+                );
+                // Chunked framing, so the body is a genuine stream rather
+                // than a length-delimited blob the client could buffer whole.
+                if sock
+                    .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = sock.flush();
+            }
+            let done = "data: [DONE]\n\n";
+            let _ = sock.write_all(format!("{:x}\r\n{done}\r\n0\r\n\r\n", done.len()).as_bytes());
+            let _ = sock.flush();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn drain(client: &LmStudioClient) -> Result<usize> {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: 0.0,
+            max_tokens: Some(16),
+            response_format: None,
+        };
+        let mut seen = 0usize;
+        for chunk in client.chat_streaming(&req)? {
+            chunk?;
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// A long call must not die just because it is long.
+    ///
+    /// `ureq::AgentBuilder::timeout` is the OVERALL request timeout — ureq's
+    /// own doc: "including DNS resolution, connection time, redirects, and
+    /// reading the response body", and it "takes precedence over
+    /// `.timeout_read()`". So the 900s that was set here bounded total wall
+    /// clock, not silence. That is survivable only while something else keeps
+    /// calls short: today the reasoning check-in chops every call at 1,000
+    /// tokens. #2836 removes that chopping, and the lifted-checkpoint proof
+    /// run contains a productive 18,875-token call — roughly 940s at the
+    /// ~20 tok/s measured on this hardware, which the overall bound would
+    /// have killed mid-generation as `SSE read failed`.
+    ///
+    /// This fixture is that shape in miniature: four chunks at 250ms apart
+    /// is ~1s of streaming against a 500ms bound. Every individual gap is
+    /// comfortably inside the bound; only the TOTAL exceeds it.
+    #[test]
+    fn a_stream_that_keeps_delivering_survives_past_the_bound() {
+        let url = sse_server_with_gaps(4, std::time::Duration::from_millis(250));
+        let client =
+            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(500));
+        let seen = drain(&client).expect(
+            "an active stream must not be killed by a bound it never went idle against \
+             — an Err here means the bound is still a deadline (#2836)",
+        );
+        assert_eq!(seen, 4, "every chunk the server sent must arrive");
+    }
+
+    /// The other half of the same claim: the bound must still FIRE. An idle
+    /// bound that never trips is not a fix, it is a removal — a wedged
+    /// endpoint would then hang until the host's hard kill, which produces
+    /// no envelope.
+    #[test]
+    fn a_stream_that_goes_silent_past_the_bound_still_errors() {
+        let url = sse_server_with_gaps(2, std::time::Duration::from_millis(900));
+        let client =
+            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(300));
+        let err = drain(&client).expect_err("a 900ms gap against a 300ms bound must not succeed");
+        assert!(
+            err.to_string().contains("SSE read failed"),
+            "a read timeout must surface as a read failure, got: {err}"
+        );
+    }
+}
