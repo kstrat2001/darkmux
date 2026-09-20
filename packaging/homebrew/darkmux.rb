@@ -17,17 +17,24 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v1.17.1 (the review-funnel release — prosecution/judgment PR review
-  # contract + pr-reviewer-agentic role for tool-granting cloud review
-  # (#1192), doctor --probe live credential verification (#1191),
-  # pr-review render mode=degraded so a produced-nothing review never reads
-  # green (#1193), and the viewer's local/cloud token split (#1189)). No
-  # data-shape schema changes — drop-in over v1.15.0.
+  # Stable release: v3.9.0 — the check-in that was meant to WATCH a stream
+  # stopped cutting it (#2836). The reasoning checkpoint sent `max_tokens` at
+  # the check-in interval, so the endpoint stopped generating mid tool-call
+  # arguments; the truncated JSON would not parse and was dropped with no
+  # record. Measured 9 destroyed tool calls across 64% of check-in firings,
+  # now 0. A discarded tool call is also recorded now, with `cut` naming
+  # whether the endpoint or the runtime ended it. Also: the fleet hero no
+  # longer counts a LOCAL endpoint as cloud (#2834), and `lab tune` reports
+  # its block total (#2848).
+  #
+  # FLOW_SCHEMA 1.51.0 -> 1.52.0, additive — an older peer ignores the new
+  # detector record rather than rejecting it. CONFIG_SCHEMA unchanged at
+  # 1.26, RULES_SCHEMA at 3.0.0. Drop-in over v3.8.0.
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.8.0.tar.gz"
-  sha256 "83e47c5988778e007ecd98fafd0a6eb48dc13b09b805d7ed416874e7f144aec6"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.9.0.tar.gz"
+  sha256 "78d85df49dfb50a76a38817e4352e65501af2818650b93821ffd80e7c97dfbf1"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
