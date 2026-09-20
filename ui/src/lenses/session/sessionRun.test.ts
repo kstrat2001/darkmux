@@ -148,7 +148,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metrics.find((m) => m.label === "TURNS")?.value).toBe("3");
     // `fmtC` — the COMPACT formatter (`lib/format.ts`), same as legacy's own
     // `fmtC(tokIn)` on the metric tile (NOT `fmtN`'s comma-grouped form).
-    expect(view.metrics.find((m) => m.label === "TOKENS IN")?.value).toBe("1k");
+    expect(view.metrics.find((m) => m.label === "TOKENS IN")?.value).toBe("1.00k");
     expect(view.metrics.find((m) => m.label === "TOKENS OUT")?.value).toBe("200");
     expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:00");
   });
@@ -991,8 +991,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     const ctx = view.metrics.find((m) => m.label.startsWith("CTX"));
     expect(ctx?.label).toBe("CTX PEAK");
-    expect(ctx?.value).toBe("45k"); // done -> headline is peak, not the last sample
-    expect(ctx?.sub).toBe("of 100k");
+    expect(ctx?.value).toBe("45.00k"); // done -> headline is peak, not the last sample
+    expect(ctx?.sub).toBe("of 100.00k");
     // The defect, stated as an assertion: the label must never contain the
     // value it sits beside.
     expect(ctx?.label).not.toContain(ctx?.value ?? "\0");
@@ -1008,8 +1008,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     const ctx = view.metrics.find((m) => m.label.startsWith("CTX"));
     expect(ctx?.label).toBe("CTX NOW");
-    expect(ctx?.value).toBe("19k"); // live -> headline is the LAST sample, not the peak
-    expect(ctx?.sub).toBe("peak 20k · of 262k"); // 262144 -> "262k", the bug's exact number
+    expect(ctx?.value).toBe("19.00k"); // live -> headline is the LAST sample, not the peak
+    expect(ctx?.sub).toBe("peak 20.00k · of 262.14k"); // 262144 -> "262.00k", the bug's exact number
     expect(ctx?.label).not.toContain(ctx?.value ?? "\0");
   });
 
