@@ -1067,11 +1067,31 @@ impl TurnAccum {
     /// written. Judging the thought unconditionally left a non-reasoning turn
     /// measuring an empty string, so degeneracy could never fire and a
     /// repeating answer spun forever.
+    ///
+    /// (#2836) **Falls back to the other region when the chosen one is
+    /// empty**, because that same failure had a mirror image nobody had hit
+    /// yet. A model that reasons exclusively through `reasoning_content`
+    /// earns one honest degenerate verdict; the remedy is `close_thought()`,
+    /// which flips the judged region to the ANSWER — and `absorb` keeps
+    /// routing reasoning to the thought, so the answer never fills. From
+    /// that point the judge read `""` and returned `continue` forever while
+    /// the model reasoned on, unwatched. Measured live: six consecutive
+    /// `judged_chars: 0, verdict: continue` records, then the dispatch died
+    /// on an exhausted budget.
+    ///
+    /// An empty region does not mean "clean", it means the model is not
+    /// writing there. A verdict computed over zero characters is a vacuous
+    /// pass, and this function is where it was manufactured.
     fn carried(&self) -> &str {
-        if self.writing_thought() {
-            self.thought.trim()
+        let (primary, fallback) = if self.writing_thought() {
+            (self.thought.trim(), self.answer.trim())
         } else {
-            self.answer.trim()
+            (self.answer.trim(), self.thought.trim())
+        };
+        if primary.is_empty() {
+            fallback
+        } else {
+            primary
         }
     }
 
@@ -8883,6 +8903,59 @@ mod tests {
     /// both of this feature's shipped defects: nothing downstream can
     /// reconstruct an answer from an orphaned prefill, so `main.rs` hands raw
     /// `<think>` markup over as the deliverable.
+    /// (#2836) The degeneracy judge must never be handed an empty string
+    /// while the model is producing output.
+    ///
+    /// `carried()`'s own doc records the MIRROR of this bug already being
+    /// fixed once: "judging the thought unconditionally left a non-reasoning
+    /// turn measuring an empty string, so degeneracy could never fire and a
+    /// repeating answer spun forever." This is the same bug on the other
+    /// region.
+    ///
+    /// The shape, measured live: a model that reasons exclusively through
+    /// `reasoning_content` gets one honest degenerate verdict, which calls
+    /// `close_thought()`. That flips the judged region from thought to
+    /// ANSWER — and `absorb` keeps routing reasoning to the thought, so the
+    /// answer stays empty. From that moment the judge reads "" and returns
+    /// `continue` forever while the model reasons on, unwatched. Six
+    /// consecutive `judged_chars: 0, verdict: continue` records, then the
+    /// dispatch died on an exhausted budget.
+    ///
+    /// A pass over zero characters is not evidence of health.
+    #[test]
+    fn the_judge_is_never_handed_an_empty_region_while_the_other_one_has_text() {
+        let mut turn = TurnAccum::default();
+        turn.absorb("reasoning that arrives on the separate field", "");
+        assert!(!turn.carried().is_empty(), "precondition: the thought is judged");
+
+        // The degenerate verdict's remedy.
+        turn.close_thought();
+
+        // The model keeps reasoning; content stays empty, as it did live.
+        turn.absorb(" and keeps going on the separate field", "");
+        assert!(
+            !turn.carried().is_empty(),
+            "after concluding, a reasoning-only model must still be judged on \
+             SOMETHING — an empty slice makes every later verdict vacuous"
+        );
+    }
+
+    /// The other direction must keep working: once there IS an answer, that
+    /// is what gets judged. Otherwise this fix would re-introduce the very
+    /// bug `carried()`'s doc says it was written to fix.
+    #[test]
+    fn a_closed_thought_with_a_real_answer_is_judged_on_the_answer() {
+        let mut turn = TurnAccum::default();
+        turn.absorb("some reasoning", "");
+        turn.close_thought();
+        turn.absorb("", "the actual answer text");
+        assert_eq!(
+            turn.carried(),
+            "the actual answer text",
+            "the answer region wins whenever it has content"
+        );
+    }
+
     #[test]
     fn a_new_turn_takes_the_previous_turns_prefill_with_it() {
         let mut messages = vec![Message::system("s"), Message::user("u")];
