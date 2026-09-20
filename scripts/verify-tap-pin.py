@@ -136,7 +136,7 @@ def self_test() -> int:
 
 
 TAP_FORMULA_URL = (
-    "https://raw.githubusercontent.com/kstrat2001/homebrew-darkmux/main/Formula/darkmux.rb"
+    "https://raw.githubusercontent.com/kstrat2001/homebrew-tap/main/Formula/darkmux.rb"
 )
 TARBALL_URL = "https://github.com/kstrat2001/darkmux/archive/refs/tags/{tag}.tar.gz"
 
