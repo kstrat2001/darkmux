@@ -1259,6 +1259,20 @@ impl TurnAccum {
 /// picks these two flags), so checking reasoning first, then generation,
 /// then falling through to the raw answer bound reproduces exactly the
 /// priority the cap-selection block already applied.
+///
+/// (#2836 stage 1) **Which bound a cut names depends on which bound cut it**,
+/// and before this the two could not differ so nothing had to ask. Sending
+/// the check-in interval as `max_tokens` made the observation interval and
+/// the wire ceiling the same number; now a streamed call carries the
+/// ceiling and the interval only governs when the runtime LOOKS. A cut can
+/// therefore come from either, and they are different knobs with different
+/// values and different provenance.
+///
+/// Found by a live run, not by the suite: a call that ran to the 10,000
+/// token ceiling recorded `bound=reasoning_checkpoint_interval/1000` beside
+/// `slice_tokens=10000`. The operator reading that record would tune the
+/// check-in interval to fix a ceiling problem. `cut_bound` below routes on
+/// [`CutSource`] so the record names the knob that actually acted.
 fn active_bound(sent_reasoning_bound: bool, sent_generation_bound: bool, per_call_cap: u32) -> BoundRef {
     let sources = bounds::bound_sources();
     if sent_reasoning_bound {
@@ -1268,6 +1282,41 @@ fn active_bound(sent_reasoning_bound: bool, sent_generation_bound: bool, per_cal
     } else {
         BoundRef::new(BoundKind::MaxTokensPerCall, per_call_cap as u64, sources.max_tokens_per_call)
     }
+}
+
+/// (#2836 stage 1) The bound that ACTUALLY ended this call.
+///
+/// A runtime abort is the observation interval doing its job, so it names
+/// the check-in knob via [`active_bound`]. A server `length` finish is the
+/// wire ceiling, so it names `max_tokens_per_call` and carries the ceiling's
+/// value. On the non-streamed path the two are the same number and this
+/// collapses to the old behavior, which is why no existing record changes.
+fn cut_bound(
+    cut: CutSource,
+    sent_reasoning_bound: bool,
+    sent_generation_bound: bool,
+    per_call_cap: u32,
+    wire_max_tokens: u32,
+) -> BoundRef {
+    // The runtime's own abort IS the observation interval acting.
+    if matches!(cut, CutSource::RuntimeAbort(_)) {
+        return active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+    }
+    // Otherwise the SERVER stopped generating, and which knob that was
+    // depends on which number the wire carried. On the non-streamed path
+    // the wire still carries the check-in interval, so a `length` finish
+    // there is the check-in firing exactly as it always did — this must
+    // stay identical to pre-Stage-1 behavior, and seven regression tests
+    // say so. Only when the wire carries the ceiling instead (the streamed
+    // path) is a server cut a ceiling hit.
+    if wire_max_tokens == per_call_cap {
+        return active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+    }
+    BoundRef::new(
+        BoundKind::MaxTokensPerCall,
+        wire_max_tokens as u64,
+        bounds::bound_sources().max_tokens_per_call,
+    )
 }
 
 /// (#1221/#1123) The mechanics both non-checkpointable shapes share: drop the
@@ -2809,7 +2858,7 @@ fn run_with_sleeper(
                 trajectory,
                 &mut last_proof_of_work,
                 &mut inactivity_soft_warning_fired_in_window,
-                per_call_cap,
+                Watch { interval: per_call_cap, carried: turn.carried() },
             )?;
             (outcome.response, outcome.cut)
         } else {
@@ -3189,7 +3238,7 @@ fn run_with_sleeper(
             // check-in interval or `max_tokens_per_call` — so a remote
             // reader never has to reconstruct it from memory of the design
             // (the miss this whole feature exists to close).
-            let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+            let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
             eprintln!(
                 "darkmux-runtime: ⚡ per-turn-cap salvage — completion_tokens=\
                  {} hit {}; dispatching {} well-formed tool call(s) and \
@@ -3471,7 +3520,7 @@ fn run_with_sleeper(
                         messages.pop();
                     }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
-                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+                    let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
                     trajectory.append_empty_tool_calls_recovered(
                         turns,
                         this_turn_completion_tokens,
@@ -4515,7 +4564,7 @@ fn run_with_sleeper(
                     // prefill is not abandoned, and the turn does not end.
                     // Probed live — a system message after a prefill does NOT
                     // break continuation, so the nudge can sit behind it.
-                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+                    let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
                     recover_intra_turn_stall(
                         &mut messages,
                         trajectory,
@@ -4632,7 +4681,18 @@ fn run_with_sleeper(
                     // to attach PROVENANCE (which `BoundKind` this was, for the
                     // trajectory record below), not to compute the value; all
                     // three of its branches return `per_call_cap` verbatim.
-                    let governing_interval = per_call_cap;
+                    // (#2836 stage 1) Sized by whichever bound actually ended
+                    // this call. A ceiling cut hands over a 10,000-token slice;
+                    // sampling it with a tail sized for the 1,000-token check-in
+                    // judges a fraction of what is there. Same reasoning as
+                    // #2258's original fix, applied now that the two numbers can
+                    // differ.
+                    let governing_interval =
+                        if matches!(cut, CutSource::RuntimeAbort(_)) || wire_max_tokens == per_call_cap {
+                            per_call_cap
+                        } else {
+                            wire_max_tokens
+                        };
                     let tail_ratio = crate::reasoning_loop::tail_repetition_ratio(
                         &carried,
                         crate::reasoning_loop::TAIL_WINDOW_TOKENS,
@@ -4671,7 +4731,7 @@ fn run_with_sleeper(
                     // checkpoint can now name either bound — `active_bound`
                     // reads back whichever one THIS iteration's request
                     // actually carried, same as the salvage site above.
-                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+                    let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
                     trajectory.append_checkpoint(
                         turns,
                         checkpoints_used,
@@ -4944,6 +5004,22 @@ fn run_with_sleeper(
     }
 }
 
+/// (#2836 stage 1) What the in-stream observer needs to do its job.
+///
+/// Grouped rather than passed as two more positional arguments: the pair is
+/// one idea (how often to look, and at what), and `run_streaming_turn`'s
+/// argument list is already at the point where another bare `u32` beside a
+/// `&str` reads as noise.
+struct Watch<'a> {
+    /// How often the runtime looks — the interval that used to ride out as
+    /// `max_tokens` and truncate this call. It no longer reaches the
+    /// endpoint.
+    interval: u32,
+    /// The turn's accumulation from earlier continuations, so the in-stream
+    /// verdict judges the same scope the post-hoc one does.
+    carried: &'a str,
+}
+
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
 /// `model.partial` trajectory event per chunk (stats only — no content
 /// in the events to keep `trajectory.jsonl` bounded), and return the
@@ -4970,18 +5046,16 @@ fn run_streaming_turn(
     // hard kill wouldn't.
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
-    // (#2836 stage 1) The OBSERVATION cadence — the interval that used to
-    // ride out as `max_tokens` and truncate this call. It no longer reaches
-    // the endpoint; it decides how often the runtime looks.
-    observe_interval: u32,
+    watch: Watch<'_>,
 ) -> Result<StreamOutcome> {
     let (system_chars, prompt_chars) = measure_request_context(&request.messages);
     trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
     let mut gate = StreamGate::new(
-        observe_interval,
+        watch.interval,
         crate::reasoning_loop::slice_is_degenerate,
+        watch.carried,
     );
     let mut cut = CutSource::None;
     let stream = client.chat_streaming(request)?;
@@ -5049,11 +5123,29 @@ fn run_streaming_turn(
         }
         response.usage = None;
     }
+    // (#2836) Stamped ONLY on a call that emitted no tool calls, and the
+    // restriction is the whole point rather than a nicety.
+    //
+    // This number exists to check `CHARS_PER_TOKEN`, the constant that
+    // converts the operator's token-denominated check-in interval into the
+    // character cadence the gate actually counts. The gate counts TEXT —
+    // reasoning and content deltas — and deliberately does not accumulate
+    // tool-call argument fragments. `completion_tokens` counts everything
+    // the model generated, arguments included. On a tool-calling call the
+    // denominator therefore contains tokens whose characters are absent
+    // from the numerator, and the ratio collapses: measured live, a median
+    // of 1.58 and a floor of 0.25 on tool-calling calls against 3.93 on
+    // text-only ones, where the constant is right.
+    //
+    // Emitting the collapsed value would have been worse than emitting
+    // nothing: it reads like a calibration, so the obvious conclusion from
+    // a run's median is that the constant is 2x too high and the cadence
+    // should be halved. It is not, and it should not be.
     let chars_per_token = response
         .usage
         .as_ref()
-        .filter(|u| u.completion_tokens > 0)
-        .map(|u| gate.slice_chars() as f32 / u.completion_tokens as f32);
+        .filter(|u| u.completion_tokens > 0 && tool_calls_count == 0)
+        .map(|u| gate.generated_chars() as f32 / u.completion_tokens as f32);
     trajectory.append_model_streaming_end(
         seq,
         partial_count,
@@ -8334,6 +8426,89 @@ mod tests {
         assert!(
             end["chars_per_token"].as_f64().unwrap_or(0.0) > 0.0,
             "the measured ratio must be stamped; got {end}"
+        );
+    }
+
+    /// (#2836, found by a live run rather than by the suite) The
+    /// calibration figure must be absent on a tool-calling call.
+    ///
+    /// The gate's character cadence counts text and deliberately skips
+    /// tool-call argument fragments; `completion_tokens` counts both. Divide
+    /// one by the other on a tool-calling call and the result is not a
+    /// chars-per-token ratio, it is an artifact of how much of the call was
+    /// arguments. Live medians: 3.93 on text-only calls (the constant is 4,
+    /// so it is right) against 1.58 on tool-calling ones. Stamping the
+    /// second kind would invite exactly the wrong conclusion — that the
+    /// cadence fires half as often as it should.
+    #[test]
+    #[serial_test::serial]
+    fn the_cadence_calibration_is_omitted_on_a_tool_calling_call() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let call = serde_json::json!([{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\"}" },
+        }]);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"id":"c","choices":[{"index":0,"delta":{"tool_calls":call}}]}),
+            serde_json::json!({
+                "id":"c",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":40,"total_tokens":50}
+            }),
+        );
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse(&["done"], "stop", 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("calib-omit").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("read x")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(3), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("the dispatch must complete");
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        let ends: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "model.streaming.end")
+            .collect();
+        let tool_call_turn = ends
+            .iter()
+            .find(|v| v["tool_calls_count"].as_u64().unwrap_or(0) > 0)
+            .expect("a tool-calling streaming.end record");
+        assert!(
+            tool_call_turn["chars_per_token"].is_null(),
+            "a tool-calling call must carry NO calibration figure; got {tool_call_turn}"
+        );
+        let text_turn = ends
+            .iter()
+            .find(|v| v["tool_calls_count"].as_u64().unwrap_or(0) == 0)
+            .expect("a text-only streaming.end record");
+        assert!(
+            text_turn["chars_per_token"].as_f64().unwrap_or(0.0) > 0.0,
+            "a text-only call must still carry one; got {text_turn}"
         );
     }
 

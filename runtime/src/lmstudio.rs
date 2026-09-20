@@ -1856,27 +1856,32 @@ mod tests {
     /// ~20 tok/s measured on this hardware, which the overall bound would
     /// have killed mid-generation as `SSE read failed`.
     ///
-    /// This fixture is that shape in miniature: 20 chunks at 100ms apart is
-    /// ~2s of streaming against a 1.5s bound. Every individual gap is
-    /// comfortably inside the bound; only the TOTAL exceeds it.
+    /// This fixture is that shape in miniature: 8 chunks at 500ms apart is
+    /// 4s of streaming against a 3s bound. Every individual gap is inside
+    /// the bound; only the TOTAL exceeds it.
     ///
-    /// The margins are deliberately lopsided (15x per gap, 1.3x on the
-    /// total) because this is the one test here whose correctness depends on
-    /// wall-clock. An earlier revision used 250ms gaps against a 500ms bound
-    /// and passed alone while failing inside the full suite, where 750
-    /// parallel tests stretch a sleep well past its nominal value. A timing
-    /// test has to survive a loaded machine or it is a flake that reports as
-    /// a regression.
+    /// **Sized by the ABSOLUTE stall it has to survive, not by a ratio**, and
+    /// it took three tries to get that right. 250ms against 500ms flaked in
+    /// the full suite; 100ms against 1500ms flaked again; 10ms against 1000ms
+    /// flaked a third time. Chasing the ratio was the error — scheduling
+    /// stalls under load are absolute (tens to hundreds of ms), not
+    /// multiplicative, so a 100x margin on a 10ms sleep still only survives
+    /// 990ms, and shrinking the gap multiplies the number of scheduling
+    /// points that can stall. This shape survives a 2.5s stall at any of
+    /// only 8 points.
+    ///
+    /// A timing test that flakes under load reports a regression that is not
+    /// there, which is worse than having no test.
     #[test]
     fn a_stream_that_keeps_delivering_survives_past_the_bound() {
-        let url = sse_server_with_gaps(20, std::time::Duration::from_millis(100));
+        let url = sse_server_with_gaps(8, std::time::Duration::from_millis(500));
         let client =
-            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(1500));
+            LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(3000));
         let seen = drain(&client).expect(
             "an active stream must not be killed by a bound it never went idle against \
              — an Err here means the bound is still a deadline (#2836)",
         );
-        assert_eq!(seen, 20, "every chunk the server sent must arrive");
+        assert_eq!(seen, 8, "every chunk the server sent must arrive");
     }
 
     /// The other half of the same claim: the bound must still FIRE. An idle

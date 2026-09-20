@@ -227,28 +227,59 @@ pub struct StreamGate {
     /// pre-Stage-1 gate judged the same union (`carried`), so the verdict
     /// sees exactly what it used to.
     slice: String,
+    /// Length of the seeded prefix, so `generated_chars` can subtract it.
+    carried_chars: usize,
     since_boundary: usize,
     observations: u32,
     tool_call_seen: bool,
 }
 
 impl StreamGate {
-    pub fn new(interval_tokens: u32, judge: fn(&str, u32) -> bool) -> Self {
+    /// `carried` is the turn's accumulation SO FAR — everything earlier
+    /// continuations of this same turn produced.
+    ///
+    /// **The verdict must see the whole turn, not this call.** The post-hoc
+    /// gate this replaces judges `turn.carried()` and says why in its own
+    /// comment: *"a model re-treading ground from three checkpoints ago
+    /// produces slices that each look locally novel, so judging one slice in
+    /// isolation cannot see the cycle it exists to catch."*
+    ///
+    /// A first cut of this gate judged only the current call and a live run
+    /// showed the other half of the same coin: one turn aborted SIX times in
+    /// a row, each after a single observation, while the post-hoc judge
+    /// looking at the full accumulation returned `continue` every time. A
+    /// short slice falls into a different regime of the detector (the token
+    /// metric returns "too short to judge" and the char fallback takes over),
+    /// so the two judges disagreed on the same text. Seeding the prefix makes
+    /// them one judge looking at one thing.
+    ///
+    /// The cadence still counts only NEW characters — `since_boundary` starts
+    /// at zero — so a long carried prefix does not immediately trip a
+    /// boundary.
+    pub fn new(interval_tokens: u32, judge: fn(&str, u32) -> bool, carried: &str) -> Self {
         Self {
             interval_chars: (interval_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
             interval_tokens,
             judge,
-            slice: String::new(),
+            slice: carried.to_string(),
+            carried_chars: carried.chars().count(),
             since_boundary: 0,
             observations: 0,
             tool_call_seen: false,
         }
     }
 
+    /// Characters this CALL generated, excluding the carried prefix — the
+    /// numerator for the cadence calibration figure.
+    pub fn generated_chars(&self) -> usize {
+        self.slice.chars().count().saturating_sub(self.carried_chars)
+    }
+
     pub fn observations(&self) -> u32 {
         self.observations
     }
 
+    #[cfg(test)]
     pub fn slice_chars(&self) -> usize {
         self.slice.chars().count()
     }
@@ -354,7 +385,7 @@ mod tests {
     /// could have landed mid-tool-call.
     #[test]
     fn a_clean_stream_is_never_interrupted_however_long_it_runs() {
-        let mut g = StreamGate::new(10, NEVER); // 40-char cadence
+        let mut g = StreamGate::new(10, NEVER, ""); // 40-char cadence
         let mut observed = 0;
         for _ in 0..40 {
             match g.ingest(&chunk(Some("some ordinary reasoning text "), None, false)) {
@@ -370,7 +401,7 @@ mod tests {
     /// fine", literally nothing. That is what makes observation free.
     #[test]
     fn nothing_happens_before_the_first_boundary() {
-        let mut g = StreamGate::new(100, ALWAYS); // 400-char cadence
+        let mut g = StreamGate::new(100, ALWAYS, ""); // 400-char cadence
         for _ in 0..3 {
             assert_eq!(g.ingest(&chunk(None, Some("short"), false)), GateAction::Continue);
         }
@@ -382,7 +413,7 @@ mod tests {
     /// never fire on exactly the models this feature is for.
     #[test]
     fn reasoning_channel_text_advances_the_cadence() {
-        let mut g = StreamGate::new(5, NEVER); // 20-char cadence
+        let mut g = StreamGate::new(5, NEVER, ""); // 20-char cadence
         let a = g.ingest(&chunk(Some("0123456789012345678901234"), None, false));
         assert!(matches!(a, GateAction::Observed { .. }), "got {a:?}");
         assert_eq!(g.observations(), 1);
@@ -390,7 +421,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_slice_at_a_boundary_stops_the_stream() {
-        let mut g = StreamGate::new(5, ALWAYS);
+        let mut g = StreamGate::new(5, ALWAYS, "");
         let a = g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
         assert!(matches!(a, GateAction::Degenerate { .. }), "got {a:?}");
     }
@@ -406,7 +437,7 @@ mod tests {
     /// leaving the model reading a thread where the action never happened.
     #[test]
     fn a_call_that_started_a_tool_call_is_never_judged_again() {
-        let mut g = StreamGate::new(5, ALWAYS); // would cut at every boundary
+        let mut g = StreamGate::new(5, ALWAYS, ""); // would cut at every boundary
         assert_eq!(g.ingest(&chunk(None, None, true)), GateAction::Continue);
         for _ in 0..20 {
             assert_eq!(
@@ -428,10 +459,43 @@ mod tests {
     /// entirely.
     #[test]
     fn boundaries_before_the_tool_call_are_still_judged() {
-        let mut g = StreamGate::new(5, ALWAYS);
+        let mut g = StreamGate::new(5, ALWAYS, "");
         let a = g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
         assert!(matches!(a, GateAction::Degenerate { .. }), "got {a:?}");
         assert_eq!(g.observations(), 1);
+    }
+
+    /// (#2836, found by a live run) The verdict judges the whole TURN, not
+    /// this call. A gate seeded with the turn's accumulation hands the
+    /// detector the same text the post-hoc gate sees.
+    ///
+    /// Without the seed, one real turn aborted six times in a row — each
+    /// after a single observation — while the post-hoc judge on the full
+    /// accumulation returned `continue` every time. Two judges, one turn,
+    /// opposite answers, because a short slice falls into the detector's
+    /// char-fallback regime that a long one never reaches.
+    #[test]
+    fn the_verdict_sees_the_carried_turn_not_just_this_call() {
+        let carried = "earlier reasoning from a previous continuation ".repeat(10);
+        let mut g = StreamGate::new(5, NEVER, &carried);
+        assert_eq!(
+            g.observations(),
+            0,
+            "a long carried prefix must not itself trip a boundary — the cadence \
+             measures NEW text"
+        );
+        assert!(g.slice_chars() >= carried.chars().count());
+        g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
+        assert_eq!(g.observations(), 1, "and the new text still advances it");
+        assert!(
+            g.slice_chars() > carried.chars().count(),
+            "the judged slice is prefix PLUS this call"
+        );
+        assert_eq!(
+            g.generated_chars(),
+            25,
+            "but the calibration numerator counts only what this call generated"
+        );
     }
 
     /// A chunk can deliver several intervals' worth of text at once — on a
@@ -440,7 +504,7 @@ mod tests {
     /// configured interval with every oversized chunk.
     #[test]
     fn an_oversized_chunk_carries_its_remainder_into_the_next_boundary() {
-        let mut g = StreamGate::new(5, NEVER); // 20-char cadence
+        let mut g = StreamGate::new(5, NEVER, ""); // 20-char cadence
         // 38 chars: one boundary now, 18 left over.
         let a = g.ingest(&chunk(None, Some(&"x".repeat(38)), false));
         assert!(matches!(a, GateAction::Observed { .. }), "got {a:?}");
@@ -460,7 +524,7 @@ mod tests {
     fn the_judged_slice_accumulates_across_boundaries() {
         let seen: std::cell::Cell<usize> = std::cell::Cell::new(0);
         // fn-pointer judges cannot capture, so assert via the gate's own view.
-        let mut g = StreamGate::new(5, NEVER);
+        let mut g = StreamGate::new(5, NEVER, "");
         g.ingest(&chunk(None, Some("aaaaaaaaaaaaaaaaaaaaa"), false));
         let after_first = g.slice_chars();
         g.ingest(&chunk(None, Some("bbbbbbbbbbbbbbbbbbbbb"), false));
