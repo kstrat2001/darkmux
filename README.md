@@ -16,7 +16,7 @@ darkmux turns a Mac (or a few of them on a tailnet) into a working local-AI flee
 ## Install
 
 ```bash
-brew tap kstrat2001/darkmux
+brew tap kstrat2001/tap
 brew install darkmux
 
 darkmux init      # config + profiles + agent skills (never overwrites)
@@ -76,7 +76,7 @@ darkmux exists because the [Genesis series](https://darklyenergized.substack.com
 
 ## Status
 
-**v3.8.0** on the [Homebrew tap](https://github.com/kstrat2001/homebrew-darkmux), moving fast: breaking changes ship clean with migration notes, and every release is dogfooded on real work before it tags. Full history: [CHANGELOG.md](CHANGELOG.md).
+**v3.8.0** on the [Homebrew tap](https://github.com/kstrat2001/homebrew-tap), moving fast: breaking changes ship clean with migration notes, and every release is dogfooded on real work before it tags. Full history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 

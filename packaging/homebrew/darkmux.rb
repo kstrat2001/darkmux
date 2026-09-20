@@ -1,10 +1,10 @@
 # This is the source-of-truth Homebrew formula for darkmux. When the custom tap
-# repo (kstrat2001/homebrew-darkmux per #618) is created, this file is copied
+# repo (kstrat2001/homebrew-tap per #618) is created, this file is copied
 # into the tap as Formula/darkmux.rb. Editing it here keeps the formula
 # version-controlled alongside the source it formulates.
 #
 # Operator-facing install path:
-#   brew tap kstrat2001/darkmux
+#   brew tap kstrat2001/tap
 #   brew install darkmux                # stable release (v3.8.0)
 #   brew install --HEAD darkmux         # build from main instead
 #

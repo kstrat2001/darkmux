@@ -1,13 +1,13 @@
 name: Sync Homebrew tap
 
 # When `packaging/homebrew/darkmux.rb` changes on main, propagate the change
-# to the kstrat2001/homebrew-darkmux tap repo by opening a PR there with the
+# to the kstrat2001/homebrew-tap tap repo by opening a PR there with the
 # updated formula. The source-of-truth formula lives in THIS repo; the tap
 # is downstream metadata.
 #
 # Requires a repository secret named HOMEBREW_TAP_TOKEN — a fine-grained
 # personal access token with `Contents: write` + `Pull requests: write`
-# scopes on `kstrat2001/homebrew-darkmux`. Setup is documented in
+# scopes on `kstrat2001/homebrew-tap`. Setup is documented in
 # packaging/homebrew/tap-bootstrap/BOOTSTRAP.md under "Automated sync".
 #
 # Without the secret, the workflow logs a notice and skips the sync — it
@@ -16,7 +16,7 @@ name: Sync Homebrew tap
 # until the operator finishes the PAT setup.
 #
 # References:
-#   - tap repo: https://github.com/kstrat2001/homebrew-darkmux
+#   - tap repo: https://github.com/kstrat2001/homebrew-tap
 #   - bundled tracking issue: #618
 #   - source formula: packaging/homebrew/darkmux.rb
 
@@ -67,7 +67,7 @@ jobs:
         if: steps.check_token.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
-          repository: kstrat2001/homebrew-darkmux
+          repository: kstrat2001/homebrew-tap
           path: tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
@@ -108,7 +108,7 @@ jobs:
             ## Review notes
 
             - Diff is pure formula content (URL, deps, install block, caveats, test block, etc.)
-            - `brew audit --strict kstrat2001/darkmux/darkmux` should still pass after merge
+            - `brew audit --strict kstrat2001/tap/darkmux` should still pass after merge
             - Operators pick up the new formula on their next `brew upgrade --HEAD darkmux`
 
             ## Source of truth

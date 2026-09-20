@@ -314,18 +314,18 @@ gh pr create --title "feat(homebrew): pin formula to stable vNEW" --body "Stable
 
 ## 5. Sync the tap
 
-Merging the formula PR fires `.github/workflows/sync-homebrew-tap.yml`, which opens a PR on `kstrat2001/homebrew-darkmux`. Merge it:
+Merging the formula PR fires `.github/workflows/sync-homebrew-tap.yml`, which opens a PR on `kstrat2001/homebrew-tap`. Merge it:
 ```bash
 gh run list --workflow sync-homebrew-tap.yml --limit 1 --json status,conclusion
-gh pr list --repo kstrat2001/homebrew-darkmux --json number,title
-gh pr merge <N> --repo kstrat2001/homebrew-darkmux --squash
+gh pr list --repo kstrat2001/homebrew-tap --json number,title
+gh pr merge <N> --repo kstrat2001/homebrew-tap --squash
 ```
 
 ## 6. Verify
 
 ```bash
 # formula serves the new tag
-gh api repos/kstrat2001/homebrew-darkmux/contents/Formula/darkmux.rb --jq .content | base64 -d | grep -E "url \"|sha256"
+gh api repos/kstrat2001/homebrew-tap/contents/Formula/darkmux.rb --jq .content | base64 -d | grep -E "url \"|sha256"
 # GHCR runtime image published on the release
 gh run list --workflow "Publish runtime image" --limit 1 --json status,conclusion
 # local dev box: reinstall from source so it matches the tag
