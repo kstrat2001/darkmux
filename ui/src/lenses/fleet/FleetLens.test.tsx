@@ -151,7 +151,7 @@ describe("FleetLens", () => {
     // Two "0" values (local + cloud tokens) render rather than the card
     // disappearing — the "hides late, pops in" defect this port guards
     // against (see `SavingsHero`'s own doc).
-    expect(screen.getByText("darkmux tokens")).toBeInTheDocument();
+    expect(screen.getByText("darkmux tokens")).toBeInTheDocument(); // the section eyebrow
     // (#2834) The cloud tile is withdrawn; one figure is the hero now.
   });
 
@@ -384,7 +384,7 @@ describe("FleetLens", () => {
     // reflow impossible, and a future split would silently reintroduce it.
     const tiles = document.querySelectorAll(".savings .savlead");
     expect(tiles).toHaveLength(1);
-    expect(screen.getByText("darkmux tokens")).toBeInTheDocument();
+    expect(screen.getByText("darkmux tokens")).toBeInTheDocument(); // the section eyebrow
     expect(tiles[0].querySelector(".savnum")!.textContent).toBe("0");
   });
 
@@ -517,7 +517,7 @@ describe("FleetLens", () => {
     // make. So they are counted, and nothing about where they ran is
     // asserted anywhere in the hero.
     await waitFor(() => expect(screen.getByText("1,000")).toBeInTheDocument());
-    expect(screen.getByText("darkmux tokens").previousSibling?.textContent).toBe("1,000");
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("1,000");
     expect(document.querySelectorAll(".savings .savlead")).toHaveLength(1);
     // The withdrawn vocabulary must not survive anywhere in the hero.
     const hero = document.querySelector(".savings")!.textContent ?? "";
@@ -857,7 +857,7 @@ describe("FleetLens", () => {
     // The playhead marker DID move, to the left edge of that fixed axis.
     expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("0%");
     // The hero moved too — the completion is no longer visible at tMin.
-    expect(screen.getByText("darkmux tokens").previousSibling?.textContent).toBe("0");
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
   });
 });
 

@@ -643,7 +643,7 @@ describe("App", () => {
 
     // The hero eyebrow drops the window suffix — these numbers cover the
     // recorded day, not the last 24 hours.
-    expect(screen.getByText("tokens")).toBeInTheDocument();
+    expect(screen.getByText("darkmux tokens")).toBeInTheDocument();
     expect(screen.queryByText(/tokens · last/i)).not.toBeInTheDocument();
 
     // The card counts the DAY's sessions and calls them specialists.

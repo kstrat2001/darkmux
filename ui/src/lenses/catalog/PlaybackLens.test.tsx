@@ -225,7 +225,7 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
     // true max); the midpoint lands after the telemetry, before the close.
     const { rerender } = render(<PlaybackLens date="2026-08-07" playhead={null} />, { wrapper: wrapper() });
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
-    await waitFor(() => expect(screen.getByText("darkmux tokens").previousSibling?.textContent).toBe("600"));
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
     expect(document.querySelector(".sbar")).toHaveClass("done");
     // (#2834) One figure now; there is no separate unattributed tile to be
     // zero. The scrubbing property this test guards is unchanged.
@@ -241,7 +241,7 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
     // dispatched these tokens", which is as true mid-flight as it is after
     // the bookend lands. The bar still flips to in-flight, which is the
     // scrubbing behaviour this test exists for.
-    expect(screen.getByText("darkmux tokens").previousSibling?.textContent).toBe("600");
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("600");
     // The tokens move OUT of the figure when the playhead passes the close
     // edge — the point of this test — rather than into a second bucket.
   });

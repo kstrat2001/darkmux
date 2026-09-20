@@ -161,7 +161,14 @@ function SavingsHero({
           day, not the last 24 hours, and the meta bar already states that
           day's range. (#1800 P2: the suffix was unconditional, so a replayed
           day claimed a window it had not been measured over.) */}
-      <div className="saveyebrow">tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+      {/* (#2834, operator) The section is ABOUT darkmux tokens; the figure
+          is all of them over the window. So the eyebrow names the subject
+          and the label under the number names what the number counts.
+          Before this the two were swapped — the eyebrow said "tokens · last
+          24h" and the label said "darkmux tokens", which read as a section
+          called "tokens" containing a figure called "darkmux tokens", with
+          the window attached to the wrong one. */}
+      <div className="saveyebrow">darkmux tokens</div>
       <div className="savrow">
         {/* (#2834) ONE figure: every token darkmux dispatched in the window.
             It used to be three — local, cloud, unattributed — split on a
@@ -187,7 +194,7 @@ function SavingsHero({
             is the only claim being made. */}
         <div className="savlead">
           <div className="savnum">{settled ? fmtN(t.local + t.cloud + t.unknown) : ""}</div>
-          <div className="savlbl">darkmux tokens</div>
+          <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
         </div>
         <div className="savclasses">
           <Chip value={settled ? fmtC(t.completion) : ""} label="generated" cls="gen" />
