@@ -162,7 +162,14 @@ fn set_session_id_ignores_an_empty_string() {
 /// "Called AT MOST ONCE" — this is the loud, debug-time half of enforcing
 /// that, so a provider bug (or a future caller that doesn't honor the
 /// contract) is caught where the mistake was made, not silently tolerated.
+///
+/// `#[cfg(debug_assertions)]`, not just `#[should_panic]`: `debug_assert!`
+/// COMPILES OUT under `--release`, so in that profile there is no panic to
+/// expect and the test fails on its own expectation rather than on any
+/// behavior. The release half of this contract is covered by the test
+/// below, which asserts the invariant that survives in BOTH profiles.
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "AT MOST ONCE")]
 fn set_session_id_called_twice_panics_in_a_debug_build() {
     let tmp = TempDir::new().unwrap();
@@ -187,7 +194,17 @@ fn set_session_id_called_twice_keeps_the_first_value_past_the_assertion() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         lc.set_session_id("darkmux-coding-second-2");
     }));
-    assert!(result.is_err(), "the debug build must have asserted on the second call");
+    // The PANIC is profile-dependent; the INVARIANT below is not. Asserting
+    // `is_err()` unconditionally is what made this test fail under
+    // `--release`, where `debug_assert!` compiles out and the second call
+    // returns normally. Both profiles are asserted here rather than one
+    // being skipped, so this is the release build's real coverage of the
+    // production path: no panic, and the first value still stands.
+    if cfg!(debug_assertions) {
+        assert!(result.is_err(), "the debug build must have asserted on the second call");
+    } else {
+        assert!(result.is_ok(), "release compiles the debug assertion out, so the second call must return normally");
+    }
     assert_eq!(
         read(tmp.path()).unwrap().session_id.as_deref(),
         Some("darkmux-coding-first-2"),

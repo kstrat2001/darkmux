@@ -77,8 +77,31 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.51.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.52.0";
 // Version history:
+//   1.52.0 (#2836): a new `telemetry.detector` kind, `discarded_tool_call`,
+//           with additive payload keys `name`, `arguments_chars` and `cut`.
+//
+//           It reports a tool call the runtime threw away without
+//           dispatching: the check-in cut inside its `arguments`, the JSON
+//           does not parse, and it can be neither dispatched nor sent back
+//           (malformed arguments fail the next request). Before this the
+//           loss had NO record anywhere — a run that destroyed nine tool
+//           calls read, from its own artifacts, like a run that had not
+//           used tools.
+//
+//           `cut` is the load-bearing key and the reason this is a kind of
+//           its own rather than a field on an existing one: it names WHO
+//           ended the call — `server_length` when the endpoint stopped
+//           generating, `runtime_abort:degenerate` or
+//           `runtime_abort:silent` when darkmux did. #2836 moved the
+//           check-in off the wire, so both eras appear in the same archive
+//           and a reader needs to tell them apart without inferring it
+//           from a version number.
+//
+//           Additive and lenient-on-read as usual: a consumer that does
+//           not know this kind ignores it, exactly as it ignores any other
+//           detector kind it was not written for.
 //   1.51.0 (#2775): new action `machine.rollup` (Category::Machinery,
 //           source `host-sampler`) — ONE periodic record carrying the whole
 //           MACHINE-LENS AGGREGATE, so a harness integrating darkmux as a

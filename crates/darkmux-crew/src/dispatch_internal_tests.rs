@@ -8441,6 +8441,156 @@
         );
     }
 
+    // ─── #2836 tool calls destroyed by the check-in ────────────────────
+
+    /// The mapping test below proves the payload is right; this proves the
+    /// event is FORWARDED at all.
+    ///
+    /// The two are separate guards and only one of them was caught by
+    /// mutation: deleting the event from the tailer's allowlist left every
+    /// other test green, because the mapping function is reachable
+    /// directly. An event that maps perfectly and is never routed is
+    /// invisible in exactly the way this record exists to fix, so the
+    /// allowlist gets its own assertion against a real emitted record.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_forwards_a_discarded_tool_call_onto_the_flow_stream() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-discard".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.tool_call.discarded","seq":15,"ts":1,"name":"edit","arguments_chars":1,"cut":"server_length"}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect(
+                "a discarded tool call must reach the flow stream — no day-file means the \
+                 tailer's allowlist dropped it (#2836)",
+            );
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| {
+                v["session_id"] == "sess-discard"
+                    && v["payload"]["kind"] == "discarded_tool_call"
+            })
+            .collect();
+        assert_eq!(records.len(), 1, "exactly one record; day-file was:\n{contents}");
+        assert_eq!(records[0]["payload"]["name"], "edit");
+        assert_eq!(records[0]["payload"]["cut"], "server_length");
+        assert_eq!(records[0]["payload"]["severity"], "warn");
+    }
+
+
+
+    /// `dispatch.tool_call.discarded` → a detector-telemetry record, so the
+    /// loss reaches the flow stream and the viewer rather than stopping at
+    /// the container's own `trajectory.jsonl`.
+    ///
+    /// Without this arm the runtime's new record is written and then
+    /// dropped on the floor by the forwarding allowlist — visible only to
+    /// someone who already knew to open the trajectory file of a run they
+    /// had no reason to suspect. That is the same invisibility the record
+    /// was added to end.
+    ///
+    /// `name`, `arguments_chars` and `cut` ride as explicit payload fields,
+    /// not only as words inside `detail`: `cut` is how a reader tells a
+    /// server-side check-in cut from the `runtime_abort:*` forms Stage 1
+    /// starts emitting, and that distinction should not require parsing a
+    /// sentence.
+    #[test]
+    fn detector_telemetry_payload_maps_discarded_tool_call_event() {
+        let event = serde_json::json!({
+            "type": "dispatch.tool_call.discarded",
+            "seq": 15,
+            "name": "edit",
+            "arguments_chars": 1,
+            "cut": "server_length",
+        });
+        let payload = detector_telemetry_payload("dispatch.tool_call.discarded", &event)
+            .expect("maps discarded_tool_call");
+        assert_eq!(payload["kind"], "discarded_tool_call");
+        assert_eq!(
+            payload["severity"], "warn",
+            "destroyed work is not an `info` — it is the thing #2836 exists to stop"
+        );
+        assert_eq!(payload["name"], "edit");
+        assert_eq!(payload["arguments_chars"], 1);
+        assert_eq!(payload["cut"], "server_length");
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(
+            detail.contains("edit"),
+            "detail must name the tool that was lost; got {detail:?}"
+        );
+        // The live run is what surfaced this: a swallowed line continuation
+        // in the source literal shipped "of arguments<22 spaces>(cut=..."
+        // straight onto the flow stream. Every assertion above passed on
+        // that string, because `contains` does not care about the gap
+        // between the words it finds.
+        assert!(
+            !detail.contains("  "),
+            "operator-facing prose must not carry the source's own indentation; \
+             got {detail:?}"
+        );
+        assert!(
+            detail.contains("1 character of"),
+            "one character is not '1 characters'; got {detail:?}"
+        );
+    }
+
+    /// The plural arm of the same sentence. Worth its own case because the
+    /// singular is what the proof run actually produced (the model had
+    /// emitted `{` and nothing else), so a fixture built only from the
+    /// observed shape would never exercise the other branch.
+    #[test]
+    fn a_discarded_tool_call_detail_pluralizes_above_one_character() {
+        let event = serde_json::json!({
+            "type": "dispatch.tool_call.discarded",
+            "seq": 3,
+            "name": "write",
+            "arguments_chars": 42,
+            "cut": "runtime_abort:degenerate",
+        });
+        let payload = detector_telemetry_payload("dispatch.tool_call.discarded", &event)
+            .expect("maps discarded_tool_call");
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(detail.contains("42 characters of"), "got {detail:?}");
+        assert!(!detail.contains("  "), "got {detail:?}");
+        // A Stage 1 cut source must read through this path untouched.
+        assert_eq!(payload["cut"], "runtime_abort:degenerate");
+    }
+
     // ─── #2169 malformed structured tool-call names ────────────────────
 
     /// `dispatch.tool.malformed_names` → `{kind:"malformed_tool_names",

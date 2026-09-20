@@ -143,6 +143,28 @@ pub struct Metrics {
     pub final_assistant_preview: String,
 }
 
+/// (#2836) What a checkpoint verdict was, and what it was computed OVER.
+///
+/// Grouped because the emitter's argument list reached eight positional
+/// values and four of them describe one thing.
+///
+/// `judged_chars` exists because the record could not distinguish a judge
+/// that looked and found nothing wrong from a judge that had nothing to look
+/// at. Live: a call emitting 32,001 characters of separate-field reasoning
+/// produced `tail_ratio: null, verdict: continue` here, while the in-stream
+/// gate judging the same turn called it degenerate. Both readings fit that
+/// record — either the two slices differ, or one judge is being handed an
+/// empty string — and nothing written down could tell them apart.
+///
+/// A `continue` over a near-empty slice is not evidence of health. It is a
+/// vacuous pass, and this is the field that makes the difference visible.
+pub struct CheckpointVerdict<'a> {
+    pub slice_tokens: Option<u32>,
+    pub tail_ratio: Option<f32>,
+    pub verdict: &'a str,
+    pub judged_chars: usize,
+}
+
 impl Trajectory {
     /// Open a trajectory file at `<base_dir>/.darkmux-runtime/`. In
     /// production `base_dir` is `RUNTIME_OUT_BASE` (`/darkmux-out`, the
@@ -364,11 +386,10 @@ impl Trajectory {
         &mut self,
         seq: u32,
         checkpoint: u32,
-        slice_tokens: Option<u32>,
-        tail_ratio: Option<f32>,
-        verdict: &str,
+        v: CheckpointVerdict<'_>,
         bound: crate::bounds::BoundRef,
     ) {
+        let CheckpointVerdict { slice_tokens, tail_ratio, verdict, judged_chars } = v;
         let slice = slice_tokens
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null);
@@ -386,6 +407,7 @@ impl Trajectory {
             "slice_tokens": slice,
             "tail_ratio": ratio,
             "verdict": verdict,
+            "judged_chars": judged_chars,
             "bound": bound,
         }));
     }
@@ -602,6 +624,149 @@ impl Trajectory {
             "cap": cap,
             "salvaged_tool_calls": salvaged_tool_calls,
             "bound": bound,
+        }));
+    }
+
+    /// dispatch.tool_call.discarded — fires once per tool call that the
+    /// runtime threw away without dispatching it (#2836).
+    ///
+    /// **Why this event exists.** A cut that lands inside a tool call's
+    /// `arguments` leaves JSON that does not parse. #479's salvage declines
+    /// to dispatch it, which is correct — malformed arguments sent back are
+    /// what 400s the next request — and the turn then continues from a
+    /// prefill, with the whole assistant message popped off the thread. Up
+    /// to this event, NOTHING recorded that. A run that lost eighteen tool
+    /// calls this way read, from its own trajectory, like a run that simply
+    /// had not used tools: a `dispatch.checkpoint` saying "handing back the
+    /// answer so far" and no trace of the work that went with it.
+    ///
+    /// `model.completed` does carry the turn's `tool_calls`, so the loss is
+    /// *inferable* — by noticing that a reported call is never followed by
+    /// a `tool.started`. That is a reconstruction, and nobody performed it
+    /// for four months. This states it.
+    ///
+    /// `cut` is [`crate::stream_gate::CutSource::wire_label`] — who ended
+    /// the call. Today that is always `server_length` (the check-in rides
+    /// out as `max_tokens`); Stage 1 moves the check-in client-side and the
+    /// same field starts reading `runtime_abort:*`, which is how a reader
+    /// tells the two eras apart without guessing from a version number.
+    ///
+    /// `arguments_chars` is how much of the call had been written when the
+    /// cut landed — 1 char in the run that proved this, i.e. the model had
+    /// emitted `{` and nothing else.
+    ///
+    /// One event per discarded call, not coalesced like
+    /// `dispatch.tool.malformed_names`. The count is bounded by the shape:
+    /// this path is only reached when NO call in the turn was well-formed
+    /// (one that was would have engaged the salvage instead), so in
+    /// practice it is the single call that was in flight.
+    ///
+    /// `name` arrives pre-sanitized by
+    /// `loop_runner::sanitize_sample_name_prefix` — the event rides into
+    /// flow records and eventually an HTTP-header-bearing hook delivery.
+    pub fn append_tool_call_discarded(
+        &mut self,
+        seq: u32,
+        name: &str,
+        arguments_chars: usize,
+        cut: &str,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.tool_call.discarded",
+            "seq": seq,
+            "ts": unix_ms(),
+            "name": name,
+            "arguments_chars": arguments_chars,
+            "cut": cut,
+        }));
+    }
+
+    /// dispatch.gate.observation — one look at the stream, and what it
+    /// measured (#2844).
+    ///
+    /// **Why every look and not just the cuts.** A detector threshold is
+    /// only defensible against the distribution it was set on, and darkmux
+    /// could not see its own. `tail_ratio` reached the trajectory only when
+    /// a checkpoint FIRED, so an engine the gate never cuts contributed
+    /// nothing: four clean runs on one engine produced zero samples while a
+    /// second engine produced 58 — the exact inverse of what is needed to
+    /// ask whether one threshold suits both.
+    ///
+    /// The concrete question this exists to answer: `DEGENERATE_TAIL_RATIO`
+    /// is documented as sitting with "enormous margin" between real
+    /// reasoning at 1.000 and synthetic loops at 0.013-0.015. That margin
+    /// was measured on ONE engine's output. If another engine produces a
+    /// continuous distribution across the threshold rather than two
+    /// clusters around it, the margin does not exist for that engine and
+    /// the threshold is cutting a population nobody characterized. This
+    /// record is how that is checked with data instead of asserted.
+    ///
+    /// `ratio` is `None` when the slice was too short for the token metric;
+    /// the char fallback may still have produced `degenerate`.
+    pub fn append_gate_observation(
+        &mut self,
+        seq: u32,
+        observation: u32,
+        slice_chars: usize,
+        ratio: Option<f32>,
+        interval_tokens: u32,
+        degenerate: bool,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.gate.observation",
+            "seq": seq,
+            "ts": unix_ms(),
+            "observation": observation,
+            "slice_chars": slice_chars,
+            "tail_ratio": ratio,
+            "interval_tokens": interval_tokens,
+            "degenerate": degenerate,
+        }));
+    }
+
+    /// dispatch.gate.abort — the in-stream observer ended a call itself
+    /// (#2836).
+    ///
+    /// **Why its own record.** A runtime abort is the one cut in the system
+    /// whose reason cannot otherwise be read back. It never receives a final
+    /// chunk, so `usage` never arrives and the `dispatch.checkpoint` record
+    /// that follows carries `slice_tokens: null`; and that record's
+    /// `tail_ratio` belongs to the POST-HOC judge, which looks at a
+    /// different slice than the gate did. Attributing that ratio to the gate
+    /// is a mistake the data actively invites.
+    ///
+    /// `slice_chars` is everything the verdict saw — the turn's carried
+    /// accumulation plus this call. `generated_chars` is how much of it this
+    /// call produced. The pair separates a turn that has been repeating
+    /// across four continuations from one that started looping inside this
+    /// call, which is the difference between the gate working and the gate
+    /// over-firing.
+    pub fn append_gate_abort(
+        &mut self,
+        seq: u32,
+        observation: u32,
+        slice_chars: usize,
+        generated_chars: usize,
+        interval_tokens: u32,
+        // (#2836) Was a tool call mid-`arguments` when this abort landed?
+        //
+        // It must always be false for a degeneracy abort — the gate
+        // suspends judging for the rest of any call that starts emitting
+        // one, which is the whole point of #2836 — so a `true` here is a
+        // bug announcing itself rather than a statistic. It is the
+        // load-bearing field for the SILENT abort, where a stream dying
+        // mid-tool-call is exactly what the operator needs to know.
+        tool_call_in_flight: bool,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.gate.abort",
+            "tool_call_in_flight": tool_call_in_flight,
+            "seq": seq,
+            "ts": unix_ms(),
+            "observation": observation,
+            "slice_chars": slice_chars,
+            "generated_chars": generated_chars,
+            "interval_tokens": interval_tokens,
         }));
     }
 
@@ -1115,13 +1280,34 @@ impl Trajectory {
         partial_count: u32,
         total_content_chars: usize,
         tool_calls_count: usize,
+        observations: u32,
+        chars_per_token: Option<f32>,
     ) {
+        // (#2836) `observations` is how many times the runtime looked at
+        // this call's output WITHOUT touching it. Folded into the existing
+        // per-call record rather than emitted per boundary on purpose: a
+        // 2-second host sampler once grew to 66% of a day's flow records and
+        // pushed every `dispatch.start` outside the 10k read window, so the
+        // activity chart drew nothing while nine dispatches ran. An
+        // observability record that evicts the work record is the observer
+        // joining the observed. One field on a record that already fires
+        // once per call costs nothing and answers the same question.
+        //
+        // `chars_per_token` is this call's MEASURED ratio (generated chars
+        // over the endpoint's own `completion_tokens`). The observation
+        // cadence is converted from the operator's token-denominated
+        // interval using a constant; this is what makes that constant
+        // checkable against reality instead of assumed. `None` when the
+        // endpoint reported no usage, or on a runtime abort, where no final
+        // usage chunk ever arrives.
         self.write_event(&serde_json::json!({
             "type": "model.streaming.end",
             "seq": seq,
             "partial_count": partial_count,
             "total_content_chars": total_content_chars,
             "tool_calls_count": tool_calls_count,
+            "observations": observations,
+            "chars_per_token": chars_per_token,
             "ts": unix_ms(),
         }));
     }

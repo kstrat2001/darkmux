@@ -37,6 +37,7 @@ use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message, To
 use crate::pace;
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
+use crate::stream_gate::{AbortReason, CutSource, StreamGate, StreamOutcome};
 use crate::tools::{dispatch, Tool};
 use crate::trajectory::Trajectory;
 
@@ -76,6 +77,37 @@ use crate::trajectory::Trajectory;
 /// `SELF_HOSTED_DEFAULT_MAX_TOKENS = 8192` — same defensive shape,
 /// slightly more headroom for thoughtful turns. (#415)
 ///
+/// **(#2836 stage 2) Raised 10,000 -> 32,000, because the reason for 10,000
+/// stopped being true.**
+///
+/// Everything above describes a FAILURE BOUNDARY, and it was set low because
+/// the only way to notice a runaway was to stop and look — the per-call cap
+/// WAS the looking. Since stage 1 the runtime watches the stream as it
+/// arrives and runs the same degeneracy verdict at an observation cadence
+/// that costs nothing, so a runaway is caught by the thing that catches
+/// runaways, and this is free to be what it says it is.
+///
+/// Two of that paragraph's own premises are also now false. "A capped turn's
+/// reasoning is discarded entirely" — it is handed back as a prefill and the
+/// turn resumes. And the cap was never a spend limit: a turn is many CALLS
+/// (a checkpoint continuation does not consume a turn), so the same work
+/// arrives either way; a low cap only decides whether it comes as one
+/// uninterrupted call or several with a re-sent prefill between each,
+/// quadratic in the number of chops. Measured live: 8 calls and 20,000
+/// completion tokens inside ONE turn.
+///
+/// **Why 32,000.** Above the largest PRODUCTIVE call observed (18,875 tokens,
+/// the lifted-checkpoint proof run) with headroom, and well under the
+/// runaway-emission signature this constant was written against (~50K in a
+/// 14-min hang). It stays an absolute value for the reason argued above —
+/// work shape, not RAM tier.
+///
+/// It is enforced by the ENGINE, in tokens, on the wire. A first cut of
+/// stage 2 tried to enforce it client-side so it could land at a safe
+/// boundary; that failed because the runtime counts characters and the true
+/// ratio across 85 real calls spans 0.01 to 3.89 — no constant converts one
+/// to the other. See `stream_gate::StreamGate::ingest`.
+///
 /// (#1221) This is now the DEFAULT, overridable per dispatch via the
 /// `--max-tokens-per-call` runtime flag (host tier:
 /// `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env > `runtime.max_tokens_per_call`
@@ -99,7 +131,7 @@ use crate::trajectory::Trajectory;
 ///
 /// Override: `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env >
 /// `runtime.max_tokens_per_call` config > this default.
-const MAX_TOKENS_PER_CALL: u32 = 10_000;
+const MAX_TOKENS_PER_CALL: u32 = 32_000;
 
 /// (#1221) How far the model reasons between check-ins — a SAMPLING RATE, not a
 /// bound on thinking. A turn may span any number of these.
@@ -279,10 +311,26 @@ fn update_frozen_prompt_turns(prev: Option<u32>, current: u32, frozen: u32) -> u
     }
 }
 
+/// (#2836) No longer says "up to the per-call cap", because that is usually
+/// false now and this is text the MODEL reads.
+///
+/// The message is sent on two paths. One is a call that returned
+/// `tool_calls` with nothing in it. The other is a call the RUNTIME ended
+/// after its own degeneracy check fired — which reached no cap at all; the
+/// runtime stopped reading. Since the ceiling moved to 32,000 and the
+/// check-in came off the wire entirely, a genuine cap hit is now the rare
+/// case rather than the usual one.
+///
+/// A model told it hit a cap it did not hit may reasonably conclude its
+/// output was truncated and that the right response is to be briefer, which
+/// is not what either path is asking for. The wording now states only what
+/// is observably true on both — no tool call, no final answer — and asks
+/// for one of them. Per the model-facing doctrine in CLAUDE.md this stays
+/// directive and literal, and keeps the `[darkmux-runtime]` provenance
+/// prefix.
 const STALL_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
-emitted reasoning tokens up to the per-call cap without producing a tool \
-call or a final answer. Please either invoke a tool to make progress, or \
-provide a direct final answer.";
+ended without a tool call and without a final answer. Please either invoke \
+a tool to make progress, or provide a direct final answer.";
 
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
@@ -1066,11 +1114,31 @@ impl TurnAccum {
     /// written. Judging the thought unconditionally left a non-reasoning turn
     /// measuring an empty string, so degeneracy could never fire and a
     /// repeating answer spun forever.
+    ///
+    /// (#2836) **Falls back to the other region when the chosen one is
+    /// empty**, because that same failure had a mirror image nobody had hit
+    /// yet. A model that reasons exclusively through `reasoning_content`
+    /// earns one honest degenerate verdict; the remedy is `close_thought()`,
+    /// which flips the judged region to the ANSWER — and `absorb` keeps
+    /// routing reasoning to the thought, so the answer never fills. From
+    /// that point the judge read `""` and returned `continue` forever while
+    /// the model reasoned on, unwatched. Measured live: six consecutive
+    /// `judged_chars: 0, verdict: continue` records, then the dispatch died
+    /// on an exhausted budget.
+    ///
+    /// An empty region does not mean "clean", it means the model is not
+    /// writing there. A verdict computed over zero characters is a vacuous
+    /// pass, and this function is where it was manufactured.
     fn carried(&self) -> &str {
-        if self.writing_thought() {
-            self.thought.trim()
+        let (primary, fallback) = if self.writing_thought() {
+            (self.thought.trim(), self.answer.trim())
         } else {
-            self.answer.trim()
+            (self.answer.trim(), self.thought.trim())
+        };
+        if primary.is_empty() {
+            fallback
+        } else {
+            primary
         }
     }
 
@@ -1258,6 +1326,20 @@ impl TurnAccum {
 /// picks these two flags), so checking reasoning first, then generation,
 /// then falling through to the raw answer bound reproduces exactly the
 /// priority the cap-selection block already applied.
+///
+/// (#2836 stage 1) **Which bound a cut names depends on which bound cut it**,
+/// and before this the two could not differ so nothing had to ask. Sending
+/// the check-in interval as `max_tokens` made the observation interval and
+/// the wire ceiling the same number; now a streamed call carries the
+/// ceiling and the interval only governs when the runtime LOOKS. A cut can
+/// therefore come from either, and they are different knobs with different
+/// values and different provenance.
+///
+/// Found by a live run, not by the suite: a call that ran to the 10,000
+/// token ceiling recorded `bound=reasoning_checkpoint_interval/1000` beside
+/// `slice_tokens=10000`. The operator reading that record would tune the
+/// check-in interval to fix a ceiling problem. `cut_bound` below routes on
+/// [`CutSource`] so the record names the knob that actually acted.
 fn active_bound(sent_reasoning_bound: bool, sent_generation_bound: bool, per_call_cap: u32) -> BoundRef {
     let sources = bounds::bound_sources();
     if sent_reasoning_bound {
@@ -1267,6 +1349,41 @@ fn active_bound(sent_reasoning_bound: bool, sent_generation_bound: bool, per_cal
     } else {
         BoundRef::new(BoundKind::MaxTokensPerCall, per_call_cap as u64, sources.max_tokens_per_call)
     }
+}
+
+/// (#2836 stage 1) The bound that ACTUALLY ended this call.
+///
+/// A runtime abort is the observation interval doing its job, so it names
+/// the check-in knob via [`active_bound`]. A server `length` finish is the
+/// wire ceiling, so it names `max_tokens_per_call` and carries the ceiling's
+/// value. On the non-streamed path the two are the same number and this
+/// collapses to the old behavior, which is why no existing record changes.
+fn cut_bound(
+    cut: CutSource,
+    sent_reasoning_bound: bool,
+    sent_generation_bound: bool,
+    per_call_cap: u32,
+    wire_max_tokens: u32,
+) -> BoundRef {
+    // The runtime's own abort IS the observation interval acting.
+    if matches!(cut, CutSource::RuntimeAbort(_)) {
+        return active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+    }
+    // Otherwise the SERVER stopped generating, and which knob that was
+    // depends on which number the wire carried. On the non-streamed path
+    // the wire still carries the check-in interval, so a `length` finish
+    // there is the check-in firing exactly as it always did — this must
+    // stay identical to pre-Stage-1 behavior, and seven regression tests
+    // say so. Only when the wire carries the ceiling instead (the streamed
+    // path) is a server cut a ceiling hit.
+    if wire_max_tokens == per_call_cap {
+        return active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+    }
+    BoundRef::new(
+        BoundKind::MaxTokensPerCall,
+        wire_max_tokens as u64,
+        bounds::bound_sources().max_tokens_per_call,
+    )
 }
 
 /// (#1221/#1123) The mechanics both non-checkpointable shapes share: drop the
@@ -2572,6 +2689,52 @@ fn run_with_sleeper(
         // region state still describes the PREVIOUS turn. A first attempt read
         // `turn.writing_thought()` at the salvage site and silently never
         // suppressed anything.
+        // (#2836 stage 1) THE WIRE CARRIES ONLY THE CEILING.
+        //
+        // `per_call_cap` keeps its name and its meaning for everything
+        // downstream — it is the region's OBSERVATION interval, and it still
+        // sizes the degeneracy detector's tail and names the bound in every
+        // record. What changed is that it no longer leaves the machine.
+        //
+        // Sending it as `max_tokens` is what made the check-in destructive:
+        // the bound was enforced SERVER side, so it truncated whatever was in
+        // flight, and `tool_calls` and `content` are separate response
+        // channels but one generation stream. Measured over four runs on
+        // 2026-09-20: 9 of 14 firings (64%) destroyed a tool call, every one
+        // of them an `edit` cut after a single character of arguments.
+        //
+        // The interval was never meant to be a ceiling —
+        // `REASONING_CHECKPOINT_INTERVAL`'s own doc says so. It is a
+        // check-in, and a check-in that deletes the work it is checking on
+        // is not observing, it is interrupting.
+        // The exception, and it is not a carve-out but the same rule: the
+        // interval comes off the wire BECAUSE the runtime can watch the
+        // stream instead. On a non-streamed call there is nothing to watch
+        // — the whole response arrives at once, and the runtime never gets
+        // the chance to intervene before the endpoint has already generated
+        // everything. There the server-side bound is still the only
+        // check-in that exists, so it stays exactly as it was.
+        // (#2836) The wire carries the CEILING, never the check-in interval.
+        //
+        // Sending the interval is what made the check-in destructive: it was
+        // enforced server-side, so it truncated whatever was in flight, and
+        // `tool_calls` and `content` are separate response channels but one
+        // generation stream. Measured over four runs before the fix: 9 of 14
+        // firings destroyed a tool call.
+        //
+        // The ceiling stays here rather than moving client-side, because the
+        // engine counts tokens and the runtime counts characters — see
+        // `MAX_TOKENS_PER_CALL`. Raised to 32,000, it is a genuine-pathology
+        // backstop instead of the thing interrupting ordinary work.
+        //
+        // On a non-streamed call there is nothing to watch, so the wire keeps
+        // the interval exactly as before: the interval can only come off the
+        // wire BECAUSE the runtime can observe the stream instead.
+        let wire_max_tokens = if streaming {
+            answer_max_tokens
+        } else {
+            per_call_cap
+        };
         let sent_reasoning_bound = carries_reasoning_bound;
         // (#2171) Same capture, for the generation bound — read by the
         // salvage nudge guard (never nudge "reduce your reasoning" on a
@@ -2749,7 +2912,7 @@ fn run_with_sleeper(
             tools: tool_defs.clone(),
             tool_choice: Some("auto".into()),
             temperature: 0.2,
-            max_tokens: Some(per_call_cap),
+            max_tokens: Some(wire_max_tokens),
             response_format: response_format.clone(),
         };
 
@@ -2770,17 +2933,26 @@ fn run_with_sleeper(
         // one. Read-only from here down.
         let opened_a_new_turn = !resuming_after_checkpoint;
         let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
-        let mut response = if streaming {
-            run_streaming_turn(
+        let (mut response, runtime_cut) = if streaming {
+            let outcome = run_streaming_turn(
                 client,
                 &request,
                 next_seq,
                 trajectory,
                 &mut last_proof_of_work,
                 &mut inactivity_soft_warning_fired_in_window,
-            )?
+                Watch {
+                    interval: per_call_cap,
+                    carried: turn.carried(),
+                },
+            )?;
+            (outcome.response, outcome.cut)
         } else {
-            client.chat(&request)?
+            // (#2836) Nothing to observe on a non-streamed call: the whole
+            // response arrives at once, so the runtime never has the chance
+            // to end it early. The server is the only possible cutter here,
+            // and it stays that way through Stage 1.
+            (client.chat(&request)?, CutSource::None)
         };
         // (#1221) A checkpoint continuation is the SAME logical turn resuming,
         // so it must not consume a turn. It is a new API CALL, which is why
@@ -2990,6 +3162,21 @@ fn run_with_sleeper(
         let mut assistant_message = choice.message;
         let finish_reason = choice.finish_reason;
 
+        // (#2836) Who ended this call. Two predicates below — the #479
+        // salvage and the #1221 cap-cliff — used to answer that by comparing
+        // `completion_tokens` against `per_call_cap` inline, resolving an
+        // absent `usage` in OPPOSITE directions four hundred lines apart with
+        // no name on the distinction. `CutSource` carries the reading once.
+        //
+        // The comparison stays against `per_call_cap` — what THIS request
+        // actually sent — deliberately. An earlier attempt keyed it to
+        // `answer_max_tokens`, which stops recognizing a check-in cut as ours
+        // and drops well-formed tool calls that should have dispatched.
+        let cut = match runtime_cut {
+            CutSource::RuntimeAbort(_) => runtime_cut,
+            _ => CutSource::classify(&finish_reason, this_turn_completion_tokens, wire_max_tokens),
+        };
+
         // Extract reasoning content from `<think>...</think>` blocks in
         // the assistant message content (#204). Thinking-mode models
         // (qwen 3.x line, in particular) emit reasoning inline; we
@@ -3106,10 +3293,15 @@ fn run_with_sleeper(
         // instead. That looked right and was worse: a reasoning turn cut at the
         // check-in interval stops being recognized as our-cut, and its
         // well-formed tool calls get dropped rather than dispatched.
-        let at_cap = this_turn_completion_tokens
-            .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
+        //
+        // (#2836) `is_ours_confirmed` is the same reading this used to
+        // compute inline, named: an absent `usage` answers NO here, because
+        // salvaging DISPATCHES the tool calls that were in flight, and an
+        // unproven "our cap cut it" costs a truncated call reaching a real
+        // tool. The cap-cliff below asks the other question of the same
+        // uncertainty and gets the opposite answer, on purpose.
         let salvaged_per_turn_cap = finish_reason == "length"
-            && at_cap
+            && cut.is_ours_confirmed()
             && assistant_message_has_well_formed_tool_calls(&assistant_message);
         if salvaged_per_turn_cap {
             // (#2169 merge-gate CONSIDER 6) `salvaged_count` measures ONLY
@@ -3132,7 +3324,7 @@ fn run_with_sleeper(
             // check-in interval or `max_tokens_per_call` — so a remote
             // reader never has to reconstruct it from memory of the design
             // (the miss this whole feature exists to close).
-            let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+            let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
             eprintln!(
                 "darkmux-runtime: ⚡ per-turn-cap salvage — completion_tokens=\
                  {} hit {}; dispatching {} well-formed tool call(s) and \
@@ -3414,7 +3606,7 @@ fn run_with_sleeper(
                         messages.pop();
                     }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
-                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+                    let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
                     trajectory.append_empty_tool_calls_recovered(
                         turns,
                         this_turn_completion_tokens,
@@ -3965,7 +4157,7 @@ fn run_with_sleeper(
                                 max_turns,
                                 cumulative_completion_tokens_used: total_completion_tokens,
                                 max_cumulative_completion_tokens: max_cumulative_tokens,
-                                max_tokens_per_call: per_call_cap,
+                                max_tokens_per_call: wire_max_tokens,
                             };
                             compaction::structured_compact(
                                 compactor_client,
@@ -4322,14 +4514,18 @@ fn run_with_sleeper(
                 //
                 // The overflow diagnosis needs a MEASURED token count below the
                 // cap; without one there is nothing to diagnose from.
-                let cap_cliff = this_turn_completion_tokens
-                    .map(|t| t.saturating_add(1) >= per_call_cap)
-                    .unwrap_or(true);
+                // (#2836) `is_ours_or_unknown` is this reading, named. The
+                // `unwrap_or(true)` it replaces is load-bearing and stays:
+                // "cannot tell" must not route into the hard `Err` below,
+                // which kills the dispatch and every banked checkpoint with
+                // it, and an overflow diagnosis needs a measured count below
+                // the cap to diagnose FROM.
+                let cap_cliff = cut.is_ours_or_unknown();
                 if !is_useless_stall && !cap_cliff {
                     return Err(anyhow!(
                         "model returned finish_reason=length with partial content \
                          BELOW the per-call cap (completion_tokens {} < \
-                         max_tokens_per_call {per_call_cap}) — context overflow: \
+                         max_tokens_per_call {wire_max_tokens}) — context overflow: \
                          prompt_tokens crossed the model's loaded context window. \
                          Compaction may need a smaller threshold or a larger n_ctx.",
                         this_turn_completion_tokens
@@ -4454,7 +4650,7 @@ fn run_with_sleeper(
                     // prefill is not abandoned, and the turn does not end.
                     // Probed live — a system message after a prefill does NOT
                     // break continuation, so the nudge can sit behind it.
-                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+                    let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
                     recover_intra_turn_stall(
                         &mut messages,
                         trajectory,
@@ -4571,7 +4767,18 @@ fn run_with_sleeper(
                     // to attach PROVENANCE (which `BoundKind` this was, for the
                     // trajectory record below), not to compute the value; all
                     // three of its branches return `per_call_cap` verbatim.
-                    let governing_interval = per_call_cap;
+                    // (#2836 stage 1) Sized by whichever bound actually ended
+                    // this call. A ceiling cut hands over a 10,000-token slice;
+                    // sampling it with a tail sized for the 1,000-token check-in
+                    // judges a fraction of what is there. Same reasoning as
+                    // #2258's original fix, applied now that the two numbers can
+                    // differ.
+                    let governing_interval =
+                        if matches!(cut, CutSource::RuntimeAbort(_)) || wire_max_tokens == per_call_cap {
+                            per_call_cap
+                        } else {
+                            wire_max_tokens
+                        };
                     let tail_ratio = crate::reasoning_loop::tail_repetition_ratio(
                         &carried,
                         crate::reasoning_loop::TAIL_WINDOW_TOKENS,
@@ -4610,13 +4817,16 @@ fn run_with_sleeper(
                     // checkpoint can now name either bound — `active_bound`
                     // reads back whichever one THIS iteration's request
                     // actually carried, same as the salvage site above.
-                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
+                    let bound = cut_bound(cut, sent_reasoning_bound, sent_generation_bound, per_call_cap, wire_max_tokens);
                     trajectory.append_checkpoint(
                         turns,
                         checkpoints_used,
-                        this_turn_completion_tokens,
-                        tail_ratio,
-                        if degenerate { "conclude" } else { "continue" },
+                        crate::trajectory::CheckpointVerdict {
+                            slice_tokens: this_turn_completion_tokens,
+                            tail_ratio,
+                            verdict: if degenerate { "conclude" } else { "continue" },
+                            judged_chars: carried.chars().count(),
+                        },
                         bound,
                     );
                     // (#1221) The gate does exactly ONE thing: decide whether
@@ -4805,6 +5015,46 @@ fn run_with_sleeper(
                              repeating; handing it back OPEN so the model continues. (#1221)"
                         );
                     }
+                    // (#2836) Before the pop: say what it destroys.
+                    //
+                    // Reaching here with tool calls attached means every one
+                    // of them failed #479's JSON check — a well-formed call
+                    // would have taken the salvage branch and dispatched.
+                    // They were cut mid-`arguments`, they cannot be sent
+                    // back (malformed arguments 400 the next request), and
+                    // the pop below is where they cease to exist. The model
+                    // meanwhile keeps its own reasoning announcing the work,
+                    // reads a thread where the call never happened, and
+                    // concludes it already answered — measured: a turn whose
+                    // reasoning said "let me rewrite the entire test file"
+                    // spent its next 54 tokens stopping.
+                    //
+                    // This is the ONLY place a tool call is discarded
+                    // silently. The two sibling pops in the stall-recovery
+                    // arms both guard on the message having no tool calls
+                    // before dropping it, so neither can lose one.
+                    //
+                    // Stage 0 records the loss; it does not prevent it.
+                    // Preventing it is Stage 1, which stops placing the cut
+                    // here at all.
+                    if let Some(dropped) = messages.last() {
+                        for tc in dropped.tool_calls.iter().flatten() {
+                            eprintln!(
+                                "darkmux-runtime: ✖ discarded tool call `{}` — the \
+                                 check-in cut it after {} characters of arguments, \
+                                 which do not parse. The call is NOT dispatched and \
+                                 NOT sent back. (#2836)",
+                                tc.function.name,
+                                tc.function.arguments.chars().count()
+                            );
+                            trajectory.append_tool_call_discarded(
+                                turns,
+                                &sanitize_sample_name_prefix(&tc.function.name),
+                                tc.function.arguments.chars().count(),
+                                cut.wire_label(),
+                            );
+                        }
+                    }
                     // A reasoning turn resumes INSIDE its think block; a
                     // plain-answer turn resumes as itself, with no delimiters
                     // invented around it. Either way the truncated raw response
@@ -4843,6 +5093,22 @@ fn run_with_sleeper(
     }
 }
 
+/// (#2836 stage 1) What the in-stream observer needs to do its job.
+///
+/// Grouped rather than passed as two more positional arguments: the pair is
+/// one idea (how often to look, and at what), and `run_streaming_turn`'s
+/// argument list is already at the point where another bare `u32` beside a
+/// `&str` reads as noise.
+struct Watch<'a> {
+    /// How often the runtime looks — the interval that used to ride out as
+    /// `max_tokens` and truncate this call. It no longer reaches the
+    /// endpoint.
+    interval: u32,
+    /// The turn's accumulation from earlier continuations, so the in-stream
+    /// verdict judges the same scope the post-hoc one does.
+    carried: &'a str,
+}
+
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
 /// `model.partial` trajectory event per chunk (stats only — no content
 /// in the events to keep `trajectory.jsonl` bounded), and return the
@@ -4869,14 +5135,45 @@ fn run_streaming_turn(
     // hard kill wouldn't.
     last_proof_of_work: &mut std::time::Instant,
     inactivity_soft_warning_fired_in_window: &mut bool,
-) -> Result<crate::lmstudio::ChatResponse> {
+    watch: Watch<'_>,
+) -> Result<StreamOutcome> {
     let (system_chars, prompt_chars) = measure_request_context(&request.messages);
     trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
+    let mut gate = StreamGate::new(
+        crate::stream_gate::GateBounds { interval_tokens: watch.interval },
+        crate::reasoning_loop::measure_and_judge,
+        watch.carried,
+    );
+    let mut cut = CutSource::None;
     let stream = client.chat_streaming(request)?;
     for chunk_result in stream {
-        let chunk = chunk_result?;
+        // (#2836 stage 2) A SILENT stream ends the turn; it does not kill the
+        // dispatch.
+        //
+        // The read timeout used to propagate as an `Err`, which `main.rs`
+        // turns into `result: "error"` with no envelope, no metrics and no
+        // deliverable — every banked checkpoint of a long turn lost because
+        // the endpoint stopped talking at the end of it. The runtime already
+        // knows how to end a call and hand the accumulation back; this routes
+        // an idle stream into that path instead of off a cliff.
+        //
+        // Genuine transport failures still propagate. The distinction is a
+        // typed marker, not a string match.
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) if e.downcast_ref::<crate::lmstudio::StreamWentSilent>().is_some() => {
+                eprintln!(
+                    "darkmux-runtime: ⏹ the endpoint went silent — ending this call \
+                     and handing back everything it produced, rather than failing the \
+                     dispatch. ({e}) (#2836)"
+                );
+                cut = CutSource::RuntimeAbort(AbortReason::Silent);
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         let partial_index = accumulator.ingest(&chunk);
         let cumulative = accumulator.content_bytes();
         let delta_bytes = cumulative.saturating_sub(last_content_bytes);
@@ -4890,6 +5187,75 @@ fn run_streaming_turn(
         );
         *last_proof_of_work = std::time::Instant::now();
         *inactivity_soft_warning_fired_in_window = false;
+
+        // (#2836 stage 1) Observe. A clean verdict costs zero tokens and
+        // emits nothing the model can see — the stream simply keeps going.
+        // Intervention happens ONLY on detection, which is the inversion
+        // this issue is about: the loop used to cut first and decide after.
+        match gate.ingest(&chunk) {
+            crate::stream_gate::GateAction::Continue => {}
+            // (#2844) A clean observation is RECORDED, not discarded.
+            //
+            // The ratio used to reach the trajectory only when the gate cut,
+            // so an engine the gate never cuts produced no samples at all:
+            // four clean LMStudio runs yielded zero, while splash yielded 58.
+            // That is backwards from what is needed to ask whether one
+            // threshold suits both engines, and it is why darkmux could not
+            // answer that question about its own detector.
+            //
+            // These are cheap — one small record per observation boundary,
+            // a few per call — and they are the only way the threshold's
+            // margin can be checked against a distribution rather than
+            // against the corpus it was originally set on.
+            crate::stream_gate::GateAction::Observed { slice_chars, ratio } => {
+                trajectory.append_gate_observation(
+                    seq,
+                    gate.observations(),
+                    slice_chars,
+                    ratio,
+                    watch.interval,
+                    false,
+                );
+            }
+            crate::stream_gate::GateAction::Degenerate { slice_chars, ratio, generated_chars } => {
+                trajectory.append_gate_observation(
+                    seq,
+                    gate.observations(),
+                    slice_chars,
+                    ratio,
+                    watch.interval,
+                    true,
+                );
+                eprintln!(
+                    "darkmux-runtime: ⏹ observation {} — the output is repeating \
+                     (degeneracy gate) after {slice_chars} characters ({generated_chars} \
+                     of them from this call); ending it at a safe boundary. No tool \
+                     call was in flight. (#2836)",
+                    gate.observations()
+                );
+                // (#2836) The gate's OWN verdict, recorded. Without this a
+                // runtime abort is the one cut in the system whose reason
+                // cannot be read back: `slice_tokens` is null (no usage ever
+                // arrives) and the `tail_ratio` on the checkpoint record
+                // downstream is the POST-HOC judge's number, computed over a
+                // different slice. Two judges disagreeing on one turn is
+                // exactly the failure this needs to be able to see.
+                trajectory.append_gate_abort(
+                    seq,
+                    gate.observations(),
+                    slice_chars,
+                    generated_chars,
+                    watch.interval,
+                    gate.tool_call_in_flight(),
+                );
+                cut = CutSource::RuntimeAbort(AbortReason::Degenerate);
+                // Dropping the stream drops ureq's pooled reader, so the
+                // socket closes rather than returning to the pool
+                // half-read. LMStudio logs `Client disconnected. Stopping
+                // generation...` about a second later.
+                break;
+            }
+        }
     }
     let partial_count = accumulator.partial_count();
     let total_content = accumulator.content_bytes();
@@ -4901,7 +5267,52 @@ fn run_streaming_turn(
         .and_then(|c| c.message.tool_calls.as_ref())
         .map(|tc| tc.len())
         .unwrap_or(0);
-    trajectory.append_model_streaming_end(seq, partial_count, total_content, tool_calls_count);
+    // (#2836 stage 1) A runtime abort never receives the final chunk, so
+    // `finish_reason` and `usage` never arrive — the loop cannot decide
+    // without ending the call, which is why the terminal state is
+    // synthesized here rather than read off the wire. `"length"` is
+    // deliberate: it routes into the arm that already knows how to close a
+    // thought and hand the accumulation back, and `CutSource` carries the
+    // provenance that a token comparison could not (see `is_ours_confirmed`
+    // / `is_ours_or_unknown`, which both answer correctly for an abort with
+    // no usage at all).
+    if matches!(cut, CutSource::RuntimeAbort(_)) {
+        if let Some(choice) = response.choices.first_mut() {
+            choice.finish_reason = "length".to_string();
+        }
+        response.usage = None;
+    }
+    // (#2836) Stamped ONLY on a call that emitted no tool calls, and the
+    // restriction is the whole point rather than a nicety.
+    //
+    // This number exists to check `CHARS_PER_TOKEN`, the constant that
+    // converts the operator's token-denominated check-in interval into the
+    // character cadence the gate actually counts. The gate counts TEXT —
+    // reasoning and content deltas — and deliberately does not accumulate
+    // tool-call argument fragments. `completion_tokens` counts everything
+    // the model generated, arguments included. On a tool-calling call the
+    // denominator therefore contains tokens whose characters are absent
+    // from the numerator, and the ratio collapses: measured live, a median
+    // of 1.58 and a floor of 0.25 on tool-calling calls against 3.93 on
+    // text-only ones, where the constant is right.
+    //
+    // Emitting the collapsed value would have been worse than emitting
+    // nothing: it reads like a calibration, so the obvious conclusion from
+    // a run's median is that the constant is 2x too high and the cadence
+    // should be halved. It is not, and it should not be.
+    let chars_per_token = response
+        .usage
+        .as_ref()
+        .filter(|u| u.completion_tokens > 0 && tool_calls_count == 0)
+        .map(|u| gate.generated_chars() as f32 / u.completion_tokens as f32);
+    trajectory.append_model_streaming_end(
+        seq,
+        partial_count,
+        total_content,
+        tool_calls_count,
+        gate.observations(),
+        chars_per_token,
+    );
     if let Some(reasoning) = reasoning_content {
         trajectory.append_model_reasoning(seq, &reasoning, "separate-field");
         // (#406) Surface reasoning_content on the response message so
@@ -4913,7 +5324,11 @@ fn run_streaming_turn(
             choice.message.reasoning_content = Some(reasoning);
         }
     }
-    Ok(response)
+    // (#2836) Stage 0 drives the stream to its end and never ends it
+    // itself, so the runtime is never the cutter here. Stage 1 feeds each
+    // chunk to a `StreamGate` and reports `RuntimeAbort` when it
+    // intervenes; the caller already routes on this field.
+    Ok(StreamOutcome { response, cut })
 }
 
 /// Measure per-turn context size: returns `(system_chars, prompt_chars)`.
@@ -8035,6 +8450,492 @@ mod tests {
         );
     }
 
+    // ─── #2836 stage 1: the observer on the streaming path ───────────
+    //
+    // NOTE worth carrying: before these, EVERY loop-level test in this file
+    // ran the non-streaming path, while streaming is the production default.
+    // The check-in's whole redesign lives on the streamed path, so it had no
+    // loop-level coverage at all until here.
+
+    /// Build an SSE body: one `data:` chunk per piece, then a terminal chunk
+    /// carrying `finish_reason` and `usage`, then `[DONE]`.
+    fn sse(pieces: &[&str], finish: &str, completion_tokens: u32) -> String {
+        let mut out = String::new();
+        for p in pieces {
+            let delta = serde_json::json!({"content": p});
+            out.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"id":"c","choices":[{"index":0,"delta":delta}]})
+            ));
+        }
+        out.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"c",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish}],
+                "usage":{"prompt_tokens":100,"completion_tokens":completion_tokens,
+                         "total_tokens":100+completion_tokens}
+            })
+        ));
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    /// **The wire change, asserted directly.** A streamed call carries the
+    /// real ceiling as `max_tokens`, never the check-in interval.
+    ///
+    /// This is the whole fix for #2836 stated as a contract: the interval was
+    /// destructive *because* it was enforced server-side, where it truncated
+    /// whatever was in flight. `tool_calls` and `content` are separate
+    /// response channels but one generation stream, so a cut landed wherever
+    /// the model happened to be — measured over four runs, 9 of 14 firings
+    /// (64%) landed mid-`arguments` and destroyed an `edit`.
+    ///
+    /// The mock matches on `max_tokens: 9000` and would 404 on the old
+    /// `1000`, so reverting the wire change reds this test.
+    #[test]
+    #[serial_test::serial]
+    fn a_streamed_call_carries_the_ceiling_on_the_wire_not_the_check_in_interval() {
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"max_tokens":9000}"#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse(&["done"], "stop", 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("wire-ceiling").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, /* streaming */ true, &cfg,
+            Some(3), None,
+            /* max_tokens_per_call  */ Some(9_000),
+            /* reasoning interval   */ Some(1_000),
+            /* generation interval  */ Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect(
+            "a streamed request must carry max_tokens=9000 (the ceiling); an Err here \
+             means the check-in interval is still being enforced server-side (#2836)",
+        );
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+    }
+
+    /// **A clean stream is never interrupted, however far past the interval
+    /// it runs.** 8,000 characters of non-repeating text against a 1,000-token
+    /// check-in: pre-Stage-1 the server would have truncated this twice, each
+    /// cut costing a round trip and a re-sent prefill. Now it is observed and
+    /// left alone.
+    #[test]
+    #[serial_test::serial]
+    fn a_long_clean_stream_runs_to_completion_and_is_observed_for_free() {
+        // Many small chunks, the shape a real stream actually has.
+        let words: Vec<String> = (0..1600).map(|i| format!("w{i} ")).collect();
+        let total: usize = words.iter().map(|w| w.len()).sum();
+        assert!(total > 8_000, "fixture must cross several boundaries");
+        let pieces: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        let body = sse(&pieces, "stop", 2_000);
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("clean-stream").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(3), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a clean stream must complete");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(outcome.turns, 1, "one turn — no continuations, because nothing was cut");
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        assert!(
+            !traj_text.contains("dispatch.checkpoint"),
+            "a healthy turn must produce no check-in cut at all; got:\n{traj_text}"
+        );
+        let end: serde_json::Value = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "model.streaming.end")
+            .expect("a streaming.end record");
+        assert!(
+            end["observations"].as_u64().unwrap_or(0) >= 2,
+            "the runtime must actually have LOOKED, repeatedly, and said nothing; got {end}"
+        );
+        // The calibration that makes the chars-per-token constant checkable
+        // rather than assumed.
+        assert!(
+            end["chars_per_token"].as_f64().unwrap_or(0.0) > 0.0,
+            "the measured ratio must be stamped; got {end}"
+        );
+    }
+
+    /// Build an SSE body whose text arrives on the separate REASONING field,
+    /// which is how the qwen3.x / Splash family delivers thinking.
+    fn sse_reasoning(pieces: &[&str], finish: &str, completion_tokens: u32) -> String {
+        let mut out = String::new();
+        for p in pieces {
+            out.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"id":"c","choices":[{"index":0,
+                    "delta":{"reasoning_content": p}}]})
+            ));
+        }
+        out.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"c",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish}],
+                "usage":{"prompt_tokens":100,"completion_tokens":completion_tokens,
+                         "total_tokens":100+completion_tokens}
+            })
+        ));
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    /// (#2839) A model that will not stop repeating is HANDED OFF after the
+    /// one remedy fails — it does not spin until a budget runs out.
+    ///
+    /// The sequence this pins, which is two calls and not seven:
+    ///
+    ///   call 1  degenerate, thought open   -> close_thought(), hand back
+    ///   call 2  degenerate, thought closed -> escalate, everything banked
+    ///
+    /// The handler for the second line already existed (`degenerate &&
+    /// !writing_thought`). It was UNREACHABLE for this model shape, because
+    /// closing the thought flips the judged region to the answer, a
+    /// separate-field reasoner never writes an answer, and the judge then
+    /// read `""` and returned "not degenerate" forever. Measured live before
+    /// the fix: six consecutive `judged_chars: 0, verdict: continue` records
+    /// on one turn, ~270s of a 273s run, ending on an exhausted generation
+    /// budget rather than on the repetition that actually caused it.
+    ///
+    /// So this test is the proof that fixing the vacuous pass reconnected an
+    /// existing remedy, rather than the proof of new machinery.
+    #[test]
+    #[serial_test::serial]
+    fn a_model_that_keeps_repeating_after_the_conclude_is_handed_off_not_spun() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
+        let body = sse_reasoning(&pieces, "stop", 2_000);
+        let server = crate::test_support::GuardedMockServer::start();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("handoff").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(20), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a non-converging turn is handed off, never fatal");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "the handoff must name the REPETITION, not a budget that ran out \
+             downstream of it",
+        );
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        let checkpoints: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.checkpoint")
+            .collect();
+        assert_eq!(
+            checkpoints.len(),
+            2,
+            "exactly two: the conclude, then the handoff. More than that is the \
+             spin this fixes; the live failure produced seven. Got:\n{}",
+            checkpoints.iter().map(|c| c.to_string()).collect::<Vec<_>>().join("\n")
+        );
+        assert_eq!(checkpoints[0]["verdict"], "conclude");
+        assert_eq!(checkpoints[1]["verdict"], "conclude");
+        for c in &checkpoints {
+            assert!(
+                c["judged_chars"].as_u64().unwrap_or(0) > 0,
+                "and neither verdict may be a pass over nothing: {c}"
+            );
+        }
+    }
+
+    /// (#2836, found by a live run rather than by the suite) The
+    /// calibration figure must be absent on a tool-calling call.
+    ///
+    /// The gate's character cadence counts text and deliberately skips
+    /// tool-call argument fragments; `completion_tokens` counts both. Divide
+    /// one by the other on a tool-calling call and the result is not a
+    /// chars-per-token ratio, it is an artifact of how much of the call was
+    /// arguments. Live medians: 3.93 on text-only calls (the constant is 4,
+    /// so it is right) against 1.58 on tool-calling ones. Stamping the
+    /// second kind would invite exactly the wrong conclusion — that the
+    /// cadence fires half as often as it should.
+    #[test]
+    #[serial_test::serial]
+    fn the_cadence_calibration_is_omitted_on_a_tool_calling_call() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let call = serde_json::json!([{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\"}" },
+        }]);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"id":"c","choices":[{"index":0,"delta":{"tool_calls":call}}]}),
+            serde_json::json!({
+                "id":"c",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":40,"total_tokens":50}
+            }),
+        );
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(sse(&["done"], "stop", 5));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("calib-omit").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("read x")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(3), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("the dispatch must complete");
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        let ends: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "model.streaming.end")
+            .collect();
+        let tool_call_turn = ends
+            .iter()
+            .find(|v| v["tool_calls_count"].as_u64().unwrap_or(0) > 0)
+            .expect("a tool-calling streaming.end record");
+        assert!(
+            tool_call_turn["chars_per_token"].is_null(),
+            "a tool-calling call must carry NO calibration figure; got {tool_call_turn}"
+        );
+        let text_turn = ends
+            .iter()
+            .find(|v| v["tool_calls_count"].as_u64().unwrap_or(0) == 0)
+            .expect("a text-only streaming.end record");
+        assert!(
+            text_turn["chars_per_token"].as_f64().unwrap_or(0.0) > 0.0,
+            "a text-only call must still carry one; got {text_turn}"
+        );
+    }
+
+    /// **And it still intervenes when the thing it exists to catch happens.**
+    /// The same fixture shape, repeating. The runtime ends the call itself —
+    /// the endpoint was never told to stop — and the turn is handed back
+    /// rather than the dispatch dying.
+    #[test]
+    #[serial_test::serial]
+    fn a_degenerate_stream_is_ended_by_the_runtime_not_the_endpoint() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        assert!(looped.len() > 8_000);
+        let server = crate::test_support::GuardedMockServer::start();
+        let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
+        let body = sse(&pieces, "stop", 2_000);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            // finish_reason "stop" deliberately: the ENDPOINT is perfectly
+            // happy. If a cut happens it was the runtime's decision, which is
+            // the whole point of moving the check-in client-side.
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("degen-stream").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(3), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("a degenerate turn must never be fatal to the dispatch");
+        // #1221's EXISTING remedy for a repeating ANSWER region, unchanged
+        // by Stage 1: there is no thought left to close, so the turn cannot
+        // be handed back to continue, and the dispatch escalates with
+        // everything banked so far attached. Asserted rather than smoothed
+        // over — what Stage 1 changes is WHO ended the call, not what
+        // happens afterward.
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+        );
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        assert!(
+            traj_text.contains("dispatch.checkpoint"),
+            "the gate must have intervened on repeating output; got:\n{traj_text}"
+        );
+        assert!(
+            !traj_text.contains("dispatch.tool_call.discarded"),
+            "and it must not have destroyed anything doing it"
+        );
+    }
+
+    /// (#2836) The cut that lands inside a tool call's arguments destroys
+    /// it, and until now destroyed it SILENTLY.
+    ///
+    /// The shape, taken from the proof run (`long-agentic-splash-qwen36-
+    /// 1789870277-1`, turn 15): the model reasons past the check-in twice,
+    /// starts emitting a tool call on the third slice, and the check-in
+    /// lands mid-`arguments`. The JSON does not parse, so #479's salvage
+    /// correctly declines to dispatch it — sending malformed arguments back
+    /// is what 400s the next request. The turn then proceeds as though
+    /// nothing happened: `messages.pop()` drops the whole assistant message
+    /// and the prefill replaces it.
+    ///
+    /// What was missing is any RECORD of that. The trajectory carried a
+    /// `dispatch.checkpoint` saying "handing back the answer so far" and
+    /// nothing at all about the tool call that went with it — so a run that
+    /// lost eighteen tool calls read, from its own artifacts, like a run
+    /// that simply did not use tools. That is a no-blind-runs violation
+    /// independent of the fix: whatever Stage 1 does about the cut, the
+    /// discard has to be visible.
+    ///
+    /// Deliberately NOT asserting that the call survives. It does not, at
+    /// Stage 0, and a test that pretended otherwise would have to be
+    /// rewritten rather than extended when Stage 1 lands.
+    #[test]
+    #[serial_test::serial]
+    fn a_tool_call_the_checkpoint_cut_in_half_is_recorded_as_discarded() {
+        let server = crate::test_support::GuardedMockServer::start();
+        // Arguments truncated mid-string — exactly what a cut inside the
+        // JSON leaves behind, and unparseable by construction.
+        let half_written = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "edit", "arguments": "{\"path\":\"/workspace/te" },
+        }]);
+        // Call 1: an OPEN think block plus the half-written call, stopped
+        // at the check-in's cap-1 (LMStudio reports cap-1 live).
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                !b.contains("<think>rewrite the test file")
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("<think>rewrite the test file"),
+                Some(half_written.clone()),
+                "length",
+                100,
+                // cap-1 of the GENERATION check-in (4000), which is what
+                // bounds a fresh turn's first call before this dispatch has
+                // shown a closed reasoning region. The proof run was cut by
+                // the reasoning check-in at 1000 instead; the discard is the
+                // same either way, because it is the cut landing mid-JSON
+                // that destroys the call, not which interval placed it.
+                3999,
+            ));
+        });
+        // Call 2 (the continuation, carrying the prefill): conclude.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.contains("<think>rewrite the test file")
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 120, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("discard-record").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("edit the test file")];
+        let tools = [Tool::Read, Tool::Edit];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, None, None, None,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("the dispatch itself must survive the discard");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        let discarded: Vec<serde_json::Value> = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["type"] == "dispatch.tool_call.discarded")
+            .collect();
+        assert_eq!(
+            discarded.len(),
+            1,
+            "the destroyed call must leave exactly one record; trajectory was:\n{traj_text}"
+        );
+        let rec = &discarded[0];
+        assert_eq!(rec["name"], "edit", "the record must name the tool that was lost");
+        assert_eq!(
+            rec["arguments_chars"], 22,
+            "the record must say how much of the call had been written when the cut landed"
+        );
+        assert_eq!(
+            rec["cut"], "server_length",
+            "and who cut it — the seam Stage 1 changes to a runtime abort"
+        );
+    }
+
     /// (#2171 test c) #2166's own invariant must survive this change: once a
     /// dispatch has PROVEN it reasons (turn 1 carries a closed `<think>`
     /// block), turn 2's first call still carries the 1000-token REASONING
@@ -8225,6 +9126,59 @@ mod tests {
     /// both of this feature's shipped defects: nothing downstream can
     /// reconstruct an answer from an orphaned prefill, so `main.rs` hands raw
     /// `<think>` markup over as the deliverable.
+    /// (#2836) The degeneracy judge must never be handed an empty string
+    /// while the model is producing output.
+    ///
+    /// `carried()`'s own doc records the MIRROR of this bug already being
+    /// fixed once: "judging the thought unconditionally left a non-reasoning
+    /// turn measuring an empty string, so degeneracy could never fire and a
+    /// repeating answer spun forever." This is the same bug on the other
+    /// region.
+    ///
+    /// The shape, measured live: a model that reasons exclusively through
+    /// `reasoning_content` gets one honest degenerate verdict, which calls
+    /// `close_thought()`. That flips the judged region from thought to
+    /// ANSWER — and `absorb` keeps routing reasoning to the thought, so the
+    /// answer stays empty. From that moment the judge reads "" and returns
+    /// `continue` forever while the model reasons on, unwatched. Six
+    /// consecutive `judged_chars: 0, verdict: continue` records, then the
+    /// dispatch died on an exhausted budget.
+    ///
+    /// A pass over zero characters is not evidence of health.
+    #[test]
+    fn the_judge_is_never_handed_an_empty_region_while_the_other_one_has_text() {
+        let mut turn = TurnAccum::default();
+        turn.absorb("reasoning that arrives on the separate field", "");
+        assert!(!turn.carried().is_empty(), "precondition: the thought is judged");
+
+        // The degenerate verdict's remedy.
+        turn.close_thought();
+
+        // The model keeps reasoning; content stays empty, as it did live.
+        turn.absorb(" and keeps going on the separate field", "");
+        assert!(
+            !turn.carried().is_empty(),
+            "after concluding, a reasoning-only model must still be judged on \
+             SOMETHING — an empty slice makes every later verdict vacuous"
+        );
+    }
+
+    /// The other direction must keep working: once there IS an answer, that
+    /// is what gets judged. Otherwise this fix would re-introduce the very
+    /// bug `carried()`'s doc says it was written to fix.
+    #[test]
+    fn a_closed_thought_with_a_real_answer_is_judged_on_the_answer() {
+        let mut turn = TurnAccum::default();
+        turn.absorb("some reasoning", "");
+        turn.close_thought();
+        turn.absorb("", "the actual answer text");
+        assert_eq!(
+            turn.carried(),
+            "the actual answer text",
+            "the answer region wins whenever it has content"
+        );
+    }
+
     #[test]
     fn a_new_turn_takes_the_previous_turns_prefill_with_it() {
         let mut messages = vec![Message::system("s"), Message::user("u")];
@@ -11901,6 +12855,83 @@ mod tests {
         );
     }
 
+    /// (#2836) #479's salvage is gated on the cut having been OURS, and
+    /// that half of the condition had never been tested. Deleting it left
+    /// 742/742 green — found by mutation while re-expressing the predicate
+    /// over `CutSource`.
+    ///
+    /// The gap matters because `finish_reason: "length"` is ambiguous on
+    /// the wire. It is what the server says when our own `max_tokens`
+    /// stopped generation AND when the prompt crossed the model's loaded
+    /// context window. Only the token count separates them. Without the
+    /// gate, an overflow that happens to carry a syntactically complete
+    /// tool call gets DISPATCHED — the runtime acts on a turn the model
+    /// never finished thinking, and the operator sees a tool run instead of
+    /// the diagnosis telling them their context window is too small.
+    ///
+    /// Well-formed arguments are the point of the fixture: they are what
+    /// makes the JSON check pass, so the cap comparison is the only thing
+    /// left standing between an overflow and a dispatch.
+    #[test]
+    #[serial_test::serial]
+    fn a_below_cap_length_is_an_overflow_even_when_its_tool_call_parses() {
+        let server = crate::test_support::GuardedMockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial content"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\"}"
+                    },
+                }])),
+                "length",
+                100,
+                4000,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("overflow-with-call").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("go")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let err = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(10),
+            None,
+            Some(10_000),
+            Some(10_000),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect_err(
+            "a length finish 6,000 tokens below our own cap is the context window, \
+             not us — a parseable tool call inside it does not change whose cut it was",
+        );
+        assert!(
+            err.to_string().contains("context overflow"),
+            "the error must name context overflow, got: {err:#}"
+        );
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+        assert!(
+            !traj_text.contains("tool.started"),
+            "the salvage must not have dispatched anything; trajectory was:\n{traj_text}"
+        );
+    }
+
     /// Salvage must still dispatch the tool call even when feedback
     /// injection is disabled. The nudge is a no-op but the salvage
     /// path itself stays active — separating queueing from routing.
@@ -14160,28 +15191,52 @@ mod tests {
     ///   fixed `k` no matter how large the interval is, because numerator
     ///   and denominator scale together.
     /// - `max_generation_continuations` is `(answer_max_tokens /
-    ///   generation_interval).max(4)`, which floors at **4** for every ratio
-    ///   at or below 4:1 — 2.5 included.
+    ///   generation_interval).max(4)`.
     ///
-    /// So the budget's stop and the gate's first possible verdict land on
+    /// So the budget's stop and the gate's first possible verdict can land on
     /// the same call, and whichever runs first wins. Measured on the merged
-    /// code at these defaults: checkpoints 1-4 at 1.0000 / 0.5007 / 0.3336 /
-    /// 0.2502, all `continue`, then `EscalationTriggered(GenerationCheckpoint
-    /// BudgetExhausted)` with only FOUR checkpoint records — the 5th call's
-    /// slice, which reads 0.2001 and is plainly degenerate, was never judged.
+    /// code when `MAX_TOKENS_PER_CALL` was 10,000 — a 2.5:1 ratio, floored to
+    /// a budget of 4: checkpoints 1-4 at 1.0000 / 0.5007 / 0.3336 / 0.2502,
+    /// all `continue`, then `EscalationTriggered(GenerationCheckpointBudget
+    /// Exhausted)` with only FOUR checkpoint records — the 5th call's slice,
+    /// which reads 0.2001 and is plainly degenerate, was never judged.
     ///
-    /// The assertions below are the after-state of that same measurement.
+    /// **(#2836 stage 2) The collision is now resolved by arithmetic, and
+    /// this fixture pins the resolution rather than the collision.** Raising
+    /// `MAX_TOKENS_PER_CALL` to 32,000 puts the budget at 8, comfortably past
+    /// the gate's `k = 5`. That is not a happy accident to be re-derived
+    /// later: a repeating turn must end on the REPETITION, which is what
+    /// darkmux observed, rather than on a budget running out, which is an
+    /// accounting fact true of any turn that long. The guard below therefore
+    /// asserts the INVARIANT — the budget must not preempt the gate — instead
+    /// of the particular ratio that happened to be shipping, so a future
+    /// retune of either constant is caught the moment it re-creates the
+    /// defect.
+    ///
+    /// The assertions below are the after-state of that same measurement, and
+    /// they read identically in both regimes: what changed is WHY checkpoint
+    /// 5 exists — #2633 made the gate run before the budget acted; 32,000
+    /// means the budget is not even close.
     #[test]
     #[serial_test::serial]
     fn degeneracy_gate_runs_at_the_shipped_generation_ratio_not_just_a_roomy_one() {
         // The fixture's numbers come from the constants, never from
         // literals — a future retune of either one keeps this honest.
+        // The gate's first possible degenerate verdict is a FIXED k = 5 (the
+        // ratio is ~1/k and numerator and denominator scale together, so the
+        // crossing does not move with the interval). The continuation budget
+        // must leave room to reach it.
+        const GATE_FIRST_VERDICT_AT: u32 = 5;
+        let budget = (MAX_TOKENS_PER_CALL / GENERATION_CHECKPOINT_INTERVAL.max(1)).max(4);
         assert!(
-            (MAX_TOKENS_PER_CALL / GENERATION_CHECKPOINT_INTERVAL.max(1)).max(4) == 4,
-            "this fixture pins the FLOORED case (ratio <= 4:1); at the shipped defaults \
-             {MAX_TOKENS_PER_CALL}/{GENERATION_CHECKPOINT_INTERVAL} the budget must be \
-             the floor, 4 — if that stops being true the collision this test describes \
-             has changed shape and the doc comment above needs rewriting, not the assert"
+            budget >= GATE_FIRST_VERDICT_AT,
+            "the generation-continuation budget ({budget}, from \
+             {MAX_TOKENS_PER_CALL}/{GENERATION_CHECKPOINT_INTERVAL} floored at 4) would \
+             escalate BEFORE the degeneracy gate can first return a verdict (k={GATE_FIRST_VERDICT_AT}). \
+             A repeating turn would then end on 'the budget ran out' instead of on the \
+             repetition darkmux actually observed — #2633's defect, re-created by a \
+             constant retune. Raise MAX_TOKENS_PER_CALL or lower \
+             GENERATION_CHECKPOINT_INTERVAL."
         );
         // One call's worth of output, exactly filling the check-in interval,
         // with every token distinct so the accumulation's period is exactly
@@ -14848,7 +15903,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.matches("ended without a tool call and without a final answer").count() == 0
             });
             then.status(200)
                 .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -14857,7 +15912,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+                    && b.matches("ended without a tool call and without a final answer").count() == 1
             });
             then.status(200).json_body(chat_response_json(
                 None,
@@ -14871,7 +15926,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 1
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+                    && b.matches("ended without a tool call and without a final answer").count() == 1
             });
             then.status(200)
                 .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -14880,7 +15935,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 1
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 2
+                    && b.matches("ended without a tool call and without a final answer").count() == 2
             });
             then.status(200).json_body(chat_response_json(
                 None,
@@ -14894,7 +15949,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 2
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 2
+                    && b.matches("ended without a tool call and without a final answer").count() == 2
             });
             then.status(200)
                 .json_body(chat_response_json(None, None, "tool_calls", 100, 50));
@@ -14982,7 +16037,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 let tools = b.matches("\"role\":\"tool\"").count();
-                let nudges = b.matches("emitted reasoning tokens up to the per-call cap").count();
+                let nudges = b.matches("ended without a tool call and without a final answer").count();
                 nudges < tools * 2 + 2
             });
             then.status(200)
@@ -14992,7 +16047,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 let tools = b.matches("\"role\":\"tool\"").count();
-                let nudges = b.matches("emitted reasoning tokens up to the per-call cap").count();
+                let nudges = b.matches("ended without a tool call and without a final answer").count();
                 nudges >= tools * 2 + 2
             });
             then.status(200).json_body(chat_response_json(
@@ -15092,7 +16147,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.matches("ended without a tool call and without a final answer").count() == 0
                     && !b.contains("PREFILLMARK")
             });
             then.status(200)
@@ -15102,7 +16157,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 0
+                    && b.matches("ended without a tool call and without a final answer").count() == 0
                     && b.contains("PREFILLMARK")
             });
             then.status(200)
@@ -15112,7 +16167,7 @@ mod tests {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
-                    && b.matches("emitted reasoning tokens up to the per-call cap").count() == 1
+                    && b.matches("ended without a tool call and without a final answer").count() == 1
             });
             then.status(200).json_body(chat_response_json(
                 None,

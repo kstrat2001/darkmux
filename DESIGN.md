@@ -153,10 +153,100 @@ Two model-shape accommodations round it out: thinking-mode models route JSON to 
 A local model in an agent loop fails in characteristic ways: re-reading the same file, re-reasoning the same dead end, hammering a tool that keeps erroring, emitting reasoning until it hits the token cap with nothing to show. The internal runtime carries a family of cheap, edge-triggered detectors for these, plus the recovery and budget machinery to act on them. Three design commitments shape the family:
 
 - **Observability before intervention.** Each detector (cycle, reasoning-loop, tool-failure cascade, cadence-drift) writes a trajectory event and, by default, nothing else changes: the MVP is *visible struggle*, not auto-bail. `MAX_TURNS` and the inactivity deadline catch genuinely-stuck dispatches *late*; the detectors exist to surface the struggle *early*, for the operator and (via feedback injection) for the model.
-- **Recover, don't discard.** When a turn hits the per-call token cap but emitted well-formed tool calls, those calls are salvaged rather than treated as a failed turn. A `finish_reason=length` turn with no content and no tool calls (pure runaway reasoning) is dropped, nudged, and retried within a small budget before escalating. Tool calls the model wrote as plain text (bracket, harmony, or darkmux's XML extension) are promoted back to structured calls instead of being lost ([#406](https://github.com/kstrat2001/darkmux/issues/406)). Each recovery is itself a trajectory event so bail/recovery rates stay visible.
+- **Recover, don't discard.** When a turn hits the per-call token cap but emitted well-formed tool calls, those calls are salvaged rather than treated as a failed turn. The check-in that used to create those cap hits no longer truncates anything — see [The check-in](#the-check-in-observing-a-stream-instead-of-truncating-it) below, which supersedes the mechanism described here while keeping the commitment. A `finish_reason=length` turn with no content and no tool calls (pure runaway reasoning) is dropped, nudged, and retried within a small budget before escalating. Tool calls the model wrote as plain text (bracket, harmony, or darkmux's XML extension) are promoted back to structured calls instead of being lost ([#406](https://github.com/kstrat2001/darkmux/issues/406)). Each recovery is itself a trajectory event so bail/recovery rates stay visible.
 - **Feedback injection is the model-facing half.** Detectors and recovery paths queue synthetic `[darkmux-runtime]`-prefixed `system` messages drained into the next turn's prompt: telemetry the model can act on, not just telemetry the operator reads after the fact. The bracketed prefix is the term-provenance contract (see the model-facing-prompt doctrine in [`CLAUDE.md`](CLAUDE.md)); per-signal wording is overridable per role via the manifest's `feedback_templates`, and the whole channel is disable-able with `DARKMUX_FEEDBACK_INJECTION=0`. The deadline and budget caps (`--max-turns` / `--max-tokens`, opt-in; `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` with a 75% soft warning before the host's 100% hard kill) are the coarse backstops underneath the fine-grained detectors.
 
 The unifying principle is operator-sovereignty applied to the runtime: every detector is observable in the trajectory, every nudge is attributable to a named signal, every bound is operator-tunable, and nothing silently changes the dispatch without leaving a record of why.
+
+## The check-in: observing a stream instead of truncating it
+
+A long model turn needs a point at which the runtime can ask "is this still productive?". Before [#2836](https://github.com/kstrat2001/darkmux/issues/2836) that point was created by stopping the model: the check-in interval was sent as `max_tokens` on the chat-completions request, the endpoint truncated the response at that many tokens, and the runtime inspected what came back and handed it forward as a prefill.
+
+### Why that design failed
+
+`tool_calls` and `content` are separate fields in the response, but they are produced by one generation pass. A cut at N tokens lands wherever the model happens to be. When it landed inside a tool call's `arguments`, the result was JSON that does not parse. Such a call cannot be dispatched, and it cannot be sent back either — an assistant message containing malformed `arguments` causes the next request to fail — so it was discarded. The model's own reasoning, which described the action it had just committed to, was handed back with the action missing. Measured: the model reads that transcript, concludes it has already answered, and stops.
+
+Four runs on the same fixture, before the fix: **9 of 14 check-in firings destroyed a tool call (64%)**. Every one was an `edit` call cut after a single character of arguments. No run passed its verify step. The discards left no trajectory record at all, so a run that lost nine tool calls was indistinguishable, from its own artifacts, from a run that had not used tools.
+
+### The design
+
+The interval is no longer sent to the endpoint. It becomes an **observation cadence**: the runtime already receives the response as a stream, so it reads each chunk as it arrives, accumulates the generated text, and at each cadence boundary runs the same degeneracy check the old design ran after truncating. A clean verdict costs nothing — no truncation, no round trip, no re-sent prefill, and nothing the model can observe. Intervention happens only when the check fires.
+
+| Bound | Sent to the endpoint | Enforced by | Purpose |
+|---|---|---|---|
+| Check-in interval (`reasoning_checkpoint_interval_tokens`, `generation_checkpoint_interval_tokens`) | no | runtime, per streamed chunk | how often the output is examined |
+| Per-call ceiling (`max_tokens_per_call`) | yes, as `max_tokens` | endpoint | backstop against unbounded generation |
+| Read timeout | n/a | transport | detects an endpoint that has stopped sending |
+
+Four properties of the runtime-side check are load-bearing:
+
+**The cadence counts characters, not chunks and not tokens.** A staged plan proposed counting chunks, based on a measurement that chunks tracked tokens roughly 1:1 on one engine. Across 61 later calls that ratio ran 0.02 to 1.00 — a 43x spread — because a speculative-decoding engine emits however many draft tokens the verify step accepted in a single chunk. Characters are read directly off the deltas and need no conversion. The token-denominated interval an operator configures is converted using a constant of 4 characters per token, and each call's measured ratio is recorded on `model.streaming.end` so the constant stays checkable. Being wrong there costs cadence, not correctness: a boundary landing early or late only changes how often a healthy stream is examined for free.
+
+**The check is suspended for any call that has begun emitting a tool call.** The degeneracy metric scores JSON at 0.003 against a 0.25 threshold, so a call writing structured arguments reads as maximally repetitive. This is wider than "while the arguments are open" on purpose: once a tool call starts, the check does not run again for the rest of that call. A model that emits a call and then repeats in a long answer is left to the ceiling. Suspending costs nothing; a false positive costs committed work.
+
+**The verdict sees the whole turn, not one call.** A turn is many calls — a check-in continuation deliberately does not consume a turn — and a model re-treading ground from three continuations ago produces calls that each look novel in isolation. The runtime-side check is therefore seeded with the turn's accumulated output before reading the first chunk of the current call. An earlier version judged only the current call and aborted one turn six times in a row while the post-turn check, looking at the full accumulation, returned "continue" every time.
+
+**The runtime ends the stream itself, so the terminal state is synthesized.** `finish_reason` and `usage` arrive only on the endpoint's final chunk, which a runtime abort never receives. The abort therefore sets `finish_reason: "length"` — routing into the existing path that closes the reasoning region and hands the accumulation back — and records the cut source explicitly, because downstream predicates that used to infer "did we cut this?" from a token comparison have no token count to compare.
+
+### Cut sources
+
+Two predicates need to distinguish a bound the runtime imposed from the model's context window overflowing. Both used to compare `completion_tokens` against the cap that was sent, and they resolved an absent `usage` in opposite directions, several hundred lines apart, with nothing naming the difference. They now read a `CutSource`:
+
+| Source | Meaning |
+|---|---|
+| `None` | the model stopped on its own (`stop`, `tool_calls`) |
+| `ServerLength { measured_at_cap }` | the endpoint reported `length`; whether that was our cap is measured, or unknown when no `usage` arrived |
+| `RuntimeAbort(Degenerate \| Silent)` | the runtime ended the stream |
+
+The salvage path asks `is_ours_confirmed()`, where unknown reads as *no*: salvaging dispatches tool calls that may have been truncated. The overflow check asks `is_ours_or_unknown()`, where unknown reads as *yes*: the alternative is a hard error that ends the dispatch and discards every banked continuation, and diagnosing an overflow requires a measured count below the cap to diagnose from.
+
+### The per-call ceiling
+
+`max_tokens_per_call` was documented as a failure boundary against runaway generation, set to 10,000 because the only way to notice a runaway was to stop and look. The runtime-side check now looks continuously, and a runaway is repetition, which is what the check detects. The ceiling is therefore no longer the mechanism that notices anything; it is a backstop.
+
+It is raised to **32,000** and left on the wire. Raised, because the largest productive call observed on this workload was 18,875 tokens and the runaway signature the constant was written against is roughly 50,000. Left on the wire, because the endpoint counts tokens and the runtime counts characters: measured across 85 calls, the true ratio of generated characters to `completion_tokens` spans 0.01 to 3.89, so no constant converts one to the other. An attempt to enforce the ceiling runtime-side failed live for exactly that reason — the runtime was still below its character threshold when the endpoint's own cap cut a tool call at 12,000 tokens.
+
+Two premises in the constant's original rationale are also no longer true, and both were arguments for keeping it low:
+
+- *A capped turn's reasoning is discarded entirely.* It is handed back as a prefill and the turn resumes.
+- *The cap limits what a turn may spend.* It does not. A turn is many calls, so the same work arrives either way; a low cap only decides whether it arrives as one call or several, each re-sending the accumulated prefill. Measured: 8 calls and 20,000 completion tokens inside one turn.
+
+Raising the ceiling also moved `max_generation_continuations`, which is `(max_tokens_per_call / generation_interval).max(4)`, from 4 to 8. That is past the first point at which the degeneracy check can return a verdict on a verbatim loop (a fixed k=5, since the metric's numerator and denominator scale together). A repeating turn now ends on the repetition that was observed rather than on a continuation budget expiring, which is an accounting fact true of any turn of that length. A regression test asserts that relationship directly, so retuning either constant back into collision fails with a message naming the constant to change.
+
+### The silence guard
+
+Repetition is visible in the stream. An endpoint that has stopped sending is not distinguishable from one that is merely slow, which makes silence the one failure this design cannot detect by reading output. It is bounded by the transport instead.
+
+The HTTP client uses a **read** timeout, not an overall request timeout. The distinction matters: the overall timeout in use previously included body read, so it bounded how long a call could take rather than how long it could be idle. Nothing hit it while the check-in was chopping every call at 1,000 tokens; removing that chopping made a single 18,875-token call plausible, which at measured generation rates is close to the 900-second bound.
+
+An idle stream ends the turn as `RuntimeAbort(Silent)` and the accumulation is handed back. Previously it propagated as an error, which produces a dispatch result of `error` with no envelope, no metrics and no deliverable — every banked continuation of a long turn lost because the endpoint went quiet at the end of it. Genuine transport failures still propagate. The two are distinguished by a typed marker rather than by matching on the error's text, because a text match fails silently when a dependency rewords its message and a failed match is indistinguishable from "not a timeout".
+
+### What the records say
+
+| Record | Field | Answers |
+|---|---|---|
+| `dispatch.tool_call.discarded` | `name`, `arguments_chars`, `cut` | a tool call was destroyed, which one, how much was written, and what cut it |
+| `dispatch.gate.abort` | `slice_chars`, `generated_chars`, `tool_call_in_flight` | the runtime ended a call, what it judged, and how much of that was this call |
+| `dispatch.checkpoint` | `judged_chars` | how much text the verdict was computed over |
+| `model.streaming.end` | `observations`, `chars_per_token` | how many times the stream was examined without being touched, and the measured cadence calibration |
+
+`judged_chars` exists because a verdict of "continue" could not previously be distinguished from a check that had nothing to examine. Both appear identical in the record. One turn produced six consecutive `continue` verdicts over **zero characters**: closing the reasoning region switches the examined region to the answer, a model that reasons entirely through the separate `reasoning_content` field never writes an answer, and the check read an empty string from then on. A pass computed over no input is not evidence of health.
+
+`chars_per_token` is recorded only on calls that emitted no tool calls. The cadence counts text and deliberately excludes tool-call arguments; `completion_tokens` counts both. On a tool-calling call the ratio therefore collapses — median 1.58 against 3.93 on text-only calls — and publishing it would suggest the conversion constant is twice too high when it is correct.
+
+### Measured outcome
+
+| | before | after |
+|---|---|---|
+| tool calls destroyed by the check-in | 9 in 61 calls | **0** |
+| share of check-in firings that destroyed work | 64% | 0% |
+| verify passing | 0 of 4 runs | 3 of 4 runs |
+
+### Known gaps
+
+- **The non-streaming path is unchanged.** The interval can only come off the wire because the runtime can observe the stream instead; with `--no-stream` there is nothing to observe, so the endpoint-side bound remains the only check-in available.
+- **A second degenerate verdict after the reasoning region is closed escalates immediately** ([#2839](https://github.com/kstrat2001/darkmux/issues/2839)). That is correct in that it hands off rather than looping, but it leaves one remedy between "continue" and "stop". Two of three runs in one series ended this way; whether the threshold is too eager is not yet measured at a useful sample size.
+- **The conversion constant is a single value for all content.** It is checkable from the records but not yet adaptive.
 
 ## Execution: one substrate, four identities
 

@@ -164,10 +164,23 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(!result, "unroutable address must report unreachable");
-        // 2x budget gives slack for slow CI without papering over a
-        // regression that doubles the timeout (~600ms+ would catch).
+        // 4x, not 2x. The 2x bound flaked on main (2026-09-20): the
+        // coverage job measured 803ms against a 600ms bound and went red,
+        // while the same job passed on a PR minutes earlier. This body runs
+        // inside a `cargo llvm-cov` instrumented binary on a shared runner,
+        // so hundreds of ms of scheduling + instrumentation overhead land
+        // between `Instant::now()` and the syscall returning -- noise that
+        // has nothing to do with the budget being measured.
+        //
+        // Widening does not give up the regression this guards, because
+        // that regression is not a doubled constant (that is a deliberate
+        // edit, visible in review). It is the timeout NOT BEING APPLIED --
+        // `connect` falling back to the OS default, which on macOS is ~75
+        // SECONDS. A 1.2s bound still catches that by ~60x. Tightening this
+        // back to 2x to "catch a doubling" trades a real, enormous signal
+        // for an intermittently-red pipeline.
         assert!(
-            elapsed < std::time::Duration::from_millis(PROBE_TIMEOUT_MS * 2),
+            elapsed < std::time::Duration::from_millis(PROBE_TIMEOUT_MS * 4),
             "probe should respect ~{}ms budget, took {:?}",
             PROBE_TIMEOUT_MS,
             elapsed
