@@ -77,6 +77,37 @@ use crate::trajectory::Trajectory;
 /// `SELF_HOSTED_DEFAULT_MAX_TOKENS = 8192` — same defensive shape,
 /// slightly more headroom for thoughtful turns. (#415)
 ///
+/// **(#2836 stage 2) Raised 10,000 -> 32,000, because the reason for 10,000
+/// stopped being true.**
+///
+/// Everything above describes a FAILURE BOUNDARY, and it was set low because
+/// the only way to notice a runaway was to stop and look — the per-call cap
+/// WAS the looking. Since stage 1 the runtime watches the stream as it
+/// arrives and runs the same degeneracy verdict at an observation cadence
+/// that costs nothing, so a runaway is caught by the thing that catches
+/// runaways, and this is free to be what it says it is.
+///
+/// Two of that paragraph's own premises are also now false. "A capped turn's
+/// reasoning is discarded entirely" — it is handed back as a prefill and the
+/// turn resumes. And the cap was never a spend limit: a turn is many CALLS
+/// (a checkpoint continuation does not consume a turn), so the same work
+/// arrives either way; a low cap only decides whether it comes as one
+/// uninterrupted call or several with a re-sent prefill between each,
+/// quadratic in the number of chops. Measured live: 8 calls and 20,000
+/// completion tokens inside ONE turn.
+///
+/// **Why 32,000.** Above the largest PRODUCTIVE call observed (18,875 tokens,
+/// the lifted-checkpoint proof run) with headroom, and well under the
+/// runaway-emission signature this constant was written against (~50K in a
+/// 14-min hang). It stays an absolute value for the reason argued above —
+/// work shape, not RAM tier.
+///
+/// It is enforced by the ENGINE, in tokens, on the wire. A first cut of
+/// stage 2 tried to enforce it client-side so it could land at a safe
+/// boundary; that failed because the runtime counts characters and the true
+/// ratio across 85 real calls spans 0.01 to 3.89 — no constant converts one
+/// to the other. See `stream_gate::StreamGate::ingest`.
+///
 /// (#1221) This is now the DEFAULT, overridable per dispatch via the
 /// `--max-tokens-per-call` runtime flag (host tier:
 /// `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env > `runtime.max_tokens_per_call`
@@ -85,31 +116,6 @@ use crate::trajectory::Trajectory;
 /// reasoning is discarded entirely), so reasoning-heavy dispatches raise it
 /// explicitly. No fixed number wins both ways — content-based stopping is
 /// the tracked real fix; this knob is the near-term control.
-/// (#2836 stage 2) How far past `answer_max_tokens` the runtime will wait for
-/// an in-flight tool call to finish writing its arguments.
-///
-/// **Why a grace exists at all.** The ceiling used to ride the wire as
-/// `max_tokens`, so the SERVER enforced it and cut wherever the model
-/// happened to be. Stage 1 removed the check-in from the wire and the
-/// check-in discards went to zero; the ceiling kept the same defect at a
-/// tenth the rate, because 10,000 tokens is a rarer place to be mid-call
-/// than 1,000. Measured live once stage 1 had cleared the noise:
-/// `DISCARDED name=edit chars=1 cut=server_length` at `completion_tokens:
-/// 10000` — a tool call destroyed by the ceiling alone.
-///
-/// The wire now carries `answer_max_tokens + CEILING_GRACE_TOKENS` and the
-/// runtime enforces the real ceiling itself, so the server is a backstop
-/// rather than the thing doing the cutting.
-///
-/// **Why 2000.** Sized to cover a real tool call's arguments rather than
-/// guessed: the arguments actually observed on this fixture ran to 8,513 and
-/// 9,803 characters, about 2,100-2,450 tokens on the measured ~4 chars/token
-/// for generated text. 2000 covers the common case without letting a call
-/// that is not converging run indefinitely — a ceiling that waits forever is
-/// not a ceiling. A call that outlasts the grace is ended anyway, and the
-/// record says it was deferred and for how long.
-const CEILING_GRACE_TOKENS: u32 = 2_000;
-
 /// (#1221) The per-call bound for ANSWER output — the model's committed text,
 /// not its scratch work.
 ///
@@ -125,7 +131,7 @@ const CEILING_GRACE_TOKENS: u32 = 2_000;
 ///
 /// Override: `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env >
 /// `runtime.max_tokens_per_call` config > this default.
-const MAX_TOKENS_PER_CALL: u32 = 10_000;
+const MAX_TOKENS_PER_CALL: u32 = 32_000;
 
 /// (#1221) How far the model reasons between check-ins — a SAMPLING RATE, not a
 /// bound on thinking. A turn may span any number of these.
@@ -2692,14 +2698,24 @@ fn run_with_sleeper(
         // the chance to intervene before the endpoint has already generated
         // everything. There the server-side bound is still the only
         // check-in that exists, so it stays exactly as it was.
+        // (#2836) The wire carries the CEILING, never the check-in interval.
+        //
+        // Sending the interval is what made the check-in destructive: it was
+        // enforced server-side, so it truncated whatever was in flight, and
+        // `tool_calls` and `content` are separate response channels but one
+        // generation stream. Measured over four runs before the fix: 9 of 14
+        // firings destroyed a tool call.
+        //
+        // The ceiling stays here rather than moving client-side, because the
+        // engine counts tokens and the runtime counts characters — see
+        // `MAX_TOKENS_PER_CALL`. Raised to 32,000, it is a genuine-pathology
+        // backstop instead of the thing interrupting ordinary work.
+        //
+        // On a non-streamed call there is nothing to watch, so the wire keeps
+        // the interval exactly as before: the interval can only come off the
+        // wire BECAUSE the runtime can observe the stream instead.
         let wire_max_tokens = if streaming {
-            // (#2836 stage 2) A BACKSTOP, not the enforcer. The runtime stops
-            // the call at `answer_max_tokens` itself, at a boundary it chose;
-            // this is what catches a stream the runtime somehow fails to end,
-            // and the grace is the room an in-flight tool call is given to
-            // finish. Saturating: an operator who sets the ceiling near u32
-            // gets no wraparound.
-            answer_max_tokens.saturating_add(CEILING_GRACE_TOKENS)
+            answer_max_tokens
         } else {
             per_call_cap
         };
@@ -2912,7 +2928,6 @@ fn run_with_sleeper(
                 Watch {
                     interval: per_call_cap,
                     carried: turn.carried(),
-                    ceiling: answer_max_tokens,
                 },
             )?;
             (outcome.response, outcome.cut)
@@ -5076,10 +5091,6 @@ struct Watch<'a> {
     /// The turn's accumulation from earlier continuations, so the in-stream
     /// verdict judges the same scope the post-hoc one does.
     carried: &'a str,
-    /// The real per-call ceiling (`answer_max_tokens`). The gate enforces it
-    /// so it can land at a safe boundary; the wire carries it plus a grace
-    /// as a backstop.
-    ceiling: u32,
 }
 
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
@@ -5115,18 +5126,38 @@ fn run_streaming_turn(
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
     let mut gate = StreamGate::new(
-        crate::stream_gate::GateBounds {
-            interval_tokens: watch.interval,
-            ceiling_tokens: watch.ceiling,
-            grace_tokens: CEILING_GRACE_TOKENS,
-        },
+        crate::stream_gate::GateBounds { interval_tokens: watch.interval },
         crate::reasoning_loop::slice_is_degenerate,
         watch.carried,
     );
     let mut cut = CutSource::None;
     let stream = client.chat_streaming(request)?;
     for chunk_result in stream {
-        let chunk = chunk_result?;
+        // (#2836 stage 2) A SILENT stream ends the turn; it does not kill the
+        // dispatch.
+        //
+        // The read timeout used to propagate as an `Err`, which `main.rs`
+        // turns into `result: "error"` with no envelope, no metrics and no
+        // deliverable — every banked checkpoint of a long turn lost because
+        // the endpoint stopped talking at the end of it. The runtime already
+        // knows how to end a call and hand the accumulation back; this routes
+        // an idle stream into that path instead of off a cliff.
+        //
+        // Genuine transport failures still propagate. The distinction is a
+        // typed marker, not a string match.
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) if e.downcast_ref::<crate::lmstudio::StreamWentSilent>().is_some() => {
+                eprintln!(
+                    "darkmux-runtime: ⏹ the endpoint went silent — ending this call \
+                     and handing back everything it produced, rather than failing the \
+                     dispatch. ({e}) (#2836)"
+                );
+                cut = CutSource::RuntimeAbort(AbortReason::Silent);
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         let partial_index = accumulator.ingest(&chunk);
         let cumulative = accumulator.content_bytes();
         let delta_bytes = cumulative.saturating_sub(last_content_bytes);
@@ -5148,26 +5179,6 @@ fn run_streaming_turn(
         match gate.ingest(&chunk) {
             crate::stream_gate::GateAction::Continue
             | crate::stream_gate::GateAction::Observed { .. } => {}
-            crate::stream_gate::GateAction::Ceiling {
-                generated_chars,
-                deferred_chars,
-            } => {
-                let waited = if deferred_chars > 0 {
-                    format!(
-                        " (waited {deferred_chars} characters for a tool call to \
-                         finish writing)"
-                    )
-                } else {
-                    String::new()
-                };
-                eprintln!(
-                    "darkmux-runtime: ⏹ per-call ceiling reached after \
-                     {generated_chars} characters{waited}; ending the call here \
-                     rather than letting the endpoint cut it mid-stream. (#2836)"
-                );
-                cut = CutSource::RuntimeAbort(AbortReason::Ceiling);
-                break;
-            }
             crate::stream_gate::GateAction::Degenerate { slice_chars, generated_chars } => {
                 eprintln!(
                     "darkmux-runtime: ⏹ observation {} — the output is repeating \
@@ -5189,6 +5200,7 @@ fn run_streaming_turn(
                     slice_chars,
                     generated_chars,
                     watch.interval,
+                    gate.tool_call_in_flight(),
                 );
                 cut = CutSource::RuntimeAbort(AbortReason::Degenerate);
                 // Dropping the stream drops ureq's pooled reader, so the
@@ -8433,15 +8445,8 @@ mod tests {
     /// the model happened to be — measured over four runs, 9 of 14 firings
     /// (64%) landed mid-`arguments` and destroyed an `edit`.
     ///
-    /// (#2836 stage 2) The wire now carries `answer_max_tokens +
-    /// CEILING_GRACE_TOKENS` — 9000 + 2000 — because the runtime enforces
-    /// the real ceiling itself and the server is a BACKSTOP. The grace is
-    /// the room an in-flight tool call gets to finish writing its arguments
-    /// rather than being cut mid-JSON.
-    ///
-    /// The mock matches on that exact number and would 404 on the check-in
-    /// interval (1000) or on a bare ceiling with no grace (9000), so either
-    /// regression reds this test.
+    /// The mock matches on `max_tokens: 9000` and would 404 on the old
+    /// `1000`, so reverting the wire change reds this test.
     #[test]
     #[serial_test::serial]
     fn a_streamed_call_carries_the_ceiling_on_the_wire_not_the_check_in_interval() {
@@ -8449,7 +8454,7 @@ mod tests {
         server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/chat/completions")
-                .json_body_partial(r#"{"max_tokens":11000}"#);
+                .json_body_partial(r#"{"max_tokens":9000}"#);
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(sse(&["done"], "stop", 5));
@@ -8470,10 +8475,8 @@ mod tests {
             tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect(
-            "a streamed request must carry max_tokens=11000 (ceiling 9000 + grace \
-             2000); an Err here means either the check-in interval is still enforced \
-             server-side, or the grace that protects an in-flight tool call is gone \
-             (#2836)",
+            "a streamed request must carry max_tokens=9000 (the ceiling); an Err here \
+             means the check-in interval is still being enforced server-side (#2836)",
         );
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
     }
@@ -15142,28 +15145,52 @@ mod tests {
     ///   fixed `k` no matter how large the interval is, because numerator
     ///   and denominator scale together.
     /// - `max_generation_continuations` is `(answer_max_tokens /
-    ///   generation_interval).max(4)`, which floors at **4** for every ratio
-    ///   at or below 4:1 — 2.5 included.
+    ///   generation_interval).max(4)`.
     ///
-    /// So the budget's stop and the gate's first possible verdict land on
+    /// So the budget's stop and the gate's first possible verdict can land on
     /// the same call, and whichever runs first wins. Measured on the merged
-    /// code at these defaults: checkpoints 1-4 at 1.0000 / 0.5007 / 0.3336 /
-    /// 0.2502, all `continue`, then `EscalationTriggered(GenerationCheckpoint
-    /// BudgetExhausted)` with only FOUR checkpoint records — the 5th call's
-    /// slice, which reads 0.2001 and is plainly degenerate, was never judged.
+    /// code when `MAX_TOKENS_PER_CALL` was 10,000 — a 2.5:1 ratio, floored to
+    /// a budget of 4: checkpoints 1-4 at 1.0000 / 0.5007 / 0.3336 / 0.2502,
+    /// all `continue`, then `EscalationTriggered(GenerationCheckpointBudget
+    /// Exhausted)` with only FOUR checkpoint records — the 5th call's slice,
+    /// which reads 0.2001 and is plainly degenerate, was never judged.
     ///
-    /// The assertions below are the after-state of that same measurement.
+    /// **(#2836 stage 2) The collision is now resolved by arithmetic, and
+    /// this fixture pins the resolution rather than the collision.** Raising
+    /// `MAX_TOKENS_PER_CALL` to 32,000 puts the budget at 8, comfortably past
+    /// the gate's `k = 5`. That is not a happy accident to be re-derived
+    /// later: a repeating turn must end on the REPETITION, which is what
+    /// darkmux observed, rather than on a budget running out, which is an
+    /// accounting fact true of any turn that long. The guard below therefore
+    /// asserts the INVARIANT — the budget must not preempt the gate — instead
+    /// of the particular ratio that happened to be shipping, so a future
+    /// retune of either constant is caught the moment it re-creates the
+    /// defect.
+    ///
+    /// The assertions below are the after-state of that same measurement, and
+    /// they read identically in both regimes: what changed is WHY checkpoint
+    /// 5 exists — #2633 made the gate run before the budget acted; 32,000
+    /// means the budget is not even close.
     #[test]
     #[serial_test::serial]
     fn degeneracy_gate_runs_at_the_shipped_generation_ratio_not_just_a_roomy_one() {
         // The fixture's numbers come from the constants, never from
         // literals — a future retune of either one keeps this honest.
+        // The gate's first possible degenerate verdict is a FIXED k = 5 (the
+        // ratio is ~1/k and numerator and denominator scale together, so the
+        // crossing does not move with the interval). The continuation budget
+        // must leave room to reach it.
+        const GATE_FIRST_VERDICT_AT: u32 = 5;
+        let budget = (MAX_TOKENS_PER_CALL / GENERATION_CHECKPOINT_INTERVAL.max(1)).max(4);
         assert!(
-            (MAX_TOKENS_PER_CALL / GENERATION_CHECKPOINT_INTERVAL.max(1)).max(4) == 4,
-            "this fixture pins the FLOORED case (ratio <= 4:1); at the shipped defaults \
-             {MAX_TOKENS_PER_CALL}/{GENERATION_CHECKPOINT_INTERVAL} the budget must be \
-             the floor, 4 — if that stops being true the collision this test describes \
-             has changed shape and the doc comment above needs rewriting, not the assert"
+            budget >= GATE_FIRST_VERDICT_AT,
+            "the generation-continuation budget ({budget}, from \
+             {MAX_TOKENS_PER_CALL}/{GENERATION_CHECKPOINT_INTERVAL} floored at 4) would \
+             escalate BEFORE the degeneracy gate can first return a verdict (k={GATE_FIRST_VERDICT_AT}). \
+             A repeating turn would then end on 'the budget ran out' instead of on the \
+             repetition darkmux actually observed — #2633's defect, re-created by a \
+             constant retune. Raise MAX_TOKENS_PER_CALL or lower \
+             GENERATION_CHECKPOINT_INTERVAL."
         );
         // One call's worth of output, exactly filling the check-in interval,
         // with every token distinct so the accumulation's period is exactly

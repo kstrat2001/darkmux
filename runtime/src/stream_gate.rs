@@ -58,10 +58,12 @@ pub enum AbortReason {
     /// Fires BEFORE the host's hard kill, so the dispatch still produces an
     /// envelope instead of dying as a transport error.
     Silent,
-    /// The real per-call ceiling (`answer_max_tokens`), enforced
-    /// client-side so it can land at a safe boundary.
-    Ceiling,
 }
+
+// (#2836 stage 2) There is deliberately NO `Ceiling` variant. The per-call
+// ceiling is enforced by the ENGINE, in tokens, because the runtime counts
+// characters and the two do not convert — measured across 85 real calls, the
+// true ratio spans 0.01 to 3.89. See the note in `StreamGate::ingest`.
 
 /// Who ended this model call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +128,6 @@ impl CutSource {
             CutSource::ServerLength { .. } => "server_length",
             CutSource::RuntimeAbort(AbortReason::Degenerate) => "runtime_abort:degenerate",
             CutSource::RuntimeAbort(AbortReason::Silent) => "runtime_abort:silent",
-            CutSource::RuntimeAbort(AbortReason::Ceiling) => "runtime_abort:ceiling",
         }
     }
 
@@ -197,9 +198,6 @@ pub enum GateAction {
     /// A boundary was reached and the slice judged clean. Keep reading;
     /// record the observation.
     Observed { slice_chars: usize },
-    /// The per-call ceiling was reached with no tool call in flight, or
-    /// with one that outlasted its grace. Stop reading.
-    Ceiling { generated_chars: usize, deferred_chars: usize },
     /// A boundary was reached and the slice is degenerate. Stop reading.
     Degenerate {
         slice_chars: usize,
@@ -232,11 +230,6 @@ pub enum GateAction {
 pub struct GateBounds {
     /// The observation cadence, in the operator's token units.
     pub interval_tokens: u32,
-    /// The real per-call ceiling (`answer_max_tokens`), in tokens.
-    pub ceiling_tokens: u32,
-    /// How far past the ceiling the gate will wait for an in-flight tool
-    /// call to finish before ending the call anyway.
-    pub grace_tokens: u32,
 }
 
 pub struct StreamGate {
@@ -256,8 +249,6 @@ pub struct StreamGate {
     since_boundary: usize,
     observations: u32,
     tool_call_seen: bool,
-    ceiling_chars: usize,
-    grace_chars: usize,
     /// Accumulated `arguments` text per tool-call slot. A slot whose text
     /// does not parse as JSON is a call still being written.
     ///
@@ -267,19 +258,6 @@ pub struct StreamGate {
     /// answers a different question (what to hand downstream) than the gate
     /// does (is something in flight RIGHT NOW).
     tool_slots: std::collections::BTreeMap<u32, String>,
-    /// Characters generated since the ceiling was first reached while a
-    /// tool call was in flight. `None` until that happens.
-    deferring_since: Option<usize>,
-    /// Characters of tool-call `arguments` this call has emitted.
-    ///
-    /// Counted separately from `slice` on purpose. The VERDICT must not see
-    /// them — JSON scores 0.003 against a 0.25 threshold, the documented
-    /// false-degenerate class — but the CEILING must, because
-    /// `completion_tokens` counts every token the model generated and a call
-    /// whose bulk is one large `edit` payload is exactly the shape that hit
-    /// the ceiling live. Judged text and generated volume are two different
-    /// questions and this is where they stop being the same number.
-    tool_arg_chars: usize,
 }
 
 impl StreamGate {
@@ -314,11 +292,7 @@ impl StreamGate {
             since_boundary: 0,
             observations: 0,
             tool_call_seen: false,
-            ceiling_chars: (bounds.ceiling_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
-            grace_chars: (bounds.grace_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
             tool_slots: std::collections::BTreeMap::new(),
-            deferring_since: None,
-            tool_arg_chars: 0,
         }
     }
 
@@ -329,7 +303,7 @@ impl StreamGate {
     /// has just opened. This is the predicate #2836 exists for: the cut that
     /// lands while this is true is the one that destroys work, because the
     /// partial JSON can be neither dispatched nor sent back.
-    fn tool_call_in_flight(&self) -> bool {
+    pub fn tool_call_in_flight(&self) -> bool {
         self.tool_slots
             .values()
             .any(|args| serde_json::from_str::<serde_json::Value>(args).is_err())
@@ -360,15 +334,12 @@ impl StreamGate {
                 // same fallback `ChunkAccumulator` uses for endpoints that
                 // omit it (Google's OpenAI-compat layer).
                 let idx = tc.index.unwrap_or(self.tool_slots.len() as u32);
-                let mut added = 0usize;
                 let slot = self.tool_slots.entry(idx).or_default();
                 if let Some(f) = tc.function.as_ref() {
                     if let Some(a) = f.arguments.as_deref() {
                         slot.push_str(a);
-                        added = a.chars().count();
                     }
                 }
-                self.tool_arg_chars += added;
             }
             for text in [d.reasoning_content.as_deref(), d.content.as_deref()]
                 .into_iter()
@@ -379,39 +350,28 @@ impl StreamGate {
             }
         }
 
-        // (#2836 stage 2) THE CEILING, enforced client-side so it can land
-        // somewhere safe.
+        // (#2836 stage 2, revised) **The ceiling is NOT enforced here, and
+        // the attempt is worth recording so it is not retried.**
         //
-        // Before this it rode the wire as `max_tokens` and the server cut on
-        // it, which is the same defect the check-in had and the same one it
-        // kept after stage 1 — just ten times rarer, because 10,000 tokens
-        // is a rarer boundary to be mid-tool-call at than 1,000. Measured on
-        // 2026-09-20, after stage 1 had eliminated every check-in discard:
-        // `DISCARDED name=edit chars=1 cut=server_length` at exactly
-        // `completion_tokens: 10000`.
+        // A first cut of stage 2 converted `answer_max_tokens` to characters
+        // and stopped the call when the gate's count crossed it. It does not
+        // work, because characters are not tokens. Measured across 85 real
+        // calls: the true ratio (text plus tool-call arguments, over the
+        // endpoint's own `completion_tokens`) ran **median 1.51, p10 0.59,
+        // min 0.01, max 3.89** — a 380x spread. No constant converts one to
+        // the other. Live consequence: the gate was still waiting at 40,000
+        // characters while the endpoint's backstop cut at 12,000 TOKENS, and
+        // destroyed the `edit` call the whole feature exists to protect.
         //
-        // The wire now carries ceiling + grace, so the server is a backstop
-        // rather than the enforcer, and the gate stops the call itself — but
-        // never while a tool call is being written. A call that is mid
-        // `arguments` gets the grace to finish; one that outlasts it is ended
-        // regardless, because an unbounded wait is how a ceiling stops being
-        // a ceiling.
-        // Everything this call generated — text AND tool-call arguments.
-        let generated = self.generated_chars() + self.tool_arg_chars;
-        if generated >= self.ceiling_chars {
-            if self.tool_call_in_flight() {
-                let started = *self.deferring_since.get_or_insert(generated);
-                if generated.saturating_sub(started) < self.grace_chars {
-                    return GateAction::Continue;
-                }
-            }
-            return GateAction::Ceiling {
-                generated_chars: generated,
-                deferred_chars: self
-                    .deferring_since
-                    .map_or(0, |s| generated.saturating_sub(s)),
-            };
-        }
+        // The deeper reason not to try harder: the per-call ceiling was only
+        // ever a PROXY for watching. Its own doc calls it a failure boundary
+        // against a "14-min reasoning hang", written when the only way to
+        // notice a runaway was to stop and look. This gate looks
+        // continuously, for free, and a runaway IS repetition — which is the
+        // thing it already catches. The ceiling stays on the wire where the
+        // engine can enforce it in the units it actually counts, raised to a
+        // value that makes it a genuine-pathology backstop rather than the
+        // thing interrupting ordinary work.
 
         if self.since_boundary < self.interval_chars {
             return GateAction::Continue;
@@ -491,11 +451,9 @@ mod tests {
         }
     }
 
-    /// Existing cadence tests do not care about the ceiling, so give them one
-    /// they cannot reach. Ceiling behavior gets its own fixtures below.
     fn gate(interval: u32, judge: fn(&str, u32) -> bool, carried: &str) -> StreamGate {
         StreamGate::new(
-            GateBounds { interval_tokens: interval, ceiling_tokens: u32::MAX / CHARS_PER_TOKEN as u32, grace_tokens: 0 },
+            GateBounds { interval_tokens: interval },
             judge,
             carried,
         )
@@ -544,9 +502,7 @@ mod tests {
             match g.ingest(&chunk(Some("some ordinary reasoning text "), None, false)) {
                 GateAction::Continue => {}
                 GateAction::Observed { .. } => observed += 1,
-                GateAction::Degenerate { .. } | GateAction::Ceiling { .. } => {
-                    panic!("a clean stream must never be cut")
-                }
+                GateAction::Degenerate { .. } => panic!("a clean stream must never be cut"),
             }
         }
         assert!(observed > 0, "the gate must actually be looking, not just passing");
@@ -618,6 +574,28 @@ mod tests {
         let a = g.ingest(&chunk(None, Some("0123456789012345678901234"), false));
         assert!(matches!(a, GateAction::Degenerate { .. }), "got {a:?}");
         assert_eq!(g.observations(), 1);
+    }
+
+    /// `tool_call_in_flight` is the field an abort record reports, so it has
+    /// to mean what it says: a call whose accumulated `arguments` do not yet
+    /// parse is being written; one whose arguments parse is not.
+    ///
+    /// The empty string counts as in flight — a call that has opened and
+    /// emitted nothing is exactly the shape the live discards had
+    /// (`arguments_chars: 1`, the model having emitted `{` and stopped).
+    #[test]
+    fn in_flight_means_the_arguments_do_not_parse_yet() {
+        let mut g = gate(1_000, NEVER, "");
+        assert!(!g.tool_call_in_flight(), "nothing opened yet");
+
+        g.ingest(&args_chunk(""));
+        assert!(g.tool_call_in_flight(), "an opened call with no arguments IS in flight");
+
+        g.ingest(&args_chunk("{\"path\":\"/workspace/x\""));
+        assert!(g.tool_call_in_flight(), "half-written JSON is in flight");
+
+        g.ingest(&args_chunk("}"));
+        assert!(!g.tool_call_in_flight(), "once it parses, the call is finished");
     }
 
     /// (#2836, found by a live run) The verdict judges the whole TURN, not
@@ -782,10 +760,6 @@ mod tests {
             CutSource::RuntimeAbort(AbortReason::Silent).wire_label(),
             "runtime_abort:silent"
         );
-        assert_eq!(
-            CutSource::RuntimeAbort(AbortReason::Ceiling).wire_label(),
-            "runtime_abort:ceiling"
-        );
     }
 
     #[test]
@@ -796,7 +770,6 @@ mod tests {
         for reason in [
             AbortReason::Degenerate,
             AbortReason::Silent,
-            AbortReason::Ceiling,
         ] {
             let cut = CutSource::RuntimeAbort(reason);
             assert!(cut.is_ours_confirmed(), "{reason:?}");
@@ -804,92 +777,4 @@ mod tests {
         }
     }
 
-    // ─── #2836 stage 2: the ceiling ──────────────────────────────────
-
-    fn ceiling_gate(ceiling: u32, grace: u32) -> StreamGate {
-        StreamGate::new(
-            GateBounds { interval_tokens: u32::MAX / CHARS_PER_TOKEN as u32, ceiling_tokens: ceiling, grace_tokens: grace },
-            NEVER,
-            "",
-        )
-    }
-
-    #[test]
-    fn the_ceiling_ends_a_call_with_nothing_in_flight() {
-        let mut g = ceiling_gate(5, 100); // 20-char ceiling
-        assert_eq!(g.ingest(&chunk(None, Some("0123456789"), false)), GateAction::Continue);
-        let a = g.ingest(&chunk(None, Some("0123456789x"), false));
-        assert!(matches!(a, GateAction::Ceiling { deferred_chars: 0, .. }), "got {a:?}");
-    }
-
-    /// **The stage 2 fix.** A tool call being written when the ceiling lands
-    /// is given room to finish instead of being destroyed.
-    ///
-    /// This is the same defect stage 1 fixed for the check-in, surviving at
-    /// the ceiling. Measured live on 2026-09-20 AFTER stage 1 had driven
-    /// check-in discards to zero: `DISCARDED name=edit chars=1
-    /// cut=server_length` at `completion_tokens: 10000`.
-    #[test]
-    fn the_ceiling_waits_for_a_tool_call_that_is_still_being_written() {
-        let mut g = ceiling_gate(5, 100); // 20-char ceiling, 400-char grace
-        g.ingest(&args_chunk("{\"path\":\"/workspace/"));   // 19 chars, unparseable
-        // Past the ceiling now, but the call is open.
-        for _ in 0..5 {
-            assert_eq!(
-                g.ingest(&args_chunk("aaaa")),
-                GateAction::Continue,
-                "the ceiling must not cut a tool call mid-arguments"
-            );
-        }
-    }
-
-    /// And it fires the moment that call closes — the deferral is a wait for
-    /// a safe boundary, not an exemption from the ceiling.
-    #[test]
-    fn the_ceiling_fires_as_soon_as_the_in_flight_call_closes() {
-        let mut g = ceiling_gate(5, 1_000);
-        assert_eq!(g.ingest(&args_chunk("{\"path\":\"/workspace/x\"")), GateAction::Continue);
-        let a = g.ingest(&args_chunk("}"));   // now valid JSON
-        assert!(
-            matches!(a, GateAction::Ceiling { .. }),
-            "once the arguments parse there is nothing left to protect; got {a:?}"
-        );
-    }
-
-    /// The wait is BOUNDED. A call that never closes is ended anyway —
-    /// an unbounded deferral is how a ceiling stops being a ceiling.
-    #[test]
-    fn a_tool_call_that_outlasts_its_grace_is_ended_regardless() {
-        let mut g = ceiling_gate(5, 5); // 20-char ceiling, 20-char grace
-        assert_eq!(g.ingest(&args_chunk("{\"never\":\"closes")), GateAction::Continue);
-        let mut acted = None;
-        for _ in 0..10 {
-            match g.ingest(&args_chunk("bbbb")) {
-                GateAction::Continue => {}
-                other => { acted = Some(other); break; }
-            }
-        }
-        let a = acted.expect("the grace must expire — an unbounded wait is not a ceiling");
-        match a {
-            GateAction::Ceiling { deferred_chars, .. } => assert!(
-                deferred_chars >= 20,
-                "and the record must say how long it waited; got {deferred_chars}"
-            ),
-            other => panic!("expected Ceiling, got {other:?}"),
-        }
-    }
-
-    /// Arguments that parse are not in flight, so a COMPLETED call does not
-    /// hold the ceiling open. Without this the first tool call of a turn
-    /// would defer the ceiling forever.
-    #[test]
-    fn a_completed_tool_call_does_not_hold_the_ceiling_open() {
-        let mut g = ceiling_gate(5, 1_000);
-        g.ingest(&args_chunk("{\"a\":1}"));  // complete, parses
-        let a = g.ingest(&chunk(None, Some("0123456789012345"), false));
-        assert!(
-            matches!(a, GateAction::Ceiling { deferred_chars: 0, .. }),
-            "a finished call is not 'in flight'; got {a:?}"
-        );
-    }
 }

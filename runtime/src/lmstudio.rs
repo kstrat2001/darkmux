@@ -986,6 +986,28 @@ fn read_line_capped<R: BufRead>(
 /// production wraps the `ureq` response body in `BufReader`. Per-line
 /// byte cap (`MAX_SSE_LINE_BYTES`) bounds OOM from a pathological no-
 /// newline stream. (#231 / S4)
+/// (#2836 stage 2) The stream went quiet for longer than the read timeout.
+///
+/// A TYPED marker, downcast at the call site, rather than a string match on
+/// the message. Discriminating a failure mode by `contains("timed out")`
+/// is the silent-wrong-key shape: it compiles, it passes, and it stops
+/// working the day a dependency rewords an error — with no warning, because
+/// a failed match reads exactly like "not a timeout".
+#[derive(Debug)]
+pub struct StreamWentSilent;
+
+impl std::fmt::Display for StreamWentSilent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the endpoint stopped sending for longer than the read timeout \
+             ({REQUEST_READ_TIMEOUT_SECS}s)"
+        )
+    }
+}
+
+impl std::error::Error for StreamWentSilent {}
+
 pub struct ChunkStream<R: BufRead> {
     reader: R,
     done: bool,
@@ -1041,6 +1063,18 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
                 }
                 Err(e) => {
                     self.done = true;
+                    // An idle socket is a DIFFERENT condition from a broken
+                    // one: the endpoint is still there and simply is not
+                    // producing. The caller can end the turn cleanly and keep
+                    // everything banked, where a transport failure cannot be
+                    // recovered from. Surfaced as a typed marker so the caller
+                    // asks `downcast_ref` instead of matching on prose.
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) {
+                        return Some(Err(anyhow!(StreamWentSilent)));
+                    }
                     return Some(Err(anyhow!("SSE read failed: {e}")));
                 }
             }
@@ -1905,9 +1939,13 @@ mod tests {
         let client =
             LmStudioClient::with_base_url_and_read_timeout(url, std::time::Duration::from_millis(300));
         let err = drain(&client).expect_err("a 1200ms gap against a 300ms bound must not succeed");
+        // (#2836 stage 2) TYPED, not a string match. The caller ends the turn
+        // cleanly on this and fails the dispatch on anything else, so the two
+        // must be distinguishable by something a dependency cannot reword.
         assert!(
-            err.to_string().contains("SSE read failed"),
-            "a read timeout must surface as a read failure, got: {err}"
+            err.downcast_ref::<StreamWentSilent>().is_some(),
+            "an idle stream must surface as StreamWentSilent, not a generic \
+             transport failure — the caller routes on the type. got: {err}"
         );
     }
 }

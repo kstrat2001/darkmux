@@ -705,9 +705,19 @@ impl Trajectory {
         slice_chars: usize,
         generated_chars: usize,
         interval_tokens: u32,
+        // (#2836) Was a tool call mid-`arguments` when this abort landed?
+        //
+        // It must always be false for a degeneracy abort — the gate
+        // suspends judging for the rest of any call that starts emitting
+        // one, which is the whole point of #2836 — so a `true` here is a
+        // bug announcing itself rather than a statistic. It is the
+        // load-bearing field for the SILENT abort, where a stream dying
+        // mid-tool-call is exactly what the operator needs to know.
+        tool_call_in_flight: bool,
     ) {
         self.write_event(&serde_json::json!({
             "type": "dispatch.gate.abort",
+            "tool_call_in_flight": tool_call_in_flight,
             "seq": seq,
             "ts": unix_ms(),
             "observation": observation,
