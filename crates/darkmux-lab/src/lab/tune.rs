@@ -36,6 +36,16 @@ pub struct DistributionStats {
     pub min_seconds: u128,
     pub max_seconds: u128,
     pub mean_seconds: u128,
+    /// (#2848) Wall clock SUMMED across the N runs -- the execution time
+    /// spent on the tasks. The campaign question a blocked run asks is "how
+    /// long did the whole set take", and no other field answers it:
+    /// reconstructing it as `mean * n` loses the integer-division
+    /// remainder.
+    ///
+    /// Each run's own clock, so in-run rest (thermal duty-cycle pauses,
+    /// turn delay) is INSIDE this figure deliberately. A throttled engine
+    /// taking longer on run 5 is the signal, not noise to be subtracted.
+    pub total_seconds: u128,
     pub fast_cluster: ClusterStats,
     pub slow_cluster: ClusterStats,
     pub slow_rate: f32,
@@ -100,6 +110,7 @@ pub(crate) fn compute_stats(outcomes: &[RunOutcome]) -> DistributionStats {
                 max_seconds: None,
             },
             slow_rate: 0.0,
+            total_seconds: 0,
         };
     }
 
@@ -134,6 +145,7 @@ pub(crate) fn compute_stats(outcomes: &[RunOutcome]) -> DistributionStats {
         fast_cluster: cluster_stats(&fast),
         slow_cluster: cluster_stats(&slow),
         slow_rate,
+        total_seconds: sum,
     }
 }
 
@@ -176,6 +188,7 @@ pub fn print_report(r: &TuneReport) {
     println!("┌─ wall clock");
     println!("│  range:  {}s – {}s", s.min_seconds, s.max_seconds);
     println!("│  mean:   {}s", s.mean_seconds);
+    println!("│  total:  {}s across {} run(s)", s.total_seconds, s.n);
     if s.slow_cluster.count == 0 {
         println!("│  cluster: single (variance < 1.5×, no meaningful bimodal split)");
     } else {
@@ -293,6 +306,41 @@ mod tests {
         let fc = s.fast_cluster.mean_seconds.unwrap();
         let sc = s.slow_cluster.mean_seconds.unwrap();
         assert!(sc > fc * 2);
+    }
+
+    /// (#2848) The block total is the SUM, and it is not reconstructible
+    /// from the other reported fields. These five values were chosen so
+    /// `mean * n` DISAGREES with the true total: 2396/5 = 479 by integer
+    /// division, and 479 * 5 = 2395, one second short. A campaign total
+    /// that silently drifts from the runs it summarizes is worse than no
+    /// total, so this pins the sum itself rather than a derivation of it.
+    #[test]
+    fn total_seconds_is_the_sum_not_mean_times_n() {
+        let s = compute_stats(&[outcome(490), outcome(793), outcome(375), outcome(674), outcome(64)]);
+        assert_eq!(s.total_seconds, 2396, "total must be the plain sum of every run");
+        assert_eq!(s.n, 5);
+        assert_eq!(s.mean_seconds, 479, "integer division floors here, which is the point");
+        assert_ne!(
+            s.mean_seconds * s.n as u128,
+            s.total_seconds,
+            "if these ever agree this test has stopped proving anything -- pick inputs whose mean does not divide evenly"
+        );
+    }
+
+    /// (#2848) In-run rest is INSIDE the figure by design: the total is each
+    /// run's own wall clock, so an engine that throttles on later runs shows
+    /// up as a larger total rather than having the pause subtracted away.
+    #[test]
+    fn total_seconds_counts_a_throttled_run_at_full_length() {
+        let steady =
+            compute_stats(&[outcome(300), outcome(300), outcome(300), outcome(300), outcome(300)]);
+        let throttled =
+            compute_stats(&[outcome(300), outcome(300), outcome(300), outcome(300), outcome(600)]);
+        assert_eq!(steady.total_seconds, 1500);
+        assert_eq!(
+            throttled.total_seconds, 1800,
+            "the run that took twice as long must add its full duration, pause included"
+        );
     }
 
     #[test]
