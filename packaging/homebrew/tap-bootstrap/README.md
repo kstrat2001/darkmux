@@ -1,4 +1,4 @@
-# homebrew-darkmux
+# homebrew-tap
 
 Homebrew tap for [darkmux](https://github.com/kstrat2001/darkmux) — a Rust CLI
 for managing local LLM stacks (LMStudio, Ollama, llama.cpp) on Apple Silicon.
@@ -11,14 +11,14 @@ for managing local LLM stacks (LMStudio, Ollama, llama.cpp) on Apple Silicon.
 ## Install
 
 ```bash
-brew tap kstrat2001/darkmux
+brew tap kstrat2001/tap
 brew install darkmux              # stable release (latest 1.x)
 # brew install --HEAD darkmux    # or build from the latest commit on main
 ```
 
 `brew install darkmux` installs the stable pinned release; `--HEAD` builds from
 the latest commit on `main`. If brew refuses with an "untrusted tap" error,
-run `brew trust kstrat2001/darkmux` once (a newer-Homebrew security gate for
+run `brew trust kstrat2001/tap` once (a newer-Homebrew security gate for
 third-party taps), then re-run the install.
 
 For a hub machine (Redis-backed multi-machine fleet coordinator):
@@ -44,7 +44,7 @@ brew services restart darkmux           # if you're running the daemon
 
 ```bash
 brew services stop darkmux              # important — stops the launchd plist
-brew untap kstrat2001/darkmux           # optional; removes the tap reference
+brew untap kstrat2001/tap           # optional; removes the tap reference
 brew uninstall darkmux
 ```
 
@@ -119,11 +119,11 @@ or open an issue here.
 
 ```bash
 # Edit packaging/homebrew/darkmux.rb in the main darkmux repo
-brew tap-new --no-git kstrat2001/darkmux    # if not already tapped
-TAP_DIR="$(brew --repository)/Library/Taps/kstrat2001/homebrew-darkmux/Formula"
+brew tap-new --no-git kstrat2001/tap    # if not already tapped
+TAP_DIR="$(brew --repository)/Library/Taps/kstrat2001/homebrew-tap/Formula"
 cp /path/to/darkmux/packaging/homebrew/darkmux.rb "$TAP_DIR/"
-brew audit --strict kstrat2001/darkmux/darkmux
-brew install --HEAD --build-from-source kstrat2001/darkmux/darkmux
+brew audit --strict kstrat2001/tap/darkmux
+brew install --HEAD --build-from-source kstrat2001/tap/darkmux
 ```
 
 ## License

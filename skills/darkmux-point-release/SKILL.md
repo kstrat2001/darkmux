@@ -27,6 +27,29 @@ A prose reminder gets skipped under momentum; the command above is the gate. If
 any run on main's tip is not `success`, stop — you are about to tag a red main
 and only find out at the formula step.
 
+**Run the release-mode gate — it is NOT part of PR CI (#2828):**
+
+```bash
+gh workflow run release-verify.yml --ref main
+sleep 10
+RID=$(gh run list --workflow release-verify.yml --limit 1 --json databaseId -q '.[0].databaseId')
+gh run watch "$RID" --exit-status
+```
+
+`ci.yml` runs **dev-profile only**. This workflow is the only thing that builds,
+tests and lints the workspace AND the standalone `runtime/` crate in RELEASE
+mode, which is the profile the shipped artifact is actually built in. It catches
+what dev-profile structurally cannot: an LTO/codegen-unit interaction, a
+`#[cfg(not(debug_assertions))]`-only path, any release-mode-only break.
+
+It takes ~20-30 minutes, so start it FIRST and do step 1's version math while it
+runs. Do not skip it because CI is green — CI is not testing this profile.
+
+**Why this is spelled out here:** #1368 moved this gate from every-PR to manual
+dispatch and nothing was ever wired to invoke it. It had run **zero times** as of
+2026-09-19, across **21 releases** (v2.0.0 through v3.8.0). The workflow's own
+header asserted that this skill named it; this skill did not. See #2828.
+
 Also confirm there are **zero open PRs you intend to include**. A release cut
 while a feature PR is still in flight ships a version number that does not mean
 what the changelog says it means.
@@ -38,9 +61,27 @@ List what's merged since the last tag and classify:
 LAST=$(git describe --tags --abbrev=0)
 git log "$LAST"..HEAD --oneline --no-merges | cat
 ```
-- **fixes only** (`fix(...)`) → **patch** (`x.y.Z+1`)
-- **any additive feature** (`feat(...)`, backward-compatible) → **minor** (`x.Y+1.0`)
+- **no schema constant moved** → **patch** (`x.y.Z+1`)
+- **any schema constant moved** (additively) → **minor** (`x.Y+1.0`)
 - **any breaking change** (rename/remove/retype a public surface, a required field) → **major → STOP**, hand to the operator.
+
+**The commit prefix is NOT the discriminator — the schema constants are.** An
+earlier version of this rule said "any additive feature (`feat(...)`) → minor",
+which is stricter than this project has ever practised and sent a session down a
+long wrong path (2026-09-19). Measured across every tag, 11 for 11: **every minor
+moved at least one schema constant; no patch moved any.** Counterexamples that
+settle it — `v1.18.1` shipped `feat(lab): configurable judge passes`, which added
+a config knob, as a PATCH with `CONFIG_SCHEMA_VERSION` unchanged at 1.2;
+`v1.18.2` shipped `feat(pr-review): dependency-free dispatch liveness floor`,
+also a patch.
+
+The useful framing when judging a change that has no schema impact: **view
+versus engine.** A viewer surface that renders data the daemon already ships adds
+nothing a consumer integrates against, so it is patch-safe. New persisted state,
+a new wire field, or a changed budget is engine, and moves a schema.
+
+Check the three constants below FIRST — that check IS the version decision, not
+a footnote to it.
 
 Check the data-shape schemas — a bump there is worth calling out and (if cross-machine) a schema-lock note in the release notes:
 ```bash
@@ -312,20 +353,53 @@ gh pr create --title "feat(homebrew): pin formula to stable vNEW" --body "Stable
 # CI-green-gate + merge (same conclusion==SUCCESS pattern as step 2)
 ```
 
+> **The tap sync is the step that fails SILENTLY.** On 2026-09-19 the workflow
+> died with `Bad credentials` and opened no PR, so v3.8.0 was tagged, released
+> and had its GHCR image published while the tap kept serving v3.7.1 — every
+> other signal green, and `brew upgrade darkmux` handing users the old version.
+> If the workflow fails, sync by hand: the workflow's whole job is
+> `cp darkmux/packaging/homebrew/darkmux.rb tap/Formula/darkmux.rb`, a verbatim
+> copy. Then ALWAYS run step 6's `verify-tap-pin.py --tag vNEW`. See #2825.
+
 ## 5. Sync the tap
 
-Merging the formula PR fires `.github/workflows/sync-homebrew-tap.yml`, which opens a PR on `kstrat2001/homebrew-darkmux`. Merge it:
+The tap PULLS the formula now; nothing pushes to it. Trigger the pull and
+merge the PR it opens:
+
 ```bash
-gh run list --workflow sync-homebrew-tap.yml --limit 1 --json status,conclusion
-gh pr list --repo kstrat2001/homebrew-darkmux --json number,title
-gh pr merge <N> --repo kstrat2001/homebrew-darkmux --squash
+gh workflow run sync-from-upstream.yml --repo kstrat2001/homebrew-tap
+sleep 10
+gh run list --repo kstrat2001/homebrew-tap --workflow sync-from-upstream.yml \
+  --limit 1 --json status,conclusion,url
+gh pr list --repo kstrat2001/homebrew-tap --json number,title
+gh pr merge <N> --repo kstrat2001/homebrew-tap --squash
 ```
+
+**Why the direction reversed (kstrat2001/homebrew-tap#62).** The old design
+lived in this repo and PUSHED to the tap with a cross-repo token. On
+2026-09-19 that token expired, the push workflow died with `Bad credentials`
+and opened no PR, and v3.8.0 was tagged, released and had its GHCR image
+published while the tap kept serving v3.7.1 — every other signal green, and
+`brew upgrade darkmux` handing users the old version (#2825). A pull needs no
+credential at all: `packaging/homebrew/darkmux.rb` is in a PUBLIC repo, so the
+tap reads it with an unauthenticated fetch and the whole class of
+expired-token silence goes away.
+
+The tap also polls every 6 hours as a backstop, so a release where you forget
+this step self-corrects within 6 hours rather than never. **Do not rely on
+that** — dispatch it here so the tap is correct when you verify, not hours
+later.
 
 ## 6. Verify
 
 ```bash
-# formula serves the new tag
-gh api repos/kstrat2001/homebrew-darkmux/contents/Formula/darkmux.rb --jq .content | base64 -d | grep -E "url \"|sha256"
+# THE tap check — run this, do not eyeball the formula (#2825). It fetches the
+# tap's published formula AND the tag's real tarball and compares them; exits
+# nonzero and names the problem if the tap is serving anything else.
+python3 scripts/verify-tap-pin.py --tag vNEW
+
+# (the manual equivalent, if you are not in a checkout)
+gh api repos/kstrat2001/homebrew-tap/contents/Formula/darkmux.rb --jq .content | base64 -d | grep -E "url \"|sha256"
 # GHCR runtime image published on the release
 gh run list --workflow "Publish runtime image" --limit 1 --json status,conclusion
 # local dev box: reinstall from source so it matches the tag

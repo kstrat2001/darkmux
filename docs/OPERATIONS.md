@@ -69,10 +69,10 @@ darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac i
 
 ### Install + bootstrap
 
-**Option A: via Homebrew tap** (recommended; tap lives at [`kstrat2001/homebrew-darkmux`](https://github.com/kstrat2001/homebrew-darkmux)):
+**Option A: via Homebrew tap** (recommended; tap lives at [`kstrat2001/homebrew-tap`](https://github.com/kstrat2001/homebrew-tap)):
 
 ```bash
-brew tap kstrat2001/darkmux
+brew tap kstrat2001/tap
 brew install darkmux                  # stable release
 # brew install --HEAD darkmux         # or build from the latest commit on main
 
@@ -84,7 +84,7 @@ brew services start redis
 brew services start darkmux
 ```
 
-> **If `brew install` refuses with "untrusted tap":** newer Homebrew gates third-party taps behind an explicit trust step. Run `brew trust kstrat2001/darkmux` once, then re-run the install. (Older Homebrew versions don't require this and won't show the prompt.)
+> **If `brew install` refuses with "untrusted tap":** newer Homebrew gates third-party taps behind an explicit trust step. Run `brew trust kstrat2001/tap` once, then re-run the install. (Older Homebrew versions don't require this and won't show the prompt.)
 
 The brew formula installs both the `darkmux` binary AND a keychain-aware wrapper script (`libexec/darkmux-serve-wrapped`) that resolves `DARKMUX_REDIS_URL` from macOS Keychain at process-start, so the Redis password never lives in the launchd plist. See [the always-on hub guide](docs/guide/always-on-hub.html) for the production-grade setup.
 
