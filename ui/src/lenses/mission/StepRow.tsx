@@ -51,8 +51,12 @@ export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
     );
   }
   if (meter.tokens) {
+    // (#2834) No `cloud` class here. It painted these tokens in the WARN
+    // colour, so a step served by a local inference engine read as a cost
+    // warning. The flag it keyed on is endpoint presence, which is not a
+    // cost fact — see MissionGraphLens.
     children.push(
-      <span key="t" className={"tok" + (meter.cloud ? " cloud" : "")}>
+      <span key="t" className="tok">
         {fmtTok(meter.tokens) + " tok"}
       </span>,
     );

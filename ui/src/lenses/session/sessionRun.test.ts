@@ -215,9 +215,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o · off-fleet");
-    expect(view.modelTrackLabel).toBe("remote model");
-    expect(view.modelTrackLines[0]).toMatch(/served off-fleet — no local model/);
+    expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o");
+    expect(view.modelTrackLabel).toBe("endpoint model");
+    expect(view.modelTrackLines[0]).toMatch(/served by the endpoint above — no local model loaded/);
   });
 
   it("a jit-model-swap (more than one local model loaded in one run) surfaces as a warning detection", () => {

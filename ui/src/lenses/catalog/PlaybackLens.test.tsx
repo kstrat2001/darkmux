@@ -218,21 +218,31 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
     },
   ];
 
-  it("moving the playhead back past a session's close edge flips its bar to in-flight and drops its tokens from the hero", async () => {
+  it("moving the playhead back past a session's close edge flips its bar to in-flight; its tokens stay counted (#2834)", async () => {
     mockDay(DAY_WITH_SESSION);
     // (#2071) The shell owns the transport now; this lens renders at the
     // playhead it is handed. `null` is the un-scrubbed default (the day's
     // true max); the midpoint lands after the telemetry, before the close.
     const { rerender } = render(<PlaybackLens date="2026-08-07" playhead={null} />, { wrapper: wrapper() });
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
-    await waitFor(() => expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("600"));
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
     expect(document.querySelector(".sbar")).toHaveClass("done");
-    expect(screen.getByText("unattributed").previousSibling?.textContent).toBe("0");
-    expect(screen.getByText("unattributed").parentElement!.className).toMatch(/\bzero\b/);
+    // (#2834) One figure now; there is no separate unattributed tile to be
+    // zero. The scrubbing property this test guards is unchanged.
 
     rerender(<PlaybackLens date="2026-08-07" playhead={Date.parse("2026-08-07T00:30:00.000Z")} />);
     await waitFor(() => expect(document.querySelector(".sbar")).toHaveClass("run"));
-    expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("0");
-    expect(screen.getByText("unattributed").previousSibling?.textContent).toBe("600");
+    // (#2834) The tokens STAY counted at 600. Before the consolidation they
+    // moved from "local" to "unattributed" here — an in-flight session has
+    // no dispatch.complete, so nothing named its endpoint, and the local
+    // figure excluded it to avoid implying it had run free.
+    //
+    // With one figure that exclusion has no purpose: the claim is "darkmux
+    // dispatched these tokens", which is as true mid-flight as it is after
+    // the bookend lands. The bar still flips to in-flight, which is the
+    // scrubbing behaviour this test exists for.
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("600");
+    // The tokens move OUT of the figure when the playhead passes the close
+    // edge — the point of this test — rather than into a second bucket.
   });
 });

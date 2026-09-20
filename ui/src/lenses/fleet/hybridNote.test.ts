@@ -52,24 +52,63 @@ describe("hybridNote", () => {
     expect(note.hasHistory).toBe(false);
   });
 
-  it("all-local runs get the local-only template", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 4, cloudRuns: 0 });
-    expect(note.text).toBe("4 local dispatches. The hybrid loop is humming, keep it up.");
-  });
+  // (#2834) The local/cloud/unattributed split is withdrawn from this line.
+  // Nine tests below used to pin the four templates that divided it. What
+  // survives is the invariant they were really protecting — #2637's "never
+  // imply local, cloud, or free" — now asserted over the whole input space
+  // rather than one template at a time, plus the count and the wording.
 
-  it("all-cloud runs get the cloud-only template", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 3, cloudRuns: 3 });
-    expect(note.text).toBe("3 dispatches via cloud. The right brain for the job, keep it up.");
-  });
-
-  it("a mix of local and cloud runs gets the combined template", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2 });
-    expect(note.text).toBe("3 dispatches local + 2 via cloud. The hybrid loop is humming, keep it up.");
+  it("states how many dispatches ran, whatever the split would have been", () => {
+    for (const [runs, cloudRuns, unknownRuns] of [
+      [4, 0, 0],
+      [3, 3, 0],
+      [5, 2, 0],
+      [5, 2, 2],
+      [3, 0, 2],
+      [2, 2, 2],
+    ]) {
+      const note = hybridNote([], { ...ZERO_TOKENS, runs, cloudRuns, unknownRuns });
+      expect(note.text).toBe(`${runs} dispatches done. The fleet is humming, keep it up.`);
+    }
   });
 
   it("singular dispatch wording at exactly one run", () => {
     const note = hybridNote([], { ...ZERO_TOKENS, runs: 1, cloudRuns: 0 });
-    expect(note.text).toBe("1 local dispatch. The hybrid loop is humming, keep it up.");
+    expect(note.text).toBe("1 dispatch done. The fleet is humming, keep it up.");
+  });
+
+  // (#2637, preserved through #2834) The note must never tell an operator
+  // where their work ran or what it cost. It could not do so honestly — the
+  // split it used keyed on endpoint presence, so a local inference server on
+  // 127.0.0.1 was reported back as cloud. Asserted over the whole input
+  // space, so no future template can reintroduce the claim in a branch a
+  // single-case test does not reach.
+  it("(#2637) never claims local, cloud, or free — for any combination of counts", () => {
+    for (let runs = 0; runs <= 4; runs++) {
+      for (let cloudRuns = 0; cloudRuns <= 4; cloudRuns++) {
+        for (const unknownRuns of [0, 1, 5]) {
+          const note = hybridNote([], { ...ZERO_TOKENS, runs, cloudRuns, unknownRuns });
+          const t = note.text.toLowerCase();
+          for (const claim of ["local", "cloud", "free", "off the meter", "unattributed"]) {
+            expect(t, `runs=${runs} cloud=${cloudRuns} unknown=${unknownRuns}`).not.toContain(claim);
+          }
+        }
+      }
+    }
+  });
+
+  // The clamp that kept a hostile `TokensOffMeter` from rendering
+  // "-1 dispatches" is gone with the subtraction that needed it, so the
+  // property is asserted directly instead: no negative count, ever.
+  it("(post-review) never renders a negative dispatch count", () => {
+    for (const [runs, cloudRuns, unknownRuns] of [
+      [2, 2, 1],
+      [0, 3, 3],
+      [1, 9, 9],
+    ]) {
+      const note = hybridNote([], { ...ZERO_TOKENS, runs, cloudRuns, unknownRuns });
+      expect(note.text).not.toMatch(/-\d/);
+    }
   });
 
   it("zero runs and no notes/missions gets the invitation", () => {
@@ -82,34 +121,10 @@ describe("hybridNote", () => {
   // runs=5 cloudRuns=2` rendered "3 dispatches local + 2 via cloud" — crediting
   // both unattributed sessions to "local". With `unknownRuns` in the picture,
   // the true local count is 5 - 2 - 2 = 1.
-  it("(#2637) unattributed sessions are excluded from the local count, not credited to it", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2, unknownRuns: 2 });
-    expect(note.text).toBe("1 dispatch local + 2 via cloud. The hybrid loop is humming, keep it up.");
-    // Never claim anything about the two unattributed sessions — no mention
-    // of "unattributed"/"unknown" and no implication they were free.
-    expect(note.text).not.toMatch(/unattributed|unknown|free/i);
-  });
 
-  it("(#2637) a mix of local and cloud runs with NO unattributed sessions is unaffected by the fix", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2, unknownRuns: 0 });
-    expect(note.text).toBe("3 dispatches local + 2 via cloud. The hybrid loop is humming, keep it up.");
-  });
 
-  it("(#2637) local + unattributed, no cloud at all — the unattributed count is silently excluded, never folded into local", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 0, unknownRuns: 2 });
-    expect(note.text).toBe("3 local dispatches. The hybrid loop is humming, keep it up.");
-  });
 
-  it("(#2637) cloud + unattributed, no local at all — the unattributed count is silently excluded, never folded into cloud", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 3, unknownRuns: 2 });
-    expect(note.text).toBe("3 dispatches via cloud. The right brain for the job, keep it up.");
-  });
 
-  it("(#2637) every run this window is unattributed — a dedicated honest line, not a local-only or cloud-only guess", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 4, cloudRuns: 0, unknownRuns: 4 });
-    expect(note.text).toBe("4 dispatches just getting started. The fleet is warming up, keep it up.");
-    expect(note.text).not.toMatch(/\blocal\b|\bcloud\b|\bfree\b|\bunattributed\b|\bunknown\b|\bconfirm\b/i);
-  });
 
   // (post-review CONSIDER) The all-unattributed branch is NOT a rare edge
   // case — it's what a fresh window looks like before any dispatch's
@@ -117,11 +132,6 @@ describe("hybridNote", () => {
   // (first ~2% of the replay). Its copy must match the upbeat register of
   // its two siblings above (a short observation + ", keep it up.") rather
   // than reading as a diagnostic ("no attribution darkmux could confirm").
-  it("(post-review) the all-unattributed line matches its siblings' upbeat register, not a diagnostic one", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 1, cloudRuns: 0, unknownRuns: 1 });
-    expect(note.text).toBe("1 dispatch just getting started. The fleet is warming up, keep it up.");
-    expect(note.text).toMatch(/keep it up\.$/);
-  });
 
   // (post-review CONSIDER, PROVEN) `hybridNote` takes its `TokensOffMeter`
   // argument as given — it does not re-derive `unknownRuns` from `data`, so
@@ -129,9 +139,4 @@ describe("hybridNote", () => {
   // `runs`/`cloudRuns` must not render a negative dispatch count.
   // `hybridNote([], { runs: 2, cloudRuns: 2, unknownRuns: 1 })` rendered
   // "-1 dispatches local + 2 via cloud." before the `Math.max(0, …)` clamp.
-  it("(post-review) a hostile TokensOffMeter (unknownRuns overcounting) never renders a negative dispatch count", () => {
-    const note = hybridNote([], { ...ZERO_TOKENS, runs: 2, cloudRuns: 2, unknownRuns: 1 });
-    expect(note.text).not.toMatch(/-\d/);
-    expect(note.text).toBe("2 dispatches via cloud. The right brain for the job, keep it up.");
-  });
 });

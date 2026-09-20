@@ -1,6 +1,13 @@
 // #1868 packet 2 retarget of mission-graph-token-attribution.spec.js against
-// `MissionGraphLens` (`#mission=<id>`). Same #1626 three-state local/cloud/
-// unknown attribution this port carries verbatim in `graph.ts`
+// `MissionGraphLens` (`#mission=<id>`).
+//
+// (#2834) The #1626 three-state local/cloud/unknown attribution these tests
+// were written against is WITHDRAWN from every rendered surface: it keyed on
+// endpoint presence, which is not a cost fact. The flag survives in `graph.ts`
+// as data; what these now assert is that the meter states a total and makes
+// no claim about where the tokens ran. Tracked for a real design in #1521.
+//
+// Formerly: same #1626 three-state attribution this port carried in `graph.ts`
 // (`applyRecordToMetrics`/`missionTotals`/`seedMetricsFromGraph`) — only the
 // header meter's selector (`.missionlens .mmeter`) changed.
 const { test, expect } = require('@playwright/test');
@@ -59,30 +66,46 @@ async function open(page, records) {
   return errors;
 }
 
-test('tokens with no endpoint evidence are not credited to local', async ({ page }) => {
+test('the meter states the total and makes no attribution claim (#2834)', async ({ page }) => {
   const errors = await open(page, RECORDS);
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
 
-  // (#2332) The header shows the total and the cloud share; the three-way
-  // split lives in the meter's tooltip. The #1607 guard is unchanged in
-  // spirit: cloud tokens must never be counted as local.
-  const split = await page.locator('.missionlens .mmeter').getAttribute('title');
+  // (#2834) The local/cloud/unattributed split is withdrawn from both the
+  // headline and the tooltip. It keyed on endpoint presence, which says a
+  // model was reached over HTTP and nothing about what it cost — an
+  // inference server on 127.0.0.1 has an endpoint. Moving the split into a
+  // tooltip would not have made it true, so the tooltip is gone too.
+  //
+  // #1607's defect ("the whole 15k reads as local") is now unreachable by
+  // construction rather than by guard: nothing here says local at all.
+  // `15k`, not `15.00k`: the mission meter formats through `graph.ts`'s own
+  // `fmtTok`, which drops to zero decimals at >=10,000 — NOT through
+  // `lib/format.ts`'s `fmtN`, which #2842 gave two decimals in the
+  // thousands. The two surfaces have separate formatters, and only the
+  // fleet hero's moved here. #2845 tracks whether the mission meter should
+  // follow; this assertion states what this surface renders TODAY so that a
+  // change to it is a deliberate rebaseline rather than a silent drift.
   expect(meter, `meter read: ${meter}`).toContain('15k tok');
-  expect(meter, 'no attribution word in the headline when nothing is cloud').not.toContain('local');
-  expect(split, `split read: ${split}`).toContain('3.0k local');
-  expect(split).toContain('unattributed');
-  expect(split, 'the whole 15k must never read as local — that is the #1607 defect').not.toContain('15.0k local');
+  for (const claim of ['local', 'cloud', 'unattributed']) {
+    expect(meter.toLowerCase(), `meter must not claim "${claim}": ${meter}`).not.toContain(claim);
+  }
+  expect(
+    await page.locator('.missionlens .mmeter').getAttribute('title'),
+    'the split tooltip is withdrawn, not relocated',
+  ).toBeNull();
 
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('the split is shown even when nothing is attributed to cloud', async ({ page }) => {
+test('drops a seat and still states only a total (#2834)', async ({ page }) => {
   const errors = await open(page, RECORDS.filter((r) => r.session_id !== 'step-local-1'));
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
-  const split = await page.locator('.missionlens .mmeter').getAttribute('title');
-  expect(split, `split read: ${split}`).toContain('unattributed');
-  expect(split).toContain('0 local');
-  expect(meter, 'no cloud share → no attribution word in the headline').not.toContain('cloud');
+  // The figure changes with the records; the CLAIM does not — whatever the
+  // mix of seats, the meter says how many tokens, never where they ran.
+  expect(meter, `meter read: ${meter}`).toMatch(/tok\b/);
+  for (const claim of ['local', 'cloud', 'unattributed']) {
+    expect(meter.toLowerCase(), `meter must not claim "${claim}": ${meter}`).not.toContain(claim);
+  }
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
@@ -104,9 +127,20 @@ test('a page opened AFTER the run agrees with one watched live', async ({ page }
   await expect(page.locator('.missionlens .mmeter')).toBeVisible();
 
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
-  const split = await page.locator('.missionlens .mmeter').getAttribute('title');
-  expect(meter, `meter read: ${meter}`).toContain('5.0k cloud');
-  expect(split, `split read: ${split}`).toContain('3.0k local');
-  expect(split, 'the errored hosted seat stays unattributed').toContain('unattributed');
+  // (#2834) The point of this test is AGREEMENT between a page opened after
+  // the run and one that watched it live — that the seeded-from-graph path
+  // and the streamed path reach the same number. The number is the total
+  // (3000 + 5000 + 7000); the split it used to assert is withdrawn.
+  // `15k`, not `15.00k`: the mission meter formats through `graph.ts`'s own
+  // `fmtTok`, which drops to zero decimals at >=10,000 — NOT through
+  // `lib/format.ts`'s `fmtN`, which #2842 gave two decimals in the
+  // thousands. The two surfaces have separate formatters, and only the
+  // fleet hero's moved here. #2845 tracks whether the mission meter should
+  // follow; this assertion states what this surface renders TODAY so that a
+  // change to it is a deliberate rebaseline rather than a silent drift.
+  expect(meter, `meter read: ${meter}`).toContain('15k tok');
+  for (const claim of ['local', 'cloud', 'unattributed']) {
+    expect(meter.toLowerCase(), `meter must not claim "${claim}": ${meter}`).not.toContain(claim);
+  }
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });

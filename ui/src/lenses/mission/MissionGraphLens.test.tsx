@@ -640,7 +640,7 @@ describe("mission header sub-line and meter (#2332)", () => {
     expect(sub()).not.toContain("ran");
   });
 
-  it("the meter shows the cloud share only when there is one; the split lives in the tooltip", async () => {
+  it("(#2834) the meter shows total tokens and makes no cloud claim; the endpoint fact stays in the tooltip", async () => {
     mockFetch({
       graph: minted("finalized"),
       flowMissionRecords: [
@@ -649,8 +649,14 @@ describe("mission header sub-line and meter (#2332)", () => {
       ],
     });
     renderLens(MINTED);
-    await waitFor(() => expect(document.querySelector(".mmeter")?.textContent).toContain("(5.0k cloud)"));
-    expect(document.querySelector(".mmeter")?.getAttribute("title")).toContain("5.0k cloud");
+    // (#2834) Both the visible "(5.0k cloud)" annotation and the tooltip's
+    // "local · cloud · unattributed" split are withdrawn. Both keyed on
+    // endpoint presence, which is not a cost fact; moving the second one
+    // into a tooltip would not have made it true.
+    await waitFor(() => expect(document.querySelector(".mmeter")?.textContent).toContain("5.0k tok"));
+    const meter = document.querySelector(".mmeter")!;
+    expect(meter.textContent).not.toContain("cloud");
+    expect(meter.getAttribute("title")).toBeNull();
   });
 
   it("tapping the name reveals the full id when the clipboard is unavailable (plain-http phone over the tailnet)", async () => {

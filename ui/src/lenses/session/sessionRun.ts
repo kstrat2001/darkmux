@@ -633,8 +633,15 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         const i = ep.indexOf(":");
         const kind = i >= 0 ? ep.slice(0, i) : "";
         const rest = i >= 0 ? ep.slice(i + 1) : ep;
-        const label = kind === "azure" ? "Azure OpenAI" : kind === "openai" ? "OpenAI" : kind || "remote";
-        return `${label} · ${rest} · off-fleet`;
+        // (#2834) The dialect and the address are FACTS darkmux read off
+        // the dispatch record. "off-fleet" was an inference on top of them,
+        // and a wrong one: `openai:` names the request FORMAT, not a
+        // vendor, so a local inference server on 127.0.0.1 speaking the
+        // OpenAI-compatible protocol was labelled as having left the
+        // machine. The address is right there for the operator to read;
+        // darkmux does not need to editorialize about where it points.
+        const label = kind === "azure" ? "Azure OpenAI" : kind === "openai" ? "OpenAI" : kind || "endpoint";
+        return `${label} · ${rest}`;
       })()
     : "LMStudio · local · this machine";
 
@@ -903,7 +910,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // profile's declared role (#1973 slice 4). Saying "also loaded" is true;
   // guessing by size or load order would not be.
   const primaryModel = d?.model ?? null;
-  const modelTrackLabel = ep ? "remote model" : "loaded models";
+  // (#2834) "endpoint model", not "remote model": the record says a model
+  // was reached over HTTP, which is true of a server on this machine too.
+  const modelTrackLabel = ep ? "endpoint model" : "loaded models";
   // (#2759) When THIS session loaded nothing itself, fall back to whatever
   // the mission-wide rollup found on its inner executions — the same data
   // that just turned TURNS/TOKENS/CONTEXT on above. Unlabeled (no primary/
@@ -911,7 +920,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // which are THIS session's own fields and mean nothing for a load that
   // happened on a different session entirely.
   const modelTrackLines = ep
-    ? [`${model || "unknown"} · served off-fleet — no local model (see route above)`]
+    ? [`${model || "unknown"} · served by the endpoint above — no local model loaded`]
     : loads.length
       ? loads.map((r) => {
           const f = r.fields as Record<string, unknown>;

@@ -161,30 +161,40 @@ function SavingsHero({
           day, not the last 24 hours, and the meta bar already states that
           day's range. (#1800 P2: the suffix was unconditional, so a replayed
           day claimed a window it had not been measured over.) */}
-      <div className="saveyebrow">tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+      {/* (#2834, operator) The section is ABOUT darkmux tokens; the figure
+          is all of them over the window. So the eyebrow names the subject
+          and the label under the number names what the number counts.
+          Before this the two were swapped — the eyebrow said "tokens · last
+          24h" and the label said "darkmux tokens", which read as a section
+          called "tokens" containing a figure called "darkmux tokens", with
+          the window attached to the wrong one. */}
+      <div className="saveyebrow">darkmux tokens</div>
       <div className="savrow">
+        {/* (#2834) ONE figure: every token darkmux dispatched in the window.
+            It used to be three — local, cloud, unattributed — split on a
+            predicate that cannot carry the distinction. `is_remote()` is
+            `endpoint.url.is_some()`, so ANY OpenAI-compatible endpoint read
+            as cloud, including a local inference server on 127.0.0.1. A
+            Splash run on this machine's own GPU, at zero marginal cost, was
+            counted against "cloud tokens" and the savings figure inverted.
+
+            The split is not being fixed here, it is being WITHDRAWN. Whether
+            an endpoint costs money is not derivable from its URL — a
+            self-hosted model on a rented VPS is metered, a local server is
+            not, and both are "an endpoint with a URL". It is a property the
+            operator knows and darkmux does not, so darkmux should stop
+            asserting it. #1521 tracks the real design: per-endpoint
+            attribution with metering declared rather than inferred.
+
+            "Unattributed" goes with it, and it was always a symptom of the
+            same thing: a bucket for sessions whose endpoint could not be
+            determined, which only needs to exist when the endpoint decides
+            the bucket. With one figure there is nothing to be unattributed
+            FROM — the tokens were dispatched by darkmux either way, which
+            is the only claim being made. */}
         <div className="savlead">
-          <div className="savnum">{settled ? fmtN(t.local) : ""}</div>
-          <div className="savlbl">local tokens</div>
-        </div>
-        <div className="savlead cloud">
-          <div className="savnum">{settled ? fmtN(t.cloud) : ""}</div>
-          <div className="savlbl">cloud tokens</div>
-        </div>
-        {/* (#2068) ALWAYS rendered, dimmed at zero. "Unattributed" is the
-            state of every dispatch between its start and its completion, so
-            mounting this tile only when the figure is non-zero made it
-            appear and vanish with each in-flight dispatch — 85px of reflow
-            under the hero on a phone, on every event during playback
-            (measured CLS 1.21 over 12s). A streaming view must not let
-            transient data change its geometry; the zero state is honest and
-            the title already explains the figure. */}
-        <div
-          className={`savlead unknown${t.unknown ? "" : " zero"}`}
-          title="No dispatch record for these sessions named an endpoint, so darkmux cannot say whether the model ran locally or on a hosted endpoint. They are excluded from the local figure rather than assumed to be free."
-        >
-          <div className="savnum">{settled ? fmtN(t.unknown) : ""}</div>
-          <div className="savlbl">unattributed</div>
+          <div className="savnum">{settled ? fmtN(t.local + t.cloud + t.unknown) : ""}</div>
+          <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
         </div>
         <div className="savclasses">
           <Chip value={settled ? fmtC(t.completion) : ""} label="generated" cls="gen" />
