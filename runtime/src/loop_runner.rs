@@ -4735,9 +4735,12 @@ fn run_with_sleeper(
                     trajectory.append_checkpoint(
                         turns,
                         checkpoints_used,
-                        this_turn_completion_tokens,
-                        tail_ratio,
-                        if degenerate { "conclude" } else { "continue" },
+                        crate::trajectory::CheckpointVerdict {
+                            slice_tokens: this_turn_completion_tokens,
+                            tail_ratio,
+                            verdict: if degenerate { "conclude" } else { "continue" },
+                            judged_chars: carried.chars().count(),
+                        },
                         bound,
                     );
                     // (#1221) The gate does exactly ONE thing: decide whether
@@ -5082,12 +5085,27 @@ fn run_streaming_turn(
         match gate.ingest(&chunk) {
             crate::stream_gate::GateAction::Continue
             | crate::stream_gate::GateAction::Observed { .. } => {}
-            crate::stream_gate::GateAction::Degenerate { slice_chars } => {
+            crate::stream_gate::GateAction::Degenerate { slice_chars, generated_chars } => {
                 eprintln!(
                     "darkmux-runtime: ⏹ observation {} — the output is repeating \
-                     (degeneracy gate) after {slice_chars} characters; ending this \
-                     call at a safe boundary. No tool call was in flight. (#2836)",
+                     (degeneracy gate) after {slice_chars} characters ({generated_chars} \
+                     of them from this call); ending it at a safe boundary. No tool \
+                     call was in flight. (#2836)",
                     gate.observations()
+                );
+                // (#2836) The gate's OWN verdict, recorded. Without this a
+                // runtime abort is the one cut in the system whose reason
+                // cannot be read back: `slice_tokens` is null (no usage ever
+                // arrives) and the `tail_ratio` on the checkpoint record
+                // downstream is the POST-HOC judge's number, computed over a
+                // different slice. Two judges disagreeing on one turn is
+                // exactly the failure this needs to be able to see.
+                trajectory.append_gate_abort(
+                    seq,
+                    gate.observations(),
+                    slice_chars,
+                    generated_chars,
+                    watch.interval,
                 );
                 cut = CutSource::RuntimeAbort(AbortReason::Degenerate);
                 // Dropping the stream drops ureq's pooled reader, so the

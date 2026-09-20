@@ -198,7 +198,14 @@ pub enum GateAction {
     /// record the observation.
     Observed { slice_chars: usize },
     /// A boundary was reached and the slice is degenerate. Stop reading.
-    Degenerate { slice_chars: usize },
+    Degenerate {
+        slice_chars: usize,
+        /// Characters of that slice this CALL produced, the rest being the
+        /// carried prefix. Recorded so a reader can tell a turn that has
+        /// been repeating for four continuations from one that started
+        /// looping inside this call.
+        generated_chars: usize,
+    },
 }
 
 /// Watches one streamed call and decides, without ever truncating a healthy
@@ -335,7 +342,10 @@ impl StreamGate {
         self.observations += 1;
         let chars = self.slice.chars().count();
         if (self.judge)(&self.slice, self.interval_tokens) {
-            GateAction::Degenerate { slice_chars: chars }
+            GateAction::Degenerate {
+                slice_chars: chars,
+                generated_chars: self.generated_chars(),
+            }
         } else {
             GateAction::Observed { slice_chars: chars }
         }

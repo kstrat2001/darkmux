@@ -143,6 +143,28 @@ pub struct Metrics {
     pub final_assistant_preview: String,
 }
 
+/// (#2836) What a checkpoint verdict was, and what it was computed OVER.
+///
+/// Grouped because the emitter's argument list reached eight positional
+/// values and four of them describe one thing.
+///
+/// `judged_chars` exists because the record could not distinguish a judge
+/// that looked and found nothing wrong from a judge that had nothing to look
+/// at. Live: a call emitting 32,001 characters of separate-field reasoning
+/// produced `tail_ratio: null, verdict: continue` here, while the in-stream
+/// gate judging the same turn called it degenerate. Both readings fit that
+/// record — either the two slices differ, or one judge is being handed an
+/// empty string — and nothing written down could tell them apart.
+///
+/// A `continue` over a near-empty slice is not evidence of health. It is a
+/// vacuous pass, and this is the field that makes the difference visible.
+pub struct CheckpointVerdict<'a> {
+    pub slice_tokens: Option<u32>,
+    pub tail_ratio: Option<f32>,
+    pub verdict: &'a str,
+    pub judged_chars: usize,
+}
+
 impl Trajectory {
     /// Open a trajectory file at `<base_dir>/.darkmux-runtime/`. In
     /// production `base_dir` is `RUNTIME_OUT_BASE` (`/darkmux-out`, the
@@ -364,11 +386,10 @@ impl Trajectory {
         &mut self,
         seq: u32,
         checkpoint: u32,
-        slice_tokens: Option<u32>,
-        tail_ratio: Option<f32>,
-        verdict: &str,
+        v: CheckpointVerdict<'_>,
         bound: crate::bounds::BoundRef,
     ) {
+        let CheckpointVerdict { slice_tokens, tail_ratio, verdict, judged_chars } = v;
         let slice = slice_tokens
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null);
@@ -386,6 +407,7 @@ impl Trajectory {
             "slice_tokens": slice,
             "tail_ratio": ratio,
             "verdict": verdict,
+            "judged_chars": judged_chars,
             "bound": bound,
         }));
     }
@@ -656,6 +678,42 @@ impl Trajectory {
             "name": name,
             "arguments_chars": arguments_chars,
             "cut": cut,
+        }));
+    }
+
+    /// dispatch.gate.abort — the in-stream observer ended a call itself
+    /// (#2836).
+    ///
+    /// **Why its own record.** A runtime abort is the one cut in the system
+    /// whose reason cannot otherwise be read back. It never receives a final
+    /// chunk, so `usage` never arrives and the `dispatch.checkpoint` record
+    /// that follows carries `slice_tokens: null`; and that record's
+    /// `tail_ratio` belongs to the POST-HOC judge, which looks at a
+    /// different slice than the gate did. Attributing that ratio to the gate
+    /// is a mistake the data actively invites.
+    ///
+    /// `slice_chars` is everything the verdict saw — the turn's carried
+    /// accumulation plus this call. `generated_chars` is how much of it this
+    /// call produced. The pair separates a turn that has been repeating
+    /// across four continuations from one that started looping inside this
+    /// call, which is the difference between the gate working and the gate
+    /// over-firing.
+    pub fn append_gate_abort(
+        &mut self,
+        seq: u32,
+        observation: u32,
+        slice_chars: usize,
+        generated_chars: usize,
+        interval_tokens: u32,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.gate.abort",
+            "seq": seq,
+            "ts": unix_ms(),
+            "observation": observation,
+            "slice_chars": slice_chars,
+            "generated_chars": generated_chars,
+            "interval_tokens": interval_tokens,
         }));
     }
 
