@@ -12228,14 +12228,15 @@ mod tests {
         // anchors on `^        check_`, which misses
         // `checks_power::check_power_posture()` (module-qualified, so the
         // line starts with `checks_power::`). The honest count of entries
-        // in the `vec![...]` block is 60, plus the one `check_hooks()`
-        // always contributes = 61. Use
+        // in the `vec![...]` block is 61 (#2846 added
+        // `check_detection_policy`), plus the one `check_hooks()` always
+        // contributes = 62. Use
         // `grep -cE '^        (checks_[a-z_]+::)?check_'` instead, or just
         // count the non-comment lines in the block.
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 61 + darkmux_eureka::all_rules().len();
+        let expected = 62 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
