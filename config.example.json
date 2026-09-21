@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.26",
+  "schema_version": "1.27",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -41,6 +41,11 @@
       "ratchet_factor": 2,
       "episode_threshold": 2,
       "tier4_enabled": true
+    },
+    "detection": {
+      "degeneracy": {
+        "policy": "enforce"
+      }
     },
     "liveness_retention_hours": 168
   },

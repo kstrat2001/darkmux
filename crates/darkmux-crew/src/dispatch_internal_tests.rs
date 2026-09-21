@@ -4075,6 +4075,7 @@
     // ─── #839 + #842: full docker-run argv assertion ──────────────
 
     #[test]
+    #[serial]
     fn build_docker_run_argv_asserts_complete_vector() {
         // (#842) Representative dispatch: non-default image (inject=true),
         // with compaction, allowed tools, and json mode. Asserts the
@@ -4220,6 +4221,25 @@
         // can.
         assert_eq!(argv[26], "-e");
         assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=enforce");
+        // (#2846, review finding I2) The assertion above pins the DEFAULT, so
+        // by itself it cannot tell "resolved correctly" from "hardcoded" —
+        // proven by mutation: replacing the resolution with a literal
+        // `"enforce"` kept all 2253 tests green. Pin a NON-default value too,
+        // the same discipline 5e below states for the timeout source.
+        {
+            unsafe {
+                std::env::set_var(
+                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observe");
+            }
+            let argv2 = build_docker_run_argv(&config);
+            unsafe {
+                std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
+            }
+            assert_eq!(
+                argv2[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=observe",
+                "the forwarded value must track the RESOLVED policy, not a literal"
+            );
+        }
 
         // 5d. (#2094 finding 1) Verify the inactivity-timeout env var is
         // forwarded too (`config.inactivity_timeout_seconds: 900` in this

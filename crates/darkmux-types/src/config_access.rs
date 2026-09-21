@@ -1498,7 +1498,8 @@ pub fn detection_degeneracy_policy() -> crate::config::DetectionPolicy {
         .as_ref()
         .and_then(|r| r.detection.as_ref())
         .and_then(|d| d.degeneracy.as_ref())
-        .and_then(|g| g.policy)
+        .and_then(|g| g.policy.as_deref())
+        .and_then(DetectionPolicy::parse_lenient)
         .unwrap_or(DetectionPolicy::Enforce)
 }
 
@@ -1519,9 +1520,15 @@ pub fn detection_degeneracy_policy_with_source()
         .as_ref()
         .and_then(|r| r.detection.as_ref())
         .and_then(|d| d.degeneracy.as_ref())
-        .and_then(|g| g.policy)
+        .and_then(|g| g.policy.as_deref())
     {
-        Some(p) => (p, "config"),
+        // A present-but-unparseable config value reports as `config-invalid`,
+        // the twin of `env-invalid` above, so the bounds stamp and `doctor`
+        // can both tell a typo from an absent key.
+        Some(raw) => match DetectionPolicy::parse_lenient(raw) {
+            Some(p) => (p, "config"),
+            None => (DetectionPolicy::Enforce, "config-invalid"),
+        },
         None => (DetectionPolicy::Enforce, "built-in"),
     }
 }
@@ -2300,6 +2307,72 @@ pub fn notebook_dir() -> std::path::PathBuf {
     }
     crate::paths::resolve(crate::paths::ResolveScope::Auto).notebook
 }
+
+
+#[cfg(test)]
+mod detection_policy_regression {
+    use crate::config::DarkmuxConfig;
+
+    /// (#2846, review finding C3) A typo in ONE value must not discard the
+    /// whole config.
+    ///
+    /// `load_from` ends in `unwrap_or_default()`, so any deserialization
+    /// error silently reverts every setting to its built-in default. While
+    /// `policy` was a derived enum, `"obserev"` — or merely `"Observe"`
+    /// capitalized — took `machine_id`, the Redis sink, the audit sink and
+    /// the thermal block down with it, with no error anywhere in the path.
+    ///
+    /// Asserted on fields FAR from the one carrying the typo, because the
+    /// failure was never local to the detection block. Red-proven by
+    /// restoring the derived enum: this test fails, the valid-value test
+    /// below still passes.
+    #[test]
+    fn a_typod_policy_value_does_not_discard_the_rest_of_the_config() {
+        for bad in ["obserev", "Observe", "", "true", "0"] {
+            let raw = format!(
+                r#"{{"machine_id":"laptop",
+                     "runtime":{{"max_turns":42,
+                       "detection":{{"degeneracy":{{"policy":"{bad}"}}}}}}}}"#
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, &raw).unwrap();
+            let cfg = DarkmuxConfig::load_from(&path);
+            assert_eq!(
+                cfg.machine_id.as_deref(),
+                Some("laptop"),
+                "a bad policy value `{bad}` discarded machine_id — the whole \
+                 config was dropped by unwrap_or_default()"
+            );
+            assert_eq!(
+                cfg.runtime.as_ref().and_then(|r| r.max_turns),
+                Some(42),
+                "a bad policy value `{bad}` discarded an unrelated runtime field"
+            );
+        }
+    }
+
+    /// A good value still round-trips, so the test above cannot pass by the
+    /// parse having been removed entirely.
+    #[test]
+    fn a_valid_policy_value_is_preserved() {
+        let raw = r#"{"machine_id":"laptop",
+            "runtime":{"detection":{"degeneracy":{"policy":"observe"}}}}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, raw).unwrap();
+        let cfg = DarkmuxConfig::load_from(&path);
+        assert_eq!(
+            cfg.runtime
+                .as_ref()
+                .and_then(|r| r.detection.as_ref())
+                .and_then(|d| d.degeneracy.as_ref())
+                .and_then(|g| g.policy.as_deref()),
+            Some("observe")
+        );
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

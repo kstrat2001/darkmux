@@ -5162,6 +5162,7 @@ fn run_streaming_turn(
         // (#2846) The stream gate is the FIRST of two gates; suppressing only
         // the checkpoint gate would still let this one cut generation short,
         // which is a second variable.
+        crate::detection::degeneracy_policy().measures(),
         crate::detection::degeneracy_policy().acts(),
     );
     let mut cut = CutSource::None;

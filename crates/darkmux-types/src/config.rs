@@ -233,6 +233,19 @@ use std::path::Path;
 //           Both `Option`-typed and lenient-on-read: an older binary
 //           ignores either block into `extras` and behaves exactly as it
 //           did before.
+//   1.27 (#2846): one additive block under `runtime`.
+//           `detection{}` — per-detector policy. `degeneracy.policy` is
+//           `enforce` (act) / `observe` (measure, never act) / `off` (do
+//           not measure). Written visibly by `init` at `enforce`, so an
+//           older binary ignoring the block behaves exactly as the
+//           default does.
+//           The value is stored as a STRING, not a derived enum: this
+//           file's loader ends in `unwrap_or_default()`, so a derived
+//           enum's hard error on an unknown variant discarded the WHOLE
+//           config on one typo. Same reason `fleet.mode` is a string.
+//           Parsing happens at the accessor, which reports an
+//           unrecognized value as `config-invalid` rather than coercing
+//           it silently.
 pub const CONFIG_SCHEMA_VERSION: &str = "1.27";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
@@ -690,8 +703,23 @@ pub struct RuntimeBehaviorConfig {
 /// Only `degeneracy` reads this today. The other three detectors are
 /// deliberately NOT given config keys until they read them: a key that
 /// nothing consumes is indistinguishable, to an operator, from one that does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+/// Deliberately does NOT derive `Deserialize`, matching [`FleetMode`]'s
+/// convention in this same file and for the same reason, which a review
+/// proved is not theoretical here (#2846):
+///
+/// `DarkmuxConfig::load_from` ends in `unwrap_or_default()`, so ANY
+/// deserialization error discards the ENTIRE config silently. A derived
+/// enum hard-errors on an unknown variant, which meant one typo in this one
+/// value (`"obserev"`, or merely `"Observe"` capitalized) dropped
+/// `machine_id`, the Redis sink, the audit sink, the thermal block and every
+/// other setting back to built-in defaults with no error anywhere in the
+/// path. The `#[serde(flatten)] extras` maps guard unknown KEYS and do
+/// nothing for unknown VALUES.
+///
+/// So the field on [`DetectorConfig`] is a plain `Option<String>` and the
+/// token is resolved at the accessor, where an unrecognized value can be
+/// reported against the raw string instead of taking the document with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DetectionPolicy {
     /// Detect and act on what is found. The shipped behavior.
     #[default]
@@ -716,10 +744,15 @@ impl DetectionPolicy {
     pub fn acts(self) -> bool {
         matches!(self, DetectionPolicy::Enforce)
     }
-    /// Lenient parse. An unrecognized value resolves to `Enforce` (the safe
-    /// direction: a typo must never silently disarm a guard) and is surfaced
-    /// by `darkmux doctor` rather than failing the hot load path, matching
-    /// contract 7's config-leniency rule.
+    /// Strict-but-non-fatal parse. Returns `None` for an unrecognized value,
+    /// kept distinct from `Some(Enforce)` so a caller (`darkmux doctor`,
+    /// `darkmux config set`) can flag the typo against the raw string rather
+    /// than silently coercing it — the same split [`FleetMode::parse`]
+    /// makes, and for the same reason.
+    ///
+    /// Callers that must produce a value resolve `None` to `Enforce`: the
+    /// ARMED direction on purpose, since a typo that disarmed a guard would
+    /// be silent.
     pub fn parse_lenient(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "enforce" => Some(DetectionPolicy::Enforce),
@@ -742,7 +775,11 @@ impl DetectionPolicy {
 /// repeats is not necessarily one whose tool calls cycle.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DetectorConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub policy: Option<DetectionPolicy>,
+    /// The raw token. `Option<String>`, not `Option<DetectionPolicy>` — see
+    /// [`DetectionPolicy`]'s own doc for the config-discarding failure that
+    /// forces this. Resolved via
+    /// `config_access::detection_degeneracy_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub policy: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
@@ -1550,7 +1587,7 @@ impl DarkmuxConfig {
                 // `thermal`: the operator tunes the file, not the source.
                 detection: Some(DetectionConfig {
                     degeneracy: Some(DetectorConfig {
-                        policy: Some(DetectionPolicy::Enforce),
+                        policy: Some(DetectionPolicy::Enforce.as_str().to_string()),
                         extras: Default::default(),
                     }),
                     extras: Default::default(),

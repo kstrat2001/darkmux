@@ -284,6 +284,8 @@ pub struct StreamGate {
     /// answers a different question (what to hand downstream) than the gate
     /// does (is something in flight RIGHT NOW).
     tool_slots: std::collections::BTreeMap<u32, String>,
+    /// (#2846) Whether the judge runs at all (`policy.measures()`).
+    may_judge: bool,
     /// (#2846) Whether a degenerate judgement may end the call.
     may_abort: bool,
 }
@@ -310,14 +312,18 @@ impl StreamGate {
     /// The cadence still counts only NEW characters — `since_boundary` starts
     /// at zero — so a long carried prefix does not immediately trip a
     /// boundary.
-    /// `may_abort` is the resolved detector policy's `acts()` (#2846).
+    /// `may_judge` / `may_abort` are the resolved detector policy's
+    /// `measures()` / `acts()` (#2846). `off` must not run the judge at all,
+    /// which its own doc promises and an earlier revision did not honor.
     pub fn new(
         bounds: GateBounds,
         judge: fn(&str, u32) -> (Option<f32>, bool),
         carried: &str,
+        may_judge: bool,
         may_abort: bool,
     ) -> Self {
         Self {
+            may_judge,
             may_abort,
             interval_chars: (bounds.interval_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
             interval_tokens: bounds.interval_tokens,
@@ -442,6 +448,12 @@ impl StreamGate {
 
         self.observations += 1;
         let chars = self.slice.chars().count();
+        // (#2846) `off` measures nothing, which is what its doc says. An
+        // earlier revision ran the judge regardless and only suppressed the
+        // abort, so `off` was `observe` that threw the finding away.
+        if !self.may_judge {
+            return GateAction::Observed { slice_chars: chars, ratio: None, would_abort: false };
+        }
         let (ratio, degenerate) = (self.judge)(&self.slice, self.interval_tokens);
         // (#2846) Judge identically, act conditionally. A gate that may not
         // act reports the SAME finding through the non-acting arm, so the
@@ -506,8 +518,9 @@ mod tests {
             GateBounds { interval_tokens: interval },
             judge,
             carried,
-            // Existing tests all exercise the acting gate; the non-acting
-            // path has its own test below (#2846).
+            // Existing tests all exercise the judging, acting gate; the other
+            // two policies have their own tests below (#2846).
+            true,
             true,
         )
     }
@@ -557,9 +570,11 @@ mod tests {
         // Same input, same judge, same cadence; the ONLY difference is
         // whether the gate is permitted to act.
         let mut acting = StreamGate::new(
-            GateBounds { interval_tokens: 1 }, always_degenerate, "", true);
+            GateBounds { interval_tokens: 1 }, always_degenerate, "", true, true);
         let mut observing = StreamGate::new(
-            GateBounds { interval_tokens: 1 }, always_degenerate, "", false);
+            GateBounds { interval_tokens: 1 }, always_degenerate, "", true, false);
+        let mut offgate = StreamGate::new(
+            GateBounds { interval_tokens: 1 }, always_degenerate, "", false, false);
 
         let feed = chunk(None, Some("aaaa aaaa aaaa aaaa aaaa aaaa "), false);
         let a = acting.ingest(&feed);
@@ -579,6 +594,15 @@ mod tests {
         // The measurement itself is unchanged, which is the claim that makes
         // this usable as an experimental control.
         assert_eq!(acting.observations(), observing.observations());
+
+        // `off` must measure NOTHING, not merely discard the finding.
+        match offgate.ingest(&feed) {
+            GateAction::Observed { ratio, would_abort, .. } => {
+                assert_eq!(ratio, None, "`off` must not run the judge at all");
+                assert!(!would_abort, "`off` has no finding to report");
+            }
+            other => panic!("`off` must never end a call; got {other:?}"),
+        }
     }
 
     #[test]
