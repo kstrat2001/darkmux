@@ -1481,6 +1481,51 @@ fn normalize_thermal_state(raw: String) -> String {
 
 /// OS thermal state at or above which the governor pauses. Default
 /// `"serious"`. Normalized — see [`normalize_thermal_state`].
+/// (#2846) Resolved policy for the repeated-output detector.
+/// `env(DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY) > config > Enforce`.
+///
+/// An unparseable value resolves to `Enforce` rather than failing, per
+/// contract 7 (config is lenient on read; loud validation belongs to
+/// `darkmux doctor`). The lenient direction is deliberately the ARMED one:
+/// a typo must never silently disarm a guard.
+pub fn detection_degeneracy_policy() -> crate::config::DetectionPolicy {
+    use crate::config::DetectionPolicy;
+    if let Some(raw) = env_str("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY") {
+        return DetectionPolicy::parse_lenient(&raw).unwrap_or(DetectionPolicy::Enforce);
+    }
+    config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.detection.as_ref())
+        .and_then(|d| d.degeneracy.as_ref())
+        .and_then(|g| g.policy)
+        .unwrap_or(DetectionPolicy::Enforce)
+}
+
+/// The same resolution, plus where the value came from, for `darkmux doctor`
+/// and for the `dispatch start.bounds` provenance stamp. A run that cannot
+/// say which detection regime it ran under is not a measurable run.
+pub fn detection_degeneracy_policy_with_source()
+    -> (crate::config::DetectionPolicy, &'static str) {
+    use crate::config::DetectionPolicy;
+    if let Some(raw) = env_str("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY") {
+        return match DetectionPolicy::parse_lenient(&raw) {
+            Some(p) => (p, "env"),
+            None => (DetectionPolicy::Enforce, "env-invalid"),
+        };
+    }
+    match config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.detection.as_ref())
+        .and_then(|d| d.degeneracy.as_ref())
+        .and_then(|g| g.policy)
+    {
+        Some(p) => (p, "config"),
+        None => (DetectionPolicy::Enforce, "built-in"),
+    }
+}
+
 pub fn thermal_pause_at() -> String {
     normalize_thermal_state(
         env_str("DARKMUX_THERMAL_PAUSE_AT")

@@ -26,6 +26,7 @@ use std::process::ExitCode;
 
 mod compaction;
 mod cycle_detector;
+mod detection;
 mod failure_rate;
 mod feedback;
 mod json_repair;

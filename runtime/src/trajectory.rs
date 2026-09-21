@@ -163,6 +163,15 @@ pub struct CheckpointVerdict<'a> {
     pub tail_ratio: Option<f32>,
     pub verdict: &'a str,
     pub judged_chars: usize,
+    /// (#2846) Which detection policy this checkpoint ran under. Stamped so
+    /// a run is self-describing: an artifact that does not say whether its
+    /// gate was armed cannot be compared against one that does.
+    pub policy: &'a str,
+    /// (#2846) What the detector FOUND, independent of whether it was
+    /// allowed to act. Under `enforce` this equals `verdict == "conclude"`.
+    /// Under `observe` it is the counterfactual the policy exists to
+    /// provide. Under `off` nothing was measured, so it is `None`.
+    pub would_conclude: Option<bool>,
 }
 
 impl Trajectory {
@@ -389,7 +398,7 @@ impl Trajectory {
         v: CheckpointVerdict<'_>,
         bound: crate::bounds::BoundRef,
     ) {
-        let CheckpointVerdict { slice_tokens, tail_ratio, verdict, judged_chars } = v;
+        let CheckpointVerdict { slice_tokens, tail_ratio, verdict, judged_chars, policy, would_conclude } = v;
         let slice = slice_tokens
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null);
@@ -408,6 +417,8 @@ impl Trajectory {
             "tail_ratio": ratio,
             "verdict": verdict,
             "judged_chars": judged_chars,
+            "policy": policy,
+            "would_conclude": would_conclude,
             "bound": bound,
         }));
     }

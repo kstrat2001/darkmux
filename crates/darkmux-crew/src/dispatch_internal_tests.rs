@@ -4212,93 +4212,102 @@
         assert_eq!(argv[24], "-e");
         assert_eq!(argv[25], "DARKMUX_TURN_DELAY_MS=3000");
 
+        // 5c-bis. (#2846) Verify the degeneracy-detector POLICY is forwarded.
+        // Always emitted, at its default too, for the same reason
+        // `turn_delay_ms` is: an absent var must never be ambiguous between
+        // "defaulted" and "the host forgot to forward it". A run that cannot
+        // say whether its gate was armed is not comparable against one that
+        // can.
+        assert_eq!(argv[26], "-e");
+        assert_eq!(argv[27], "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY=enforce");
+
         // 5d. (#2094 finding 1) Verify the inactivity-timeout env var is
         // forwarded too (`config.inactivity_timeout_seconds: 900` in this
         // test's config → `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900` on argv)
         // — the piece #2094's original cut left unforwarded, so the
         // runtime's soft-warning detector silently used its own 600s
         // literal default instead of the operator's configured budget.
-        assert_eq!(argv[26], "-e");
-        assert_eq!(argv[27], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
+        assert_eq!(argv[28], "-e");
+        assert_eq!(argv[29], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
 
         // 5e. (#2165) Verify the inactivity-timeout SOURCE env var is
         // forwarded alongside the value — a distinct, non-default source
         // (`Config`, not the built-in default) so this assertion actually
         // pins forwarding rather than coincidentally matching a default.
-        assert_eq!(argv[28], "-e");
-        assert_eq!(argv[29], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
+        assert_eq!(argv[30], "-e");
+        assert_eq!(argv[31], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
 
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[30], "-v");
+        assert_eq!(argv[32], "-v");
         assert_eq!(
-            argv[31],
+            argv[33],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[32], "--entrypoint");
-        assert_eq!(argv[33], "/darkmux-runtime");
+        assert_eq!(argv[34], "--entrypoint");
+        assert_eq!(argv[35], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[34], "--");
-        assert_eq!(argv[35], "rust:slim"); // image
-        assert_eq!(argv[36], "run"); // runtime subcommand
-        assert_eq!(argv[37], "--model");
-        assert_eq!(argv[38], "llama3-8b");
+        assert_eq!(argv[36], "--");
+        assert_eq!(argv[37], "rust:slim"); // image
+        assert_eq!(argv[38], "run"); // runtime subcommand
+        assert_eq!(argv[39], "--model");
+        assert_eq!(argv[40], "llama3-8b");
         // (Security audit, #2114 resume follow-up) Unconditional, every
         // dispatch — see `DockerRunConfig::role_id`'s own doc.
-        assert_eq!(argv[39], "--role-id");
-        assert_eq!(argv[40], "test-role");
+        assert_eq!(argv[41], "--role-id");
+        assert_eq!(argv[42], "test-role");
         // (#2386) Unconditional too — the runtime needs its finding-key
         // namespace on every dispatch. See `DockerRunConfig::session_id`.
-        assert_eq!(argv[41], "--session-id");
-        assert_eq!(argv[42], "sess-test");
-        assert_eq!(argv[43], "--system");
-        assert_eq!(argv[44], "You are a coding assistant.");
+        assert_eq!(argv[43], "--session-id");
+        assert_eq!(argv[44], "sess-test");
+        assert_eq!(argv[45], "--system");
+        assert_eq!(argv[46], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[45], "--prompt-file");
-        assert_eq!(argv[46], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[47], "--prompt-file");
+        assert_eq!(argv[48], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[47], "--json");
+        assert_eq!(argv[49], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[48], "--allowed-tools");
-        assert_eq!(argv[49], "exec,edit");
+        assert_eq!(argv[50], "--allowed-tools");
+        assert_eq!(argv[51], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[50], "--compact-threshold-tokens");
-        assert_eq!(argv[51], "4096");
-        assert_eq!(argv[52], "--compactor-model");
-        assert_eq!(argv[53], "util-model");
-        assert_eq!(argv[54], "--compact-threshold-ratio");
-        assert_eq!(argv[55], "0.75");
-        assert_eq!(argv[56], "--context-window");
-        assert_eq!(argv[57], "32000");
+        assert_eq!(argv[52], "--compact-threshold-tokens");
+        assert_eq!(argv[53], "4096");
+        assert_eq!(argv[54], "--compactor-model");
+        assert_eq!(argv[55], "util-model");
+        assert_eq!(argv[56], "--compact-threshold-ratio");
+        assert_eq!(argv[57], "0.75");
+        assert_eq!(argv[58], "--context-window");
+        assert_eq!(argv[59], "32000");
         // (#2808) The COMPACTOR's own window, and it must be DISTINCT from
         // the primary's 32,000 above — passing the primary's here would be
         // the defect, not the fix. Without this flag the runtime bounds its
         // compaction excerpt by nothing and posts a ~30,000-token excerpt to
         // a 16,000-token model, which LMStudio refuses with HTTP 400 every
         // time.
-        assert_eq!(argv[58], "--compactor-context-window");
-        assert_eq!(argv[59], "16000");
-        assert_eq!(argv[60], "--compact-strategy");
-        assert_eq!(argv[61], "structured-slot");
-        assert_eq!(argv[62], "--bail-after-compactions");
-        assert_eq!(argv[63], "10");
-        assert_eq!(argv[64], "--compactor-custom-instructions");
-        assert_eq!(argv[65], "Be terse.");
+        assert_eq!(argv[60], "--compactor-context-window");
+        assert_eq!(argv[61], "16000");
+        assert_eq!(argv[62], "--compact-strategy");
+        assert_eq!(argv[63], "structured-slot");
+        assert_eq!(argv[64], "--bail-after-compactions");
+        assert_eq!(argv[65], "10");
+        assert_eq!(argv[66], "--compactor-custom-instructions");
+        assert_eq!(argv[67], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[66], "--feedback-templates-json");
+        assert_eq!(argv[68], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[67].contains("error"));
-        assert!(argv[67].contains("An error occurred"));
+        assert!(argv[69].contains("error"));
+        assert!(argv[69].contains("An error occurred"));
 
         // Total arg count: 66 (0..=65) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
@@ -4308,7 +4317,7 @@
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
         // +2 for `--session-id <id>` (#2386). +1 for `--init` (#2481).
         // +2 for `--compactor-context-window <n>` (#2808).
-        assert_eq!(argv.len(), 68);
+        assert_eq!(argv.len(), 70);
     }
 
     #[test]
