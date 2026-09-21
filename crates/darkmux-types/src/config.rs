@@ -233,7 +233,20 @@ use std::path::Path;
 //           Both `Option`-typed and lenient-on-read: an older binary
 //           ignores either block into `extras` and behaves exactly as it
 //           did before.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.26";
+//   1.27 (#2846): one additive block under `runtime`.
+//           `detection{}` — per-detector policy. `degeneracy.policy` is
+//           `enforce` (act) / `observe` (measure, never act) / `off` (do
+//           not measure). Written visibly by `init` at `enforce`, so an
+//           older binary ignoring the block behaves exactly as the
+//           default does.
+//           The value is stored as a STRING, not a derived enum: this
+//           file's loader ends in `unwrap_or_default()`, so a derived
+//           enum's hard error on an unknown variant discarded the WHOLE
+//           config on one typo. Same reason `fleet.mode` is a string.
+//           Parsing happens at the accessor, which reports an
+//           unrecognized value as `config-invalid` rather than coercing
+//           it silently.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.27";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -606,6 +619,11 @@ pub struct RuntimeBehaviorConfig {
     /// (#2110/#2109) The thermal governor + breaker's tuning block. See
     /// [`ThermalConfig`]'s own doc for the pause/resume/breaker semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub thermal: Option<ThermalConfig>,
+    /// (#2846) Per-detector policy block. The runtime carries several
+    /// detectors that WATCH a dispatch and ACT on what they find; this is
+    /// where an operator says how much authority each one has. See
+    /// [`DetectionConfig`] and [`DetectionPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub detection: Option<DetectionConfig>,
     /// (#2653) Retention window, in hours, for
     /// `<darkmux-home>/liveness/<pid>.log` per-dispatch heartbeat files
     /// (`darkmux_types::dispatch_liveness`) — a file older than this is
@@ -673,6 +691,110 @@ pub struct RuntimeBehaviorConfig {
 ///
 /// Resume within a run is the operator's call (`darkmux dispatch
 /// --resume`); the breaker does not un-pause itself on recovery.
+/// (#2846) What authority one detector has over the dispatch it watches.
+///
+/// A boolean was the first shape proposed and was rejected: the runtime has
+/// FOUR detectors (degeneracy, tool-call cycles, repeated reasoning,
+/// consecutive tool failures), and "on/off" cannot express the state that is
+/// actually most useful for diagnosing one of them, which is *keep measuring
+/// but stop acting*. A policy enum says that directly and leaves room for
+/// per-detector policies that are not yet written.
+///
+/// Only `degeneracy` reads this today. The other three detectors are
+/// deliberately NOT given config keys until they read them: a key that
+/// nothing consumes is indistinguishable, to an operator, from one that does.
+/// Deliberately does NOT derive `Deserialize`, matching [`FleetMode`]'s
+/// convention in this same file and for the same reason, which a review
+/// proved is not theoretical here (#2846):
+///
+/// `DarkmuxConfig::load_from` ends in `unwrap_or_default()`, so ANY
+/// deserialization error discards the ENTIRE config silently. A derived
+/// enum hard-errors on an unknown variant, which meant one typo in this one
+/// value (`"obserev"`, or merely `"Observe"` capitalized) dropped
+/// `machine_id`, the Redis sink, the audit sink, the thermal block and every
+/// other setting back to built-in defaults with no error anywhere in the
+/// path. The `#[serde(flatten)] extras` maps guard unknown KEYS and do
+/// nothing for unknown VALUES.
+///
+/// So the field on [`DetectorConfig`] is a plain `Option<String>` and the
+/// token is resolved at the accessor, where an unrecognized value can be
+/// reported against the raw string instead of taking the document with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetectionPolicy {
+    /// Detect and act on what is found. The shipped behavior.
+    #[default]
+    Enforce,
+    /// Detect and RECORD, but never act. The record carries what the
+    /// detector would have done, so the counterfactual is measurable
+    /// without paying for it. This is the setting that makes a controlled
+    /// comparison possible: the check-in cadence, the per-call token cap
+    /// and therefore the usable prompt budget are all unchanged, so the
+    /// only variable is whether the verdict is obeyed.
+    Observe,
+    /// Do not run the detector at all. Cheapest, and measures nothing.
+    Off,
+}
+
+impl DetectionPolicy {
+    /// Whether the detector should run its measurement.
+    pub fn measures(self) -> bool {
+        !matches!(self, DetectionPolicy::Off)
+    }
+    /// Whether a finding may change what the dispatch does.
+    pub fn acts(self) -> bool {
+        matches!(self, DetectionPolicy::Enforce)
+    }
+    /// Strict-but-non-fatal parse. Returns `None` for an unrecognized value,
+    /// kept distinct from `Some(Enforce)` so a caller (`darkmux doctor`,
+    /// `darkmux config set`) can flag the typo against the raw string rather
+    /// than silently coercing it — the same split [`FleetMode::parse`]
+    /// makes, and for the same reason.
+    ///
+    /// Callers that must produce a value resolve `None` to `Enforce`: the
+    /// ARMED direction on purpose, since a typo that disarmed a guard would
+    /// be silent.
+    pub fn parse_lenient(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "enforce" => Some(DetectionPolicy::Enforce),
+            "observe" => Some(DetectionPolicy::Observe),
+            "off" => Some(DetectionPolicy::Off),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DetectionPolicy::Enforce => "enforce",
+            DetectionPolicy::Observe => "observe",
+            DetectionPolicy::Off => "off",
+        }
+    }
+}
+
+/// (#2846) One detector's settings. Split per detector rather than one global
+/// policy because the detectors are independent: an engine whose reasoning
+/// repeats is not necessarily one whose tool calls cycle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetectorConfig {
+    /// The raw token. `Option<String>`, not `Option<DetectionPolicy>` — see
+    /// [`DetectionPolicy`]'s own doc for the config-discarding failure that
+    /// forces this. Resolved via
+    /// `config_access::detection_degeneracy_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub policy: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2846) The detector block. Only `degeneracy` is wired today.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetectionConfig {
+    /// The repeated-output gate (`runtime/src/reasoning_loop.rs`). Under
+    /// `observe` the check-in still fires on exactly the same cadence and the
+    /// tail ratio is still computed and recorded; what stops is the cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub degeneracy: Option<DetectorConfig>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThermalConfig {
     /// The gate: `true`/absent → governor + breaker active; `false` → the
@@ -1461,6 +1583,15 @@ impl DarkmuxConfig {
                 // `ThermalConfig`'s own doc for why this defaults to
                 // `enabled: true` rather than the redis/audit off-by-default
                 // pattern.
+                // (#2846) Visible on-by-default block, same rationale as
+                // `thermal`: the operator tunes the file, not the source.
+                detection: Some(DetectionConfig {
+                    degeneracy: Some(DetectorConfig {
+                        policy: Some(DetectionPolicy::Enforce.as_str().to_string()),
+                        extras: Default::default(),
+                    }),
+                    extras: Default::default(),
+                }),
                 thermal: Some(ThermalConfig {
                     enabled: Some(true),
                     pause_at: Some("serious".to_string()),

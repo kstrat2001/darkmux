@@ -173,6 +173,7 @@ pub fn run() -> DoctorReport {
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
+        check_detection_policy(),
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
@@ -2620,6 +2621,67 @@ fn check_dispatch_free_concurrency() -> Check {
 /// "warn on a laptop with 0" clause is deliberately not implemented; the
 /// issue itself names this as conditional ("if the hardware crate exposes
 /// that cheaply"). Showing the resolved value is what's left.
+/// (#2846) Surface the resolved degeneracy-detector policy, and FLAG a
+/// value that was set but could not be parsed.
+///
+/// The runtime's parse is deliberately lenient and resolves an unrecognized
+/// value to `enforce`. That direction is right — a typo must never disarm a
+/// guard — but silent leniency is its own hazard: `POLICY=observ` (missing
+/// `e`) produces a fully armed run while the operator's shell history says
+/// `observe`, and the only evidence is a `source` field in a bounds stamp
+/// that nobody reads. This is the check that makes the leniency safe, and it
+/// is the half `turn_delay_ms`'s own unparseable-value check already has.
+fn check_detection_policy() -> Check {
+    use darkmux_types::config::DetectionPolicy;
+    let name = "detection policy (degeneracy)";
+    let (policy, source) =
+        darkmux_types::config_access::detection_degeneracy_policy_with_source();
+    if source.ends_with("-invalid") {
+        let raw = if source == "env-invalid" {
+            std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").unwrap_or_default()
+        } else {
+            darkmux_types::config::DarkmuxConfig::load_resolved()
+                .runtime
+                .and_then(|r| r.detection)
+                .and_then(|d| d.degeneracy)
+                .and_then(|g| g.policy)
+                .unwrap_or_default()
+        };
+        let where_ = if source == "env-invalid" {
+            "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"
+        } else {
+            "runtime.detection.degeneracy.policy"
+        };
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "`{raw}` is not a valid policy; running as `enforce` (armed). \
+                 Set via {where_}"
+            ),
+            hint: Some(
+                "Valid values: enforce, observe, off. \
+                 `darkmux config set runtime.detection.degeneracy.policy observe`"
+                    .into(),
+            ),
+        };
+    }
+    let detail = match policy {
+        DetectionPolicy::Enforce => "detects and acts on repeating output",
+        DetectionPolicy::Observe => {
+            "detects and RECORDS repeating output, never acts \
+             (`would_conclude` carries the counterfactual)"
+        }
+        DetectionPolicy::Off => "does not measure repeating output at all",
+    };
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!("{} ({source}) — {detail}", policy.as_str()),
+        hint: None,
+    }
+}
+
 fn check_turn_delay() -> Check {
     let name = "runtime.turn_delay_ms";
     // (#2094 finding 9) `env_raw` is the RAW string, if the env var is set
@@ -8574,6 +8636,44 @@ mod tests {
     // ─── (#2094) check_turn_delay — resolved state + provenance + clamp warn ─
 
     #[serial_test::serial]
+    /// (#2846, review finding I1) A set-but-unparseable policy must be
+    /// SURFACED, not silently resolved. The lenient direction is correct;
+    /// the silence is the hazard, because the operator's shell says
+    /// `observe` while the run is armed.
+    // Attribute order matches every other env-mutating test in this file:
+    // `serial` must wrap `test`, not the reverse.
+    #[serial_test::serial]
+    #[test]
+    fn an_unparseable_detection_policy_warns_rather_than_resolving_silently() {
+        let prev = std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observ");
+        }
+        let check = check_detection_policy();
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var(
+                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", v),
+                None => std::env::remove_var(
+                    "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"),
+            }
+        }
+        assert_eq!(check.status, Status::Warn, "got: {check:?}");
+        assert!(
+            check.message.contains("observ") && check.message.contains("enforce"),
+            "the warning must name BOTH the typo and what is actually running; \
+             got: {}",
+            check.message
+        );
+    }
+
+    // (#2846) Was missing `serial` while every sibling had it. It REMOVES
+    // DARKMUX_TURN_DELAY_MS, so unserialized it raced
+    // `check_turn_delay_below_timeout_is_pass_and_names_provenance` and wiped
+    // the 3000 that test had just set — surfacing as `0ms (from
+    // DARKMUX_TURN_DELAY_MS env)`. Latent before this branch; adding a check
+    // to `run()` changed the scheduling enough to expose it.
+    #[serial_test::serial]
     #[test]
     fn check_turn_delay_zero_by_default_is_pass() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
@@ -12137,14 +12237,15 @@ mod tests {
         // anchors on `^        check_`, which misses
         // `checks_power::check_power_posture()` (module-qualified, so the
         // line starts with `checks_power::`). The honest count of entries
-        // in the `vec![...]` block is 60, plus the one `check_hooks()`
-        // always contributes = 61. Use
+        // in the `vec![...]` block is 61 (#2846 added
+        // `check_detection_policy`), plus the one `check_hooks()` always
+        // contributes = 62. Use
         // `grep -cE '^        (checks_[a-z_]+::)?check_'` instead, or just
         // count the non-comment lines in the block.
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 61 + darkmux_eureka::all_rules().len();
+        let expected = 62 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -1990,6 +1990,18 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push("-e".to_string());
     args.push(format!("DARKMUX_TURN_DELAY_MS={}", config.turn_delay_ms));
 
+    // (#2846) Forward the resolved degeneracy-detector policy — the SAME
+    // #1548 pattern as `turn_delay_ms` above, and always emitted so the
+    // container never has to guess whether an absent var means "default" or
+    // "the host forgot". The runtime reads this in
+    // `runtime/src/detection.rs`, which is declared there rather than shared
+    // because that crate is independent of this workspace.
+    args.push("-e".to_string());
+    args.push(format!(
+        "DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY={}",
+        darkmux_types::config_access::detection_degeneracy_policy().as_str()
+    ));
+
     // (#2094 finding 1) Forward the resolved `inactivity_timeout_seconds`
     // setting — the SAME #1548 pattern as `feedback_injection` and
     // `turn_delay_ms` above. Always emitted so the runtime's soft-warning
@@ -6539,6 +6551,8 @@ fn resolved_runtime_bounds_json(
     // operator-facing, so it names the real provenance rather than
     // borrowing the nearest enum variant — unlike the container's env-var
     // wire format, this one has no fixed vocabulary to round-trip through.
+    let (dg_policy, dg_source) =
+        darkmux_types::config_access::detection_degeneracy_policy_with_source();
     let inactivity_timeout_block = match timeout_override_seconds {
         Some(n) => serde_json::json!({ "value": n, "source": "cli" }),
         None => vs(Some(inactivity_timeout_seconds.into()), s_inact),
@@ -6551,6 +6565,14 @@ fn resolved_runtime_bounds_json(
         "max_tokens": vs(max_tokens.map(Into::into), s_tokens),
         "turn_delay_ms": turn_delay_block,
         "feedback_injection": vs(Some(feedback_injection.into()), s_fi),
+        // (#2846) The detection regime the run executed under. Stamped here
+        // because a run that cannot say whether its gate was armed is not
+        // comparable against one that can — which is exactly what made an
+        // earlier engine comparison unreadable.
+        "detection_degeneracy_policy": {
+            "value": dg_policy.as_str(),
+            "source": dg_source,
+        },
     })
 }
 

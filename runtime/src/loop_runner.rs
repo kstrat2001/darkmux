@@ -4790,10 +4790,22 @@ fn run_with_sleeper(
                     // with no gate at all — it checkpointed forever, and the
                     // pre-existing intra-turn stall escalation that used to
                     // bound exactly that shape became unreachable.
-                    let degenerate = crate::reasoning_loop::slice_is_degenerate(
-                        &carried,
-                        governing_interval,
-                    );
+                    // (#2846) Measure, then decide separately whether the
+                    // measurement is allowed to change anything. Splitting
+                    // these two is the whole feature: `observe` keeps every
+                    // other variable identical (check-in cadence, per-call
+                    // cap, and therefore the usable prompt budget) and
+                    // changes only whether the verdict is obeyed.
+                    let policy = crate::detection::degeneracy_policy();
+                    let would_conclude = if policy.measures() {
+                        Some(crate::reasoning_loop::slice_is_degenerate(
+                            &carried,
+                            governing_interval,
+                        ))
+                    } else {
+                        None
+                    };
+                    let degenerate = would_conclude.unwrap_or(false) && policy.acts();
                     // (#1221) EVERY continuation is the same logical turn,
                     // including the one that follows a `conclude`.
                     //
@@ -4826,6 +4838,8 @@ fn run_with_sleeper(
                             tail_ratio,
                             verdict: if degenerate { "conclude" } else { "continue" },
                             judged_chars: carried.chars().count(),
+                            policy: policy.as_str(),
+                            would_conclude,
                         },
                         bound,
                     );
@@ -5145,6 +5159,11 @@ fn run_streaming_turn(
         crate::stream_gate::GateBounds { interval_tokens: watch.interval },
         crate::reasoning_loop::measure_and_judge,
         watch.carried,
+        // (#2846) The stream gate is the FIRST of two gates; suppressing only
+        // the checkpoint gate would still let this one cut generation short,
+        // which is a second variable.
+        crate::detection::degeneracy_policy().measures(),
+        crate::detection::degeneracy_policy().acts(),
     );
     let mut cut = CutSource::None;
     let stream = client.chat_streaming(request)?;
@@ -5207,14 +5226,20 @@ fn run_streaming_turn(
             // a few per call — and they are the only way the threshold's
             // margin can be checked against a distribution rather than
             // against the corpus it was originally set on.
-            crate::stream_gate::GateAction::Observed { slice_chars, ratio } => {
+            crate::stream_gate::GateAction::Observed { slice_chars, ratio, would_abort } => {
+                // (#2846) `would_abort` carries the suppressed finding. The
+                // record says the output WAS repeating even though the call
+                // was allowed to continue, which is the counterfactual the
+                // `observe` policy exists to produce. Recording it as `false`
+                // here would make an observe run indistinguishable from a
+                // clean one, and the policy would measure nothing.
                 trajectory.append_gate_observation(
                     seq,
                     gate.observations(),
                     slice_chars,
                     ratio,
                     watch.interval,
-                    false,
+                    would_abort,
                 );
             }
             crate::stream_gate::GateAction::Degenerate { slice_chars, ratio, generated_chars } => {
@@ -8828,6 +8853,88 @@ mod tests {
         assert!(
             !traj_text.contains("dispatch.tool_call.discarded"),
             "and it must not have destroyed anything doing it"
+        );
+    }
+
+    /// (#2846) `observe` measures and records without acting.
+    ///
+    /// The same degenerate stream the test above feeds to the default
+    /// `enforce` policy, where it escalates the dispatch. Under `observe`
+    /// the check-in must still fire on the same cadence, the tail ratio
+    /// must still be computed, the record must say the gate WOULD have
+    /// concluded, and the dispatch must NOT be cut.
+    ///
+    /// This is the single-variable form the bake-off arm D lacked. Widening
+    /// the per-call cap to disable the gate also shrinks the usable prompt
+    /// budget (cap + prompt must fit the context window), so a failure could
+    /// not be attributed to the missing gate. Policy changes only whether the
+    /// verdict is obeyed: cadence, per-call cap and prompt budget are
+    /// untouched.
+    #[test]
+    #[serial_test::serial]
+    fn observe_policy_records_the_would_be_cut_without_cutting() {
+        let looped: String = "the same thing over and over ".repeat(400);
+        let server = crate::test_support::GuardedMockServer::start();
+        let pieces: Vec<&str> = looped.split_inclusive(' ').collect();
+        let body = sse(&pieces, "stop", 2_000);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.clone());
+        });
+        std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observe");
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("degen-observe").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run_with_sleeper(
+            &client, &client, "m",
+            vec![Message::system("s"), Message::user("go")],
+            &[Tool::Read], &mut traj, true, &cfg,
+            Some(3), None, Some(9_000), Some(1_000), Some(1_000),
+            None, std::collections::BTreeMap::new(), None,
+            tmp.path(), "test-role", None, &RealSleeper,
+        );
+        std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
+        let outcome = outcome.expect("observe must not make a degenerate turn fatal");
+
+        let traj_text =
+            std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
+                .unwrap();
+
+        // The STREAM gate is what this fixture reaches: the endpoint returns
+        // `finish_reason: "stop"`, so under `observe` the call is never cut
+        // short and therefore never produces a length-finish for the
+        // checkpoint gate to judge. That absence is the POINT — under
+        // `enforce` the same fixture is aborted mid-stream (asserted by
+        // `a_degenerate_stream_is_ended_by_the_runtime_not_the_endpoint`).
+        assert!(
+            traj_text.contains("dispatch.gate.observation"),
+            "observe must still MEASURE; a policy that records nothing is \
+             indistinguishable from `off`; got:\n{traj_text}"
+        );
+        assert!(
+            traj_text.contains("\"degenerate\":true"),
+            "observe must record that the output WAS repeating, or the \
+             counterfactual it exists to provide is not in the artifact; \
+             got:\n{traj_text}"
+        );
+        assert_ne!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "observe must not escalate the dispatch the way enforce does"
+        );
+        // There are TWO gates. The stream gate (`runtime/src/stream_gate.rs`)
+        // judges mid-stream and ABORTS the call client-side; the checkpoint
+        // gate judges at the per-call cap. A policy that suppresses only the
+        // second one still lets the first cut generation short, which is a
+        // second variable and destroys this feature's entire reason to exist.
+        assert!(
+            !traj_text.contains("dispatch.gate.abort"),
+            "observe must not let the STREAM gate abort either; the claim is \
+             that only the verdict's EFFECT changes, and an aborted stream is \
+             an effect; got:\n{traj_text}"
         );
     }
 

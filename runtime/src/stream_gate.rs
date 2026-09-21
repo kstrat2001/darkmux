@@ -201,7 +201,12 @@ pub enum GateAction {
     /// A boundary was reached and the slice judged clean. Keep reading;
     /// record the observation — including the measured ratio, which is the
     /// point (see `Measured` below).
-    Observed { slice_chars: usize, ratio: Option<f32> },
+    /// Judged and allowed to continue. `would_abort` is TRUE when the
+    /// judgement WAS degenerate but the detector's policy does not permit it
+    /// to act (#2846) — the finding is real and must still be recorded, only
+    /// the abort is suppressed. Under `enforce` this is always false, because
+    /// a degenerate judgement returns [`GateAction::Degenerate`] instead.
+    Observed { slice_chars: usize, ratio: Option<f32>, would_abort: bool },
     /// A boundary was reached and the slice is degenerate. Stop reading.
     Degenerate {
         slice_chars: usize,
@@ -279,6 +284,10 @@ pub struct StreamGate {
     /// answers a different question (what to hand downstream) than the gate
     /// does (is something in flight RIGHT NOW).
     tool_slots: std::collections::BTreeMap<u32, String>,
+    /// (#2846) Whether the judge runs at all (`policy.measures()`).
+    may_judge: bool,
+    /// (#2846) Whether a degenerate judgement may end the call.
+    may_abort: bool,
 }
 
 impl StreamGate {
@@ -303,12 +312,19 @@ impl StreamGate {
     /// The cadence still counts only NEW characters — `since_boundary` starts
     /// at zero — so a long carried prefix does not immediately trip a
     /// boundary.
+    /// `may_judge` / `may_abort` are the resolved detector policy's
+    /// `measures()` / `acts()` (#2846). `off` must not run the judge at all,
+    /// which its own doc promises and an earlier revision did not honor.
     pub fn new(
         bounds: GateBounds,
         judge: fn(&str, u32) -> (Option<f32>, bool),
         carried: &str,
+        may_judge: bool,
+        may_abort: bool,
     ) -> Self {
         Self {
+            may_judge,
+            may_abort,
             interval_chars: (bounds.interval_tokens as usize).saturating_mul(CHARS_PER_TOKEN),
             interval_tokens: bounds.interval_tokens,
             judge,
@@ -432,7 +448,22 @@ impl StreamGate {
 
         self.observations += 1;
         let chars = self.slice.chars().count();
+        // (#2846) `off` measures nothing, which is what its doc says. An
+        // earlier revision ran the judge regardless and only suppressed the
+        // abort, so `off` was `observe` that threw the finding away.
+        if !self.may_judge {
+            return GateAction::Observed { slice_chars: chars, ratio: None, would_abort: false };
+        }
         let (ratio, degenerate) = (self.judge)(&self.slice, self.interval_tokens);
+        // (#2846) Judge identically, act conditionally. A gate that may not
+        // act reports the SAME finding through the non-acting arm, so the
+        // slice lifecycle, the cadence and the observation count are
+        // bit-for-bit what `enforce` would have produced. Returning early
+        // instead, or suppressing the record, would each introduce the second
+        // variable this policy exists to avoid.
+        if degenerate && !self.may_abort {
+            return GateAction::Observed { slice_chars: chars, ratio, would_abort: true };
+        }
         if degenerate {
             GateAction::Degenerate {
                 slice_chars: chars,
@@ -440,7 +471,7 @@ impl StreamGate {
                 generated_chars: self.generated_chars(),
             }
         } else {
-            GateAction::Observed { slice_chars: chars, ratio }
+            GateAction::Observed { slice_chars: chars, ratio, would_abort: false }
         }
     }
 }
@@ -487,6 +518,10 @@ mod tests {
             GateBounds { interval_tokens: interval },
             judge,
             carried,
+            // Existing tests all exercise the judging, acting gate; the other
+            // two policies have their own tests below (#2846).
+            true,
+            true,
         )
     }
 
@@ -525,6 +560,51 @@ mod tests {
     /// this stream would have been truncated four times by the server, each
     /// cut costing a round trip and a re-sent prefill, and any one of them
     /// could have landed mid-tool-call.
+    /// (#2846) A gate that may not abort judges identically and reports the
+    /// finding through the non-acting arm.
+    #[test]
+    fn a_non_acting_gate_reports_the_finding_without_ending_the_call() {
+        fn always_degenerate(_: &str, _: u32) -> (Option<f32>, bool) {
+            (Some(0.01), true)
+        }
+        // Same input, same judge, same cadence; the ONLY difference is
+        // whether the gate is permitted to act.
+        let mut acting = StreamGate::new(
+            GateBounds { interval_tokens: 1 }, always_degenerate, "", true, true);
+        let mut observing = StreamGate::new(
+            GateBounds { interval_tokens: 1 }, always_degenerate, "", true, false);
+        let mut offgate = StreamGate::new(
+            GateBounds { interval_tokens: 1 }, always_degenerate, "", false, false);
+
+        let feed = chunk(None, Some("aaaa aaaa aaaa aaaa aaaa aaaa "), false);
+        let a = acting.ingest(&feed);
+        let o = observing.ingest(&feed);
+
+        assert!(
+            matches!(a, GateAction::Degenerate { .. }),
+            "the acting gate must still end the call; got {a:?}"
+        );
+        match o {
+            GateAction::Observed { would_abort, ratio, .. } => {
+                assert!(would_abort, "the finding must survive the suppression");
+                assert_eq!(ratio, Some(0.01), "and it must carry the same ratio");
+            }
+            other => panic!("a non-acting gate must not end the call; got {other:?}"),
+        }
+        // The measurement itself is unchanged, which is the claim that makes
+        // this usable as an experimental control.
+        assert_eq!(acting.observations(), observing.observations());
+
+        // `off` must measure NOTHING, not merely discard the finding.
+        match offgate.ingest(&feed) {
+            GateAction::Observed { ratio, would_abort, .. } => {
+                assert_eq!(ratio, None, "`off` must not run the judge at all");
+                assert!(!would_abort, "`off` has no finding to report");
+            }
+            other => panic!("`off` must never end a call; got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_clean_stream_is_never_interrupted_however_long_it_runs() {
         let mut g = gate(10, NEVER, ""); // 40-char cadence
