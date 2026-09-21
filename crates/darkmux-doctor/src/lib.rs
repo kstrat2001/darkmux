@@ -8640,8 +8640,10 @@ mod tests {
     /// SURFACED, not silently resolved. The lenient direction is correct;
     /// the silence is the hazard, because the operator's shell says
     /// `observe` while the run is armed.
-    #[test]
+    // Attribute order matches every other env-mutating test in this file:
+    // `serial` must wrap `test`, not the reverse.
     #[serial_test::serial]
+    #[test]
     fn an_unparseable_detection_policy_warns_rather_than_resolving_silently() {
         let prev = std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").ok();
         unsafe {
