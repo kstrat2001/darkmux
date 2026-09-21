@@ -5159,6 +5159,10 @@ fn run_streaming_turn(
         crate::stream_gate::GateBounds { interval_tokens: watch.interval },
         crate::reasoning_loop::measure_and_judge,
         watch.carried,
+        // (#2846) The stream gate is the FIRST of two gates; suppressing only
+        // the checkpoint gate would still let this one cut generation short,
+        // which is a second variable.
+        crate::detection::degeneracy_policy().acts(),
     );
     let mut cut = CutSource::None;
     let stream = client.chat_streaming(request)?;
@@ -5221,14 +5225,20 @@ fn run_streaming_turn(
             // a few per call — and they are the only way the threshold's
             // margin can be checked against a distribution rather than
             // against the corpus it was originally set on.
-            crate::stream_gate::GateAction::Observed { slice_chars, ratio } => {
+            crate::stream_gate::GateAction::Observed { slice_chars, ratio, would_abort } => {
+                // (#2846) `would_abort` carries the suppressed finding. The
+                // record says the output WAS repeating even though the call
+                // was allowed to continue, which is the counterfactual the
+                // `observe` policy exists to produce. Recording it as `false`
+                // here would make an observe run indistinguishable from a
+                // clean one, and the policy would measure nothing.
                 trajectory.append_gate_observation(
                     seq,
                     gate.observations(),
                     slice_chars,
                     ratio,
                     watch.interval,
-                    false,
+                    would_abort,
                 );
             }
             crate::stream_gate::GateAction::Degenerate { slice_chars, ratio, generated_chars } => {
@@ -8892,29 +8902,38 @@ mod tests {
             std::fs::read_to_string(tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"))
                 .unwrap();
 
+        // The STREAM gate is what this fixture reaches: the endpoint returns
+        // `finish_reason: "stop"`, so under `observe` the call is never cut
+        // short and therefore never produces a length-finish for the
+        // checkpoint gate to judge. That absence is the POINT — under
+        // `enforce` the same fixture is aborted mid-stream (asserted by
+        // `a_degenerate_stream_is_ended_by_the_runtime_not_the_endpoint`).
         assert!(
-            traj_text.contains("dispatch.checkpoint"),
-            "the check-in must still fire under observe; got:\n{traj_text}"
+            traj_text.contains("dispatch.gate.observation"),
+            "observe must still MEASURE; a policy that records nothing is \
+             indistinguishable from `off`; got:\n{traj_text}"
         );
         assert!(
-            traj_text.contains("\"would_conclude\":true"),
-            "observe must RECORD that the gate would have concluded, or the \
-             counterfactual it exists to provide is not in the artifact; got:\n{traj_text}"
-        );
-        assert!(
-            traj_text.contains("\"policy\":\"observe\""),
-            "the record must name the policy it ran under, so a run is \
-             self-describing; got:\n{traj_text}"
-        );
-        assert!(
-            !traj_text.contains("\"verdict\":\"conclude\""),
-            "observe must never emit a conclude verdict — that is the ACT it \
-             suppresses; got:\n{traj_text}"
+            traj_text.contains("\"degenerate\":true"),
+            "observe must record that the output WAS repeating, or the \
+             counterfactual it exists to provide is not in the artifact; \
+             got:\n{traj_text}"
         );
         assert_ne!(
             outcome.terminal_reason,
             TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
             "observe must not escalate the dispatch the way enforce does"
+        );
+        // There are TWO gates. The stream gate (`runtime/src/stream_gate.rs`)
+        // judges mid-stream and ABORTS the call client-side; the checkpoint
+        // gate judges at the per-call cap. A policy that suppresses only the
+        // second one still lets the first cut generation short, which is a
+        // second variable and destroys this feature's entire reason to exist.
+        assert!(
+            !traj_text.contains("dispatch.gate.abort"),
+            "observe must not let the STREAM gate abort either; the claim is \
+             that only the verdict's EFFECT changes, and an aborted stream is \
+             an effect; got:\n{traj_text}"
         );
     }
 
