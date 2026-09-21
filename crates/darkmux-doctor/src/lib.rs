@@ -8667,6 +8667,13 @@ mod tests {
         );
     }
 
+    // (#2846) Was missing `serial` while every sibling had it. It REMOVES
+    // DARKMUX_TURN_DELAY_MS, so unserialized it raced
+    // `check_turn_delay_below_timeout_is_pass_and_names_provenance` and wiped
+    // the 3000 that test had just set — surfacing as `0ms (from
+    // DARKMUX_TURN_DELAY_MS env)`. Latent before this branch; adding a check
+    // to `run()` changed the scheduling enough to expose it.
+    #[serial_test::serial]
     #[test]
     fn check_turn_delay_zero_by_default_is_pass() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
