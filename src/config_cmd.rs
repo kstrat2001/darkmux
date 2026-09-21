@@ -54,6 +54,15 @@ enum Ty {
     Float,
     /// A string constrained to the `FleetMode` token set (#933).
     FleetMode,
+    /// (#2846) A string constrained to the `DetectionPolicy` token set
+    /// (`enforce`/`observe`/`off`). Validated here rather than left as
+    /// `Ty::Str` for the reason `ThermalState` is: the runtime's own parse
+    /// is deliberately LENIENT and resolves an unknown value to `enforce`,
+    /// so a typo written through `config set` would be silently armed and
+    /// the operator would never learn the key did not take. Leniency on the
+    /// hot load path and strictness at the write surface is contract 7's
+    /// split, not a contradiction.
+    DetectionPolicy,
     /// (#2110/#2109 review finding 6) A string constrained to
     /// `darkmux_crew::host_probe::thermal::THERMAL_STATES`
     /// (`nominal`/`fair`/`serious`/`critical`) — `runtime.thermal.pause_at`
@@ -167,6 +176,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.liveness_retention_hours", Ty::Uint),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc.
+    ("runtime.detection.degeneracy.policy", Ty::DetectionPolicy),
     ("runtime.thermal.enabled", Ty::Bool),
     ("runtime.thermal.pause_at", Ty::ThermalState),
     ("runtime.thermal.resume_at", Ty::ThermalState),
@@ -506,6 +516,15 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                 .ok_or_else(|| anyhow!("invalid fleet.mode `{raw}` — valid: standalone, hub, peer"))?;
             // Store the canonical lowercase token regardless of the input casing.
             Value::String(mode.as_str().to_string())
+        }
+        Ty::DetectionPolicy => {
+            let lower = raw.trim().to_ascii_lowercase();
+            match darkmux_types::config::DetectionPolicy::parse_lenient(&lower) {
+                Some(p) => Value::String(p.as_str().to_string()),
+                None => bail!(
+                    "invalid detection policy `{raw}` — valid: enforce, observe, off"
+                ),
+            }
         }
         Ty::ThermalState => {
             let lower = raw.trim().to_ascii_lowercase();
@@ -1047,6 +1066,7 @@ mod tests {
                 // a valid FleetMode token doubles as the generic string sentinel
                 Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
                 // a valid THERMAL_STATES token, same reasoning as FleetMode above
+                Ty::DetectionPolicy => Value::String("enforce".into()),
                 Ty::ThermalState => Value::String("nominal".into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
                 // An empty array is valid JSON that parses cleanly to an
