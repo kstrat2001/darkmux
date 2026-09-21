@@ -12,6 +12,60 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.10.0] - 2026-09-21
+
+### Added
+
+- **Per-detector policy for the degeneracy detector** (#2846, #2856). The
+  repeated-output detector had exactly one behavior: detect and act. There was
+  no way to run a dispatch with it measuring but not intervening, which made it
+  impossible to measure what acting on a finding actually costs or buys.
+  `runtime.detection.degeneracy.policy` now takes three values:
+
+  | policy | behavior |
+  |---|---|
+  | `enforce` | detect and act. The shipped default, unchanged. |
+  | `observe` | detect and RECORD, never act. |
+  | `off` | do not measure at all. |
+
+  `observe` keeps every other variable fixed: the check-in cadence, the per-call
+  token limit, and therefore the usable prompt budget are all identical to
+  `enforce`. Only whether the verdict is obeyed changes. Previously the only way
+  to quiet the detector was to raise the per-call token limit until it stopped
+  being reached, which also shrinks the prompt budget, because the endpoint
+  requires prompt plus `max_tokens` to fit the context window. That is a second
+  variable, and it made the results of any such comparison unattributable.
+
+  A policy enum rather than a boolean because the runtime carries four detectors
+  (degeneracy, tool-call cycles, repeated reasoning, consecutive tool failures)
+  and on/off cannot express the state that is most useful for diagnosing one of
+  them: keep measuring, stop acting. Only `degeneracy` reads a key today; the
+  other three get none until they do.
+
+  Both gates honor the policy, not just one. The checkpoint gate judges at the
+  per-call limit and the stream gate judges mid-call and can end the call
+  client-side; a policy that reached only the first would still let the second
+  cut generation short.
+
+  Records carry the counterfactual: `dispatch.checkpoint` gains `policy` and
+  `would_conclude`, `dispatch.gate.observation` keeps `degenerate: true` on a
+  suppressed finding, and `dispatch start.bounds` stamps the resolved policy
+  with provenance. An `observe` run therefore reports how many turns WOULD have
+  been cut while letting them run, and every run is self-describing about the
+  regime it executed under.
+
+  Set it with `darkmux config set runtime.detection.degeneracy.policy observe`,
+  or per-shell with `DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY`. An
+  unrecognized value resolves to `enforce`, the armed direction, and `darkmux
+  doctor` warns rather than leaving the typo silent.
+
+- `CONFIG_SCHEMA_VERSION` 1.26 -> 1.27 (additive). An older binary ignores the
+  new `runtime.detection` block into `extras` and behaves exactly as its default
+  does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
+  unchanged at 3.0.0.
+
+[3.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.10.0
+
 ## [3.9.0] - 2026-09-20
 
 Schema contracts: `FLOW_SCHEMA` 1.51.0 to 1.52.0, an additive minor bump for one
