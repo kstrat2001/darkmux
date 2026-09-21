@@ -1,6 +1,6 @@
 [package]
 name = "darkmux-hardware"
-version = "3.9.0"
+version = "3.10.0"
 edition = "2021"
 description = "darkmux hardware detection — RAM/chip tier introspection"
 license = "MIT"
