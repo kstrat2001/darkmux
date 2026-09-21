@@ -17,24 +17,29 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v3.9.0 — the check-in that was meant to WATCH a stream
-  # stopped cutting it (#2836). The reasoning checkpoint sent `max_tokens` at
-  # the check-in interval, so the endpoint stopped generating mid tool-call
-  # arguments; the truncated JSON would not parse and was dropped with no
-  # record. Measured 9 destroyed tool calls across 64% of check-in firings,
-  # now 0. A discarded tool call is also recorded now, with `cut` naming
-  # whether the endpoint or the runtime ended it. Also: the fleet hero no
-  # longer counts a LOCAL endpoint as cloud (#2834), and `lab tune` reports
-  # its block total (#2848).
+  # Stable release: v3.10.0 — the repeated-output detector gets a policy
+  # (#2846). It had one behavior, detect and act, so there was no way to run
+  # a dispatch with it measuring but not intervening.
+  # `runtime.detection.degeneracy.policy` now takes `enforce` (act, the
+  # unchanged default), `observe` (record, never act) or `off` (do not
+  # measure). `observe` holds every other variable fixed: check-in cadence,
+  # per-call token limit, and therefore the usable prompt budget. The old
+  # workaround, raising the per-call limit until the detector stopped being
+  # reached, also shrinks the prompt budget, because the endpoint requires
+  # prompt plus max_tokens to fit the context window. Both gates honor the
+  # policy, and records carry what the detector WOULD have done
+  # (`would_conclude`), so an observe run is measurable rather than merely
+  # quieter.
   #
-  # FLOW_SCHEMA 1.51.0 -> 1.52.0, additive — an older peer ignores the new
-  # detector record rather than rejecting it. CONFIG_SCHEMA unchanged at
-  # 1.26, RULES_SCHEMA at 3.0.0. Drop-in over v3.8.0.
+  # CONFIG_SCHEMA 1.26 -> 1.27, additive — an older binary ignores the new
+  # `runtime.detection` block and behaves exactly as its default does.
+  # FLOW_SCHEMA unchanged at 1.52.0, RULES_SCHEMA at 3.0.0. Drop-in over
+  # v3.9.0.
   # `brew install darkmux` builds from this source tarball; `brew install
   # --HEAD darkmux` builds from main instead. The sha256 is of the
   # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.9.0.tar.gz"
-  sha256 "78d85df49dfb50a76a38817e4352e65501af2818650b93821ffd80e7c97dfbf1"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.10.0.tar.gz"
+  sha256 "2d068a21993b809abfd6eba172dc674bec0fd4e73d3eea2d2841222ca0ed098e"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
