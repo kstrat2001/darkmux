@@ -161,7 +161,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.pillLabel).toBe("ERRORED");
     expect(view.header.pillCls).toBe("err");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("1:00 · errored (exit 1)");
+    // (#2860) The figure alone in `value`, the outcome on the `sub` line: the
+    // tile value is `nowrap` because it is contracted to be one short figure
+    // (`styles.css`, `.session-run .mv`), and "3:38 · errored (exit 1)" ran
+    // straight through the COMPACTIONS tile beside it on a phone.
+    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.value).toBe("1:00");
+    expect(wall?.sub).toBe("errored (exit 1)");
   });
 
   it("a watchdog-killed dispatch (exit 137) reads 'killed', not 'errored'", () => {
@@ -171,7 +177,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.pillLabel).toBe("KILLED");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("1:00 · killed (timeout)");
+    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.value).toBe("1:00");
+    expect(wall?.sub).toBe("killed (timeout)");
   });
 
   // ── (#2011) the wall clock reads the RECORD, not a subtraction ──────

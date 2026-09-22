@@ -587,11 +587,16 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // that runs past an hour used to read "75:23" here.
   const wallBase = done ? fmtElapsed(runWallMs) : `${fmtElapsed(nowMs - startTs)} so far`;
   const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
-  const wallLoud =
+  // (#2860) How the run ended goes on the tile's `sub` line, not appended to
+  // the figure: the value is `nowrap` because it is contracted to be one
+  // short figure (`styles.css`, `.session-run .mv`), and "3:38 · errored
+  // (exit 1)" ran through the neighbouring tile on a phone.
+  const wallOutcome =
     done && c && dispatchErrored(c)
-      ? ` · ${dispatchKilled(c) ? "killed (timeout)" : `errored${exitCode != null ? ` (exit ${exitCode})` : ""}`}`
-      : "";
-  const wall = wallBase + wallLoud;
+      ? dispatchKilled(c)
+        ? "killed (timeout)"
+        : `errored${exitCode != null ? ` (exit ${exitCode})` : ""}`
+      : undefined;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();
   const svLabel = statusLabel(
@@ -837,10 +842,11 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // what the label does. `StepRow.tsx` carries the matching half.
   push(
     systemIdx,
-    wall,
+    wallBase,
     "WALL CLOCK",
     "model time",
     "model time — the runtime's own measure of this execution. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
+    wallOutcome,
   );
   // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
   // and it is the reading contract 8 supports: the harness DECIDES to compact
