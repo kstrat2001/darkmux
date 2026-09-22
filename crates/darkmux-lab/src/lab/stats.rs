@@ -307,7 +307,10 @@ pub struct RunStats {
     /// Machine-wide, so a PRESSURE reading rather than this run's footprint.
     pub mem_pct_busy_max: Option<u64>,
 
-    pub flow_records: usize,
+    /// This session's flow records inside the scanned window. A provenance
+    /// count, bounded by the same window as everything else here.
+    pub flow_records_in_window: usize,
+    pub flow_scan: FlowScan,
     pub checks: RunChecks,
 }
 
@@ -576,26 +579,98 @@ impl Sample {
     }
 }
 
-/// Pull `machine.telemetry` samples whose `sampled_at_ms` lands inside
-/// `[from, to]` out of a flow file's lines.
-pub(crate) fn parse_telemetry(raw: &str, from: u64, to: u64, out: &mut Vec<Sample>) {
+/// How far outside a run's own window a record that belongs to it can land.
+///
+/// The host emits `dispatch start` before the runtime stamps its own
+/// `started_at_unix_ms`, and the terminal records land after `wall_ms` has
+/// elapsed. Telemetry is NOT widened by this: power is averaged over samples
+/// strictly inside the run, and only the file-selection and early-stop bounds
+/// use the slack.
+pub const WINDOW_SLACK_MS: u64 = 5 * 60 * 1000;
+
+/// What reading the flow stream cost, stamped into the output so "the
+/// observer was negligible" is a claim the data can check rather than an
+/// assumption. The point of the bound: `files_read` and `lines_scanned` track
+/// the size of the RUN, not the size of the archive.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FlowScan {
+    pub files_total: usize,
+    /// Last written before the run began, so they cannot hold any of it.
+    /// Never opened.
+    pub files_skipped: usize,
+    pub files_read: usize,
+    /// Files whose own clock passed the end of the window, so the rest of
+    /// the file was not read.
+    pub files_stopped_early: usize,
+    pub lines_scanned: usize,
+    pub gather_ms: u64,
+}
+
+/// What one pass over the flow stream yields for a run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FlowFacts {
+    samples: Vec<Sample>,
+    records_for_session: usize,
+    bounds: BTreeMap<String, serde_json::Value>,
+    scan: FlowScan,
+}
+
+/// One pass over one flow file's lines. Collects telemetry inside
+/// `[run_from, run_to]` and this session's records, and STOPS once the file's
+/// own clock passes `run_to + WINDOW_SLACK_MS`.
+///
+/// Stopping is safe because flow files are append-only: a record is written
+/// when it happens, so the order of lines is the order of time. The clock
+/// read is `payload.sampled_at_ms`, which the telemetry sampler writes every
+/// few seconds while the daemon runs. If there is no sampler, there is no
+/// clock, and the file is read to the end — slower, never wrong.
+///
+/// Returns `(lines_scanned, stopped_early)`.
+pub(crate) fn scan_flow_lines(
+    raw: &str,
+    run_from: u64,
+    run_to: u64,
+    session_id: Option<&str>,
+    facts: &mut FlowFacts,
+) -> (usize, bool) {
+    let stop_after = run_to.saturating_add(WINDOW_SLACK_MS);
+    let mut scanned = 0usize;
     for line in raw.lines() {
+        scanned += 1;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let p = r.get("payload");
+        let clock = p.and_then(|p| as_u64(p.get("sampled_at_ms")));
+        if clock.is_some_and(|ts| ts > stop_after) {
+            return (scanned, true);
+        }
+
+        if let Some(sid) = session_id {
+            if r.get("session_id").and_then(|v| v.as_str()) == Some(sid) {
+                facts.records_for_session += 1;
+                if r.get("action").and_then(|v| v.as_str()) == Some("dispatch start") {
+                    if let Some(b) = p.and_then(|p| p.get("bounds")).and_then(|b| b.as_object()) {
+                        for (k, v) in b {
+                            facts.bounds.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         if r.get("action").and_then(|v| v.as_str()) != Some("machine.telemetry") {
             continue;
         }
-        let Some(p) = r.get("payload") else { continue };
-        let Some(ts) = as_u64(p.get("sampled_at_ms")) else { continue };
-        if ts < from || ts > to {
+        let (Some(p), Some(ts)) = (p, clock) else { continue };
+        if ts < run_from || ts > run_to {
             continue;
         }
         let Some(pw) = p.get("power_mw") else { continue };
         let thermal = p.get("thermal");
-        out.push(Sample {
+        facts.samples.push(Sample {
             gpu_pct: as_u64(p.get("gpu_pct")).unwrap_or(0),
             w_gpu: as_f64(pw.get("gpu")).unwrap_or(0.0) / 1000.0,
             w_cpu: as_f64(pw.get("cpu")).unwrap_or(0.0) / 1000.0,
@@ -610,21 +685,32 @@ pub(crate) fn parse_telemetry(raw: &str, from: u64, to: u64, out: &mut Vec<Sampl
             mem_pct: as_u64(p.get("mem_pct")).unwrap_or(0),
         });
     }
+    (scanned, false)
 }
 
-/// What one pass over the flow stream yields for a run.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct FlowFacts {
-    samples: Vec<Sample>,
-    records_for_session: usize,
-    bounds: BTreeMap<String, serde_json::Value>,
+fn mtime_ms(path: &Path) -> Option<u64> {
+    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
-fn read_flows(flows_dir: &Path, session_id: Option<&str>, from: u64, to: u64) -> FlowFacts {
+/// Read the part of the flow stream that can describe one run.
+///
+/// **The work is bounded by the run, not by the archive.** A flow directory
+/// grows forever (289 MB across 125 files measured on one machine); reading
+/// all of it to describe a run that lasted minutes is the same shape as a
+/// query with no LIMIT. Two bounds keep it proportional:
+///
+/// 1. **A file last written before the run started cannot contain it**, so
+///    it is never opened. This is decided by modification time, NOT by the
+///    date in the file's name: names are UTC dates, and a reader that picks
+///    files by name misses a run that crossed midnight. Modification time has
+///    no such edge — a record inside the window forces its file's mtime past
+///    the window's start.
+/// 2. **A file is abandoned once its own clock passes the window's end**
+///    (see [`scan_flow_lines`]).
+fn read_flows(flows_dir: &Path, session_id: Option<&str>, run_from: u64, run_to: u64) -> FlowFacts {
+    let started = std::time::Instant::now();
     let mut facts = FlowFacts::default();
-    // EVERY file. Flow files are named by UTC date, so a reader that opens
-    // "today's" returns nothing for a run that crossed midnight — or for any
-    // run read the next morning.
     let Ok(entries) = std::fs::read_dir(flows_dir) else { return facts };
     let mut paths: Vec<_> = entries
         .flatten()
@@ -632,25 +718,23 @@ fn read_flows(flows_dir: &Path, session_id: Option<&str>, from: u64, to: u64) ->
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
         .collect();
     paths.sort();
-    for p in paths {
-        let Ok(raw) = std::fs::read_to_string(&p) else { continue };
-        parse_telemetry(&raw, from, to, &mut facts.samples);
-        let Some(sid) = session_id else { continue };
-        for line in raw.lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if r.get("session_id").and_then(|v| v.as_str()) != Some(sid) {
-                continue;
-            }
-            facts.records_for_session += 1;
-            if r.get("action").and_then(|v| v.as_str()) == Some("dispatch start") {
-                if let Some(b) = r.get("payload").and_then(|p| p.get("bounds")).and_then(|b| b.as_object()) {
-                    for (k, v) in b {
-                        facts.bounds.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                }
-            }
+    let open_from = run_from.saturating_sub(WINDOW_SLACK_MS);
+    for path in paths {
+        facts.scan.files_total += 1;
+        // An unreadable mtime is not evidence the file is old: read it.
+        if mtime_ms(&path).is_some_and(|m| m < open_from) {
+            facts.scan.files_skipped += 1;
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        facts.scan.files_read += 1;
+        let (lines, stopped) = scan_flow_lines(&raw, run_from, run_to, session_id, &mut facts);
+        facts.scan.lines_scanned += lines;
+        if stopped {
+            facts.scan.files_stopped_early += 1;
         }
     }
+    facts.scan.gather_ms = started.elapsed().as_millis() as u64;
     facts
 }
 
@@ -964,7 +1048,8 @@ pub(crate) fn derive_stats(
         cpu_speed_limit_min: busy.iter().map(|s| s.cpu_speed_limit_pct).min(),
         throttled_samples: busy.iter().filter(|s| s.cpu_speed_limit_pct < 100).count(),
         mem_pct_busy_max: busy.iter().map(|s| s.mem_pct).max(),
-        flow_records: flows.records_for_session,
+        flow_records_in_window: flows.records_for_session,
+        flow_scan: flows.scan.clone(),
         checks: RunChecks {
             tokens_reconcile: completion_tokens == m.total_completion_tokens.unwrap_or(0),
             rest_within_wall: rest_ms <= wall_ms,

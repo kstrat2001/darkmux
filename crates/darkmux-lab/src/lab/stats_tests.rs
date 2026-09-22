@@ -378,9 +378,8 @@ fn telem(ts: u64, gpu_pct: u64, w: f64) -> String {
 #[test]
 fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
     let raw = format!("{}{}{}{}", telem(10, 96, 40.0), telem(20, 97, 44.0), telem(30, 0, 0.0), telem(40, 1, 0.04));
-    let mut samples = Vec::new();
-    parse_telemetry(&raw, 0, 1_000, &mut samples);
-    let flows = FlowFacts { samples, ..Default::default() };
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(&raw, 0, 1_000, None, &mut flows);
     let s = derive_stats("t".into(), metrics(100_000, 0, 1, 0), Trajectory::default(), flows, None, None);
 
     assert_eq!(s.samples_busy, 2);
@@ -402,9 +401,9 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
 #[test]
 fn telemetry_outside_the_run_window_is_ignored() {
     let raw = format!("{}{}{}", telem(50, 96, 40.0), telem(150, 96, 40.0), telem(250, 96, 40.0));
-    let mut samples = Vec::new();
-    parse_telemetry(&raw, 100, 200, &mut samples);
-    assert_eq!(samples.len(), 1);
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(&raw, 100, 200, None, &mut flows);
+    assert_eq!(flows.samples.len(), 1);
 }
 
 /// No telemetry means the power arm has no data — said plainly, rather than
@@ -422,11 +421,12 @@ fn absent_telemetry_reads_as_absent_not_as_zero_watts() {
 // End to end over a run directory
 // ---------------------------------------------------------------------------
 
-/// Flow files are named by UTC date. A reader that opens "today's" returns
-/// nothing for a run that crossed midnight, or for any run read the next
-/// morning — so every file is read.
+/// Flow files are named by UTC date. A reader that picks files by NAME
+/// returns nothing for a run that crossed midnight, or for any run read the
+/// next morning — so files are chosen by what they could contain, and both
+/// days' files are read here.
 #[test]
-fn every_flow_file_is_read_not_just_todays() {
+fn a_run_that_crossed_midnight_reads_both_days_files() {
     let run = tempfile::TempDir::new().unwrap();
     let flows = tempfile::TempDir::new().unwrap();
     std::fs::write(
@@ -479,7 +479,7 @@ fn every_flow_file_is_read_not_just_todays() {
     assert_eq!(s.active_ms, 8_000);
     assert_eq!(s.tok_per_s, Some(100.0), "300 tokens over the 3s stream");
     assert_eq!(s.samples_busy, 1, "today's telemetry");
-    assert_eq!(s.flow_records, 1, "yesterday's session record");
+    assert_eq!(s.flow_records_in_window, 1, "yesterday's session record");
     assert!(s.bounds.contains_key("max_tokens_per_call"), "bounds from yesterday's file");
     assert!(s.checks.tokens_reconcile);
     assert!(s.unreconciled().is_empty(), "a clean run quotes cleanly: {:?}", s.unreconciled());
@@ -507,4 +507,134 @@ fn a_missing_flow_directory_is_not_an_error() {
     let s = compute_from_dir(run.path(), Path::new("/nonexistent-flows")).unwrap();
     assert!(!s.checks.have_telemetry_samples);
     assert_eq!(s.wall_ms, 1_000);
+}
+
+// ---------------------------------------------------------------------------
+// The scan is bounded by the run, not by the archive
+// ---------------------------------------------------------------------------
+
+/// A minute, in the same unit as the run window.
+const MIN: u64 = 60_000;
+
+/// Write a flow file and stamp its modification time, so a test controls
+/// what the file-selection bound sees.
+fn flow_file(dir: &Path, name: &str, body: &str, mtime_ms: u64) {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms))
+        .unwrap();
+}
+
+/// A run directory whose window is `[start, start + wall]`.
+fn run_at(start: u64, wall: u64) -> tempfile::TempDir {
+    let run = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        run.path().join("metrics.json"),
+        serde_json::json!({
+            "started_at_unix_ms": start, "wall_ms": wall, "rest_ms": 0,
+            "turns": 1, "total_completion_tokens": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    run
+}
+
+/// Junk the scan would have to parse if it opened the file: many lines of
+/// real-shaped records, none of them this run's.
+fn filler(n: usize, ts: u64) -> String {
+    (0..n).map(|i| telem(ts + i as u64, 0, 0.0)).collect()
+}
+
+/// A file last written before the run began cannot contain any of it, and is
+/// never opened. Without this bound one `stats` call read 289 MB across 125
+/// files to describe a run that lasted four minutes.
+#[test]
+fn a_flow_file_last_written_before_the_run_is_never_opened() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    let flows = tempfile::TempDir::new().unwrap();
+    flow_file(flows.path(), "2026-09-20.jsonl", &filler(500, 10 * MIN), 20 * MIN);
+    flow_file(flows.path(), "2026-09-21.jsonl", &filler(500, 500 * MIN), 600 * MIN);
+    flow_file(flows.path(), "2026-09-22.jsonl", &telem(start + MIN, 96, 40.0), start + 20 * MIN);
+
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.flow_scan.files_total, 3);
+    assert_eq!(s.flow_scan.files_skipped, 2, "both older files skipped unopened");
+    assert_eq!(s.flow_scan.files_read, 1);
+    assert_eq!(s.flow_scan.lines_scanned, 1);
+    assert_eq!(s.samples_busy, 1, "and the run's own sample is still found");
+}
+
+/// A file is abandoned once its own clock passes the end of the window.
+/// Files are append-only, so everything after that line is later still.
+#[test]
+fn the_scan_stops_once_the_file_clock_passes_the_window() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    let flows = tempfile::TempDir::new().unwrap();
+    let body = format!(
+        "{}{}{}",
+        telem(start + MIN, 96, 40.0),
+        telem(start + 60 * MIN, 0, 0.0), // an hour past: the clock has passed
+        filler(5_000, start + 61 * MIN),
+    );
+    flow_file(flows.path(), "2026-09-22.jsonl", &body, start + 24 * 60 * MIN);
+
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.flow_scan.files_stopped_early, 1);
+    assert_eq!(s.flow_scan.lines_scanned, 2, "the 5,000 lines after the stop were not read");
+    assert_eq!(s.samples_busy, 1);
+}
+
+/// The whole point, stated as a property: growing the archive does not grow
+/// the work. Ten old files or a thousand, one `stats` call reads the same
+/// lines.
+#[test]
+fn the_cost_of_a_stats_call_does_not_grow_with_the_archive() {
+    let start = 100_000 * MIN;
+    let lines_for = |old_files: usize| {
+        let run = run_at(start, 10 * MIN);
+        let flows = tempfile::TempDir::new().unwrap();
+        for i in 0..old_files {
+            let t = (i as u64 + 1) * 60 * MIN;
+            flow_file(flows.path(), &format!("old-{i:04}.jsonl"), &filler(200, t), t + MIN);
+        }
+        flow_file(
+            flows.path(),
+            "current.jsonl",
+            &format!("{}{}", telem(start + MIN, 96, 40.0), filler(200, start + 90 * MIN)),
+            start + 120 * MIN,
+        );
+        compute_from_dir(run.path(), flows.path()).unwrap().flow_scan.lines_scanned
+    };
+    assert_eq!(lines_for(10), lines_for(200));
+    assert_eq!(lines_for(200), 2);
+}
+
+/// Session records land a little outside the runtime's own window: the host
+/// writes `dispatch start` before the runtime stamps `started_at_unix_ms`.
+/// The slack keeps them; the telemetry bound does not widen with it.
+#[test]
+fn the_window_slack_keeps_session_records_but_not_outside_telemetry() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    std::fs::write(run.path().join("lifecycle.json"), r#"{"session_id":"sid-9"}"#).unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    let body = format!(
+        "{}{}{}",
+        telem(start - 2 * MIN, 96, 40.0), // before the run: not a run sample
+        line(serde_json::json!({
+            "action": "dispatch start", "session_id": "sid-9",
+            "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
+        })),
+        telem(start + MIN, 96, 40.0),
+    );
+    // The session record precedes the run start; the slack keeps it.
+    flow_file(flows.path(), "d.jsonl", &body, start + 2 * MIN);
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.flow_records_in_window, 1);
+    assert!(s.bounds.contains_key("max_turns"));
+    assert_eq!(s.samples_busy, 1, "the pre-run sample is not averaged into the run");
 }
