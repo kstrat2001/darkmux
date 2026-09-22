@@ -734,7 +734,8 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
         if s.passed_with_runtime_error > 0 {
             notes.push(format!(
                 "{label}{} of the {} passes came from runs whose runtime result was `error`; \
-                 check that this fixture's verify fails on an untouched tree",
+                 if this fixture's verify is green on an untouched tree, those passes do not \
+                 show the task was done, and cost per success is understated",
                 s.passed_with_runtime_error, s.passed
             ));
         }
