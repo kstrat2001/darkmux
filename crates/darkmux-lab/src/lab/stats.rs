@@ -377,6 +377,9 @@ impl RunStats {
         if c.policy_consistent == Some(false) {
             out.push("the detection policy that ran differs from the one the host resolved");
         }
+        if self.flow_scan.files_read_errors > 0 {
+            out.push("a flow file could not be read to the end; telemetry and flow records may be incomplete");
+        }
         if !c.have_flow_records {
             out.push("no flow records for this session in the window; its dispatch bounds are unknown");
         }
@@ -653,6 +656,9 @@ pub struct FlowScan {
     /// Could not be opened. `files_total` always equals skipped + read +
     /// unreadable, so no file leaves the count silently.
     pub files_unreadable: usize,
+    /// Opened, but could not be read to the end. A subset of `files_read`:
+    /// what came before the error was used, what came after is unknown.
+    pub files_read_errors: usize,
     /// Files whose own clock passed the end of the window, so the rest of
     /// the file was not read.
     pub files_stopped_early: usize,
@@ -679,14 +685,14 @@ pub(crate) struct FlowFacts {
 /// few seconds while the daemon runs. If there is no sampler, there is no
 /// clock, and the file is read to the end — slower, never wrong.
 ///
-/// Returns `(lines_scanned, stopped_early)`.
+/// Returns `(lines_scanned, stopped_early, read_error)`.
 pub(crate) fn scan_flow_lines(
     mut reader: impl std::io::BufRead,
     run_from: u64,
     run_to: u64,
     session_id: Option<&str>,
     facts: &mut FlowFacts,
-) -> (usize, bool) {
+) -> (usize, bool, bool) {
     let stop_after = run_to.saturating_add(WINDOW_SLACK_MS);
     let mut scanned = 0usize;
     let mut buf = Vec::new();
@@ -696,7 +702,11 @@ pub(crate) fn scan_flow_lines(
         // parse; and decode lossily, so one bad byte costs one line instead of
         // making the whole day file vanish.
         match reader.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // A directory named like a day file opens and then fails to read;
+            // so can a file midway. Either way the rest of it is unknown, and
+            // the caller is told rather than handed a quiet short read.
+            Err(_) => return (scanned, false, true),
             Ok(_) => {}
         }
         scanned += 1;
@@ -709,7 +719,7 @@ pub(crate) fn scan_flow_lines(
         let p = r.get("payload");
         let clock = p.and_then(|p| as_u64(p.get("sampled_at_ms")));
         if clock.is_some_and(|ts| ts > stop_after) {
-            return (scanned, true);
+            return (scanned, true, false);
         }
 
         if let Some(sid) = session_id {
@@ -751,7 +761,7 @@ pub(crate) fn scan_flow_lines(
             mem_pct: as_u64(p.get("mem_pct")).unwrap_or(0),
         });
     }
-    (scanned, false)
+    (scanned, false, false)
 }
 
 fn mtime_ms(path: &Path) -> Option<u64> {
@@ -797,7 +807,7 @@ fn read_flows(flows_dir: &Path, session_id: Option<&str>, run_from: u64, run_to:
             continue;
         };
         facts.scan.files_read += 1;
-        let (lines, stopped) = scan_flow_lines(
+        let (lines, stopped, read_error) = scan_flow_lines(
             std::io::BufReader::new(file),
             run_from,
             run_to,
@@ -807,6 +817,9 @@ fn read_flows(flows_dir: &Path, session_id: Option<&str>, run_from: u64, run_to:
         facts.scan.lines_scanned += lines;
         if stopped {
             facts.scan.files_stopped_early += 1;
+        }
+        if read_error {
+            facts.scan.files_read_errors += 1;
         }
     }
     facts.scan.gather_ms = started.elapsed().as_millis() as u64;
@@ -829,8 +842,12 @@ struct Coverage {
 const TELEMETRY_GAP_FLOOR_MS: u64 = 10_000;
 
 /// Each sample stands for the interval it closes: `[ts - interval_ms, ts]`,
-/// clamped to the window. Where a sample carries no `interval_ms`, it stands
-/// for the time back to the previous sample. A gap no sample stands for is
+/// clamped to the window. A sample with no `interval_ms` (all telemetry
+/// recorded before 2026-09-05) stands for at most the typical interval, or
+/// [`TELEMETRY_GAP_FLOOR_MS`] when none is known — never all the way back to
+/// the previous sample: that made every gap between unstamped samples
+/// invisible, and passed two samples in the last ten seconds of a ten-minute
+/// run as full coverage. A gap no sample stands for is
 /// uncovered, and a run whose largest uncovered gap exceeds twice the
 /// sampler's typical interval (at least [`TELEMETRY_GAP_FLOOR_MS`]) is not
 /// covered: its duty cycle and energy would be extrapolated from a part of
@@ -838,15 +855,15 @@ const TELEMETRY_GAP_FLOOR_MS: u64 = 10_000;
 fn telemetry_coverage(samples: &[Sample], from: u64, to: u64) -> Coverage {
     let mut sorted: Vec<&Sample> = samples.iter().collect();
     sorted.sort_by_key(|s| s.ts);
+    let mut intervals: Vec<u64> = sorted.iter().filter_map(|s| s.interval_ms).collect();
+    intervals.sort_unstable();
+    let typical = intervals.get(intervals.len() / 2).copied();
+    let unstamped_reach = typical.unwrap_or(TELEMETRY_GAP_FLOOR_MS);
     let (mut weight_busy, mut weight_all) = (0u64, 0u64);
     let mut covered_to = from;
     let mut max_gap = 0u64;
-    let mut intervals: Vec<u64> = Vec::new();
     for s in &sorted {
-        let back = s.interval_ms.unwrap_or(s.ts.saturating_sub(covered_to));
-        if let Some(i) = s.interval_ms {
-            intervals.push(i);
-        }
+        let back = s.interval_ms.unwrap_or(unstamped_reach);
         let start = s.ts.saturating_sub(back).max(from);
         max_gap = max_gap.max(start.saturating_sub(covered_to));
         let w = s.ts.saturating_sub(start.max(covered_to.min(s.ts)));
@@ -859,10 +876,10 @@ fn telemetry_coverage(samples: &[Sample], from: u64, to: u64) -> Coverage {
     if sorted.is_empty() {
         return Coverage { weight_busy: 0, weight_all: 0, max_gap_ms: None, covers_run: false };
     }
+    // The tail after the last sample: the only thing that sees a sampler that
+    // stopped partway through the run.
     max_gap = max_gap.max(to.saturating_sub(covered_to));
-    intervals.sort_unstable();
-    let typical = intervals.get(intervals.len() / 2).copied().unwrap_or(0);
-    let allowed = (2 * typical).max(TELEMETRY_GAP_FLOOR_MS);
+    let allowed = (2 * typical.unwrap_or(0)).max(TELEMETRY_GAP_FLOOR_MS);
     Coverage { weight_busy, weight_all, max_gap_ms: Some(max_gap), covers_run: max_gap <= allowed }
 }
 

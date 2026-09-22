@@ -992,3 +992,121 @@ fn a_policy_the_runtime_did_not_run_is_flagged() {
     assert_eq!(s.checks.policy_consistent, Some(false));
     assert!(s.unreconciled().iter().any(|r| r.contains("policy")));
 }
+
+// ---------------------------------------------------------------------------
+// Re-review of the coverage rule, 2026-09-23.
+// ---------------------------------------------------------------------------
+
+/// Coverage over `from..from+wall` for raw telemetry lines.
+fn coverage_of(raw: &str, wall: u64) -> RunStats {
+    let from = 1_000_000; // `metrics()`'s start
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + wall, None, &mut flows);
+    derive_stats("t".into(), metrics(wall, 0, 1, 0), Trajectory::default(), flows, None, None)
+}
+
+fn old_telem(off: u64, gpu: u64) -> String {
+    // Telemetry as recorded before 2026-09-05: no `interval_ms`.
+    line(serde_json::json!({
+        "action": "machine.telemetry",
+        "payload": {"sampled_at_ms": 1_000_000 + off, "gpu_pct": gpu,
+                    "power_mw": {"gpu": 30_000, "cpu": 5_000, "total": 35_000}}
+    }))
+}
+
+fn new_telem(off: u64, gpu: u64, interval: u64) -> String {
+    telem_at(1_000_000 + off, gpu, interval)
+}
+
+/// Re-review MF1: a sample with no `interval_ms` reached all the way back to
+/// the previous sample or the window start, so no gap was ever visible. Every
+/// run recorded before 2026-09-05 is like this. Two samples in the last ten
+/// seconds of a ten-minute run passed as 600 s busy and 27 kJ.
+#[test]
+fn old_telemetry_without_an_interval_still_shows_its_gaps() {
+    let s = coverage_of(&format!("{}{}", old_telem(590_000, 96), old_telem(595_000, 96)), 600_000);
+    assert!(!s.checks.telemetry_covers_run);
+    assert_eq!(s.busy_ms, None);
+}
+
+/// Re-review MF1, second shape: an unstamped first sample claimed the whole
+/// unobserved start of the run, so duty was made up.
+#[test]
+fn an_unstamped_first_sample_does_not_claim_the_unobserved_start() {
+    let mut raw = old_telem(300_000, 0);
+    for i in 1..=60 {
+        raw.push_str(&new_telem(300_000 + i * 5_000, 96, 5_000));
+    }
+    let s = coverage_of(&raw, 600_000);
+    assert!(!s.checks.telemetry_covers_run);
+}
+
+/// Re-review N4: the tail after the last sample is the only thing that sees
+/// a sampler that stopped partway through a run.
+#[test]
+fn a_sampler_that_stops_partway_fails_coverage() {
+    let raw: String = (1..=60).map(|i| new_telem(i * 5_000, 96, 5_000)).collect();
+    let s = coverage_of(&raw, 600_000); // samples end at 300 s
+    assert!(!s.checks.telemetry_covers_run);
+    assert!(s.telemetry_max_gap_ms.unwrap() >= 300_000);
+}
+
+/// Re-review N6: the allowance is TWICE the typical interval. A 15 s hole in
+/// a 5 s cadence is a hole.
+#[test]
+fn a_gap_of_three_intervals_fails_coverage() {
+    let raw = format!(
+        "{}{}{}{}",
+        new_telem(5_000, 96, 5_000),
+        new_telem(10_000, 96, 5_000),
+        new_telem(30_000, 96, 5_000), // stands for 25-30 s: 10-25 s uncovered
+        new_telem(35_000, 96, 5_000),
+    );
+    let s = coverage_of(&raw, 35_000);
+    assert_eq!(s.telemetry_max_gap_ms, Some(15_000));
+    assert!(!s.checks.telemetry_covers_run);
+}
+
+/// Re-review N9: when the sampler switches from busy to idle cadence, the
+/// first idle sample is stamped with the idle interval but only the time
+/// since the previous sample is new. Counting its whole stamped interval
+/// double-counts, and halves this duty.
+#[test]
+fn an_interval_overlapping_the_previous_sample_is_not_counted_twice() {
+    let mut raw: String = (1..=10).map(|i| new_telem(i * 5_000, 96, 5_000)).collect();
+    raw.push_str(&new_telem(55_000, 0, 51_000));
+    let s = coverage_of(&raw, 55_000);
+    assert_eq!(s.gpu_duty_pct, Some(90.9), "50 s busy of 55 s; double-counting reads 49.5");
+}
+
+/// Re-review C3: an entry that opens but cannot be read (a directory named
+/// like a day file, or a read error midway) was counted as read, silently.
+#[test]
+fn a_flow_file_that_cannot_be_read_to_the_end_is_counted() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    let flows = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(flows.path().join("2026-01-02.jsonl")).unwrap();
+    flow_file(flows.path(), "d.jsonl", &telem(start + MIN, 96, 40.0), start + 20 * MIN);
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.flow_scan.files_read_errors, 1);
+    assert!(s.unreconciled().iter().any(|r| r.contains("could not be read to the end")));
+}
+
+/// Re-review N14: the `files_unreadable` counter had no test. A file that
+/// cannot be opened is counted, so the scan's totals always add up.
+#[cfg(unix)]
+#[test]
+fn a_flow_file_that_cannot_be_opened_is_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    let flows = tempfile::TempDir::new().unwrap();
+    flow_file(flows.path(), "locked.jsonl", &telem(start + MIN, 96, 40.0), start + 20 * MIN);
+    let locked = flows.path().join("locked.jsonl");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(s.flow_scan.files_unreadable, 1);
+    assert_eq!(s.flow_scan.files_total, s.flow_scan.files_read + s.flow_scan.files_skipped + s.flow_scan.files_unreadable);
+}

@@ -437,6 +437,7 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
                         "runs": set.runs,
                         "summary": lab::stats_set::summarize(&set.runs),
                         "errors": set.errors,
+                        "duplicates": set.duplicates,
                     })
                 };
                 let mut out = set_json(&cand);
@@ -580,19 +581,26 @@ struct StatsSet {
     /// `(run, error)`. Never silently dropped: a set missing a run it was
     /// asked for reads as a different arm.
     errors: Vec<(String, String)>,
+    /// Runs named more than once (by id or by path): counted once. A notice,
+    /// not an error, so it does not change the exit code.
+    duplicates: Vec<String>,
 }
 
 fn load_stats_set(ids: &[String]) -> StatsSet {
-    let mut set = StatsSet { runs: Vec::new(), errors: Vec::new() };
+    let mut set = StatsSet { runs: Vec::new(), errors: Vec::new(), duplicates: Vec::new() };
     let mut seen = std::collections::BTreeSet::new();
     for id in ids {
-        // A run listed twice would count twice in every range and total.
-        if !seen.insert(id.as_str()) {
-            set.errors.push((id.clone(), "listed more than once; counted once".into()));
-            continue;
-        }
         match lab::stats::run_stats(id) {
-            Ok(s) => set.runs.push(s),
+            // Deduplicated on the run it RESOLVED to, not the argument text:
+            // `run-a` and `~/.darkmux/runs/run-a` are the same run, and a run
+            // counted twice skews every range and total in the set.
+            Ok(s) => {
+                if seen.insert(s.run.clone()) {
+                    set.runs.push(s);
+                } else {
+                    set.duplicates.push(s.run);
+                }
+            }
             Err(e) => set.errors.push((id.clone(), format!("{e:#}"))),
         }
     }
@@ -749,6 +757,9 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
         for (run, f) in &s.flagged {
             notes.push(format!("{label}{run}: {}", f.join(", ")));
         }
+    }
+    for d in cand.duplicates.iter().chain(base.iter().flat_map(|b| b.duplicates.iter())) {
+        notes.push(format!("{d} was listed more than once and is counted once"));
     }
     let errors = cand.errors.len() + base.map_or(0, |b| b.errors.len());
     if errors > 0 {
