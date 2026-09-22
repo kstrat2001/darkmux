@@ -2202,6 +2202,12 @@ pub(crate) struct LabRunSummary {
     /// artifact-and-staleness inference, so this is additive, not a migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
+    /// (#2860) `manifest.json`'s `ok`: how the run's DISPATCH ended. The
+    /// lifecycle's `complete` only says the harness ran to the end (see
+    /// `lab::run`'s own comment at `finish_complete`), so the two together
+    /// are the outcome. `None` when there is no manifest yet, or no `ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_ok: Option<bool>,
     /// (#2812) The lifecycle record's own `started_at_ms` — the run's real
     /// START, written before the provider is ever called. `LabRunSummary`
     /// carried no start timestamp at all before this, which is why
@@ -2533,11 +2539,16 @@ fn build_lab_run_summary(
     // both exist (byte-identical for the two providers that ever populate
     // either), so a run that finishes normally reads from the same
     // authoritative artifact it always did.
-    let session_id = std::fs::read_to_string(dir.join("manifest.json"))
+    // One read of `manifest.json` fills both fields, so the session a row
+    // links to and the outcome it reports come from the same write.
+    let manifest = std::fs::read_to_string(dir.join("manifest.json"))
         .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let session_id = manifest
+        .as_ref()
         .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
         .or_else(|| lifecycle_record.as_ref().and_then(|r| r.session_id.clone()));
+    let run_ok = manifest.as_ref().and_then(|v| v.get("ok")).and_then(|v| v.as_bool());
 
     Some(LabRunSummary {
         dir: rel,
@@ -2581,6 +2592,7 @@ fn build_lab_run_summary(
         has_funnels,
         has_events,
         session_id,
+        run_ok,
     })
 }
 

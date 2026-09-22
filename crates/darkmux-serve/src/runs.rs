@@ -1857,8 +1857,13 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // gap RAII cannot close), and the second must never be read as a verdict.
     use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
     match summary.lifecycle_status {
+        // (#2860) `Complete` says the HARNESS ran to the end, not how the
+        // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
+        // dispatch errored was listed complete while its own detail view
+        // said errored. Every other run kind already reports its outcome.
         Some(Lc::Complete) => {
-            return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
+            let failed = summary.degenerate || summary.run_ok == Some(false);
+            return if failed { RunStatus::Error } else { RunStatus::Complete };
         }
         Some(Lc::Error) => return RunStatus::Error,
         Some(Lc::Interrupted) => return RunStatus::Abandoned,
@@ -4078,7 +4083,28 @@ mod tests {
             has_funnels: true,
             has_events: true,
             session_id: None,
+            run_ok: None,
         }
+    }
+
+    /// (#2860) `lifecycle.json`'s `complete` means the HARNESS ran to the
+    /// end; how the dispatch itself ended is `manifest.json`'s `ok`. The list
+    /// read `complete` as the outcome, so a run whose dispatch errored after
+    /// 3.5 minutes (`refresh-rotation-splash-qwen36-1789978023-1`, runtime
+    /// exit 1) was listed complete while its own detail view said errored.
+    /// Every other run kind already reports its outcome here.
+    #[test]
+    fn a_completed_lab_run_whose_dispatch_failed_is_an_error() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let now = 1_700_000_000_000u64;
+        let with_ok = |ok: Option<bool>| LabRunSummary {
+            run_ok: ok,
+            ..lab_summary_with_lifecycle("d", false, false, Some(Lc::Complete))
+        };
+        assert_eq!(lab_run_status(&with_ok(Some(false)), now, None), RunStatus::Error);
+        assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
+        // No manifest (a provider that writes none) is not evidence of failure.
+        assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
     }
 
     /// (#1930) The run's own terminal record outranks every inference.

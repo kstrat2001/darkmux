@@ -237,17 +237,18 @@ export type RunDestination =
  * richer one.
  */
 export function runDestination(run: Run, graphReachable: boolean): RunDestination {
-  // (#2511) A lab row now carries `session_id` too (`Run::session_id`'s own
-  // doc), but it is only CONSULTED here while the run is still `Running`.
-  // Once a lab run reaches a terminal artifact, `LabRunDetail` (funnels +
-  // scores) is the richer destination and stays the default. While it is
-  // still running there is no terminal artifact to show, and the session
-  // this field now carries is the only way to watch the dispatch live — the
-  // same #1982/#2511 fix that stops that session from ALSO surfacing as a
-  // duplicate `ghost_runs` dispatch row (server-side `known_session_ids`)
-  // would otherwise leave it with no drill-in at all.
+  // (#2860) A lab row with a session opens the SAME session detail view as
+  // every other run, running or finished. It used to switch, once finished,
+  // to `LabRunDetail`: a page kept from the funnel-eval era with its own
+  // idea of "finished" (funnel artifacts a `lab run <workload>` never
+  // writes) and its own event source. Every finished workload run therefore
+  // read RUNNING there, with an empty pipeline and no events, while the run
+  // list said complete. One run, one detail view, one status source.
+  //
+  // `LabRunDetail` remains only for a row with no session to open: archived
+  // runs from before lab rows carried one (#2511).
   if (run.kind === "lab") {
-    if (run.status === "running" && run.session_id) {
+    if (run.session_id) {
       return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
     }
     return { kind: "lab", dir: run.id };
