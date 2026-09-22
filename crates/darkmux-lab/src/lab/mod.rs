@@ -31,4 +31,7 @@ pub mod run;
 pub mod sandbox_hash;
 // (#1198) scores.json — the bench suite's persisted score artifact (#1197).
 pub mod scores;
+// (#2855) Derived run metrics — the lab computes them once, correctly, with
+// the reconciliation checks that say whether each number may be quoted.
+pub mod stats;
 pub mod tune;

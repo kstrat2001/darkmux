@@ -127,7 +127,7 @@ pub fn lab_inspect(run_path: &str) -> Result<InspectionReport> {
     Ok(report)
 }
 
-fn resolve_run_dir(path: &str) -> PathBuf {
+pub(crate) fn resolve_run_dir(path: &str) -> PathBuf {
     if path.starts_with('/') || path.starts_with("./") || path.starts_with("../") || path.contains('/') {
         return PathBuf::from(path);
     }

@@ -1499,6 +1499,17 @@ pub(crate) enum RunCmd {
         #[arg(long)]
         summary: bool,
     },
+    /// (#2855) Derived metrics for a recorded run — active time, throughput
+    /// over the streams that were actually billed, both degeneracy gates,
+    /// busy-only power — each with the reconciliation check that says
+    /// whether it may be quoted. Reads the run's existing artifacts; nothing
+    /// is recomputed at dispatch time, so this applies to runs already on
+    /// disk.
+    Stats {
+        run: String,
+        #[command(flatten)]
+        json: JsonFlagPlain,
+    },
     /// Compare two runs. (was: `lab compare`)
     Compare { run_a: String, run_b: String },
 }

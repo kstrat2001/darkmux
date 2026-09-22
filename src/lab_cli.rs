@@ -419,12 +419,133 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             }
             Ok(0)
         }
+        RunCmd::Stats { run, json } => {
+            let s = lab::stats::run_stats(&run)?;
+            if json.json {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+                return Ok(0);
+            }
+            render_stats(&s);
+            Ok(0)
+        }
         RunCmd::Compare { run_a, run_b } => {
             let result = lab::compare::lab_compare(&run_a, &run_b)?;
             for n in &result.notes {
                 println!("{n}");
             }
             Ok(0)
+        }
+    }
+}
+
+/// (#2855) The human read of a run's derived metrics.
+///
+/// Two rules the layout exists to enforce. **Rest is printed beside wall and
+/// active, never alone**, so a rested run's wall clock cannot be misread as a
+/// slow model. And **the caveats print last and unconditionally** — a figure
+/// whose reconciliation check failed is still shown, because hiding it would
+/// lose the evidence, but no run's numbers can be copied out of here without
+/// the reasons they may not be quoted appearing in the same block.
+fn render_stats(s: &darkmux_lab::lab::stats::RunStats) {
+    let secs = |ms: u64| ms as f64 / 1000.0;
+    println!("run:         {}", s.run);
+    if let Some(m) = &s.model {
+        println!("model:       {m}");
+    }
+    println!(
+        "result:      {}{}",
+        s.result.as_deref().unwrap_or("?"),
+        s.verify.as_deref().map(|v| format!("   verify: {v}")).unwrap_or_default()
+    );
+    println!();
+
+    println!(
+        "time         wall {:.0}s   rest {:.0}s   active {:.0}s",
+        secs(s.wall_ms),
+        secs(s.rest_ms),
+        secs(s.active_ms)
+    );
+    if s.rest_events > 0 {
+        // The distinct delays, not a mean: more than one value means the
+        // thermal ratchet doubled the delay mid-run.
+        println!(
+            "             {} rests, delays {:?}ms{}",
+            s.rest_events,
+            s.rest_delays_ms,
+            if s.thermal_ratchet_fired { "  (ratchet fired)" } else { "" }
+        );
+    }
+    println!(
+        "work         {} turns   {} compactions   {} tool calls ({} failed)",
+        s.turns, s.compactions, s.tool_calls_total, s.tool_calls_failed
+    );
+    println!(
+        "output       {} completion tokens   {} reasoning chars   {} content chars",
+        s.completion_tokens, s.reasoning_chars, s.content_chars
+    );
+    match (s.tok_per_s, s.billed_gen_fraction) {
+        (Some(t), Some(f)) => println!(
+            "throughput   {t} tok/s over {:.0}% of generation ({:.0}s of {:.0}s)",
+            f * 100.0,
+            secs(s.gen_ms_billed),
+            secs(s.gen_ms_all)
+        ),
+        _ => println!("throughput   (no billed generation recorded)"),
+    }
+
+    // Both gates, always both, on their own lines. One line for "detection"
+    // is what let a reader take the checkpoint gate's silence for the whole
+    // answer.
+    let g = &s.gates;
+    let dp = darkmux_lab::lab::stats::TAIL_RATIO_DISPLAY_DP;
+    let ratio = |r: Option<f64>| {
+        r.map(|r| format!("   min ratio {:.*}", dp, r)).unwrap_or_default()
+    };
+    println!(
+        "stream gate  {} observations   {} degenerate   {} aborts{}",
+        g.stream.observations,
+        g.stream.degenerate_turns.len(),
+        g.stream.aborts,
+        ratio(g.stream.min_tail_ratio)
+    );
+    println!(
+        "checkpoint   {} observations   {} degenerate   {} cut{}{}",
+        g.checkpoint.observations,
+        g.checkpoint.degenerate_turns.len(),
+        g.checkpoint.concluded_turns.len(),
+        ratio(g.checkpoint.min_tail_ratio),
+        g.checkpoint.policy.as_deref().map(|p| format!("   policy={p}")).unwrap_or_default()
+    );
+
+    if let (Some(gpu), Some(cpu), Some(pkg)) = (s.gpu_w_busy, s.cpu_w_busy, s.pkg_w_busy) {
+        println!(
+            "power        gpu {gpu} W   cpu {cpu} W   package {pkg} W   busy {}% of the run ({} samples)",
+            s.gpu_duty_pct.unwrap_or(0.0),
+            s.samples_busy + s.samples_idle
+        );
+        if let Some(j) = s.pkg_j_per_1k_tokens {
+            println!(
+                "energy       {j} J per 1k tokens{}",
+                s.pkg_j_busy.map(|t| format!("   {:.1} kJ over the run", t / 1000.0)).unwrap_or_default()
+            );
+        }
+        if !s.thermal_states_busy.is_empty() {
+            let states: Vec<String> =
+                s.thermal_states_busy.iter().map(|(k, v)| format!("{k} {v}")).collect();
+            println!(
+                "thermal      {}   cpu speed limit min {}%",
+                states.join(", "),
+                s.cpu_speed_limit_min.unwrap_or(100)
+            );
+        }
+    }
+
+    let caveats = s.unreconciled();
+    if !caveats.is_empty() {
+        println!();
+        println!("not reconciled — do not quote these figures without saying so:");
+        for c in &caveats {
+            println!("  - {c}");
         }
     }
 }
