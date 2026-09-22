@@ -679,7 +679,8 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
         format!("{} of {} passed", s.passed, s.n)
             + &if s.unverified > 0 { format!(", {} unverified", s.unverified) } else { String::new() }
     };
-    let cost: [(&str, fn(&SetSummary) -> Option<f64>, &dyn Fn(f64) -> String); 3] = [
+    type CostRow<'a> = (&'a str, fn(&SetSummary) -> Option<f64>, &'a dyn Fn(f64) -> String);
+    let cost: [CostRow; 3] = [
         ("active", |s| s.cost_per_success.active_ms, &secs),
         ("GPU busy", |s| s.cost_per_success.gpu_busy_ms, &secs),
         ("energy", |s| s.cost_per_success.pkg_joules.map(|j| j / 1000.0), &|v| format!("{v:.1} kJ")),
@@ -697,12 +698,12 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
             );
             println!("cost per successful run");
             for (name, get, f) in &cost {
-                println!("  {name:<16} {}", get(&c).map(|v| f(v)).unwrap_or_else(|| "-".into()));
+                println!("  {name:<16} {}", get(&c).map(f).unwrap_or_else(|| "-".into()));
             }
         }
         Some(b) => {
             let col = 26.max(b.models.join(", ").len() + 2);
-            println!("{:<18} {:<col$} {:<col$} {}", "", "baseline", "candidate", "moved");
+            println!("{:<18} {:<col$} {:<col$} moved", "", "baseline", "candidate");
             println!("{:<18} {:<col$} {:<col$}", "outcome", outcome(b), outcome(&c));
             println!("{:<18} {:<col$} {:<col$}", "models", b.models.join(", "), c.models.join(", "));
             for (name, get, f) in &rows {
@@ -719,7 +720,7 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
             );
             println!("cost per successful run (every run's cost, divided by the runs that passed)");
             for (name, get, f) in &cost {
-                let show = |s: &SetSummary| get(s).map(|v| f(v)).unwrap_or_else(|| "-".into());
+                let show = |s: &SetSummary| get(s).map(f).unwrap_or_else(|| "-".into());
                 let moved = ratio(get(&c), get(b)).map(|x| format!("{x:.2}x")).unwrap_or_default();
                 println!("  {name:<16} {:<col$} {:<col$} {moved}", show(b), show(&c));
             }
