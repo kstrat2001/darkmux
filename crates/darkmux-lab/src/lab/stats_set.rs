@@ -117,7 +117,7 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
         Some(r) if r.starts_with("escalation") => f.push("ESCALATED"),
         _ => {}
     }
-    if !c.tokens_reconcile {
+    if c.tokens_reconcile == Some(false) {
         f.push("TOKENS");
     }
     if !c.checkpoint_parse_consistent || !c.missing_required_events.is_empty() {
@@ -135,8 +135,19 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if !c.rest_within_wall {
         f.push("REST");
     }
+    if c.turns_match_trajectory == Some(false) || c.rest_matches_trajectory == Some(false) {
+        f.push("COUNTS");
+    }
     if !c.have_telemetry_samples {
         f.push("NO-TELEM");
+    } else if !c.telemetry_covers_run {
+        f.push("TELEM-GAP");
+    }
+    if !c.have_flow_records {
+        f.push("NO-FLOW");
+    }
+    if !s.suspect_turns.is_empty() {
+        f.push("CHARS");
     }
     if s.thermal_ratchet_fired {
         f.push("RATCHET");
@@ -239,6 +250,21 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
             })
             .collect(),
     }
+}
+
+/// A set figure for a terminal: `median (min–max)`, and `[n=k]` whenever it
+/// rests on fewer runs than the set holds. A figure over one run must not
+/// look like five identical runs, and a median over two must not sit beside
+/// one over five as if they were the same claim (tok/s, for one, is absent
+/// on a run with no billed stream).
+pub fn fmt_range(r: Option<Range>, set_n: usize, f: &dyn Fn(f64) -> String) -> String {
+    let Some(r) = r else { return "-".into() };
+    let body = if r.min == r.max {
+        f(r.median)
+    } else {
+        format!("{} ({}–{})", f(r.median), f(r.min), f(r.max))
+    };
+    if r.n < set_n { format!("{body} [n={}]", r.n) } else { body }
 }
 
 /// `candidate / baseline`, for a figure both sides have. `None` when either

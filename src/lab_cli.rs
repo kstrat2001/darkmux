@@ -584,7 +584,13 @@ struct StatsSet {
 
 fn load_stats_set(ids: &[String]) -> StatsSet {
     let mut set = StatsSet { runs: Vec::new(), errors: Vec::new() };
+    let mut seen = std::collections::BTreeSet::new();
     for id in ids {
+        // A run listed twice would count twice in every range and total.
+        if !seen.insert(id.as_str()) {
+            set.errors.push((id.clone(), "listed more than once; counted once".into()));
+            continue;
+        }
         match lab::stats::run_stats(id) {
             Ok(s) => set.runs.push(s),
             Err(e) => set.errors.push((id.clone(), format!("{e:#}"))),
@@ -599,15 +605,6 @@ fn fmt_secs(ms: f64) -> String {
 
 fn fmt_opt(v: Option<f64>, dp: usize) -> String {
     v.map(|v| format!("{v:.dp$}")).unwrap_or_else(|| "-".into())
-}
-
-/// `median (min–max)`, the only form a set figure is printed in.
-fn fmt_range(r: Option<darkmux_lab::lab::stats_set::Range>, f: &dyn Fn(f64) -> String) -> String {
-    match r {
-        Some(r) if r.min == r.max => f(r.median),
-        Some(r) => format!("{} ({}–{})", f(r.median), f(r.min), f(r.max)),
-        None => "-".into(),
-    }
 }
 
 /// (#2855) One row per run. Every row prints whatever its checks say, with
@@ -640,13 +637,13 @@ fn render_stats_table(set: &StatsSet) {
         );
     }
     for (r, e) in &set.errors {
-        println!("{r:<w$}  NOT READ: {e}");
+        println!("{r:<w$}  not counted: {e}");
     }
 }
 
 /// (#2855) The set view, and with a baseline, the comparison.
 fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
-    use darkmux_lab::lab::stats_set::{ratio, summarize, SetSummary};
+    use darkmux_lab::lab::stats_set::{fmt_range, ratio, summarize, SetSummary};
     let c = summarize(&cand.runs);
     let b = base.map(|b| summarize(&b.runs));
 
@@ -690,7 +687,7 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
         None => {
             println!("set          {}   models: {}", outcome(&c), c.models.join(", "));
             for (name, get, f) in &rows {
-                println!("  {name:<16} {}", fmt_range(get(&c), f));
+                println!("  {name:<16} {}", fmt_range(get(&c), c.n, f));
             }
             println!(
                 "  {:<16} {} runs with degeneracy, {} turns cut",
@@ -710,7 +707,11 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
                 let moved = ratio(get(&c).map(|r| r.median), get(b).map(|r| r.median))
                     .map(|x| format!("{x:.2}x"))
                     .unwrap_or_default();
-                println!("{name:<18} {:<col$} {:<col$} {moved}", fmt_range(get(b), f), fmt_range(get(&c), f));
+                println!(
+                    "{name:<18} {:<col$} {:<col$} {moved}",
+                    fmt_range(get(b), b.n, f),
+                    fmt_range(get(&c), c.n, f)
+                );
             }
             println!(
                 "{:<18} {:<col$} {:<col$}",
@@ -751,7 +752,7 @@ fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
     }
     let errors = cand.errors.len() + base.map_or(0, |b| b.errors.len());
     if errors > 0 {
-        notes.push(format!("{errors} run(s) could not be read and are not in the figures above"));
+        notes.push(format!("{errors} listed run(s) are not in the figures above; see their rows"));
     }
     if !notes.is_empty() {
         println!();

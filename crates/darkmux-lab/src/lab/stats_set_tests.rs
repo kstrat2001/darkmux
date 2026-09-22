@@ -11,9 +11,10 @@ fn run(name: &str, verify: &str) -> RunStats {
         model: Some("m".into()),
         verify: Some(verify.into()),
         checks: RunChecks {
-            tokens_reconcile: true,
+            tokens_reconcile: Some(true),
             rest_within_wall: true,
             have_telemetry_samples: true,
+            telemetry_covers_run: true,
             have_flow_records: true,
             checkpoint_parse_consistent: true,
             verdict_matches_ratio: true,
@@ -105,7 +106,7 @@ fn an_unverified_run_is_neither_a_pass_nor_a_failure() {
 #[test]
 fn a_run_that_did_not_reconcile_stays_in_the_set_and_is_named() {
     let mut bad = run("b", "pass");
-    bad.checks.tokens_reconcile = false;
+    bad.checks.tokens_reconcile = Some(false);
     bad.checks.all_streams_billed = false;
     let s = summarize(&[run("a", "pass"), bad]);
     assert_eq!(s.n, 2);
@@ -117,14 +118,20 @@ fn a_run_that_did_not_reconcile_stays_in_the_set_and_is_named() {
 #[test]
 fn every_failed_check_raises_a_flag() {
     let mut r = run("a", "pass");
-    r.checks = RunChecks::default(); // every check false
+    r.checks = RunChecks::default(); // every boolean check false
+    r.checks.tokens_reconcile = Some(false);
+    r.checks.turns_match_trajectory = Some(false);
     r.checks.missing_required_events = vec!["model.completed".into()];
+    r.suspect_turns = vec![crate::lab::stats::SuspectTurn { seq: 1, reasoning_chars_per_token: 90.0 }];
     r.thermal_ratchet_fired = true;
     r.throttled_samples = 1;
     r.result = Some("error".into());
     assert_eq!(
         flags(&r),
-        vec!["RUNTIME-ERROR", "TOKENS", "PARSE", "VERDICT", "UNBILLED", "STREAMS", "REST", "NO-TELEM", "RATCHET", "THROTTLE"]
+        vec![
+            "RUNTIME-ERROR", "TOKENS", "PARSE", "VERDICT", "UNBILLED", "STREAMS", "REST",
+            "COUNTS", "NO-TELEM", "NO-FLOW", "CHARS", "RATCHET", "THROTTLE"
+        ]
     );
     assert!(flags(&run("clean", "pass")).is_empty());
 }
@@ -182,4 +189,36 @@ fn an_escalated_run_is_flagged() {
     let mut r = run("a", "fail");
     r.result = Some("escalation_intra_turn_stall_exhausted".into());
     assert_eq!(flags(&r), vec!["ESCALATED"]);
+}
+
+/// Review C9: a figure over one run printed as a bare number, identical to
+/// five runs that agreed. The count shows whenever it is short of the set.
+#[test]
+fn a_range_over_fewer_runs_than_the_set_says_how_many() {
+    let f = |v: f64| format!("{v:.0}");
+    assert_eq!(fmt_range(Range::of([120.0]), 5, &f), "120 [n=1]");
+    assert_eq!(fmt_range(Range::of([120.0; 5]), 5, &f), "120");
+    assert_eq!(fmt_range(Range::of([100.0, 140.0]), 5, &f), "120 (100–140) [n=2]");
+    assert_eq!(fmt_range(None, 5, &f), "-");
+}
+
+/// Review C10: flags that are an OR of two conditions were only tested with
+/// every condition false at once, so either half could be deleted unseen.
+/// Each condition alone must raise its flag.
+#[test]
+fn each_condition_raises_its_flag_alone() {
+    let only = |set: fn(&mut RunStats)| {
+        let mut r = run("a", "pass");
+        set(&mut r);
+        flags(&r)
+    };
+    assert_eq!(only(|r| r.checks.checkpoint_parse_consistent = false), vec!["PARSE"]);
+    assert_eq!(only(|r| r.checks.missing_required_events = vec!["x".into()]), vec!["PARSE"]);
+    assert_eq!(only(|r| r.checks.frames_match_streams = false), vec!["STREAMS"]);
+    assert_eq!(only(|r| r.checks.streams_terminated = false), vec!["STREAMS"]);
+    assert_eq!(only(|r| r.checks.turns_match_trajectory = Some(false)), vec!["COUNTS"]);
+    assert_eq!(only(|r| r.checks.rest_matches_trajectory = Some(false)), vec!["COUNTS"]);
+    assert_eq!(only(|r| r.checks.telemetry_covers_run = false), vec!["TELEM-GAP"]);
+    assert_eq!(only(|r| r.checks.have_flow_records = false), vec!["NO-FLOW"]);
+    assert_eq!(only(|r| r.checks.tokens_reconcile = None), Vec::<&str>::new(), "not checkable is not a failure");
 }

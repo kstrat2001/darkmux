@@ -70,7 +70,7 @@ fn usage_frames_accumulate_within_one_turn_and_are_not_assigned() {
     let s = stats(&traj, metrics(20_000, 0, 1, 3_606));
     assert_eq!(s.completion_tokens, 3_606, "sum, not the last frame (1,881)");
     assert_eq!(s.reasoning_tokens, 60);
-    assert!(s.checks.tokens_reconcile, "the per-turn sum must equal the run total");
+    assert_eq!(s.checks.tokens_reconcile, Some(true), "the per-turn sum must equal the run total");
 }
 
 /// The check that caught the undercount: it fails the moment the per-turn
@@ -79,7 +79,7 @@ fn usage_frames_accumulate_within_one_turn_and_are_not_assigned() {
 fn tokens_reconcile_is_false_when_the_run_total_disagrees() {
     let traj = format!("{}{}", stream(1, 0, Some(1_000)), completed(1, Some(100), 0));
     let s = stats(&traj, metrics(2_000, 0, 1, 999));
-    assert!(!s.checks.tokens_reconcile);
+    assert_eq!(s.checks.tokens_reconcile, Some(false));
     assert!(s.unreconciled().iter().any(|r| r.contains("sum to the run total")));
 }
 
@@ -375,17 +375,33 @@ fn telem(ts: u64, gpu_pct: u64, w: f64) -> String {
 /// Power averaged across the whole run mixes inference with idle and
 /// understates load by whatever fraction of the run was tool calls and rest.
 /// Busy-only, with the duty cycle beside it, is the honest pair.
+///
+/// (Revised after review: the first version of this test put four samples
+/// in the first 30 ms of a 100 s run and asserted 50 s busy — it enshrined
+/// the extrapolation it should have refused. These samples cover the run.)
 #[test]
 fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
-    let raw = format!("{}{}{}{}", telem(10, 96, 40.0), telem(20, 97, 44.0), telem(30, 0, 0.0), telem(40, 1, 0.04));
+    let from = 1_000_000; // `metrics()`'s start
+    let at = |off: u64, gpu: u64, w: f64| {
+        line(serde_json::json!({
+            "action": "machine.telemetry",
+            "payload": {
+                "sampled_at_ms": from + off, "interval_ms": 25_000, "gpu_pct": gpu, "mem_pct": 62,
+                "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
+                "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "total": (w * 1000.0) as u64 + 5_000}
+            }
+        }))
+    };
+    let raw = format!("{}{}{}{}", at(25_000, 96, 40.0), at(50_000, 97, 44.0), at(75_000, 0, 0.0), at(100_000, 1, 0.04));
     let mut flows = FlowFacts::default();
-    scan_flow_lines(&raw, 0, 1_000, None, &mut flows);
+    scan_flow_lines(raw.as_bytes(), from, from + 100_000, None, &mut flows);
     let s = derive_stats("t".into(), metrics(100_000, 0, 1, 0), Trajectory::default(), flows, None, None);
 
     assert_eq!(s.samples_busy, 2);
     assert_eq!(s.samples_idle, 2);
     assert_eq!(s.gpu_w_busy, Some(42.0), "a flat mean would read 21.0");
     assert_eq!(s.gpu_duty_pct, Some(50.0));
+    assert!(s.checks.telemetry_covers_run);
     assert_eq!(s.busy_ms, Some(50_000));
     assert_eq!(s.pkg_w_busy, Some(47.0));
     assert_eq!(s.pkg_j_busy, Some(2_350.0), "47 W across 50 busy seconds");
@@ -402,7 +418,7 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
 fn telemetry_outside_the_run_window_is_ignored() {
     let raw = format!("{}{}{}", telem(50, 96, 40.0), telem(150, 96, 40.0), telem(250, 96, 40.0));
     let mut flows = FlowFacts::default();
-    scan_flow_lines(&raw, 100, 200, None, &mut flows);
+    scan_flow_lines(raw.as_bytes(), 100, 200, None, &mut flows);
     assert_eq!(flows.samples.len(), 1);
 }
 
@@ -441,7 +457,9 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     .unwrap();
     std::fs::write(
         run.path().join("trajectory.jsonl"),
-        format!("{}{}", stream(1, 1_000, Some(4_000)), completed(1, Some(300), 0)),
+        // The 2 s of rest in metrics.json is recorded in the trajectory too;
+        // the cross-check requires both to say it.
+        format!("{}{}{}", stream(1, 1_000, Some(4_000)), completed(1, Some(300), 0), rest(2_000)),
     )
     .unwrap();
     std::fs::write(
@@ -481,7 +499,7 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     assert_eq!(s.samples_busy, 1, "today's telemetry");
     assert_eq!(s.flow_records_in_window, 1, "yesterday's session record");
     assert!(s.bounds.contains_key("max_tokens_per_call"), "bounds from yesterday's file");
-    assert!(s.checks.tokens_reconcile);
+    assert_eq!(s.checks.tokens_reconcile, Some(true));
     assert!(s.unreconciled().is_empty(), "a clean run quotes cleanly: {:?}", s.unreconciled());
 }
 
@@ -637,4 +655,304 @@ fn the_window_slack_keeps_session_records_but_not_outside_telemetry() {
     assert_eq!(s.flow_records_in_window, 1);
     assert!(s.bounds.contains_key("max_turns"));
     assert_eq!(s.samples_busy, 1, "the pre-run sample is not averaged into the run");
+}
+
+// ---------------------------------------------------------------------------
+// Merge-gate review, 2026-09-23. Each test below reproduces a PROVEN finding:
+// a wrong figure that passed every check, or a guard no test pinned.
+// ---------------------------------------------------------------------------
+
+/// Review MF1: `aborts` counted distinct SEQS. A turn aborted twice (the
+/// retry was aborted too) is two aborts. Measured: a real run with four
+/// abort records reported three.
+#[test]
+fn every_abort_counts_not_every_aborted_turn() {
+    let abort = |seq: u64| line(serde_json::json!({"type": "dispatch.gate.abort", "seq": seq}));
+    let traj = format!("{}{}{}", abort(2), abort(6), abort(6));
+    let s = stats(&traj, metrics(10_000, 0, 6, 0));
+    assert_eq!(s.gates.stream.aborts, 3);
+    assert_eq!(s.turns_with_stream_abort, vec![2, 6]);
+}
+
+fn rest(ms: u64) -> String {
+    line(serde_json::json!({"type": "runtime.rest", "ms": ms, "reason": "thermal-duty-cycle", "state": "fair"}))
+}
+
+/// Review MF2: the runtime's error path writes `metrics.json` with turns and
+/// rest hardcoded to zero, so an errored run printed "rest 0s, 0 turns"
+/// beside three rests and 234k tokens, active time overstated by the rest it
+/// hid, and no caveat. The trajectory holds the real counts.
+#[test]
+fn an_errored_run_takes_turns_and_rest_from_the_trajectory() {
+    let traj = format!(
+        "{}{}{}{}{}{}",
+        stream(1, 0, Some(10_000)),
+        completed(1, Some(100), 0),
+        rest(15_000),
+        stream(2, 30_000, Some(40_000)),
+        completed(2, Some(200), 0),
+        rest(15_000),
+    );
+    let mut m = metrics(100_000, 0, 0, 0);
+    m.result = Some("error".into());
+    let s = stats(&traj, m);
+    assert_eq!(s.turns, 2);
+    assert_eq!(s.rest_ms, 30_000);
+    assert_eq!(s.active_ms, 70_000);
+    assert!(s.checks.metrics_totals_zeroed);
+    assert_eq!(s.checks.tokens_reconcile, None, "there is no total to reconcile against");
+    assert!(s.unreconciled().iter().any(|r| r.contains("zeroed")));
+}
+
+/// Outside the error path the two sources must agree; when they do not, the
+/// run says so instead of quietly picking one.
+#[test]
+fn a_run_whose_metrics_disagree_with_its_trajectory_is_flagged() {
+    let traj = format!("{}{}{}", stream(1, 0, Some(1_000)), completed(1, Some(10), 0), rest(15_000));
+    let s = stats(&traj, metrics(100_000, 0, 1, 10));
+    assert_eq!(s.checks.rest_matches_trajectory, Some(false));
+    assert_eq!(s.checks.turns_match_trajectory, Some(true));
+    assert!(s.unreconciled().iter().any(|r| r.contains("rest")));
+}
+
+/// Review MF3: the "longest span on an aborted seq" guess ran even when null
+/// frames had already identified the unbilled span exactly, so a SHORT abort
+/// followed by a LONG billed retry marked the retry unbilled. Measured in the
+/// probe: 700 tok/s against a true 100.
+#[test]
+fn a_short_abort_then_a_long_retry_keeps_the_retry_billed() {
+    let traj = format!(
+        "{}{}{}{}{}{}{}",
+        stream(2, 0, Some(5_000)),
+        completed(2, None, 0),
+        stream(2, 5_000, Some(65_000)),
+        completed(2, Some(6_000), 0),
+        line(serde_json::json!({"type": "dispatch.gate.abort", "seq": 2})),
+        stream(3, 70_000, Some(80_000)),
+        completed(3, Some(1_000), 0),
+    );
+    let s = stats(&traj, metrics(100_000, 0, 3, 7_000));
+    assert_eq!(s.streams_unbilled, 1);
+    assert_eq!(s.gen_ms_billed, 70_000);
+    assert_eq!(s.tok_per_s, Some(100.0));
+}
+
+/// When frames and streams do NOT pair, null-frame indexes are not trusted:
+/// a frame missing from the middle would shift every later index.
+#[test]
+fn a_null_frame_is_not_paired_by_index_when_counts_differ() {
+    let traj = format!(
+        "{}{}{}{}",
+        stream(1, 0, Some(10_000)),
+        completed(1, None, 0),
+        stream(2, 10_000, Some(20_000)),
+        stream(3, 20_000, Some(30_000)),
+    );
+    let s = stats(&traj, metrics(40_000, 0, 3, 0));
+    assert!(!s.checks.frames_match_streams);
+    assert_eq!(s.streams_unbilled, 0, "index pairing is off when the counts differ");
+}
+
+fn telem_at(ts: u64, gpu_pct: u64, interval_ms: u64) -> String {
+    line(serde_json::json!({
+        "action": "machine.telemetry",
+        "payload": {
+            "sampled_at_ms": ts, "gpu_pct": gpu_pct, "interval_ms": interval_ms,
+            "power_mw": {"gpu": 30_000, "cpu": 5_000, "total": 35_000}
+        }
+    }))
+}
+
+/// Review MF4: two samples in the last ten seconds of a ten-minute run
+/// (the daemon started late) extrapolated to 600 s busy and 21 kJ, with no
+/// caveat. Busy time and energy are withheld when telemetry does not cover
+/// the run.
+#[test]
+fn sparse_telemetry_withholds_busy_time_and_energy() {
+    let from = 1_000_000; // `metrics()`'s start
+    let raw = format!("{}{}", telem_at(from + 595_000, 96, 5_000), telem_at(from + 600_000, 96, 5_000));
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + 600_000, None, &mut flows);
+    let s = derive_stats("t".into(), metrics(600_000, 0, 1, 0), Trajectory::default(), flows, None, None);
+    assert!(!s.checks.telemetry_covers_run);
+    assert!(s.telemetry_max_gap_ms.unwrap() >= 590_000);
+    assert_eq!(s.busy_ms, None);
+    assert_eq!(s.pkg_j_busy, None);
+    assert!(s.unreconciled().iter().any(|r| r.contains("telemetry")));
+}
+
+/// The sampler slows to ~51 s when idle and runs at ~5 s while busy, so
+/// counting SAMPLES over-weights busy time. Each sample is weighted by the
+/// interval it closes (`interval_ms`, measured equal to the actual gap).
+#[test]
+fn duty_is_weighted_by_time_not_by_sample_count() {
+    let from = 1_000_000; // `metrics()`'s start
+    let mut raw = String::new();
+    for i in 1..=6 {
+        raw.push_str(&telem_at(from + i * 5_000, 96, 5_000)); // 30 s busy
+    }
+    raw.push_str(&telem_at(from + 60_000, 0, 30_000)); // 30 s idle, one sample
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + 60_000, None, &mut flows);
+    let s = derive_stats("t".into(), metrics(60_000, 0, 1, 0), Trajectory::default(), flows, None, None);
+    assert_eq!(s.gpu_duty_pct, Some(50.0), "by count it would read 85.7%");
+    assert!(s.checks.telemetry_covers_run);
+}
+
+/// Review C5: `cumulative_chars` restarts with every stream, so the per-seq
+/// maximum dropped every stream but the largest on a retried turn.
+#[test]
+fn content_chars_sum_across_streams_on_one_seq() {
+    let partial = |n: u64| line(serde_json::json!({"type": "model.partial", "seq": 1, "cumulative_chars": n}));
+    let traj = format!(
+        "{}{}{}{}",
+        stream(1, 0, Some(1_000)),
+        partial(3_000),
+        stream(1, 1_000, Some(2_000)),
+        partial(2_000),
+    );
+    let s = stats(&traj, metrics(5_000, 0, 1, 0));
+    assert_eq!(s.content_chars, 5_000);
+}
+
+/// Review C6: one invalid byte made `read_to_string` fail and the whole day
+/// file vanished, counted as neither read nor skipped.
+#[test]
+fn an_undecodable_flow_file_is_still_read() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    let flows = tempfile::TempDir::new().unwrap();
+    let mut body = b"{\"action\":\"x\",\"payload\":{\"note\":\"\xff\xfe\"}}\n".to_vec();
+    body.extend_from_slice(telem(start + MIN, 96, 40.0).as_bytes());
+    let path = flows.path().join("d.jsonl");
+    std::fs::write(&path, &body).unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.flow_scan.files_read, 1);
+    assert_eq!(s.samples_busy, 1);
+    assert_eq!(
+        s.flow_scan.files_total,
+        s.flow_scan.files_read + s.flow_scan.files_skipped + s.flow_scan.files_unreadable
+    );
+}
+
+/// Review C7: the stop bound's slack was unpinned. A session record written
+/// just after the run ends, after a telemetry line already past `run_to`,
+/// is still this run's.
+#[test]
+fn a_session_record_just_after_the_run_is_kept() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    std::fs::write(run.path().join("lifecycle.json"), r#"{"session_id":"sid-3"}"#).unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    let body = format!(
+        "{}{}",
+        telem(start + 11 * MIN, 0, 0.0),
+        line(serde_json::json!({"action": "dispatch complete", "session_id": "sid-3", "payload": {}})),
+    );
+    flow_file(flows.path(), "d.jsonl", &body, start + 12 * MIN);
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert_eq!(s.flow_records_in_window, 1);
+}
+
+/// Review C7: the open bound's slack was unpinned. The host writes `dispatch
+/// start` before the runtime stamps its start; a file last written in that
+/// gap still holds the run's bounds.
+#[test]
+fn a_file_last_written_just_before_the_run_is_still_opened() {
+    let start = 1_000 * MIN;
+    let run = run_at(start, 10 * MIN);
+    std::fs::write(run.path().join("lifecycle.json"), r#"{"session_id":"sid-4"}"#).unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    let body = line(serde_json::json!({
+        "action": "dispatch start", "session_id": "sid-4",
+        "payload": {"bounds": {"max_turns": {"value": null, "source": "built-in"}}}
+    }));
+    flow_file(flows.path(), "d.jsonl", &body, start - 2 * MIN);
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert!(s.bounds.contains_key("max_turns"));
+}
+
+/// Review C8: an implausible chars-per-token turn was computed and never
+/// shown; a run with no flow records raised nothing.
+#[test]
+fn suspect_turns_and_missing_flow_records_are_caveats() {
+    let traj = format!(
+        "{}{}{}",
+        stream(1, 0, Some(1_000)),
+        completed(1, Some(500), 10),
+        line(serde_json::json!({"type": "model.reasoning", "seq": 1, "reasoning_chars": 9_000})),
+    );
+    let s = stats(&traj, metrics(2_000, 0, 1, 500));
+    let u = s.unreconciled();
+    assert!(u.iter().any(|r| r.contains("chars per token")), "{u:?}");
+    assert!(u.iter().any(|r| r.contains("flow records")), "{u:?}");
+}
+
+/// Review M1: records written before `would_conclude` existed carry only the
+/// verdict. A conclusion there still counts as the finding.
+#[test]
+fn an_older_checkpoint_without_would_conclude_still_counts_its_conclusion() {
+    let traj = line(serde_json::json!({"type": "dispatch.checkpoint", "seq": 1, "tail_ratio": 0.1, "verdict": "conclude"}));
+    let s = stats(&traj, metrics(1_000, 0, 1, 0));
+    assert_eq!(s.gates.checkpoint.degenerate_turns, vec![1]);
+}
+
+/// Review M9: rest longer than wall is impossible; the check must fail.
+#[test]
+fn rest_longer_than_wall_fails_its_check() {
+    let s = stats("", metrics(1_000, 5_000, 1, 0));
+    assert!(!s.checks.rest_within_wall);
+}
+
+/// Review M10: a second end record for one stream must not re-time it.
+#[test]
+fn a_duplicate_end_does_not_re_time_a_closed_stream() {
+    let traj = format!(
+        "{}{}",
+        stream(1, 0, Some(1_000)),
+        line(serde_json::json!({"type": "model.streaming.end", "seq": 1, "ts": 9_000})),
+    );
+    let s = stats(&traj, metrics(10_000, 0, 1, 0));
+    assert_eq!(s.gen_ms_all, 1_000);
+}
+
+/// Review M17: the runtime's comparison is strict. A ratio of exactly the
+/// threshold is NOT degenerate.
+#[test]
+fn a_ratio_exactly_at_the_threshold_is_not_degenerate() {
+    let traj = line(serde_json::json!({
+        "type": "dispatch.checkpoint", "seq": 1, "tail_ratio": DEGENERATE_TAIL_RATIO,
+        "verdict": "continue", "would_conclude": false
+    }));
+    let s = stats(&traj, metrics(1_000, 0, 1, 0));
+    assert!(s.gates.checkpoint.degenerate_turns_by_ratio.is_empty());
+    assert!(s.checks.verdict_matches_ratio);
+}
+
+/// Review C12: a run id that does not resolve read as "a run without runtime
+/// metrics", which sent the reader looking in the wrong place.
+#[test]
+fn a_run_that_does_not_exist_says_so() {
+    let err = compute_from_dir(Path::new("/nonexistent/run-xyz"), Path::new("/nonexistent")).unwrap_err();
+    assert!(err.to_string().contains("no run directory"), "got: {err}");
+}
+
+/// Review M14: when frames and streams do NOT pair, the fallback marks the
+/// LONGEST span on an aborted seq as the unbilled one (the gate fires at the
+/// end of the run it killed). Nothing pinned longest over shortest.
+#[test]
+fn without_a_pairing_the_longest_span_on_an_aborted_seq_is_the_unbilled_one() {
+    let traj = format!(
+        "{}{}{}{}{}{}",
+        stream(2, 0, Some(50_000)), // the aborted stream: no usage frame at all
+        line(serde_json::json!({"type": "dispatch.gate.abort", "seq": 2})),
+        stream(2, 50_000, Some(55_000)),
+        completed(2, Some(500), 0),
+        stream(3, 60_000, Some(70_000)),
+        completed(3, Some(1_000), 0),
+    );
+    let s = stats(&traj, metrics(80_000, 0, 3, 1_500));
+    assert!(!s.checks.frames_match_streams, "three streams, two frames");
+    assert_eq!(s.streams_unbilled, 1);
+    assert_eq!(s.gen_ms_billed, 15_000, "the 5 s retry and the 10 s turn");
 }
