@@ -146,6 +146,9 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if !c.have_flow_records {
         f.push("NO-FLOW");
     }
+    if c.policy_consistent == Some(false) {
+        f.push("POLICY");
+    }
     if !s.suspect_turns.is_empty() {
         f.push("CHARS");
     }

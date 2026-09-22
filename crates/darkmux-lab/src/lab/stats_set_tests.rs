@@ -220,5 +220,6 @@ fn each_condition_raises_its_flag_alone() {
     assert_eq!(only(|r| r.checks.rest_matches_trajectory = Some(false)), vec!["COUNTS"]);
     assert_eq!(only(|r| r.checks.telemetry_covers_run = false), vec!["TELEM-GAP"]);
     assert_eq!(only(|r| r.checks.have_flow_records = false), vec!["NO-FLOW"]);
+    assert_eq!(only(|r| r.checks.policy_consistent = Some(false)), vec!["POLICY"]);
     assert_eq!(only(|r| r.checks.tokens_reconcile = None), Vec::<&str>::new(), "not checkable is not a failure");
 }

@@ -956,3 +956,39 @@ fn without_a_pairing_the_longest_span_on_an_aborted_seq_is_the_unbilled_one() {
     assert_eq!(s.streams_unbilled, 1);
     assert_eq!(s.gen_ms_billed, 15_000, "the 5 s retry and the 10 s turn");
 }
+
+fn with_policy_bound(value: &str) -> FlowFacts {
+    let mut f = FlowFacts::default();
+    f.bounds.insert(
+        "detection_degeneracy_policy".into(),
+        serde_json::json!({"value": value, "source": "env"}),
+    );
+    f
+}
+
+/// A run with no checkpoint records (a clean run, or any run under `off`)
+/// showed no policy at all, though `dispatch start.bounds` recorded it. That
+/// made a healthy `enforce` run and an `off` run look identical, the exact
+/// ambiguity the detector policy exists to remove. Measured on a real
+/// `observe` run with no checkpoints.
+#[test]
+fn the_policy_is_read_from_the_bounds_when_no_checkpoint_recorded_it() {
+    let s = derive_stats("t".into(), metrics(1_000, 0, 0, 0), Trajectory::default(), with_policy_bound("off"), None, None);
+    assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("off"));
+    assert_eq!(s.checks.policy_consistent, None, "one source, nothing to compare");
+}
+
+/// The host resolves the policy it records in the bounds, but the runtime
+/// reads its OWN environment inside the container. When the two disagree,
+/// the policy that ran is not the one the operator's settings say.
+#[test]
+fn a_policy_the_runtime_did_not_run_is_flagged() {
+    let traj = line(serde_json::json!({
+        "type": "dispatch.checkpoint", "seq": 1, "tail_ratio": 0.9,
+        "verdict": "continue", "would_conclude": false, "policy": "observe"
+    }));
+    let s = derive_stats("t".into(), metrics(1_000, 0, 1, 0), parse_trajectory(&traj), with_policy_bound("enforce"), None, None);
+    assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("observe"), "what ran wins");
+    assert_eq!(s.checks.policy_consistent, Some(false));
+    assert!(s.unreconciled().iter().any(|r| r.contains("policy")));
+}

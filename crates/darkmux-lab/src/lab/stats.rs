@@ -151,7 +151,10 @@ pub struct CheckpointGate {
     /// Re-derived from [`DEGENERATE_TAIL_RATIO`], for the cross-check only.
     pub degenerate_turns_by_ratio: Vec<u64>,
     pub min_tail_ratio: Option<f64>,
-    /// The resolved detection policy the records themselves report.
+    /// The detection policy in force: what the checkpoint records say ran,
+    /// or, when the run made none (a clean run, or any run under `off`), what
+    /// `dispatch start.bounds` says the host resolved. Without the fallback a
+    /// healthy `enforce` run and an `off` run read identically.
     pub policy: Option<String>,
 }
 
@@ -182,6 +185,11 @@ pub struct RunChecks {
     pub rest_matches_trajectory: Option<bool>,
     pub turns_match_trajectory: Option<bool>,
     pub telemetry_covers_run: bool,
+    /// The policy the checkpoint records say RAN agrees with the one
+    /// `dispatch start.bounds` says the host RESOLVED. They can differ: the
+    /// runtime reads its own environment inside the container. `None` when
+    /// only one source exists.
+    pub policy_consistent: Option<bool>,
     /// Rest cannot exceed wall. A violation means one of the two counters is
     /// measuring a different window than the other.
     pub rest_within_wall: bool,
@@ -365,6 +373,9 @@ impl RunStats {
             out.push("no host telemetry in the run window");
         } else if !c.telemetry_covers_run {
             out.push("host telemetry does not cover the whole run; busy time and energy are withheld");
+        }
+        if c.policy_consistent == Some(false) {
+            out.push("the detection policy that ran differs from the one the host resolved");
         }
         if !c.have_flow_records {
             out.push("no flow records for this session in the window; its dispatch bounds are unknown");
@@ -1057,6 +1068,13 @@ pub(crate) fn derive_stats(
         })
         .collect();
 
+    let bounds_policy = flows
+        .bounds
+        .get("detection_degeneracy_policy")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
     // --- the two gates ----------------------------------------------------
     let mut cp_min: BTreeMap<u64, f64> = BTreeMap::new();
     let mut concluded: Vec<u64> = Vec::new();
@@ -1101,7 +1119,7 @@ pub(crate) fn derive_stats(
                 .values()
                 .copied()
                 .fold(None, |a: Option<f64>, r| Some(a.map_or(r, |m| m.min(r)))),
-            policy: t.policy.clone(),
+            policy: t.policy.clone().or_else(|| bounds_policy.clone()),
         },
     };
 
@@ -1223,6 +1241,10 @@ pub(crate) fn derive_stats(
             rest_matches_trajectory: rest_match,
             turns_match_trajectory: turns_match,
             telemetry_covers_run: cover.covers_run,
+            policy_consistent: match (&t.policy, &bounds_policy) {
+                (Some(ran), Some(resolved)) => Some(ran == resolved),
+                _ => None,
+            },
             rest_within_wall: rest_ms <= wall_ms,
             have_telemetry_samples: !flows.samples.is_empty(),
             have_flow_records: flows.records_for_session > 0,
