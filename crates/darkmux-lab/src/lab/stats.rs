@@ -173,7 +173,7 @@ pub struct SuspectTurn {
 /// these would have caught a specific wrong claim made before this module
 /// existed; [`RunStats::unreconciled`] turns the failures into the caveats a
 /// renderer prints next to the figures.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RunChecks {
     /// Per-turn tokens sum to the run total. This is what caught the 15x
     /// undercount; it fails the moment frames are assigned instead of summed.
@@ -217,7 +217,7 @@ pub struct RunChecks {
 /// Durations are milliseconds because that is the unit the artifacts use;
 /// converting to seconds is the renderer's job, and doing it here would
 /// round away differences the comparison depends on.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RunStats {
     pub schema_version: &'static str,
     pub run: String,

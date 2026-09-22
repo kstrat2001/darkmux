@@ -1505,8 +1505,18 @@ pub(crate) enum RunCmd {
     /// whether it may be quoted. Reads the run's existing artifacts; nothing
     /// is recomputed at dispatch time, so this applies to runs already on
     /// disk.
+    ///
+    /// Given several runs, prints one row per run and the set as ranges
+    /// (median with min and max, never a bare mean), plus cost per
+    /// successful outcome. With `--baseline`, prints both sets side by side
+    /// with what moved.
     Stats {
-        run: String,
+        /// One or more run ids or paths.
+        #[arg(required = true, num_args = 1..)]
+        runs: Vec<String>,
+        /// Runs to compare against (repeatable, or several after one flag).
+        #[arg(long, num_args = 1..)]
+        baseline: Vec<String>,
         #[command(flatten)]
         json: JsonFlagPlain,
     },

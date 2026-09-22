@@ -419,14 +419,38 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             }
             Ok(0)
         }
-        RunCmd::Stats { run, json } => {
-            let s = lab::stats::run_stats(&run)?;
-            if json.json {
-                println!("{}", serde_json::to_string_pretty(&s)?);
+        RunCmd::Stats { runs, baseline, json } => {
+            if runs.len() == 1 && baseline.is_empty() {
+                let s = lab::stats::run_stats(&runs[0])?;
+                if json.json {
+                    println!("{}", serde_json::to_string_pretty(&s)?);
+                } else {
+                    render_stats(&s);
+                }
                 return Ok(0);
             }
-            render_stats(&s);
-            Ok(0)
+            let cand = load_stats_set(&runs);
+            let base = (!baseline.is_empty()).then(|| load_stats_set(&baseline));
+            if json.json {
+                let set_json = |set: &StatsSet| {
+                    serde_json::json!({
+                        "runs": set.runs,
+                        "summary": lab::stats_set::summarize(&set.runs),
+                        "errors": set.errors,
+                    })
+                };
+                let mut out = set_json(&cand);
+                if let Some(b) = &base {
+                    out["baseline"] = set_json(b);
+                }
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                render_stats_sets(&cand, base.as_ref());
+            }
+            // A run that could not be read is reported, and makes the exit
+            // non-zero, so a script cannot mistake a partial set for a whole one.
+            let errored = !cand.errors.is_empty() || base.as_ref().is_some_and(|b| !b.errors.is_empty());
+            Ok(if errored { 1 } else { 0 })
         }
         RunCmd::Compare { run_a, run_b } => {
             let result = lab::compare::lab_compare(&run_a, &run_b)?;
@@ -543,10 +567,197 @@ fn render_stats(s: &darkmux_lab::lab::stats::RunStats) {
     let caveats = s.unreconciled();
     if !caveats.is_empty() {
         println!();
-        println!("not reconciled — do not quote these figures without saying so:");
+        println!("not reconciled, so do not quote these figures without saying so:");
         for c in &caveats {
             println!("  - {c}");
         }
+    }
+}
+
+/// Runs loaded for a set view, and the ones that could not be.
+struct StatsSet {
+    runs: Vec<darkmux_lab::lab::stats::RunStats>,
+    /// `(run, error)`. Never silently dropped: a set missing a run it was
+    /// asked for reads as a different arm.
+    errors: Vec<(String, String)>,
+}
+
+fn load_stats_set(ids: &[String]) -> StatsSet {
+    let mut set = StatsSet { runs: Vec::new(), errors: Vec::new() };
+    for id in ids {
+        match lab::stats::run_stats(id) {
+            Ok(s) => set.runs.push(s),
+            Err(e) => set.errors.push((id.clone(), format!("{e:#}"))),
+        }
+    }
+    set
+}
+
+fn fmt_secs(ms: f64) -> String {
+    format!("{:.0}s", ms / 1000.0)
+}
+
+fn fmt_opt(v: Option<f64>, dp: usize) -> String {
+    v.map(|v| format!("{v:.dp$}")).unwrap_or_else(|| "-".into())
+}
+
+/// `median (min–max)`, the only form a set figure is printed in.
+fn fmt_range(r: Option<darkmux_lab::lab::stats_set::Range>, f: &dyn Fn(f64) -> String) -> String {
+    match r {
+        Some(r) if r.min == r.max => f(r.median),
+        Some(r) => format!("{} ({}–{})", f(r.median), f(r.min), f(r.max)),
+        None => "-".into(),
+    }
+}
+
+/// (#2855) One row per run. Every row prints whatever its checks say, with
+/// the failed ones as flags on the same line: dropping a row that did not
+/// reconcile would be choosing the answer.
+fn render_stats_table(set: &StatsSet) {
+    use darkmux_lab::lab::stats_set::flags;
+    let w = set.runs.iter().map(|s| s.run.len()).chain(set.errors.iter().map(|(r, _)| r.len())).max().unwrap_or(3).max(3);
+    println!(
+        "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  flags",
+        "run", "verify", "active", "rest", "turns", "tok/s", "billed", "tokens", "cuts", "pkgW", "duty", "J/1ktok"
+    );
+    for s in &set.runs {
+        let f = flags(s);
+        println!(
+            "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  {}",
+            s.run,
+            s.verify.as_deref().unwrap_or("-"),
+            fmt_secs(s.active_ms as f64),
+            fmt_secs(s.rest_ms as f64),
+            s.turns,
+            fmt_opt(s.tok_per_s, 1),
+            s.billed_gen_fraction.map(|f| format!("{:.0}%", f * 100.0)).unwrap_or_else(|| "-".into()),
+            s.completion_tokens,
+            s.gates.stream.aborts + s.gates.checkpoint.concluded_turns.len(),
+            fmt_opt(s.pkg_w_busy, 1),
+            s.gpu_duty_pct.map(|d| format!("{d:.0}%")).unwrap_or_else(|| "-".into()),
+            fmt_opt(s.pkg_j_per_1k_tokens, 0),
+            if f.is_empty() { "ok".to_string() } else { f.join(",") },
+        );
+    }
+    for (r, e) in &set.errors {
+        println!("{r:<w$}  NOT READ: {e}");
+    }
+}
+
+/// (#2855) The set view, and with a baseline, the comparison.
+fn render_stats_sets(cand: &StatsSet, base: Option<&StatsSet>) {
+    use darkmux_lab::lab::stats_set::{ratio, summarize, SetSummary};
+    let c = summarize(&cand.runs);
+    let b = base.map(|b| summarize(&b.runs));
+
+    if let Some(bs) = base {
+        println!("baseline");
+        render_stats_table(bs);
+        println!();
+        println!("candidate");
+    }
+    render_stats_table(cand);
+    println!();
+
+    let secs = |v: f64| fmt_secs(v);
+    let one = |v: f64| format!("{v:.1}");
+    let pct = |v: f64| format!("{:.0}%", v * 100.0);
+    let int = |v: f64| format!("{v:.0}");
+    type Row<'a> = (&'a str, fn(&SetSummary) -> Option<darkmux_lab::lab::stats_set::Range>, &'a dyn Fn(f64) -> String);
+    let rows: [Row; 9] = [
+        ("active", |s| s.active_ms, &secs),
+        ("rest", |s| s.rest_ms, &secs),
+        ("turns", |s| s.turns, &int),
+        ("tokens", |s| s.completion_tokens, &int),
+        ("tok/s", |s| s.tok_per_s, &one),
+        ("billed share", |s| s.billed_gen_fraction, &pct),
+        ("gpu W busy", |s| s.gpu_w_busy, &one),
+        ("package W busy", |s| s.pkg_w_busy, &one),
+        ("J per 1k tokens", |s| s.pkg_j_per_1k_tokens, &int),
+    ];
+    let outcome = |s: &SetSummary| {
+        format!("{} of {} passed", s.passed, s.n)
+            + &if s.unverified > 0 { format!(", {} unverified", s.unverified) } else { String::new() }
+    };
+    let cost: [(&str, fn(&SetSummary) -> Option<f64>, &dyn Fn(f64) -> String); 3] = [
+        ("active", |s| s.cost_per_success.active_ms, &secs),
+        ("GPU busy", |s| s.cost_per_success.gpu_busy_ms, &secs),
+        ("energy", |s| s.cost_per_success.pkg_joules.map(|j| j / 1000.0), &|v| format!("{v:.1} kJ")),
+    ];
+
+    match &b {
+        None => {
+            println!("set          {}   models: {}", outcome(&c), c.models.join(", "));
+            for (name, get, f) in &rows {
+                println!("  {name:<16} {}", fmt_range(get(&c), f));
+            }
+            println!(
+                "  {:<16} {} runs with degeneracy, {} turns cut",
+                "detection", c.runs_with_degeneracy, c.turns_cut
+            );
+            println!("cost per successful run");
+            for (name, get, f) in &cost {
+                println!("  {name:<16} {}", get(&c).map(|v| f(v)).unwrap_or_else(|| "-".into()));
+            }
+        }
+        Some(b) => {
+            let col = 26.max(b.models.join(", ").len() + 2);
+            println!("{:<18} {:<col$} {:<col$} {}", "", "baseline", "candidate", "moved");
+            println!("{:<18} {:<col$} {:<col$}", "outcome", outcome(b), outcome(&c));
+            println!("{:<18} {:<col$} {:<col$}", "models", b.models.join(", "), c.models.join(", "));
+            for (name, get, f) in &rows {
+                let moved = ratio(get(&c).map(|r| r.median), get(b).map(|r| r.median))
+                    .map(|x| format!("{x:.2}x"))
+                    .unwrap_or_default();
+                println!("{name:<18} {:<col$} {:<col$} {moved}", fmt_range(get(b), f), fmt_range(get(&c), f));
+            }
+            println!(
+                "{:<18} {:<col$} {:<col$}",
+                "degeneracy",
+                format!("{} runs, {} cuts", b.runs_with_degeneracy, b.turns_cut),
+                format!("{} runs, {} cuts", c.runs_with_degeneracy, c.turns_cut)
+            );
+            println!("cost per successful run (every run's cost, divided by the runs that passed)");
+            for (name, get, f) in &cost {
+                let show = |s: &SetSummary| get(s).map(|v| f(v)).unwrap_or_else(|| "-".into());
+                let moved = ratio(get(&c), get(b)).map(|x| format!("{x:.2}x")).unwrap_or_default();
+                println!("  {name:<16} {:<col$} {:<col$} {moved}", show(b), show(&c));
+            }
+        }
+    }
+
+    // Caveats last and unconditionally, as in the single-run view.
+    let mut notes: Vec<String> = Vec::new();
+    for (label, s) in b.iter().map(|s| ("baseline", s)).chain(std::iter::once(("candidate", &c))) {
+        let label = if b.is_some() { format!("{label}: ") } else { String::new() };
+        if s.passed_with_runtime_error > 0 {
+            notes.push(format!(
+                "{label}{} of the {} passes came from runs whose runtime result was `error`; \
+                 check that this fixture's verify fails on an untouched tree",
+                s.passed_with_runtime_error, s.passed
+            ));
+        }
+        if s.models.len() > 1 {
+            notes.push(format!("{label}the set mixes {} models", s.models.len()));
+        }
+        for w in &s.cost_per_success.withheld {
+            notes.push(format!("{label}cost per success withheld: {w}"));
+        }
+        for (run, f) in &s.flagged {
+            notes.push(format!("{label}{run}: {}", f.join(", ")));
+        }
+    }
+    let errors = cand.errors.len() + base.map_or(0, |b| b.errors.len());
+    if errors > 0 {
+        notes.push(format!("{errors} run(s) could not be read and are not in the figures above"));
+    }
+    if !notes.is_empty() {
+        println!();
+        println!("read before quoting:");
+        for n in &notes {
+            println!("  - {n}");
+        }
+        println!("  (flag meanings: `darkmux lab run stats <run>` explains a single run's failed checks)");
     }
 }
 

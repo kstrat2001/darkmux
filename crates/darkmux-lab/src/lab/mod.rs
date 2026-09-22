@@ -34,4 +34,6 @@ pub mod scores;
 // (#2855) Derived run metrics — the lab computes them once, correctly, with
 // the reconciliation checks that say whether each number may be quoted.
 pub mod stats;
+// (#2855) A set of runs summarized as ranges, with cost per successful outcome.
+pub mod stats_set;
 pub mod tune;
