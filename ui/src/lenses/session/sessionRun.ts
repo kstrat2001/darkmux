@@ -611,6 +611,13 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         ? "killed (timeout)"
         : `errored${exitCode != null ? ` (exit ${exitCode})` : ""}`
       : undefined;
+  // (rest-reason cards) WALL CLOCK used to append a "incl. N rest" breakdown
+  // here (#2863). That breakdown now lives as its own per-kind SYSTEM tiles
+  // (THERMAL REST / TURN DELAY / BATTERY PAUSE / OPERATOR HOLD, built below
+  // via `restKindTiles`) — a card showing a count AND whether the
+  // protection was even armed, rather than one crowded sub-line. WALL CLOCK
+  // goes back to naming only what it always named: run time + outcome.
+  const wallSub = wallOutcome;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();
   const svLabel = statusLabel(
@@ -862,9 +869,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     systemIdx,
     wallBase,
     "WALL CLOCK",
-    "model time",
-    "model time — the runtime's own measure of this execution. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
-    wallOutcome,
+    "run time",
+    "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
+    wallSub,
   );
   // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
   // and it is the reading contract 8 supports: the harness DECIDES to compact
@@ -879,6 +886,70 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // would assert "the harness compacted nothing" where the truth is "there
   // was nothing here that could be compacted".
   if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
+  // (rest-reason cards) One SYSTEM tile per rest KIND — THERMAL REST / TURN
+  // DELAY / BATTERY PAUSE / OPERATOR HOLD, plus a generic label for a
+  // reason string this file doesn't recognize — replacing the single
+  // blended "incl. N rest" WALL CLOCK sub-line stripped out above. A card
+  // shows even at 0 rests when the protection was ARMED for this dispatch
+  // (`sp.bounds`), so an operator can tell "configured and never fired"
+  // from "not configured at all"; a run with no recorded `bounds` (older
+  // runs, before #2165) shows a card only for a kind that actually
+  // occurred — this mirrors `config_access`'s own `env > config > built-in`
+  // leniency posture: absent data reads as "unknown", never "off".
+  const restKindOf = (reason: unknown): { key: string; label: string } => {
+    const r = String(reason ?? "").trim();
+    if (r.startsWith("thermal")) return { key: "thermal", label: "THERMAL REST" };
+    if (r === "turn_delay") return { key: "turn_delay", label: "TURN DELAY" };
+    if (r.startsWith("battery")) return { key: "battery", label: "BATTERY PAUSE" };
+    if (r.startsWith("operator")) return { key: "operator_hold", label: "OPERATOR HOLD" };
+    const key = r || "rest";
+    return { key, label: `${key.toUpperCase()} REST` };
+  };
+  const restByKind = new Map<string, { label: string; count: number; totalMs: number }>();
+  for (const r of attemptRecs) {
+    if (r.action !== "dispatch.rest") continue;
+    const f = (r.fields || r.payload || {}) as Record<string, unknown>;
+    // A record carrying `delay_ms` with no `ms` is the governor changing
+    // its PACING, not a rest (`emit_rest`/`emit_rest_with_extra`,
+    // `dispatch_internal.rs`) — only a record with a real `ms` is one rest.
+    if (typeof f.ms !== "number" || !Number.isFinite(f.ms) || f.ms <= 0) continue;
+    const { key, label } = restKindOf(f.reason);
+    const cur = restByKind.get(key) ?? { label, count: 0, totalMs: 0 };
+    cur.count += 1;
+    cur.totalMs += f.ms;
+    restByKind.set(key, cur);
+  }
+  const restBounds = sp.bounds;
+  const restConfiguredByKind: Record<string, boolean> = {
+    thermal: restBounds?.thermal_pacing_enabled?.value === true,
+    turn_delay: typeof restBounds?.turn_delay_ms?.value === "number" && restBounds.turn_delay_ms.value > 0,
+    battery: restBounds?.battery_pause_enabled?.value === true,
+    // operator_hold has no config knob to arm — always falls through to
+    // "shown only if it actually occurred", per operator design.
+  };
+  const STATIC_REST_LABELS: Record<string, string> = {
+    thermal: "THERMAL REST",
+    turn_delay: "TURN DELAY",
+    battery: "BATTERY PAUSE",
+    operator_hold: "OPERATOR HOLD",
+  };
+  const restKindOrder = ["thermal", "turn_delay", "battery", "operator_hold"];
+  const extraKinds = [...restByKind.keys()]
+    .filter((k) => !restKindOrder.includes(k))
+    .sort((a, b) => (restByKind.get(b)?.totalMs ?? 0) - (restByKind.get(a)?.totalMs ?? 0));
+  for (const key of [...restKindOrder, ...extraKinds]) {
+    const occurred = restByKind.get(key);
+    const configured = restConfiguredByKind[key] === true;
+    if (!configured && !occurred) continue;
+    const label = STATIC_REST_LABELS[key] ?? occurred?.label ?? key.toUpperCase();
+    const count = occurred?.count ?? 0;
+    const totalMs = occurred?.totalMs ?? 0;
+    const sub =
+      key === "turn_delay" && count > 0
+        ? `${count} rest${count === 1 ? "" : "s"} · ${Math.round(totalMs / count / 1000)} s each`
+        : `${count} rest${count === 1 ? "" : "s"}`;
+    push(systemIdx, fmtElapsed(totalMs), label, undefined, undefined, sub);
+  }
   if (cpuPeak != null) {
     const s = avgHighSplit(hostAgg.cpu);
     push(systemIdx, s.value, "CPU", undefined, undefined, s.sub, s.unit);

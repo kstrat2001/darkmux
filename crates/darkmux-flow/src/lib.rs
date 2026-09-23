@@ -3221,7 +3221,11 @@ mod tests {
         //           consumer that does not know the kind ignores it.
         //   1.53.0 — additive payload key `generation_ms` on `dispatch.turn`
         //            (#2863): the turn's generation time, summed over its streams.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.53.0");
+        //   1.54.0 — additive `bounds` keys `thermal_pacing_enabled` /
+        //            `battery_pause_enabled` / `battery_pause_floor_pct`
+        //            (run-page rest-reason cards): whether thermal/battery
+        //            pacing was armed for this dispatch.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.54.0");
     }
 
     #[test]

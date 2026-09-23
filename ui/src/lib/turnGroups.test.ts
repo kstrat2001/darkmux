@@ -145,6 +145,107 @@ describe("turnItems (#2863)", () => {
     expect(items).toHaveLength(4);
   });
 
+  // (#2863 review, finding 3) A turn that never completed (measured on
+  // `crew-dispatch-code-reviewer-1789963273339920-0`: turn 4 left a
+  // `dispatch.checkpoint` with its own `turn_seq` but no `dispatch.turn`)
+  // used to leave `current` pointed at the PRIOR completed turn, since only
+  // `dispatch.turn`/`dispatch.reasoning` advanced it — so the checkpoint's
+  // own group rendered headerless and out of time order, and the run's
+  // terminal error (which carries no `turn_seq` of its own) was misfiled
+  // under the wrong turn.
+  it("a turn that never finished still gets a header and its error, in time order", () => {
+    const e1 = r(0, "dispatch start");
+    const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
+    const t2 = r(10, "dispatch.turn", { turn_seq: 2, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 200 } });
+    const t3 = r(15, "dispatch.turn", { turn_seq: 3, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 300 } });
+    const checkpoint4 = r(20, "dispatch.checkpoint", { turn_seq: 4 });
+    const err = r(21, "dispatch error", {}); // no turn_seq of its own
+    const all = [e1, t1, t2, t3, checkpoint4, err];
+    const visible = [err, checkpoint4, t3, t2, t1, e1];
+    const items = turnItems(visible, all);
+    const labels = items.map((i) => (i.kind === "turn" ? `turn ${i.turn.seq}` : `${i.kind}:${i.rec.action}`));
+    // Turn 4's synthesized header leads (it is the newest), the error and
+    // checkpoint sit under it, THEN turn 3 — not the other way around.
+    expect(labels).toEqual([
+      "turn 4",
+      "rec:dispatch error",
+      "rec:dispatch.checkpoint",
+      "turn 3",
+      "turn 2",
+      "turn 1",
+      "rec:dispatch start",
+    ]);
+    const head4 = items.find((i) => i.kind === "turn" && i.turn.seq === 4);
+    expect(head4 && head4.kind === "turn" && head4.turn.why).toBe("did not finish");
+    expect(head4 && head4.kind === "turn" && head4.turn.durationMs).toBeNull();
+    // (#2863 review round 2, finding 1) The synthesized header must carry
+    // an identity distinct from the anchor record it borrows a timestamp
+    // from — reusing the anchor's OWN identity is what produced the
+    // duplicate-React-key/co-highlight bug (`EventLogColumn.test.tsx`
+    // proves the render-level consequence against a real session).
+    expect(head4 && head4.kind === "turn" ? head4.id : undefined).toBeTruthy();
+    expect(items.some((i) => i.kind !== "turn" && "id" in i)).toBe(false);
+  });
+
+  // (#2863 review round 2, finding 2) A checkpoint with no terminal record
+  // YET does not mean the turn never will finish — it means the run is
+  // still going. "did not finish" is a claim about the PAST (the run
+  // ended and this turn has no closing record); "in progress" is the
+  // honest word while the execution has no terminal at all.
+  it("a checkpoint with no terminal record yet reads as in progress, not did not finish", () => {
+    const e1 = r(0, "dispatch start");
+    const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
+    const checkpoint2 = r(10, "dispatch.checkpoint", { turn_seq: 2, verdict: "continue" });
+    const all = [e1, t1, checkpoint2];
+    const items = turnItems([checkpoint2, t1, e1], all);
+    const head2 = items.find((i) => i.kind === "turn" && i.turn.seq === 2);
+    expect(head2 && head2.kind === "turn" && head2.turn.why).toBe("in progress");
+  });
+
+  // (#2863 review round 2, finding 8) A record naming an OLDER turn_seq
+  // than the one already reached (a late-arriving per-call token record
+  // for turn 3, delivered AFTER turn 4's checkpoint) must not yank
+  // `current` backward — an un-seq'd record arriving after it (the
+  // terminal error) belongs with the FURTHEST turn reached, not the stale
+  // one.
+  it("a stale (lower) turn_seq does not pull `current` backward", () => {
+    const e1 = r(0, "dispatch start");
+    const turn3 = r(5, "dispatch.turn", { turn_seq: 3, finish_reason: "tool_calls", tool_calls_count: 1, usage: { prompt_tokens: 100 } });
+    const checkpoint4 = r(7, "dispatch.checkpoint", { turn_seq: 4 });
+    const staleTokens = r(7, "telemetry.tokens", { turn_seq: 3, completion_tokens: 5 });
+    const err = r(8, "dispatch error", {}); // no turn_seq of its own
+    const all = [e1, turn3, checkpoint4, staleTokens, err];
+    const items = turnItems([err, staleTokens, checkpoint4, turn3, e1], all);
+    const labels = items.map((i) => (i.kind === "turn" ? `turn ${i.turn.seq}` : `${i.kind}:${i.rec.action}`));
+    const errIdx = labels.indexOf("rec:dispatch error");
+    const turn4Idx = labels.indexOf("turn 4");
+    const turn3Idx = labels.indexOf("turn 3");
+    expect(turn4Idx).toBeLessThan(turn3Idx);
+    expect(errIdx).toBeGreaterThan(turn4Idx);
+    expect(errIdx).toBeLessThan(turn3Idx);
+  });
+
+  // (#2863 review, finding 3, the missing test the general reviewer found)
+  // A second `dispatch start` must reset `current` to null — deleting that
+  // reset leaves a record with no `turn_seq` of its own, right after the
+  // second start, joining the FIRST execution's last turn instead of
+  // starting fresh under the new execution.
+  it("a second dispatch start resets which turn an un-seq'd record joins", () => {
+    const e1 = r(0, "dispatch start");
+    const t1 = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: { prompt_tokens: 100 } });
+    const e2 = r(20, "dispatch start");
+    const stray = r(21, "dispatch.tool", { tool_name: "read" }); // no turn_seq, right after the second start
+    const all = [e1, t1, e2, stray];
+    const items = turnItems([stray, e2, t1, e1], all);
+    // `stray` must NOT join execution 1's turn 1 — it belongs to no turn yet
+    // (execution 2 hasn't produced one), so it sits in the `null` group
+    // alongside `e2`, not folded into turn 1's group.
+    const turn1 = items.find((i) => i.kind === "turn" && i.turn.seq === 1)!;
+    const turn1Idx = items.indexOf(turn1);
+    const strayIdx = items.findIndex((i) => i.kind === "rec" && i.rec === stray);
+    expect(strayIdx).toBeLessThan(turn1Idx);
+  });
+
   it("an approximate duration that would be negative is no duration", () => {
     // The turn's first heartbeat stamped AFTER its turn record (whole-second
     // clocks, out-of-order delivery) must not render as a negative time.

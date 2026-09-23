@@ -189,11 +189,18 @@ describe("SessionReplay", () => {
     expect([...grid!.children].filter((c) => c.classList.contains("brief-label"))).toHaveLength(0);
   });
 
-  it("(U3-6) names WALL CLOCK as MODEL time, so it cannot be read as the mission step's span", async () => {
+  it("(U3-6, #2863 review) names WALL CLOCK as RUN time, so it cannot be read as the mission step's span", async () => {
     // The mission graph's per-step badge is the STEP SPAN (setup + the
     // model's work + the gate); this tile is the dispatch's own `wall_ms`.
     // On a real mission the same step read 10:36 there and 10:07 here, and
     // neither screen said why. `StepRow.test.tsx` asserts the other half.
+    //
+    // (#2863 review, finding 1) Was "model time" — but `wall_ms` INCLUDES
+    // thermal-rest time ("wall stays wall", `dispatch_internal.rs`'s own
+    // comment), so a rested run's tile overstated how long the model
+    // actually worked. Renamed to "run time" (what the figure actually
+    // measures); the rested-time distinction now surfaces on its own `sub`
+    // line from the record's `rest_ms` (`sessionRun.test.ts` covers that).
     //
     // Same mechanism on both surfaces: a `data-hint` short label rendered by
     // one CSS rule (so it never enters `textContent`, and
@@ -206,12 +213,12 @@ describe("SessionReplay", () => {
     const tiles = [...document.querySelectorAll('.metrics[data-scope="system"] .met')];
     const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "WALL CLOCK");
     expect(wall, "the WALL CLOCK tile").toBeTruthy();
-    expect(wall?.querySelector(".ml")?.getAttribute("data-hint")).toBe("model time");
+    expect(wall?.querySelector(".ml")?.getAttribute("data-hint")).toBe("run time");
     // (#2863) Drawn under the value, not appended to the label, so the label
     // stays one line in a narrow tile.
-    expect(wall?.getAttribute("data-subhint")).toBe("model time");
+    expect(wall?.getAttribute("data-subhint")).toBe("run time");
     const title = wall?.getAttribute("title") ?? "";
-    expect(title).toContain("model time");
+    expect(title).toContain("run time");
     // It has to name what it EXCLUDES, or the label is just another word.
     expect(title).toContain("step");
 
@@ -219,7 +226,7 @@ describe("SessionReplay", () => {
     expect(tiles.filter((t) => t.querySelector(".ml")?.hasAttribute("data-hint")).length).toBe(1);
 
     // And the golden's text is untouched.
-    expect(wall?.textContent).not.toContain("model time");
+    expect(wall?.textContent).not.toContain("run time");
   });
 
   it("(operator, 2026-09-05) no rendered tile's label restates its own value — the CTX quirk, at the DOM layer", async () => {

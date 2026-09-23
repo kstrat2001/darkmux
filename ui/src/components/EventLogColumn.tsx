@@ -12,7 +12,9 @@ import {
   createFacetSeen,
   createStoredPicks,
   hiddenCauseLabel,
+  isPeriodicOnlyWindow,
   matchesFilters,
+  PERIODIC_SAMPLE_ACTIVITIES,
   type Facets,
   type FacetSeen,
   type StoredPicks,
@@ -744,6 +746,27 @@ export function EventLogColumn({
     });
   }
 
+  // (operator, 2026-09-23) The #2512/#2770 backstop's tier (c): every
+  // activity value this window offers is a periodic sample
+  // (`PERIODIC_SAMPLE_ACTIVITIES`), so the fallback legitimately settled on
+  // "show nothing" rather than flooding the list with sampler noise. The
+  // empty-state branch below names this explicitly instead of the generic
+  // "no events match your activity filter" — see `isPeriodicOnlyWindow`'s
+  // own doc for why it's keyed on `facets.act` (offered), not the current
+  // selection.
+  const periodicOnlyWindow = isPeriodicOnlyWindow(facets);
+  // Count against ALL records this pane received, not `filtered` (which is
+  // empty in exactly this case) — the number the operator actually cares
+  // about is "how many samples are sitting there", not "how many survived
+  // a filter that hid all of them by definition".
+  const periodicHiddenCount = useMemo(
+    () => (periodicOnlyWindow ? records.filter((r) => PERIODIC_SAMPLE_ACTIVITIES.has(activityOf(r))).length : 0),
+    [periodicOnlyWindow, records],
+  );
+  function showPeriodicActivities() {
+    setFacetMany("act", facets.act.filter((v) => PERIODIC_SAMPLE_ACTIVITIES.has(v)), true);
+  }
+
   // (#2417 round 2, MF2) How many records the facet filters themselves are
   // hiding — as opposed to `capped`, which is the separate "only the newest
   // LOG_CAP are rendered" disclosure. Omitted from the chip entirely when
@@ -1197,19 +1220,32 @@ export function EventLogColumn({
           ) : visibleRecs.length ? (
             listItems.map((item) => {
               const r = item.rec;
-              const key = recKey(r);
-              const isSel = !!selected && recKey(selected) === key;
-              const common = {
-                "data-act": "rec",
-                role: "button" as const,
-                tabIndex: 0,
-                // (#1868) The row's own `handle` — hover provenance, and the
-                // mission lens's own parity-extraction hook
-                // (`tests/parity/lib/extract-graph.js` reads it).
-                title: r.handle || undefined,
-                onClick: () => selectRecord(r),
-                onKeyDown: onActivateKeyDown(() => selectRecord(r)),
-              };
+              // (#2863 review round 2, finding 1) A SYNTHESIZED turn header
+              // (`turnGroups.ts`'s `id`, set only when it borrowed `rec`
+              // from another row purely for a timestamp) keys off that `id`
+              // rather than `recKey(r)` — reusing `recKey(r)` produced two
+              // elements with the same React key (the header and the real
+              // row it borrowed `rec` from), and reacted to selection as
+              // one: selecting either co-highlighted both. A synthesized
+              // header names no single real record, so it is not
+              // selectable/interactive at all — it is a label for the
+              // group, not a row standing in for one.
+              const synthId = item.kind === "turn" ? item.id : undefined;
+              const key = synthId ?? recKey(r);
+              const isSel = !synthId && !!selected && recKey(selected) === key;
+              const common = synthId
+                ? {}
+                : {
+                    "data-act": "rec",
+                    role: "button" as const,
+                    tabIndex: 0,
+                    // (#1868) The row's own `handle` — hover provenance, and the
+                    // mission lens's own parity-extraction hook
+                    // (`tests/parity/lib/extract-graph.js` reads it).
+                    title: r.handle || undefined,
+                    onClick: () => selectRecord(r),
+                    onKeyDown: onActivateKeyDown(() => selectRecord(r)),
+                  };
               // (#2863) A turn is the header its events sit under: how long
               // it took, and how full the context was going in.
               if (item.kind === "turn") {
@@ -1262,13 +1298,63 @@ export function EventLogColumn({
               // (#2863) A rest is a divider between turns, not a row among them.
               if (item.kind === "rest") {
                 const f = (r.fields || r.payload || {}) as Record<string, unknown>;
-                const ms = typeof f.ms === "number" ? f.ms : typeof f.delay_ms === "number" ? f.delay_ms : null;
+                const ms = typeof f.ms === "number" ? f.ms : null;
+                if (ms !== null) {
+                  return (
+                    <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
+                      <span className="eventlog__ractivity">
+                        rested {Math.round(ms / 1000)} s
+                        {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
+                      </span>
+                    </div>
+                  );
+                }
+                // (#2863 review round 2, finding 3) Every OTHER
+                // `dispatch.rest` shape carries `{reason, state, pause}` —
+                // `reason` is NOT always "thermal" (`PACE_REASON = "battery"`
+                // for the power governor), and only a `pause: true` record
+                // means the run actually stopped. Branch on `pause`, and
+                // build the detail text from the record's OWN `reason`/
+                // `state` rather than assuming which governor sent it.
+                const reason = typeof f.reason === "string" ? f.reason : null;
+                const state = typeof f.state === "string" ? f.state : null;
+                const detail = [reason, state].filter(Boolean).join(": ");
+                if (f.pause === true) {
+                  // (#2863 review round 2, finding 3) A real pause — the
+                  // thermal governor's Paused/Breaker events, the tier-4
+                  // OperatorHold, or the battery governor's Paused — none
+                  // of which carry `ms`/`delay_ms`. Warn-colored: the run
+                  // is stopped, not merely paced.
+                  return (
+                    <div key={key} className={`eventlog__rec eventlog__rec--paused${isSel ? " sel" : ""}`} {...common}>
+                      <span className="eventlog__ractivity">paused{detail ? ` · ${detail}` : ""}</span>
+                    </div>
+                  );
+                }
+                // (#2863 review, finding 2) The governor's own duty-cycle
+                // ENTRY record shares the `dispatch.rest` action but
+                // carries `{pause: false, delay_ms, state}` — no rest
+                // happened, only the pacing between turns changed.
+                // Rendering it as "rested N s" (the old `?? f.delay_ms`
+                // fallback) claimed a pause that never occurred.
+                const delay = typeof f.delay_ms === "number" ? f.delay_ms : null;
+                if (delay !== null) {
+                  return (
+                    <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
+                      <span className="eventlog__ractivity">
+                        pacing · {Math.round(delay / 1000)} s between turns{state ? ` · thermal: ${state}` : ""}
+                      </span>
+                    </div>
+                  );
+                }
+                // (#2863 review round 2, finding 3) `pause: false` with
+                // neither `ms` nor `delay_ms` — a governor RESUME/duty-cycle-
+                // EXIT record (`ThermalEvent::Resumed`/`DutyCycleExited`).
+                // Nothing is happening between turns any more; "pacing"
+                // would claim an ongoing delay that ended.
                 return (
-                  <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
-                    <span className="eventlog__ractivity">
-                      rested{ms !== null ? ` ${Math.round(ms / 1000)} s` : ""}
-                      {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
-                    </span>
+                  <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
+                    <span className="eventlog__ractivity">resumed{detail ? ` · ${detail}` : ""}</span>
                   </div>
                 );
               }
@@ -1326,7 +1412,11 @@ export function EventLogColumn({
               );
             })
           ) : (
-            <div className="eventlog__empty" data-state={error ? "error" : loading ? "loading" : "empty"} role={error ? "alert" : undefined}>
+            <div
+              className="eventlog__empty"
+              data-state={error ? "error" : loading ? "loading" : periodicOnlyWindow ? "periodic-only" : "empty"}
+              role={error ? "alert" : undefined}
+            >
               {error
                 ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
                 : loading
@@ -1346,8 +1436,29 @@ export function EventLogColumn({
                     // (more than one facet narrowed, or a facet AND the
                     // query both narrowing) it stays the generic message
                     // rather than misattribute to just one of several.
+                    //
+                    // (operator, 2026-09-23) A THIRD case, checked first: a
+                    // window that offers nothing but periodic samples. The
+                    // generic "activity filter" message above is technically
+                    // true here too, but reads as an ordinary filter problem
+                    // rather than "this window genuinely has nothing but
+                    // telemetry in it" — and gives no way back without
+                    // opening the filter dialog. Names the count and gives a
+                    // one-tap path back, reusing the same link-styled button
+                    // `RecordView`'s own disclosure toggles use (`rv__toggle`)
+                    // rather than introducing a new control.
                     records.length > 0
-                    ? `no events match your${hiddenCause ? ` ${hiddenCause}` : " filters"}`
+                    ? periodicOnlyWindow
+                      ? (
+                        <>
+                          no events in this window · {periodicHiddenCount.toLocaleString("en-US")} telemetry sample
+                          {periodicHiddenCount === 1 ? "" : "s"} hidden{" "}
+                          <button className="rv__toggle" onClick={showPeriodicActivities}>
+                            show
+                          </button>
+                        </>
+                      )
+                      : `no events match your${hiddenCause ? ` ${hiddenCause}` : " filters"}`
                     : "no events yet"}
             </div>
           )}

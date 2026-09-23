@@ -175,6 +175,52 @@ test('viewer renders attacker-controlled flow records inertly across every view'
     await sess.click();
     await page.waitForSelector('.session-run');
     await assertInert(page, 'subsystem');
+
+    // (#2863 review, finding 7) Three `dispatch.tool` records appended to
+    // the fixture carry a script tag, a bidi override, and a multi-line
+    // command together — in plain, truncated, and double-encoded arg
+    // shapes (`tests/fixtures/xss-flow.jsonl`'s `xss-probe-*` tool names).
+    // `assertInert` above already proves no script executed and nothing
+    // parsed into a live element; this asserts the ROW TEXT itself: the
+    // bidi override is a visible escape, not the raw control character, and
+    // a multi-line command shows a marker rather than silently dropping the
+    // second line (findings 6 and 7 together — the same row exercises
+    // both).
+    const plainRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-plain' }) }).first();
+    await expect(plainRow.locator('.eventlog__recobj')).toContainText('⟨U+202E⟩');
+    // (#2863 review round 3) The multi-line marker moved to a PREFIX
+    // (`⏎+1`, not a trailing "... ⏎ +1 more line") so it cannot be pushed
+    // off-screen by a long first line.
+    await expect(plainRow.locator('.eventlog__recobj')).toContainText('⏎+1');
+    const rowText = await plainRow.locator('.eventlog__recobj').innerText();
+    expect(rowText).not.toContain('‮');
+
+    const doubleRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-double' }) }).first();
+    await expect(doubleRow.locator('.eventlog__recobj')).toContainText('⟨U+202E⟩');
+    const doubleText = await doubleRow.locator('.eventlog__recobj').innerText();
+    expect(doubleText).not.toContain('‮');
+
+    // Truncated shape has no complete `command` value to recover (the cut
+    // lands mid-string) — it still must not execute or inject, which
+    // `assertInert` above already covers for the whole session.
+    const truncRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-truncated' }) }).first();
+    await expect(truncRow).toBeVisible();
+
+    // (#2863 review round 2, finding 5) The detail pane's "raw JSON" view
+    // is a SEPARATE render path from the row above — `JSON.stringify`
+    // straight into a `<pre>`, bypassing every field-level escape. Select
+    // the plain-shape row and open it: the bidi override must show as its
+    // visible escape there too, not the raw control character.
+    await plainRow.click();
+    const rawToggle = page.getByText('raw JSON', { exact: true });
+    if (await rawToggle.count()) {
+      await rawToggle.click();
+      const pre = page.locator('.eventlog__detailpre');
+      await expect(pre).toContainText('⟨U+202E⟩');
+      const preText = await pre.innerText();
+      expect(preText).not.toContain('‮');
+    }
+
     // Back to the fleet stage for the machine-card drill below.
     await page.locator('[data-act="fleet"]').click();
     await page.waitForSelector('[data-act="machine"][data-arg]');
