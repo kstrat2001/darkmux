@@ -1197,19 +1197,32 @@ export function EventLogColumn({
           ) : visibleRecs.length ? (
             listItems.map((item) => {
               const r = item.rec;
-              const key = recKey(r);
-              const isSel = !!selected && recKey(selected) === key;
-              const common = {
-                "data-act": "rec",
-                role: "button" as const,
-                tabIndex: 0,
-                // (#1868) The row's own `handle` — hover provenance, and the
-                // mission lens's own parity-extraction hook
-                // (`tests/parity/lib/extract-graph.js` reads it).
-                title: r.handle || undefined,
-                onClick: () => selectRecord(r),
-                onKeyDown: onActivateKeyDown(() => selectRecord(r)),
-              };
+              // (#2863 review round 2, finding 1) A SYNTHESIZED turn header
+              // (`turnGroups.ts`'s `id`, set only when it borrowed `rec`
+              // from another row purely for a timestamp) keys off that `id`
+              // rather than `recKey(r)` — reusing `recKey(r)` produced two
+              // elements with the same React key (the header and the real
+              // row it borrowed `rec` from), and reacted to selection as
+              // one: selecting either co-highlighted both. A synthesized
+              // header names no single real record, so it is not
+              // selectable/interactive at all — it is a label for the
+              // group, not a row standing in for one.
+              const synthId = item.kind === "turn" ? item.id : undefined;
+              const key = synthId ?? recKey(r);
+              const isSel = !synthId && !!selected && recKey(selected) === key;
+              const common = synthId
+                ? {}
+                : {
+                    "data-act": "rec",
+                    role: "button" as const,
+                    tabIndex: 0,
+                    // (#1868) The row's own `handle` — hover provenance, and the
+                    // mission lens's own parity-extraction hook
+                    // (`tests/parity/lib/extract-graph.js` reads it).
+                    title: r.handle || undefined,
+                    onClick: () => selectRecord(r),
+                    onKeyDown: onActivateKeyDown(() => selectRecord(r)),
+                  };
               // (#2863) A turn is the header its events sit under: how long
               // it took, and how full the context was going in.
               if (item.kind === "turn") {
@@ -1273,19 +1286,52 @@ export function EventLogColumn({
                     </div>
                   );
                 }
-                // (#2863 review, finding 2) The governor's own state-change
-                // record shares the `dispatch.rest` action but carries
-                // `{pause, delay_ms, state}` — no rest happened, only the
-                // pacing between turns changed. Rendering it as "rested N s"
-                // (the old `?? f.delay_ms` fallback) claimed a pause that
-                // never occurred. This is quieter and names what it is.
+                // (#2863 review round 2, finding 3) Every OTHER
+                // `dispatch.rest` shape carries `{reason, state, pause}` —
+                // `reason` is NOT always "thermal" (`PACE_REASON = "battery"`
+                // for the power governor), and only a `pause: true` record
+                // means the run actually stopped. Branch on `pause`, and
+                // build the detail text from the record's OWN `reason`/
+                // `state` rather than assuming which governor sent it.
+                const reason = typeof f.reason === "string" ? f.reason : null;
+                const state = typeof f.state === "string" ? f.state : null;
+                const detail = [reason, state].filter(Boolean).join(": ");
+                if (f.pause === true) {
+                  // (#2863 review round 2, finding 3) A real pause — the
+                  // thermal governor's Paused/Breaker events, the tier-4
+                  // OperatorHold, or the battery governor's Paused — none
+                  // of which carry `ms`/`delay_ms`. Warn-colored: the run
+                  // is stopped, not merely paced.
+                  return (
+                    <div key={key} className={`eventlog__rec eventlog__rec--paused${isSel ? " sel" : ""}`} {...common}>
+                      <span className="eventlog__ractivity">paused{detail ? ` · ${detail}` : ""}</span>
+                    </div>
+                  );
+                }
+                // (#2863 review, finding 2) The governor's own duty-cycle
+                // ENTRY record shares the `dispatch.rest` action but
+                // carries `{pause: false, delay_ms, state}` — no rest
+                // happened, only the pacing between turns changed.
+                // Rendering it as "rested N s" (the old `?? f.delay_ms`
+                // fallback) claimed a pause that never occurred.
                 const delay = typeof f.delay_ms === "number" ? f.delay_ms : null;
+                if (delay !== null) {
+                  return (
+                    <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
+                      <span className="eventlog__ractivity">
+                        pacing · {Math.round(delay / 1000)} s between turns{state ? ` · thermal: ${state}` : ""}
+                      </span>
+                    </div>
+                  );
+                }
+                // (#2863 review round 2, finding 3) `pause: false` with
+                // neither `ms` nor `delay_ms` — a governor RESUME/duty-cycle-
+                // EXIT record (`ThermalEvent::Resumed`/`DutyCycleExited`).
+                // Nothing is happening between turns any more; "pacing"
+                // would claim an ongoing delay that ended.
                 return (
                   <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
-                    <span className="eventlog__ractivity">
-                      pacing{delay !== null ? ` · ${Math.round(delay / 1000)} s between turns` : ""}
-                      {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
-                    </span>
+                    <span className="eventlog__ractivity">resumed{detail ? ` · ${detail}` : ""}</span>
                   </div>
                 );
               }

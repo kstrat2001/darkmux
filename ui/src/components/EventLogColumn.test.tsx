@@ -1,8 +1,29 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { EventLogColumn, compactCountLabel, fmtTok, fmtTurnDuration } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 import { closeOpenModal } from "../lib/dialogManager";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// `ui/src/components/` -> repo root is three levels up.
+const REPO_ROOT = path.resolve(__dirname, "../../..");
+
+/** (#2863 review round 2, finding 1) A trimmed, REAL flow-session fixture —
+ * fetched once from `/flow-session/crew-dispatch-code-reviewer-1789963273339920-0`
+ * (a run that left `turn 4` unfinished: a `dispatch.checkpoint` and a
+ * `dispatch error`, no `dispatch.turn`), saved with most heartbeats/host
+ * telemetry dropped but every action/payload shape kept verbatim from the
+ * live daemon. Reused here (not a hand-built fixture) because the
+ * duplicate-key bug this file's test below proves only reproduces against
+ * the REAL record shapes — a hand-simplified version could accidentally
+ * fix itself by construction. */
+function readCorpus(name: string): FlowRecord[] {
+  const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8"));
+  return raw.records as FlowRecord[];
+}
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
   return {
@@ -697,6 +718,25 @@ describe("EventLogColumn — pushDetail mode", () => {
     expect(row.className).toMatch(/\bsel\b/);
   });
 
+  // (#2863 review round 2, finding 5) The pushed-detail strip's preview
+  // text calls `recordDetail(selected)` DIRECTLY — a second render path
+  // outside `recordObject()`, whose own fallback was already escaped.
+  it("the strip's preview text escapes a bidi override in the selected record", () => {
+    const records = [
+      rec({
+        session_id: "s1",
+        action: "dispatch.reasoning",
+        payload: { reasoning_text: "Let me ‮esrever siht‬ read." },
+      }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    const preview = document.querySelector(".preview-text")!;
+    expect(preview).not.toBeNull();
+    expect(preview.textContent).not.toContain("‮");
+    expect(preview.textContent).toContain("⟨U+202E⟩");
+  });
+
   it("the strip is keyboard-activatable (Enter/Space), same as any other row", () => {
     const records = [rec({ session_id: "s1" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
@@ -1113,6 +1153,64 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(pacingRow).toHaveAttribute("data-act", "rec");
   });
 
+  // (#2863 review round 2, finding 3) Four MORE `dispatch.rest` shapes,
+  // read straight off the producers (`dispatch_internal.rs`): a real
+  // pause carries neither `ms` nor `delay_ms` — the OLD code's `f.ms ===
+  // null` fallthrough rendered every one of these as gray "pacing", which
+  // is wrong in two ways: nothing is "between turns" (the run is STOPPED),
+  // and the reason is not always thermal.
+  it("a thermal pause (no ms/delay_ms) reads as paused, not pacing", () => {
+    const paused = [...records, r(20, "dispatch.rest", { reason: "thermal", state: "serious", pause: true })];
+    render(<EventLogColumn scopeLabel="runs" records={paused} visible />);
+    expect(document.querySelector(".eventlog__rec--pacing")).toBeNull();
+    const row = document.querySelector(".eventlog__rec--paused")!;
+    expect(row).not.toBeNull();
+    expect(row.textContent).toBe("paused · thermal: serious");
+  });
+
+  it("a thermal breaker trip reads as paused with the breaker's own reason", () => {
+    const tripped = [...records, r(20, "dispatch.rest", { reason: "thermal-critical", state: "critical", pause: true })];
+    render(<EventLogColumn scopeLabel="runs" records={tripped} visible />);
+    expect(document.querySelector(".eventlog__rec--paused")!.textContent).toBe("paused · thermal-critical: critical");
+  });
+
+  it("an operator hold (tier 4) reads as paused with its own reason, not pacing", () => {
+    const held = [
+      ...records,
+      r(20, "dispatch.rest", {
+        reason: "thermal-episode-limit",
+        state: "serious",
+        pause: true,
+        episode: 2,
+        checklist: "worth checking: ...",
+        resume_hint: "darkmux dispatch ...",
+      }),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={held} visible />);
+    expect(document.querySelector(".eventlog__rec--paused")!.textContent).toBe("paused · thermal-episode-limit: serious");
+  });
+
+  it("a battery pause reads as paused and does NOT say thermal", () => {
+    const battery = [...records, r(20, "dispatch.rest", { reason: "battery", state: "12% (floor 20%)", pause: true })];
+    render(<EventLogColumn scopeLabel="runs" records={battery} visible />);
+    const row = document.querySelector(".eventlog__rec--paused")!;
+    expect(row.textContent).toBe("paused · battery: 12% (floor 20%)");
+    expect(row.textContent).not.toContain("thermal");
+  });
+
+  it("a resume/duty-cycle-exit record (pause:false, no delay_ms) reads as resumed, not pacing", () => {
+    // Shares the quiet `--pacing` styling (both are low-severity, dim rows)
+    // but the TEXT must not claim an ongoing delay that has ended.
+    const resumed = [...records, r(20, "dispatch.rest", { reason: "thermal-duty-cycle", state: "fair", pause: false })];
+    render(<EventLogColumn scopeLabel="runs" records={resumed} visible />);
+    expect(document.querySelector(".eventlog__rec--paused")).toBeNull();
+    const rows = [...document.querySelectorAll(".eventlog__rec")].filter((el) => el.textContent?.startsWith("resumed"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toBe("resumed · thermal-duty-cycle: fair");
+    expect(rows[0].textContent).not.toContain("pacing");
+    expect(rows[0].textContent).not.toContain("between turns");
+  });
+
   it("a list mixing sessions shows no turn headers", () => {
     const mixed = [...records, rec({ ts: "2026-09-23T01:09:30.000Z", action: "dispatch.turn", session_id: "other", payload: { turn_seq: 1 } } as never)];
     render(<EventLogColumn scopeLabel="fleet" records={mixed} visible />);
@@ -1126,5 +1224,37 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(fmtTurnDuration(300, true)).toBe("~1 s");
     expect(fmtTok(933)).toBe("933");
     expect(fmtTok(18926)).toBe("18.9k");
+  });
+});
+
+// (#2863 review round 2, finding 1) A synthesized turn header used to reuse
+// its anchor record's OWN identity for its React key — proven on a real
+// session where turn 4 left a checkpoint and an error but no `dispatch.turn`.
+describe("EventLogColumn — synthesized header identity (#2863 review round 2)", () => {
+  it("gives the synthesized header its own key, distinct from the row it borrowed a timestamp from", () => {
+    const records = readCorpus("flow-session-unfinished-turn.json");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    errSpy.mock.calls.forEach((call) => {
+      const msg = String(call[0] ?? "");
+      expect(msg, `console.error: ${call.map(String).join(" ")}`).not.toMatch(/same key|unique "key" prop/i);
+    });
+    errSpy.mockRestore();
+
+    // The synthesized "Turn 4" header renders once, and the row it borrowed
+    // its timestamp from (the checkpoint or the error) renders as its OWN,
+    // separately selectable row underneath — not merged into one element.
+    const heads = [...document.querySelectorAll(".eventlog__rec--turn")].filter(
+      (h) => h.querySelector(".eventlog__turnname")?.textContent === "Turn 4",
+    );
+    expect(heads).toHaveLength(1);
+    expect(heads[0]).not.toHaveAttribute("data-act");
+
+    // Selecting the real error row must not highlight the synthesized
+    // header too (the co-highlight the shared key produced).
+    const errRow = [...document.querySelectorAll('[data-act="rec"]')].find((el) => el.textContent?.includes("dispatch error"));
+    expect(errRow).toBeTruthy();
+    fireEvent.click(errRow!);
+    expect(heads[0]).not.toHaveClass("sel");
   });
 });

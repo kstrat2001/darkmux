@@ -1,4 +1,5 @@
 import type { FlowRecord } from "../types/handwritten";
+import { isDispatchTerminal } from "./flow";
 
 /** (#2863) A run's event list, grouped by the turn each event belongs to.
  *
@@ -38,7 +39,16 @@ export interface TurnInfo {
 }
 
 export type TurnItem =
-  | { kind: "turn"; rec: FlowRecord; turn: TurnInfo }
+  // (#2863 review round 2, finding 1) `id` is set ONLY on a SYNTHESIZED
+  // header — one with no real `dispatch.turn` record of its own, so `rec`
+  // is borrowed from another row purely for its timestamp. Reusing that
+  // row's own identity as the header's React key produced two elements
+  // with the same key (the header and the row it borrowed `rec` from),
+  // and the two co-highlighted on selection. `id` gives the synthesized
+  // header an identity nothing else in the list can collide with; a REAL
+  // header (whose `rec` genuinely IS the `dispatch.turn` record) leaves
+  // this undefined and keys off `rec` exactly as before.
+  | { kind: "turn"; rec: FlowRecord; turn: TurnInfo; id?: string }
   | { kind: "rest"; rec: FlowRecord }
   | { kind: "rec"; rec: FlowRecord };
 
@@ -83,17 +93,34 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   let window: number | null = null;
   let threshold: number | null = null;
   let current: string | null = null;
+  // (#2863 review round 2, finding 8) The SEQ `current` is tracked at,
+  // within the CURRENT execution only — reset alongside `current` on every
+  // `dispatch start`. Guards the advance below against a record that names
+  // an OLDER seq than the one already reached (a per-call `telemetry.tokens`
+  // record for turn 3, delivered AFTER turn 4's checkpoint — measured
+  // producer behavior: the per-call usage event can lag the checkpoint it
+  // was accumulated under).
+  let currentSeqNum: number | null = null;
   // (#2863 review, finding 3) A turn's SEQ, for a group whose only records
   // are ones that name their own `turn_seq` but never got a `dispatch.turn`
   // (a checkpoint before the turn that would have completed it) — used to
   // synthesize that group's header below.
   const seqForKey = new Map<string, number>();
+  // (#2863 review round 2, finding 2) Whether THIS execution has emitted a
+  // terminal (`dispatch complete`/`dispatch error`) record at all, by the
+  // time the forward pass finishes — read below to decide whether an
+  // unfinished turn's header says "did not finish" (the run ended; this
+  // turn has no closing record) or "in progress" (the run has not ended
+  // yet, so "did not finish" would be a claim about the future).
+  const terminalForExec = new Map<number, boolean>();
   for (const r of byTime) {
     const f = fields(r);
     if (r.action === "dispatch start" || r.action === "dispatch.start") {
       exec++;
       current = null;
+      currentSeqNum = null;
     }
+    if (isDispatchTerminal(r.action)) terminalForExec.set(exec, true);
     const seq = num(f.turn_seq);
     const own = seq === null ? null : key(seq);
     // (#2863 review, finding 3) ANY record naming its own `turn_seq` advances
@@ -102,9 +129,21 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
     // instead, then errored) still moved the run forward; a record with no
     // seq of its own that arrives after it (the terminal error) belongs
     // there, not filed under the last turn that DID complete.
-    if (own !== null) {
-      current = own;
-      if (seq !== null) seqForKey.set(own, seq);
+    //
+    // (#2863 review round 2, finding 8) Only FORWARD, within this
+    // execution: a record naming a LOWER seq than the one already reached
+    // must not pull `current` backward, or an un-seq'd record arriving
+    // after it (the terminal error) would misfile under the stale turn
+    // instead of the furthest one actually reached. The record still maps
+    // to ITS OWN declared turn via `own` below regardless — this guard is
+    // only about what `current` (the fallback for records with no seq of
+    // their own) tracks.
+    if (own !== null && seq !== null) {
+      if (currentSeqNum === null || seq >= currentSeqNum) {
+        current = own;
+        currentSeqNum = seq;
+      }
+      seqForKey.set(own, seq);
     }
     turnOf.set(r, own ?? current);
     if (r.action === "dispatch.turn.heartbeat" && own !== null && !firstBeat.has(own)) {
@@ -178,12 +217,25 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
     if (!h && t !== null && seqForKey.has(t)) {
       const anchor = groups.get(t)?.[0]?.rec ?? rests.get(t)?.[0]?.rec;
       if (anchor) {
+        // (#2863 review round 2, finding 2) "did not finish" is a claim
+        // about the PAST — the run ended and this turn has no closing
+        // record. A checkpoint with no terminal record YET does not mean
+        // the turn never will finish; it means the run is still going.
+        const execNum = Number(t.split(":")[0]);
+        const finished = terminalForExec.get(execNum) === true;
         h = {
           kind: "turn",
           rec: anchor,
+          // (#2863 review round 2, finding 1) `id` gives this synthesized
+          // header its own identity — `t` is already unique per
+          // execution+seq (see the `key()` closure above) and collides
+          // with nothing else in the list, unlike `anchor`'s own recKey,
+          // which is shared with a REAL row rendered elsewhere in this
+          // same group.
+          id: `synth:${t}`,
           turn: {
             seq: seqForKey.get(t)!,
-            why: "did not finish",
+            why: finished ? "did not finish" : "in progress",
             durationMs: null,
             approx: true,
             inTok: null,

@@ -1955,18 +1955,29 @@ body {
      narrow `minmax(48px, 1fr)` floor keeps the bar visible; the label's own
      `white-space: nowrap` below stops IT from being the one squeezed to
      compensate (measured: without it, "context" wrapped to 3 lines at
-     390px). */
-  grid-template-columns: auto minmax(48px, 1fr) auto;
+     390px).
+     (#2863 review round 2, finding 6) That fix moved the overflow, not the
+     total: with nums sharing the label+bar row, the grid's own natural
+     width (label + 48px bar floor + nums) exceeded the 380px column by
+     ~41px and the 358px phone content width by ~71px, so the numbers ran
+     off the right edge — measured with a real `--fs-scale: 1.18` "in
+     194.3k · out 34.0k (32.3k thinking)" string. Nums now get their OWN
+     row, spanning the full column width instead of splitting it three
+     ways with the label and bar. */
+  grid-template-columns: auto minmax(48px, 1fr);
+  grid-template-areas: "lbl bar" "nums nums";
   align-items: center;
-  gap: 10px;
+  gap: 4px 10px;
 }
 /* (#2863 review, finding 4) `overflow-wrap: anywhere` inherits from
    `.eventlog__rec`; without an explicit `nowrap` the label is the thing the
    grid squeezes when the row is tight, breaking "context" mid-word. */
 .eventlog__ctxlbl {
+  grid-area: lbl;
   white-space: nowrap;
 }
 .eventlog__ctxbar {
+  grid-area: bar;
   position: relative;
   height: 4px;
   border-radius: 2px;
@@ -1992,9 +2003,18 @@ body {
    no casing mechanism of its own to preserve here (no text-transform was
    ever applied), so nothing is left in this selector's own block. */
 .eventlog__ctxnums {
+  grid-area: nums;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  /* (#2863 review round 2, finding 6) Was `nowrap` — safe when nums sat
+     beside the label+bar on their OWN row's `auto` column (unbounded), but
+     dangerous now that this is a real column-width row: a longer nums
+     string than any measured so far (bigger token counts, both peaks
+     shown) could still exceed 380px/358px even on its own row. Wrapping at
+     the space/middot boundaries it already has costs nothing on the
+     common case (fits on one line) and cannot leave the column on the
+     long one. */
+  white-space: normal;
 }
 .eventlog__ctxnums b {
   color: var(--fg);
@@ -2019,6 +2039,27 @@ body {
 }
 .eventlog__rec--rest .eventlog__ractivity {
   color: var(--warn);
+}
+/* (#2863 review round 2, finding 3) A real pause (`pause: true` — the
+   thermal governor's Paused/Breaker, a tier-4 OperatorHold, or the battery
+   governor's Paused) shares the `--rest` divider's warn coloring: the run
+   is genuinely stopped, same severity as a completed rest, just not yet
+   resumed. */
+.eventlog__rec--paused {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  font-size: calc(10px * var(--fs-scale));
+  padding-block: 3px;
+}
+.eventlog__rec--paused::before,
+.eventlog__rec--paused::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--warn) 25%, transparent);
 }
 /* (#2863 review, finding 2) The governor's pacing-change record — no rest
    happened, so it does not borrow the `--rest` divider's warn coloring; it
