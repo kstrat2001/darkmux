@@ -732,7 +732,12 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     expect(screen.getByText(/5,701 of 6,249 mAh design/)).toBeInTheDocument();
     expect(screen.getByText("28")).toBeInTheDocument();
     expect(screen.getByText("31.0 °C")).toBeInTheDocument();
-    expect(screen.getByText(/4 state-of-charge bands/)).toBeInTheDocument();
+    // (#2821, operator, 2026-09-23) The per-bucket histogram was pulled —
+    // `time_at_soc_hours` is an undocumented flat array that likely
+    // collapses a 2D table, so a chart of it overclaims. Only the lifetime
+    // cross-check total renders now.
+    expect(screen.getByText("5,368 h")).toBeInTheDocument();
+    expect(screen.queryByText(/state-of-charge bands/)).toBeNull();
   });
 
   it("renders no battery section at all on a machine with no battery", async () => {
@@ -743,7 +748,7 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
     expect(screen.queryByText("Battery")).toBeNull();
-    expect(screen.queryByText(/state-of-charge bands/)).toBeNull();
+    expect(screen.queryByText(/operating time/i)).toBeNull();
   });
 
   it("warns on Service Battery", async () => {

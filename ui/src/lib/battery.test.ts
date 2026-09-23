@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours, socHistogramBars } from "./battery";
+import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "./battery";
 import type { BatteryHealth, BatterySample } from "../types/handwritten";
 
 function sample(over: Partial<BatterySample> = {}): BatterySample {
@@ -74,25 +74,6 @@ describe("capacityLine", () => {
   });
 });
 
-describe("socHistogramBars", () => {
-  it("scales each bucket to a percent of the tallest", () => {
-    expect(socHistogramBars([10, 20, 40])).toEqual([
-      { index: 0, hours: 10, pct: 25 },
-      { index: 1, hours: 20, pct: 50 },
-      { index: 2, hours: 40, pct: 100 },
-    ]);
-  });
-  it("is empty for null or empty input", () => {
-    expect(socHistogramBars(null)).toEqual([]);
-    expect(socHistogramBars([])).toEqual([]);
-  });
-  it("degrades to zero-height bars rather than dividing by zero when every bucket is zero", () => {
-    expect(socHistogramBars([0, 0])).toEqual([
-      { index: 0, hours: 0, pct: 0 },
-      { index: 1, hours: 0, pct: 0 },
-    ]);
-  });
-});
 
 describe("fmtOperatingHours", () => {
   it("formats with a thousands separator", () => {

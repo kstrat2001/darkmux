@@ -97,8 +97,7 @@ CYCLES
 42
 TEMPERATURE
 30.0 °C
-time at charge · 28 state-of-charge bands (edges undocumented by Apple) · 4,000 h total operating time
-band 1
-band 28
+OPERATING TIME
+4,000 h
 runs on MacBook-Pro →
 

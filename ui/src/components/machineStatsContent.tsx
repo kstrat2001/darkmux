@@ -64,7 +64,7 @@ import type {
   PresenceBeat,
   ThermalState,
 } from "../types/handwritten";
-import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours, socHistogramBars } from "../lib/battery";
+import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "../lib/battery";
 
 /** Re-render on a light interval so the rolling 10-minute window keeps
  * aging samples out, and the compact line's live value stays current, even
@@ -386,24 +386,26 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
 }
 
 /** (#2821, operator scope: LENS ONLY — never `body`/`HostExtras`, which
- * `MachineDrawer.tsx`/`PhoneDrawer.tsx` also render) charge + health +
- * time-at-charge histogram, for `MachineLens.tsx`'s `liveBlock` alone. A
- * caller with neither a charge sample nor a health reading (no battery on
- * this machine — every Mac Studio, mini, Pro) gets `null`: absent, not an
- * empty section. */
+ * `MachineDrawer.tsx`/`PhoneDrawer.tsx` also render) charge + health, for
+ * `MachineLens.tsx`'s `liveBlock` alone. A caller with neither a charge
+ * sample nor a health reading (no battery on this machine — every Mac
+ * Studio, mini, Pro) gets `null`: absent, not an empty section.
+ *
+ * **No time-at-charge histogram (operator decision, 2026-09-23).** An
+ * earlier revision drew `time_at_soc_hours` as a 28-bar chart, one bar per
+ * bucket. `TimeAtHighSoc` is an undocumented FLAT `u32` array — the real
+ * values cluster like a 2D table (state-of-charge band × something else)
+ * that got flattened into one dimension, so a 28-bar chart implicitly
+ * claims a per-bucket charge-distribution reading this data cannot back.
+ * `time_at_soc_hours` is still RECORDED (probe + wire payload, unchanged —
+ * record exhaustively, display selectively), just not rendered here. Do
+ * not re-add a chart of it without first getting the layout documented (or
+ * reverse-engineered with actual confidence) from Apple. */
 function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; health: BatteryHealth | null }) {
   if (sample === null && health === null) return null;
   const cond = conditionRow(health);
   const capacity = capacityLine(health);
-  const bars = socHistogramBars(health?.time_at_soc_hours ?? null);
-  const totalHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
-  // Bar geometry — a fixed viewBox that scales to 100% width via CSS
-  // (`.battery-histogram svg`), same responsive pattern `Meter`'s own SVGs
-  // use, so the chart reads correctly from desktop down to a 390px phone.
-  const chartW = 280;
-  const chartH = 56;
-  const gap = 2;
-  const barW = bars.length > 0 ? (chartW - gap * (bars.length - 1)) / bars.length : 0;
+  const operatingHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
   return (
     <div className="battery-block hx-section">
       <div className="hx-section__title">Battery</div>
@@ -443,39 +445,7 @@ function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; he
           {capacity && <Kv label="capacity" value={capacity} />}
           <Kv label="cycles" value={health.cycle_count != null ? String(health.cycle_count) : ""} />
           <Kv label="temperature" value={health.temperature_c != null ? `${health.temperature_c.toFixed(1)} °C` : ""} />
-          {bars.length > 0 && (
-            <div className="battery-histogram">
-              <div className="battery-histogram__title">
-                time at charge · {bars.length} state-of-charge bands (edges undocumented by Apple)
-                {totalHours ? ` · ${totalHours} total operating time` : ""}
-              </div>
-              <svg
-                viewBox={`0 0 ${chartW} ${chartH + 14}`}
-                role="img"
-                aria-label={`Cumulative operating hours per state-of-charge band, ${bars.length} bands: ${bars.map((b) => `band ${b.index + 1}: ${b.hours} h`).join(", ")}.`}
-              >
-                {bars.map((b) => (
-                  <rect
-                    key={b.index}
-                    x={b.index * (barW + gap)}
-                    y={chartH - (chartH * b.pct) / 100}
-                    width={barW}
-                    height={(chartH * b.pct) / 100}
-                    fill="var(--accent, var(--good))"
-                  />
-                ))}
-                {/* The axis line + endpoint labels — real units (hours),
-                    never a bare unlabeled bar row. */}
-                <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke="var(--border)" strokeWidth={1} />
-                <text x={0} y={chartH + 11} className="battery-histogram__axislabel" textAnchor="start">
-                  band 1
-                </text>
-                <text x={chartW} y={chartH + 11} className="battery-histogram__axislabel" textAnchor="end">
-                  band {bars.length}
-                </text>
-              </svg>
-            </div>
-          )}
+          <Kv label="operating time" value={operatingHours ?? ""} />
         </>
       )}
     </div>

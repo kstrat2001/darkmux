@@ -72,28 +72,6 @@ export function capacityLine(h: BatteryHealth | null): string | null {
   return `${raw.toLocaleString()} of ${design.toLocaleString()} mAh design${pctClause}`;
 }
 
-/** One scaled bar for the time-at-charge histogram — height is a PERCENT
- * of the tallest bucket (never a raw hour count as a bar length, which
- * would make the whole chart unreadable whenever one bucket dominates).
- * `null` heights are impossible here: every element of `time_at_soc_hours`
- * is a `u32` on the wire (`parse_time_at_soc`'s own doc), never absent
- * individually — only the whole array is optional. */
-export interface SocBar {
-  index: number;
-  hours: number;
-  pct: number;
-}
-
-/** Scales `time_at_soc_hours` to a 0-100 bar-height percent per bucket.
- * `null`/empty input yields `[]` — the caller renders no chart rather than
- * an empty axis. */
-export function socHistogramBars(hours: number[] | null): SocBar[] {
-  if (hours == null || hours.length === 0) return [];
-  const max = Math.max(...hours);
-  if (max <= 0) return hours.map((h, i) => ({ index: i, hours: h, pct: 0 }));
-  return hours.map((h, i) => ({ index: i, hours: h, pct: (h / max) * 100 }));
-}
-
 /** `5,368 h` — the lifetime cross-check total, formatted with the same
  * thousands separator the mAh figures use. `null` renders as `null`
  * (caller decides whether to hide the row). */

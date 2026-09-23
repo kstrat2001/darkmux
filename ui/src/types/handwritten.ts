@@ -571,9 +571,15 @@ export interface BatterySample {
  * labeled RAW/NOMINAL rather than picking one and calling it "capacity".
  *
  * `time_at_soc_hours` is the battery's own 28-bucket lifetime counter
- * (4 groups of 7 on the reference machine) — Apple documents neither the
- * band edges nor the grouping, so a chart may show bucket INDEX but must
- * not assert a state-of-charge percentage range per bucket. */
+ * (4 groups of 7 on the reference machine) — an undocumented FLAT array
+ * whose real shape likely clusters like a 2D table (state-of-charge band
+ * × something else) collapsed into one dimension. Apple documents neither
+ * the band edges nor the grouping, so a per-bucket chart (tried, then
+ * pulled — operator decision, 2026-09-23) implicitly claims a
+ * charge-distribution reading this data cannot back. RECORDED (probe +
+ * this field) but deliberately NOT rendered anywhere today — see
+ * `BatteryLensBlock`'s own doc in `machineStatsContent.tsx` before
+ * re-adding a visualization of it. */
 export interface BatteryHealth {
   cycle_count: number | null;
   design_capacity_mah: number | null;

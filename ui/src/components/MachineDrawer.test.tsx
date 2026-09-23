@@ -1407,7 +1407,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     await waitFor(() => expect(screen.getByText("GPU clock")).toBeInTheDocument());
     expect(screen.queryByText("Battery")).toBeNull();
     expect(screen.queryByText("condition")).toBeNull();
-    expect(screen.queryByText(/state-of-charge bands/)).toBeNull();
+    expect(screen.queryByText(/operating time/i)).toBeNull();
     expect(screen.queryByText(/mAh design/)).toBeNull();
   });
 
