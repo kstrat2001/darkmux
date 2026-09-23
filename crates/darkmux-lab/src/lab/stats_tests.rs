@@ -357,6 +357,38 @@ fn a_repeated_identical_rest_delay_does_not_fire_the_ratchet() {
     assert!(!s.thermal_ratchet_fired);
 }
 
+/// (Frontier review, 2026-09-23) The governor's ratchet is ONE-WAY — it only
+/// ever multiplies the duty-cycle delay, never divides it back down
+/// (`thermal_governor.rs`). Two distinct thermal delays where the SECOND is
+/// SMALLER cannot be the ratchet firing; the old "more than one distinct
+/// value" predicate could not tell this from a genuine escalation.
+#[test]
+fn a_decreasing_thermal_delay_does_not_fire_the_ratchet() {
+    let traj = format!(
+        "{}{}",
+        line(serde_json::json!({"type":"runtime.rest","ms":30_000,"reason":"thermal-duty-cycle","state":"serious"})),
+        line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
+    );
+    let s = stats(&traj, metrics(200_000, 45_000, 4, 0));
+    assert_eq!(s.rest_delays_ms, vec![15_000, 30_000], "distinct values are still reported for display");
+    assert!(!s.thermal_ratchet_fired, "a decrease is not the one-way ratchet");
+}
+
+/// A distinct delay from an unrelated, non-thermal rest reason (a pace-file
+/// pause, say) must not be mistaken for the governor's ratchet — only
+/// `thermal-duty-cycle` rests carry ratchet evidence.
+#[test]
+fn a_non_thermal_rest_with_a_different_delay_does_not_fire_the_ratchet() {
+    let traj = format!(
+        "{}{}",
+        line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
+        line(serde_json::json!({"type":"runtime.rest","ms":90_000,"reason":"paused","state":"operator-hold"})),
+    );
+    let s = stats(&traj, metrics(200_000, 105_000, 4, 0));
+    assert_eq!(s.rest_delays_ms, vec![15_000, 90_000]);
+    assert!(!s.thermal_ratchet_fired, "only one thermal-duty-cycle delay exists; nothing escalated");
+}
+
 /// A turn whose reasoning chars and reasoning tokens imply an impossible
 /// ratio is listed, not averaged in. Comparing against TOTAL completion
 /// tokens instead flagged three healthy turns whose output was mostly
@@ -592,6 +624,113 @@ fn a_metrics_clock_within_slack_of_the_runs_own_id_is_not_flagged() {
     .unwrap();
     let s = compute_from_dir(&run_dir, flows.path()).unwrap();
     assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// (Frontier review, 2026-09-23) A 1ms gap between generation and claimed
+/// wall time is clock jitter between two different clocks (trajectory
+/// stream timestamps vs the runtime's own wall-clock stamp), not a
+/// different run's metrics file. Pinned to the exact real numbers measured
+/// on disk for `long-agentic-balanced-1779702243-1` (wall 23605ms, gen
+/// 23606ms) — it owns its own metrics and must not be flagged.
+#[test]
+fn a_one_millisecond_generation_jitter_over_wall_is_not_flagged_stale() {
+    let traj = format!("{}{}", stream(1, 0, Some(23_606)), completed(1, Some(100), 5));
+    let s = stats(&traj, metrics(23_605, 0, 1, 100));
+    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// Same shape, the other real example: wall 1219ms, gen 1220ms
+/// (`long-agentic-balanced-1779802198-1`).
+#[test]
+fn a_one_millisecond_generation_jitter_on_a_short_run_is_not_flagged_stale() {
+    let traj = format!("{}{}", stream(1, 0, Some(1_220)), completed(1, Some(100), 5));
+    let s = stats(&traj, metrics(1_219, 0, 1, 100));
+    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// (Frontier review, 2026-09-23) A symmetric slack let a `metrics.json`
+/// starting ~90s BEFORE its own run's id pass as identity, because 90s sits
+/// comfortably inside a 10-minute window either direction. That is exactly
+/// `medium-coding-deep-1779688920-1` on disk — a byte-identical copy of
+/// `…-1779688829-1`'s metrics, un-flagged before this fix. A clock claiming
+/// a start before the run was even minted is impossible, so the tolerance
+/// on that side must be tight, not symmetric with the generous AFTER side.
+#[test]
+fn a_metrics_clock_90_seconds_before_its_own_id_is_flagged_stale() {
+    let flows = tempfile::TempDir::new().unwrap();
+    let runs = tempfile::TempDir::new().unwrap();
+    let run_dir = runs.path().join("medium-coding-deep-1779688920-1");
+    std::fs::create_dir(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("metrics.json"),
+        serde_json::json!({
+            // 89.843s BEFORE the id's own stamp (1_779_688_920_000) —
+            // the exact real gap measured on disk.
+            "started_at_unix_ms": 1_779_688_830_157u64, "wall_ms": 68_953, "rest_ms": 0,
+            "turns": 1, "total_completion_tokens": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
+    assert!(s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// The genuine owner of that same metrics content (id
+/// `…-1779688829-1`, whose own epoch is only ~1.157s before the metrics
+/// clock) must NOT be flagged — the fix is one-sided, not just tighter.
+#[test]
+fn the_genuine_owner_of_an_early_metrics_clock_is_not_flagged() {
+    let flows = tempfile::TempDir::new().unwrap();
+    let runs = tempfile::TempDir::new().unwrap();
+    let run_dir = runs.path().join("medium-coding-deep-1779688829-1");
+    std::fs::create_dir(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("metrics.json"),
+        serde_json::json!({
+            "started_at_unix_ms": 1_779_688_830_157u64, "wall_ms": 68_953, "rest_ms": 0,
+            "turns": 1, "total_completion_tokens": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
+    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// (#2855 review) `lifecycle.json`'s `started_at_ms`, when present, is the
+/// run's identity — NOT the id-embedded epoch, even when they disagree.
+/// Rigged so the two sources give OPPOSITE verdicts: the id epoch alone
+/// would call this run clean, but lifecycle.json (which must win) calls it
+/// stale. Pins the precedence rather than just exercising the fallback.
+#[test]
+fn lifecycle_started_at_wins_over_the_id_epoch_when_they_disagree() {
+    let flows = tempfile::TempDir::new().unwrap();
+    let runs = tempfile::TempDir::new().unwrap();
+    // Id epoch: 1_780_000_000s. metrics.json claims 500s later — well
+    // within slack of the ID ALONE, so if the id epoch were used this run
+    // reads clean.
+    let run_dir = runs.path().join("long-agentic-balanced-1780000000-1");
+    std::fs::create_dir(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("metrics.json"),
+        serde_json::json!({
+            "started_at_unix_ms": 1_780_000_500_000u64, "wall_ms": 10_000, "rest_ms": 0,
+            "turns": 1, "total_completion_tokens": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // lifecycle.json's own identity is ~1000s EARLIER than metrics.json's
+    // claim — if lifecycle wins, that puts metrics.json's claim well past
+    // lifecycle's own `STALE_METRICS_SLACK_MS` budget.
+    std::fs::write(
+        run_dir.join("lifecycle.json"),
+        serde_json::json!({"started_at_ms": 1_779_000_000_000u64}).to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
+    assert!(s.checks.metrics_stale, "lifecycle.json must win over the id epoch: {:?}", s.checks);
 }
 
 /// A run without metrics has no derivable numbers, and says so

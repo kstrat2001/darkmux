@@ -33,9 +33,12 @@
 //! 5. **Rest is the thermal governor, not harness overhead.** It is charged
 //!    PER TURN, so an engine taking more turns pays more rest at identical
 //!    thermals — which is why `wall_ms` is the wrong cross-engine number and
-//!    `active_ms` is reported beside it (#2848). `ratchet_factor` doubles
-//!    the delay after a serious episode, so the DISTINCT delays are reported:
-//!    anything but one value means the ratchet fired.
+//!    `active_ms` is reported beside it (#2848). The ratchet is ONE-WAY —
+//!    it only ever multiplies the duty-cycle delay, never divides it back
+//!    down — so the fired/not-fired verdict looks for `thermal-duty-cycle`
+//!    delays that GREW somewhere in the run, in order, never merely "more
+//!    than one distinct value" (that also fires on a decrease, or on an
+//!    unrelated non-thermal rest reason landing a different value).
 //! 6. **A tail ratio needs six decimals.** 0.2499837 rounds to `0.25` at 4dp
 //!    and then reads as sitting ON the threshold; the comparison is a
 //!    strict `<`, so that digit is the whole verdict.
@@ -61,16 +64,36 @@ use std::path::Path;
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
 pub const RUN_STATS_SCHEMA_VERSION: &str = "1.1.0";
 
-/// How far `metrics.json`'s own `started_at_unix_ms` may drift from the
-/// run's OWN identity — `lifecycle.json`'s `started_at_ms` when present, else
-/// the epoch embedded in the run id itself
-/// (`<workload>-<profile>-<epoch_secs>-<n>`, see `lab::run::run_id`) — before
-/// the file is read as describing a DIFFERENT run entirely, not a late write
-/// of this one. Measured on disk: every stale `metrics.json` found (11 run
-/// dirs, 4 of them byte-identical copies) differed by days; none by minutes.
-/// Deliberately a separate constant from [`WINDOW_SLACK_MS`], which bounds
-/// file SELECTION for telemetry — a different question from file IDENTITY.
+/// How far AFTER the run's OWN identity — `lifecycle.json`'s `started_at_ms`
+/// when present, else the epoch embedded in the run id itself
+/// (`<workload>-<profile>-<epoch_secs>-<n>`, see `lab::run::run_id`) —
+/// `metrics.json`'s own `started_at_unix_ms` may land before the file is
+/// read as describing a DIFFERENT run entirely, not a late write of this
+/// one. Deliberately a separate constant from [`WINDOW_SLACK_MS`], which
+/// bounds file SELECTION for telemetry — a different question from file
+/// IDENTITY.
+///
+/// **One-sided on purpose (review, 2026-09-23).** The runtime mints the run
+/// id, THEN stamps `started_at_unix_ms` once its own clock reads "now" —
+/// container spin-up and model-load variance can push that stamp well AFTER
+/// the id's epoch (measured legitimate spread on disk: about -1.2s to
+/// +22.8s), so generous slack on the AFTER side is real jitter, not
+/// staleness. A stamp BEFORE the id's epoch has no such story — a run
+/// cannot have started generating before it was minted — so that side uses
+/// the much tighter [`EARLY_CLOCK_TOLERANCE_MS`] instead. A symmetric
+/// `abs_diff` bound here previously let a `metrics.json` starting 90s
+/// BEFORE its own run's id pass as identity
+/// (`medium-coding-deep-1779688920-1`, a byte-identical copy of
+/// `…-1779688829-1`'s metrics), because 90s sits comfortably inside a
+/// symmetric 10-minute window in either direction.
 pub const STALE_METRICS_SLACK_MS: u64 = 10 * 60 * 1000;
+
+/// How far BEFORE the run's own identity `metrics.json`'s claimed start may
+/// land and still be read as clock jitter rather than a different run's
+/// file. See [`STALE_METRICS_SLACK_MS`]'s doc for why this side is so much
+/// tighter: the measured legitimate range never went more than about 1.2s
+/// early.
+pub const EARLY_CLOCK_TOLERANCE_MS: u64 = 5_000;
 
 /// Uniqueness ratio below which a slice is degenerate.
 ///
@@ -282,12 +305,21 @@ pub struct RunStats {
     /// thermal penalty proportional to turn count (#2848).
     pub active_ms: u64,
     pub rest_events: usize,
-    /// DISTINCT rest delays. Anything other than a single value means the
-    /// thermal ratchet fired mid-run, which would otherwise read as a
-    /// within-block slowdown.
+    /// DISTINCT rest delays, for display. NOT the ratchet signal on its
+    /// own — see [`RunStats::thermal_ratchet_fired`]'s doc.
     pub rest_delays_ms: Vec<u64>,
     pub rest_reasons: Vec<String>,
     pub rest_states: Vec<String>,
+    /// The thermal governor's tier-3 duty-cycle delay ESCALATED mid-run
+    /// (`thermal_governor.rs`: the ratchet only ever multiplies the delay,
+    /// "ONE-WAY for the life of the run" — it never divides it back down).
+    /// True iff the `thermal-duty-cycle` rest delays, in the order they
+    /// occurred, are non-decreasing throughout AND grow at least once.
+    ///
+    /// Review, 2026-09-23: this used to be "more than one DISTINCT delay
+    /// value", which also fired on a decrease, or on a run whose distinct
+    /// delays came from an unrelated non-thermal rest reason mixed in with
+    /// a thermal one — neither is what the governor's one-way ratchet does.
     pub thermal_ratchet_fired: bool,
     pub rest_ms_per_turn: Option<f64>,
 
@@ -490,6 +522,24 @@ struct Rest {
     ms: u64,
     reason: String,
     state: String,
+}
+
+/// The `thermal-duty-cycle` reason string the governor stamps on the rests
+/// its own tier-3 escalation drives (`thermal_governor.rs`). Rests with any
+/// other reason (a pace-file pause, etc.) don't carry ratchet evidence and
+/// are excluded before checking for escalation.
+const THERMAL_DUTY_CYCLE_REASON: &str = "thermal-duty-cycle";
+
+/// Whether the run's THERMAL rest delays, in the order they occurred, show
+/// the governor's one-way ratchet actually firing: non-decreasing
+/// throughout, with at least one real increase. A decrease anywhere rules
+/// it out — the ratchet only ever multiplies the delay, so a decrease can
+/// only mean two different, unrelated delay settings landed in the same
+/// run, not an escalation.
+fn thermal_delay_escalated(rests: &[Rest]) -> bool {
+    let thermal: Vec<u64> =
+        rests.iter().filter(|r| r.reason == THERMAL_DUTY_CYCLE_REASON).map(|r| r.ms).collect();
+    thermal.windows(2).all(|w| w[1] >= w[0]) && thermal.windows(2).any(|w| w[1] > w[0])
 }
 
 /// Everything one pass over `trajectory.jsonl` yields.
@@ -1023,7 +1073,12 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
         .and_then(|v| v.as_u64())
         .or_else(|| run_id_epoch_ms(&run_id));
     let identity_mismatch = match (m.started_at_unix_ms, identity_started_ms) {
-        (Some(claimed), Some(identity)) => claimed.abs_diff(identity) > STALE_METRICS_SLACK_MS,
+        // One-sided: see STALE_METRICS_SLACK_MS's doc for why the two
+        // directions get very different budgets.
+        (Some(claimed), Some(identity)) => {
+            claimed.saturating_add(EARLY_CLOCK_TOLERANCE_MS) < identity
+                || claimed > identity.saturating_add(STALE_METRICS_SLACK_MS)
+        }
         _ => false,
     };
 
@@ -1129,8 +1184,23 @@ pub(crate) fn derive_stats(
     // `metrics.json` claiming less wall time than the trajectory spent
     // generating is a fingerprint of a metrics file that belongs to a
     // DIFFERENT (shorter) run — measured: wall 439s beside "1234s of 1234s"
-    // of generation.
-    let generation_exceeds_wall = wall_ms > 0 && gen_ms_all > wall_ms;
+    // of generation. A tolerance is required: spans and `wall_ms` come from
+    // two different clocks (the trajectory's stream timestamps vs the
+    // runtime's own wall-clock stamp), so a real, honest run can show
+    // generation a few ms past its own wall time — measured on disk,
+    // `long-agentic-balanced-1779702243-1` (wall 23605ms, gen 23606ms) and
+    // `…-1779802198-1` (1219ms vs 1220ms) are each 1ms over and own their
+    // metrics outright. `max(1s, 5% of wall)` comfortably absorbs that
+    // while still catching the actual bug (1234s of generation against a
+    // 439s claimed wall is nowhere near the boundary).
+    let generation_vs_wall_tolerance_ms = wall_ms / 20;
+    let generation_vs_wall_tolerance_ms = if generation_vs_wall_tolerance_ms < 1_000 {
+        1_000
+    } else {
+        generation_vs_wall_tolerance_ms
+    };
+    let generation_exceeds_wall =
+        wall_ms > 0 && gen_ms_all > wall_ms.saturating_add(generation_vs_wall_tolerance_ms);
 
     let completion_tokens: u64 = t.turns.values().map(|e| e.completion_tokens).sum();
     let reasoning_tokens: u64 = t.turns.values().map(|e| e.reasoning_tokens).sum();
@@ -1257,6 +1327,7 @@ pub(crate) fn derive_stats(
     }
 
     let rest_delays: Vec<u64> = t.rests.iter().map(|r| r.ms).collect::<BTreeSet<_>>().into_iter().collect();
+    let thermal_ratchet_fired = thermal_delay_escalated(&t.rests);
     let missing_required: Vec<String> = if t.seen_types.is_empty() {
         Vec::new()
     } else {
@@ -1285,7 +1356,7 @@ pub(crate) fn derive_stats(
         rest_ms,
         active_ms: wall_ms.saturating_sub(rest_ms),
         rest_events: t.rests.len(),
-        thermal_ratchet_fired: rest_delays.len() > 1,
+        thermal_ratchet_fired,
         rest_delays_ms: rest_delays,
         rest_reasons: t.rests.iter().map(|r| r.reason.clone()).collect::<BTreeSet<_>>().into_iter().collect(),
         rest_states: t.rests.iter().map(|r| r.state.clone()).collect::<BTreeSet<_>>().into_iter().collect(),
