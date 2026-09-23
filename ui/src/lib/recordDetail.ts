@@ -203,25 +203,28 @@ function commandText(cmd: string): string {
     .replace(/\s*2>&1\s*$/, "");
   const lines = stripped.split("\n");
   const first = lines[0].trim();
-  // (#2863 review round 2, finding 9) A chained command on the SAME line —
-  // `cd X && Y` (already legitimately shown in full above) counts too:
-  // the marker means "this row is more than one command", true whether or
-  // not this particular render happens to be wide enough to show all of
-  // it.
+  // (#2863 review round 3) A trailing marker ("cmd ⏎ +1") only ever showed
+  // the FIRST unit (line or top-level command) — readable, but it hid the
+  // rest of a compound command that would otherwise have fit on the row.
+  // Moved to a PREFIX instead: the FULL first line is kept (compound
+  // separators and all — `cd X && Y` shows both halves, same as before
+  // #2863 review round 2 ever touched it), with the marker at position 0.
+  //
+  // (security) This is also why the prefix form, not just a cosmetic
+  // move: `.eventlog__recobj`'s CSS `text-overflow: ellipsis` always cuts
+  // from the visual END of the row. A trailing marker after a long first
+  // unit could itself be the thing that gets cut off — the one case the
+  // marker exists to cover. A marker at position 0 cannot be pushed
+  // off-screen by anything that comes after it.
   const segments = splitTopLevelCommands(first);
-  const shown = segments[0] ?? first;
   const markers: string[] = [];
-  if (segments.length > 1) markers.push(`⛓ +${segments.length - 1}`);
+  if (segments.length > 1) markers.push(`⛓+${segments.length - 1}`);
   // (#2863 review, finding 6, security) A command with more than one line
   // used to show only the first, no different from a genuinely single-line
   // one — `echo ok` and `echo ok\nrm -rf /workspace` were indistinguishable.
-  // A visible marker survives padding line 1 long: it counts LINES, not
-  // characters.
-  if (lines.length > 1) {
-    const extra = lines.length - 1;
-    markers.push(`⏎ +${extra} more line${extra === 1 ? "" : "s"}`);
-  }
-  return markers.length ? `${shown} ${markers.join(" ")}` : shown;
+  // Counts LINES, not characters, so padding line 1 cannot defeat it.
+  if (lines.length > 1) markers.push(`⏎+${lines.length - 1}`);
+  return markers.length ? `${markers.join(" ")} ${first}` : first;
 }
 
 /** (#2863 review, finding 5) A `write` call's `content` can be long enough

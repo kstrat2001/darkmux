@@ -188,7 +188,10 @@ test('viewer renders attacker-controlled flow records inertly across every view'
     // both).
     const plainRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-plain' }) }).first();
     await expect(plainRow.locator('.eventlog__recobj')).toContainText('⟨U+202E⟩');
-    await expect(plainRow.locator('.eventlog__recobj')).toContainText('more line');
+    // (#2863 review round 3) The multi-line marker moved to a PREFIX
+    // (`⏎+1`, not a trailing "... ⏎ +1 more line") so it cannot be pushed
+    // off-screen by a long first line.
+    await expect(plainRow.locator('.eventlog__recobj')).toContainText('⏎+1');
     const rowText = await plainRow.locator('.eventlog__recobj').innerText();
     expect(rowText).not.toContain('‮');
 
