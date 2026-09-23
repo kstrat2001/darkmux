@@ -12,6 +12,94 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.11.0] - 2026-09-24
+
+### Added
+
+- **`darkmux lab run stats`: derived metrics for recorded lab runs** (#2855,
+  #2859, #2870). One run, a set, or a set against `--baseline`:
+  - **Per run:** active time next to rest time, tokens per second over the
+    streams that were actually billed, what both degeneracy gates did, and
+    busy-only power and energy.
+  - **Per set:** ranges, not means, plus **cost per successful run**: every
+    run's cost divided by the runs that passed. A failed run still used the
+    GPU, so this is the figure that says what a working result costs.
+  - **Checks, not trust:** each figure comes with the reconciliation check
+    that says whether it may be quoted. Run flags name what is off:
+    `STALE-METRICS` (the run holds another run's `metrics.json`), `OVERLAP`
+    (runs that overlap in time would share host energy), `UNBILLED` (an
+    aborted stream reported no usage), and `UNGATED` (the run predates the
+    pass rule below).
+  - **Bounded read:** the flow read is bounded by the run's own time window,
+    so it does not scan the whole archive.
+  - **JSON:** the `--json` shape is versioned at 1.1.0.
+- **Battery on the live machine lens** (#2821, #2873). A battery gauge (bolt
+  while charging, plug while on AC and full) sits beside condition, max
+  charge, original capacity, cycles, temperature and operating time.
+  Condition matches what macOS reports. The key darkmux used to read said
+  "Check Battery" on a healthy pack.
+- **A readable run page** (#2863, #2864, #2871):
+  - **Sections:** MODEL, SYSTEM and SIGNALS, each with one header style.
+  - **Turn headers in the events pane:** a header for every turn, showing
+    model time, prompt tokens in, output and thinking tokens out, and a
+    context bar with the compaction threshold marked. A turn that never
+    finished says so.
+  - **Rest cards:** each kind of rest gets its own SYSTEM card (thermal rest,
+    turn delay, battery pause, operator hold) with total time and count. A
+    card shows whenever that protection was configured for the run, even
+    with zero rests.
+  - **Resizable events column** on desktop.
+
+### Changed
+
+- **A write-the-tests lab run passes only when it did the work** (#2833,
+  #2867). Previously the fixture's suite was green untouched, so a run that
+  did nothing passed. When a fixture declares its baseline test count, a pass
+  now requires all of the following:
+  - the sandbox changed;
+  - more *passing* tests than the baseline (skipped and todo do not count);
+  - the suite is green and the test script is unchanged;
+  - any coverage threshold the workload declares is met.
+
+  The verdict names the rule a run failed. The evidence is in
+  `manifest.verify.work_gate` (run manifest `schema_version` 6).
+- **Meters show how tight a resource is**, not just how full: every compact
+  dial uses the same green → amber → red ramp as the big memory gauge.
+- **The events list no longer floods with periodic telemetry.** When no model
+  activity is in the window, the fallback shows lifecycle events, never host
+  samples, heartbeats or battery health records. A window of only telemetry
+  says so, with a one-tap way to show it.
+
+### Removed
+
+- **The lab "series" view** (#2872). It was a port of the retired
+  review-bench view: for coding-task runs, every field except the run id was
+  empty or wrong, and every run read RUNNING. The runs list shows lab status
+  correctly, and `lab run stats --baseline` covers comparison.
+
+### Fixed
+
+- **A finished lab run opened a page stuck on RUNNING** (#2860, #2861). It
+  now opens the shared run view, and the list reports how it ended.
+- **An event row could show a different command than the one that ran.** A
+  `cd` the model wrote was stripped, and a `command` key inside a written
+  file's content could be shown as the command. Multi-line and chained
+  commands now carry a marker the ellipsis cannot hide, and bidi and
+  zero-width characters render as visible escapes.
+- **Battery health was recorded every hour.** Temperature and running totals
+  counted as changes. A record is now written only when cycles, capacity
+  (beyond 1% of original) or condition move.
+- **The event detail pane** rendered epoch `_ms` fields as durations, and
+  lists of objects as `[object Object]`.
+
+### Schema notes
+
+- **`FLOW_SCHEMA_VERSION` 1.52.0 → 1.54.0, additive:**
+  - `dispatch.turn` gains `generation_ms`, the turn's model time.
+  - `dispatch start` bounds record `thermal_pacing_enabled`,
+    `battery_pause_enabled` and `battery_pause_floor_pct`.
+- **Readers:** older readers ignore the new fields.
+
 ## [3.10.0] - 2026-09-21
 
 ### Added
@@ -64,6 +152,7 @@ darkmux release.
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[3.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.11.0
 [3.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.10.0
 
 ## [3.9.0] - 2026-09-20

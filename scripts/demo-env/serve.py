@@ -198,7 +198,7 @@ def make_handler(inner, fx, hero, demo_uids, home):
             return text.encode()
 
         def _filter_flow(self, data):
-            """Drop presence records for machines that are not in the demo world.
+            """Drop records for machines that are not in the demo world.
 
             The daemon self-emits one `machine.online` at startup
             (`presence_reconciler::emit_machine_online_edge`, called
@@ -215,8 +215,13 @@ def make_handler(inner, fx, hero, demo_uids, home):
                 return data
             if not isinstance(recs, list):
                 return data
+            # (#2850) Not only presence: the daemon's host sampler also writes
+            # `machine.telemetry` and `machine.battery_health` for THIS host
+            # (its real hardware uid, its real battery) into the demo flows
+            # dir while serve.py runs. In the demo world, any record that
+            # carries a machine_uid must belong to a demo machine.
             kept = [r for r in recs
-                    if r.get("source") != "presence-reconciler"
+                    if not r.get("machine_uid")
                     or r.get("machine_uid") in demo_uids]
             return json.dumps(kept).encode()
 
