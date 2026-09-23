@@ -486,7 +486,9 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           // CSS, so the text stays the detectors' names.
           <>
             <div className="sigclean">
-              <WorkStatus status="complete" label="clean" className="pill" />
+              {/* Its own class, not `.pill`: `.pill` on this page means the run's
+                  status in the header, and e2e specs address it that way. */}
+              <WorkStatus status="complete" label="clean" className="sigpill" />
               <span className="sigclean__note">no detector flagged this run</span>
             </div>
             <div className="sigchecks">

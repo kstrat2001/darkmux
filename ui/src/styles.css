@@ -1539,8 +1539,9 @@ body {
   flex-wrap: wrap;
   row-gap: 5px;
   /* (#2863) Room for the filter badge, which pins 5px outside its button's
-     corner: without a column gap it ran into the count pill beside it. */
-  column-gap: 12px;
+     corner: without a column gap it ran into the count pill beside it. 10px,
+     the same gap as between the buttons themselves. */
+  column-gap: 10px;
   /* `flex-start` + `margin-left: auto` on the button group, NOT
      `space-between`. With the pill outside `.eventlog__headbtns` this row
      has THREE children, and `space-between` pins the first and last and
@@ -4932,7 +4933,8 @@ body {
   color: var(--dim);
   font-weight: 400;
 }
-.session-run .pill {
+.session-run .pill,
+.session-run .sigpill {
   border-radius: 10px;
   vertical-align: middle;
 }
