@@ -8965,6 +8965,13 @@ struct TailerState {
     /// runtime's own envelope had the right number the whole time; only this
     /// re-derivation was wrong.
     last_counted_turn_seq: Option<u64>,
+    /// (#2863) The stream in progress: its `seq` and its start timestamp.
+    open_stream: Option<(Option<u64>, u64)>,
+    /// (#2863) Generation time so far per logical turn, summed over its
+    /// streams (a checkpoint continuation resumes the same `seq`). Emitted
+    /// on the turn's record as `generation_ms` and cleared, so a turn's time
+    /// never leaks into the next.
+    generation_ms_by_seq: std::collections::HashMap<u64, u64>,
     session_id: String,
     role_id: String,
     model: String,
@@ -9067,6 +9074,8 @@ impl TailerState {
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
+            open_stream: None,
+            generation_ms_by_seq: std::collections::HashMap::new(),
             session_id,
             role_id,
             model,
@@ -9145,6 +9154,8 @@ impl TailerState {
             offset: 0,
             pending: Vec::new(),
             last_counted_turn_seq: None,
+            open_stream: None,
+            generation_ms_by_seq: std::collections::HashMap::new(),
             session_id,
             role_id,
             model,
@@ -9254,6 +9265,13 @@ impl TailerState {
                     .map(|f| f != "length")
                     .unwrap_or(true);
                 if finish_is_terminal {
+                    // (#2863) The turn's model time (request sent to stream end), from the
+                    // trajectory's millisecond stream bookends. Absent (not
+                    // zero) when no stream was recorded.
+                    let mut payload = payload;
+                    if let Some(ms) = seq.and_then(|s| self.generation_ms_by_seq.remove(&s)) {
+                        payload["generation_ms"] = serde_json::json!(ms);
+                    }
                     self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
                 }
                 // (#795) Per-turn token telemetry — the live "tokens
@@ -9581,6 +9599,23 @@ impl TailerState {
                     "signal_kinds": event.get("signal_kinds"),
                 });
                 self.emit("dispatch.feedback.injected", darkmux_flow::Level::Info, payload);
+            }
+            // (#2863) Stream bookends: accumulate each logical turn's
+            // model time for its `dispatch.turn` record.
+            "model.streaming.start" => {
+                let seq = event.get("seq").and_then(|v| v.as_u64());
+                if let Some(ts) = event.get("ts").and_then(|v| v.as_u64()) {
+                    self.open_stream = Some((seq, ts));
+                }
+            }
+            "model.streaming.end" => {
+                let seq = event.get("seq").and_then(|v| v.as_u64());
+                let end = event.get("ts").and_then(|v| v.as_u64());
+                if let (Some((open_seq, start)), Some(end), Some(s)) = (self.open_stream.take(), end, seq) {
+                    if open_seq == Some(s) && end >= start {
+                        *self.generation_ms_by_seq.entry(s).or_insert(0) += end - start;
+                    }
+                }
             }
             "model.partial" => {
                 // Per-SSE-chunk events coalesced into a coarser heartbeat

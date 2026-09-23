@@ -84,6 +84,10 @@
   --severe: #f97316;
   --bad: #f56565;
   --accent-dim: #3aa89f;
+  /* (#2863 style pass) The reasoning chip's own blue (`.aico.act-reasoning`,
+     `.eventlog__chip--think`), promoted — it was repeated as a literal in
+     both places it means "informational, not a warning". */
+  --info: #8ab4f8;
 
   /* (U2-3) Panel shades, promoted. `--panel` existed only as a FALLBACK —
      `var(--panel, #12141c)` and `var(--line, #232838)` on
@@ -117,6 +121,10 @@
      a visual change hiding inside a refactor. Named here so the next person
      can decide that on purpose. */
   --good-soft: rgba(126, 231, 135, 0.45);
+  /* (#2863 style pass) The soft card background `.track`/`.met`/`.rv__group`
+     each repeated as the same literal. One token for "an inset card on the
+     panel surface". */
+  --card-bg: rgba(255, 255, 255, 0.025);
 }
 
 * {
@@ -144,7 +152,10 @@
 [data-hint]::after {
   content: " " attr(data-hint);
   margin-left: 4px;
-  opacity: 0.62;
+  /* (#2863 style pass) `opacity: 0.62` on `--dim` computed below WCAG AA's
+     4.5:1 for this text size (see `.signal__at`'s own note on the same
+     trap). `--dim` alone already reads 6.00:1 against the panel background,
+     so dropping the opacity is the fix, not a new color. */
   font-weight: 400;
   letter-spacing: normal;
   text-transform: none;
@@ -893,7 +904,9 @@ body {
    The inner `.loglist` still scrolls. */
 
 .eventlog {
-  width: 380px;
+  /* (#2863) Set by dragging the column's left edge; 380px is the minimum
+     and the default (`MIN_COL_WIDTH_PX`, `EventLogColumn.tsx`). */
+  width: var(--eventlog-w, 380px);
   flex: none;
   /* Positioning context for the absolute collapse rail (#1066). */
   position: relative;
@@ -930,6 +943,10 @@ body {
   flex-direction: column;
   border-left: 1px solid var(--border);
   background: var(--surface);
+  /* (#2863 style pass, operator decision) Mono root-to-leaf: two rows
+     (`.eventlog__turnname`, `.eventlog__recobj`) reached past this for the
+     sans body stack, and this stops the next one from being able to. */
+  font-family: var(--font-mono);
 }
 
 /* (#1066) The collapse control + the collapsed rail.
@@ -950,6 +967,58 @@ body {
    `!important` would also "work" and is the wrong fix: it wins the argument
    without resolving it, and leaves the next reader with two rules that
    disagree. Ordering says which one is the exception. */
+/* (#2863) The width handle on the column's left edge. A 10px hit area over
+   the 1px border, so it is easy to grab without widening the border itself.
+   The accent line appears on hover, focus and drag, the same affordance the
+   split bar gives its own grip. */
+.eventlog__resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  width: 10px;
+  z-index: 4;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+.eventlog__resize::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.12s;
+}
+.eventlog__resize:hover::before,
+.eventlog__resize:focus-visible::before,
+.eventlog__resize--dragging::before {
+  background: var(--accent);
+}
+.eventlog__resize-readout {
+  position: absolute;
+  top: 10px;
+  right: 8px;
+  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+  color: var(--bg);
+  background: var(--accent);
+  padding: 4px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .eventlog__resize::before { transition: none; }
+}
+/* Set on <html> for the length of a width drag. */
+.is-resizing,
+.is-resizing * {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: col-resize;
+}
 .eventlog--collapsed {
   width: 28px;
   min-width: 28px;
@@ -1444,15 +1513,21 @@ body {
 }
 .eventlog__head {
   flex: none;
-  padding: 8px 12px 6px;
+  /* (#2863) 10px top, not 8: the filter badge overhangs its button upward
+     by 5px and sat 3px under the pane's top edge. */
+  padding: 10px 12px 6px;
   border-bottom: 1px solid var(--border);
 }
 .eventlog__head h3 {
   margin: 0;
-  font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
-  letter-spacing: 0.12em;
+  /* (#2863 style pass) Size/weight/letter-spacing/color now come from the
+     ONE label-style rule grouped at `.session-run .runsec::before` and
+     friends. Font-family is inherited from `.eventlog`'s own mono root.
+     `text-transform` stays HERE, not in the group: it is this element's
+     existing casing mechanism (a real text node, not pre-uppercased JS
+     string), and moving it wouldn't change behavior — it just keeps each
+     selector's own casing mechanism visible at its own rule. */
   text-transform: uppercase;
-  color: var(--dim);
   display: flex;
   /* (operator, 2026-09-06, desktop) The count pill (`.eventlog__qcount`,
      a direct child here on desktop — see `qcountNode` in
@@ -1463,6 +1538,10 @@ body {
      its own line instead, and the title keeps ONE line either way. */
   flex-wrap: wrap;
   row-gap: 5px;
+  /* (#2863) Room for the filter badge, which pins 5px outside its button's
+     corner: without a column gap it ran into the count pill beside it. 10px,
+     the same gap as between the buttons themselves. */
+  column-gap: 10px;
   /* `flex-start` + `margin-left: auto` on the button group, NOT
      `space-between`. With the pill outside `.eventlog__headbtns` this row
      has THREE children, and `space-between` pins the first and last and
@@ -1482,7 +1561,8 @@ body {
 .eventlog__headbtns {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  /* (#2863) 10, not 6: the filter badge overhangs its button by 5px. */
+  gap: 10px;
   flex: none;
   /* Holds the group against the header's right edge now that the h3 is
      `justify-content: flex-start` (see its own rule for why). Inert on the
@@ -1515,6 +1595,14 @@ body {
   background: none;
   font-size: calc(12px * var(--fs-scale));
   line-height: 1;
+  /* (#2863) One control size across the header: both icon buttons and the
+     count pill are 24px tall, the buttons 28px wide, all 6px radius. Before,
+     measured: follow 25x24, filters 29x25, count 18.6 tall with a 10px
+     radius. */
+  box-sizing: border-box;
+  height: 24px;
+  width: 28px;
+  padding: 0;
 }
 
 /* (#2018) The active-filter count. Colour is NOT the only channel — the
@@ -1671,9 +1759,17 @@ body {
   letter-spacing: 0.04em;
   color: var(--dim);
   white-space: nowrap;
-  padding: 3px 7px;
+  /* (#2863) Same 24px height and 6px radius as the icon buttons beside it.
+     Flex centering + the cap-height `text-box` trim (see the pill rule at
+     the end of this file) centers the caps; overflow still clips at the
+     column edge, though an anonymous flex item cannot show the ellipsis. */
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 6px;
   opacity: 0;
 }
 .eventlog__qcount.show {
@@ -1730,8 +1826,299 @@ body {
   border-left: 2px solid var(--accent);
   color: var(--fg);
 }
+/* (#2863, for operator comparison) Was `--accent` — a plain row's
+   timestamp was the loudest teal on the row, louder than the turn rows
+   right below it (`.eventlog__rec--turn .eventlog__rectime` already reads
+   `--dim`). One color for the same field everywhere. */
 .eventlog__rectime {
+  color: var(--dim);
+}
+/* (#2863) A list row is ONE scannable line: time, a kind chip, the object,
+   an outcome dot. Everything else is in the detail pane. A modifier rather
+   than a change to `.eventlog__rec` itself, because the pinned strip rows
+   share the base class and keep their own layout. The object takes the
+   remaining width and truncates, so a long path or command can never widen
+   the list (the #2106 horizontal-scroll class). */
+.eventlog__rec--lean {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+.eventlog__rec--lean .eventlog__rectime {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.eventlog__rec--lean .eventlog__recmachine,
+.eventlog__rec--lean .eventlog__recsession {
+  flex: none;
+  max-width: 30%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.eventlog__chip {
+  flex: none;
+  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+.eventlog__chip--tool {
   color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+/* The reasoning icon's own color (`.aico.act-reasoning`), so a kind reads
+   the same wherever it appears. */
+/* Two classes: `.eventlog__ractivity`'s own color (later in this file, same
+   specificity) otherwise wins and the text renders --fg. */
+.eventlog__chip.eventlog__chip--think {
+  color: var(--info);
+  background: color-mix(in srgb, var(--info) 14%, transparent);
+}
+.eventlog__recobj {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg);
+  /* (#2863 style pass) Mono, not the sans stack: the events pane is now
+     mono root-to-leaf (`.eventlog`'s own font-family), and this size drops
+     from 12px to 11px×scale onto the type scale's 11px step — the same
+     size `--mono` used to carry on its own, so the two variants collapse to
+     one number instead of two off-scale ones. */
+  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
+}
+.eventlog__recobj--mono {
+  font-size: calc(11px * var(--fs-scale));
+}
+.eventlog__recobj--dim {
+  color: var(--dim);
+}
+.eventlog__outcome {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.eventlog__outcome--ok { background: var(--good); }
+.eventlog__outcome--reported { background: var(--warn); }
+.eventlog__outcome--failed { background: var(--bad); }
+/* (#2863) A turn header: the group its events sit under. Two lines: what
+   the turn was and how long it took; then how full the context was going in
+   (a bar against the window, a tick at the compaction threshold) and what
+   went in and out. */
+.eventlog__rec--turn {
+  display: grid;
+  gap: 4px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+.eventlog__turnline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.eventlog__turnname {
+  color: var(--fg);
+  font: 700 calc(12px * var(--fs-scale))/1.2 var(--font-mono);
+}
+.eventlog__turnwhy {
+  flex: 1;
+  color: var(--dim);
+}
+.eventlog__rec--turn .eventlog__rectime {
+  color: var(--dim);
+}
+.eventlog__turndur {
+  color: var(--fg);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.eventlog__turndur--slow {
+  color: var(--warn);
+}
+.eventlog__turnctx {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+.eventlog__ctxbar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--panel-4);
+}
+.eventlog__ctxfill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0.8;
+}
+.eventlog__ctxtick {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 1px;
+  background: var(--warn);
+  opacity: 0.7;
+}
+/* (#2863 style pass) Size/weight/letter-spacing/color come from the ONE
+   label-style rule grouped at `.session-run .runsec::before` and friends —
+   no casing mechanism of its own to preserve here (no text-transform was
+   ever applied), so nothing is left in this selector's own block. */
+.eventlog__ctxnums {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.eventlog__ctxnums b {
+  color: var(--fg);
+  font-weight: 600;
+}
+/* (#2863) A rest is a divider between turns. */
+.eventlog__rec--rest {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  font-size: calc(10px * var(--fs-scale));
+  padding-block: 3px;
+}
+.eventlog__rec--rest::before,
+.eventlog__rec--rest::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--warn) 25%, transparent);
+}
+.eventlog__rec--rest .eventlog__ractivity {
+  color: var(--warn);
+}
+/* (#2863) Loaded models, one row each; the model that ran is marked and
+   listed first. */
+.modelrow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 12px;
+  align-items: baseline;
+  padding: 6px 8px;
+  margin-inline: -8px;
+  border-radius: 6px;
+  /* (#2863 style pass) Reserved so `--ran`'s accent bar costs no reflow —
+     same pattern as `.eventlog__rec`'s own transparent-by-default border. */
+  border-left: 2px solid transparent;
+}
+.modelrow--ran {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  /* (#2863 style pass) Was a 3px inset box-shadow, which — combined with
+     this row's own -8px bleed margin — sat 5px inside the card rather than
+     flush with it. Now the same 2px flush left border the selected event
+     row (`.eventlog__rec.sel`) and the signal accent bar (`.signal`) use. */
+  border-left-color: var(--accent);
+}
+.modelrow__name {
+  overflow-wrap: anywhere;
+}
+.modelrow--ran .modelrow__name {
+  color: var(--fg);
+  font-weight: 700;
+}
+.modelrow__size {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+/* (#2863 style pass) One filled-tag rule, shared with `.eventlog__chip` /
+   `.rv__chip` / `.signal__count`: calc(10px * var(--fs-scale)), weight 600,
+   padding 3px 6px, radius 4px, tint via color-mix. */
+.modelrow__tag {
+  grid-column: 1 / -1;
+  justify-self: start;
+  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+  padding: 3px 6px;
+  border-radius: 4px;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--dim) 14%, transparent);
+}
+.modelrow__tag--ran {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+/* (#2863) A clean run: the shared outcome chip, then one cell per detector.
+   The check is drawn here so the page's text stays the detectors' names. */
+.sigclean {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.sigclean__note {
+  color: var(--dim);
+}
+.sigchecks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.sigcheck {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.sigcheck::before {
+  content: "✓";
+  color: var(--good);
+  font-weight: 700;
+}
+/* (#2863) The panel's own scope, said once: which session, then who ran it
+   where. */
+.eventlog__shared {
+  display: grid;
+  gap: 2px;
+  font: calc(10.5px * var(--fs-scale))/1.35 var(--font-mono);
+  color: var(--dim);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  min-width: 0;
+}
+.eventlog__sharedline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.eventlog__sharedlbl {
+  flex: none;
+  /* (#2863 style pass) Size/weight/letter-spacing/color come from the ONE
+     label-style rule grouped at `.session-run .runsec::before` and friends.
+     `text-transform` stays here — its own existing casing mechanism. */
+  text-transform: uppercase;
+}
+/* A leading ellipsis: right-to-left overflow on the box, the id itself kept
+   left-to-right, so a narrow column drops the prefix, not the unique tail. */
+.eventlog__sharedsession {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+.eventlog__sharedwho {
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .eventlog__ractivity {
   color: var(--fg);
@@ -3345,10 +3732,12 @@ body {
 .rv__when { color: var(--dim); font-size: calc(11px * var(--fs-scale)); margin-bottom: 10px; }
 .rv__dim { color: var(--dim); }
 
-.rv__group { margin: 0 0 10px; padding: 8px 10px; background: rgba(255,255,255,.025);
+.rv__group { margin: 0 0 10px; padding: 10px 12px; background: var(--card-bg);
              border: 1px solid var(--border); border-radius: 6px; }
-.rv__grouphd { font-size: calc(10px * var(--fs-scale)); letter-spacing: .12em; text-transform: uppercase;
-               color: var(--dim); margin-bottom: 6px; }
+/* (#2863 style pass) Size/weight/letter-spacing/color come from the ONE
+   label-style rule grouped at `.session-run .runsec::before` and friends.
+   `text-transform` stays here — its own existing casing mechanism. */
+.rv__grouphd { text-transform: uppercase; margin-bottom: 6px; }
 
 .rv__row { display: flex; gap: 10px; align-items: baseline; padding: 1px 0; flex-wrap: wrap; }
 /* (U2-2) A MINIMUM column, not a fixed one. The 116px width was set before
@@ -3378,8 +3767,13 @@ body {
 .rv__time { color: var(--fg); }
 .rv__bool { color: var(--dim); }
 .rv__bool.on { color: var(--good); }
-.rv__chip { display: inline-block; padding: 0 6px; border-radius: 4px;
-            background: rgba(255,255,255,.06); color: var(--fg); font-size: calc(11px * var(--fs-scale)); }
+/* (#2863 style pass) One filled-tag rule, shared with `.eventlog__chip` /
+   `.modelrow__tag` / `.signal__count`: calc(10px * var(--fs-scale)), weight
+   600, padding 3px 6px, radius 4px, tint via color-mix. Neutral (no warn/
+   info role here), so it tints off `--dim` like `.modelrow__tag`'s base. */
+.rv__chip { display: inline-block; font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+            padding: 3px 6px; border-radius: 4px;
+            background: color-mix(in srgb, var(--dim) 14%, transparent); color: var(--fg); }
 
 /* (#2108, operator finding — detail text too small on a phone) A flat
    15px/1.4, NOT `--fs-scale`-multiplied like the rest of this block —
@@ -4524,7 +4918,10 @@ body {
 .session-run__header {
   font: 600 calc(13px * var(--fs-scale))/1.4 var(--font-mono);
   color: var(--accent);
-  margin-bottom: 10px;
+  /* (#2863 style pass) 12px — the same in-section gap as brief→prompt below
+     it, so header→brief reads the same rhythm instead of a slightly
+     tighter 10px. */
+  margin-bottom: 12px;
   overflow-wrap: anywhere;
   /* NO text-transform — `pillLabel`/`role` are already uppercased in
      `sessionRun.ts` (the "uppercase the STRING directly" discipline this
@@ -4536,7 +4933,8 @@ body {
   color: var(--dim);
   font-weight: 400;
 }
-.session-run .pill {
+.session-run .pill,
+.session-run .sigpill {
   border-radius: 10px;
   vertical-align: middle;
 }
@@ -4562,7 +4960,7 @@ body {
   margin-top: 6px;
 }
 .session-run .track {
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--card-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 10px 12px;
@@ -4664,10 +5062,10 @@ body {
   margin: 6px 0;
 }
 .session-run .signals .signal--warn {
-  border-left-color: #d08b3a;
+  border-left-color: var(--warn);
 }
 .session-run .signals .signal--info {
-  border-left-color: #3a8fd0;
+  border-left-color: var(--info);
 }
 .session-run .signals .signal__head {
   display: flex;
@@ -4677,11 +5075,11 @@ body {
 }
 .session-run .signals .signal--warn .signal__glyph,
 .session-run .signals .signal--warn .signal__kind {
-  color: #e0a45c;
+  color: var(--warn);
 }
 .session-run .signals .signal--info .signal__glyph,
 .session-run .signals .signal--info .signal__kind {
-  color: #6fb3e8;
+  color: var(--info);
 }
 .session-run .signals .signal__kind {
   font-weight: 600;
@@ -4689,12 +5087,18 @@ body {
 }
 /* A count badge, shown only when there IS a count — `×1` on every row is
    noise, not information. */
+/* (#2863 style pass) One filled-tag rule, shared with `.eventlog__chip` /
+   `.rv__chip` / `.modelrow__tag`: calc(10px * var(--fs-scale)), weight 600,
+   padding 3px 6px, radius 4px, tint via color-mix. Was outlined at a 999px
+   pill radius — the OTHER chip kind, `WorkStatus`'s `.pill` — which put two
+   different chip languages on the same page. Neutral severity, so it tints
+   off `--dim` like `.modelrow__tag`'s own base state. */
 .session-run .signals .signal__count {
+  font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
   color: var(--dim);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 0 6px;
-  font-size: calc(10px * var(--fs-scale));
+  background: color-mix(in srgb, var(--dim) 14%, transparent);
+  border-radius: 4px;
+  padding: 3px 6px;
 }
 /* WRAPS. Without this the row is a single flex line, and a `.signal__fix`
    that refuses to shrink starves `.signal__detail` — measured at 390px:
@@ -4757,7 +5161,14 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   margin: 8px 0 12px;
-  background: rgba(255, 255, 255, 0.02);
+  /* (#2863 style pass) --card-bg, the same inset `.track`/`.met`/
+     `.rv__group` use. No outer padding added here on purpose: unlike those,
+     this element's content is `.disclosure__sum`/`.disclosure__body`, each
+     already padded on its own — an outer 10px/12px would double-inset them
+     and, worse, sit ABOVE `.disclosure__sum`'s 44px touch target rather
+     than inside it, shrinking the tappable area below the WCAG 2.5.8 floor
+     this rule exists to protect. */
+  background: var(--card-bg);
 }
 /* `min-height: 44px` is the touch target, not decoration. At 11px text with
    6px padding this control computed to roughly 30px tall — over WCAG 2.5.8's
@@ -4821,10 +5232,6 @@ body {
    second row. Two ragged half-rows read worse than two full ones.
    Full width lets each pane lay its tiles out in a single line at desktop,
    and reflow cleanly at narrow widths. */
-.session-run .metricbanks {
-  display: block;
-  margin-bottom: 12px;
-}
 
 /* (#1973) The metric panes carry a scope so the operator can tell which
    numbers describe the MODEL's work and which describe the HARNESS around it
@@ -4841,19 +5248,53 @@ body {
    Out of flow, the empty tracks collapse and the tiles expand to fill. It
    stays CSS-generated so the parity goldens, which compare innerText, are
    untouched. */
-.session-run .metrics[data-scope] {
-  position: relative;
-  padding-top: 16px;
+/* (#2863) One section header for MODEL, SYSTEM and SIGNALS. Generated from
+   `data-head` so the parity goldens (innerText) never see it; in normal flow
+   on the section (not inside the tile grid, where it once squashed the
+   tracks — see #1973's note in git history), with room beneath it. */
+.session-run .runsec {
+  /* (#2863 style pass) 24px on both sides of the boundary, consistently —
+     including room ABOVE the first section, where the previous margin-only-
+     below rule left prompt→MODEL at a mere 12px (the same as an in-section
+     gap) while MODEL→SYSTEM read 14px. Margins collapse against the
+     previous sibling's own bottom margin (`.disclosure`'s 12px, or a prior
+     `.runsec`'s 24px), so both boundaries now resolve to max(*, 24) = 24px. */
+  margin-top: 24px;
+  margin-bottom: 24px;
 }
-.session-run .metrics[data-scope]::before {
-  position: absolute;
-  top: 0;
-  left: 0;
-  content: attr(data-scope);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+/* (#2863 style pass) ONE label style for section headers, group headers and
+   field labels: calc(10px * var(--fs-scale)), weight 400, letter-spacing
+   .08em, color --dim. Casing is each element's OWN existing mechanism —
+   CSS `text-transform` on generated/pseudo content or a real text node that
+   was never transformed, or a string the JS layer already uppercased
+   before render — and stays wherever it already lived: the parity goldens
+   pin `innerText`, and adding a transform to a real text node changes it. */
+.session-run .runsec::before,
+.session-run .ml,
+.session-run .track .lbl,
+.eventlog__head h3,
+.rv__grouphd,
+.eventlog__sharedlbl,
+.eventlog__ctxlbl {
   font-size: calc(10px * var(--fs-scale));
+  font-weight: 400;
+  letter-spacing: 0.08em;
   color: var(--dim);
+}
+.session-run .runsec::before {
+  display: block;
+  content: attr(data-head);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+/* (#2863 style pass) `.session-run .track .lbl` — the model card's "loaded
+   models" / "endpoint model" line — had no rule of its own above and
+   rendered as 14px bright body text, louder than the MODEL section header
+   above it; it now shares the label style declared there. The text itself
+   stays lowercase (page text a golden pins), same reasoning as
+   `.brief-label`'s own comment below. */
+.session-run .runsec > :last-child {
+  margin-bottom: 0;
 }
 
 /* (operator, 2026-09-05, second pass) The FIRST pass forced every tile to a
@@ -4876,10 +5317,28 @@ body {
 .session-run .metrics {
   display: grid;
   /* `min(150px, 100%)` so a narrow phone still gets ONE full-width column
-     instead of a track wider than the viewport. */
-  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+     instead of a track wider than the viewport.
+     (#2863 style pass) `auto-fill`, not `auto-fit`. MODEL (4 tiles) and
+     SYSTEM (5 tiles) are two SEPARATE grids at the same container width;
+     `auto-fit` resolves its column COUNT from each grid's own item count,
+     so at 1400px the two sections landed on different track counts and
+     their tile edges didn't line up column-for-column. `auto-fill` sizes
+     tracks from the container width alone and keeps any track the last row
+     doesn't fill (rather than collapsing it), so both grids resolve the
+     SAME track count and their left edges match. */
+  grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr));
   gap: 10px;
   margin-bottom: 12px;
+}
+/* (#2863 style pass) A fixed 2 columns at phone width, rather than letting
+   `auto-fill`'s track count fall out of 150px minmax math — at 390px that
+   math can resolve to a track count that leaves an odd item (SYSTEM's 5
+   tiles) as a lone half-width orphan in the last row. Two columns is
+   simple and avoids it. */
+@media (max-width: 480px) {
+  .session-run .metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
 }
 /* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
    width, via `order` rather than DOM position. The DOM keeps `.mv` before
@@ -4890,10 +5349,13 @@ body {
 .session-run .met {
   display: flex;
   flex-direction: column;
-  padding: 8px 10px;
+  /* (#2863 style pass) 10px 12px, background --card-bg — the same card
+     inset `.track`/`.disclosure`/`.rv__group` use. Layout (flex column,
+     tile-height-follows-row's-tallest) is untouched. */
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--card-bg);
 }
 .session-run .mv {
   order: 2;
@@ -4909,11 +5371,18 @@ body {
      longer a space inside `.mv` for nowrap to trap against the tile edge. */
   white-space: nowrap;
 }
+/* (#2863) A unit naming the figure ("avg"), on the value's line, quieter. */
+.session-run .munit {
+  margin-left: 0.3em;
+  /* (#2863 style pass) A literal `0.7em` (relative to `.mv`'s 15px×scale)
+     landed near, but not on, the 10/11/12/15×scale step ladder. Named
+     directly onto the 10px step instead. */
+  font-size: calc(10px * var(--fs-scale));
+  font-weight: 500;
+  color: var(--dim);
+}
 .session-run .ml {
   order: 1;
-  font-size: calc(10px * var(--fs-scale));
-  letter-spacing: 0.06em;
-  color: var(--dim);
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
 }
@@ -4926,6 +5395,22 @@ body {
    reserve a line via `min-height`; grid row `align-items: stretch` above
    does that job now, so an empty `.msub` would just be dead markup). */
 .session-run .msub {
+  order: 3;
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  margin-top: 3px;
+}
+/* (#2863) A tile's short hint ("model time") sits in the sub slot, under the
+   value, at every width. Appended to the label it wrapped WALL CLOCK onto two
+   lines in a ~150px tile, desktop included. The attribute stays on `.ml` (the
+   mission graph shares the mechanism); the tile mirrors it as `data-subhint`
+   and draws it here, CSS-generated so it never enters the goldens. A tile
+   with a real `.msub` does not carry the mirror (see SessionReplay). */
+.session-run .ml[data-hint]::after {
+  content: none;
+}
+.session-run .met[data-subhint]::after {
+  content: attr(data-subhint);
   order: 3;
   font-size: calc(10px * var(--fs-scale));
   color: var(--dim);
@@ -7163,4 +7648,23 @@ body {
   font-size: calc(10px * var(--fs-scale));
   color: var(--dim);
   margin-bottom: 10px;
+}
+
+/* (#2863, operator: "words aren't centered in the pills") Every chip/pill is
+   `line-height: 1` on uppercase or short text, so the line box still holds
+   descender room below the baseline and the letters sat 2.4px HIGH (measured:
+   3.2px above the cap line, 5.6px below the baseline, all four kinds).
+   `text-box` trims the line box to cap-height..baseline, so equal padding is
+   equal visual space. Browsers without it keep the previous padding and look. */
+@supports (text-box: trim-both cap alphabetic) {
+  .wstatus,
+  .eventlog__chip,
+  .modelrow__tag,
+  .eventlog__qcount,
+  .signal__count,
+  .rv__chip {
+    text-box: trim-both cap alphabetic;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
 }

@@ -17,7 +17,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { runRegions } from "./sessionRun";
+import { CLEAN_DETECTORS, runRegions } from "./sessionRun";
 import { flowToRenderModel } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 
@@ -54,24 +54,40 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   const lines: string[] = [];
   lines.push(`${view.header.pillLabel} ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
   lines.push(...view.briefLines.map((e) => e.text));
-  // (#1973) Iterate by SCOPE, not over the flat `metrics` array. The panes
-  // render model-then-harness and the model pane is ABSENT for a unit that
-  // did no model work, so a mirror that walked all six would claim tiles the
-  // page does not show.
-  for (const i of [...view.metricScope.model, ...view.metricScope.system]) {
-    const m = view.metrics[i];
-    if (m) lines.push(m.value, m.label);
+  // (#2863) Mirrors the page's three sections in reading order: MODEL (its
+  // tiles, then the model card), SYSTEM, SIGNALS. The section headers are
+  // CSS-generated, so they are not in the text. The model section is ABSENT
+  // for a unit that did no model work (#1973), so iterate by scope rather
+  // than over the flat `metrics` array.
+  const tiles = (idx: number[]) => {
+    for (const i of idx) {
+      const m = view.metrics[i];
+      if (m) lines.push(m.value + (m.unit ?? ""), m.label);
+    }
+  };
+  tiles(view.metricScope.model);
+  if (view.showModelCard) {
+    lines.push(view.modelTrackLabel);
+    // (#2863) Mirrors the card: with per-model structure, each row is its
+    // name, its size and its tag; otherwise the text lines.
+    if (view.modelEntries) {
+      for (const m of view.modelEntries) {
+        lines.push(m.name, m.gb != null ? `${m.gb} GB` : "?");
+        if (m.ran != null) lines.push(m.ran ? "ran this run" : "also loaded");
+      }
+    } else {
+      lines.push(...view.modelTrackLines);
+    }
   }
-  if (view.hasModelWork) {
-    lines.push(view.modelTrackLabel, ...view.modelTrackLines);
-  }
-  // (#1973) Mirrors the SIGNALS block's DOM: label, then either the clean
-  // pair or, per group, a head line and one line per signal. Note this mirror
-  // is NOT enforced against the component (#1978) — the rendered assertions
-  // live in `SessionReplay.test.tsx`. What this pins is the DERIVATION.
-  lines.push(view.signalsLabel);
+  tiles(view.metricScope.system);
+  // (#1973) Mirrors the SIGNALS block's DOM: either the clean pair or, per
+  // group, a head line and one line per signal. Note this mirror is NOT
+  // enforced against the component (#1978) — the rendered assertions live in
+  // `SessionReplay.test.tsx`. What this pins is the DERIVATION.
   if (view.signalGroups.length === 0) {
-    lines.push("✓ clean", "no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)");
+    // (#2863) The shared chip renders its label upper-cased, as it does
+    // COMPLETE; the detector cells read from the one list the card uses.
+    lines.push("CLEAN", "no detector flagged this run", ...CLEAN_DETECTORS);
   } else {
     for (const g of view.signalGroups) {
       lines.push(`${g.severity === "warn" ? "⚠" : "✓"}${g.kind}${g.count > 1 ? `×${g.count}` : ""}`);
@@ -224,8 +240,11 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o");
-    expect(view.modelTrackLabel).toBe("endpoint model");
-    expect(view.modelTrackLines[0]).toMatch(/served by the endpoint above — no local model loaded/);
+    // (#2863) No model card: all it could say is the model's name, which the
+    // brief's own `model` row already shows. (It used to add "no local model
+    // loaded", false for an endpoint on this machine.)
+    expect(view.showModelCard).toBe(false);
+    expect(view.briefLines.map((e) => e.text)).toContain("gpt-4o");
   });
 
   it("a jit-model-swap (more than one local model loaded in one run) surfaces as a warning detection", () => {
@@ -570,11 +589,14 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // or overflow the tile; a value can never again contain a second,
     // space-separated figure.
     expect(tileFor("CPU")?.value).toBe("27%");
-    expect(tileFor("CPU")?.sub).toBe("avg · 39% high");
+    expect(tileFor("CPU")?.sub).toBe("39% high");
+    expect(tileFor("CPU")?.unit).toBe("avg");
     expect(tileFor("RAM")?.value).toBe("63%");
-    expect(tileFor("RAM")?.sub).toBe("avg · 68% high");
+    expect(tileFor("RAM")?.sub).toBe("68% high");
+    expect(tileFor("RAM")?.unit).toBe("avg");
     expect(tileFor("GPU")?.value).toBe("43%");
-    expect(tileFor("GPU")?.sub).toBe("avg · 97% high");
+    expect(tileFor("GPU")?.sub).toBe("97% high");
+    expect(tileFor("GPU")?.unit).toBe("avg");
     // No metric's value smuggles a second figure back in via a space.
     for (const l of ["CPU", "RAM", "GPU"]) {
       expect(tileFor(l)?.value, `${l}'s value must be one figure`).not.toContain(" ");
@@ -708,9 +730,31 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.modelTrackLabel).toBe("loaded models");
+    expect(view.showModelCard).toBe(true);
     expect(view.modelTrackLines).toEqual([
       "big-specialist · 18GB · primary",
       "small-utility · 2GB · also loaded",
+    ]);
+  });
+
+  it("(#2863) the model that ran is found through darkmux's namespace, and listed first", () => {
+    // Since #2240 a local dispatch puts the NAMESPACED identifier on the wire
+    // (`darkmux:<key>`), while LM Studio's load telemetry reports the bare
+    // key. Compared as-is they never matched, so on a real run every model,
+    // including the one that did the work, read "also loaded".
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "darkmux:big-specialist" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "small-utility", gb: 2 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "big-specialist", gb: 18 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.modelTrackLines).toEqual([
+      "big-specialist · 18GB · primary",
+      "small-utility · 2GB · also loaded",
+    ]);
+    expect(view.modelEntries).toEqual([
+      { name: "big-specialist", gb: 18, ran: true },
+      { name: "small-utility", gb: 2, ran: false },
     ]);
   });
 

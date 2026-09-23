@@ -18,7 +18,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
  *  asserting something the harness has already ruled out. */
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
-import { runRegions } from "../session/sessionRun";
+import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
 
@@ -416,74 +416,88 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
         </details>
       ))}
 
-      {/* (#1973) Both panes share one row. HARNESS often holds a SINGLE tile
-          (wall clock), and giving it a full-width band of its own made one
-          card look stranded under five. Side by side they read as two groups
-          of one row rather than as a row and an afterthought.
-          A wrapper, not a reordering: MODEL's tiles still precede HARNESS's
-          in the DOM, so innerText order — and the parity goldens — are
-          unchanged. */}
-      <div className="metricbanks">
-      {/* Absent, not empty, when the unit did no model work — see
-          `hasModelWork`. */}
-      {view.metricScope.model.length > 0 && (
-      <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
-        {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-          <div className="met" key={i} title={m.hintTitle}>
-            <div className="mv">{m.value}</div>
-            <div className="ml" data-hint={m.hint}>{m.label}</div>
-            {/* (operator, 2026-09-05, second pass) Rendered ONLY when
-                non-empty — grid row `align-items: stretch` (the default,
-                see `.session-run .metrics`) equalizes tile heights WITHIN a
-                row now, so a tile with nothing to add here doesn't need a
-                dead empty slot to avoid sitting shorter than a neighbor. */}
-            {m.sub && <div className="msub">{m.sub}</div>}
-          </div>
-        ))}
-      </div>
-      )}
-
-      {/* (#1973) The SYSTEM pane, ADJACENT to the model pane rather than
-          below the model track. Two reasons, and the second is why CI caught
-          it: sandwiching `model (lms)` between two metric grids read as a
-          mistake on screen, and the split is a GROUPING of one metric row —
-          separating the halves with an unrelated block denies that. Keeping
-          them adjacent also leaves `innerText` order identical to legacy, so
-          `goldens/session-task-list.txt` still passes byte-for-byte; the pane
-          labels are CSS-generated (`::before`) and never enter the text. A
-          redesign that can keep its golden should. */}
-      {view.metricScope.system.length > 0 && (
-        <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
-          {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-            <div className="met" key={i} title={m.hintTitle}>
-              <div className="mv">{m.value}</div>
+      {/* (#2863) Three sections, one header style: MODEL (its tiles, then
+          which model did the work), SYSTEM (the machine around it), SIGNALS.
+          The model row used to sit BELOW the system tiles, so the page read
+          model, system, model again; it belongs with the model's numbers.
+          Headers are CSS-generated from `data-head` (`.runsec::before`), so
+          the parity goldens, which read innerText, never see them. The
+          `.metrics[data-scope]` grids keep their scope attribute as a hook. */}
+      {(view.metricScope.model.length > 0 || view.hasModelWork) && (
+        <section className="runsec" data-head="model">
+          {view.metricScope.model.length > 0 && (
+            <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
+              {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
+            <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
+              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>
-          ))}
-        </div>
+              ))}
+            </div>
+          )}
+          {view.showModelCard && (
+            <div className="track">
+              <div className="lbl">{view.modelTrackLabel}</div>
+              {/* (#2863) One row per model, the one that ran first and marked:
+                  the name, its size, and what it was here for. The text lines
+                  remain for the cases with no per-model structure (an
+                  endpoint, no telemetry yet). */}
+              {view.modelEntries
+            ? view.modelEntries.map((m, i) => (
+                <div className={`modelrow${m.ran ? " modelrow--ran" : ""}`} key={i}>
+                  <span className="modelrow__name">{m.name}</span>
+                  <span className="modelrow__size">{m.gb != null ? `${m.gb} GB` : "?"}</span>
+                  {m.ran != null && (
+                    <span className={`modelrow__tag${m.ran ? " modelrow__tag--ran" : ""}`}>
+                      {m.ran ? "ran this run" : "also loaded"}
+                    </span>
+                  )}
+                </div>
+              ))
+            : view.modelTrackLines.map((line, i) => <div key={i}>{line}</div>)}
+            </div>
+          )}
+        </section>
       )}
-      </div>
 
-      {view.hasModelWork && (
-        <div className="track">
-          <div className="lbl">{view.modelTrackLabel}</div>
-          {view.modelTrackLines.map((line, i) => (
-            <div key={i}>{line}</div>
-          ))}
-        </div>
+      {view.metricScope.system.length > 0 && (
+        <section className="runsec" data-head="system">
+          <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
+            {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
+            <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
+              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
+              <div className="ml" data-hint={m.hint}>{m.label}</div>
+              {m.sub && <div className="msub">{m.sub}</div>}
+            </div>
+            ))}
+          </div>
+        </section>
       )}
-
 
       {/* (#1973) SIGNALS — grouped by kind, severity-coded, run-relative
           times. Was a flat list of grey strings with a `⚠` in front of every
           entry, including the ones that report a successful RECOVERY. */}
+      <section className="runsec" data-head={view.signalsLabel} aria-label={view.signalsLabel}>
       <div className="track signals">
-        <div className="lbl">{view.signalsLabel}</div>
         {view.signalGroups.length === 0 ? (
+          // (#2863) State as shape: the shared outcome pill, then one cell
+          // per detector that looked and found nothing. The check marks are
+          // CSS, so the text stays the detectors' names.
           <>
-            <div>✓ clean</div>
-            <div>no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</div>
+            <div className="sigclean">
+              {/* Its own class, not `.pill`: `.pill` on this page means the run's
+                  status in the header, and e2e specs address it that way. */}
+              <WorkStatus status="complete" label="clean" className="sigpill" />
+              <span className="sigclean__note">no detector flagged this run</span>
+            </div>
+            <div className="sigchecks">
+              {CLEAN_DETECTORS.map((d) => (
+                <div className="sigcheck" key={d}>
+                  {d}
+                </div>
+              ))}
+            </div>
           </>
         ) : (
           view.signalGroups.map((g) => (
@@ -513,6 +527,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           ))
         )}
       </div>
+      </section>
     </div>
   );
 }

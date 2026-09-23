@@ -97,7 +97,11 @@ export const ACT_ORDER: string[] = [
  *
  * `heartbeat` is deliberately absent — see `MODEL_ACTIVITIES`'s doc for why
  * it no longer needs to carry liveness here. */
-export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call", "turn", "dispatch error"]);
+// (#2863) `dispatch.rest` is on by default: on a run's page a rest is the
+// divider between turns, and one per turn is what explains wall time against
+// active time (the thermal governor's pauses). The raw value is kept rather
+// than renamed; the section router already files it under DISPATCH.
+export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call", "turn", "dispatch error", "dispatch.rest"]);
 
 /** (silent-miss audit, 2026-09-06) Suffixes that mark an activity value as
  * failure- or abandonment-shaped, checked in ADDITION to `DEFAULT_ACTIVITIES`

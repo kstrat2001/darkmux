@@ -25,7 +25,10 @@ timing
 07:36:48 · running
 17:51:54 so far
 WALL CLOCK
-signals
-✓ clean
-no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)
+CLEAN
+no detector flagged this run
+cycle
+tool failure
+reasoning loop
+edit drift
 

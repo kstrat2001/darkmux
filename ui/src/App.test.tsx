@@ -206,7 +206,7 @@ describe("App", () => {
     // (see `machineHeaderMatches`'s own doc for the same gotcha), so a plain
     // textContent check on the header is the reliable form here too.
     expect(document.querySelector(".session-run__header")?.textContent).toContain("CODER");
-    expect(screen.getByText("signals")).toBeInTheDocument();
+    expect(document.querySelector('.session-run .runsec[data-head="signals"]')).toBeInTheDocument();
   });
 
   it("renders the machine lens (Packet 2) instead of a placeholder", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prettyArgs, recordDetail } from "./recordDetail";
+import { prettyArgs, recordDetail, recordObject } from "./recordDetail";
 import type { FlowRecord } from "../types/handwritten";
 
 /** A `dispatch.tool` record shaped exactly like the ones a live crawl emits
@@ -110,5 +110,95 @@ describe("recordDetail", () => {
   it("returns nothing for a record kind with no preview", () => {
     const r = { ts: "2026-08-25T14:45:41Z", action: "dispatch.turn.heartbeat", fields: {} } as unknown as FlowRecord;
     expect(recordDetail(r)).toBe("");
+  });
+});
+
+// ── (#2863) A row's object: what a person scans for, not a report ──────────
+describe("recordObject", () => {
+  const tool = (fields: Record<string, unknown>) =>
+    ({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } }) as never;
+
+  it("names a file tool by its file, with the container prefix dropped", () => {
+    const o = recordObject(tool({ tool_name: "edit", args: '{"path":"/workspace/test/refreshTokenService.test.js","edits":[]}', ok: true, outcome: "ok" }));
+    expect(o).toEqual({ chip: "edit", kind: "tool", text: "test/refreshTokenService.test.js", mono: false, outcome: "ok" });
+  });
+
+  it("reads arguments that arrive double-encoded (a JSON string of JSON)", () => {
+    // Measured on a live run: `edit`'s args are `"{\"path\":…}"`, so one
+    // parse yields a STRING and the row showed the raw JSON.
+    const args = JSON.stringify(JSON.stringify({ path: "/workspace/test/a.test.js", edits: [] }));
+    expect(recordObject(tool({ tool_name: "edit", args })).text).toBe("test/a.test.js");
+  });
+
+  it("reads the object out of arguments the flow record cut short", () => {
+    // Measured: the host clips long arguments, so a big edit's args are not
+    // valid JSON (double-encoded AND truncated) and a parse fails.
+    const args = JSON.stringify(JSON.stringify({ path: "/workspace/test/a.test.js", edits: [{ old_string: "x".repeat(50) }] })).slice(0, 70) + "…";
+    expect(recordObject(tool({ tool_name: "edit", args })).text).toBe("test/a.test.js");
+    const cmd = '{"command":"cd /workspace && npm test 2>&1","timeout_se…';
+    expect(recordObject(tool({ tool_name: "bash", args: cmd })).text).toBe("npm test");
+  });
+
+  it("reads only the call's OWN top-level keys from cut-short arguments, never a key inside a value", () => {
+    // (#2863 review) A truncated write of a file whose CONTENT holds a
+    // `"command"` key rendered that command as the row, a command that never
+    // ran. Both encodings, both key orders.
+    const content = JSON.stringify({ version: "2.0.0", tasks: [{ command: "rm -rf build", label: "clean" }] });
+    const pathFirst = JSON.stringify({ path: "/workspace/.vscode/tasks.json", content }).slice(0, 95) + "…";
+    const contentFirst = JSON.stringify({ content, path: "/workspace/.vscode/tasks.json" });
+    for (const raw of [pathFirst, contentFirst.slice(0, -1) + "…"]) {
+      for (const args of [raw, JSON.stringify(raw)]) {
+        const o = recordObject(tool({ tool_name: "write", args }));
+        expect(o.text, args).not.toContain("rm -rf");
+        expect(o.text, args).toBe(".vscode/tasks.json");
+      }
+    }
+  });
+
+  it("keeps a cd the model wrote itself; only the runtime's own /workspace hop is dropped", () => {
+    // (#2863 review) Stripping any `cd X &&` rendered `cd /tmp && rm -rf *`
+    // as `rm -rf *`, a different command.
+    const cmd = (c: string) => recordObject(tool({ tool_name: "bash", args: JSON.stringify({ command: c }) })).text;
+    expect(cmd("cd /tmp && rm -rf *")).toBe("cd /tmp && rm -rf *");
+    expect(cmd("cd crates/a && cargo test 2>&1")).toBe("cd crates/a && cargo test");
+    expect(cmd("cd /workspace/ && npm test")).toBe("npm test");
+    expect(cmd("cd /workspace/sub && npm test")).toBe("cd /workspace/sub && npm test");
+  });
+
+  it("a reasoning record with no text says so rather than showing a bare chip", () => {
+    const r = { action: "dispatch.reasoning", fields: { reasoning_text: "\n\n" } } as never;
+    expect(recordObject(r).text).toBe("(no reasoning text)");
+  });
+
+  it("names a command by the command, without the cd prefix or the redirect", () => {
+    const o = recordObject(tool({ tool_name: "bash", args: '{"command":"cd /workspace && npm test 2>&1","timeout_seconds":30}', outcome: "ok" }));
+    expect(o.text).toBe("npm test");
+    expect(o.mono).toBe(true);
+  });
+
+  it("names a search by its pattern", () => {
+    expect(recordObject(tool({ tool_name: "search", args: '{"path":"/workspace/src","pattern":"let _ ="}' })).text).toBe("let _ =");
+  });
+
+  it("carries the three outcomes #2008 distinguishes", () => {
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", outcome: "reported", exit_code: 1 })).outcome).toBe("reported");
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", outcome: "failed" })).outcome).toBe("failed");
+    // pre-1.22: `ok:false` meant failed when it was written
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", ok: false })).outcome).toBe("failed");
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", ok: true })).outcome).toBe("ok");
+  });
+
+  it("falls back to the arguments when no field names the object", () => {
+    expect(recordObject(tool({ tool_name: "fetch", args: '{"url":"http://x"}' })).text).toBe("url=http://x");
+  });
+
+  it("a reasoning row is its first line, without the JSON-string quotes it sometimes carries", () => {
+    const r = { action: "dispatch.reasoning", fields: { reasoning_text: '"Let me analyze the implementation.\n\nMore."' } } as never;
+    expect(recordObject(r)).toEqual({ chip: "reasoning", kind: "think", text: "Let me analyze the implementation.", mono: false });
+  });
+
+  it("anything else keeps its existing one-line detail and no chip", () => {
+    const r = { action: "dispatch start", fields: { prompt_chars: 3204 } } as never;
+    expect(recordObject(r)).toEqual({ text: "start (prompt: 3204ch)", mono: false });
   });
 });

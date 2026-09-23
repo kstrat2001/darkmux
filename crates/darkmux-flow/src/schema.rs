@@ -77,8 +77,18 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.52.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.53.0";
 // Version history:
+//   1.53.0 (#2863): additive payload key `generation_ms` on `dispatch.turn`.
+//
+//           The turn's model time (request sent to stream end: prompt processing
+//           plus generation), summed over every stream it took (a
+//           checkpoint continuation resumes the same `seq`), read from the
+//           trajectory's millisecond stream bookends. The viewer's turn
+//           header shows it; the flow's own timestamps are whole seconds,
+//           which is guesswork for a 1.3 s turn. Absent, not zero, when no
+//           stream was recorded (an older runtime).
+//
 //   1.52.0 (#2836): a new `telemetry.detector` kind, `discarded_tool_call`,
 //           with additive payload keys `name`, `arguments_chars` and `cut`.
 //

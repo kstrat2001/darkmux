@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
-import { EventLogColumn, compactCountLabel } from "./EventLogColumn";
+import { EventLogColumn, compactCountLabel, fmtTok, fmtTurnDuration } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 import { closeOpenModal } from "../lib/dialogManager";
 
@@ -481,7 +481,9 @@ describe("EventLogColumn", () => {
     rerender(<EventLogColumn scopeLabel="fleet" records={records} visible />);
 
     await waitFor(() => expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1));
-    expect(document.querySelector('[data-act="rec"]')!.textContent).toContain("s-late");
+    // (#2863) One session: its id is said once on the shared line, not on
+    // the row. The point here is that the late record rendered at all.
+    expect(document.querySelector(".eventlog")!.textContent).toContain("s-late");
   });
 
   // `.eventlog__rec` was a click-only div — no `role`, no `tabIndex`, no
@@ -521,16 +523,69 @@ describe("EventLogColumn", () => {
     });
   });
 
-  // Structural coverage for the two classNames that shipped matching
-  // nothing in styles.css (rendered as default sans-serif text, invisible
-  // to the innerText-based parity goldens).
-  it("renders the machine/session meta spans with their styling classes", () => {
-    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-1", machine_id: "MacBook-Pro" })];
+  // (#2863) Constants are said once. On a list that mixes machines or
+  // sessions (the fleet), each row names its own: that is information. On a
+  // list that is one session (a run's page), every row would repeat the same
+  // two values, so they move to one line under the header.
+  it("a list mixing sessions names each row's machine and session", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-1", machine_id: "MacBook-Pro" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "s-2", machine_id: "studio" }),
+    ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    expect(document.querySelector(".eventlog__recmachine")).toBeInTheDocument();
-    expect(document.querySelector(".eventlog__recsession")).toBeInTheDocument();
-    expect(document.querySelector(".eventlog__recmachine")!.textContent).toContain("MacBook-Pro");
-    expect(document.querySelector(".eventlog__recsession")!.textContent).toContain("s-1");
+    expect(document.querySelectorAll(".eventlog__recmachine")).toHaveLength(2);
+    expect(document.querySelectorAll(".eventlog__recsession")).toHaveLength(2);
+    expect(document.querySelector(".eventlog__shared")).toBeNull();
+  });
+
+  it("a one-session list says its machine and session once, not on every row", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro", handle: "coder" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro", handle: "coder" }),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    expect(document.querySelector(".eventlog__recmachine")).toBeNull();
+    expect(document.querySelector(".eventlog__recsession")).toBeNull();
+    const shared = document.querySelector(".eventlog__shared")!;
+    // (#2863, operator) The panel names its own scope: which session these
+    // events are, and who ran it where, rather than leaving the reader to
+    // infer it from the page beside it.
+    expect(shared.querySelector(".eventlog__sharedlbl")!.textContent).toBe("session");
+    expect(shared.querySelector(".eventlog__sharedwho")!.textContent).toBe("coder on MacBook-Pro");
+    // The FULL id: the column truncates it only when it runs out of room,
+    // and from the start, keeping the distinguishing tail (CSS). A fixed
+    // six-character cut stayed cut however wide the column was dragged.
+    expect(shared.querySelector(".eventlog__sharedsession")!.textContent).toBe("darkmux-coding-x-1790125784225");
+    expect(shared.getAttribute("title")).toContain("darkmux-coding-x-1790125784225");
+  });
+
+  it("records that carry no session do not stop a list from being one session", () => {
+    // Measured on a live run's page: machine telemetry rides the same list
+    // with no session id, and every row still repeated the session.
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "sess-1", machine_id: "MacBook-Pro" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: undefined, machine_id: "MacBook-Pro", action: "machine.telemetry" } as never),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    expect(document.querySelector(".eventlog__recsession")).toBeNull();
+    expect(document.querySelector(".eventlog__sharedsession")!.textContent).toBe("sess-1");
+  });
+
+  it("a tool row is its tool, its object and its outcome, not its raw arguments", () => {
+    const records = [
+      rec({
+        action: "dispatch.tool",
+        session_id: "s-1",
+        payload: { tool_name: "edit", args: '{"path":"/workspace/src/a.js","edits":[{"old_string":"x"}]}', result_chars: 88, outcome: "ok" },
+      } as never),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    const row = document.querySelector('[data-act="rec"]')!;
+    expect(row.querySelector(".eventlog__ractivity")!.textContent).toBe("edit");
+    expect(row.querySelector(".eventlog__recobj")!.textContent).toBe("src/a.js");
+    expect(row.querySelector(".eventlog__outcome--ok")).not.toBeNull();
+    expect(row.textContent).not.toContain("old_string");
+    expect(row.textContent).not.toContain("88ch");
   });
 
   // ── Collapse (#1066) ───────────────────────────────────────────────────
@@ -852,5 +907,203 @@ describe("count pill placement (#2447)", () => {
     setViewport(390, 844);
     const phone = render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     expect(phone.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
+  });
+});
+
+// ── (#2863) The vertical divider: the events column's width is the operator's ──
+//
+// Desktop only. 380px (the column's long-standing width) is the MINIMUM;
+// dragging well past it collapses the column to the existing #1066 rail, so
+// there is one collapsed state, not two. The width is kept per mount site,
+// like the split ratio above, which makes the App-level column's width
+// app-wide.
+describe("EventLogColumn — resizable width (#2863)", () => {
+  const ORIGINAL = {
+    width: Object.getOwnPropertyDescriptor(window, "innerWidth"),
+    height: Object.getOwnPropertyDescriptor(window, "innerHeight"),
+  };
+  function setViewport(width: number, height: number) {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
+  }
+  afterEach(() => {
+    if (ORIGINAL.width) Object.defineProperty(window, "innerWidth", ORIGINAL.width);
+    if (ORIGINAL.height) Object.defineProperty(window, "innerHeight", ORIGINAL.height);
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+  });
+
+  const handle = () => document.querySelector('[data-act="eventlog-resize"]') as HTMLElement;
+  const column = () => document.querySelector(".eventlog") as HTMLElement;
+  const width = () => column().style.getPropertyValue("--eventlog-w");
+  function drag(dx: number) {
+    const h = handle();
+    fireEvent.pointerDown(h, { clientX: 1000, pointerId: 1 });
+    fireEvent.pointerMove(h, { clientX: 1000 + dx, pointerId: 1 });
+    fireEvent.pointerUp(h, { clientX: 1000 + dx, pointerId: 1 });
+  }
+
+  it("renders a vertical separator at the 380px minimum", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(handle()).toHaveAttribute("role", "separator");
+    expect(handle()).toHaveAttribute("aria-orientation", "vertical");
+    expect(handle()).toHaveAttribute("aria-valuenow", "380");
+    expect(width()).toBe("380px");
+  });
+
+  it("dragging left widens the column (it sits on the right)", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-100);
+    expect(width()).toBe("480px");
+    expect(handle()).toHaveAttribute("aria-valuenow", "480");
+  });
+
+  it("never narrower than 380px while short of the collapse point", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(60);
+    expect(width()).toBe("380px");
+    expect(column()).not.toHaveClass("eventlog--collapsed");
+  });
+
+  it("dragging well past the minimum collapses to the existing rail", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(120);
+    expect(column()).toHaveClass("eventlog--collapsed");
+    expect(width()).toBe("380px"); // reopening restores a usable width
+  });
+
+  it("never so wide that the page beside it drops under 420px", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-2000);
+    expect(width()).toBe(`${1440 - 420}px`);
+  });
+
+  it("the width persists per mount site and is restored on the next mount", () => {
+    setViewport(1440, 900);
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-100);
+    expect(window.localStorage.getItem("dmux.eventlog.width.app")).toBe("480");
+    unmount();
+    render(<EventLogColumn scopeLabel="runs" records={[]} visible />);
+    expect(width()).toBe("480px");
+  });
+
+  it("double-click resets to 380px", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-100);
+    fireEvent.doubleClick(handle());
+    expect(width()).toBe("380px");
+  });
+
+  it("keyboard: arrows resize by 20px, Enter collapses", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.keyDown(handle(), { key: "ArrowLeft" });
+    expect(width()).toBe("400px");
+    fireEvent.keyDown(handle(), { key: "ArrowRight" });
+    fireEvent.keyDown(handle(), { key: "ArrowRight" });
+    expect(width()).toBe("380px");
+    fireEvent.keyDown(handle(), { key: "Enter" });
+    expect(column()).toHaveClass("eventlog--collapsed");
+  });
+
+  it("text selection is suspended across the page while dragging", () => {
+    // Measured: a drag highlighted the run page's text beside the column.
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.pointerDown(handle(), { clientX: 1000, pointerId: 1 });
+    expect(document.documentElement).toHaveClass("is-resizing");
+    fireEvent.pointerUp(handle(), { clientX: 900, pointerId: 1 });
+    expect(document.documentElement).not.toHaveClass("is-resizing");
+  });
+
+  it("a pane that unmounts mid-drag does not leave text selection off page-wide", () => {
+    // (#2863 review) Navigating away during a drag skipped pointerup, so the
+    // class stayed on <html>.
+    setViewport(1440, 900);
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.pointerDown(handle(), { clientX: 1000, pointerId: 1 });
+    expect(document.documentElement).toHaveClass("is-resizing");
+    unmount();
+    expect(document.documentElement).not.toHaveClass("is-resizing");
+  });
+
+  it("only the primary button starts a drag", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.pointerDown(handle(), { clientX: 1000, pointerId: 1, button: 2 });
+    expect(document.documentElement).not.toHaveClass("is-resizing");
+  });
+
+  it("is not offered on a phone, where the events live in the bottom sheet", () => {
+    setViewport(390, 844);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(handle()).toBeNull();
+  });
+});
+
+// ── (#2863) A run's list is grouped by turn ─────────────────────────────────
+describe("EventLogColumn — turns (#2863)", () => {
+  const S = "darkmux-coding-x-1790125784225";
+  const r = (sec: number, action: string, payload: Record<string, unknown> = {}) =>
+    rec({ ts: new Date(Date.UTC(2026, 8, 23, 1, 9, sec)).toISOString(), action, session_id: S, machine_id: "MacBook-Pro", payload } as never);
+  const records = [
+    r(1, "dispatch.turn.heartbeat", { turn_seq: 1 }),
+    r(9, "dispatch.turn", {
+      turn_seq: 1,
+      finish_reason: "tool_calls",
+      tool_calls_count: 1,
+      usage: { prompt_tokens: 15898, completion_tokens: 933, reasoning_tokens: 0 },
+    }),
+    r(9, "telemetry.context", { used: 15898, max: 262144, threshold: 131072 }),
+    r(10, "dispatch.tool", { tool_name: "edit", args: '{"path":"/workspace/a.js"}', outcome: "ok" }),
+    r(11, "dispatch.rest", { ms: 15000, reason: "thermal-duty-cycle", state: "fair" }),
+  ];
+
+  it("a turn is a header row: its number, what it did, its time, and its context", () => {
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    const head = document.querySelector(".eventlog__rec--turn")!;
+    expect(head.querySelector(".eventlog__turnname")!.textContent).toBe("Turn 1");
+    expect(head.querySelector(".eventlog__turnwhy")!.textContent).toBe("1 tool");
+    expect(head.querySelector(".eventlog__turndur")!.textContent).toBe("~8 s");
+    expect(head.querySelector(".eventlog__ctxnums")!.textContent).toBe("in 15.9k · out 933");
+    expect((head.querySelector(".eventlog__ctxfill") as HTMLElement).style.width).toMatch(/^6\.06/);
+    expect((head.querySelector(".eventlog__ctxtick") as HTMLElement).style.left).toBe("50%");
+    // The bar says what it is: a visible label (phones have no hover) and a
+    // tooltip naming the yellow compaction mark.
+    expect(head.querySelector(".eventlog__ctxlbl")!.textContent).toBe("context");
+    expect(head.querySelector(".eventlog__ctxbar")!.getAttribute("title")).toBe(
+      "context: 15,898 of 262,144 tokens (6%)\nyellow mark: compaction starts at 131,072 tokens",
+    );
+    // Still a row: clickable, counted, carries the handle title.
+    expect(head).toHaveAttribute("data-act", "rec");
+  });
+
+  it("a rest is a divider between turns, still a selectable row", () => {
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    const rest = document.querySelector(".eventlog__rec--rest")!;
+    expect(rest.textContent).toBe("rested 15 s · thermal: fair");
+    expect(rest).toHaveAttribute("data-act", "rec");
+  });
+
+  it("a list mixing sessions shows no turn headers", () => {
+    const mixed = [...records, rec({ ts: "2026-09-23T01:09:30.000Z", action: "dispatch.turn", session_id: "other", payload: { turn_seq: 1 } } as never)];
+    render(<EventLogColumn scopeLabel="fleet" records={mixed} visible />);
+    expect(document.querySelector(".eventlog__rec--turn")).toBeNull();
+  });
+
+  it("formats durations with precision the data has", () => {
+    expect(fmtTurnDuration(14217, false)).toBe("14.2 s");
+    expect(fmtTurnDuration(74100, false)).toBe("1:14");
+    expect(fmtTurnDuration(8000, true)).toBe("~8 s");
+    expect(fmtTurnDuration(300, true)).toBe("~1 s");
+    expect(fmtTok(933)).toBe("933");
+    expect(fmtTok(18926)).toBe("18.9k");
   });
 });

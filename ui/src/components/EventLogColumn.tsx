@@ -20,7 +20,8 @@ import {
 import { FiltersDialog, FiltersBody } from "./FiltersDialog";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
-import { recordDetail } from "../lib/recordDetail";
+import { recordDetail, recordObject } from "../lib/recordDetail";
+import { turnItems } from "../lib/turnGroups";
 import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
@@ -70,6 +71,50 @@ const WINDOW_HOURS = Math.round(LIVE_WINDOW_MS / 3600000);
 const MIN_DETAIL_PCT = 15;
 const MAX_DETAIL_PCT = 70;
 const DEFAULT_DETAIL_PCT = 38;
+
+/** (#2863) The column's width, set by dragging its left edge on desktop.
+ * 380px is the width it always had, and stays the MINIMUM: narrower and the
+ * rows stop being readable. Dragging `COLLAPSE_SLACK_PX` past the minimum
+ * collapses the column to the existing #1066 rail instead, so there is one
+ * collapsed state, not a second one. The page beside it keeps at least
+ * `PAGE_MIN_PX`. */
+export const MIN_COL_WIDTH_PX = 380;
+
+/** (#2863) A turn header's figures. A turn past `SLOW_TURN_MS` shows its
+ * time in amber; thinking tokens are named once they are a real share. */
+const SLOW_TURN_MS = 30_000;
+const THINKING_NOTE_MIN = 1_000;
+
+/** `14.2 s` when exact; `~8 s` when read from whole-second timestamps, where
+ * a decimal would claim precision the data does not have. */
+export function fmtTurnDuration(ms: number, approx: boolean): string {
+  if (approx) return `~${Math.max(1, Math.round(ms / 1000))} s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  const sec = Math.round(ms / 1000);
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+
+// (#2863) The context bar's explanation: fill = prompt tokens this turn,
+// yellow mark = where compaction kicks in.
+export function ctxTitle(inTok: number, window: number, threshold: number | null): string {
+  const base = `context: ${inTok.toLocaleString()} of ${window.toLocaleString()} tokens (${Math.round((100 * inTok) / window)}%)`;
+  return threshold ? `${base}\nyellow mark: compaction starts at ${threshold.toLocaleString()} tokens` : base;
+}
+
+export function fmtTok(n: number): string {
+  return n < 1000 ? n.toLocaleString() : `${(n / 1000).toFixed(1)}k`;
+}
+const COLLAPSE_SLACK_PX = 80;
+const PAGE_MIN_PX = 420;
+const COL_WIDTH_STEP_PX = 20;
+
+function maxColWidth(): number {
+  return Math.max(MIN_COL_WIDTH_PX, window.innerWidth - PAGE_MIN_PX);
+}
+
+function clampColWidth(w: number): number {
+  return Math.round(Math.min(maxColWidth(), Math.max(MIN_COL_WIDTH_PX, w)));
+}
 
 /** Enter/Space activates a `role="button"` `<div>` the same way a native
  * `<button>` would (matching `RunsBoard.tsx`'s own `onActivateKeyDown`) —
@@ -195,6 +240,33 @@ function collapseKeyFor(pane: string): string {
  * `lib/drawerStorage.ts`'s own persistence for the phone drawer's height. */
 function detailPctKeyFor(pane: string): string {
   return `dmux.eventlog.detailpct.${pane}`;
+}
+
+/** (#2863) Per mount site, same scoping as the split ratio: the App-level
+ * column is ONE mount site across every route, so its width is app-wide,
+ * while a lens's own pane keeps its own. `localStorage`, like the ratio: a
+ * width is a deliberate layout preference worth keeping across a refresh. */
+function colWidthKeyFor(pane: string): string {
+  return `dmux.eventlog.width.${pane}`;
+}
+
+function loadColWidth(pane: string): number {
+  try {
+    const raw = window.localStorage.getItem(colWidthKeyFor(pane));
+    const n = raw === null ? NaN : Number(raw);
+    if (Number.isFinite(n)) return clampColWidth(n);
+  } catch {
+    // storage unavailable — fall through to the default
+  }
+  return MIN_COL_WIDTH_PX;
+}
+
+function persistColWidth(pane: string, w: number): void {
+  try {
+    window.localStorage.setItem(colWidthKeyFor(pane), String(Math.round(w)));
+  } catch {
+    // storage unavailable — the width just won't survive a refresh
+  }
 }
 
 function loadDetailPct(pane: string): number {
@@ -405,16 +477,15 @@ export function EventLogColumn({
       return false;
     }
   });
-  const toggleCollapsed = () => {
-    setCollapsed((c) => {
-      try {
-        window.sessionStorage.setItem(collapseKeyFor(paneId), c ? "0" : "1");
-      } catch {
-        // ignore — storage unavailable
-      }
-      return !c;
-    });
+  const setCollapsedPersisted = (next: boolean) => {
+    try {
+      window.sessionStorage.setItem(collapseKeyFor(paneId), next ? "1" : "0");
+    } catch {
+      // ignore — storage unavailable
+    }
+    setCollapsed(next);
   };
+  const toggleCollapsed = () => setCollapsedPersisted(!collapsed);
 
   // (operator, 2026-09-01) On a phone the filters render INLINE in this pane
   // rather than as a modal stacked over a small screen, and the `filters`
@@ -470,6 +541,10 @@ export function EventLogColumn({
 
   const columnRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startY: number; startPct: number } | null>(null);
+  // (#2863) The column's own width and the drag that sets it.
+  const [colWidth, setColWidth] = useState(() => loadColWidth(paneId));
+  const widthDragRef = useRef<{ startX: number; startW: number; proposed: number } | null>(null);
+  const [widthReadout, setWidthReadout] = useState<string | null>(null);
 
   const filtered = useMemo(() => records.filter((r) => matchesFilters(r, filters)), [records, filters]);
 
@@ -514,6 +589,25 @@ export function EventLogColumn({
 
   const capped = filtered.length > LOG_CAP;
   const visibleRecs = useMemo(() => filtered.slice(-LOG_CAP).reverse(), [filtered]);
+  // (#2863) Constants are said once. When every record this list was GIVEN
+  // shares one machine (or one session), naming it on each row is
+  // repetition; it moves to one line under the header. A list that mixes
+  // them keeps them per row, where they tell rows apart.
+  // Decided from `records`, not the filtered rows: otherwise narrowing a
+  // fleet list to one session would move that session from its rows to the
+  // header, and the layout would shift under the operator's own filter.
+  // Grouped once per change, not on every render (playback re-renders often).
+  const listItems = useMemo(() => turnItems(visibleRecs, records), [visibleRecs, records]);
+  const shared = useMemo(() => {
+    // A record with no session (machine telemetry rides the same list) says
+    // nothing about which session this is, so it neither joins nor breaks
+    // the set; same for a record with no machine.
+    const machines = new Set(records.map((r) => r.machine_id).filter(Boolean) as string[]);
+    const sessions = new Set(records.map((r) => r.session_id).filter(Boolean) as string[]);
+    const handles = new Set(records.map((r) => r.handle).filter(Boolean) as string[]);
+    const one = (set: Set<string>) => (set.size === 1 ? [...set][0] : null);
+    return { machine: one(machines), session: one(sessions), handle: one(handles) };
+  }, [records]);
 
   // (#2068) The followed record is throttled: at playback speed the newest
   // record changed several times a second and the detail card swapped its
@@ -560,6 +654,59 @@ export function EventLogColumn({
       }
       return next;
     });
+  }
+
+  // (#2863) Left-edge drag. The column sits on the RIGHT, so dragging LEFT
+  // widens it. Past the minimum by `COLLAPSE_SLACK_PX`, releasing collapses
+  // it to the rail rather than squeezing it below readable.
+  function commitColWidth(w: number) {
+    const next = clampColWidth(w);
+    setColWidth(next);
+    persistColWidth(paneId, next);
+  }
+  // A pane that unmounts mid-drag (navigating away) never sees pointerup,
+  // so the page-wide selection lock is released here too (#2863 review).
+  useEffect(() => () => document.documentElement.classList.remove("is-resizing"), []);
+  function onWidthPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    // Primary button only: a right-click opens a context menu, not a drag.
+    if (e.button !== 0) return;
+    widthDragRef.current = { startX: e.clientX, startW: colWidth, proposed: colWidth };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    // Suspend text selection page-wide for the drag: without it, dragging
+    // highlighted the page's text beside the column.
+    document.documentElement.classList.add("is-resizing");
+    setWidthReadout(`${colWidth}px`);
+  }
+  function onWidthPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = widthDragRef.current;
+    if (!drag) return;
+    drag.proposed = drag.startW + (drag.startX - e.clientX);
+    const willCollapse = drag.proposed < MIN_COL_WIDTH_PX - COLLAPSE_SLACK_PX;
+    const shown = clampColWidth(drag.proposed);
+    setColWidth(shown);
+    setWidthReadout(willCollapse ? "release to collapse" : `${shown}px${shown === MIN_COL_WIDTH_PX ? " · min" : ""}`);
+  }
+  function onWidthPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = widthDragRef.current;
+    widthDragRef.current = null;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    document.documentElement.classList.remove("is-resizing");
+    setWidthReadout(null);
+    if (!drag) return;
+    if (drag.proposed < MIN_COL_WIDTH_PX - COLLAPSE_SLACK_PX) {
+      commitColWidth(MIN_COL_WIDTH_PX);
+      setCollapsedPersisted(true);
+    } else {
+      commitColWidth(drag.proposed);
+    }
+  }
+  function onWidthKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "ArrowLeft") commitColWidth(colWidth + COL_WIDTH_STEP_PX);
+    else if (e.key === "ArrowRight") commitColWidth(colWidth - COL_WIDTH_STEP_PX);
+    else if (e.key === "Home") commitColWidth(MIN_COL_WIDTH_PX);
+    else if (e.key === "Enter") setCollapsedPersisted(true);
+    else return;
+    e.preventDefault();
   }
 
   // `.split` drag-to-resize — Pointer Events (not mouse-only), so this
@@ -703,7 +850,33 @@ export function EventLogColumn({
     <div
       className={`eventlog${visible ? "" : " eventlog--hidden"}${collapsed ? " eventlog--collapsed" : ""}`}
       ref={columnRef}
+      style={{ "--eventlog-w": `${colWidth}px` } as React.CSSProperties}
     >
+      {/* (#2863) The width handle: desktop only (on a phone the events live
+          in the bottom sheet, sized by its own handle), and absent while
+          collapsed, where the rail button is the way back. */}
+      {!isMobile && !pushDetail && !collapsed && (
+        <div
+          className={`eventlog__resize${widthReadout ? " eventlog__resize--dragging" : ""}`}
+          data-act="eventlog-resize"
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-label="Resize the event log"
+          aria-valuemin={MIN_COL_WIDTH_PX}
+          aria-valuemax={maxColWidth()}
+          aria-valuenow={colWidth}
+          title="Drag to resize · double-click to reset"
+          onPointerDown={onWidthPointerDown}
+          onPointerMove={onWidthPointerMove}
+          onPointerUp={onWidthPointerUp}
+          onPointerCancel={onWidthPointerUp}
+          onDoubleClick={() => commitColWidth(MIN_COL_WIDTH_PX)}
+          onKeyDown={onWidthKeyDown}
+        >
+          {widthReadout && <span className="eventlog__resize-readout">{widthReadout}</span>}
+        </div>
+      )}
       {/* (#1066) The rail is the whole reason "collapsed" differs from
           "hidden". `visible=false` is `display:none` with nothing left to
           click — a route decides for the operator. Collapsed leaves a
@@ -958,6 +1131,29 @@ export function EventLogColumn({
             </div>
           </div>
         </div>
+        {/* (#2863) The panel names its own scope: which session these events
+            are, and who ran it where. Said once here instead of on every row,
+            and explicit, so the reader does not have to infer it from the page
+            beside the panel (operator finding). The full id truncates only
+            when the column runs out of room, and from the START, keeping the
+            tail that tells two sessions apart. */}
+        {(shared.machine || shared.session) && (
+          <div className="eventlog__shared" title={[shared.session, shared.handle, shared.machine].filter(Boolean).join(" · ")}>
+            {shared.session ? (
+              <div className="eventlog__sharedline">
+                <span className="eventlog__sharedlbl">session</span>
+                <span className="eventlog__sharedsession" dir="rtl">
+                  <bdi dir="ltr">{shared.session}</bdi>
+                </span>
+              </div>
+            ) : null}
+            <div className="eventlog__sharedwho">
+              {shared.handle && shared.machine
+                ? `${shared.handle} on ${shared.machine}`
+                : shared.handle || shared.machine}
+            </div>
+          </div>
+        )}
         {/* (#2108, operator finding — one-tap expand) Expanded, the list
             collapses to a 1-ROW STRIP showing just the selected record —
             the pane above fills the rest of the sheet. Collapsing back
@@ -999,13 +1195,88 @@ export function EventLogColumn({
               onSetQuery={setQuery}
             />
           ) : visibleRecs.length ? (
-            visibleRecs.map((r) => {
+            listItems.map((item) => {
+              const r = item.rec;
               const key = recKey(r);
-              const detail = recordDetail(r);
+              const isSel = !!selected && recKey(selected) === key;
+              const common = {
+                "data-act": "rec",
+                role: "button" as const,
+                tabIndex: 0,
+                // (#1868) The row's own `handle` — hover provenance, and the
+                // mission lens's own parity-extraction hook
+                // (`tests/parity/lib/extract-graph.js` reads it).
+                title: r.handle || undefined,
+                onClick: () => selectRecord(r),
+                onKeyDown: onActivateKeyDown(() => selectRecord(r)),
+              };
+              // (#2863) A turn is the header its events sit under: how long
+              // it took, and how full the context was going in.
+              if (item.kind === "turn") {
+                const t = item.turn;
+                const pct = t.window && t.inTok !== null ? Math.min(100, (100 * t.inTok) / t.window) : null;
+                return (
+                  <div key={key} className={`eventlog__rec eventlog__rec--turn${isSel ? " sel" : ""}`} {...common}>
+                    <div className="eventlog__turnline">
+                      <span className="eventlog__ractivity eventlog__turnname">Turn {t.seq}</span>
+                      <span className="eventlog__turnwhy">{t.why}</span>
+                      <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>
+                      {t.durationMs !== null ? (
+                        <span
+                          className={`eventlog__turndur${t.durationMs >= SLOW_TURN_MS ? " eventlog__turndur--slow" : ""}`}
+                          title={t.approx ? "approximate: from whole-second timestamps" : "model time: request sent to turn complete"}
+                        >
+                          {fmtTurnDuration(t.durationMs, t.approx)}
+                        </span>
+                      ) : null}
+                    </div>
+                    {t.inTok !== null || t.outTok !== null ? (
+                      <div className="eventlog__turnctx">
+                        {pct !== null ? (
+                          <span className="eventlog__ctxlbl">context</span>
+                        ) : null}
+                        {pct !== null ? (
+                          <span
+                            className="eventlog__ctxbar"
+                            role="img"
+                            title={ctxTitle(t.inTok!, t.window!, t.threshold)}
+                            aria-label={ctxTitle(t.inTok!, t.window!, t.threshold)}
+                          >
+                            <span className="eventlog__ctxfill" style={{ width: `${pct}%` }} />
+                            {t.threshold ? (
+                              <span className="eventlog__ctxtick" style={{ left: `${(100 * t.threshold) / t.window!}%` }} />
+                            ) : null}
+                          </span>
+                        ) : null}
+                        <span className="eventlog__ctxnums">
+                          {t.inTok !== null ? <>in <b>{fmtTok(t.inTok)}</b></> : null}
+                          {t.inTok !== null && t.outTok !== null ? " · " : ""}
+                          {t.outTok !== null ? <>out <b>{fmtTok(t.outTok)}</b></> : null}
+                          {t.thinkTok !== null && t.thinkTok >= THINKING_NOTE_MIN ? ` (${fmtTok(t.thinkTok)} thinking)` : ""}
+                        </span>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              }
+              // (#2863) A rest is a divider between turns, not a row among them.
+              if (item.kind === "rest") {
+                const f = (r.fields || r.payload || {}) as Record<string, unknown>;
+                const ms = typeof f.ms === "number" ? f.ms : typeof f.delay_ms === "number" ? f.delay_ms : null;
+                return (
+                  <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
+                    <span className="eventlog__ractivity">
+                      rested{ms !== null ? ` ${Math.round(ms / 1000)} s` : ""}
+                      {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
+                    </span>
+                  </div>
+                );
+              }
+              const obj = recordObject(r);
               return (
                 <div
                   key={key}
-                  className={`eventlog__rec${selected && recKey(selected) === key ? " sel" : ""}`}
+                  className={`eventlog__rec eventlog__rec--lean${selected && recKey(selected) === key ? " sel" : ""}`}
                   data-act="rec"
                   role="button"
                   tabIndex={0}
@@ -1023,15 +1294,34 @@ export function EventLogColumn({
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >
                   <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>{" "}
-                  <ActivityIcon act={activityOf(r)} />
-                  <span className="eventlog__ractivity">{activityOf(r)}</span>
-                  {r.machine_id ? <span className="eventlog__recmachine"> · {r.machine_id}</span> : null}
-                  {r.session_id ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
-                  {/* What the record DID — a tool call's name + arguments +
-                      result size, a turn's finish reason, a reasoning
-                      excerpt. Without it every tool call in the log read
-                      "tool call" and nothing else. */}
-                  {detail ? <span className="preview-text"> · {detail}</span> : null}
+                  {/* (#2863) A row says what happened in one scannable line:
+                      the kind (a tool's own name, or "reasoning") as a chip,
+                      the object it was about, and how a tool came out. The
+                      arguments, output and full reasoning live in the detail
+                      pane, one tap away. Other actions keep their icon and
+                      activity word. */}
+                  {obj.chip ? (
+                    <span className={`eventlog__ractivity eventlog__chip eventlog__chip--${obj.kind}`}>{obj.chip}</span>
+                  ) : (
+                    <>
+                      <ActivityIcon act={activityOf(r)} />
+                      <span className="eventlog__ractivity">{activityOf(r)}</span>
+                    </>
+                  )}
+                  {r.machine_id && !shared.machine ? <span className="eventlog__recmachine"> · {r.machine_id}</span> : null}
+                  {r.session_id && !shared.session ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
+                  {obj.text ? (
+                    <span className={`eventlog__recobj${obj.mono ? " eventlog__recobj--mono" : ""}${obj.kind === "think" ? " eventlog__recobj--dim" : ""}`}>
+                      {obj.text}
+                    </span>
+                  ) : null}
+                  {obj.outcome ? (
+                    <span
+                      className={`eventlog__outcome eventlog__outcome--${obj.outcome}`}
+                      role="img"
+                      aria-label={obj.outcome === "ok" ? "ran" : obj.outcome === "reported" ? "ran, reported a non-zero exit" : "failed to run"}
+                    />
+                  ) : null}
                 </div>
               );
             })

@@ -50,8 +50,9 @@ function definedTokens(): Set<string> {
  * heights as inline properties (`el.style.setProperty("--chrome-h", ...)`).
  * They are legitimately absent from the CSS, and their `var()` fallbacks are
  * the pre-measurement value, which is the one case where a fallback is
- * load-bearing. */
-const JS_SET_TOKENS = new Set(["--chrome-h", "--masthead-h"]);
+ * load-bearing. (#2863) `--eventlog-w` is the events column's dragged width,
+ * written inline by `EventLogColumn.tsx`; its fallback is the 380px minimum. */
+const JS_SET_TOKENS = new Set(["--chrome-h", "--masthead-h", "--eventlog-w"]);
 
 function tokenRefs(): Array<{ name: string; line: number; hasFallback: boolean }> {
   const out: Array<{ name: string; line: number; hasFallback: boolean }> = [];
@@ -153,5 +154,21 @@ describe("(U2-3) styles.css colour tokens", () => {
       offenders.map((l) => `${l.value} (line ${l.line})`),
       "a retired duplicate came back — use the token it was mapped onto",
     ).toEqual([]);
+  });
+});
+
+describe("(#2863) pill text is vertically centered", () => {
+  // Layout cannot be measured in jsdom; the centering itself was measured in
+  // a real browser (caps 2.4px high before, 0.02px after). This pins that the
+  // rule doing it still covers every chip/pill kind.
+  it("trims every chip/pill's line box to cap height", () => {
+    const at = CSS.indexOf("@supports (text-box: trim-both cap alphabetic)");
+    expect(at).toBeGreaterThan(-1);
+    const open = CSS.indexOf("{", at);
+    const selectors = CSS.slice(open + 1, CSS.indexOf("{", open + 1))
+      .split(",")
+      .map((x) => x.trim());
+    expect(selectors).toEqual([".wstatus", ".eventlog__chip", ".modelrow__tag", ".eventlog__qcount", ".signal__count", ".rv__chip"]);
+    expect(CSS.slice(open, CSS.indexOf("}", open))).toMatch(/text-box:\s*trim-both cap alphabetic/);
   });
 });

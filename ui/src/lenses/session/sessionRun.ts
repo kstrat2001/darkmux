@@ -70,6 +70,12 @@ function pillClsFor(label: string): PillCls {
   return "canceled";
 }
 
+/** (#2863) The detectors a clean run passed, in the order the old sentence
+ * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
+ * read by the signals card and by the text mirror its tests compare against
+ * the parity golden, so the two cannot drift apart. */
+export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift"] as const;
+
 export interface SessionHeader {
   /** Pre-uppercased (`.sub h2{text-transform:uppercase}` in legacy CSS —
    * this port uppercases the string directly, per `lib/format.ts`'s
@@ -147,7 +153,7 @@ export interface SessionRunView {
    * instead. Every tile renders its `sub` slot, empty or not, so the grid
    * doesn't go ragged the moment one tile has more to say than its
    * neighbors — see `.session-run .msub` in `styles.css`. */
-  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string }>;
+  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }>;
   /** (#1973) Which metrics describe the MODEL's work and which describe the
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
@@ -164,8 +170,16 @@ export interface SessionRunView {
    * `model (lms)` mean, and are these numbers about the model or about
    * darkmux?" */
   metricScope: { model: number[]; system: number[] };
+  /** (#2863) Whether the MODEL section shows its model card. False for an
+   * endpoint-served run: the card could only repeat the model name the
+   * brief's `model` row already shows. */
+  showModelCard: boolean;
   modelTrackLabel: string;
   modelTrackLines: string[];
+  /** (#2863) The same loaded models as structure, for the card: the model
+   * that ran first. Present only when this session loaded models itself;
+   * the endpoint and no-telemetry cases have only their `modelTrackLines`. */
+  modelEntries?: Array<{ name: string; gb: number | null; ran: boolean | null }>;
   /** (#1972) Is this run still going? Drives whether the page subscribes to
    *  the shared clock at all — a finished run's elapsed time is a fixed fact,
    *  and re-rendering it once a second is pure waste. */
@@ -811,9 +825,13 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // `sub` — the same value/label/sub split CTX got, applied here because
   // this was the OTHER place a tile's value was a multi-stat phrase rather
   // than a figure.
-  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string } => ({
+  // (#2863) "avg" names the big figure, so it rides beside it as a `unit`
+  // (rendered small, same line) rather than leading the sub line, where it
+  // read as a label for the peak beneath it.
+  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string; unit: string } => ({
     value: `${roundPct(m.avg)}%`,
-    sub: `avg · ${roundPct(m.high)}% high`,
+    sub: `${roundPct(m.high)}% high`,
+    unit: "avg",
   });
 
   // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
@@ -821,12 +839,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // conditional (host tiles only exist when host telemetry does), and an
   // audit already flagged the hardcoded form as a positional contract nothing
   // enforced — this makes the two unable to drift because there is only one.
-  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string }> = [];
+  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }> = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string) => {
+  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string) => {
     into.push(metrics.length);
-    metrics.push({ value, label, hint, hintTitle, sub });
+    metrics.push({ value, label, hint, hintTitle, sub, unit });
   };
   push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
   push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
@@ -863,15 +881,15 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
   if (cpuPeak != null) {
     const s = avgHighSplit(hostAgg.cpu);
-    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub);
+    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub, s.unit);
   }
   if (ramPeak != null) {
     const s = avgHighSplit(hostAgg.mem);
-    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub);
+    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub, s.unit);
   }
   if (gpuPeak != null) {
     const s = avgHighSplit(hostAgg.gpu);
-    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub);
+    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub, s.unit);
   }
   // (#2413 M4) CPU/RAM/GPU used to silently vanish here whenever the
   // machine-scoped join below found nothing for this run's window — no
@@ -919,19 +937,39 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // (#2834) "endpoint model", not "remote model": the record says a model
   // was reached over HTTP, which is true of a server on this machine too.
   const modelTrackLabel = ep ? "endpoint model" : "loaded models";
+  const showModelCard = hasModelWork && !ep;
   // (#2759) When THIS session loaded nothing itself, fall back to whatever
   // the mission-wide rollup found on its inner executions — the same data
   // that just turned TURNS/TOKENS/CONTEXT on above. Unlabeled (no primary/
   // also-loaded tag): those tags read `d?.model` against `f.model`, both of
   // which are THIS session's own fields and mean nothing for a load that
   // happened on a different session entirely.
-  const modelTrackLines = ep
-    ? [`${model || "unknown"} · served by the endpoint above — no local model loaded`]
-    : loads.length
-      ? loads.map((r) => {
+  // (#2863) Compared WITHOUT darkmux's namespace. Since #2240 a local
+  // dispatch names the model `darkmux:<key>` on the wire, while LM Studio's
+  // load telemetry reports the bare key; compared as-is they never matched,
+  // and every model on a real run, including the one that ran, read "also
+  // loaded". The model that ran is listed first.
+  const bare = (m: unknown) => String(m ?? "").replace(/^darkmux:/, "");
+  const isRan = (r: FlowRecord) =>
+    primaryModel != null && bare((r.fields as Record<string, unknown>).model) === bare(primaryModel);
+  const orderedLoads = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
+  const modelEntries =
+    !ep && orderedLoads.length
+      ? orderedLoads.map((r) => {
           const f = r.fields as Record<string, unknown>;
-          const isPrimary = primaryModel != null && f.model === primaryModel;
-          const tag = primaryModel == null ? "" : isPrimary ? " · primary" : " · also loaded";
+          return {
+            name: String(f.model ?? "?"),
+            gb: typeof f.gb === "number" ? f.gb : null,
+            ran: primaryModel == null ? null : isRan(r),
+          };
+        })
+      : undefined;
+  const modelTrackLines = ep
+    ? [model || "unknown"]
+    : orderedLoads.length
+      ? orderedLoads.map((r) => {
+          const f = r.fields as Record<string, unknown>;
+          const tag = primaryModel == null ? "" : isRan(r) ? " · primary" : " · also loaded";
           return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
         })
       : rollup && rollup.loadLines.length
@@ -1180,8 +1218,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     disclosures,
     metrics,
     metricScope,
+    showModelCard,
     modelTrackLabel,
     modelTrackLines,
+    modelEntries,
     // (#2759) Gates the "loaded models" track's own visibility
     // (`SessionReplay.tsx`'s `view.hasModelWork &&` render guard) — a rolled-
     // up mission execution must open that track the same as an own-session
