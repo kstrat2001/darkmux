@@ -156,3 +156,19 @@ describe("(U2-3) styles.css colour tokens", () => {
     ).toEqual([]);
   });
 });
+
+describe("(#2863) pill text is vertically centered", () => {
+  // Layout cannot be measured in jsdom; the centering itself was measured in
+  // a real browser (caps 2.4px high before, 0.02px after). This pins that the
+  // rule doing it still covers every chip/pill kind.
+  it("trims every chip/pill's line box to cap height", () => {
+    const at = CSS.indexOf("@supports (text-box: trim-both cap alphabetic)");
+    expect(at).toBeGreaterThan(-1);
+    const open = CSS.indexOf("{", at);
+    const selectors = CSS.slice(open + 1, CSS.indexOf("{", open + 1))
+      .split(",")
+      .map((x) => x.trim());
+    expect(selectors).toEqual([".wstatus", ".eventlog__chip", ".modelrow__tag", ".eventlog__qcount", ".signal__count", ".rv__chip"]);
+    expect(CSS.slice(open, CSS.indexOf("}", open))).toMatch(/text-box:\s*trim-both cap alphabetic/);
+  });
+});

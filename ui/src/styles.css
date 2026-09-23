@@ -1513,7 +1513,9 @@ body {
 }
 .eventlog__head {
   flex: none;
-  padding: 8px 12px 6px;
+  /* (#2863) 10px top, not 8: the filter badge overhangs its button upward
+     by 5px and sat 3px under the pane's top edge. */
+  padding: 10px 12px 6px;
   border-bottom: 1px solid var(--border);
 }
 .eventlog__head h3 {
@@ -1536,6 +1538,9 @@ body {
      its own line instead, and the title keeps ONE line either way. */
   flex-wrap: wrap;
   row-gap: 5px;
+  /* (#2863) Room for the filter badge, which pins 5px outside its button's
+     corner: without a column gap it ran into the count pill beside it. */
+  column-gap: 12px;
   /* `flex-start` + `margin-left: auto` on the button group, NOT
      `space-between`. With the pill outside `.eventlog__headbtns` this row
      has THREE children, and `space-between` pins the first and last and
@@ -1555,7 +1560,8 @@ body {
 .eventlog__headbtns {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  /* (#2863) 10, not 6: the filter badge overhangs its button by 5px. */
+  gap: 10px;
   flex: none;
   /* Holds the group against the header's right edge now that the h3 is
      `justify-content: flex-start` (see its own rule for why). Inert on the
@@ -1588,6 +1594,14 @@ body {
   background: none;
   font-size: calc(12px * var(--fs-scale));
   line-height: 1;
+  /* (#2863) One control size across the header: both icon buttons and the
+     count pill are 24px tall, the buttons 28px wide, all 6px radius. Before,
+     measured: follow 25x24, filters 29x25, count 18.6 tall with a 10px
+     radius. */
+  box-sizing: border-box;
+  height: 24px;
+  width: 28px;
+  padding: 0;
 }
 
 /* (#2018) The active-filter count. Colour is NOT the only channel — the
@@ -1744,9 +1758,17 @@ body {
   letter-spacing: 0.04em;
   color: var(--dim);
   white-space: nowrap;
-  padding: 3px 7px;
+  /* (#2863) Same 24px height and 6px radius as the icon buttons beside it.
+     Flex centering + the cap-height `text-box` trim (see the pill rule at
+     the end of this file) centers the caps; overflow still clips at the
+     column edge, though an anonymous flex item cannot show the ellipsis. */
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 24px;
+  padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 6px;
   opacity: 0;
 }
 .eventlog__qcount.show {
@@ -7624,4 +7646,23 @@ body {
   font-size: calc(10px * var(--fs-scale));
   color: var(--dim);
   margin-bottom: 10px;
+}
+
+/* (#2863, operator: "words aren't centered in the pills") Every chip/pill is
+   `line-height: 1` on uppercase or short text, so the line box still holds
+   descender room below the baseline and the letters sat 2.4px HIGH (measured:
+   3.2px above the cap line, 5.6px below the baseline, all four kinds).
+   `text-box` trims the line box to cap-height..baseline, so equal padding is
+   equal visual space. Browsers without it keep the previous padding and look. */
+@supports (text-box: trim-both cap alphabetic) {
+  .wstatus,
+  .eventlog__chip,
+  .modelrow__tag,
+  .eventlog__qcount,
+  .signal__count,
+  .rv__chip {
+    text-box: trim-both cap alphabetic;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
 }
