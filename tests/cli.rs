@@ -10972,3 +10972,97 @@ fn mission_launch_records_the_run_wall_clock_in_the_envelope() {
         "adding wall_ms is an additive field ⇒ minor bump: {envelope}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (#2855) `lab run stats`: which view prints, and the exit code. The text
+// itself is tested in darkmux-lab (`stats_render_tests.rs`); these spawn the
+// real binary because routing and exit codes exist only in the CLI, and CI's
+// mutation job showed nothing else could catch them.
+// ---------------------------------------------------------------------------
+
+/// A minimal lab run directory: one billed 3 s stream of 300 tokens.
+fn stats_run_dir(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let d = parent.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("metrics.json"),
+        r#"{"model":"m","result":"stop","started_at_unix_ms":1000,"wall_ms":10000,"rest_ms":0,"turns":1,"compactions":0,"total_completion_tokens":300}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("trajectory.jsonl"),
+        concat!(
+            r#"{"type":"model.streaming.start","seq":1,"ts":1000}"#, "\n",
+            r#"{"type":"model.streaming.end","seq":1,"ts":4000}"#, "\n",
+            r#"{"type":"model.completed","seq":1,"usage":{"completion_tokens":300}}"#, "\n",
+        ),
+    )
+    .unwrap();
+    d
+}
+
+fn stats_cmd(flows: &std::path::Path) -> Command {
+    let mut c = darkmux_cmd();
+    c.env("DARKMUX_FLOWS_DIR", flows);
+    c
+}
+
+#[test]
+fn lab_run_stats_one_run_prints_the_single_run_view() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats"]).arg(&a).assert().success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(text.contains("stream gate") && text.contains("100 tok/s"), "{text}");
+    assert!(!text.contains("cost per successful run"), "one run is not a set: {text}");
+}
+
+#[test]
+fn lab_run_stats_one_run_json_is_the_run_record() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats", "--json"]).arg(&a).assert().success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["run"], "run-a");
+    assert_eq!(v["tok_per_s"], 100.0);
+}
+
+#[test]
+fn lab_run_stats_several_runs_print_the_set_view() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    let b = stats_run_dir(tmp.path(), "run-b");
+    let out = stats_cmd(tmp.path()).args(["lab", "run", "stats"]).arg(&a).arg(&b).assert().success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(text.contains("cost per successful run") && text.contains("run-b"), "{text}");
+}
+
+#[test]
+fn lab_run_stats_one_run_with_a_baseline_prints_the_comparison() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    let b = stats_run_dir(tmp.path(), "run-b");
+    let out = stats_cmd(tmp.path())
+        .args(["lab", "run", "stats"])
+        .arg(&a)
+        .arg("--baseline")
+        .arg(&b)
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(text.contains("candidate") && text.contains("moved"), "{text}");
+}
+
+/// A set with a run that cannot be read fails, so a script cannot mistake a
+/// partial set for a whole one.
+#[test]
+fn lab_run_stats_a_set_with_an_unreadable_run_exits_1() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let a = stats_run_dir(tmp.path(), "run-a");
+    stats_cmd(tmp.path())
+        .args(["lab", "run", "stats"])
+        .arg(&a)
+        .arg(tmp.path().join("no-such-run"))
+        .assert()
+        .code(1);
+}

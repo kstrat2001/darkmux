@@ -419,6 +419,26 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             }
             Ok(0)
         }
+        RunCmd::Stats { runs, baseline, json } => {
+            use lab::stats_render as render;
+            if runs.len() == 1 && baseline.is_empty() {
+                let s = lab::stats::run_stats(&runs[0])?;
+                if json.json {
+                    println!("{}", serde_json::to_string_pretty(&s)?);
+                } else {
+                    print!("{}", render::run_text(&s));
+                }
+                return Ok(0);
+            }
+            let cand = render::load_set(&runs);
+            let base = (!baseline.is_empty()).then(|| render::load_set(&baseline));
+            if json.json {
+                println!("{}", serde_json::to_string_pretty(&render::sets_json(&cand, base.as_ref()))?);
+            } else {
+                print!("{}", render::sets_text(&cand, base.as_ref()));
+            }
+            Ok(render::exit_code(&cand, base.as_ref()))
+        }
         RunCmd::Compare { run_a, run_b } => {
             let result = lab::compare::lab_compare(&run_a, &run_b)?;
             for n in &result.notes {

@@ -591,6 +591,15 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          `#[cfg(test)]` module, which the untruncated discovery scan sees and `audit` does \
          not; the envelope builds no flow records",
     ),
+    (
+        "crates/darkmux-lab/src/lab/stats.rs",
+        "consumer (#2855): reads `machine.telemetry` records back out of the flow files to \
+         derive a lab run's power figures, builds nothing",
+    ),
+    (
+        "crates/darkmux-lab/src/lab/stats_tests.rs",
+        "tests for that consumer, in a sibling file; its literals are fixture records",
+    ),
 ];
 
 /// Every flow-record action, in the sources [`audit`] scans, whose payload
