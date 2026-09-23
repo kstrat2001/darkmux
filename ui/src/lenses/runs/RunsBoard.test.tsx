@@ -181,17 +181,6 @@ describe("RunsBoard", () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(fetchCallsBefore);
   });
 
-  it("the ◧ series toggle only appears under kind=lab, and switches to the grouped view", async () => {
-    mockFetch();
-    renderBoard("lab");
-    await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
-    const seriesToggle = screen.getByText("◧ series");
-    expect(seriesToggle).toBeInTheDocument();
-
-    fireEvent.click(seriesToggle);
-    await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
-  });
-
   it("(#1900, session_id wiring #1915) a terminated, untracked dispatch row with flow records is interactive and activating it navigates to #dispatch=<id>", async () => {
     // "ghost" is `kind: "dispatch", tracked: false` — server-side, EVERY
     // such row is synthesized only for a flow session that saw a real
@@ -471,11 +460,10 @@ describe("RunsBoard", () => {
     expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
   });
 
-  // (#2860 review F2) The series view and a `run=<dir>` deep link used to
-  // open `LabRunDetail` directly, skipping the rule list rows follow. A lab
-  // run with a representative session opens the shared session view from
-  // EVERY entry point; only a run without one (a bench run) keeps its own
-  // record page.
+  // (#2860 review F2) A `run=<dir>` deep link used to open `LabRunDetail`
+  // directly, skipping the rule list rows follow. A lab run with a
+  // representative session opens the shared session view from EVERY entry
+  // point; only a run without one (a bench run) keeps its own record page.
   const CODING_RUN = { id: "coding-1", kind: "lab", status: "complete", tracked: true, session_id: "sess-c1", updated_ts: 50 };
   const CODING_LAB_RUN = {
     dir: "coding-1", mtime_ms: 50, case_ids: [], bundles: 0, raw_flags: 0, deduped_flags: 0,
@@ -493,17 +481,14 @@ describe("RunsBoard", () => {
     );
   }
 
-  it("(#2860) a series row for a run with a session opens the shared session view, not the funnel page", async () => {
+  it("(#2860) a plain list row for a lab run with a session opens the shared session view, not the funnel page", async () => {
     mockLabBoard();
     renderBoard("lab");
-    await waitFor(() => expect(screen.getByText("◧ series")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("◧ series"));
-    await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("coding-1")).toBeInTheDocument());
     const before = history.length;
     fireEvent.click(screen.getByText("coding-1").closest(".labrunrow")!);
     expect(window.location.hash).toBe("#dispatch=sess-c1");
-    // A real navigation, not a replace: Back returns to the lab list (the
-    // series toggle is component state, not in the hash, so it reopens off).
+    // A real navigation, not a replace: Back returns to the lab list.
     // Opening the record page and redirecting from there also lands on the
     // session view, but REPLACES the list's history entry on the way.
     expect(history.length).toBe(before + 1);
@@ -575,7 +560,7 @@ describe("RunsBoard", () => {
   });
 
   // Keyboard-accessibility structure — the runs-lens `role="button"` chips
-  // (RunsBar's kind filter + series toggle) and the `.runmore` "show all"
+  // (RunsBar's kind filter) and the `.runmore` "show all"
   // row are click-only divs/spans with tabIndex but no key handler prior to
   // this fix: reachable by Tab, unactivatable by keyboard. Text-only
   // assertions can't see either defect (the click handler still exists and
@@ -610,14 +595,6 @@ describe("RunsBoard", () => {
       fireEvent.keyDown(container.querySelector('[data-arg="dispatch"]')!, { key: " " });
       await waitFor(() => expect(screen.queryByText("m1")).not.toBeInTheDocument());
       expect(screen.getByText("d1")).toBeInTheDocument();
-    });
-
-    it("the ◧ series toggle switches to the grouped view on Enter", async () => {
-      mockFetch();
-      renderBoard("lab");
-      await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
-      fireEvent.keyDown(screen.getByText("◧ series"), { key: "Enter" });
-      await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
     });
 
     it("'show all N more' is a real role=button and expands on Enter/Space", async () => {
@@ -855,17 +832,6 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     renderBoard("all", null, "u1");
     await waitFor(() => expect(screen.getByText("old-alias")).toBeInTheDocument());
     expect(screen.getByText("new-alias")).toBeInTheDocument();
-  });
-
-  it("the lab series view (kind=lab, ◧ series) is ALSO scoped to the pin, bridged via the shared dir/id", async () => {
-    mockPinnedFetch();
-    const { container } = renderBoard("lab", null, "u1");
-    await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("◧ series"));
-    await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
-    // l1 is the pinned machine's only lab run and has a recorded corpus
-    // (`LAB_RUNS_FIXTURE`) — the series card renders for it.
-    expect(container.querySelector(".labtaskcard")).toBeInTheDocument();
   });
 });
 

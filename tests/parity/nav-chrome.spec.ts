@@ -32,11 +32,12 @@
 // past `data-state="loading"`; the same navigation via
 // `page.evaluate(() => location.hash = ...)` (what `next-parity.spec.ts`
 // uses) is unaffected, and a real click against LOCAL REACT STATE (no query,
-// no `refetchInterval`) is ALSO unaffected — proof: `next-parity-runs.spec.ts`'s
-// own "kind=lab + ◧ series toggle" test does a genuine `page.click()` on the
-// series toggle UNDER a frozen clock and passes cleanly every run, because
-// that toggle is `useState`, not a polled query. The bug needs BOTH a real
-// click AND a refetchInterval-bearing query sitting downstream of it.
+// no `refetchInterval`) is ALSO unaffected — proof: this file's own
+// "a runs-lens kind-chip selection survives an unrelated App re-render"
+// test below does a genuine `page.click()` (the "show all" expansion) UNDER
+// a frozen clock and passes cleanly every run, because that toggle is
+// `useState`, not a polled query. The bug needs BOTH a real click AND a
+// refetchInterval-bearing query sitting downstream of it.
 //
 // Root-caused by hand (frozen clock temporarily removed, re-added, a
 // `debug-chrome.spec.ts` scratch repro file used then deleted). Three-line
@@ -205,9 +206,9 @@ test.describe("nav chrome (Packet 1.5)", () => {
   // `PRESENCE_POLL_MS` — 5s) then recomputes a fresh `Route` whose
   // `runsKind` matches what the operator already selected, which
   // `RunsBoard`'s `useEffect([initialKind])` used to treat as a BRAND NEW
-  // deep-link and reset `series`/`showAll`/the row-click notice out from
-  // under the operator. Fixed by a `if (initialKind === kind) return;`
-  // guard in that effect (see `RunsBoard.tsx`).
+  // deep-link and reset `showAll`/the row-click notice out from under the
+  // operator. Fixed by a `if (initialKind === kind) return;` guard in that
+  // effect (see `RunsBoard.tsx`).
   //
   // QA's own diagnosis of why the OTHER tests in this file (and every
   // corpus-backed next-parity spec) never caught it: the corpus is a
@@ -248,15 +249,21 @@ test.describe("nav chrome (Packet 1.5)", () => {
     await page.goto("/index.html#lens=runs");
     await waitSettled(page, expect, '[data-state="data"], [data-state="pending"]');
 
-    // Operator action: select kind=lab, then toggle the series view — the
-    // exact sequence QA's live-browser repro used.
+    // Operator action: select kind=lab, then expand "show all" — a SECOND
+    // piece of `RunsBoard`'s own local `useState` (`showAll`), the same
+    // shape the original repro used (the `◧ series` toggle, removed in the
+    // #2860 follow-up) to prove more than just `kind` survives.
     await page.click('[data-arg="lab"]');
     await expect(page.locator('[data-arg="lab"].on')).toBeAttached();
-    await page.click('[data-arg="series"]');
-    await expect(page.locator('[data-arg="series"].on')).toBeAttached();
+    await expect(page.locator(".runmore")).toBeAttached();
+    await page.click(".runmore");
+    await expect(page.locator(".runmore")).toHaveCount(0);
 
     const headerBefore = await page.locator(".stagehdr").innerText();
-    expect(headerBefore, "the series view's own header must actually say 'series' before we can prove it survives").toMatch(/series/);
+    expect(
+      headerBefore,
+      "the expanded list's own header must no longer say 'newest N of M' before we can prove it survives",
+    ).not.toMatch(/newest/);
 
     // Touch nothing. Wait long enough for the 5s presence poll to fire at
     // least once (and for React to process whatever re-render it triggers).
@@ -267,7 +274,7 @@ test.describe("nav chrome (Packet 1.5)", () => {
     const headerAfter = await page.locator(".stagehdr").innerText();
     expect(
       headerAfter,
-      `the runs board must NOT revert out of series view just because an unrelated poll re-rendered the app (got: "${headerAfter}")`,
-    ).toMatch(/series/);
+      `the runs board must NOT revert out of the expanded list just because an unrelated poll re-rendered the app (got: "${headerAfter}")`,
+    ).not.toMatch(/newest/);
   });
 });

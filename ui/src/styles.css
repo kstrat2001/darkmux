@@ -2200,13 +2200,19 @@ body {
    makes `next-parity-runs.spec.ts`'s stage-text byte-comparison possible at
    all: Chromium's `innerText()` treats each direct child of a `display:flex`
    container as its own line, REGARDLESS of visual wrapping (verified
-   empirically — see the packet's own report) — so `.labrunmain`/`.runsbar`/
-   `.labtaskhdr` being `display:flex` (not just visually similar) is
-   load-bearing for parity, not a styling nicety. Likewise `text-transform:
-   uppercase` on `.labbadge`/`.runkind`/`.labtaskcount` is what turns the
-   wire's lowercase `status`/`kind` strings into the goldens' UPPERCASE
-   text — innerText reflects CSS text-transform. Don't "clean up" either
-   property without re-running the parity spec. */
+   empirically — see the packet's own report) — so `.labrunmain`/`.runsbar`
+   being `display:flex` (not just visually similar) is load-bearing for
+   parity, not a styling nicety. Likewise `text-transform: uppercase` on
+   `.labbadge`/`.runkind` is what turns the wire's lowercase `status`/`kind`
+   strings into the goldens' UPPERCASE text — innerText reflects CSS
+   text-transform. Don't "clean up" either property without re-running the
+   parity spec.
+   (#2860 follow-up) `.labtaskcard`/`.labtaskhdr`/`.labtaskcount`/
+   `.labdiffline`/`.labdegenerate` — the `◧ series` knob-diff sub-view's own
+   classes — are removed below along with the view itself; every OTHER
+   class here (`.labrunrow`/`.labrunmain`/`.labruncrew`/`.labrundir`/
+   `.labrunmeta`/`.labbadge`) is shared with the flat list's own `RunRow`
+   and stays. */
 .lablist {
   display: flex;
   flex-direction: column;
@@ -2373,26 +2379,6 @@ body {
 .labrunmeta.dim {
   color: var(--dim);
 }
-.labdegenerate {
-  color: var(--error);
-  font-weight: 600;
-}
-.labdiffline {
-  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  color: var(--good);
-  padding: 2px 0 8px 6px;
-  border-left: 2px solid var(--good);
-  margin: -2px 0 6px 4px;
-  overflow-wrap: anywhere;
-}
-.labdiffline.warn {
-  color: var(--warn);
-  border-left-color: var(--warn);
-}
-.labdiffline.dim {
-  color: var(--dim);
-  border-left-color: var(--border);
-}
 /* ─── The ONE work-status chip (components/WorkStatus.tsx) ──────────────────
    Every scope — mission, phase, task, step, run — renders its status through
    this. Five kinds, one palette, one pulse. A call site may add a LAYOUT
@@ -2463,27 +2449,6 @@ body {
 .runmore:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
-}
-.labtaskcard {
-  background: var(--panel-3);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 14px;
-}
-.labtaskhdr {
-  font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
-  color: var(--accent);
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.labtaskcount {
-  font: 600 calc(10px * var(--fs-scale)) var(--font-mono);
-  color: var(--dim);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
 }
 .none {
   color: var(--dim);

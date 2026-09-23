@@ -1,8 +1,10 @@
 // @ts-nocheck
 // Packet 3 acceptance: `/next`'s ported runs board vs the legacy goldens
-// recorded in Packet 0a (plus the four this packet grew — see
-// `goldens/runs-kind-mission.txt`, `runs-kind-dispatch.txt`, `runs-series.txt`,
-// `runs-lens-boot.txt`). Run with `bunx playwright test --config
+// recorded in Packet 0a (plus the goldens this packet grew — see
+// `goldens/runs-kind-mission.txt`, `runs-kind-dispatch.txt`,
+// `runs-lens-boot.txt`; `runs-series.txt` and its own spec covered the `◧
+// series` sub-view, removed in the #2860 follow-up). Run with `bunx
+// playwright test --config
 // next-playwright.config.js` (see `package.json`'s `next-parity` script) —
 // NOT picked up by `playwright.config.js`'s `testMatch`, which is scoped to
 // the legacy extractor/red-prove pair on purpose (see that file's own doc).
@@ -50,10 +52,9 @@ function goldenStageText(label: string): string {
   return stageSectionOf(full);
 }
 
-// `[data-state="data"]` is `RunsBoard`'s own settle marker (present in BOTH
-// the flat-list and the series-view success branches — see `RunsBoard.tsx`),
-// the `/next` analog of legacy's `.lablist` — real content is in the DOM,
-// not the `data-state="pending"` skeleton.
+// `[data-state="data"]` is `RunsBoard`'s own settle marker — the `/next`
+// analog of legacy's `.lablist` — real content is in the DOM, not the
+// `data-state="pending"` skeleton.
 const SETTLED = '[data-state="data"]';
 
 test.describe("next-parity: runs board (Packet 3)", () => {
@@ -109,29 +110,6 @@ test.describe("next-parity: runs board (Packet 3)", () => {
     await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
     expect(await extractStageOnlyText(page)).toBe(goldenStageText("runs-kind-lab"));
     await page.screenshot({ path: shot("runs-kind-lab.png"), fullPage: true });
-  });
-
-  test("kind=lab + ◧ series toggle matches runs-series.txt's #stage", async ({ page }) => {
-    const meta = loadMeta();
-    await installFrozenClock(page, meta.frozen_clock_ms);
-    installCorpusRoutes(page, meta);
-    await page.goto("/index.html#lens=runs&kind=lab");
-    await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
-    const beforeToggle = await extractStageOnlyText(page);
-
-    await page.click('[data-arg="series"]');
-    // Belt-and-suspenders (same pattern as `waitSettled`'s `previousText`
-    // check in the legacy harness): confirm the toggle's `.on` class landed
-    // AND the stage text actually changed, so a click that silently no-opped
-    // can't pass this test by accident.
-    await expect(page.locator('[data-arg="series"].on')).toBeAttached({ timeout: 15000 });
-    await expect(async () => {
-      const now = await extractStageOnlyText(page);
-      if (now === beforeToggle) throw new Error("stage text unchanged after clicking the series toggle");
-    }).toPass({ timeout: 15000 });
-
-    expect(await extractStageOnlyText(page)).toBe(goldenStageText("runs-series"));
-    await page.screenshot({ path: shot("runs-series.png"), fullPage: true });
   });
 
   test("render-sanity: zero pageerror, real #stage height, no 390px overflow", async ({ page }) => {
@@ -197,14 +175,5 @@ test.describe("next-parity: runs board red-prove (harness self-test)", () => {
     await page.goto("/index.html#lens=runs&kind=lab");
     await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
     expect(await extractStageOnlyText(page)).not.toBe(goldenStageText("runs-kind-lab"));
-
-    const beforeToggle = await extractStageOnlyText(page);
-    await page.click('[data-arg="series"]');
-    await expect(page.locator('[data-arg="series"].on')).toBeAttached({ timeout: 15000 });
-    await expect(async () => {
-      const now = await extractStageOnlyText(page);
-      if (now === beforeToggle) throw new Error("stage text unchanged after clicking the series toggle");
-    }).toPass({ timeout: 15000 });
-    expect(await extractStageOnlyText(page)).not.toBe(goldenStageText("runs-series"));
   });
 });
