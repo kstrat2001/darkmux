@@ -1803,8 +1803,12 @@ body {
   border-left: 2px solid var(--accent);
   color: var(--fg);
 }
+/* (#2863, for operator comparison) Was `--accent` — a plain row's
+   timestamp was the loudest teal on the row, louder than the turn rows
+   right below it (`.eventlog__rec--turn .eventlog__rectime` already reads
+   `--dim`). One color for the same field everywhere. */
 .eventlog__rectime {
-  color: var(--accent);
+  color: var(--dim);
 }
 /* (#2863) A list row is ONE scannable line: time, a kind chip, the object,
    an outcome dot. Everything else is in the detail pane. A modifier rather
