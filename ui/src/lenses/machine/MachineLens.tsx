@@ -11,7 +11,6 @@ import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { getSource } from "../../lib/source";
-import { useIsMobile } from "../../hooks/useIsMobile";
 import {
   Meter,
   compactMeterProps,
@@ -104,9 +103,12 @@ export function lineClass(line: string): string | undefined {
  * section). #1508 step 2 (`d2041ae3`) merged this page with the flow-scoped
  * fleet-card drill and left its runs list as an explicitly interim stand-in
  * ("step 4 of #1508 replaces it with the full Runs lens, machine-pinned").
- * #1809 is that step 4: the `RUNS ON <MACHINE>` list is gone, replaced by a
- * link into `#lens=runs&machine=<uid>` (`RunsBoard.tsx`'s machine pin) —
- * see the render below for the link itself.
+ * #1809 was that step 4: the `RUNS ON <MACHINE>` list was replaced by a
+ * link into `#lens=runs&machine=<uid>` (`RunsBoard.tsx`'s machine pin).
+ * That link itself was then REMOVED (operator, 2026-09-23: "the runs link
+ * is out of place. probably just remove it.") — this lens has no
+ * cross-lens exit to the runs board any more; the nav tab is the way
+ * there now.
  *
  * Reached by ONE minted entry point: the nav tab / bare `#lens=machine`
  * deep-link (`uid: null` — always "the local machine"). As of 2026-08-23 the
@@ -133,8 +135,8 @@ export function lineClass(line: string): string | undefined {
  * guard: a remote machine's page never reads THIS daemon's own probe under
  * the wrong name) PLUS `/flow/<today>` + `/flow/<yesterday>` +
  * `/fleet/machines/live` (machine presence — the source of the header's
- * `label`/`spec`, the run-count link below, AND a remote machine's own
- * `specs` string — `specOf()`, viewer.html:1124-1129, since a remote
+ * `label`/`spec` AND a remote machine's own `specs` string — `specOf()`,
+ * viewer.html:1124-1129, since a remote
  * machine's hardware line comes from its presence beat, not this daemon's
  * local `/machine/specs` probe). `/fleet/sessions/live` — fetched by the
  * OLD runs list for its live-vs-ended status labels — is gone along with
@@ -142,19 +144,10 @@ export function lineClass(line: string): string | undefined {
  */
 export function MachineLens({
   uid: routeUid,
-  isMobileOverride,
 }: {
   uid: string | null;
-  /** (#2108, operator finding) Test-only override for the "runs on
-   * <machine> →" link's mobile full-width treatment below — production
-   * omits this and measures `window.innerWidth` via `useIsMobile` (the
-   * SAME 768px breakpoint the drawer/health-region key their own mobile
-   * forms off). */
-  isMobileOverride?: boolean;
 }) {
   const nowMs = Date.now();
-  const measuredIsMobile = useIsMobile();
-  const isMobile = isMobileOverride ?? measuredIsMobile;
 
   // (#1801) A daemon-less build has nothing to poll. `App.tsx` gates its own
   // copies of these on `isLiveRoute(route)` and states the rule in place:
@@ -367,9 +360,11 @@ export function MachineLens({
   // hardware uid, `targetUid` on an empty window is a real 36-character UUID
   // rather than (as before) the machine's own name arriving through
   // `localMachineUid`'s `?? machineId` fallback. `nameOf` has nothing to
-  // answer with there and echoes the uid, so "runs on MacBook-Pro" would
-  // become "runs on F9ACF59C-…". The floor only fills that gap; an observed
-  // name still wins. See `displayNameOf`'s own doc.
+  // answer with there and echoes the uid — the floor only fills that gap;
+  // an observed name still wins. See `displayNameOf`'s own doc. (The
+  // cross-lens link this used to label — "runs on <machine> →" — was
+  // removed 2026-09-23; `label` still feeds `MachineHealthRegion`'s
+  // `machineName` prop below, used for the remote-machine placeholder.)
   const label = targetUid != null ? displayNameOf(flowWindow.data, liveMachines, specs, targetUid) : "this machine";
   // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
   // reused rather than re-derived here) — the local daemon's own
@@ -377,26 +372,6 @@ export function MachineLens({
   // otherwise the machine's own presence-beat `specs` string (a remote
   // machine's hardware line, as broadcast by ITS heartbeat).
   const spec = targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : "";
-
-  // (#1809) The link below carries NO COUNT, deliberately.
-  //
-  // It used to read `${sessionsOn(data, uid).length} runs on <machine> →`,
-  // which was the same total the removed runs list always showed — correct
-  // while it labeled a list rendered from that same data, and a lie the
-  // moment it labeled a link to somewhere else. The two count different
-  // things over different windows: `sessionsOn` counts distinct session ids
-  // in the 24h flow window (`LIVE_WINDOW_MS`), while the destination lists
-  // `/runs` rows over the daemon's 14-day scan window, unioning missions,
-  // lab runs and ghosts this page never sees. Measured live on both
-  // machines: the link said "0 runs" while the destination listed 282 and
-  // 16. Agreement would have been coincidence.
-  //
-  // Fetching `/runs` here to make the number honest was the alternative and
-  // is the wrong trade: this page is the RESIDENCY ROOM (see the module doc)
-  // and the whole point of #1809 is that run accounting belongs to the runs
-  // lens. Adding a second live-only query, and a second thing to gate on
-  // the static-build check (`getSource().kind`), to label a hyperlink would walk that back. A count that
-  // cannot drift because it is not there beats a count that is right today.
 
   return (
     <div className="machine-lens">
@@ -520,56 +495,6 @@ export function MachineLens({
           </div>
         )}
       </div>
-
-      {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
-          #1508 step 2's own commit named it "deliberately interim". This is
-          the replacement: a link into the Runs lens, pinned to this
-          machine. It carries NO count, deliberately — the measured reason is
-          the comment block just above this component's `return` (the two
-          sides counted different things over different windows, and the link
-          read "0 runs" against a destination listing 282). That block used to
-          be anchored here as "above `loose`"; the `loose` memo is gone, the
-          block is not. Rendered
-          only once a machine is actually resolved (`targetUid != null` —
-          mirrors every other `targetUid`-gated region on this page); a page
-          that hasn't resolved a target yet has nothing to link to. A real
-          `<a>` (not a `role="button"` div, unlike the old expand control it
-          replaces) — this is honest cross-lens NAVIGATION, keyboard-
-          activatable for free, and consistent with every other cross-lens
-          hop in this file (`NavChrome`'s own tabs use the same direct
-          hash-write pattern). */}
-      {targetUid != null &&
-        (isMobile ? (
-          // (#2108, operator finding) The mobile full-width form needs TWO
-          // flex items — the label and the arrow — so `justify-content:
-          // space-between` (styles.css's `--mobile` rule) has something to
-          // pin apart; a single text run (desktop's own form, below) is
-          // ONE anonymous flex item with nothing to distribute against.
-          // Neither span is `aria-hidden` — the accessible name stays
-          // "runs on <machine> →", arrow included, exactly like desktop.
-          <a
-            className="machine-lens__runslink machine-lens__runslink--mobile"
-            href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
-            onClick={(e) => {
-              e.preventDefault();
-              location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
-            }}
-          >
-            <span>runs on {label}</span>
-            <span>→</span>
-          </a>
-        ) : (
-          <a
-            className="machine-lens__runslink"
-            href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
-            onClick={(e) => {
-              e.preventDefault();
-              location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
-            }}
-          >
-            runs on {label} →
-          </a>
-        ))}
 
     </div>
   );
