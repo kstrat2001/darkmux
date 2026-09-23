@@ -673,6 +673,11 @@ export interface DispatchCompletePayload {
    * predating the field exist. Consumers fall back to subtracting the start
    * and terminal timestamps — see `lenses/session/sessionRun.ts`. */
   wall_ms?: number;
+  /** (#2863 review) `wall_ms` INCLUDES this time — "wall stays wall"
+   * (`dispatch_internal.rs`'s own comment on `build_dispatch_complete_payload`).
+   * The sum of every inter-turn rest this execution took, and how many. */
+  rest_ms?: number;
+  rests?: number;
   total_turns?: number;
   total_tools?: number;
   total_tokens?: number;

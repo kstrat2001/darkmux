@@ -611,6 +611,17 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         ? "killed (timeout)"
         : `errored${exitCode != null ? ` (exit ${exitCode})` : ""}`
       : undefined;
+  // (#2863 review, finding 1) `wall_ms` INCLUDES thermal-rest time ("wall
+  // stays wall" — `dispatch_internal.rs`'s own comment), so a tile labeled
+  // "model time" over that figure overstates how long the model actually
+  // worked — a run resting 6 times for 1:30 total still reads as 4:03 of
+  // model time. There is no honest model-only figure to show (turn headers
+  // sum only the VISIBLE turns, not a total the harness itself records), so
+  // the tile names itself for what it measures (run time, wall_ms as-is) and
+  // surfaces the rest separately from the recorded `rest_ms`/`rests`.
+  const restMs = (c?.payload as DispatchCompletePayload | undefined)?.rest_ms;
+  const restSub = typeof restMs === "number" && Number.isFinite(restMs) && restMs > 0 ? `incl. ${fmtElapsed(restMs)} thermal rest` : undefined;
+  const wallSub = [wallOutcome, restSub].filter(Boolean).join(" · ") || undefined;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();
   const svLabel = statusLabel(
@@ -862,9 +873,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     systemIdx,
     wallBase,
     "WALL CLOCK",
-    "model time",
-    "model time — the runtime's own measure of this execution. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
-    wallOutcome,
+    "run time",
+    "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
+    wallSub,
   );
   // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
   // and it is the reading contract 8 supports: the harness DECIDES to compact
