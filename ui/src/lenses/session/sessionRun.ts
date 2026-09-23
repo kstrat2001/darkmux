@@ -620,19 +620,45 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // the tile names itself for what it measures (run time, wall_ms as-is) and
   // surfaces the rest separately from the recorded `rest_ms`/`rests`.
   const restMs = (c?.payload as DispatchCompletePayload | undefined)?.rest_ms;
-  // (#2863 review round 2, finding 4) `rest_ms` sums EVERY inter-turn rest —
-  // routine `turn_delay` cool-downs, thermal governor pauses, battery
-  // pauses, and operator holds — not thermal-only (verified against
-  // `DispatchCompletePayload.rest_ms`'s own doc, not assumed). The base
-  // line names no cause. `paced_rest_ms` is the non-routine share
-  // (`reason != "turn_delay"`), and it is ALSO not thermal-only — a
-  // battery pause's reason is `"battery"`, also `!= "turn_delay"` — so it
-  // is labeled "paced", not "thermal".
-  const pacedRestMs = (c?.payload as DispatchCompletePayload | undefined)?.paced_rest_ms;
-  const restSub =
-    typeof restMs === "number" && Number.isFinite(restMs) && restMs > 0
-      ? `incl. ${fmtElapsed(restMs)} rest${typeof pacedRestMs === "number" && pacedRestMs > 0 ? ` · ${fmtElapsed(pacedRestMs)} paced` : ""}`
-      : undefined;
+  // (#2863) Name what the rest was FOR, from the rest records themselves:
+  // each `dispatch.rest` that carries `ms` is one rest and names its
+  // `reason`. (A record with `delay_ms` and no `ms` is the governor changing
+  // its pacing, not a rest.) The operator read "incl. 1:30 rest · 1:30
+  // paced" as harness jargon saying one thing twice; `rest_ms` totals every
+  // rest and `paced_rest_ms` only says "not routine", so neither can name a
+  // cause. When the per-rest records don't add up to the recorded total
+  // (older runs, records outside the loaded window), the line names none
+  // rather than under-report.
+  const restCause = (reason: unknown): string => {
+    const r = String(reason ?? "");
+    if (r.startsWith("thermal")) return "thermal";
+    if (r === "turn_delay") return "cool-down";
+    if (r.startsWith("battery")) return "battery";
+    if (r.startsWith("operator")) return "hold";
+    return r || "rest";
+  };
+  const byCause = new Map<string, number>();
+  for (const r of attemptRecs) {
+    if (r.action !== "dispatch.rest") continue;
+    const f = (r.fields || r.payload || {}) as Record<string, unknown>;
+    if (typeof f.ms !== "number" || !Number.isFinite(f.ms) || f.ms <= 0) continue;
+    const k = restCause(f.reason);
+    byCause.set(k, (byCause.get(k) ?? 0) + f.ms);
+  }
+  const causeSum = [...byCause.values()].reduce((x, y) => x + y, 0);
+  const causes = [...byCause.entries()].sort((x, y) => y[1] - x[1]);
+  let restSub: string | undefined;
+  if (typeof restMs === "number" && Number.isFinite(restMs) && restMs > 0) {
+    const total = fmtElapsed(restMs);
+    if (causes.length && causeSum === restMs) {
+      restSub =
+        causes.length === 1
+          ? `incl. ${total} ${causes[0][0]} rest`
+          : `incl. ${total} rest (${causes.map(([k, ms]) => `${fmtElapsed(ms)} ${k}`).join(" · ")})`;
+    } else {
+      restSub = `incl. ${total} rest`;
+    }
+  }
   const wallSub = [wallOutcome, restSub].filter(Boolean).join(" · ") || undefined;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();

@@ -250,24 +250,59 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // thermal-only (a battery pause's `reason` is also `!= "turn_delay"`).
   // So the base line names no cause ("incl. N rest") and only a non-zero
   // `paced_rest_ms` gets its own, honestly-named clause ("N paced").
-  it("(#2863 review) WALL CLOCK reads as run time, with a sub line for rested time", () => {
+  it("(#2863 review) WALL CLOCK reads as run time, and names what the rest was for", () => {
+    // Operator, 2026-09-23: "incl. 1:30 rest · 1:30 paced" said the same
+    // thing twice in harness words. Each rest record carries its cause; the
+    // tile names it.
+    const rest = (sec: number) => ({
+      ts: `2026-01-01T00:0${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}Z`,
+      session_id: "s1",
+      action: "dispatch.rest",
+      payload: { ms: 15000, reason: "thermal-duty-cycle", state: "fair" },
+    });
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // A pacing CHANGE record (delay_ms, no ms) is not a rest and must not count.
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", action: "dispatch.rest", payload: { delay_ms: 15000, reason: "thermal-duty-cycle", state: "fair", pause: false } },
+      ...[10, 30, 50, 70, 90, 110].map(rest),
       {
         ts: "2026-01-01T00:04:03.705Z",
         session_id: "s1",
         action: "dispatch.complete",
-        payload: { wall_ms: 243705, rest_ms: 90000, rests: 6, paced_rest_ms: 45000 },
+        payload: { wall_ms: 243705, rest_ms: 90000, rests: 6, paced_rest_ms: 90000 },
       },
-    ];
+    ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
     expect(wall?.value).toBe("4:03");
     expect(wall?.hint).toBe("run time");
-    expect(wall?.sub).toBe("incl. 1:30 rest · 0:45 paced");
+    expect(wall?.sub).toBe("incl. 1:30 thermal rest");
   });
 
-  it("(#2863 review round 2) rest with no paced portion names no cause", () => {
+  it("(#2863) mixed rest causes are each named, largest first", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } },
+      { ts: "2026-01-01T00:00:50Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 60000, reason: "thermal-duty-cycle", state: "fair" } },
+      { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 60000 } },
+    ] as FlowRecord[];
+    const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.sub).toBe("incl. 1:30 rest (1:00 thermal · 0:30 cool-down)");
+  });
+
+  it("(#2863) rest records that don't add up to the recorded total name no cause", () => {
+    // Older runs, or records outside the loaded window: the per-cause sum
+    // would under-report, so fall back to the recorded total alone.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "thermal-duty-cycle" } },
+      { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 6 } },
+    ] as FlowRecord[];
+    const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.sub).toBe("incl. 1:30 rest");
+  });
+
+  it("(#2863 review round 2) rest with no per-rest records names no cause", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -307,7 +342,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("errored (exit 1) · incl. 0:15 rest · 0:15 paced");
+    expect(wall?.sub).toBe("errored (exit 1) · incl. 0:15 rest");
   });
 
   it("a remote (endpoint-served) run names the endpoint and omits the local model track", () => {
