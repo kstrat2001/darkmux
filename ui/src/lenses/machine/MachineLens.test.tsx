@@ -729,7 +729,7 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     // exists to fix.
     expect(screen.getByText("Normal")).toBeInTheDocument();
     expect(screen.queryByText(/Check Battery/)).toBeNull();
-    expect(screen.getByText(/5,701 of 6,249 mAh design/)).toBeInTheDocument();
+    expect(screen.getByText(/5,701 of 6,249 mAh \(raw/)).toBeInTheDocument();
     expect(screen.getByText("28")).toBeInTheDocument();
     expect(screen.getByText("31.0 °C")).toBeInTheDocument();
     // (#2821, operator, 2026-09-23) The per-bucket histogram was pulled —
@@ -778,6 +778,36 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     renderMachine(null);
     await waitFor(() => expect(screen.getByText("charging")).toBeInTheDocument());
     expect(screen.queryByText(/left$/)).toBeNull();
+  });
+
+  // (#2821 review, item 5) The dial tints red/amber only while genuinely
+  // discharging and low — never on AC, however low the percent.
+  it("tints critical while discharging at 5%", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: {
+        ...RESOURCES,
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { charge_pct: 5, on_ac: false, charging: false, minutes_to_empty: 9 } } },
+      },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("5%")).toBeInTheDocument());
+    const fill = container.querySelector(".battery-block .mm-gauge-fill-compact")!;
+    expect(fill.classList.contains("mm-band-critical")).toBe(true);
+  });
+
+  it("stays untinted on AC even at 5% — the concerning direction requires discharging", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: {
+        ...RESOURCES,
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { charge_pct: 5, on_ac: true, charging: true, minutes_to_empty: null } } },
+      },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("5%")).toBeInTheDocument());
+    const fill = container.querySelector(".battery-block .mm-gauge-fill-compact")!;
+    expect(fill.getAttribute("class")).not.toMatch(/mm-band-/);
   });
 });
 

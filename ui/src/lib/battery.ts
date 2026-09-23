@@ -34,13 +34,17 @@ export function chargeCaption(b: BatterySample | null): string {
 }
 
 /** The health row's condition value + whether it should render in the warn
- * tone. Prefers the COMPUTED `condition_word` (Normal/Service Battery,
- * derived from `permanent_failure_status`) over the raw, unreliable IOKit
- * `condition` string — see `BatteryHealth`'s own doc for the measurement
- * this is based on (the reference machine's raw string read "Check
- * Battery" while `condition_word` and macOS's own Settings/system_profiler
- * agreed "Normal"). Falls back to labeling the raw string PRECISELY (never
- * as "the" condition) only when no computed word is available at all. */
+ * tone. Prefers the COMPUTED `condition_word` — derived server-side from
+ * `health_condition` (the authoritative `BatteryHealthCondition` signal),
+ * with `permanent_failure_status` acting only as a failure override; see
+ * `BatteryHealth`'s own doc for the corrected derivation and the
+ * measurement backing it (the reference machine's raw `condition` string
+ * read "Check Battery" while `health_condition`/`condition_word` and
+ * `system_profiler` agreed "Normal"). `warn` fires for ANY non-"Normal"
+ * value, including a verbatim passthrough like "Service Recommended" —
+ * never just a fixed two-word enum. Falls back to labeling the raw
+ * `condition` string PRECISELY (never as "the" condition) only when no
+ * computed word is available at all. */
 export function conditionRow(h: BatteryHealth | null): { value: string; warn: boolean } | null {
   if (h === null) return null;
   if (h.condition_word != null) {
@@ -54,22 +58,43 @@ export function conditionRow(h: BatteryHealth | null): { value: string; warn: bo
   return null;
 }
 
-/** `5,701 of 6,249 mAh design (91.2% raw · 93.7% nominal)` — both capacity
- * ratios, always both, never relabeled "Maximum Capacity": measured
- * against the reference machine, neither ratio reproduces macOS's own
- * "Maximum Capacity" figure (system_profiler showed 95% where raw read
- * 91.2% and nominal read 93.7%), so claiming parity with that figure would
- * be a fabrication. `null` when the mAh pair itself is unavailable. */
-export function capacityLine(h: BatteryHealth | null): string | null {
+/** The battery-lens "charge capacity" row's value + a `title` disclosure —
+ * split apart (#2821 review, item 3) because the ORIGINAL one-line form
+ * ("5,701 of 6,249 mAh design (91.2% raw · 93.7% nominal)") reads too much
+ * like macOS's own single "Maximum Capacity: 95%" figure, just with more
+ * digits. Neither ratio recorded here reproduces that figure (measured on
+ * the reference machine: raw 91.2%, nominal 93.7%, macOS's own figure
+ * 95%), so presenting two percentages side by side invited exactly the
+ * conflation the label change fixes.
+ *
+ * The visible `value` now carries ONLY the raw reading — `N of M mAh
+ * (raw)`, parenthetical source named inline rather than implied — and the
+ * nominal reading moves into `title` (a hover/long-press disclosure,
+ * `Kv`'s own new prop), worded as a disclaimer rather than a second
+ * headline number. `null` when the mAh pair itself is unavailable. */
+export interface CapacityDisplay {
+  value: string;
+  title: string | null;
+}
+
+export function capacityLine(h: BatteryHealth | null): CapacityDisplay | null {
   if (h === null) return null;
   const design = h.design_capacity_mah;
   const raw = h.raw_max_capacity_mah;
   if (design == null || raw == null) return null;
-  const parts: string[] = [];
-  if (h.raw_capacity_pct != null) parts.push(`${h.raw_capacity_pct}% raw`);
-  if (h.nominal_capacity_pct != null) parts.push(`${h.nominal_capacity_pct}% nominal`);
-  const pctClause = parts.length > 0 ? ` (${parts.join(" · ")})` : "";
-  return `${raw.toLocaleString()} of ${design.toLocaleString()} mAh design${pctClause}`;
+  const rawPctClause = h.raw_capacity_pct != null ? `, ${h.raw_capacity_pct}%` : "";
+  const value = `${raw.toLocaleString()} of ${design.toLocaleString()} mAh (raw${rawPctClause})`;
+
+  const nominalParts: string[] = [];
+  if (h.nominal_charge_capacity_mah != null) {
+    nominalParts.push(`${h.nominal_charge_capacity_mah.toLocaleString()} mAh nominal`);
+  }
+  if (h.nominal_capacity_pct != null) nominalParts.push(`${h.nominal_capacity_pct}%`);
+  const title =
+    nominalParts.length > 0
+      ? `Nominal reading: ${nominalParts.join(", ")}. Neither this nor the raw figure above is macOS's own "Maximum Capacity" percentage — that figure uses an undocumented Apple formula and reproduces from neither.`
+      : `Not macOS's own "Maximum Capacity" percentage — that figure uses an undocumented Apple formula.`;
+  return { value, title };
 }
 
 /** `5,368 h` — the lifetime cross-check total, formatted with the same

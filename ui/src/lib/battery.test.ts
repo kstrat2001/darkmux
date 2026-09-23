@@ -15,6 +15,7 @@ function health(over: Partial<BatteryHealth> = {}): BatteryHealth {
     raw_capacity_pct: 91.2,
     nominal_capacity_pct: 93.7,
     condition: "Check Battery",
+    health_condition: "",
     condition_word: "Normal",
     permanent_failure_status: 0,
     temperature_c: 31.01,
@@ -54,6 +55,16 @@ describe("conditionRow", () => {
       warn: true,
     });
   });
+  // (#2821 review, MUST-FIX 1's UI-facing counterpart) A verbatim
+  // passthrough condition word (not one of the two fixed literals) must
+  // still warn — the false all-clear this review found was exactly a case
+  // where a non-"Normal" word was being silently read as healthy.
+  it("warns on any non-Normal verbatim passthrough, not just the fixed Service Battery literal", () => {
+    expect(conditionRow(health({ condition_word: "Service Recommended" }))).toEqual({
+      value: "Service Recommended",
+      warn: true,
+    });
+  });
   it("falls back to a precisely-labeled raw string, never colored, when no computed word exists", () => {
     expect(conditionRow(health({ condition_word: null, condition: "Good" }))).toEqual({
       value: "power source reports: Good",
@@ -66,8 +77,22 @@ describe("conditionRow", () => {
 });
 
 describe("capacityLine", () => {
-  it("shows both ratios, never as macOS's own Maximum Capacity figure", () => {
-    expect(capacityLine(health())).toBe("5,701 of 6,249 mAh design (91.2% raw · 93.7% nominal)");
+  // (#2821 review, item 3) The value shows ONLY the raw reading, labeled
+  // inline — never a second headline percentage that reads like macOS's
+  // own single "Maximum Capacity" figure.
+  it("the visible value carries only the raw reading, labeled inline", () => {
+    expect(capacityLine(health())?.value).toBe("5,701 of 6,249 mAh (raw, 91.2%)");
+  });
+  it("the nominal reading and the disclaimer move into title", () => {
+    const title = capacityLine(health())?.title;
+    expect(title).toContain("5,853 mAh nominal");
+    expect(title).toContain("93.7%");
+    expect(title).toContain('macOS\'s own "Maximum Capacity"');
+  });
+  it("title still carries the disclaimer even with no nominal figures at all", () => {
+    const title = capacityLine(health({ nominal_charge_capacity_mah: null, nominal_capacity_pct: null }))?.title;
+    expect(title).toContain('macOS\'s own "Maximum Capacity"');
+    expect(title).not.toContain("nominal");
   });
   it("is null without the mAh pair", () => {
     expect(capacityLine(health({ raw_max_capacity_mah: null }))).toBeNull();

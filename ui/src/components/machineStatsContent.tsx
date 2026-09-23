@@ -102,14 +102,22 @@ function Kv({
   label,
   value,
   className,
+  title,
 }: {
   label: string;
   value: string;
   className?: string;
+  /** (#2821 review, item 3) An optional hover/long-press disclosure —
+   * currently only the battery health row's "charge capacity" line uses
+   * this, to carry the nominal-capacity reading and the "not macOS's own
+   * Maximum Capacity" disclaimer without making it a second headline
+   * number beside the raw one. Every other `Kv` caller omits this and
+   * renders unchanged (`title={undefined}` renders no attribute at all). */
+  title?: string;
 }) {
   if (!value) return null;
   return (
-    <div className={`dialog__kv${className ? ` ${className}` : ""}`}>
+    <div className={`dialog__kv${className ? ` ${className}` : ""}`} title={title}>
       <b>{label}</b>
       <span>{value}</span>
     </div>
@@ -401,11 +409,22 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  * record exhaustively, display selectively), just not rendered here. Do
  * not re-add a chart of it without first getting the layout documented (or
  * reverse-engineered with actual confidence) from Apple. */
+/** (#2821 review, item 5) The charge dial's own low-charge thresholds —
+ * meaningful ONLY while genuinely discharging (`!sample.on_ac`); on AC
+ * (charging or topped off) the dial stays neutral regardless of percent,
+ * since "20% while plugged in and climbing" is not the concerning reading
+ * "20% and falling" is. Picked to read as an ordinary low-battery warning
+ * (a phone's own UI convention), not tied to any macOS-documented value. */
+const BATTERY_LOW_WARN_PCT = 20;
+const BATTERY_LOW_CRITICAL_PCT = 10;
+
 function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; health: BatteryHealth | null }) {
   if (sample === null && health === null) return null;
   const cond = conditionRow(health);
   const capacity = capacityLine(health);
   const operatingHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
+  // Only tint while discharging — see the constants' own doc above.
+  const dischargingLow = sample != null && !sample.on_ac;
   return (
     <div className="battery-block hx-section">
       <div className="hx-section__title">Battery</div>
@@ -423,15 +442,15 @@ function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; he
             // caption directly under the dial would be a literal duplicate
             // of the title one line up — caught live via the parity golden
             // (#2821, playwright run: "BATTERY" rendered twice).
-            // (#2821) The charge dial's own reading never turns amber/red on
-            // this gauge — a LOW charge is the concerning direction here,
-            // the opposite of CPU/GPU/MEM's "high is bad" scale that
-            // `meterBandLevel`'s thresholds assume, and there is no single
-            // percent that means "low" independent of on_ac/charging. The
-            // health row below (condition) carries the real alarm; this
-            // dial stays neutral, same treatment the CPU-cluster tiles get.
-            warnAt={Number.POSITIVE_INFINITY}
-            criticalAt={Number.POSITIVE_INFINITY}
+            // (#2821 review, item 5) The dial DOES tint now, but only while
+            // discharging and low — `lowIsBad` inverts the usual "high is
+            // bad" direction CPU/GPU/MEM use. On AC the thresholds are
+            // pushed to -Infinity so nothing can ever cross them (never
+            // +Infinity here: with lowIsBad, a LOWER bound is what "never
+            // fires" needs).
+            warnAt={dischargingLow ? BATTERY_LOW_WARN_PCT : Number.NEGATIVE_INFINITY}
+            criticalAt={dischargingLow ? BATTERY_LOW_CRITICAL_PCT : Number.NEGATIVE_INFINITY}
+            lowIsBad
             bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", sample.charge_pct)}
             needleAngleDeg={sample.charge_pct == null ? undefined : angleForPct(sample.charge_pct)}
             numerals={{ now: sample.charge_pct, avg: null, max: null }}
@@ -442,7 +461,7 @@ function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; he
       {health && (
         <>
           {cond && <Kv className={cond.warn ? "dialog__kv--warn" : ""} label="condition" value={cond.value} />}
-          {capacity && <Kv label="capacity" value={capacity} />}
+          {capacity && <Kv label="charge capacity" value={capacity.value} title={capacity.title ?? undefined} />}
           <Kv label="cycles" value={health.cycle_count != null ? String(health.cycle_count) : ""} />
           <Kv label="temperature" value={health.temperature_c != null ? `${health.temperature_c.toFixed(1)} °C` : ""} />
           <Kv label="operating time" value={operatingHours ?? ""} />
@@ -1082,9 +1101,10 @@ export function useMachineStatsContent({
       )}
       {hostExtras}
       {/* (#2821, operator scope: the LIVE MACHINE LENS ONLY) charge + health
-          + time-at-charge histogram. Deliberately absent from `body` above
-          (the machine drawer / phone-drawer Machine tab) and from
-          `HostExtras` (shared by both) — see `BatteryLensBlock`'s own doc.
+          (condition, capacity, cycles, temperature, operating time — no
+          time-at-charge chart, see `BatteryLensBlock`'s own doc for why).
+          Deliberately absent from `body` above (the machine drawer /
+          phone-drawer Machine tab) and from `HostExtras` (shared by both).
           Reads `daemonLoad` directly, the same way `hostExtras` does: a
           host fact, not scoped to any one dispatch. */}
       <BatteryLensBlock sample={daemonLoad?.now?.battery ?? null} health={daemonLoad?.battery_health ?? null} />

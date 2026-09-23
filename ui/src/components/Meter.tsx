@@ -185,6 +185,11 @@ export interface MeterProps {
    * never reads these — nothing to threshold. */
   warnAt?: number;
   criticalAt?: number;
+  /** (#2821 review, item 5) Inverts `warnAt`/`criticalAt`'s direction —
+   * see `meterBandLevel`'s own doc. Defaults to `false` (every existing
+   * "high is bad" caller). The battery charge gauge is the one caller
+   * that passes `true`, and only while genuinely discharging. */
+  lowIsBad?: boolean;
   /** Extra SVG content drawn last, before `</svg>` closes — VRAM's
    * odometer digit group + its two text labels. The one thing that isn't
    * shared core (see this module's own doc). */
@@ -228,9 +233,28 @@ export const MEM_CRITICAL_AT = 97;
  * (MEM wants 90/97, see `MachineLens.tsx`'s own note on why) rather than
  * hardcoded here, so this stays one function for every caller. `>=` at
  * each edge: a reading AT the threshold is already the next band up,
- * matching the thermal pill's own `>= 80` / `>= 95` wording (#2122). */
-export function meterBandLevel(now: number | null, warnAt: number, criticalAt: number): MeterBandLevel {
+ * matching the thermal pill's own `>= 80` / `>= 95` wording (#2122).
+ *
+ * `lowIsBad` (#2821 review, item 5) inverts the direction for a metric
+ * where a LOW reading is the concerning one — battery charge while
+ * discharging, unlike every "high is bad" caller (CPU/GPU/MEM/clusters).
+ * Inverted, `warnAt`/`criticalAt` are read as upper bounds a falling
+ * reading crosses (e.g. `warnAt: 20, criticalAt: 10` — at or below 20% is
+ * warn, at or below 10% is critical), with the SAME `>=`-style inclusive
+ * edge in its own direction (`<=`). Defaults to `false` so every existing
+ * caller is unaffected. */
+export function meterBandLevel(
+  now: number | null,
+  warnAt: number,
+  criticalAt: number,
+  lowIsBad = false,
+): MeterBandLevel {
   if (now === null) return "quiet";
+  if (lowIsBad) {
+    if (now <= criticalAt) return "critical";
+    if (now <= warnAt) return "warn";
+    return "quiet";
+  }
   if (now >= criticalAt) return "critical";
   if (now >= warnAt) return "warn";
   return "quiet";
@@ -320,6 +344,7 @@ export function Meter({
   hideAvgMax,
   warnAt = DEFAULT_WARN_AT,
   criticalAt = DEFAULT_CRITICAL_AT,
+  lowIsBad = false,
   children,
 }: MeterProps) {
   // (#2122) The caption numeral colors itself off its OWN value — every
@@ -327,7 +352,7 @@ export function Meter({
   // never disagree, but computing this independently means a caller with
   // `numerals` and no `banded` band (none exist today) simply gets no
   // caption color rather than crashing on a band lookup.
-  const nowLevelCls = numerals ? bandLevelClass(meterBandLevel(numerals.now, warnAt, criticalAt)) : "";
+  const nowLevelCls = numerals ? bandLevelClass(meterBandLevel(numerals.now, warnAt, criticalAt, lowIsBad)) : "";
   return (
     <div className={wrapperClassName} data-meter={label ? label.toLowerCase() : undefined}>
       <svg width={width} height={height} viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
@@ -352,7 +377,7 @@ export function Meter({
             // `stroke` prop via ordinary CSS cascade — SVG presentation
             // attributes sit below any stylesheet rule in priority, so no
             // conditional here is needed to suppress `b.stroke`.
-            const levelCls = b.banded ? bandLevelClass(meterBandLevel(b.lengthPct, warnAt, criticalAt)) : "";
+            const levelCls = b.banded ? bandLevelClass(meterBandLevel(b.lengthPct, warnAt, criticalAt, lowIsBad)) : "";
             return (
               <path
                 key={b.className}

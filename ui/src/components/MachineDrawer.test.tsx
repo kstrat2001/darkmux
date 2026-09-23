@@ -1408,7 +1408,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     expect(screen.queryByText("Battery")).toBeNull();
     expect(screen.queryByText("condition")).toBeNull();
     expect(screen.queryByText(/operating time/i)).toBeNull();
-    expect(screen.queryByText(/mAh design/)).toBeNull();
+    expect(screen.queryByText(/mAh \(raw/)).toBeNull();
   });
 
   // (#2440 cut 6, operator finding) The ladder already lights CURRENT

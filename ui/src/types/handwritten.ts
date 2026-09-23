@@ -551,24 +551,40 @@ export interface BatterySample {
  * telemetry sample), sitting beside `now`/`window` rather than inside
  * either. `null` on a machine with no battery.
  *
- * **`condition` vs `condition_word`**: `condition` is the raw, verbatim
- * `IOPSCopyPowerSourcesInfo` `BatteryHealth` string and is demonstrably
- * unreliable on Apple Silicon (measured on the reference machine,
- * 2026-09-23: it read "Check Battery" while `pmset`/`system_profiler` both
- * agreed "Normal" and `permanent_failure_status` was `0`). `condition_word`
- * is the COMPUTED verdict ("Normal" / "Service Battery") derived from
- * `permanent_failure_status`, which is the field that agrees with what
- * System Settings shows the user — render THIS as the primary condition,
- * and fall back to labeling `condition` precisely (never as "the"
- * condition) only when `condition_word` is `null` (an older daemon, or the
- * signal itself unavailable). See `BatteryHealth::condition`'s Rust doc
+ * **Three condition fields, and which one a UI shows** (corrected on
+ * review, #2821): `condition` is the raw, verbatim `IOPSCopyPowerSourcesInfo`
+ * `BatteryHealth` string and is demonstrably unreliable on Apple Silicon
+ * (measured on the reference machine, 2026-09-23: it read "Check Battery").
+ * `health_condition` is a DIFFERENT, AUTHORITATIVE raw signal — verbatim
+ * `IOPSGetPowerSourceDescription`'s `BatteryHealthCondition` key — verified
+ * on the SAME machine at the SAME instant to read `""` (empty, healthy),
+ * agreeing with `system_profiler -xml SPPowerDataType`'s
+ * `sppower_battery_health: "Good"`. `condition_word` is the COMPUTED
+ * verdict derived from `health_condition` (empty -> `"Normal"`, non-empty
+ * -> passed through verbatim) with `permanent_failure_status` acting only
+ * as a FAILURE OVERRIDE (non-zero -> `"Service Battery"` regardless) — see
+ * `BatteryHealth::condition_word`'s Rust doc
  * (`crates/darkmux-crew/src/host_probe/battery.rs`) for the full
- * measurement this is based on.
+ * derivation and why `permanent_failure_status` alone is NOT sufficient
+ * (an earlier revision used it alone and produced a false "Normal" for a
+ * battery macOS flags "Service Recommended" for ordinary wear). Render
+ * `condition_word` as the primary condition; fall back to labeling
+ * `condition` precisely (never as "the" condition) only when
+ * `condition_word` is `null`.
+ *
+ * Correction: an earlier revision of this doc also claimed `pmset -g
+ * rawbatt` "agrees the battery is healthy" — re-checked and that is wrong;
+ * `pmset -g batt`/`-g rawbatt` print no condition word at all on this
+ * macOS version, so pmset neither agrees nor disagrees with anything here.
  *
  * **Capacity**: two DIFFERENT ratios, both recorded, neither claimed to be
  * macOS's own "Maximum Capacity" figure (measured: neither reproduces it —
- * see the Rust module doc's capacity table). Render both mAh pairs plainly
- * labeled RAW/NOMINAL rather than picking one and calling it "capacity".
+ * see the Rust module doc's capacity table). The battery lens shows only
+ * the RAW ratio as its headline "charge capacity" value, labeled `(raw)`
+ * inline; the nominal ratio moves into a hover/long-press disclosure
+ * (`ui/src/lib/battery.ts`'s `capacityLine`) rather than sitting beside the
+ * raw figure as a second headline number, which read too much like macOS's
+ * own single "Maximum Capacity" percentage.
  *
  * `time_at_soc_hours` is the battery's own 28-bucket lifetime counter
  * (4 groups of 7 on the reference machine) — an undocumented FLAT array
@@ -588,7 +604,19 @@ export interface BatteryHealth {
   raw_capacity_pct: number | null;
   nominal_capacity_pct: number | null;
   condition: string | null;
-  condition_word: "Normal" | "Service Battery" | null;
+  /** `BatteryHealthCondition`, verbatim — the AUTHORITATIVE raw signal
+   * `condition_word` is derived from. `Some("")` (empty, present) is a
+   * definite "no condition to report" answer, distinct from `null` (key
+   * unreadable). See the interface's own doc. */
+  health_condition: string | null;
+  /** `"Normal"` when healthy, a verbatim passthrough of `health_condition`
+   * when it reports something (e.g. `"Check Battery"`,
+   * `"Permanent Battery Failure"` — Apple's own documented values, never
+   * remapped to a fixed enum), or `"Service Battery"` on a real
+   * `permanent_failure_status` failure regardless of `health_condition`.
+   * `string` rather than a closed union, matching `ThermalState`'s own
+   * convention: an unrecognized future word must render, not vanish. */
+  condition_word: string | null;
   permanent_failure_status: number | null;
   temperature_c: number | null;
   time_at_soc_hours: number[] | null;
