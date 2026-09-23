@@ -8,6 +8,26 @@
 
 use serde_json::json;
 
+/// Strip terminal control characters (`char::is_control`: C0 incl. ESC, and
+/// C1) from a string before it is printed to a terminal. `model`, `result`,
+/// `verify` and the checkpoint `policy` all ride the trajectory, and the
+/// sandbox's `/darkmux-out` is model-writable — an untrusted string can
+/// carry an escape sequence that repaints the terminal. JSON output needs no
+/// such pass: `serde_json` already escapes control characters on write.
+fn sanitize_for_terminal(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// The same pass, applied to a model list (`SetSummary::models`, sourced
+/// from every run's own `model` field) and joined the way every set-view
+/// print site displays it. One function so the column-width calculation and
+/// the actual print always sanitize identically — a length computed from
+/// the RAW string and a value printed from the SANITIZED one can disagree
+/// by exactly however many control bytes got stripped.
+fn sanitized_models(models: &[String]) -> String {
+    models.iter().map(|m| sanitize_for_terminal(m)).collect::<Vec<_>>().join(", ")
+}
+
 /// `writeln!` into the output buffer. Writing to a `String` cannot fail.
 macro_rules! p {
     ($o:expr) => {
@@ -32,12 +52,12 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
     let secs = |ms: u64| ms as f64 / 1000.0;
     p!(out, "run:         {}", s.run);
     if let Some(m) = &s.model {
-        p!(out, "model:       {m}");
+        p!(out, "model:       {}", sanitize_for_terminal(m));
     }
-    p!(out, 
+    p!(out,
         "result:      {}{}",
-        s.result.as_deref().unwrap_or("?"),
-        s.verify.as_deref().map(|v| format!("   verify: {v}")).unwrap_or_default()
+        s.result.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "?".into()),
+        s.verify.as_deref().map(|v| format!("   verify: {}", sanitize_for_terminal(v))).unwrap_or_default()
     );
     p!(out);
 
@@ -96,7 +116,7 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
         g.checkpoint.degenerate_turns.len(),
         g.checkpoint.concluded_turns.len(),
         ratio(g.checkpoint.min_tail_ratio),
-        g.checkpoint.policy.as_deref().map(|p| format!("   policy={p}")).unwrap_or_default()
+        g.checkpoint.policy.as_deref().map(|p| format!("   policy={}", sanitize_for_terminal(p))).unwrap_or_default()
     );
 
     if let (Some(gpu), Some(cpu), Some(pkg)) = (s.gpu_w_busy, s.cpu_w_busy, s.pkg_w_busy) {
@@ -108,7 +128,7 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
         if let Some(j) = s.pkg_j_per_1k_tokens {
             p!(out, 
                 "energy       {j} J per 1k tokens{}",
-                s.pkg_j_busy.map(|t| format!("   {:.1} kJ over the run", t / 1000.0)).unwrap_or_default()
+                s.pkg_j_busy.map(|t| format!("   {:.1} kJ while busy", t / 1000.0)).unwrap_or_default()
             );
         }
         if !s.thermal_states_busy.is_empty() {
@@ -177,18 +197,22 @@ fn fmt_opt(v: Option<f64>, dp: usize) -> String {
 /// the failed ones as flags on the same line: dropping a row that did not
 /// reconcile would be choosing the answer.
 fn table_text(out: &mut String, set: &StatsSet) {
-    use crate::lab::stats_set::flags;
+    use crate::lab::stats_set::{flags, overlapping};
+    let overlap = overlapping(&set.runs);
     let w = set.runs.iter().map(|s| s.run.len()).chain(set.errors.iter().map(|(r, _)| r.len())).max().unwrap_or(3).max(3);
-    p!(out, 
+    p!(out,
         "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  flags",
         "run", "verify", "active", "rest", "turns", "tok/s", "billed", "tokens", "cuts", "pkgW", "duty", "J/1ktok"
     );
     for s in &set.runs {
-        let f = flags(s);
+        let mut f = flags(s);
+        if overlap.contains(&s.run) {
+            f.push("OVERLAP");
+        }
         p!(out, 
             "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  {}",
             s.run,
-            s.verify.as_deref().unwrap_or("-"),
+            s.verify.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "-".into()),
             fmt_secs(s.active_ms as f64),
             fmt_secs(s.rest_ms as f64),
             s.turns,
@@ -205,6 +229,15 @@ fn table_text(out: &mut String, set: &StatsSet) {
     for (r, e) in &set.errors {
         p!(out, "{r:<w$}  not counted: {e}");
     }
+}
+
+/// Run ids present in both arms of a comparison — `stats X --baseline X`
+/// being the degenerate case, but any run named on both sides has the same
+/// shape: every ratio touching it reads 1.00x because the two arms are
+/// literally the same data, not because the change had no effect.
+fn cross_arm_overlap(cand: &StatsSet, base: &StatsSet) -> Vec<String> {
+    let base_ids: std::collections::BTreeSet<&str> = base.runs.iter().map(|s| s.run.as_str()).collect();
+    cand.runs.iter().map(|s| s.run.as_str()).filter(|r| base_ids.contains(r)).map(str::to_string).collect()
 }
 
 /// (#2855) The set view, and with a baseline, the comparison.
@@ -247,12 +280,12 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
     let cost: [CostRow; 3] = [
         ("active", |s| s.cost_per_success.active_ms, &secs),
         ("GPU busy", |s| s.cost_per_success.gpu_busy_ms, &secs),
-        ("energy", |s| s.cost_per_success.pkg_joules.map(|j| j / 1000.0), &|v| format!("{v:.1} kJ")),
+        ("energy (busy)", |s| s.cost_per_success.pkg_joules.map(|j| j / 1000.0), &|v| format!("{v:.1} kJ")),
     ];
 
     match &b {
         None => {
-            p!(out, "set          {}   models: {}", outcome(&c), c.models.join(", "));
+            p!(out, "set          {}   models: {}", outcome(&c), sanitized_models(&c.models));
             for (name, get, f) in &rows {
                 p!(out, "  {name:<16} {}", fmt_range(get(&c), c.n, f));
             }
@@ -266,10 +299,12 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
             }
         }
         Some(b) => {
-            let col = 26.max(b.models.join(", ").len() + 2);
+            let baseline_models = sanitized_models(&b.models);
+            let candidate_models = sanitized_models(&c.models);
+            let col = 26.max(baseline_models.len() + 2);
             p!(out, "{:<18} {:<col$} {:<col$} moved", "", "baseline", "candidate");
             p!(out, "{:<18} {:<col$} {:<col$}", "outcome", outcome(b), outcome(&c));
-            p!(out, "{:<18} {:<col$} {:<col$}", "models", b.models.join(", "), c.models.join(", "));
+            p!(out, "{:<18} {:<col$} {:<col$}", "models", baseline_models, candidate_models);
             for (name, get, f) in &rows {
                 let moved = ratio(get(&c).map(|r| r.median), get(b).map(|r| r.median))
                     .map(|x| format!("{x:.2}x"))
@@ -320,6 +355,13 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
     for d in cand.duplicates.iter().chain(base.iter().flat_map(|b| b.duplicates.iter())) {
         notes.push(format!("{d} was listed more than once and is counted once"));
     }
+    if let Some(b) = base {
+        for run in cross_arm_overlap(cand, b) {
+            notes.push(format!(
+                "{run} is in both the candidate and the baseline; any comparison touching it is 1.00x by construction"
+            ));
+        }
+    }
     let errors = cand.errors.len() + base.map_or(0, |b| b.errors.len());
     if errors > 0 {
         notes.push(format!("{errors} listed run(s) are not in the figures above; see their rows"));
@@ -349,6 +391,7 @@ pub fn sets_json(cand: &StatsSet, base: Option<&StatsSet>) -> serde_json::Value 
     let mut out = one(cand);
     if let Some(b) = base {
         out["baseline"] = one(b);
+        out["cross_arm_overlap"] = json!(cross_arm_overlap(cand, b));
     }
     out
 }

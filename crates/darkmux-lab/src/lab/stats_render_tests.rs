@@ -118,13 +118,19 @@ fn rests_print_their_distinct_delays_and_the_ratchet() {
 }
 
 /// Power, energy and thermals print from telemetry, with energy in kJ.
+///
+/// (#2855 review) The kJ figure is mean BUSY-sample watts × busy time, not
+/// the run's total draw — idle and rest samples are excluded. "over the
+/// run" reads as the whole run and overstates it; the label must say
+/// "while busy" instead.
 #[test]
 fn power_and_energy_print_when_measured() {
     let mut s = run("r");
     s.thermal_states_busy.insert("fair".into(), 4);
     let t = run_text(&s);
     assert!(t.contains("gpu 30 W   cpu 8 W   package 38 W   busy 70% of the run (100 samples)"), "{t}");
-    assert!(t.contains("energy       190 J per 1k tokens   10.6 kJ over the run"), "{t}");
+    assert!(t.contains("energy       190 J per 1k tokens   10.6 kJ while busy"), "{t}");
+    assert!(!t.contains("over the run"), "the run's total draw is a different, larger figure");
     assert!(t.contains("thermal      fair 4   cpu speed limit min 100%"), "{t}");
     s.gpu_w_busy = None;
     assert!(!run_text(&s).contains("power "), "no telemetry, no power line");
@@ -173,7 +179,10 @@ fn the_set_summary_prints_ranges_and_cost_per_success() {
     let t = sets_text(&set(vec![run("a"), b]), None);
     assert_eq!(line_starting(&t, "  active").trim_end(), "  active           380s (280s–480s)");
     assert!(t.contains("cost per successful run"), "{t}");
-    assert!(line_with(&t, "  energy").contains("10.6 kJ"), "{t}");
+    // (Frontier review, 2026-09-23) "energy (busy)" — consistent with the
+    // single-run "kJ while busy" label; a bare "energy" reads as the run's
+    // total draw, which this figure is not.
+    assert!(line_with(&t, "  energy (busy)").contains("10.6 kJ"), "{t}");
     assert!(line_with(&t, "set ").contains("2 of 2 passed"), "{t}");
 }
 
@@ -248,4 +257,78 @@ fn unread_runs_are_counted_across_both_sets() {
     base.errors.push(("gone-b".into(), "x".into()));
     let t = sets_text(&cand, Some(&base));
     assert!(t.contains("2 listed run(s) are not in the figures above"), "{t}");
+}
+
+// ---- Same run named in both arms (#2855 review) -----------------------------
+
+/// `stats X --baseline X` prints a 1.00x comparison and exits 0 with no
+/// indication the two arms are the same data. A notice, same shape as the
+/// existing duplicates notice, must say so.
+#[test]
+fn a_run_named_in_both_arms_gets_a_notice() {
+    let cand = set(vec![run("x"), run("y")]);
+    let base = set(vec![run("x")]);
+    let t = sets_text(&cand, Some(&base));
+    assert!(
+        t.contains("x is in both the candidate and the baseline"),
+        "{t}"
+    );
+    assert!(!t.contains("y is in both"), "y is only in the candidate");
+    assert_eq!(exit_code(&cand, Some(&base)), 0, "a notice, not an error");
+    let j = sets_json(&cand, Some(&base));
+    assert_eq!(j["cross_arm_overlap"], serde_json::json!(["x"]));
+}
+
+/// No overlap, no notice.
+#[test]
+fn distinct_arms_get_no_cross_arm_overlap_notice() {
+    let t = sets_text(&set(vec![run("x")]), Some(&set(vec![run("y")])));
+    assert!(!t.contains("is in both the candidate and the baseline"), "{t}");
+}
+
+// ---- Terminal control characters (#2855 review, security) ------------------
+
+/// `model`, `result`, `verify` and the checkpoint `policy` ride the
+/// trajectory, which the sandbox's model-writable `/darkmux-out` can shape.
+/// An ESC/OSC payload in any of them must not reach the terminal.
+#[test]
+fn control_characters_in_model_facing_strings_are_stripped_before_printing() {
+    let mut s = run("r");
+    s.model = Some("evil\u{1b}]0;pwned\u{07}model".into());
+    s.result = Some("stop\u{1b}[31m".into());
+    s.verify = Some("pass\u{1b}[2J".into());
+    s.gates.checkpoint.policy = Some("observe\u{1b}[0m".into());
+    let t = run_text(&s);
+    assert!(!t.contains('\u{1b}'), "an ESC byte reached the terminal:\n{t:?}");
+    assert!(!t.contains('\u{07}'), "a BEL byte reached the terminal:\n{t:?}");
+    assert!(t.contains("model:       evil]0;pwnedmodel"));
+    assert!(line_starting(&t, "result:").contains("stop[31m"));
+    assert!(line_with(&t, "policy=").contains("policy=observe[0m"));
+}
+
+/// (Frontier review, 2026-09-23) The SET view has its own untrusted-string
+/// print sites — the table's `verify` column and the "models:" line(s) —
+/// that the single-run control-char test above never exercised, because
+/// `sets_text`/`table_text` are a separate code path from `run_text`.
+#[test]
+fn control_characters_in_the_set_view_are_stripped_too() {
+    let mut a = run("a");
+    a.verify = Some("pass\u{1b}[2J".into());
+    a.model = Some("m\u{1b}[31m-evil".into());
+    let t = sets_text(&set(vec![a]), None);
+    assert!(!t.contains('\u{1b}'), "an ESC byte reached the set view:\n{t:?}");
+    assert!(line_with(&t, "a ").contains("pass[2J"), "the table's verify column: {t:?}");
+    assert!(t.contains("models: m[31m-evil"), "the set's models line: {t:?}");
+}
+
+/// Same, for a baseline comparison — the "models" row prints BOTH arms.
+#[test]
+fn control_characters_in_a_baseline_comparisons_models_row_are_stripped() {
+    let mut cand = run("x");
+    cand.model = Some("cand\u{1b}[31m".into());
+    let mut base = run("y");
+    base.model = Some("base\u{1b}[32m".into());
+    let t = sets_text(&set(vec![cand]), Some(&set(vec![base])));
+    assert!(!t.contains('\u{1b}'), "an ESC byte reached the comparison view:\n{t:?}");
+    assert!(line_starting(&t, "models").contains("base[32m") && line_starting(&t, "models").contains("cand[31m"));
 }

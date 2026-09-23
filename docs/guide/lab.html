@@ -128,6 +128,35 @@
 
 <section>
   <div class="wrap">
+    <h2>Derived metrics: <code>lab run stats</code></h2>
+    <p><code>darkmux lab run stats &lt;run&gt;</code> derives the numbers a run's raw artifacts don't hand you directly &mdash; tok/s, active time (wall minus rest), energy per token, which gate cut which turn &mdash; and runs a set of reconciliation checks before printing any of it. A figure that fails a check still prints (dropping it would be choosing the answer), but the run's checks are listed underneath, unconditionally, so you never copy a number without the reason it may not be quotable.</p>
+    <pre><code>darkmux lab run stats long-agentic-balanced-1780396995-1</code></pre>
+    <p>One run prints wall/rest/active time, turns, throughput, both detection gates (the streaming gate and the per-call checkpoint gate &mdash; they judge different things and are never collapsed into one line), and host power/energy when telemetry covers the run. Pass <code>--json</code> for the full <code>RunStats</code> record instead of the text.</p>
+    <h3>Comparing a set of runs</h3>
+    <p>Name more than one run, or add <code>--baseline</code>, to get the set view: a table with one row per run, ranges (median with min&ndash;max, never a bare mean) across the set, and <strong>cost per successful run</strong> &mdash; every run's cost divided by only the runs that passed verify, because a failed run still consumed the GPU.</p>
+    <pre><code>darkmux lab run stats candidate-1 candidate-2 candidate-3 --baseline base-1 base-2 base-3</code></pre>
+    <p>A comparison prints both arms' figures side by side with the ratio that moved between them, plus a "read before quoting" block for anything the set can't vouch for: a mixed set of models, a run whose pass came from a runtime error, a run listed in both arms (its ratio is 1.00x by construction, not because nothing changed), or a withheld cost figure with the reason.</p>
+    <h3>Run flags</h3>
+    <p>Each run's table row ends with flags &mdash; short codes for a failed check or a notable condition, defined in <code>stats_set::flags()</code>. A single-run view (<code>darkmux lab run stats &lt;run&gt;</code>, no <code>--json</code>) spells the same conditions out as full sentences under "not reconciled, so do not quote these figures without saying so".</p>
+    <ul>
+      <li><strong><code>STALE-METRICS</code></strong>: this run's <code>metrics.json</code> doesn't belong to it &mdash; its own clock lands more than a few seconds before the run's own identity, or more than ten minutes after it, or it claims less wall time than the trajectory spent generating (past a small jitter tolerance either way &mdash; two different clocks, so a real run can be a few ms over). On its OWN row, wall/rest/active are still printed (dropping a row is choosing the answer), just flagged and caveated. In a SET, this run is excluded outright from the wall/rest/active/energy ranges and from cost per success, rather than folded into the median &mdash; a wrong number corrupts a comparison the same way a missing one does.</li>
+      <li><strong><code>OVERLAP</code></strong> (set view only): this run's window overlaps another (non-stale) run's in the same set. Host telemetry is matched by time window, so two overlapping runs would each claim the whole host's power; GPU-busy time and package energy are excluded from the set's ranges and from cost per success for both, rather than apportioned. A STALE-METRICS run's window is never trusted enough to accuse another run of overlapping it, and is itself excluded from overlap detection.</li>
+      <li><strong><code>RUNTIME-ERROR</code></strong> / <strong><code>ESCALATED</code></strong>: the runtime's own terminal result. A run can pass verify without doing the task (an untouched-tree fixture is green from second zero), so this is flagged, never reclassified.</li>
+      <li><strong><code>TOKENS</code></strong> / <strong><code>COUNTS</code></strong>: per-turn tokens don't sum to the recorded total, or <code>metrics.json</code>'s turns/rest disagree with the trajectory's own count.</li>
+      <li><strong><code>PARSE</code></strong> / <strong><code>VERDICT</code></strong>: the trajectory is missing an event this reading keys on, or the runtime's recorded degeneracy verdicts don't match what the tail-ratio threshold would derive &mdash; a sign the constant here no longer matches the build that produced the run.</li>
+      <li><strong><code>UNBILLED</code></strong> / <strong><code>STREAMS</code></strong>: a gate cut a stream before its usage frame arrived (tok/s then covers only the billed subset), or a stream started but never ended.</li>
+      <li><strong><code>REST</code></strong>: rest exceeds wall &mdash; two counters measuring different windows.</li>
+      <li><strong><code>NO-TELEM</code></strong> / <strong><code>TELEM-GAP</code></strong> / <strong><code>NO-FLOW</code></strong>: no host telemetry landed in the run's window, telemetry doesn't cover the whole run (busy time and energy are withheld rather than extrapolated from a gap), or no flow records at all &mdash; the run's dispatch bounds are unknown.</li>
+      <li><strong><code>POLICY</code></strong>: the detection policy the checkpoint records say ran differs from the one the host resolved.</li>
+      <li><strong><code>CHARS</code></strong>: a turn's reasoning-chars-per-token ratio is outside the plausible band &mdash; one of the two counters may not measure what its name says.</li>
+      <li><strong><code>RATCHET</code></strong> / <strong><code>THROTTLE</code></strong>: the thermal ratchet doubled the rest delay mid-run, or a busy sample recorded a CPU speed limit below 100%.</li>
+      <li><strong><code>UNGATED</code></strong>: this run's <code>verify: pass</code> predates the write-the-tests work gate for its fixture &mdash; the old "verify command exited 0" signal, which a dispatch that made zero edits also satisfies. Never reinterpreted after the fact; flagged so a mixed series isn't silently compared across two different definitions of success.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>List your runs</h2>
     <pre><code>darkmux lab run list --limit 10        <span class="comment"># most recent 10</span>
 darkmux lab run list --limit 50</code></pre>
