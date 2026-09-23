@@ -18,6 +18,16 @@ fn sanitize_for_terminal(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// The same pass, applied to a model list (`SetSummary::models`, sourced
+/// from every run's own `model` field) and joined the way every set-view
+/// print site displays it. One function so the column-width calculation and
+/// the actual print always sanitize identically — a length computed from
+/// the RAW string and a value printed from the SANITIZED one can disagree
+/// by exactly however many control bytes got stripped.
+fn sanitized_models(models: &[String]) -> String {
+    models.iter().map(|m| sanitize_for_terminal(m)).collect::<Vec<_>>().join(", ")
+}
+
 /// `writeln!` into the output buffer. Writing to a `String` cannot fail.
 macro_rules! p {
     ($o:expr) => {
@@ -202,7 +212,7 @@ fn table_text(out: &mut String, set: &StatsSet) {
         p!(out, 
             "{:<w$}  {:>6} {:>7} {:>6} {:>5} {:>7} {:>6} {:>7} {:>4} {:>6} {:>5} {:>7}  {}",
             s.run,
-            s.verify.as_deref().unwrap_or("-"),
+            s.verify.as_deref().map(sanitize_for_terminal).unwrap_or_else(|| "-".into()),
             fmt_secs(s.active_ms as f64),
             fmt_secs(s.rest_ms as f64),
             s.turns,
@@ -270,12 +280,12 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
     let cost: [CostRow; 3] = [
         ("active", |s| s.cost_per_success.active_ms, &secs),
         ("GPU busy", |s| s.cost_per_success.gpu_busy_ms, &secs),
-        ("energy", |s| s.cost_per_success.pkg_joules.map(|j| j / 1000.0), &|v| format!("{v:.1} kJ")),
+        ("energy (busy)", |s| s.cost_per_success.pkg_joules.map(|j| j / 1000.0), &|v| format!("{v:.1} kJ")),
     ];
 
     match &b {
         None => {
-            p!(out, "set          {}   models: {}", outcome(&c), c.models.join(", "));
+            p!(out, "set          {}   models: {}", outcome(&c), sanitized_models(&c.models));
             for (name, get, f) in &rows {
                 p!(out, "  {name:<16} {}", fmt_range(get(&c), c.n, f));
             }
@@ -289,10 +299,12 @@ pub fn sets_text(cand: &StatsSet, base: Option<&StatsSet>) -> String {
             }
         }
         Some(b) => {
-            let col = 26.max(b.models.join(", ").len() + 2);
+            let baseline_models = sanitized_models(&b.models);
+            let candidate_models = sanitized_models(&c.models);
+            let col = 26.max(baseline_models.len() + 2);
             p!(out, "{:<18} {:<col$} {:<col$} moved", "", "baseline", "candidate");
             p!(out, "{:<18} {:<col$} {:<col$}", "outcome", outcome(b), outcome(&c));
-            p!(out, "{:<18} {:<col$} {:<col$}", "models", b.models.join(", "), c.models.join(", "));
+            p!(out, "{:<18} {:<col$} {:<col$}", "models", baseline_models, candidate_models);
             for (name, get, f) in &rows {
                 let moved = ratio(get(&c).map(|r| r.median), get(b).map(|r| r.median))
                     .map(|x| format!("{x:.2}x"))

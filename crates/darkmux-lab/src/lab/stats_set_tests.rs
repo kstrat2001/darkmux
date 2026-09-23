@@ -189,7 +189,42 @@ fn overlapping_runs_are_flagged_and_their_energy_is_withheld() {
     assert_eq!(s.cost_per_success.pkg_joules, None);
     // Active time is not host telemetry and is unaffected by the overlap.
     assert_eq!(s.cost_per_success.active_ms, Some(100_000.0));
-    assert!(s.cost_per_success.withheld.iter().any(|w| w.contains("OVERLAP")));
+    // (Review, 2026-09-23) the EXACT reason per figure, not merely "some
+    // withheld note mentions OVERLAP" — a generic "not every run recorded
+    // it" message must not ALSO appear once the real reason is known.
+    assert_eq!(
+        s.cost_per_success.withheld,
+        vec![
+            "GPU busy time: 2 run(s) have overlapping host-telemetry windows (OVERLAP) and cannot be apportioned"
+                .to_string(),
+            "package energy: 2 run(s) have overlapping host-telemetry windows (OVERLAP) and cannot be apportioned"
+                .to_string(),
+        ]
+    );
+}
+
+/// (Review, 2026-09-23) A STALE-METRICS run's borrowed window must not
+/// implicate the CLEAN run whose metrics it copied — `overlapping()`
+/// excludes metrics_stale runs before building windows at all, so the
+/// genuine owner is never even compared against the copy.
+#[test]
+fn a_stale_metrics_runs_window_does_not_flag_the_clean_owner_it_overlaps() {
+    let mut owner = costed("owner", "pass", 100_000, 90_000, 3_000.0);
+    owner.started_at_unix_ms = Some(1_000_000);
+    owner.wall_ms = 100_000;
+    let mut stale_copy = costed("copy", "pass", 100_000, 90_000, 3_000.0);
+    // Literally the same window as `owner` — a byte-identical metrics.json
+    // copy would produce exactly this.
+    stale_copy.started_at_unix_ms = Some(1_000_000);
+    stale_copy.wall_ms = 100_000;
+    stale_copy.checks.metrics_stale = true;
+    let s = summarize(&[owner, stale_copy]);
+    let owner_flags = s.flagged.iter().find(|(r, _)| r == "owner").map(|(_, f)| f.clone());
+    assert_eq!(owner_flags, None, "the clean owner must not be flagged OVERLAP: {:?}", s.flagged);
+    // The copy is still flagged, on its own merits (STALE-METRICS), and its
+    // energy is still withheld — just not doubly implicated as OVERLAP too.
+    let copy_flags = s.flagged.iter().find(|(r, _)| r == "copy").unwrap().1.clone();
+    assert_eq!(copy_flags, vec!["STALE-METRICS"]);
 }
 
 /// Adjacent, non-overlapping runs (one starts exactly as the other ends)
@@ -221,7 +256,44 @@ fn a_stale_metrics_run_is_excluded_from_cost_per_success() {
     assert_eq!(s.cost_per_success.active_ms, None, "the whole total is withheld, not read low");
     assert_eq!(s.cost_per_success.gpu_busy_ms, None);
     assert_eq!(s.cost_per_success.pkg_joules, None);
-    assert!(s.cost_per_success.withheld.iter().any(|w| w.contains("STALE-METRICS")));
+    // (Review, 2026-09-23) exact reasons: one for active time, one for
+    // energy — both correctly attributed to STALE-METRICS, and NEITHER the
+    // generic "not every run recorded it" fallback (which would be false
+    // here — every run DID record a value; this run's is just excluded).
+    assert_eq!(
+        s.cost_per_success.withheld,
+        vec![
+            "active time: 1 run(s) have a metrics.json that does not belong to them (STALE-METRICS)"
+                .to_string(),
+            "GPU busy time: 1 run(s) have a metrics.json that does not belong to them (STALE-METRICS)"
+                .to_string(),
+            "package energy: 1 run(s) have a metrics.json that does not belong to them (STALE-METRICS)"
+                .to_string(),
+        ]
+    );
+}
+
+/// (Frontier review, 2026-09-23) A STALE-METRICS run's active/wall/rest
+/// figures are wrong, not merely uncertain — the docs said they were
+/// withheld, but only `cost_per_success` was actually excluding them; the
+/// SET RANGES still folded the bad number into the median/min/max, and a
+/// baseline "moved" ratio (built from these same ranges) would too. The fix
+/// excludes the run from these ranges outright, same as cost per success.
+#[test]
+fn a_stale_metrics_runs_active_time_is_excluded_from_the_set_range_not_just_cost() {
+    let mut stale = costed("a", "pass", 999_000_000, 900_000, 30_000.0);
+    stale.checks.metrics_stale = true;
+    stale.wall_ms = 999_000_000;
+    stale.rest_ms = 0;
+    let clean = costed("b", "pass", 100_000, 90_000, 3_000.0);
+    let clean_wall = clean.wall_ms;
+    let s = summarize(&[stale, clean]);
+    let active = s.active_ms.expect("clean run still contributes");
+    assert_eq!(active.n, 1, "the stale run's absurd active time must not enter the range");
+    assert_eq!(active.median, 100_000.0);
+    let wall = s.wall_ms.expect("clean run still contributes");
+    assert_eq!(wall.n, 1);
+    assert_eq!(wall.median, clean_wall as f64);
 }
 
 #[test]

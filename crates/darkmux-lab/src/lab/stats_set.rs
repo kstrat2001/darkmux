@@ -177,9 +177,18 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
 /// the WHOLE host's power — there is no way to apportion it between them, so
 /// this only detects the condition; the caller withholds the figures it
 /// would corrupt rather than dividing them up.
+///
+/// `metrics_stale` runs are excluded before windows are even built (review,
+/// 2026-09-23): a STALE-METRICS run's window is `metrics.json`'s claim
+/// about SOME run's clock, not necessarily this one's — using it to accuse
+/// a genuine, clean run of overlapping is exactly what a byte-identical
+/// stale copy did on disk. All 17 real OVERLAP hits before this fix were
+/// stale copies or the clean owner they were copied from; zero were
+/// independent concurrent runs.
 pub fn overlapping(runs: &[RunStats]) -> std::collections::BTreeSet<String> {
     let mut windows: Vec<(&str, u64, u64)> = runs
         .iter()
+        .filter(|s| !s.checks.metrics_stale)
         .filter_map(|s| s.started_at_unix_ms.map(|from| (s.run.as_str(), from, from.saturating_add(s.wall_ms))))
         .collect();
     windows.sort_by_key(|(_, from, _)| *from);
@@ -221,19 +230,36 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
     models.dedup();
 
     let r = |f: fn(&RunStats) -> Option<f64>| Range::of(runs.iter().filter_map(f));
+    // (Review, 2026-09-23) A STALE-METRICS run's wall/rest/active time is
+    // built on another run's clock, and a STALE-METRICS or OVERLAP run's
+    // power/energy is either the same suspect window or the whole host's
+    // draw claimed twice — either way a wrong number, not merely an
+    // uncertain one, so these SET-level figures exclude the run rather than
+    // averaging it in. This is narrower than the module's general "never
+    // drop a run" rule: that rule is for CHECKS that leave the figure
+    // itself untouched (TOKENS, UNBILLED, …); these two conditions mean the
+    // figure is actively wrong. The per-run TABLE ROW still prints the
+    // run's own number, flagged — only the aggregate excludes it.
+    let r_excl = |excl: &std::collections::BTreeSet<&str>, f: fn(&RunStats) -> Option<f64>| {
+        Range::of(runs.iter().filter(|s| !excl.contains(s.run.as_str())).filter_map(f))
+    };
 
     // Cost per success. A numerator summed over only the runs that HAVE the
     // value is short by the ones that do not, and reads as cheaper; so each
     // figure is all-or-nothing across the set.
     let mut withheld = Vec::new();
-    let per_success = |total: Option<f64>, what: &str, withheld: &mut Vec<String>| -> Option<f64> {
+    // `reason`, when given, replaces the generic fallback — used whenever
+    // `total` is `None` BECAUSE of a run this fn's caller already excluded
+    // (and already named in `withheld`), so the generic "not every run
+    // recorded it" is never printed alongside a reason that contradicts it.
+    let per_success = |total: Option<f64>, what: &str, reason: Option<&str>, withheld: &mut Vec<String>| -> Option<f64> {
         if passed == 0 {
             return None;
         }
         match total {
             Some(t) => Some(t / passed as f64),
             None => {
-                withheld.push(format!("{what}: not every run in the set recorded it"));
+                withheld.push(format!("{what}: {}", reason.unwrap_or("not every run in the set recorded it")));
                 None
             }
         }
@@ -252,30 +278,43 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
     if passed == 0 && n > 0 {
         withheld.push("no run in the set passed verify, so there is no success to cost".into());
     }
-    if !stale.is_empty() {
-        withheld.push(format!(
-            "active time: {} run(s) have a metrics.json that does not belong to them (STALE-METRICS)",
-            stale.len()
-        ));
-    }
-    if !overlap.is_empty() {
-        withheld.push(format!(
-            "GPU busy time and package energy: {} run(s) have overlapping host-telemetry windows \
-             (OVERLAP) and cannot be apportioned",
-            overlap.len()
-        ));
-    }
     // Both conditions can make a host-telemetry figure unreliable for the
     // same run; union them once rather than excluding twice.
     let energy_excl: std::collections::BTreeSet<&str> = stale.union(&overlap.iter().map(|s| s.as_str()).collect()).copied().collect();
+    let stale_reason = (!stale.is_empty()).then(|| {
+        format!("{} run(s) have a metrics.json that does not belong to them (STALE-METRICS)", stale.len())
+    });
+    let overlap_reason = (!overlap.is_empty()).then(|| {
+        format!("{} run(s) have overlapping host-telemetry windows (OVERLAP) and cannot be apportioned", overlap.len())
+    });
+    // The energy reason is the CONCATENATION of whichever of the two
+    // conditions applies — a run can be excluded from energy for both at
+    // once, and each reason is independently true.
+    let energy_reason: Option<String> = match (&stale_reason, &overlap_reason) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(a), None) => Some(a.clone()),
+        (None, Some(b)) => Some(b.clone()),
+        (None, None) => None,
+    };
     let cost_per_success = CostPerSuccess {
-        active_ms: per_success(sum_all_excluding(&stale, |s| Some(s.active_ms as f64)), "active time", &mut withheld),
+        active_ms: per_success(
+            sum_all_excluding(&stale, |s| Some(s.active_ms as f64)),
+            "active time",
+            stale_reason.as_deref(),
+            &mut withheld,
+        ),
         gpu_busy_ms: per_success(
             sum_all_excluding(&energy_excl, |s| s.busy_ms.map(|v| v as f64)),
             "GPU busy time",
+            energy_reason.as_deref(),
             &mut withheld,
         ),
-        pkg_joules: per_success(sum_all_excluding(&energy_excl, |s| s.pkg_j_busy), "package energy", &mut withheld),
+        pkg_joules: per_success(
+            sum_all_excluding(&energy_excl, |s| s.pkg_j_busy),
+            "package energy",
+            energy_reason.as_deref(),
+            &mut withheld,
+        ),
         withheld,
     };
 
@@ -289,16 +328,16 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
             .filter(|s| verified(s) == Some(true) && s.result.as_deref() == Some("error"))
             .count(),
         models,
-        active_ms: r(|s| Some(s.active_ms as f64)),
-        wall_ms: r(|s| Some(s.wall_ms as f64)),
-        rest_ms: r(|s| Some(s.rest_ms as f64)),
+        active_ms: r_excl(&stale, |s| Some(s.active_ms as f64)),
+        wall_ms: r_excl(&stale, |s| Some(s.wall_ms as f64)),
+        rest_ms: r_excl(&stale, |s| Some(s.rest_ms as f64)),
         turns: r(|s| Some(s.turns as f64)),
         completion_tokens: r(|s| Some(s.completion_tokens as f64)),
         tok_per_s: r(|s| s.tok_per_s),
         billed_gen_fraction: r(|s| s.billed_gen_fraction),
-        gpu_w_busy: r(|s| s.gpu_w_busy),
-        pkg_w_busy: r(|s| s.pkg_w_busy),
-        pkg_j_per_1k_tokens: r(|s| s.pkg_j_per_1k_tokens),
+        gpu_w_busy: r_excl(&energy_excl, |s| s.gpu_w_busy),
+        pkg_w_busy: r_excl(&energy_excl, |s| s.pkg_w_busy),
+        pkg_j_per_1k_tokens: r_excl(&energy_excl, |s| s.pkg_j_per_1k_tokens),
         runs_with_degeneracy: runs
             .iter()
             .filter(|s| {

@@ -179,7 +179,10 @@ fn the_set_summary_prints_ranges_and_cost_per_success() {
     let t = sets_text(&set(vec![run("a"), b]), None);
     assert_eq!(line_starting(&t, "  active").trim_end(), "  active           380s (280s–480s)");
     assert!(t.contains("cost per successful run"), "{t}");
-    assert!(line_with(&t, "  energy").contains("10.6 kJ"), "{t}");
+    // (Frontier review, 2026-09-23) "energy (busy)" — consistent with the
+    // single-run "kJ while busy" label; a bare "energy" reads as the run's
+    // total draw, which this figure is not.
+    assert!(line_with(&t, "  energy (busy)").contains("10.6 kJ"), "{t}");
     assert!(line_with(&t, "set ").contains("2 of 2 passed"), "{t}");
 }
 
@@ -301,4 +304,31 @@ fn control_characters_in_model_facing_strings_are_stripped_before_printing() {
     assert!(t.contains("model:       evil]0;pwnedmodel"));
     assert!(line_starting(&t, "result:").contains("stop[31m"));
     assert!(line_with(&t, "policy=").contains("policy=observe[0m"));
+}
+
+/// (Frontier review, 2026-09-23) The SET view has its own untrusted-string
+/// print sites — the table's `verify` column and the "models:" line(s) —
+/// that the single-run control-char test above never exercised, because
+/// `sets_text`/`table_text` are a separate code path from `run_text`.
+#[test]
+fn control_characters_in_the_set_view_are_stripped_too() {
+    let mut a = run("a");
+    a.verify = Some("pass\u{1b}[2J".into());
+    a.model = Some("m\u{1b}[31m-evil".into());
+    let t = sets_text(&set(vec![a]), None);
+    assert!(!t.contains('\u{1b}'), "an ESC byte reached the set view:\n{t:?}");
+    assert!(line_with(&t, "a ").contains("pass[2J"), "the table's verify column: {t:?}");
+    assert!(t.contains("models: m[31m-evil"), "the set's models line: {t:?}");
+}
+
+/// Same, for a baseline comparison — the "models" row prints BOTH arms.
+#[test]
+fn control_characters_in_a_baseline_comparisons_models_row_are_stripped() {
+    let mut cand = run("x");
+    cand.model = Some("cand\u{1b}[31m".into());
+    let mut base = run("y");
+    base.model = Some("base\u{1b}[32m".into());
+    let t = sets_text(&set(vec![cand]), Some(&set(vec![base])));
+    assert!(!t.contains('\u{1b}'), "an ESC byte reached the comparison view:\n{t:?}");
+    assert!(line_starting(&t, "models").contains("base[32m") && line_starting(&t, "models").contains("cand[31m"));
 }
