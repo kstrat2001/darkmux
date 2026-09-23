@@ -250,10 +250,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // thermal-only (a battery pause's `reason` is also `!= "turn_delay"`).
   // So the base line names no cause ("incl. N rest") and only a non-zero
   // `paced_rest_ms` gets its own, honestly-named clause ("N paced").
-  it("(#2863 review) WALL CLOCK reads as run time, and names what the rest was for", () => {
-    // Operator, 2026-09-23: "incl. 1:30 rest · 1:30 paced" said the same
-    // thing twice in harness words. Each rest record carries its cause; the
-    // tile names it.
+  it("(rest-reason cards) WALL CLOCK sub no longer mentions rest — cards carry that now", () => {
     const rest = (sec: number) => ({
       ts: `2026-01-01T00:0${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}Z`,
       session_id: "s1",
@@ -276,21 +273,29 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
     expect(wall?.value).toBe("4:03");
     expect(wall?.hint).toBe("run time");
-    expect(wall?.sub).toBe("incl. 1:30 thermal rest");
+    expect(wall?.sub).toBeUndefined();
+    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
+    expect(thermal?.value).toBe("1:30");
+    expect(thermal?.sub).toBe("6 rests");
   });
 
-  it("(#2863) mixed rest causes are each named, largest first", () => {
+  it("(rest-reason cards) mixed rest causes each get their own card", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:00:50Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 60000, reason: "thermal-duty-cycle", state: "fair" } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 60000 } },
     ] as FlowRecord[];
-    const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("incl. 1:30 rest (1:00 thermal · 0:30 turn delay)");
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
+    const delay = view.metrics.find((m) => m.label === "TURN DELAY");
+    expect(thermal?.value).toBe("1:00");
+    expect(thermal?.sub).toBe("1 rest");
+    expect(delay?.value).toBe("0:30");
+    expect(delay?.sub).toBe("1 rest · 30 s each");
   });
 
-  it("(#2863) a configured turn delay alone is named as such, never as thermal", () => {
+  it("(rest-reason cards) a configured turn delay alone is named as such, never as thermal", () => {
     // The runtime writes `reason: "turn_delay"` for the operator's own
     // `turn_delay_ms` sleep (`runtime/src/trajectory.rs` `append_rest`).
     const data: FlowRecord[] = [
@@ -299,24 +304,38 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:01:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "turn_delay" } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 0 } },
     ] as FlowRecord[];
-    const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("incl. 1:30 turn delay");
-    expect(wall?.sub).not.toContain("thermal");
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const delay = view.metrics.find((m) => m.label === "TURN DELAY");
+    expect(delay?.value).toBe("1:30");
+    expect(delay?.sub).toBe("2 rests · 45 s each");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
-  it("(#2863) rest records that don't add up to the recorded total name no cause", () => {
-    // Older runs, or records outside the loaded window: the per-cause sum
-    // would under-report, so fall back to the recorded total alone.
+  it("(rest-reason cards) pacing-change records (delay_ms, no ms) are never counted as rests", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { delay_ms: 15000, reason: "thermal-duty-cycle", state: "fair", pause: false } },
+      { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000 } },
+    ] as FlowRecord[];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
+  });
+
+  it("(rest-reason cards) an old run with no bounds but thermal rests still shows the card", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "thermal-duty-cycle" } },
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 6 } },
     ] as FlowRecord[];
-    const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("incl. 1:30 rest");
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.sub).toBeUndefined();
+    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
+    expect(thermal?.value).toBe("0:15");
+    expect(thermal?.sub).toBe("1 rest");
   });
 
-  it("(#2863 review round 2) rest with no per-rest records names no cause", () => {
+  it("(rest-reason cards) rest with no per-rest records shows no card at all", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -328,12 +347,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("incl. 1:30 rest");
-    expect(wall?.sub).not.toContain("thermal");
-    expect(wall?.sub).not.toContain("paced");
+    expect(wall?.sub).toBeUndefined();
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
+    expect(view.metrics.find((m) => m.label === "TURN DELAY")).toBeUndefined();
   });
 
-  it("(#2863 review) a run with no rest gets no rest sub line", () => {
+  it("(rest-reason cards) a run with no rest gets no rest sub line and no cards", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
@@ -344,7 +363,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(wall?.hint).toBe("run time");
   });
 
-  it("(#2863 review) an errored AND rested run combines both on the sub line", () => {
+  it("(rest-reason cards) an errored run's WALL CLOCK sub names only the outcome, not rest", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -356,7 +375,59 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("errored (exit 1) · incl. 0:15 rest");
+    expect(wall?.sub).toBe("errored (exit 1)");
+  });
+
+  it("(rest-reason cards) thermal configured with 0 rests shows an armed-but-quiet card", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        payload: { bounds: { thermal_pacing_enabled: { value: true, source: "built-in" } } },
+      },
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
+    ] as FlowRecord[];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
+    expect(thermal?.value).toBe("0:00");
+    expect(thermal?.sub).toBe("0 rests");
+  });
+
+  it("(rest-reason cards) thermal NOT configured and no rests shows no card", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        payload: { bounds: { thermal_pacing_enabled: { value: false, source: "config" } } },
+      },
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
+    ] as FlowRecord[];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
+  });
+
+  it("(rest-reason cards) turn delay configured 15s with 3 rests reads '0:45' / '3 rests · 15 s each'", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        payload: { bounds: { turn_delay_ms: { value: 15000, source: "config" } } },
+      },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "turn_delay" } },
+      { ts: "2026-01-01T00:00:40Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "turn_delay" } },
+      { ts: "2026-01-01T00:01:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 15000, reason: "turn_delay" } },
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 120000 } },
+    ] as FlowRecord[];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const delay = view.metrics.find((m) => m.label === "TURN DELAY");
+    expect(delay?.value).toBe("0:45");
+    expect(delay?.sub).toBe("3 rests · 15 s each");
   });
 
   it("a remote (endpoint-served) run names the endpoint and omits the local model track", () => {

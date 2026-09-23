@@ -716,6 +716,18 @@ export interface DispatchStartPayload {
   endpoint?: string;
   prompt?: string;
   prompt_chars?: number;
+  /** The resolved-runtime-knobs block, `{<knob>: {value, source}}`
+   * (`resolved_runtime_bounds_json`, `crates/darkmux-crew/src/
+   * dispatch_internal.rs`). Only the keys the run-page rest-reason cards
+   * read are named here; the block carries more (max_turns, max_tokens,
+   * …) unread by this port. */
+  bounds?: {
+    turn_delay_ms?: { value?: number | null; source?: string };
+    thermal_pacing_enabled?: { value?: boolean | null; source?: string };
+    battery_pause_enabled?: { value?: boolean | null; source?: string };
+    battery_pause_floor_pct?: { value?: number | null; source?: string };
+    [key: string]: unknown;
+  };
 }
 
 /** One `funnel-events.jsonl` line — the lab-run detail's event feed +
