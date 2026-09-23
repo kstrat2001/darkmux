@@ -540,15 +540,22 @@ describe("EventLogColumn", () => {
 
   it("a one-session list says its machine and session once, not on every row", () => {
     const records = [
-      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro" }),
-      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro" }),
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro", handle: "coder" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro", handle: "coder" }),
     ];
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);
     expect(document.querySelector(".eventlog__recmachine")).toBeNull();
     expect(document.querySelector(".eventlog__recsession")).toBeNull();
     const shared = document.querySelector(".eventlog__shared")!;
-    expect(shared.textContent).toContain("MacBook-Pro");
-    expect(shared.textContent).toContain("…784225");
+    // (#2863, operator) The panel names its own scope: which session these
+    // events are, and who ran it where, rather than leaving the reader to
+    // infer it from the page beside it.
+    expect(shared.querySelector(".eventlog__sharedlbl")!.textContent).toBe("session");
+    expect(shared.querySelector(".eventlog__sharedwho")!.textContent).toBe("coder on MacBook-Pro");
+    // The FULL id: the column truncates it only when it runs out of room,
+    // and from the start, keeping the distinguishing tail (CSS). A fixed
+    // six-character cut stayed cut however wide the column was dragged.
+    expect(shared.querySelector(".eventlog__sharedsession")!.textContent).toBe("darkmux-coding-x-1790125784225");
     expect(shared.getAttribute("title")).toContain("darkmux-coding-x-1790125784225");
   });
 
@@ -561,7 +568,7 @@ describe("EventLogColumn", () => {
     ];
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);
     expect(document.querySelector(".eventlog__recsession")).toBeNull();
-    expect(document.querySelector(".eventlog__shared")!.textContent).toContain("sess-1".slice(-6));
+    expect(document.querySelector(".eventlog__sharedsession")!.textContent).toBe("sess-1");
   });
 
   it("a tool row is its tool, its object and its outcome, not its raw arguments", () => {
@@ -1050,6 +1057,12 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(head.querySelector(".eventlog__ctxnums")!.textContent).toBe("in 15.9k · out 933");
     expect((head.querySelector(".eventlog__ctxfill") as HTMLElement).style.width).toMatch(/^6\.06/);
     expect((head.querySelector(".eventlog__ctxtick") as HTMLElement).style.left).toBe("50%");
+    // The bar says what it is: a visible label (phones have no hover) and a
+    // tooltip naming the yellow compaction mark.
+    expect(head.querySelector(".eventlog__ctxlbl")!.textContent).toBe("context");
+    expect(head.querySelector(".eventlog__ctxbar")!.getAttribute("title")).toBe(
+      "context: 15,898 of 262,144 tokens (6%)\nyellow mark: compaction starts at 131,072 tokens",
+    );
     // Still a row: clickable, counted, carries the handle title.
     expect(head).toHaveAttribute("data-act", "rec");
   });

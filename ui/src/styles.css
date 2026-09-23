@@ -1889,7 +1889,7 @@ body {
 }
 .eventlog__turnctx {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 10px;
 }
@@ -1913,6 +1913,11 @@ body {
   width: 1px;
   background: var(--warn);
   opacity: 0.7;
+}
+.eventlog__ctxlbl {
+  color: var(--dim);
+  font-size: 0.85em;
+  letter-spacing: 0.04em;
 }
 .eventlog__ctxnums {
   color: var(--dim);
@@ -2012,12 +2017,44 @@ body {
   color: var(--good);
   font-weight: 700;
 }
-/* The machine and session every row shares, said once. */
+/* (#2863) The panel's own scope, said once: which session, then who ran it
+   where. */
 .eventlog__shared {
-  font: calc(10.5px * var(--fs-scale))/1.3 var(--font-mono);
+  display: grid;
+  gap: 2px;
+  font: calc(10.5px * var(--fs-scale))/1.35 var(--font-mono);
   color: var(--dim);
-  padding: 4px 10px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  min-width: 0;
+}
+.eventlog__sharedline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.eventlog__sharedlbl {
+  flex: none;
+  font-size: calc(9.5px * var(--fs-scale));
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+/* A leading ellipsis: right-to-left overflow on the box, the id itself kept
+   left-to-right, so a narrow column drops the prefix, not the unique tail. */
+.eventlog__sharedsession {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+.eventlog__sharedwho {
+  color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -94,6 +94,13 @@ export function fmtTurnDuration(ms: number, approx: boolean): string {
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 }
 
+// (#2863) The context bar's explanation: fill = prompt tokens this turn,
+// yellow mark = where compaction kicks in.
+export function ctxTitle(inTok: number, window: number, threshold: number | null): string {
+  const base = `context: ${inTok.toLocaleString()} of ${window.toLocaleString()} tokens (${Math.round((100 * inTok) / window)}%)`;
+  return threshold ? `${base}\nyellow mark: compaction starts at ${threshold.toLocaleString()} tokens` : base;
+}
+
 export function fmtTok(n: number): string {
   return n < 1000 ? n.toLocaleString() : `${(n / 1000).toFixed(1)}k`;
 }
@@ -595,8 +602,9 @@ export function EventLogColumn({
     // the set; same for a record with no machine.
     const machines = new Set(records.map((r) => r.machine_id).filter(Boolean) as string[]);
     const sessions = new Set(records.map((r) => r.session_id).filter(Boolean) as string[]);
+    const handles = new Set(records.map((r) => r.handle).filter(Boolean) as string[]);
     const one = (set: Set<string>) => (set.size === 1 ? [...set][0] : null);
-    return { machine: one(machines), session: one(sessions) };
+    return { machine: one(machines), session: one(sessions), handle: one(handles) };
   }, [records]);
 
   // (#2068) The followed record is throttled: at playback speed the newest
@@ -1116,13 +1124,27 @@ export function EventLogColumn({
             </div>
           </div>
         </div>
-        {/* (#2863) The machine and session every visible row shares, said
-            once here instead of on each row. */}
+        {/* (#2863) The panel names its own scope: which session these events
+            are, and who ran it where. Said once here instead of on every row,
+            and explicit, so the reader does not have to infer it from the page
+            beside the panel (operator finding). The full id truncates only
+            when the column runs out of room, and from the START, keeping the
+            tail that tells two sessions apart. */}
         {(shared.machine || shared.session) && (
-          <div className="eventlog__shared" title={[shared.machine, shared.session].filter(Boolean).join(" · ")}>
-            {shared.machine}
-            {shared.machine && shared.session ? " · " : ""}
-            {shared.session ? `session …${shared.session.slice(-6)}` : ""}
+          <div className="eventlog__shared" title={[shared.session, shared.handle, shared.machine].filter(Boolean).join(" · ")}>
+            {shared.session ? (
+              <div className="eventlog__sharedline">
+                <span className="eventlog__sharedlbl">session</span>
+                <span className="eventlog__sharedsession" dir="rtl">
+                  <bdi dir="ltr">{shared.session}</bdi>
+                </span>
+              </div>
+            ) : null}
+            <div className="eventlog__sharedwho">
+              {shared.handle && shared.machine
+                ? `${shared.handle} on ${shared.machine}`
+                : shared.handle || shared.machine}
+            </div>
           </div>
         )}
         {/* (#2108, operator finding — one-tap expand) Expanded, the list
@@ -1204,10 +1226,14 @@ export function EventLogColumn({
                     {t.inTok !== null || t.outTok !== null ? (
                       <div className="eventlog__turnctx">
                         {pct !== null ? (
+                          <span className="eventlog__ctxlbl">context</span>
+                        ) : null}
+                        {pct !== null ? (
                           <span
                             className="eventlog__ctxbar"
                             role="img"
-                            aria-label={`${t.inTok!.toLocaleString()} of ${t.window!.toLocaleString()} tokens in context`}
+                            title={ctxTitle(t.inTok!, t.window!, t.threshold)}
+                            aria-label={ctxTitle(t.inTok!, t.window!, t.threshold)}
                           >
                             <span className="eventlog__ctxfill" style={{ width: `${pct}%` }} />
                             {t.threshold ? (
