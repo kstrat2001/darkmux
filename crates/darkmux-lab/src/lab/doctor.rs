@@ -202,6 +202,23 @@ fn check_one(name: &str, entry: &RegisteredFixture) -> std::result::Result<(), S
     let manifest = FixtureManifest::load_from_dir(&entry.path)
         .map_err(|e| format!("{name}: .fixture.json invalid: {e}"))?;
 
+    // (#2833) A `baseline.test_count` that isn't a non-negative integer
+    // (a string, a float, negative) fails the write-the-tests work gate
+    // CLOSED at run time — it can never leave a raw, ungated verdict
+    // standing — but that only surfaces per-run, after a dispatch already
+    // happened. Catching the typo here, offline, before a dispatch is
+    // wasted on it, is the whole point of `darkmux lab doctor`.
+    if let Some(test_count) = manifest.baseline.get("test_count") {
+        if test_count.as_u64().is_none() {
+            return Err(format!(
+                "{name}: .fixture.json declares baseline.test_count = {test_count}, which is \
+                 not a non-negative integer (e.g. a quoted string or a decimal) — every run \
+                 against this fixture will fail the write-the-tests work gate closed until \
+                 this is fixed to a plain unquoted integer, e.g. \"test_count\": 14",
+            ));
+        }
+    }
+
     let missing = manifest.missing_required_files(&entry.path);
     if !missing.is_empty() {
         return Err(format!(
@@ -318,6 +335,46 @@ mod tests {
         let err = check_one("demo", entry).unwrap_err();
         assert!(err.contains("required file(s) missing"), "got: {err}");
         assert!(err.contains("src/important.ts"), "got: {err}");
+    }
+
+    /// (#2833) A mistyped `baseline.test_count` (here: a quoted string
+    /// instead of a plain integer) must be caught offline by doctor, before
+    /// a dispatch is wasted on a fixture whose write-the-tests gate will
+    /// fail closed on every run.
+    #[test]
+    fn check_one_detects_malformed_baseline_test_count() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("fx");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".fixture.json"),
+            r#"{"name": "demo", "baseline": {"test_count": "14"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("source.txt"), "x").unwrap();
+        let mut reg = LabRegistry::default();
+        reg.register(&dir, None, false).unwrap();
+        let entry = reg.get("demo").unwrap();
+        let err = check_one("demo", entry).unwrap_err();
+        assert!(err.contains("not a non-negative integer"), "got: {err}");
+        assert!(err.contains("test_count"), "got: {err}");
+    }
+
+    #[test]
+    fn check_one_passes_a_valid_baseline_test_count() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("fx");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".fixture.json"),
+            r#"{"name": "demo", "baseline": {"test_count": 14}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("source.txt"), "x").unwrap();
+        let mut reg = LabRegistry::default();
+        reg.register(&dir, None, false).unwrap();
+        let entry = reg.get("demo").unwrap();
+        assert!(check_one("demo", entry).is_ok());
     }
 
     #[test]

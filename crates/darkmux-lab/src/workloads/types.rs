@@ -21,6 +21,25 @@ pub(crate) struct VerifySpec {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// (#2833) Minimum LINE coverage percentage the run's verify command
+    /// must report, evaluated only for fixtures that also declare
+    /// `baseline.test_count` (see `crate::lab::verify_gate`). `None` (the
+    /// default — pepper-grinder's `refresh-rotation` workload does NOT set
+    /// this) means no coverage rule is applied at all, matching today's
+    /// behavior exactly.
+    ///
+    /// darkmux does NOT append a coverage flag to the declared `command`
+    /// itself — the workload/fixture author owns the command shape (npm
+    /// script, bare `node --test`, a Makefile target, …) and darkmux has no
+    /// reliable way to inject `--experimental-test-coverage` into an
+    /// arbitrary shell command. If this threshold is set, the declared
+    /// `command` MUST itself request coverage (e.g.
+    /// `"npm test -- --experimental-test-coverage"` or
+    /// `"node --test --experimental-test-coverage test/*.test.js"`). If the
+    /// verify output has no coverage table when this is set, that is a gate
+    /// FAILURE with an explicit reason — never a silent pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_min_pct: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -31,8 +50,19 @@ pub(crate) struct ExpectedSpec {
     pub slow_cluster_seconds: Option<(u64, u64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slow_rate: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub test_count_baseline: Option<u32>,
+    // (#2833) `test_count_baseline` REMOVED. It was declared here but never
+    // read by any code (verified by grep before removal) — the actual
+    // source of truth for a coding-task workload's baseline test count is
+    // the FIXTURE's own `.fixture.json::baseline.test_count`
+    // (`crate::lab::fixture::FixtureManifest`), since the count is a
+    // property of the fixture (what "untouched" means), not of the
+    // workload (which merely requires a fixture). `crate::lab::verify_gate`
+    // reads it from there. Some on-disk workload documents (e.g. the
+    // operator's `~/.darkmux/workloads/refresh-rotation.json`) still carry
+    // `"expected": {"test_count_baseline": 14}` — that is now a harmless,
+    // ignored extra key (config leniency: unknown fields on a struct
+    // without `deny_unknown_fields` are silently skipped on read), not a
+    // migration hazard.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,13 +443,35 @@ mod tests {
         let json = r#"{
             "fast_cluster_seconds": [197, 280],
             "slow_cluster_seconds": [600, 950],
-            "slow_rate": 0.33,
-            "test_count_baseline": 77
+            "slow_rate": 0.33
         }"#;
         let parsed: ExpectedSpec = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.fast_cluster_seconds, Some((197, 280)));
         assert_eq!(parsed.slow_cluster_seconds, Some((600, 950)));
         assert_eq!(parsed.slow_rate, Some(0.33));
-        assert_eq!(parsed.test_count_baseline, Some(77));
+    }
+
+    /// (#2833) `test_count_baseline` was removed from `ExpectedSpec`. A
+    /// still-installed on-disk workload document carrying the old key must
+    /// keep parsing (config leniency — unknown fields are silently
+    /// ignored), not fail to load.
+    #[test]
+    fn expected_spec_ignores_retired_test_count_baseline_key() {
+        let json = r#"{"slow_rate": 0.5, "test_count_baseline": 14}"#;
+        let parsed: ExpectedSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.slow_rate, Some(0.5));
+    }
+
+    #[test]
+    fn verify_spec_coverage_min_pct_defaults_to_none() {
+        let parsed: VerifySpec = serde_json::from_str(r#"{"command": "npm test"}"#).unwrap();
+        assert_eq!(parsed.coverage_min_pct, None);
+    }
+
+    #[test]
+    fn verify_spec_parses_coverage_min_pct() {
+        let parsed: VerifySpec =
+            serde_json::from_str(r#"{"command": "npm test", "coverage_min_pct": 85.0}"#).unwrap();
+        assert_eq!(parsed.coverage_min_pct, Some(85.0));
     }
 }

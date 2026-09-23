@@ -1110,3 +1110,99 @@ fn a_flow_file_that_cannot_be_opened_is_counted() {
     assert_eq!(s.flow_scan.files_unreadable, 1);
     assert_eq!(s.flow_scan.files_total, s.flow_scan.files_read + s.flow_scan.files_skipped + s.flow_scan.files_unreadable);
 }
+
+/// (#2833) A run whose manifest predates the work gate (`schema_version` <
+/// 6) but whose fixture declares `baseline.test_count` must be flagged
+/// `verify_ungated` — its `verify: pass` is the old, vacuous "exited 0"
+/// signal, not the gated one, and must never be silently compared as if it
+/// were.
+#[test]
+fn a_pre_gate_run_on_a_baselined_fixture_is_flagged_ungated() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    let fixture = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        fixture.path().join(".fixture.json"),
+        serde_json::json!({"name": "demo", "baseline": {"test_count": 14}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.path().join("metrics.json"),
+        serde_json::json!({"wall_ms": 1_000, "turns": 1}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.path().join("manifest.json"),
+        serde_json::json!({
+            "schema_version": 5,
+            "verify": {"passed": true, "details": "verify command exited 0"},
+            "fixture": {"source_path": fixture.path().display().to_string()},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert!(s.verify_ungated, "a pre-gate run on a baselined fixture must be flagged");
+}
+
+/// The same manifest, but already gated (`schema_version: 6`) — must NOT be
+/// flagged, even though the fixture still declares a baseline.
+#[test]
+fn a_gated_run_on_the_same_fixture_is_not_flagged_ungated() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    let fixture = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        fixture.path().join(".fixture.json"),
+        serde_json::json!({"name": "demo", "baseline": {"test_count": 14}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.path().join("metrics.json"),
+        serde_json::json!({"wall_ms": 1_000, "turns": 1}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.path().join("manifest.json"),
+        serde_json::json!({
+            "schema_version": 6,
+            "verify": {"passed": true, "details": "8 test(s) added"},
+            "fixture": {"source_path": fixture.path().display().to_string()},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert!(!s.verify_ungated);
+}
+
+/// A pre-gate run on a fixture with NO baseline declared must not be
+/// flagged — the gate never would have applied to it anyway.
+#[test]
+fn a_pre_gate_run_on_an_unbaselined_fixture_is_not_flagged_ungated() {
+    let run = tempfile::TempDir::new().unwrap();
+    let flows = tempfile::TempDir::new().unwrap();
+    let fixture = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        fixture.path().join(".fixture.json"),
+        serde_json::json!({"name": "demo"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.path().join("metrics.json"),
+        serde_json::json!({"wall_ms": 1_000, "turns": 1}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        run.path().join("manifest.json"),
+        serde_json::json!({
+            "schema_version": 5,
+            "verify": {"passed": true, "details": "verify command exited 0"},
+            "fixture": {"source_path": fixture.path().display().to_string()},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(run.path(), flows.path()).unwrap();
+    assert!(!s.verify_ungated);
+}

@@ -126,14 +126,24 @@ fn every_failed_check_raises_a_flag() {
     r.thermal_ratchet_fired = true;
     r.throttled_samples = 1;
     r.result = Some("error".into());
+    r.verify_ungated = true;
     assert_eq!(
         flags(&r),
         vec![
             "RUNTIME-ERROR", "TOKENS", "PARSE", "VERDICT", "UNBILLED", "STREAMS", "REST",
-            "COUNTS", "NO-TELEM", "NO-FLOW", "CHARS", "RATCHET", "THROTTLE"
+            "COUNTS", "NO-TELEM", "NO-FLOW", "CHARS", "RATCHET", "THROTTLE", "UNGATED"
         ]
     );
     assert!(flags(&run("clean", "pass")).is_empty());
+}
+
+/// (#2833) `verify_ungated` alone raises exactly one flag, on an otherwise
+/// clean run — proving the flag isn't riding along with some other check.
+#[test]
+fn verify_ungated_alone_raises_its_own_flag() {
+    let mut r = run("a", "pass");
+    r.verify_ungated = true;
+    assert_eq!(flags(&r), vec!["UNGATED"]);
 }
 
 /// Both gates count toward degeneracy, and cuts come from both.

@@ -158,6 +158,13 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if s.throttled_samples > 0 {
         f.push("THROTTLE");
     }
+    // (#2833) verify came from before the write-the-tests work gate existed
+    // for this fixture — the old, vacuous "verify command exited 0" signal,
+    // not the gated one. Never reinterpreted; flagged so a mixed series
+    // isn't silently compared across two definitions of success.
+    if s.verify_ungated {
+        f.push("UNGATED");
+    }
     f
 }
 
