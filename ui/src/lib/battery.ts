@@ -33,6 +33,33 @@ export function chargeCaption(b: BatterySample | null): string {
   return "on battery";
 }
 
+/** "battery 100%, on AC" / "battery 35%, 2 h 10 m left" / "battery
+ * unmeasured" — the accessible name for the battery bar glyph (`role="img"`
+ * on its `<svg>`, matching every other compact gauge on this page). Built
+ * from the same `chargeCaption` every sighted reader sees, so the two
+ * channels never disagree. `null` sample renders the caller's own absent
+ * case — this function is never called for one (`BatteryLensBlock` returns
+ * early), but is total anyway rather than partial. */
+export function batteryAriaLabel(sample: BatterySample | null): string {
+  if (sample === null) return "battery unmeasured";
+  const pct = sample.charge_pct == null ? "unmeasured" : `${sample.charge_pct}%`;
+  const cap = chargeCaption(sample);
+  return `battery ${pct}${cap ? `, ${cap}` : ""}`;
+}
+
+/** The battery bar's fill width, in the SAME units as `maxWidth` (the
+ * glyph's own inner fillable width), clamped 0-100% first so a
+ * momentarily-over-100 gauge reading (the same post-full-charge overshoot
+ * `charge_pct_from` already clamps server-side) can never draw past the
+ * glyph's own body. `null` when unmeasured — the caller draws no fill rect
+ * at all, the same absence-never-zero rule `simpleBand` follows for the
+ * CPU/GPU/MEM dials. */
+export function batteryFillWidth(chargePct: number | null, maxWidth: number): number | null {
+  if (chargePct === null) return null;
+  const clamped = Math.max(0, Math.min(100, chargePct));
+  return (clamped / 100) * maxWidth;
+}
+
 /** The health row's condition value + whether it should render in the warn
  * tone. Prefers the COMPUTED `condition_word` — derived server-side from
  * `health_condition` (the authoritative `BatteryHealthCondition` signal),

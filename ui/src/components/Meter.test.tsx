@@ -399,46 +399,14 @@ describe("Meter — band-colored fill + caption (#2122)", () => {
     expect(band.classList.contains("mm-band-critical")).toBe(false);
   });
 
-  // (#2821 review, item 5) `lowIsBad` — the battery charge gauge's own
-  // inverted direction, rendered end to end (not just `meterBandLevel`'s
-  // pure logic above).
-  function renderLowIsBad(now: number, warnAt: number, criticalAt: number) {
-    return render(
-      <Meter
-        wrapperClassName="mm-gauge mm-gauge--compact"
-        ariaLabel="Battery"
-        bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", now)}
-        numerals={{ now, avg: null, max: null }}
-        hideAvgMax
-        warnAt={warnAt}
-        criticalAt={criticalAt}
-        lowIsBad
-      />,
-    );
-  }
-
-  it("lowIsBad: 25% at warnAt=20/criticalAt=10 is quiet — well above the low threshold", () => {
-    const { container } = renderLowIsBad(25, 20, 10);
-    expect(container.querySelector(".mm-gauge-fill-compact")!.getAttribute("class")).not.toMatch(/mm-band-/);
-  });
-
-  it("lowIsBad: 15% is warn (below warnAt, above criticalAt)", () => {
-    const { container } = renderLowIsBad(15, 20, 10);
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.classList.contains("mm-band-warn")).toBe(true);
-    expect(band.classList.contains("mm-band-critical")).toBe(false);
-  });
-
-  it("lowIsBad: 5% is critical", () => {
-    const { container } = renderLowIsBad(5, 20, 10);
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.classList.contains("mm-band-critical")).toBe(true);
-  });
-
-  it("lowIsBad with -Infinity thresholds (the on-AC \"never fires\" case) never tints, at any percent", () => {
-    const { container } = renderLowIsBad(1, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY);
-    expect(container.querySelector(".mm-gauge-fill-compact")!.getAttribute("class")).not.toMatch(/mm-band-/);
-  });
+  // (#2821 review, item 5; amended by operator) `lowIsBad` used to have a
+  // component-level rendered test HERE, against a `<Meter lowIsBad>` prop.
+  // That prop is gone — the battery gauge became `BatteryBar`, a bespoke
+  // SVG in `machineStatsContent.tsx` that calls the PURE `meterBandLevel`
+  // function directly (tested above, "lowIsBad inverts the direction" etc.)
+  // rather than going through `<Meter>` at all. End-to-end coverage of the
+  // battery bar's own rendered color now lives in
+  // `MachineLens.test.tsx`'s battery-bar tests.
 
   it("a non-banded band (VRAM's own bands) never picks up a band-level class regardless of length", () => {
     const { container } = render(

@@ -99,5 +99,4 @@ TEMPERATURE
 30.0 °C
 OPERATING TIME
 4,000 h
-runs on MacBook-Pro →
 

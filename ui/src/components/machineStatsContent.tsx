@@ -42,6 +42,8 @@ import {
   fmtPct,
   simpleBand,
   angleForPct,
+  meterBandLevel,
+  bandLevelClass,
   MEM_WARN_AT,
   MEM_CRITICAL_AT,
 } from "./Meter";
@@ -64,7 +66,7 @@ import type {
   PresenceBeat,
   ThermalState,
 } from "../types/handwritten";
-import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "../lib/battery";
+import { batteryAriaLabel, batteryFillWidth, capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "../lib/battery";
 
 /** Re-render on a light interval so the rolling 10-minute window keeps
  * aging samples out, and the compact line's live value stays current, even
@@ -409,52 +411,130 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  * record exhaustively, display selectively), just not rendered here. Do
  * not re-add a chart of it without first getting the layout documented (or
  * reverse-engineered with actual confidence) from Apple. */
-/** (#2821 review, item 5) The charge dial's own low-charge thresholds —
- * meaningful ONLY while genuinely discharging (`!sample.on_ac`); on AC
- * (charging or topped off) the dial stays neutral regardless of percent,
- * since "20% while plugged in and climbing" is not the concerning reading
- * "20% and falling" is. Picked to read as an ordinary low-battery warning
- * (a phone's own UI convention), not tied to any macOS-documented value. */
+/** (#2821 review, item 5; amended by operator — no gradient, reuse the
+ * meters' own solid accent + warn/critical colors) The bar's low-charge
+ * thresholds — meaningful ONLY while genuinely discharging
+ * (`!sample.on_ac`); on AC (charging or topped off) the bar stays the
+ * plain accent color regardless of percent, since "20% while plugged in
+ * and climbing" is not the concerning reading "20% and falling" is.
+ * Matches the SAME two-threshold shape CPU/GPU/MEM's own `warnAt`/
+ * `criticalAt` use, just inverted (`meterBandLevel`'s `lowIsBad`) and at
+ * different numbers, chosen to read as an ordinary low-battery warning (a
+ * phone's own UI convention), not tied to any macOS-documented value. */
 const BATTERY_LOW_WARN_PCT = 20;
 const BATTERY_LOW_CRITICAL_PCT = 10;
+
+/** The battery glyph's own SVG geometry, in its `viewBox` units — a
+ * rounded body + a small terminal nub on the right, the conventional
+ * "battery" icon shape. Sized to read clearly at the small scale this
+ * section uses (roughly the CPU/GPU/MEM dials' own visual weight — see
+ * `.battery-bar` in styles.css for the rendered pixel size), not to match
+ * `Meter.tsx`'s `STROKE_W`/arc geometry verbatim: that constant is scaled
+ * for an 11px stroke on a 240×170 arc, which would read as a solid block
+ * on a glyph this size, so the outline/fill weights below are picked for
+ * THIS shape instead and stated here rather than inherited silently. */
+const BATTERY_ICON_VIEW_W = 64;
+const BATTERY_ICON_VIEW_H = 28;
+const BATTERY_BODY_X = 1;
+const BATTERY_BODY_Y = 1;
+const BATTERY_BODY_W = 52;
+const BATTERY_BODY_H = 26;
+const BATTERY_BODY_RX = 4;
+const BATTERY_NUB_X = BATTERY_BODY_X + BATTERY_BODY_W + 2;
+const BATTERY_NUB_Y = BATTERY_BODY_Y + BATTERY_BODY_H / 2 - 5;
+const BATTERY_NUB_W = 6;
+const BATTERY_NUB_H = 10;
+const BATTERY_FILL_INSET = 4;
+const BATTERY_FILL_X = BATTERY_BODY_X + BATTERY_FILL_INSET;
+const BATTERY_FILL_Y = BATTERY_BODY_Y + BATTERY_FILL_INSET;
+const BATTERY_FILL_MAX_W = BATTERY_BODY_W - BATTERY_FILL_INSET * 2;
+const BATTERY_FILL_H = BATTERY_BODY_H - BATTERY_FILL_INSET * 2;
+const BATTERY_FILL_RX = 2;
+
+/** The battery-shaped bar that replaced the compact dial (operator,
+ * 2026-09-23: "it's a little bit off that other meters represent higher
+ * pct being closer to danger, when battery you want full... a battery
+ * shaped bar that gradients from green full down to red empty?" — then
+ * amended: "none of the other meters use gradient for the fill... blue
+ * seems to be solid on all the other meters except the big one," so this
+ * draws NO gradient. The fill is a SOLID color, exactly the CPU/GPU/MEM
+ * dials' own convention: the plain accent color
+ * (`.mm-gauge-fill-compact`'s `var(--accent)`) normally, switching to the
+ * SAME `.mm-band-warn`/`.mm-band-critical` classes those dials use — the
+ * identical `bandLevelClass(meterBandLevel(...))` call, just with
+ * `lowIsBad: true` and the constants above — while genuinely discharging
+ * and low. On AC the thresholds are pushed to `-Infinity` so nothing can
+ * ever cross them (never `+Infinity` here: with `lowIsBad`, a LOWER bound
+ * is what "never fires" needs) and the bar stays the plain accent color at
+ * any percent. `.battery-bar-fill` in styles.css maps those reused class
+ * names to `fill` instead of `stroke` (the dials use `stroke`; a filled
+ * rect needs `fill`) — the color TOKENS and the class NAMES are shared,
+ * only the CSS property they set differs, because the shape differs. */
+function BatteryBar({ sample }: { sample: BatterySample }) {
+  const dischargingLow = !sample.on_ac;
+  const levelCls = bandLevelClass(
+    meterBandLevel(
+      sample.charge_pct,
+      dischargingLow ? BATTERY_LOW_WARN_PCT : Number.NEGATIVE_INFINITY,
+      dischargingLow ? BATTERY_LOW_CRITICAL_PCT : Number.NEGATIVE_INFINITY,
+      true,
+    ),
+  );
+  const fillW = batteryFillWidth(sample.charge_pct, BATTERY_FILL_MAX_W);
+  return (
+    <div className="battery-bar-row">
+      <svg
+        className="battery-bar"
+        viewBox={`0 0 ${BATTERY_ICON_VIEW_W} ${BATTERY_ICON_VIEW_H}`}
+        role="img"
+        aria-label={batteryAriaLabel(sample)}
+      >
+        <rect
+          className="battery-bar-body"
+          x={BATTERY_BODY_X}
+          y={BATTERY_BODY_Y}
+          width={BATTERY_BODY_W}
+          height={BATTERY_BODY_H}
+          rx={BATTERY_BODY_RX}
+        />
+        <rect className="battery-bar-nub" x={BATTERY_NUB_X} y={BATTERY_NUB_Y} width={BATTERY_NUB_W} height={BATTERY_NUB_H} rx={1.5} />
+        {fillW != null && (
+          <rect
+            className={`battery-bar-fill${levelCls ? ` ${levelCls}` : ""}`}
+            x={BATTERY_FILL_X}
+            y={BATTERY_FILL_Y}
+            width={fillW}
+            height={BATTERY_FILL_H}
+            rx={BATTERY_FILL_RX}
+          />
+        )}
+        {/* A small bolt glyph ONLY while current is actually flowing in —
+            `charging`, not `on_ac` (a laptop sitting on AC at 100% is
+            `on_ac: true, charging: false`, the reference machine's own
+            steady state per `BatterySample.on_ac`'s own Rust doc; showing
+            a bolt there would claim current is flowing when it isn't). */}
+        {sample.charging && (
+          <text className="battery-bar-bolt" x={BATTERY_BODY_X + BATTERY_BODY_W / 2} y={BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4} textAnchor="middle" aria-hidden="true">
+            ⚡
+          </text>
+        )}
+      </svg>
+      <span className={`battery-bar-pct${levelCls ? ` ${levelCls}` : ""}`}>{fmtPct(sample.charge_pct)}</span>
+    </div>
+  );
+}
 
 function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; health: BatteryHealth | null }) {
   if (sample === null && health === null) return null;
   const cond = conditionRow(health);
   const capacity = capacityLine(health);
   const operatingHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
-  // Only tint while discharging — see the constants' own doc above.
-  const dischargingLow = sample != null && !sample.on_ac;
   return (
     <div className="battery-block hx-section">
       <div className="hx-section__title">Battery</div>
       {sample && (
-        <div className="meter-row">
-          <Meter
-            wrapperClassName="mm-gauge mm-gauge--compact"
-            width={COMPACT_METER_WIDTH}
-            height={COMPACT_METER_HEIGHT}
-            ariaLabel={`Battery: ${sample.charge_pct == null ? "unmeasured" : `${sample.charge_pct}%`}${chargeCaption(sample) ? `, ${chargeCaption(sample)}` : ""}`}
-            hideAvgMax
-            // No `label` prop: the section title ("Battery") right above
-            // already names this gauge, unlike the untitled CPU/GPU/MEM row
-            // (which relies on each gauge's own label). A second "BATTERY"
-            // caption directly under the dial would be a literal duplicate
-            // of the title one line up — caught live via the parity golden
-            // (#2821, playwright run: "BATTERY" rendered twice).
-            // (#2821 review, item 5) The dial DOES tint now, but only while
-            // discharging and low — `lowIsBad` inverts the usual "high is
-            // bad" direction CPU/GPU/MEM use. On AC the thresholds are
-            // pushed to -Infinity so nothing can ever cross them (never
-            // +Infinity here: with lowIsBad, a LOWER bound is what "never
-            // fires" needs).
-            warnAt={dischargingLow ? BATTERY_LOW_WARN_PCT : Number.NEGATIVE_INFINITY}
-            criticalAt={dischargingLow ? BATTERY_LOW_CRITICAL_PCT : Number.NEGATIVE_INFINITY}
-            lowIsBad
-            bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", sample.charge_pct)}
-            needleAngleDeg={sample.charge_pct == null ? undefined : angleForPct(sample.charge_pct)}
-            numerals={{ now: sample.charge_pct, avg: null, max: null }}
-          />
+        <div className="battery-bar-wrap">
+          <BatteryBar sample={sample} />
           <div className="cluster-tile__caption battery-caption">{chargeCaption(sample)}</div>
         </div>
       )}

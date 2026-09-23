@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "./battery";
+import { batteryAriaLabel, batteryFillWidth, capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "./battery";
 import type { BatteryHealth, BatterySample } from "../types/handwritten";
 
 function sample(over: Partial<BatterySample> = {}): BatterySample {
@@ -106,5 +106,39 @@ describe("fmtOperatingHours", () => {
   });
   it("is null when unmeasured", () => {
     expect(fmtOperatingHours(null)).toBeNull();
+  });
+});
+
+describe("batteryAriaLabel", () => {
+  it("states percent and on-AC", () => {
+    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, charging: false }))).toBe("battery 100%, on AC");
+  });
+  it("states percent and charging", () => {
+    expect(batteryAriaLabel(sample({ charge_pct: 62, on_ac: true, charging: true }))).toBe("battery 62%, charging");
+  });
+  it("states percent and a time-left estimate while discharging", () => {
+    expect(batteryAriaLabel(sample({ charge_pct: 35, on_ac: false, minutes_to_empty: 130 }))).toBe(
+      "battery 35%, 2 h 10 m left",
+    );
+  });
+  it("is unmeasured for a null sample", () => {
+    expect(batteryAriaLabel(null)).toBe("battery unmeasured");
+  });
+});
+
+describe("batteryFillWidth", () => {
+  it("scales linearly to the given max width", () => {
+    expect(batteryFillWidth(100, 44)).toBe(44);
+    expect(batteryFillWidth(50, 44)).toBe(22);
+    expect(batteryFillWidth(0, 44)).toBe(0);
+  });
+  it("clamps a >100 reading (the post-full-charge overshoot) to the max width, never past it", () => {
+    expect(batteryFillWidth(103, 44)).toBe(44);
+  });
+  it("clamps a negative reading to 0", () => {
+    expect(batteryFillWidth(-5, 44)).toBe(0);
+  });
+  it("is null when unmeasured — the caller draws no fill rect at all", () => {
+    expect(batteryFillWidth(null, 44)).toBeNull();
   });
 });

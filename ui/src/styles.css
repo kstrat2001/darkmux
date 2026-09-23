@@ -4761,58 +4761,10 @@ body {
   margin: 4px 0;
 }
 
-/* (#1809) The link out to this machine's pinned runs lens, replacing the
-   per-run list that used to live here. Styled as a control rather than a
-   document link: a bare `<a>` renders as the browser's default blue
-   underline, which is the only such thing on a page built entirely from
-   bordered cards and chips. Carries the same box the expand-control that
-   used to sit here had (bordered, accent, 44px touch target), so the
-   affordance reads as the one operators already learned. */
-.machine-lens__runslink {
-  display: inline-block;
-  margin-top: 14px;
-  padding: 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--accent);
-  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  text-decoration: none;
-  position: relative;
-}
-/* 44px touch target without inflating the painted control — the same
-   `::after` technique the chrome controls use. */
-.machine-lens__runslink::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  height: 44px;
-  transform: translateY(-50%);
-}
-.machine-lens__runslink:hover,
-.machine-lens__runslink:focus-visible {
-  border-color: var(--accent);
-}
-/* (#2108, operator finding) On a phone this control sat at roughly HALF
-   the card's width with dead space beside it — an `inline-block` sized to
-   its own text, not to the card. The mobile variant (`useIsMobile`, the
-   drawer's own 768px breakpoint) makes it screen-wide within the card and
-   a real 48px iOS touch target (not the invisible `::after` overlay
-   desktop uses — full-width already gives it that height honestly);
-   "runs on <machine>" reads on the left, the `→` pins right via the
-   `justify-content: space-between` this needs `display: flex` for.
-   Desktop (`.machine-lens__runslink` alone, no modifier) is completely
-   unchanged. */
-.machine-lens__runslink--mobile {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  min-height: 48px;
-  box-sizing: border-box;
-  padding: 0 14px;
-}
+/* (#1809, removed 2026-09-23 — operator: "the runs link is out of place.
+   probably just remove it.") `.machine-lens__runslink`/`--mobile` used to
+   style the link out to this machine's pinned runs lens; deleted along
+   with the `<a>` it styled (`MachineLens.tsx`). */
 
 /* `.hint` is used by this lens's empty state and was likewise undefined —
    legacy defines it at viewer.html:455. */
@@ -7228,17 +7180,84 @@ body {
   text-align: center;
 }
 
-/* (#2821) The battery charge dial's state caption ("on AC" / "charging" /
-   "2 h 10 m left") — reuses `.cluster-tile__caption`'s exact type
-   treatment (same quiet mono caption every compact gauge in this row
-   already uses) via the shared class on the element; this rule only widens
-   it, since a battery caption's phrase runs longer than a cluster's
-   "N cores · N MHz" line and must not truncate mid-word on a 100px gauge
-   column. */
+/* (#2821) The battery caption ("on AC" / "charging" / "2 h 10 m left") —
+   reuses `.cluster-tile__caption`'s exact type treatment (same quiet mono
+   caption every compact gauge in this row already uses) via the shared
+   class on the element; this rule only widens it, since a battery
+   caption's phrase runs longer than a cluster's "N cores · N MHz" line and
+   must not truncate mid-word. */
 .battery-caption {
   width: 100%;
   white-space: normal;
   text-align: center;
+}
+
+/* (#2821, operator: "a battery shaped bar that gradients from green full
+   down to red empty" — then amended: "none of the other meters use
+   gradient... blue seems to be solid on all the other meters except the
+   big one") The battery-shaped bar that replaced the compact dial. NO
+   gradient: the fill is a flat, solid color exactly like every other
+   compact gauge's `.mm-gauge-fill-compact` (`stroke: var(--accent)`) —
+   this is the same idea for a FILLED shape instead of an arc, so it sets
+   `fill` rather than `stroke`. `.mm-band-warn`/`.mm-band-critical` are the
+   IDENTICAL class names `bandLevelClass()` returns for the CPU/GPU/MEM
+   dials (`Meter.tsx`'s own doc) — reused verbatim here, just mapped to
+   `fill` instead of `stroke` because the shape differs, not the color
+   language. */
+.battery-bar-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.battery-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.battery-bar {
+  width: 84px;
+  height: auto;
+  display: block;
+}
+.battery-bar-body {
+  fill: #222a3c; /* `.mm-gauge-track`'s own unfilled-track color */
+  stroke: var(--border);
+  stroke-width: 2;
+}
+.battery-bar-nub {
+  fill: var(--border);
+}
+.battery-bar-fill {
+  fill: var(--accent);
+}
+.battery-bar-fill.mm-band-warn {
+  fill: var(--warn);
+}
+.battery-bar-fill.mm-band-critical {
+  fill: var(--bad);
+}
+/* The bolt sits ON the fill (or the empty track, at very low charge), so
+   it needs a color that reads against either — `var(--bg)` (the page's
+   own background, near-black) with a soft light stroke reads as an etched
+   glyph rather than disappearing into a light accent fill. */
+.battery-bar-bolt {
+  font-size: 13px;
+  fill: var(--bg);
+  paint-order: stroke;
+  stroke: var(--fg);
+  stroke-width: 0.6px;
+}
+.battery-bar-pct {
+  font: 700 calc(15px * var(--fs-scale))/1.2 var(--font-mono);
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.battery-bar-pct.mm-band-warn {
+  color: var(--warn);
+}
+.battery-bar-pct.mm-band-critical {
+  color: var(--bad);
 }
 
 /* (#2108, operator finding — wrap fix) The mobile identity block — two

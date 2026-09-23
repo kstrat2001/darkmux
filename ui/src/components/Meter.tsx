@@ -185,11 +185,6 @@ export interface MeterProps {
    * never reads these — nothing to threshold. */
   warnAt?: number;
   criticalAt?: number;
-  /** (#2821 review, item 5) Inverts `warnAt`/`criticalAt`'s direction —
-   * see `meterBandLevel`'s own doc. Defaults to `false` (every existing
-   * "high is bad" caller). The battery charge gauge is the one caller
-   * that passes `true`, and only while genuinely discharging. */
-  lowIsBad?: boolean;
   /** Extra SVG content drawn last, before `</svg>` closes — VRAM's
    * odometer digit group + its two text labels. The one thing that isn't
    * shared core (see this module's own doc). */
@@ -242,7 +237,17 @@ export const MEM_CRITICAL_AT = 97;
  * reading crosses (e.g. `warnAt: 20, criticalAt: 10` — at or below 20% is
  * warn, at or below 10% is critical), with the SAME `>=`-style inclusive
  * edge in its own direction (`<=`). Defaults to `false` so every existing
- * caller is unaffected. */
+ * caller is unaffected.
+ *
+ * **This parameter is kept on the FUNCTION even though the `<Meter>`
+ * COMPONENT's own `lowIsBad` prop was deleted** (operator amendment: the
+ * battery dial became a battery-shaped bar, `machineStatsContent.tsx`'s
+ * `BatteryBar`, which draws its own SVG rather than going through
+ * `<Meter>` at all). `BatteryBar` calls this function DIRECTLY —
+ * `meterBandLevel(sample.charge_pct, warnAt, criticalAt, true)` — to
+ * decide its own fill/percent-text color, reusing the exact severity
+ * logic rather than re-deriving it. Deleting the parameter here too would
+ * force that reuse to fork the threshold math instead. */
 export function meterBandLevel(
   now: number | null,
   warnAt: number,
@@ -344,7 +349,6 @@ export function Meter({
   hideAvgMax,
   warnAt = DEFAULT_WARN_AT,
   criticalAt = DEFAULT_CRITICAL_AT,
-  lowIsBad = false,
   children,
 }: MeterProps) {
   // (#2122) The caption numeral colors itself off its OWN value — every
@@ -352,7 +356,7 @@ export function Meter({
   // never disagree, but computing this independently means a caller with
   // `numerals` and no `banded` band (none exist today) simply gets no
   // caption color rather than crashing on a band lookup.
-  const nowLevelCls = numerals ? bandLevelClass(meterBandLevel(numerals.now, warnAt, criticalAt, lowIsBad)) : "";
+  const nowLevelCls = numerals ? bandLevelClass(meterBandLevel(numerals.now, warnAt, criticalAt)) : "";
   return (
     <div className={wrapperClassName} data-meter={label ? label.toLowerCase() : undefined}>
       <svg width={width} height={height} viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
@@ -377,7 +381,7 @@ export function Meter({
             // `stroke` prop via ordinary CSS cascade — SVG presentation
             // attributes sit below any stylesheet rule in priority, so no
             // conditional here is needed to suppress `b.stroke`.
-            const levelCls = b.banded ? bandLevelClass(meterBandLevel(b.lengthPct, warnAt, criticalAt, lowIsBad)) : "";
+            const levelCls = b.banded ? bandLevelClass(meterBandLevel(b.lengthPct, warnAt, criticalAt)) : "";
             return (
               <path
                 key={b.className}
