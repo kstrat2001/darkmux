@@ -7281,16 +7281,21 @@ body {
   min-width: 0;
 }
 @media (min-width: 481px) {
+  /* Both columns take their content width and pack to the LEFT (with
+     row-reverse, `flex-end` is the left edge), so the meter sits a fixed
+     gap after the info rows instead of at the far edge of a wide lens
+     (operator: "too far to the right"). */
   .battery-layout {
     flex-direction: row-reverse;
+    justify-content: flex-end;
     align-items: center;
-    gap: 24px;
+    gap: 48px;
   }
   .battery-meter {
     flex: 0 0 auto;
   }
   .battery-info {
-    flex: 1 1 auto;
+    flex: 0 1 auto;
   }
 }
 
