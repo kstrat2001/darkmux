@@ -9613,7 +9613,8 @@ impl TailerState {
                 let end = event.get("ts").and_then(|v| v.as_u64());
                 if let (Some((open_seq, start)), Some(end), Some(s)) = (self.open_stream.take(), end, seq) {
                     if open_seq == Some(s) && end >= start {
-                        *self.generation_ms_by_seq.entry(s).or_insert(0) += end - start;
+                        let e = self.generation_ms_by_seq.entry(s).or_insert(0);
+                        *e = e.saturating_add(end - start);
                     }
                 }
             }
