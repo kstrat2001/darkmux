@@ -288,7 +288,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // `Drop` would record this as `interrupted`, which is true but less
         // useful than the reason. Naming the error explicitly is the whole
         // point of #1930 — "it errored, and here is why" beats "it stopped".
-        let result = match with_provider(&provider_id, |p| {
+        let mut result = match with_provider(&provider_id, |p| {
             p.setup(&loaded_workload, &run_dir, &per_run_sandbox_dir)?;
             p.run(
                 &loaded_workload,
@@ -347,6 +347,42 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 eprintln!(
                     "[lab] warn: enriching manifest with fixture info skipped: {e}"
                 );
+            }
+        }
+
+        // (#2833) The write-the-tests work gate. Runs AFTER the fixture-info
+        // enrichment above so `final_hash` (top-level, from the provider) and
+        // `fixture.baseline_hash` (just written) are both on disk to compare.
+        // A no-op unless the fixture declares `baseline.test_count` — that's
+        // read inside `verify_gate::apply` itself, from `source_sandbox_dir`'s
+        // `.fixture.json`. When the gate DOES fire, its verdict is synced back
+        // onto `result.verify` (in-memory) so the notes below, and
+        // `RunOutcome::verify_passed`, agree with what just landed in
+        // `manifest.json` — the CLI's own printed line must not contradict
+        // the artifact `lab run stats`/`inspect` reads. Best-effort, same
+        // discipline as the enrichment above: logged, never fails the run.
+        match crate::lab::verify_gate::apply(
+            &run_dir,
+            &source_sandbox_dir,
+            result.ok,
+            loaded_workload
+                .manifest
+                .workload
+                .verify
+                .as_ref()
+                .and_then(|v| v.coverage_min_pct),
+        ) {
+            Ok(Some(gate)) => {
+                if let Some(v) = result.verify.as_mut() {
+                    v.passed = gate.passed;
+                    v.details = gate.details;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                if !opts.quiet {
+                    eprintln!("[lab] warn: applying verify work gate skipped: {e}");
+                }
             }
         }
 

@@ -39,3 +39,6 @@ pub mod stats_set;
 // (#2855) The text `lab run stats` prints, as tested pure functions.
 pub mod stats_render;
 pub mod tune;
+// (#2833) The write-the-tests work gate: a run can only pass when it did
+// the work, broke nothing, and met any coverage it was asked for.
+pub mod verify_gate;
