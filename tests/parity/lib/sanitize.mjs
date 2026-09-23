@@ -285,7 +285,7 @@ const UUID_FIELDS = new Set(["machine_uid"]);
 const SAFE_FIELDS = new Set([
   "_type", "action", "ansi_text", "args", "argv", "attribution", "build",
   "captured_date", "captured_prev_date", "case_ids", "category", "command",
-  "condition", "config_id", "cpu_brand", "crew", "daemon_url",
+  "condition", "condition_word", "config_id", "cpu_brand", "crew", "daemon_url",
   "darkmux_version", "date", "decision", "dir", "display_name", "endpoint",
   "event", "exec_mode", "extra", "file", "finish_reason", "first_date",
   "first_ts", "flow_schema_version", "handle", "http_status", "id",
@@ -392,13 +392,71 @@ function sanitizeString(s, fieldName, matched) {
   return syntheticIdentifier(entityScan(s, matched));
 }
 
+// (#2821) `battery_health`'s numeric fields are a DEVICE FINGERPRINT — cycle
+// count, raw/nominal capacity in mAh, temperature, the 28-bucket
+// state-of-charge histogram, cumulative operating hours, and
+// `permanent_failure_status` are all specific to one real machine's one
+// real battery pack, recorded verbatim off THIS machine on 2026-09-23. The
+// generic "number/boolean/null pass through untouched" rule below is
+// defensible everywhere else in the corpus (non-identifying counts, byte
+// totals, etc.) but would silently re-leak this exact fingerprint on any
+// future re-record, so this block gets its OWN numeric policy rather than
+// falling through to that default. Round, clearly-synthetic values —
+// nothing here should ever be mistaken for a real reading.
+const BATTERY_HEALTH_SYNTHETIC_NUMERIC = {
+  cycle_count: 42,
+  design_capacity_mah: 6000,
+  raw_max_capacity_mah: 5400,
+  nominal_charge_capacity_mah: 5520,
+  raw_capacity_pct: 90,
+  nominal_capacity_pct: 92,
+  permanent_failure_status: 0,
+  temperature_c: 30,
+  total_operating_time_hours: 4000,
+};
+
+/** A smooth synthetic ramp, not the shape of any real battery's lifetime
+ * counters (real ones are irregular per-bucket) — so a reader can never
+ * mistake this for recorded device data. Preserves only the ARRAY LENGTH
+ * from the original (a structural fact the parity renderer's bar count
+ * depends on), never any of its values. */
+function syntheticSocHistogram(length) {
+  return Array.from({ length }, (_, i) => (i + 1) * 10);
+}
+
+/** `battery_health`'s own sanitizer, used in place of the generic `walk`
+ * recursion for that one object. String fields (`condition`/
+ * `condition_word`) still go through the normal field-name policy — both
+ * are small fixed enums already on `SAFE_FIELDS`, the same character as
+ * `state`/`limit_source`. Every numeric field is replaced with a fixed
+ * synthetic value from `BATTERY_HEALTH_SYNTHETIC_NUMERIC` (or, for the
+ * histogram array, `syntheticSocHistogram`) rather than passed through. */
+function sanitizeBatteryHealth(value, matched) {
+  if (value === null) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (k === "time_at_soc_hours") {
+      out[k] = v === null ? null : syntheticSocHistogram(v.length);
+      matched.batteryNumeric++;
+    } else if (typeof v === "number" && Object.prototype.hasOwnProperty.call(BATTERY_HEALTH_SYNTHETIC_NUMERIC, k)) {
+      out[k] = BATTERY_HEALTH_SYNTHETIC_NUMERIC[k];
+      matched.batteryNumeric++;
+    } else {
+      out[k] = walk(v, matched, k);
+    }
+  }
+  return out;
+}
+
 /** Recursively walk a parsed JSON value, sanitizing every string leaf by its enclosing field name. */
 function walk(value, matched, fieldName) {
   if (typeof value === "string") return sanitizeString(value, fieldName, matched);
   if (Array.isArray(value)) return value.map((v) => walk(v, matched, fieldName));
   if (value && typeof value === "object") {
     const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = walk(v, matched, k);
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = k === "battery_health" ? sanitizeBatteryHealth(v, matched) : walk(v, matched, k);
+    }
     return out;
   }
   return value; // number / boolean / null pass through untouched
@@ -416,7 +474,7 @@ export function sanitizeText(text) {
   const parsed = JSON.parse(text);
   const matched = {
     identifiers: 0, tickets: 0, shas: 0, ips: 0, magicdns: 0,
-    prose: 0, paths: 0, uuids: 0, unknown: 0,
+    prose: 0, paths: 0, uuids: 0, unknown: 0, batteryNumeric: 0,
     unknownFields: new Set(),
   };
   const sanitized = walk(parsed, matched, "");
