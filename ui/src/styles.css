@@ -5147,10 +5147,6 @@ body {
    second row. Two ragged half-rows read worse than two full ones.
    Full width lets each pane lay its tiles out in a single line at desktop,
    and reflow cleanly at narrow widths. */
-.session-run .metricbanks {
-  display: block;
-  margin-bottom: 12px;
-}
 
 /* (#1973) The metric panes carry a scope so the operator can tell which
    numbers describe the MODEL's work and which describe the HARNESS around it
@@ -5167,19 +5163,24 @@ body {
    Out of flow, the empty tracks collapse and the tiles expand to fill. It
    stays CSS-generated so the parity goldens, which compare innerText, are
    untouched. */
-.session-run .metrics[data-scope] {
-  position: relative;
-  padding-top: 16px;
+/* (#2863) One section header for MODEL, SYSTEM and SIGNALS. Generated from
+   `data-head` so the parity goldens (innerText) never see it; in normal flow
+   on the section (not inside the tile grid, where it once squashed the
+   tracks — see #1973's note in git history), with room beneath it. */
+.session-run .runsec {
+  margin-bottom: 14px;
 }
-.session-run .metrics[data-scope]::before {
-  position: absolute;
-  top: 0;
-  left: 0;
-  content: attr(data-scope);
+.session-run .runsec::before {
+  display: block;
+  content: attr(data-head);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-size: calc(10px * var(--fs-scale));
   color: var(--dim);
+  margin-bottom: 8px;
+}
+.session-run .runsec > :last-child {
+  margin-bottom: 0;
 }
 
 /* (operator, 2026-09-05, second pass) The FIRST pass forced every tile to a

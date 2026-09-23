@@ -25,7 +25,6 @@ timing
 07:36:48 · running
 17:51:54 so far
 WALL CLOCK
-signals
 CLEAN
 no detector flagged this run
 cycle

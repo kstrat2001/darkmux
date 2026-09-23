@@ -435,31 +435,25 @@ describe("SessionReplay", () => {
     expect(document.querySelector(".session-run")?.textContent).toContain("qwen3.6-35b-a3b-turboquant-mlx · 20GB");
   });
 
-  it("(#1973) keeps the two metric panes ADJACENT, so text order still matches the legacy golden", async () => {
-    // CI caught what the screen did not. The first version of the pane split
-    // rendered HARNESS *below* the model track, which sandwiched
-    // `model (lms)` between two metric grids — and, because the parity spec
-    // compares the rendered `#stage` text byte-for-byte against
-    // `goldens/session-task-list.txt`, moved WALL CLOCK after `model (lms)`
-    // and failed it.
-    //
-    // Adjacency is the fix for both: it reads as one grouped metric row, and
-    // `innerText` order stays identical to legacy (the pane labels are
-    // CSS-generated and never enter the text). This asserts it locally,
-    // because the parity suite only runs in CI and a layout regression should
-    // not need a full playwright run to surface.
+  it("(#2863) groups the page as MODEL (tiles, then which model), SYSTEM, SIGNALS", async () => {
+    // Operator, 2026-09-23: the page read model tiles, system tiles, then the
+    // model card again. #1973 had kept the two tile grids adjacent to hold a
+    // golden's text order; the model card belongs with the model's numbers,
+    // and the golden was updated rather than the layout bent around it.
     stubSession();
     renderReplay("s-disc");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
-    const model = document.querySelector('.metrics[data-scope="model"]');
-    const system = document.querySelector('.metrics[data-scope="system"]');
-    expect(model?.nextElementSibling, "HARNESS must directly follow MODEL — nothing between them").toBe(system);
-
-    // And the text order the golden pins: COMPACTIONS ... WALL CLOCK ... model track.
+    const secs = [...document.querySelectorAll(".session-run .runsec")];
+    expect(secs.map((e) => e.getAttribute("data-head"))).toEqual(["model", "system", "signals"]);
+    // The model card sits inside the MODEL section, after its tiles.
+    const model = secs[0];
+    expect(model.querySelector('.metrics[data-scope="model"]')?.nextElementSibling?.querySelector(".lbl")?.textContent).toBe(
+      "loaded models",
+    );
     const txt = document.querySelector(".session-run")?.textContent ?? "";
-    expect(txt.indexOf("TOKENS OUT")).toBeLessThan(txt.indexOf("WALL CLOCK"));
-    expect(txt.indexOf("WALL CLOCK")).toBeLessThan(txt.indexOf("loaded models"));
+    expect(txt.indexOf("TOKENS OUT")).toBeLessThan(txt.indexOf("loaded models"));
+    expect(txt.indexOf("loaded models")).toBeLessThan(txt.indexOf("WALL CLOCK"));
   });
 
   it("(#1973) renders a signal group with its severity, count badge and run-relative time", async () => {
@@ -828,7 +822,12 @@ describe("SessionReplay", () => {
     // which is the golden recording a defect rather than catching one.
     expect(screen.queryByText("loaded models")).not.toBeInTheDocument();
     expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();
-    expect(screen.getByText("signals")).toBeInTheDocument();
+    // (#2863) Three sections, one header style, in reading order: no model
+    // section here (non-model unit), then system, then signals.
+    expect([...document.querySelectorAll(".session-run .runsec")].map((e) => e.getAttribute("data-head"))).toEqual([
+      "system",
+      "signals",
+    ]);
     // (#2863) A clean run: the shared outcome chip labeled "clean", then one
     // cell per detector that looked and found nothing.
     expect(screen.getByText("clean")).toBeInTheDocument();

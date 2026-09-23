@@ -54,14 +54,18 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   const lines: string[] = [];
   lines.push(`${view.header.pillLabel} ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
   lines.push(...view.briefLines.map((e) => e.text));
-  // (#1973) Iterate by SCOPE, not over the flat `metrics` array. The panes
-  // render model-then-harness and the model pane is ABSENT for a unit that
-  // did no model work, so a mirror that walked all six would claim tiles the
-  // page does not show.
-  for (const i of [...view.metricScope.model, ...view.metricScope.system]) {
-    const m = view.metrics[i];
-    if (m) lines.push(m.value, m.label);
-  }
+  // (#2863) Mirrors the page's three sections in reading order: MODEL (its
+  // tiles, then the model card), SYSTEM, SIGNALS. The section headers are
+  // CSS-generated, so they are not in the text. The model section is ABSENT
+  // for a unit that did no model work (#1973), so iterate by scope rather
+  // than over the flat `metrics` array.
+  const tiles = (idx: number[]) => {
+    for (const i of idx) {
+      const m = view.metrics[i];
+      if (m) lines.push(m.value + (m.unit ?? ""), m.label);
+    }
+  };
+  tiles(view.metricScope.model);
   if (view.hasModelWork) {
     lines.push(view.modelTrackLabel);
     // (#2863) Mirrors the card: with per-model structure, each row is its
@@ -75,11 +79,11 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
       lines.push(...view.modelTrackLines);
     }
   }
-  // (#1973) Mirrors the SIGNALS block's DOM: label, then either the clean
-  // pair or, per group, a head line and one line per signal. Note this mirror
-  // is NOT enforced against the component (#1978) — the rendered assertions
-  // live in `SessionReplay.test.tsx`. What this pins is the DERIVATION.
-  lines.push(view.signalsLabel);
+  tiles(view.metricScope.system);
+  // (#1973) Mirrors the SIGNALS block's DOM: either the clean pair or, per
+  // group, a head line and one line per signal. Note this mirror is NOT
+  // enforced against the component (#1978) — the rendered assertions live in
+  // `SessionReplay.test.tsx`. What this pins is the DERIVATION.
   if (view.signalGroups.length === 0) {
     // (#2863) The shared chip renders its label upper-cased, as it does
     // COMPLETE; the detector cells read from the one list the card uses.
