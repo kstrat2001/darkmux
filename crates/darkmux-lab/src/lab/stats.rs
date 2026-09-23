@@ -240,6 +240,16 @@ pub struct RunStats {
     /// once: the faster engine cost 1.85x the GPU seconds per FINISHED run,
     /// because a failed run consumes the GPU too.
     pub verify: Option<String>,
+    /// (#2833) `verify` came from a run whose fixture declares
+    /// `baseline.test_count` (a write-the-tests-shaped fixture), but whose
+    /// manifest predates the work gate (`schema_version < 6`) — so `verify`
+    /// is the OLD raw "did the verify command exit 0" signal, which passes
+    /// on an untouched sandbox. Never reinterpreted after the fact (the run
+    /// already happened under the old rule); flagged so a mixed series
+    /// isn't silently compared across two different definitions of
+    /// success. `false` for every run gated at write time, and for any run
+    /// whose fixture doesn't declare a baseline at all.
+    pub verify_ungated: bool,
     pub ok: Option<bool>,
 
     // --- time -------------------------------------------------------------
@@ -944,11 +954,33 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
     });
     let ok = side("manifest.json", "ok").and_then(|v| v.as_bool());
 
+    // (#2833) A run's verify came from BEFORE the write-the-tests work gate
+    // existed iff: verify was recorded at all, the manifest's schema
+    // predates the gate (< 6 — absent reads as 0, which is also "before"),
+    // and the fixture this run actually used (`fixture.source_path`,
+    // recorded by the run itself, not re-derived from current config)
+    // declares a `baseline.test_count` — i.e. the gate WOULD have applied
+    // had it existed yet. Best-effort: if the fixture path is gone or
+    // unreadable, this stays `false` rather than guessing.
+    let schema_version = side("manifest.json", "schema_version").and_then(|v| v.as_u64());
+    let fixture_source_path = side("manifest.json", "fixture")
+        .and_then(|f| f.get("source_path").cloned())
+        .and_then(|v| v.as_str().map(str::to_string));
+    let verify_ungated = verify.is_some()
+        && schema_version.unwrap_or(0) < 6
+        && fixture_source_path
+            .as_deref()
+            .map(|p| crate::lab::fixture::FixtureManifest::load_from_dir(Path::new(p))
+                .ok()
+                .and_then(|m| m.baseline.get("test_count").cloned())
+                .is_some())
+            .unwrap_or(false);
+
     let wall_ms = m.wall_ms.unwrap_or(0);
     let started = m.started_at_unix_ms.unwrap_or(0);
     let flows = read_flows(flows_dir, session_id.as_deref(), started, started + wall_ms);
 
-    Ok(derive_stats(
+    let mut stats = derive_stats(
         run_dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -959,7 +991,9 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
         flows,
         verify,
         ok,
-    ))
+    );
+    stats.verify_ungated = verify_ungated;
+    Ok(stats)
 }
 
 pub(crate) fn derive_stats(
@@ -1185,6 +1219,12 @@ pub(crate) fn derive_stats(
         model: m.model.clone(),
         result: m.result.clone(),
         verify,
+        // Overwritten by `compute_from_dir` right after this call returns —
+        // `derive_stats` has no fixture path to check, so it can't compute
+        // this itself. `false` here matches its meaning for every direct
+        // `derive_stats` caller (the unit tests in stats_tests.rs), none of
+        // which exercise a baselined fixture.
+        verify_ungated: false,
         ok,
         wall_ms,
         rest_ms,

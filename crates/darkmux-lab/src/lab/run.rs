@@ -353,17 +353,27 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // (#2833) The write-the-tests work gate. Runs AFTER the fixture-info
         // enrichment above so `final_hash` (top-level, from the provider) and
         // `fixture.baseline_hash` (just written) are both on disk to compare.
-        // A no-op unless the fixture declares `baseline.test_count` — that's
-        // read inside `verify_gate::apply` itself, from `source_sandbox_dir`'s
-        // `.fixture.json`. When the gate DOES fire, its verdict is synced back
-        // onto `result.verify` (in-memory) so the notes below, and
-        // `RunOutcome::verify_passed`, agree with what just landed in
-        // `manifest.json` — the CLI's own printed line must not contradict
-        // the artifact `lab run stats`/`inspect` reads. Best-effort, same
-        // discipline as the enrichment above: logged, never fails the run.
+        // A no-op unless the fixture declares `baseline.test_count` (or the
+        // workload declares a coverage threshold with no baseline, which
+        // gets a warning instead) — that's resolved inside `verify_gate::
+        // apply` itself, from `source_sandbox_dir`'s `.fixture.json`. When
+        // the gate DOES fire, its verdict is synced back onto `result.verify`
+        // (in-memory) so the notes below, and `RunOutcome::verify_passed`,
+        // agree with what just landed in `manifest.json` — the CLI's own
+        // printed line must not contradict the artifact `lab run
+        // stats`/`inspect` reads.
+        //
+        // FAIL-CLOSED on `Err` (#2833 review finding 4): `verify_gate::apply`
+        // is itself fail-closed once a baseline is known declared — it only
+        // bubbles `Err` when it couldn't even read/write `manifest.json` at
+        // all, so there was nothing to force a recorded failure into. That
+        // residual case still must not leave a stale/raw PASS standing in
+        // the CLI's own in-memory view, so it's forced here too, even though
+        // nothing could be persisted to disk.
         match crate::lab::verify_gate::apply(
             &run_dir,
             &source_sandbox_dir,
+            &per_run_sandbox_dir,
             result.ok,
             loaded_workload
                 .manifest
@@ -381,7 +391,14 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             Ok(None) => {}
             Err(e) => {
                 if !opts.quiet {
-                    eprintln!("[lab] warn: applying verify work gate skipped: {e}");
+                    eprintln!(
+                        "[lab] warn: applying verify work gate failed ({e}) — \
+                         failing verify closed rather than trusting the raw result"
+                    );
+                }
+                if let Some(v) = result.verify.as_mut() {
+                    v.passed = false;
+                    v.details = format!("verify gate could not be applied: {e}");
                 }
             }
         }
