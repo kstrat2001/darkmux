@@ -130,6 +130,20 @@ describe("recordObject", () => {
     expect(recordObject(tool({ tool_name: "edit", args })).text).toBe("test/a.test.js");
   });
 
+  it("reads the object out of arguments the flow record cut short", () => {
+    // Measured: the host clips long arguments, so a big edit's args are not
+    // valid JSON (double-encoded AND truncated) and a parse fails.
+    const args = JSON.stringify(JSON.stringify({ path: "/workspace/test/a.test.js", edits: [{ old_string: "x".repeat(50) }] })).slice(0, 70) + "…";
+    expect(recordObject(tool({ tool_name: "edit", args })).text).toBe("test/a.test.js");
+    const cmd = '{"command":"cd /workspace && npm test 2>&1","timeout_se…';
+    expect(recordObject(tool({ tool_name: "bash", args: cmd })).text).toBe("npm test");
+  });
+
+  it("a reasoning record with no text says so rather than showing a bare chip", () => {
+    const r = { action: "dispatch.reasoning", fields: { reasoning_text: "\n\n" } } as never;
+    expect(recordObject(r).text).toBe("(no reasoning text)");
+  });
+
   it("names a command by the command, without the cd prefix or the redirect", () => {
     const o = recordObject(tool({ tool_name: "bash", args: '{"command":"cd /workspace && npm test 2>&1","timeout_seconds":30}', outcome: "ok" }));
     expect(o.text).toBe("npm test");

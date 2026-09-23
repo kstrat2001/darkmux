@@ -21,6 +21,7 @@ import { FiltersDialog, FiltersBody } from "./FiltersDialog";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail, recordObject } from "../lib/recordDetail";
+import { turnItems } from "../lib/turnGroups";
 import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
@@ -78,6 +79,24 @@ const DEFAULT_DETAIL_PCT = 38;
  * collapsed state, not a second one. The page beside it keeps at least
  * `PAGE_MIN_PX`. */
 export const MIN_COL_WIDTH_PX = 380;
+
+/** (#2863) A turn header's figures. A turn past `SLOW_TURN_MS` shows its
+ * time in amber; thinking tokens are named once they are a real share. */
+const SLOW_TURN_MS = 30_000;
+const THINKING_NOTE_MIN = 1_000;
+
+/** `14.2 s` when exact; `~8 s` when read from whole-second timestamps, where
+ * a decimal would claim precision the data does not have. */
+export function fmtTurnDuration(ms: number, approx: boolean): string {
+  if (approx) return `~${Math.max(1, Math.round(ms / 1000))} s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  const sec = Math.round(ms / 1000);
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+
+export function fmtTok(n: number): string {
+  return n < 1000 ? n.toLocaleString() : `${(n / 1000).toFixed(1)}k`;
+}
 const COLLAPSE_SLACK_PX = 80;
 const PAGE_MIN_PX = 420;
 const COL_WIDTH_STEP_PX = 20;
@@ -1147,8 +1166,79 @@ export function EventLogColumn({
               onSetQuery={setQuery}
             />
           ) : visibleRecs.length ? (
-            visibleRecs.map((r) => {
+            turnItems(visibleRecs, records).map((item) => {
+              const r = item.rec;
               const key = recKey(r);
+              const isSel = !!selected && recKey(selected) === key;
+              const common = {
+                "data-act": "rec",
+                role: "button" as const,
+                tabIndex: 0,
+                // (#1868) The row's own `handle` — hover provenance, and the
+                // mission lens's own parity-extraction hook
+                // (`tests/parity/lib/extract-graph.js` reads it).
+                title: r.handle || undefined,
+                onClick: () => selectRecord(r),
+                onKeyDown: onActivateKeyDown(() => selectRecord(r)),
+              };
+              // (#2863) A turn is the header its events sit under: how long
+              // it took, and how full the context was going in.
+              if (item.kind === "turn") {
+                const t = item.turn;
+                const pct = t.window && t.inTok !== null ? Math.min(100, (100 * t.inTok) / t.window) : null;
+                return (
+                  <div key={key} className={`eventlog__rec eventlog__rec--turn${isSel ? " sel" : ""}`} {...common}>
+                    <div className="eventlog__turnline">
+                      <span className="eventlog__ractivity eventlog__turnname">Turn {t.seq}</span>
+                      <span className="eventlog__turnwhy">{t.why}</span>
+                      <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>
+                      {t.durationMs !== null ? (
+                        <span
+                          className={`eventlog__turndur${t.durationMs >= SLOW_TURN_MS ? " eventlog__turndur--slow" : ""}`}
+                          title={t.approx ? "approximate: from whole-second timestamps" : "generation time"}
+                        >
+                          {fmtTurnDuration(t.durationMs, t.approx)}
+                        </span>
+                      ) : null}
+                    </div>
+                    {t.inTok !== null || t.outTok !== null ? (
+                      <div className="eventlog__turnctx">
+                        {pct !== null ? (
+                          <span
+                            className="eventlog__ctxbar"
+                            role="img"
+                            aria-label={`${t.inTok!.toLocaleString()} of ${t.window!.toLocaleString()} tokens in context`}
+                          >
+                            <span className="eventlog__ctxfill" style={{ width: `${pct}%` }} />
+                            {t.threshold ? (
+                              <span className="eventlog__ctxtick" style={{ left: `${(100 * t.threshold) / t.window!}%` }} />
+                            ) : null}
+                          </span>
+                        ) : null}
+                        <span className="eventlog__ctxnums">
+                          {t.inTok !== null ? <>in <b>{fmtTok(t.inTok)}</b></> : null}
+                          {t.inTok !== null && t.outTok !== null ? " · " : ""}
+                          {t.outTok !== null ? <>out <b>{fmtTok(t.outTok)}</b></> : null}
+                          {t.thinkTok !== null && t.thinkTok >= THINKING_NOTE_MIN ? ` (${fmtTok(t.thinkTok)} thinking)` : ""}
+                        </span>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              }
+              // (#2863) A rest is a divider between turns, not a row among them.
+              if (item.kind === "rest") {
+                const f = (r.fields || r.payload || {}) as Record<string, unknown>;
+                const ms = typeof f.ms === "number" ? f.ms : typeof f.delay_ms === "number" ? f.delay_ms : null;
+                return (
+                  <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
+                    <span className="eventlog__ractivity">
+                      rested{ms !== null ? ` ${Math.round(ms / 1000)} s` : ""}
+                      {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
+                    </span>
+                  </div>
+                );
+              }
               const obj = recordObject(r);
               return (
                 <div

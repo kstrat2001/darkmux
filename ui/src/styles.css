@@ -1852,6 +1852,97 @@ body {
 .eventlog__outcome--ok { background: var(--good); }
 .eventlog__outcome--reported { background: var(--warn); }
 .eventlog__outcome--failed { background: var(--bad); }
+/* (#2863) A turn header: the group its events sit under. Two lines: what
+   the turn was and how long it took; then how full the context was going in
+   (a bar against the window, a tick at the compaction threshold) and what
+   went in and out. */
+.eventlog__rec--turn {
+  display: grid;
+  gap: 4px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+}
+.eventlog__turnline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.eventlog__turnname {
+  color: var(--fg);
+  font: 700 calc(12px * var(--fs-scale))/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.eventlog__turnwhy {
+  flex: 1;
+  color: var(--dim);
+}
+.eventlog__rec--turn .eventlog__rectime {
+  color: var(--dim);
+}
+.eventlog__turndur {
+  color: var(--fg);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.eventlog__turndur--slow {
+  color: var(--warn);
+}
+.eventlog__turnctx {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+.eventlog__ctxbar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--panel-4);
+}
+.eventlog__ctxfill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0.8;
+}
+.eventlog__ctxtick {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 1px;
+  background: var(--warn);
+  opacity: 0.7;
+}
+.eventlog__ctxnums {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.eventlog__ctxnums b {
+  color: var(--fg);
+  font-weight: 600;
+}
+/* (#2863) A rest is a divider between turns. */
+.eventlog__rec--rest {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  font-size: calc(10px * var(--fs-scale));
+  padding-block: 3px;
+}
+.eventlog__rec--rest::before,
+.eventlog__rec--rest::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--warn) 25%, transparent);
+}
+.eventlog__rec--rest .eventlog__ractivity {
+  color: var(--warn);
+}
 /* The machine and session every row shares, said once. */
 .eventlog__shared {
   font: calc(10.5px * var(--fs-scale))/1.3 var(--font-mono);

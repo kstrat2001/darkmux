@@ -515,6 +515,8 @@ describe("#2416 — act defaults to DEFAULT_ACTIVITIES, new values absorb off, p
       rec({ action: "dispatch.tool" }),
       rec({ action: "dispatch.turn" }),
       rec({ action: "dispatch.error" }),
+      // (#2863) a default too: the divider between a run's turns
+      rec({ action: "dispatch.rest" }),
       rec({ action: "dispatch.turn.heartbeat" }),
       rec({ action: "flow.note" }),
     ]);

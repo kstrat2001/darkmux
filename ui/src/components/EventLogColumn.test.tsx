@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
-import { EventLogColumn, compactCountLabel } from "./EventLogColumn";
+import { EventLogColumn, compactCountLabel, fmtTok, fmtTurnDuration } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 import { closeOpenModal } from "../lib/dialogManager";
 
@@ -1020,5 +1020,59 @@ describe("EventLogColumn — resizable width (#2863)", () => {
     setViewport(390, 844);
     render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
     expect(handle()).toBeNull();
+  });
+});
+
+// ── (#2863) A run's list is grouped by turn ─────────────────────────────────
+describe("EventLogColumn — turns (#2863)", () => {
+  const S = "darkmux-coding-x-1790125784225";
+  const r = (sec: number, action: string, payload: Record<string, unknown> = {}) =>
+    rec({ ts: new Date(Date.UTC(2026, 8, 23, 1, 9, sec)).toISOString(), action, session_id: S, machine_id: "MacBook-Pro", payload } as never);
+  const records = [
+    r(1, "dispatch.turn.heartbeat", { turn_seq: 1 }),
+    r(9, "dispatch.turn", {
+      turn_seq: 1,
+      finish_reason: "tool_calls",
+      tool_calls_count: 1,
+      usage: { prompt_tokens: 15898, completion_tokens: 933, reasoning_tokens: 0 },
+    }),
+    r(9, "telemetry.context", { used: 15898, max: 262144, threshold: 131072 }),
+    r(10, "dispatch.tool", { tool_name: "edit", args: '{"path":"/workspace/a.js"}', outcome: "ok" }),
+    r(11, "dispatch.rest", { ms: 15000, reason: "thermal-duty-cycle", state: "fair" }),
+  ];
+
+  it("a turn is a header row: its number, what it did, its time, and its context", () => {
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    const head = document.querySelector(".eventlog__rec--turn")!;
+    expect(head.querySelector(".eventlog__turnname")!.textContent).toBe("Turn 1");
+    expect(head.querySelector(".eventlog__turnwhy")!.textContent).toBe("1 tool");
+    expect(head.querySelector(".eventlog__turndur")!.textContent).toBe("~8 s");
+    expect(head.querySelector(".eventlog__ctxnums")!.textContent).toBe("in 15.9k · out 933");
+    expect((head.querySelector(".eventlog__ctxfill") as HTMLElement).style.width).toMatch(/^6\.06/);
+    expect((head.querySelector(".eventlog__ctxtick") as HTMLElement).style.left).toBe("50%");
+    // Still a row: clickable, counted, carries the handle title.
+    expect(head).toHaveAttribute("data-act", "rec");
+  });
+
+  it("a rest is a divider between turns, still a selectable row", () => {
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    const rest = document.querySelector(".eventlog__rec--rest")!;
+    expect(rest.textContent).toBe("rested 15 s · thermal: fair");
+    expect(rest).toHaveAttribute("data-act", "rec");
+  });
+
+  it("a list mixing sessions shows no turn headers", () => {
+    const mixed = [...records, rec({ ts: "2026-09-23T01:09:30.000Z", action: "dispatch.turn", session_id: "other", payload: { turn_seq: 1 } } as never)];
+    render(<EventLogColumn scopeLabel="fleet" records={mixed} visible />);
+    expect(document.querySelector(".eventlog__rec--turn")).toBeNull();
+  });
+
+  it("formats durations with precision the data has", () => {
+    expect(fmtTurnDuration(14217, false)).toBe("14.2 s");
+    expect(fmtTurnDuration(74100, false)).toBe("1:14");
+    expect(fmtTurnDuration(8000, true)).toBe("~8 s");
+    expect(fmtTurnDuration(300, true)).toBe("~1 s");
+    expect(fmtTok(933)).toBe("933");
+    expect(fmtTok(18926)).toBe("18.9k");
   });
 });

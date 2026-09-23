@@ -133,6 +133,20 @@ function commandText(cmd: string): string {
     .trim();
 }
 
+/** The one field that names a tool call's object, read out of arguments
+ * that did not parse: the host clips long arguments, so a large edit's are
+ * cut mid-JSON (and may be double-encoded too). Un-escape until stable, then
+ * take the first complete `"key":"value"` pair. */
+function fieldFromRaw(raw: string, keys: readonly string[]): { key: string; value: string } | null {
+  let t = raw;
+  for (let i = 0; i < 3 && t.includes('\\"'); i++) t = t.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  for (const key of keys) {
+    const m = t.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+    if (m) return { key, value: m[1] };
+  }
+  return null;
+}
+
 function unquote(s: string): string {
   const t = s.trim();
   return t.startsWith('"') ? t.replace(/^"+|"+$/g, "") : t;
@@ -166,8 +180,16 @@ export function recordObject(r: FlowRecord): RecordObject {
     } else if (args && typeof args.path === "string") {
       text = args.path.replace(CONTAINER_ROOT, "");
     } else {
-      text = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
-      mono = true;
+      const raw = typeof f.args === "string" && !args ? fieldFromRaw(f.args, ["command", "pattern", "path"]) : null;
+      if (raw?.key === "path") {
+        text = raw.value.replace(CONTAINER_ROOT, "");
+      } else if (raw) {
+        text = raw.key === "command" ? commandText(raw.value) : raw.value;
+        mono = true;
+      } else {
+        text = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
+        mono = true;
+      }
     }
     let outcome: RecordObject["outcome"];
     if (typeof f.outcome === "string") {
@@ -183,7 +205,7 @@ export function recordObject(r: FlowRecord): RecordObject {
   }
   if (a === "dispatch.reasoning" && typeof f?.reasoning_text === "string") {
     const first = unquote(f.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
-    return { chip: "reasoning", kind: "think", text: first.trim(), mono: false };
+    return { chip: "reasoning", kind: "think", text: first.trim() || "(no reasoning text)", mono: false };
   }
   return { text: recordDetail(r), mono: false };
 }
