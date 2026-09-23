@@ -70,6 +70,12 @@ function pillClsFor(label: string): PillCls {
   return "canceled";
 }
 
+/** (#2863) The detectors a clean run passed, in the order the old sentence
+ * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
+ * read by the signals card and by the text mirror its tests compare against
+ * the parity golden, so the two cannot drift apart. */
+export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift"] as const;
+
 export interface SessionHeader {
   /** Pre-uppercased (`.sub h2{text-transform:uppercase}` in legacy CSS —
    * this port uppercases the string directly, per `lib/format.ts`'s

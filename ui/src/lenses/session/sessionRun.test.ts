@@ -17,7 +17,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { runRegions } from "./sessionRun";
+import { CLEAN_DETECTORS, runRegions } from "./sessionRun";
 import { flowToRenderModel } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 
@@ -63,7 +63,17 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
     if (m) lines.push(m.value, m.label);
   }
   if (view.hasModelWork) {
-    lines.push(view.modelTrackLabel, ...view.modelTrackLines);
+    lines.push(view.modelTrackLabel);
+    // (#2863) Mirrors the card: with per-model structure, each row is its
+    // name, its size and its tag; otherwise the text lines.
+    if (view.modelEntries) {
+      for (const m of view.modelEntries) {
+        lines.push(m.name, m.gb != null ? `${m.gb} GB` : "?");
+        if (m.ran != null) lines.push(m.ran ? "ran this run" : "also loaded");
+      }
+    } else {
+      lines.push(...view.modelTrackLines);
+    }
   }
   // (#1973) Mirrors the SIGNALS block's DOM: label, then either the clean
   // pair or, per group, a head line and one line per signal. Note this mirror
@@ -71,7 +81,9 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   // live in `SessionReplay.test.tsx`. What this pins is the DERIVATION.
   lines.push(view.signalsLabel);
   if (view.signalGroups.length === 0) {
-    lines.push("✓ clean", "no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)");
+    // (#2863) The shared chip renders its label upper-cased, as it does
+    // COMPLETE; the detector cells read from the one list the card uses.
+    lines.push("CLEAN", "no detector flagged this run", ...CLEAN_DETECTORS);
   } else {
     for (const g of view.signalGroups) {
       lines.push(`${g.severity === "warn" ? "⚠" : "✓"}${g.kind}${g.count > 1 ? `×${g.count}` : ""}`);

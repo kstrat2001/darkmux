@@ -18,7 +18,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
  *  asserting something the harness has already ruled out. */
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
-import { runRegions } from "../session/sessionRun";
+import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
 
@@ -105,10 +105,6 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
     <>{entry.text}</>
   );
 }
-
-/** (#2863) The detectors a clean run passed, in the order the old sentence
- * named them: `cycle, tool-failure, reasoning-loop, edit-drift`. */
-const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift"] as const;
 
 export function SessionReplay({ sessionId, playhead = null }: { sessionId: string; playhead?: number | null }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
