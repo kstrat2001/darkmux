@@ -575,8 +575,10 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     // exists to fix.
     expect(screen.getByText("Normal")).toBeInTheDocument();
     expect(screen.queryByText(/Check Battery/)).toBeNull();
-    expect(screen.getByText(/5,701 of 6,249 mAh/)).toBeInTheDocument();
-    expect(screen.getByText("(raw, 91.2%)")).toBeInTheDocument();
+    expect(screen.getByText(/^max charge$/i)).toBeInTheDocument();
+    expect(screen.getByText("5,701 mAh · 91.2%")).toBeInTheDocument();
+    expect(screen.getByText(/^original capacity$/i)).toBeInTheDocument();
+    expect(screen.getByText("6,249 mAh")).toBeInTheDocument();
     expect(screen.getByText("28")).toBeInTheDocument();
     expect(screen.getByText("31.0 °C")).toBeInTheDocument();
     // (#2821, operator, 2026-09-23) The per-bucket histogram was pulled —

@@ -122,14 +122,21 @@ describe("capacityLine", () => {
   // raw reading; the "(raw, X%)" parenthetical is now a SEPARATE field so
   // the caller can wrap it in `white-space: nowrap` — it must move to the
   // next line whole, never split mid-parenthesis at a narrow viewport.
-  it("value carries only the raw mAh reading, no parenthetical", () => {
-    expect(capacityLine(health())?.value).toBe("5,701 of 6,249 mAh");
+  // (operator, 2026-09-24) "raw", "design" and "when new" all read as
+  // jargon. Two rows: MAX CHARGE (what the pack holds now, and that as a
+  // percent of the original) and ORIGINAL CAPACITY on its own line.
+  it("max charge is what the pack holds now, with its percent of the original", () => {
+    expect(capacityLine(health())?.value).toBe("5,701 mAh · 91.2%");
   });
-  it("parenthetical carries the raw percent, separately", () => {
-    expect(capacityLine(health())?.parenthetical).toBe("(raw, 91.2%)");
+  it("original capacity is its own figure", () => {
+    expect(capacityLine(health())?.original).toBe("6,249 mAh");
   });
-  it("parenthetical degrades to bare (raw) without a percent figure", () => {
-    expect(capacityLine(health({ raw_capacity_pct: null }))?.parenthetical).toBe("(raw)");
+  it("without a percent, max charge is the mAh alone", () => {
+    expect(capacityLine(health({ raw_capacity_pct: null }))?.value).toBe("5,701 mAh");
+  });
+  it("no jargon in what renders", () => {
+    const c = capacityLine(health())!;
+    expect(`${c.value} ${c.original}`).not.toMatch(/raw|design|when new|nominal/i);
   });
   it("the nominal reading and the disclaimer move into title", () => {
     const title = capacityLine(health())?.title;

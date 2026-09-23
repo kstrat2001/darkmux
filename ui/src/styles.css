@@ -7294,15 +7294,6 @@ body {
   }
 }
 
-/* (operator, 2026-09-24) "5,700 of 6,249 mAh (raw, 91.2%)" wrapped mid-
-   parenthesis at 390px — `capacityLine`'s `parenthetical` field is now a
-   separate string specifically so this ONE span can be pinned `nowrap`:
-   it moves to the next line whole, or not at all, never split after the
-   comma. */
-.battery-nowrap {
-  white-space: nowrap;
-}
-
 /* (#2108, operator finding — wrap fix) The mobile identity block — two
    stacked lines (machine name, then hardware) with NO separators,
    replacing the single dotted `headerLine` that wrapped after "128 GB ·"

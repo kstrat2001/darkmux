@@ -117,21 +117,17 @@ function Kv({
   title,
 }: {
   label: string;
-  /** A plain string for every existing caller; the battery health row's
-   * "charge capacity" line is the one exception — it passes a short JSX
-   * fragment (text + a `white-space: nowrap`-wrapped parenthetical span,
-   * `capacity.parenthetical`, so "(raw, 91.2%)" never splits mid-clause at
-   * a narrow viewport) rather than a plain string. The `!value` empty-hide
-   * check below only fires for the string case (a JSX element is always
-   * truthy) — every JSX caller is expected to gate its OWN presence
-   * upstream instead (this file's `{capacity && <Kv .../>}` pattern). */
+  /** A plain string for every caller today. `ReactNode` stays allowed for
+   * a row that needs inline markup; the `!value` empty-hide check below only
+   * fires for the string case (a JSX element is always truthy), so a JSX
+   * caller gates its own presence upstream (`{x && <Kv .../>}`). */
   value: string | ReactNode;
   className?: string;
   /** (#2821 review, item 3) An optional hover/long-press disclosure —
-   * currently only the battery health row's "charge capacity" line uses
+   * currently only the battery health row's "max charge" line uses
    * this, to carry the nominal-capacity reading and the "not macOS's own
    * Maximum Capacity" disclaimer without making it a second headline
-   * number beside the raw one. Every other `Kv` caller omits this and
+   * number beside the measured one. Every other `Kv` caller omits this and
    * renders unchanged (`title={undefined}` renders no attribute at all). */
   title?: string;
 }) {
@@ -571,15 +567,12 @@ function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; he
             {cond && <Kv className={cond.warn ? "dialog__kv--warn" : ""} label="condition" value={cond.value} />}
             {capacity && (
               <Kv
-                label="charge capacity"
-                value={
-                  <>
-                    {capacity.value} <span className="battery-nowrap">{capacity.parenthetical}</span>
-                  </>
-                }
+                label="max charge"
+                value={capacity.value}
                 title={capacity.title ?? undefined}
               />
             )}
+            {capacity && <Kv label="original capacity" value={capacity.original} />}
             <Kv label="cycles" value={health.cycle_count != null ? String(health.cycle_count) : ""} />
             <Kv label="temperature" value={health.temperature_c != null ? `${health.temperature_c.toFixed(1)} °C` : ""} />
             <Kv label="operating time" value={operatingHours ?? ""} />
