@@ -502,7 +502,8 @@ describe("RunsBoard", () => {
     const before = history.length;
     fireEvent.click(screen.getByText("coding-1").closest(".labrunrow")!);
     expect(window.location.hash).toBe("#dispatch=sess-c1");
-    // A real navigation, not a replace: Back returns to the series list.
+    // A real navigation, not a replace: Back returns to the lab list (the
+    // series toggle is component state, not in the hash, so it reopens off).
     // Opening the record page and redirecting from there also lands on the
     // session view, but REPLACES the list's history entry on the way.
     expect(history.length).toBe(before + 1);
@@ -514,6 +515,10 @@ describe("RunsBoard", () => {
     renderBoard("lab", "coding-1");
     await waitFor(() => expect(window.location.hash).toBe("#dispatch=sess-c1"));
     expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
+    // The funnel page never mounts on the way: it would start its own detail
+    // fetch in the same commit as the redirect.
+    const calls = (fetch as unknown as { mock: { calls: [string][] } }).mock.calls.map((c) => c[0]);
+    expect(calls.some((u) => u.startsWith("/lab/run/detail"))).toBe(false);
   });
 
   it("a deep-link into kind=lab with a run= param opens the lab-run detail pane directly, on first render", async () => {

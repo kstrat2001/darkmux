@@ -4131,6 +4131,10 @@ mod tests {
         let old = |ok: Option<bool>| LabRunSummary { run_ok: ok, ..minimal_lab_summary("d", false, false) };
         assert_eq!(lab_run_status(&old(Some(true)), now, Some(false)), RunStatus::Complete);
         assert_eq!(lab_run_status(&old(Some(false)), now, Some(false)), RunStatus::Error);
+        // A degenerate run is an error even when its manifest says ok:
+        // tool-bench always writes `ok: true`.
+        let degenerate = LabRunSummary { degenerate: true, ..old(Some(true)) };
+        assert_eq!(lab_run_status(&degenerate, now, Some(false)), RunStatus::Error);
         // CONTROL: no manifest outcome keeps the old inference.
         assert_eq!(lab_run_status(&old(None), now, Some(false)), RunStatus::Abandoned);
     }
