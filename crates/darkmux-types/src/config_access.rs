@@ -1443,19 +1443,25 @@ pub fn host_sampler_lock_path() -> std::path::PathBuf {
 
 /// Whether the thermal governor + breaker are active at all.
 pub fn thermal_enabled() -> bool {
+    thermal_enabled_with_source().0
+}
+
+/// (run-page rest-reason cards) `thermal_enabled` plus WHICH tier resolved
+/// it — so the `dispatch start.bounds` stamp can say whether thermal pacing
+/// was ARMED for this dispatch, the same way `turn_delay_ms_with_source`
+/// already does for the sibling rest knob.
+pub fn thermal_enabled_with_source() -> (bool, Source) {
     if let Some(s) = env_str("DARKMUX_THERMAL_ENABLED") {
         // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
         // every knob in this family: all five are opt-OUTs of a feature or
         // a safety behavior, so a typo must not be the thing that turns
         // one off. See `parse_bool_token`.
-        return parse_bool_token(&s).unwrap_or(true);
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
     }
-    config()
-        .runtime
-        .as_ref()
-        .and_then(|r| r.thermal.as_ref())
-        .and_then(|t| t.enabled)
-        .unwrap_or(true)
+    match config().runtime.as_ref().and_then(|r| r.thermal.as_ref()).and_then(|t| t.enabled) {
+        Some(v) => (v, Source::Config),
+        None => (true, Source::BuiltIn),
+    }
 }
 
 /// (#2774 round-3 C4) Normalize a thermal-state token at RESOLUTION —
@@ -1780,8 +1786,16 @@ pub fn host_source_script() -> Option<std::path::PathBuf> {
 /// charge is too low", the numeric way to disable the floor without
 /// touching either boolean.
 pub fn power_min_battery_pct() -> u8 {
+    power_min_battery_pct_with_source().0
+}
+
+/// (run-page rest-reason cards) `power_min_battery_pct` plus WHICH tier
+/// resolved it — for the `dispatch start.bounds` stamp's `battery_pause_
+/// floor_pct` field.
+pub fn power_min_battery_pct_with_source() -> (u8, Source) {
     let cfg = config().power.as_ref().and_then(|p| p.min_battery_pct);
-    pick_parsed::<u64>("DARKMUX_POWER_MIN_BATTERY_PCT", cfg, Some(50)).unwrap().min(100) as u8
+    let (v, s) = pick_parsed_with_source::<u64>("DARKMUX_POWER_MIN_BATTERY_PCT", cfg, Some(50));
+    (v.unwrap().min(100) as u8, s)
 }
 
 /// Whether a new run refuses to start below [`power_min_battery_pct`].
@@ -1800,14 +1814,25 @@ pub fn power_refuse_start_below_min() -> bool {
 /// Whether a run already in flight pauses when charge crosses
 /// [`power_min_battery_pct`]. Default `true`.
 pub fn power_pause_running_below_min() -> bool {
+    power_pause_running_below_min_with_source().0
+}
+
+/// (run-page rest-reason cards) `power_pause_running_below_min` plus WHICH
+/// tier resolved it — for the `dispatch start.bounds` stamp's
+/// `battery_pause_enabled` field, the same shape `thermal_enabled_with_
+/// source` uses for the sibling protection.
+pub fn power_pause_running_below_min_with_source() -> (bool, Source) {
     if let Some(s) = env_str("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN") {
         // (#2774 review C7) An UNRECOGNIZED token reads as `true` for
         // every knob in this family: all five are opt-OUTs of a feature or
         // a safety behavior, so a typo must not be the thing that turns
         // one off. See `parse_bool_token`.
-        return parse_bool_token(&s).unwrap_or(true);
+        return (parse_bool_token(&s).unwrap_or(true), Source::Env);
     }
-    config().power.as_ref().and_then(|p| p.pause_running_below_min).unwrap_or(true)
+    match config().power.as_ref().and_then(|p| p.pause_running_below_min) {
+        Some(v) => (v, Source::Config),
+        None => (true, Source::BuiltIn),
+    }
 }
 
 // ── Mission board (#1230 Packet 5) ──

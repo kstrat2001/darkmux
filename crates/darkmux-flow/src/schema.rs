@@ -77,8 +77,22 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.53.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.54.0";
 // Version history:
+//   1.54.0 (run-page rest-reason cards): additive keys on `dispatch
+//           start`'s (and the finished envelope's) `bounds` block —
+//           `thermal_pacing_enabled`, `battery_pause_enabled`,
+//           `battery_pause_floor_pct` (each the same `{value, source}`
+//           shape `turn_delay_ms`/`max_turns`/etc. already use). Records
+//           whether thermal/battery pacing was ARMED for this dispatch,
+//           not merely whether it fired — the run-page SYSTEM section
+//           needs this to tell "protection configured, 0 rests" from "not
+//           configured at all" and show (or omit) a per-rest-reason card
+//           accordingly. MINOR, on this history's own repeated precedent
+//           for additive `bounds` fields (1.39.0 `turn_delay_ms`'s own
+//           entry, 1.53.0 immediately below): an older reader that doesn't
+//           know these keys ignores them.
+//
 //   1.53.0 (#2863): additive payload key `generation_ms` on `dispatch.turn`.
 //
 //           The turn's model time (request sent to stream end: prompt processing

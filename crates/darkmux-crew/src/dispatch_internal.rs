@@ -6553,6 +6553,19 @@ fn resolved_runtime_bounds_json(
     // wire format, this one has no fixed vocabulary to round-trip through.
     let (dg_policy, dg_source) =
         darkmux_types::config_access::detection_degeneracy_policy_with_source();
+    // (run-page rest-reason cards) Thermal/battery pacing enablement, so a
+    // SYSTEM-section card can tell "armed and never fired" (0 rests, still
+    // shown) from "not configured for this dispatch" (no card at all).
+    // Neither knob is gated by `is_agentic_remote` — unlike `turn_delay_ms`
+    // above, the thermal/battery governors ride the always-on host sampler
+    // for every container-backed dispatch (`spawn_guarded_sampler`), local
+    // brain or remote-endpoint brain alike, so there is no local/endpoint
+    // override to mirror here.
+    let (thermal_pacing_enabled, s_thermal) = darkmux_types::config_access::thermal_enabled_with_source();
+    let (battery_pause_enabled, s_batt_en) =
+        darkmux_types::config_access::power_pause_running_below_min_with_source();
+    let (battery_pause_floor_pct, s_batt_floor) =
+        darkmux_types::config_access::power_min_battery_pct_with_source();
     let inactivity_timeout_block = match timeout_override_seconds {
         Some(n) => serde_json::json!({ "value": n, "source": "cli" }),
         None => vs(Some(inactivity_timeout_seconds.into()), s_inact),
@@ -6573,6 +6586,9 @@ fn resolved_runtime_bounds_json(
             "value": dg_policy.as_str(),
             "source": dg_source,
         },
+        "thermal_pacing_enabled": vs(Some(thermal_pacing_enabled.into()), s_thermal),
+        "battery_pause_enabled": vs(Some(battery_pause_enabled.into()), s_batt_en),
+        "battery_pause_floor_pct": vs(Some(battery_pause_floor_pct.into()), s_batt_floor),
     })
 }
 

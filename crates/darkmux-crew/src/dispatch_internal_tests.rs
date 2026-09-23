@@ -1229,6 +1229,67 @@
         assert_eq!(bounds["feedback_injection"], serde_json::json!({"value": true, "source": "built-in"}));
     }
 
+    // ─── run-page rest-reason cards: `bounds.thermal_pacing_enabled` /
+    //     `bounds.battery_pause_enabled` / `bounds.battery_pause_floor_pct`
+    //     — the SYSTEM section needs to know whether a protection was
+    //     ARMED for this dispatch (not just whether it fired), so a card
+    //     can show "0:00 · 0 rests" for a protection that never tripped
+    //     rather than being silently absent. ──
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_names_built_in_for_thermal_and_battery_pacing() {
+        for k in [
+            "DARKMUX_THERMAL_ENABLED",
+            "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
+            "DARKMUX_POWER_MIN_BATTERY_PCT",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+        let bounds = resolved_runtime_bounds_json(false, None, None);
+        assert_eq!(
+            bounds["thermal_pacing_enabled"],
+            serde_json::json!({"value": true, "source": "built-in"}),
+            "thermal pacing defaults to armed: {bounds}"
+        );
+        assert_eq!(
+            bounds["battery_pause_enabled"],
+            serde_json::json!({"value": true, "source": "built-in"}),
+            "battery pause defaults to armed: {bounds}"
+        );
+        assert_eq!(
+            bounds["battery_pause_floor_pct"],
+            serde_json::json!({"value": 50, "source": "built-in"}),
+            "battery floor defaults to 50: {bounds}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_names_env_when_thermal_and_battery_pacing_are_overridden() {
+        for k in [
+            "DARKMUX_THERMAL_ENABLED",
+            "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
+            "DARKMUX_POWER_MIN_BATTERY_PCT",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+        unsafe { std::env::set_var("DARKMUX_THERMAL_ENABLED", "false") };
+        unsafe { std::env::set_var("DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN", "off") };
+        unsafe { std::env::set_var("DARKMUX_POWER_MIN_BATTERY_PCT", "35") };
+        let bounds = resolved_runtime_bounds_json(false, None, None);
+        assert_eq!(bounds["thermal_pacing_enabled"], serde_json::json!({"value": false, "source": "env"}));
+        assert_eq!(bounds["battery_pause_enabled"], serde_json::json!({"value": false, "source": "env"}));
+        assert_eq!(bounds["battery_pause_floor_pct"], serde_json::json!({"value": 35, "source": "env"}));
+        for k in [
+            "DARKMUX_THERMAL_ENABLED",
+            "DARKMUX_POWER_PAUSE_RUNNING_BELOW_MIN",
+            "DARKMUX_POWER_MIN_BATTERY_PCT",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
     #[test]
     #[serial]
     fn resolved_runtime_bounds_json_names_env_when_an_env_var_wins() {
