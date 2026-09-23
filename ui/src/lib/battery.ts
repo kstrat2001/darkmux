@@ -10,6 +10,7 @@
  * consumed only from `MachineLens.tsx`.
  */
 import type { BatteryHealth, BatterySample } from "../types/handwritten";
+import { gaugeFillColor } from "../components/Meter";
 
 /** `Nh Mm` from a minute count — the same coarse shape `relAgoFrom` uses
  * for its own hour bucket, just without the "ago" framing (this is a
@@ -21,30 +22,65 @@ function fmtHm(totalMinutes: number): string {
   return `${h} h ${m} m`;
 }
 
-/** The one-line state under the charge gauge: on AC, charging, a time
- * estimate, or nothing extra when discharging with no estimate yet — never
- * a fabricated "0 min left" (the estimator's absence-never-zero rule
- * already governs `minutes_to_empty` on the wire; this just renders what
- * arrives). `null` sample (no battery) renders no caption at all. */
-export function chargeCaption(b: BatterySample | null): string {
-  if (b === null) return "";
-  if (b.on_ac) return b.charging ? "charging" : "on AC";
-  if (b.minutes_to_empty != null) return `${fmtHm(b.minutes_to_empty)} left`;
-  return "on battery";
+/** (operator, 2026-09-24: "'on AC' is unlike a lot of meters these days...
+ * a lightning bolt icon works inside the battery") The glyph drawn INSIDE
+ * the battery body, replacing the old plain-text "on AC"/"charging"
+ * caption:
+ * - `"bolt"` — current is actually flowing in (`charging`).
+ * - `"plug"` — connected to power but NOT charging (topped off/held at
+ *   100%, `on_ac && !charging` — the reference machine's own steady
+ *   state). A bolt here would claim current is flowing when it isn't;
+ *   this is the same distinction macOS's own menu-bar battery icon draws
+ *   between "charging" and "power-connected, full".
+ * - `null` — discharging (`!on_ac`). No icon; the time-remaining estimate
+ *   (`batteryTimeLeftText`) is the information that state actually has to
+ *   show, and an icon can't carry a number. */
+export type BatteryIconKind = "bolt" | "plug" | null;
+
+export function batteryIcon(b: BatterySample): BatteryIconKind {
+  if (b.charging) return "bolt";
+  if (b.on_ac) return "plug";
+  return null;
 }
 
-/** "battery 100%, on AC" / "battery 35%, 2 h 10 m left" / "battery
- * unmeasured" — the accessible name for the battery bar glyph (`role="img"`
- * on its `<svg>`, matching every other compact gauge on this page). Built
- * from the same `chargeCaption` every sighted reader sees, so the two
- * channels never disagree. `null` sample renders the caller's own absent
- * case — this function is never called for one (`BatteryLensBlock` returns
- * early), but is total anyway rather than partial. */
+/** The state fragment for the accessible name — three shapes, matching the
+ * icon states above one-for-one (plus the "on battery" case a bolt/plug
+ * icon never draws): `"charging"`, `"on AC, not charging"`, or
+ * `"on battery"` (with `, H h M m left` appended when an estimate exists).
+ * Never a fabricated "0 min left" — the estimator's absence-never-zero
+ * rule already governs `minutes_to_empty` on the wire; this just states
+ * what arrives, in words. */
+export function batteryStateText(b: BatterySample): string {
+  if (b.charging) return "charging";
+  if (b.on_ac) return "on AC, not charging";
+  const time = b.minutes_to_empty != null ? `, ${fmtHm(b.minutes_to_empty)} left` : "";
+  return `on battery${time}`;
+}
+
+/** The ONLY visible text the battery meter still carries for its power
+ * state (operator: "keep the time-remaining text... only when discharging
+ * with an estimate — that's information an icon can't carry"). Neutral
+ * `null` for every other state: charging/on-AC now speak entirely through
+ * `batteryIcon`'s glyph, and a discharging reading with no estimate yet
+ * has nothing honest to print (never a fabricated "0 min left" placeholder
+ * where the OS declined to estimate). */
+export function batteryTimeLeftText(b: BatterySample | null): string | null {
+  if (b === null || b.on_ac || b.minutes_to_empty == null) return null;
+  return `${fmtHm(b.minutes_to_empty)} left`;
+}
+
+/** "battery 100%, on AC, not charging" / "battery 62%, charging" /
+ * "battery 35%, on battery, 2 h 10 m left" / "battery unmeasured" — the
+ * accessible name for the battery meter's `<svg role="img">`. States the
+ * SAME facts the icon + time text carry visually, in words, so a
+ * screen-reader user loses nothing the icon-only sighted presentation
+ * shows. `null` sample renders the caller's own absent case — this
+ * function is never called for one (`BatteryLensBlock` returns early), but
+ * is total anyway rather than partial. */
 export function batteryAriaLabel(sample: BatterySample | null): string {
   if (sample === null) return "battery unmeasured";
   const pct = sample.charge_pct == null ? "unmeasured" : `${sample.charge_pct}%`;
-  const cap = chargeCaption(sample);
-  return `battery ${pct}${cap ? `, ${cap}` : ""}`;
+  return `battery ${pct}, ${batteryStateText(sample)}`;
 }
 
 /** The battery bar's fill width, in the SAME units as `maxWidth` (the
@@ -58,6 +94,37 @@ export function batteryFillWidth(chargePct: number | null, maxWidth: number): nu
   if (chargePct === null) return null;
   const clamped = Math.max(0, Math.min(100, chargePct));
   return (clamped / 100) * maxWidth;
+}
+
+/** The gradient id the battery bar's own `<linearGradient>` uses — a
+ * separate constant from `COMPACT_RAMP_ID` (Meter.tsx) even though only
+ * one `BatteryBar` ever renders per page (so reuse-safety across multiple
+ * instances is moot here) — named for what it is, not borrowed just
+ * because collision isn't a risk. */
+export const BATTERY_RAMP_ID = "mm-battery-ramp";
+
+/** (operator, 2026-09-24, reversing an earlier "no gradient" amendment:
+ * "the solid meters do not indicate when things are getting tight... give
+ * every small meter the same gradient treatment the big gauge uses") The
+ * battery's OWN ramp — the SAME three-stop palette every other gauge on
+ * this page draws from (`gaugeFillColor`, `components/Meter.tsx`), but
+ * REVERSED: red at the EMPTY end (offset 0%), green at the FULL end
+ * (offset 100%) — "empty is bad, full is good," the opposite direction of
+ * every "high is bad" CPU/GPU/MEM dial, matching the battery's own
+ * `lowIsBad` semantics from a discrete-threshold era of this same file
+ * without needing a discrete threshold: the fill simply reveals less of
+ * the ramp's green end the lower the charge.
+ *
+ * Linear, not cosine-spaced: `gaugeRampStops` (Meter.tsx) cosine-warps its
+ * offsets because a horizontal gradient has to track a SEMICIRCULAR arc's
+ * angle-vs-x mismatch — the battery bar is a plain rectangle, advancing
+ * linearly, so evenly-spaced stops are already correct and a warp would
+ * introduce a mismatch that isn't there to fix. */
+export function batteryRampStops(segments = 12): Array<{ offset: string; color: string }> {
+  return Array.from({ length: segments + 1 }, (_, i) => {
+    const t = i / segments; // 0 = empty edge, 1 = full edge
+    return { offset: `${(t * 100).toFixed(4)}%`, color: gaugeFillColor((1 - t) * 100) };
+  });
 }
 
 /** The health row's condition value + whether it should render in the warn
@@ -100,7 +167,16 @@ export function conditionRow(h: BatteryHealth | null): { value: string; warn: bo
  * `Kv`'s own new prop), worded as a disclaimer rather than a second
  * headline number. `null` when the mAh pair itself is unavailable. */
 export interface CapacityDisplay {
+  /** "5,701 of 6,249 mAh" — no parenthetical, so the caller can render it
+   * as ordinary wrappable text. */
   value: string;
+  /** "(raw, 91.2%)", or bare "(raw)" when the percent itself is absent
+   * (design/raw mAh present but the percent guard in `capacity_pct`
+   * declined) — kept SEPARATE from `value` (operator, 2026-09-24: a 390px
+   * viewport wrapped "(raw, 91.2%)" mid-parenthesis) so the caller can
+   * wrap only this fragment in `white-space: nowrap` — it moves to the
+   * next line WHOLE or not at all, never split after the comma. */
+  parenthetical: string;
   title: string | null;
 }
 
@@ -109,8 +185,8 @@ export function capacityLine(h: BatteryHealth | null): CapacityDisplay | null {
   const design = h.design_capacity_mah;
   const raw = h.raw_max_capacity_mah;
   if (design == null || raw == null) return null;
-  const rawPctClause = h.raw_capacity_pct != null ? `, ${h.raw_capacity_pct}%` : "";
-  const value = `${raw.toLocaleString()} of ${design.toLocaleString()} mAh (raw${rawPctClause})`;
+  const value = `${raw.toLocaleString()} of ${design.toLocaleString()} mAh`;
+  const parenthetical = h.raw_capacity_pct != null ? `(raw, ${h.raw_capacity_pct}%)` : "(raw)";
 
   const nominalParts: string[] = [];
   if (h.nominal_charge_capacity_mah != null) {
@@ -121,7 +197,7 @@ export function capacityLine(h: BatteryHealth | null): CapacityDisplay | null {
     nominalParts.length > 0
       ? `Nominal reading: ${nominalParts.join(", ")}. Neither this nor the raw figure above is macOS's own "Maximum Capacity" percentage — that figure uses an undocumented Apple formula and reproduces from neither.`
       : `Not macOS's own "Maximum Capacity" percentage — that figure uses an undocumented Apple formula.`;
-  return { value, title };
+  return { value, parenthetical, title };
 }
 
 /** `5,368 h` — the lifetime cross-check total, formatted with the same

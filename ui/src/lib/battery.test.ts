@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { batteryAriaLabel, batteryFillWidth, capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "./battery";
+import {
+  batteryAriaLabel,
+  batteryFillWidth,
+  batteryIcon,
+  batteryRampStops,
+  batteryStateText,
+  batteryTimeLeftText,
+  capacityLine,
+  conditionRow,
+  fmtOperatingHours,
+} from "./battery";
+import { gaugeFillColor } from "../components/Meter";
 import type { BatteryHealth, BatterySample } from "../types/handwritten";
 
 function sample(over: Partial<BatterySample> = {}): BatterySample {
@@ -25,21 +36,51 @@ function health(over: Partial<BatteryHealth> = {}): BatteryHealth {
   };
 }
 
-describe("chargeCaption", () => {
-  it("is absent for no battery", () => {
-    expect(chargeCaption(null)).toBe("");
+// ── (operator, 2026-09-24) "'on AC' is unlike a lot of meters these days
+//    ... a lightning bolt icon works inside the battery" — icon replaces
+//    the old plain-text caption for the two AC-connected states; the third
+//    state (discharging) draws none, since `batteryTimeLeftText` is what
+//    that state has to say instead. ─────────────────────────────────────
+describe("batteryIcon", () => {
+  it("bolt while charging (current actually flowing)", () => {
+    expect(batteryIcon(sample({ on_ac: true, charging: true }))).toBe("bolt");
   });
-  it("reads on AC when not charging", () => {
-    expect(chargeCaption(sample({ on_ac: true, charging: false }))).toBe("on AC");
+  it("plug when on AC but NOT charging — topped off/held, never a false bolt", () => {
+    expect(batteryIcon(sample({ on_ac: true, charging: false }))).toBe("plug");
   });
-  it("reads charging when on AC and charging", () => {
-    expect(chargeCaption(sample({ on_ac: true, charging: true }))).toBe("charging");
+  it("no icon while discharging", () => {
+    expect(batteryIcon(sample({ on_ac: false, charging: false }))).toBeNull();
   });
-  it("reads a time-left estimate while discharging", () => {
-    expect(chargeCaption(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("2 h 10 m left");
+});
+
+describe("batteryStateText", () => {
+  it('"charging" while current is flowing', () => {
+    expect(batteryStateText(sample({ on_ac: true, charging: true }))).toBe("charging");
   });
-  it("never fabricates a zero estimate", () => {
-    expect(chargeCaption(sample({ on_ac: false, minutes_to_empty: null }))).toBe("on battery");
+  it('"on AC, not charging" when connected but topped off', () => {
+    expect(batteryStateText(sample({ on_ac: true, charging: false }))).toBe("on AC, not charging");
+  });
+  it('"on battery, H h M m left" while discharging with an estimate', () => {
+    expect(batteryStateText(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("on battery, 2 h 10 m left");
+  });
+  it('bare "on battery" while discharging with no estimate yet — never a fabricated zero', () => {
+    expect(batteryStateText(sample({ on_ac: false, minutes_to_empty: null }))).toBe("on battery");
+  });
+});
+
+describe("batteryTimeLeftText — the ONLY visible power-state text left (icon carries the rest)", () => {
+  it("is null on AC, charging or not — the icon carries that state now", () => {
+    expect(batteryTimeLeftText(sample({ on_ac: true, charging: true }))).toBeNull();
+    expect(batteryTimeLeftText(sample({ on_ac: true, charging: false }))).toBeNull();
+  });
+  it("reads the time-left estimate while discharging", () => {
+    expect(batteryTimeLeftText(sample({ on_ac: false, minutes_to_empty: 130 }))).toBe("2 h 10 m left");
+  });
+  it("is null while discharging with no estimate yet — never a fabricated 0 min", () => {
+    expect(batteryTimeLeftText(sample({ on_ac: false, minutes_to_empty: null }))).toBeNull();
+  });
+  it("is null for a null sample", () => {
+    expect(batteryTimeLeftText(null)).toBeNull();
   });
 });
 
@@ -77,11 +118,18 @@ describe("conditionRow", () => {
 });
 
 describe("capacityLine", () => {
-  // (#2821 review, item 3) The value shows ONLY the raw reading, labeled
-  // inline — never a second headline percentage that reads like macOS's
-  // own single "Maximum Capacity" figure.
-  it("the visible value carries only the raw reading, labeled inline", () => {
-    expect(capacityLine(health())?.value).toBe("5,701 of 6,249 mAh (raw, 91.2%)");
+  // (#2821 review, item 3 / operator, 2026-09-24) The value shows ONLY the
+  // raw reading; the "(raw, X%)" parenthetical is now a SEPARATE field so
+  // the caller can wrap it in `white-space: nowrap` — it must move to the
+  // next line whole, never split mid-parenthesis at a narrow viewport.
+  it("value carries only the raw mAh reading, no parenthetical", () => {
+    expect(capacityLine(health())?.value).toBe("5,701 of 6,249 mAh");
+  });
+  it("parenthetical carries the raw percent, separately", () => {
+    expect(capacityLine(health())?.parenthetical).toBe("(raw, 91.2%)");
+  });
+  it("parenthetical degrades to bare (raw) without a percent figure", () => {
+    expect(capacityLine(health({ raw_capacity_pct: null }))?.parenthetical).toBe("(raw)");
   });
   it("the nominal reading and the disclaimer move into title", () => {
     const title = capacityLine(health())?.title;
@@ -99,7 +147,6 @@ describe("capacityLine", () => {
   });
 });
 
-
 describe("fmtOperatingHours", () => {
   it("formats with a thousands separator", () => {
     expect(fmtOperatingHours(5368)).toBe("5,368 h");
@@ -110,15 +157,17 @@ describe("fmtOperatingHours", () => {
 });
 
 describe("batteryAriaLabel", () => {
-  it("states percent and on-AC", () => {
-    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, charging: false }))).toBe("battery 100%, on AC");
+  it("states percent, on AC, not charging", () => {
+    expect(batteryAriaLabel(sample({ charge_pct: 100, on_ac: true, charging: false }))).toBe(
+      "battery 100%, on AC, not charging",
+    );
   });
   it("states percent and charging", () => {
     expect(batteryAriaLabel(sample({ charge_pct: 62, on_ac: true, charging: true }))).toBe("battery 62%, charging");
   });
-  it("states percent and a time-left estimate while discharging", () => {
+  it("states percent, on battery, and a time-left estimate while discharging", () => {
     expect(batteryAriaLabel(sample({ charge_pct: 35, on_ac: false, minutes_to_empty: 130 }))).toBe(
-      "battery 35%, 2 h 10 m left",
+      "battery 35%, on battery, 2 h 10 m left",
     );
   });
   it("is unmeasured for a null sample", () => {
@@ -140,5 +189,36 @@ describe("batteryFillWidth", () => {
   });
   it("is null when unmeasured — the caller draws no fill rect at all", () => {
     expect(batteryFillWidth(null, 44)).toBeNull();
+  });
+});
+
+// ── (operator, 2026-09-24, reversing an earlier "no gradient" amendment)
+//    "give every small meter the same gradient treatment the big memory
+//    gauge uses"; for the battery, REVERSED — red at empty, green at full.
+describe("batteryRampStops — the REVERSED ramp (red empty -> green full)", () => {
+  it("the empty edge (offset 0%) is red; the full edge (offset 100%) is green", () => {
+    const stops = batteryRampStops(4);
+    expect(stops[0].offset).toBe("0.0000%");
+    expect(stops[0].color).toBe(gaugeFillColor(100)); // red
+    expect(stops[stops.length - 1].offset).toBe("100.0000%");
+    expect(stops[stops.length - 1].color).toBe(gaugeFillColor(0)); // green
+  });
+
+  it("each stop is gaugeFillColor at the MIRRORED percent — same palette as every other dial, opposite direction", () => {
+    const stops = batteryRampStops(8);
+    stops.forEach((s, i) => {
+      const t = i / 8;
+      expect(s.color).toBe(gaugeFillColor((1 - t) * 100));
+    });
+    // The midpoint (50% full) reproduces the palette's own amber, same as
+    // it would at the dial's own 50% — the ramp is mirrored, not a
+    // different palette.
+    expect(stops[4].color).toBe(gaugeFillColor(50));
+  });
+
+  it("offsets are evenly (linearly) spaced, unlike the arc's cosine-spaced stops — the bar is a straight rectangle", () => {
+    const stops = batteryRampStops(4);
+    const offsets = stops.map((s) => parseFloat(s.offset));
+    expect(offsets).toEqual([0, 25, 50, 75, 100]);
   });
 });

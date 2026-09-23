@@ -35,15 +35,15 @@
  * renders its OWN top-level element would force an extra wrapper div into
  * both call sites for no reason.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Meter,
   compactMeterProps,
   fmtPct,
-  simpleBand,
+  gradientBand,
+  gaugeRampStops,
+  COMPACT_RAMP_ID,
   angleForPct,
-  meterBandLevel,
-  bandLevelClass,
   MEM_WARN_AT,
   MEM_CRITICAL_AT,
 } from "./Meter";
@@ -66,7 +66,17 @@ import type {
   PresenceBeat,
   ThermalState,
 } from "../types/handwritten";
-import { batteryAriaLabel, batteryFillWidth, capacityLine, chargeCaption, conditionRow, fmtOperatingHours } from "../lib/battery";
+import {
+  batteryAriaLabel,
+  batteryFillWidth,
+  batteryIcon,
+  batteryRampStops,
+  batteryTimeLeftText,
+  BATTERY_RAMP_ID,
+  capacityLine,
+  conditionRow,
+  fmtOperatingHours,
+} from "../lib/battery";
 
 /** Re-render on a light interval so the rolling 10-minute window keeps
  * aging samples out, and the compact line's live value stays current, even
@@ -107,7 +117,15 @@ function Kv({
   title,
 }: {
   label: string;
-  value: string;
+  /** A plain string for every existing caller; the battery health row's
+   * "charge capacity" line is the one exception — it passes a short JSX
+   * fragment (text + a `white-space: nowrap`-wrapped parenthetical span,
+   * `capacity.parenthetical`, so "(raw, 91.2%)" never splits mid-clause at
+   * a narrow viewport) rather than a plain string. The `!value` empty-hide
+   * check below only fires for the string case (a JSX element is always
+   * truthy) — every JSX caller is expected to gate its OWN presence
+   * upstream instead (this file's `{capacity && <Kv .../>}` pattern). */
+  value: string | ReactNode;
   className?: string;
   /** (#2821 review, item 3) An optional hover/long-press disclosure —
    * currently only the battery health row's "charge capacity" line uses
@@ -312,11 +330,8 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
                   label={c.name}
                   numerals={{ now: c.pct, avg: null, max: null }}
                   hideAvgMax
-                  bands={simpleBand(
-                    "mm-gauge-fill-compact",
-                    "var(--accent, var(--good))",
-                    c.pct,
-                  )}
+                  gradient={{ id: COMPACT_RAMP_ID, stops: gaugeRampStops() }}
+                  bands={gradientBand("mm-gauge-fill-compact", c.pct)}
                   needleAngleDeg={c.pct == null ? undefined : angleForPct(c.pct)}
                 />
                 <div className="cluster-tile__caption">
@@ -411,19 +426,6 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
  * record exhaustively, display selectively), just not rendered here. Do
  * not re-add a chart of it without first getting the layout documented (or
  * reverse-engineered with actual confidence) from Apple. */
-/** (#2821 review, item 5; amended by operator — no gradient, reuse the
- * meters' own solid accent + warn/critical colors) The bar's low-charge
- * thresholds — meaningful ONLY while genuinely discharging
- * (`!sample.on_ac`); on AC (charging or topped off) the bar stays the
- * plain accent color regardless of percent, since "20% while plugged in
- * and climbing" is not the concerning reading "20% and falling" is.
- * Matches the SAME two-threshold shape CPU/GPU/MEM's own `warnAt`/
- * `criticalAt` use, just inverted (`meterBandLevel`'s `lowIsBad`) and at
- * different numbers, chosen to read as an ordinary low-battery warning (a
- * phone's own UI convention), not tied to any macOS-documented value. */
-const BATTERY_LOW_WARN_PCT = 20;
-const BATTERY_LOW_CRITICAL_PCT = 10;
-
 /** The battery glyph's own SVG geometry, in its `viewBox` units — a
  * rounded body + a small terminal nub on the right, the conventional
  * "battery" icon shape. Sized to read clearly at the small scale this
@@ -450,37 +452,46 @@ const BATTERY_FILL_Y = BATTERY_BODY_Y + BATTERY_FILL_INSET;
 const BATTERY_FILL_MAX_W = BATTERY_BODY_W - BATTERY_FILL_INSET * 2;
 const BATTERY_FILL_H = BATTERY_BODY_H - BATTERY_FILL_INSET * 2;
 const BATTERY_FILL_RX = 2;
+const BATTERY_ICON_CX = BATTERY_BODY_X + BATTERY_BODY_W / 2;
+const BATTERY_ICON_CY = BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4;
 
-/** The battery-shaped bar that replaced the compact dial (operator,
- * 2026-09-23: "it's a little bit off that other meters represent higher
- * pct being closer to danger, when battery you want full... a battery
- * shaped bar that gradients from green full down to red empty?" — then
- * amended: "none of the other meters use gradient for the fill... blue
- * seems to be solid on all the other meters except the big one," so this
- * draws NO gradient. The fill is a SOLID color, exactly the CPU/GPU/MEM
- * dials' own convention: the plain accent color
- * (`.mm-gauge-fill-compact`'s `var(--accent)`) normally, switching to the
- * SAME `.mm-band-warn`/`.mm-band-critical` classes those dials use — the
- * identical `bandLevelClass(meterBandLevel(...))` call, just with
- * `lowIsBad: true` and the constants above — while genuinely discharging
- * and low. On AC the thresholds are pushed to `-Infinity` so nothing can
- * ever cross them (never `+Infinity` here: with `lowIsBad`, a LOWER bound
- * is what "never fires" needs) and the bar stays the plain accent color at
- * any percent. `.battery-bar-fill` in styles.css maps those reused class
- * names to `fill` instead of `stroke` (the dials use `stroke`; a filled
- * rect needs `fill`) — the color TOKENS and the class NAMES are shared,
- * only the CSS property they set differs, because the shape differs. */
+/** The battery-shaped bar (operator, 2026-09-23/24 — the full arc of this
+ * surface's own history):
+ *
+ * 1. Replaced the compact DIAL: "other meters represent higher pct being
+ *    closer to danger, when battery you want full... a battery shaped bar
+ *    that gradients from green full down to red empty?"
+ * 2. Amended to a SOLID fill: "none of the other meters use gradient for
+ *    the fill... blue seems to be solid on all the other meters."
+ * 3. Reversed again to a GRADIENT, and this time it's every OTHER meter
+ *    that changes to match: "the solid meters do not indicate when things
+ *    are getting tight. they all read as 'fine.'" So the fill here paints
+ *    from `batteryRampStops()` (`lib/battery.ts`) — the SAME three-stop
+ *    palette every compact dial now uses (`gaugeFillColor`,
+ *    `components/Meter.tsx`), REVERSED: red at the empty edge, green at
+ *    the full edge. The fill rect's OWN width still equals the charge
+ *    percent, so only the LEFT slice of that gradient (0..charge%) is
+ *    ever revealed — at 8% almost nothing but red shows; at 100% the
+ *    whole ramp shows, ending in green. No discrete warn/critical
+ *    threshold on the fill OR the percent text any more (see
+ *    `meterBandLevel`'s own doc for why keeping one would have doubled up
+ *    against the ramp) — the gradient is state-invariant, in place of the
+ *    old discharging-only banding.
+ * 4. The old "on AC"/"charging" TEXT caption is gone too (operator,
+ *    2026-09-24: "'on AC' is unlike a lot of meters these days... a
+ *    lightning bolt icon works inside the battery"). `batteryIcon` picks
+ *    a bolt (charging), a plug (on AC, not charging — macOS's own
+ *    convention; a bolt here would claim current is flowing when it
+ *    isn't), or nothing (discharging, where `batteryTimeLeftText` is the
+ *    fact worth showing instead — an icon can't carry a number). The
+ *    glyph gets a stroke/fill KNOCKOUT (`.battery-bar-icon`) so it reads
+ *    against any color the gradient happens to show underneath it, and a
+ *    `<title>` for mouse hover; the outer `<svg>`'s `aria-label`
+ *    (`batteryAriaLabel`) states the same fact in words for a screen
+ *    reader, which never sees the decorative (`aria-hidden`) glyph. */
 function BatteryBar({ sample }: { sample: BatterySample }) {
-  const dischargingLow = !sample.on_ac;
-  const levelCls = bandLevelClass(
-    meterBandLevel(
-      sample.charge_pct,
-      dischargingLow ? BATTERY_LOW_WARN_PCT : Number.NEGATIVE_INFINITY,
-      dischargingLow ? BATTERY_LOW_CRITICAL_PCT : Number.NEGATIVE_INFINITY,
-      true,
-    ),
-  );
   const fillW = batteryFillWidth(sample.charge_pct, BATTERY_FILL_MAX_W);
+  const icon = batteryIcon(sample);
   return (
     <div className="battery-bar-row">
       <svg
@@ -489,6 +500,13 @@ function BatteryBar({ sample }: { sample: BatterySample }) {
         role="img"
         aria-label={batteryAriaLabel(sample)}
       >
+        <defs>
+          <linearGradient id={BATTERY_RAMP_ID} gradientUnits="userSpaceOnUse" x1={BATTERY_FILL_X} y1={0} x2={BATTERY_FILL_X + BATTERY_FILL_MAX_W} y2={0}>
+            {batteryRampStops().map((s) => (
+              <stop key={s.offset} offset={s.offset} stopColor={s.color} />
+            ))}
+          </linearGradient>
+        </defs>
         <rect
           className="battery-bar-body"
           x={BATTERY_BODY_X}
@@ -500,7 +518,8 @@ function BatteryBar({ sample }: { sample: BatterySample }) {
         <rect className="battery-bar-nub" x={BATTERY_NUB_X} y={BATTERY_NUB_Y} width={BATTERY_NUB_W} height={BATTERY_NUB_H} rx={1.5} />
         {fillW != null && (
           <rect
-            className={`battery-bar-fill${levelCls ? ` ${levelCls}` : ""}`}
+            className="battery-bar-fill"
+            fill={`url(#${BATTERY_RAMP_ID})`}
             x={BATTERY_FILL_X}
             y={BATTERY_FILL_Y}
             width={fillW}
@@ -508,18 +527,14 @@ function BatteryBar({ sample }: { sample: BatterySample }) {
             rx={BATTERY_FILL_RX}
           />
         )}
-        {/* A small bolt glyph ONLY while current is actually flowing in —
-            `charging`, not `on_ac` (a laptop sitting on AC at 100% is
-            `on_ac: true, charging: false`, the reference machine's own
-            steady state per `BatterySample.on_ac`'s own Rust doc; showing
-            a bolt there would claim current is flowing when it isn't). */}
-        {sample.charging && (
-          <text className="battery-bar-bolt" x={BATTERY_BODY_X + BATTERY_BODY_W / 2} y={BATTERY_BODY_Y + BATTERY_BODY_H / 2 + 4} textAnchor="middle" aria-hidden="true">
-            ⚡
+        {icon && (
+          <text className="battery-bar-icon" x={BATTERY_ICON_CX} y={BATTERY_ICON_CY} textAnchor="middle" aria-hidden="true">
+            <title>{icon === "bolt" ? "charging" : "on AC"}</title>
+            {icon === "bolt" ? "⚡" : "🔌"}
           </text>
         )}
       </svg>
-      <span className={`battery-bar-pct${levelCls ? ` ${levelCls}` : ""}`}>{fmtPct(sample.charge_pct)}</span>
+      <span className="battery-bar-pct">{fmtPct(sample.charge_pct)}</span>
     </div>
   );
 }
@@ -529,24 +544,48 @@ function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; he
   const cond = conditionRow(health);
   const capacity = capacityLine(health);
   const operatingHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
+  const timeLeft = sample ? batteryTimeLeftText(sample) : null;
   return (
     <div className="battery-block hx-section">
       <div className="hx-section__title">Battery</div>
-      {sample && (
-        <div className="battery-bar-wrap">
-          <BatteryBar sample={sample} />
-          <div className="cluster-tile__caption battery-caption">{chargeCaption(sample)}</div>
-        </div>
-      )}
-      {health && (
-        <>
-          {cond && <Kv className={cond.warn ? "dialog__kv--warn" : ""} label="condition" value={cond.value} />}
-          {capacity && <Kv label="charge capacity" value={capacity.value} title={capacity.title ?? undefined} />}
-          <Kv label="cycles" value={health.cycle_count != null ? String(health.cycle_count) : ""} />
-          <Kv label="temperature" value={health.temperature_c != null ? `${health.temperature_c.toFixed(1)} °C` : ""} />
-          <Kv label="operating time" value={operatingHours ?? ""} />
-        </>
-      )}
+      {/* (operator, 2026-09-24) Desktop: the meter sits to the RIGHT of the
+          info rows, "better use of space" than centered above them — a
+          flex row with the meter's own fixed content width and the info
+          column filling the rest, DOM order unchanged (`.battery-meter`
+          first) so a narrow viewport's natural stack (no media query
+          matched) reads meter-above-rows without any reordering; only the
+          desktop breakpoint below reverses the VISUAL order via
+          `flex-direction: row-reverse` (a layout primitive, not a fixed
+          offset). Phone gap matches `.meter-row + .dialog__kv`'s own
+          established 14px block-to-block rhythm elsewhere in this file,
+          not a new number. */}
+      <div className="battery-layout">
+        {sample && (
+          <div className="battery-meter">
+            <BatteryBar sample={sample} />
+            {timeLeft && <div className="battery-caption">{timeLeft}</div>}
+          </div>
+        )}
+        {health && (
+          <div className="battery-info">
+            {cond && <Kv className={cond.warn ? "dialog__kv--warn" : ""} label="condition" value={cond.value} />}
+            {capacity && (
+              <Kv
+                label="charge capacity"
+                value={
+                  <>
+                    {capacity.value} <span className="battery-nowrap">{capacity.parenthetical}</span>
+                  </>
+                }
+                title={capacity.title ?? undefined}
+              />
+            )}
+            <Kv label="cycles" value={health.cycle_count != null ? String(health.cycle_count) : ""} />
+            <Kv label="temperature" value={health.temperature_c != null ? `${health.temperature_c.toFixed(1)} °C` : ""} />
+            <Kv label="operating time" value={operatingHours ?? ""} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -857,24 +896,14 @@ export function useMachineStatsContent({
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
         ariaLabel={`CPU: ${gaugeAriaScope}`}
-        {...compactMeterProps(
-          "CPU",
-          "mm-gauge-fill-compact",
-          "var(--accent, var(--good))",
-          agg.cpu,
-        )}
+        {...compactMeterProps("CPU", "mm-gauge-fill-compact", agg.cpu)}
       />
       <Meter
         wrapperClassName="mm-gauge mm-gauge--compact"
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
         ariaLabel={`GPU: ${gaugeAriaScope}`}
-        {...compactMeterProps(
-          "GPU",
-          "mm-gauge-fill-compact",
-          "var(--accent, var(--good))",
-          agg.gpu,
-        )}
+        {...compactMeterProps("GPU", "mm-gauge-fill-compact", agg.gpu)}
       />
       <Meter
         wrapperClassName="mm-gauge mm-gauge--compact"
@@ -883,12 +912,7 @@ export function useMachineStatsContent({
         ariaLabel={`MEM: ${gaugeAriaScope}`}
         warnAt={MEM_WARN_AT}
         criticalAt={MEM_CRITICAL_AT}
-        {...compactMeterProps(
-          "MEM",
-          "mm-gauge-fill-compact",
-          "var(--accent, var(--good))",
-          agg.mem,
-        )}
+        {...compactMeterProps("MEM", "mm-gauge-fill-compact", agg.mem)}
       />
     </div>
   );

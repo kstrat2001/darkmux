@@ -474,14 +474,14 @@ export function MachineLens({
               width={COMPACT_METER_WIDTH}
               height={COMPACT_METER_HEIGHT}
               ariaLabel="CPU: last 10 min"
-              {...compactMeterProps("CPU", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.cpu)}
+              {...compactMeterProps("CPU", "mm-gauge-fill-compact", liveAgg.cpu)}
             />
             <Meter
               wrapperClassName="mm-gauge mm-gauge--compact"
               width={COMPACT_METER_WIDTH}
               height={COMPACT_METER_HEIGHT}
               ariaLabel="GPU: last 10 min"
-              {...compactMeterProps("GPU", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.gpu)}
+              {...compactMeterProps("GPU", "mm-gauge-fill-compact", liveAgg.gpu)}
             />
             <Meter
               wrapperClassName="mm-gauge mm-gauge--compact"
@@ -490,7 +490,7 @@ export function MachineLens({
               ariaLabel="MEM: last 10 min"
               warnAt={MEM_WARN_AT}
               criticalAt={MEM_CRITICAL_AT}
-              {...compactMeterProps("MEM", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.mem)}
+              {...compactMeterProps("MEM", "mm-gauge-fill-compact", liveAgg.mem)}
             />
           </div>
         )}

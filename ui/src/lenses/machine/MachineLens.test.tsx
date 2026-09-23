@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -554,12 +554,12 @@ const LOAD_NO_BATTERY = {
 };
 
 describe("MachineLens — battery surfaces (#2821, lens only)", () => {
-  it("shows the charge gauge, its state caption, and the health row from the daemon fixture", async () => {
+  it("shows the charge bar (gradient fill, no icon while discharging), the time-left text, and the health row", async () => {
     mockMachineFetch({
       specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
       resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
     });
-    renderMachine(null);
+    const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
     // "Battery" — the raw DOM text; `.hx-section__title`'s uppercase is a
     // CSS `text-transform`, invisible to jsdom/RTL's textContent-based
@@ -568,12 +568,15 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     expect(screen.getByText("Battery")).toBeInTheDocument();
     expect(screen.getByText("78%")).toBeInTheDocument();
     expect(screen.getByText("2 h 10 m left")).toBeInTheDocument();
+    expect(container.querySelector(".battery-bar-icon")).toBeNull(); // discharging: no icon
+    expect(container.querySelector(".battery-bar-fill")!.getAttribute("fill")).toMatch(/^url\(#mm-battery-ramp\)$/);
     // The computed condition_word ("Normal"), never the raw unreliable
     // IOKit string ("Check Battery") — the Step-0 regression this issue
     // exists to fix.
     expect(screen.getByText("Normal")).toBeInTheDocument();
     expect(screen.queryByText(/Check Battery/)).toBeNull();
-    expect(screen.getByText(/5,701 of 6,249 mAh \(raw/)).toBeInTheDocument();
+    expect(screen.getByText(/5,701 of 6,249 mAh/)).toBeInTheDocument();
+    expect(screen.getByText("(raw, 91.2%)")).toBeInTheDocument();
     expect(screen.getByText("28")).toBeInTheDocument();
     expect(screen.getByText("31.0 °C")).toBeInTheDocument();
     // (#2821, operator, 2026-09-23) The per-bucket histogram was pulled —
@@ -611,23 +614,13 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     expect(screen.getByText("Service Battery").closest(".dialog__kv")).toHaveClass("dialog__kv--warn");
   });
 
-  it("on AC while charging reads a plain state word, not a fabricated time estimate", async () => {
-    mockMachineFetch({
-      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
-      resources: {
-        ...RESOURCES,
-        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { charge_pct: 62, on_ac: true, charging: true, minutes_to_empty: null } } },
-      },
-    });
-    renderMachine(null);
-    await waitFor(() => expect(screen.getByText("charging")).toBeInTheDocument());
-    expect(screen.queryByText(/left$/)).toBeNull();
-  });
-
-  // ── The battery BAR (operator, 2026-09-23: replaced the dial with a
-  //    battery-shaped bar — "other meters represent higher pct closer to
-  //    danger, when battery you want full"; amended: NO gradient, solid
-  //    fill reusing the meters' own accent/warn/critical colors). ────────
+  // ── The battery BAR's own arc of history: dial -> solid bar -> reversed
+  //    gradient (operator, 2026-09-24: "the solid meters do not indicate
+  //    when things are getting tight... give every small meter the same
+  //    gradient treatment the big memory gauge uses"). No discrete
+  //    warn/critical threshold on the fill OR the percent text any more —
+  //    the reversed ramp (red empty -> green full) carries that
+  //    continuously, state-invariant (same on AC or discharging). ───────
 
   function machineWithBattery(battery: { charge_pct: number; on_ac: boolean; charging: boolean; minutes_to_empty?: number | null }) {
     return {
@@ -657,75 +650,80 @@ describe("MachineLens — battery surfaces (#2821, lens only)", () => {
     expect(w35).toBeCloseTo(44 * 0.35, 5);
   });
 
-  // Color at 100/35/8, all discharging: 100% and 35% are both above the
-  // 20% warnAt threshold (quiet/plain accent — no band class at all);
-  // 8% is below the 10% criticalAt threshold.
-  it("color at 100% discharging: quiet (no band class)", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 100, on_ac: false, charging: false, minutes_to_empty: 500 }));
-    const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar-fill")!.getAttribute("class")).not.toMatch(/mm-band-/);
+  it("the fill and percent text carry NO threshold class at any percent — the gradient replaces it", async () => {
+    for (const pct of [100, 35, 8, 15]) {
+      mockMachineFetch(machineWithBattery({ charge_pct: pct, on_ac: false, charging: false, minutes_to_empty: 30 }));
+      const { container } = renderMachine(null);
+      await waitFor(() => expect(screen.getByText(`${pct}%`)).toBeInTheDocument());
+      expect(container.querySelector(".battery-bar-fill")!.getAttribute("class")).not.toMatch(/mm-band-/);
+      expect(container.querySelector(".battery-bar-pct")!.getAttribute("class")).not.toMatch(/mm-band-/);
+    }
   });
 
-  it("color at 35% discharging: still quiet — above the 20% warn threshold", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 60 }));
-    const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText("35%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar-fill")!.getAttribute("class")).not.toMatch(/mm-band-/);
+  it("the fill always paints from the reversed battery ramp url, on AC or discharging alike — state-invariant", async () => {
+    for (const battery of [
+      { charge_pct: 8, on_ac: false, charging: false },
+      { charge_pct: 8, on_ac: true, charging: true },
+    ]) {
+      mockMachineFetch(machineWithBattery(battery));
+      const { container } = renderMachine(null);
+      await waitFor(() => expect(screen.getByText("8%")).toBeInTheDocument());
+      expect(container.querySelector(".battery-bar-fill")!.getAttribute("fill")).toBe("url(#mm-battery-ramp)");
+      cleanup(); // same "8%" text in both iterations — must not match the PRIOR render's stale node
+    }
   });
 
-  it("color at 8% discharging: critical — below the 10% threshold", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 8, on_ac: false, charging: false, minutes_to_empty: 9 }));
-    const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText("8%")).toBeInTheDocument());
-    const fill = container.querySelector(".battery-bar-fill")!;
-    expect(fill.classList.contains("mm-band-critical")).toBe(true);
-    // The percent text colors the same way.
-    expect(container.querySelector(".battery-bar-pct")!.classList.contains("mm-band-critical")).toBe(true);
-  });
+  // ── Icon states (operator, 2026-09-24: "a lightning bolt icon works
+  //    inside the battery... on AC, not charging -> plug; on battery -> no
+  //    icon"). ──────────────────────────────────────────────────────────
 
-  it("stays untinted on AC even at 8% — the concerning direction requires discharging", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 8, on_ac: true, charging: true }));
-    const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText("8%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar-fill")!.getAttribute("class")).not.toMatch(/mm-band-/);
-  });
-
-  it("15% discharging (between the two thresholds) is warn, not critical", async () => {
-    mockMachineFetch(machineWithBattery({ charge_pct: 15, on_ac: false, charging: false, minutes_to_empty: 20 }));
-    const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText("15%")).toBeInTheDocument());
-    const fill = container.querySelector(".battery-bar-fill")!;
-    expect(fill.classList.contains("mm-band-warn")).toBe(true);
-    expect(fill.classList.contains("mm-band-critical")).toBe(false);
-  });
-
-  it("the charging bolt glyph renders only while charging, never merely on AC", async () => {
+  it("bolt icon while charging", async () => {
     mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: true }));
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar-bolt")).not.toBeNull();
+    const icon = container.querySelector(".battery-bar-icon")!;
+    expect(icon).not.toBeNull();
+    expect(icon.textContent).toContain("⚡");
   });
 
-  it("no bolt when on AC but not charging (topped off)", async () => {
+  it("plug icon when on AC but not charging (topped off) — never a bolt", async () => {
     mockMachineFetch(machineWithBattery({ charge_pct: 100, on_ac: true, charging: false }));
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar-bolt")).toBeNull();
+    const icon = container.querySelector(".battery-bar-icon")!;
+    expect(icon).not.toBeNull();
+    expect(icon.textContent).toContain("🔌");
   });
 
-  it("no bolt while discharging", async () => {
+  it("no icon while discharging", async () => {
     mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 60 }));
     const { container } = renderMachine(null);
     await waitFor(() => expect(screen.getByText("35%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar-bolt")).toBeNull();
+    expect(container.querySelector(".battery-bar-icon")).toBeNull();
   });
 
-  it("the SVG carries an accessible name stating percent and state", async () => {
+  it("time-left text renders ONLY while discharging with an estimate — never on AC, never charging", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: true }));
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    expect(screen.queryByText(/left$/)).toBeNull();
+  });
+
+  it("aria-label per state: on AC not charging / charging / on battery with estimate", async () => {
     mockMachineFetch(machineWithBattery({ charge_pct: 100, on_ac: true, charging: false }));
-    const { container } = renderMachine(null);
+    const { container: c1 } = renderMachine(null);
     await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
-    expect(container.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 100%, on AC");
+    expect(c1.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 100%, on AC, not charging");
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 62, on_ac: true, charging: true }));
+    const { container: c2 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("62%")).toBeInTheDocument());
+    expect(c2.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 62%, charging");
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 130 }));
+    const { container: c3 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("35%")).toBeInTheDocument());
+    expect(c3.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 35%, on battery, 2 h 10 m left");
   });
 });
 
