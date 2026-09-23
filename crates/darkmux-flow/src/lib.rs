@@ -3219,7 +3219,9 @@ mod tests {
         //           pre- and post-#2836 archives apart without inferring it
         //           from a version number. Minor bump: additive, and a
         //           consumer that does not know the kind ignores it.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.52.0");
+        //   1.53.0 — additive payload key `generation_ms` on `dispatch.turn`
+        //            (#2863): the turn's generation time, summed over its streams.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.53.0");
     }
 
     #[test]

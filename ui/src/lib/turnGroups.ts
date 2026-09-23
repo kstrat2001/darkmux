@@ -68,6 +68,12 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   const byTime = [...all].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const turnOf = new Map<FlowRecord, number | null>();
   const firstBeat = new Map<number, number>();
+  // Per-call usage by turn. A checkpointed turn takes several calls under
+  // one seq, and the turn record's own `usage` is only the LAST call's, so
+  // output and thinking are summed from these; input stays the last call's,
+  // since the last prompt is the context the turn ended with.
+  const callOut = new Map<number, number>();
+  const callThink = new Map<number, number>();
   let window: number | null = null;
   let threshold: number | null = null;
   let current: number | null = null;
@@ -80,6 +86,12 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
     turnOf.set(r, own ?? current);
     if (r.action === "dispatch.turn.heartbeat" && own !== null && !firstBeat.has(own)) {
       firstBeat.set(own, Date.parse(r.ts));
+    }
+    if (r.action === "telemetry.tokens" && own !== null) {
+      const out = num(f.completion_tokens);
+      const think = num(f.reasoning_tokens);
+      if (out !== null) callOut.set(own, (callOut.get(own) ?? 0) + out);
+      if (think !== null) callThink.set(own, (callThink.get(own) ?? 0) + think);
     }
     if (r.action === "telemetry.context") {
       window = num(f.max) ?? window;
@@ -101,8 +113,8 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
       durationMs: exact ?? (approxMs !== null && approxMs >= 0 ? approxMs : null),
       approx: exact === null,
       inTok: num(usage.prompt_tokens),
-      outTok: num(usage.completion_tokens),
-      thinkTok: num(usage.reasoning_tokens),
+      outTok: callOut.get(seq) ?? num(usage.completion_tokens),
+      thinkTok: callThink.get(seq) ?? num(usage.reasoning_tokens),
       window,
       threshold,
     };

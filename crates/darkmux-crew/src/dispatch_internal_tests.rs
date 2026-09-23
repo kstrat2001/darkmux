@@ -15143,3 +15143,64 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         );
     }
 
+
+    /// (#2863) A turn record carries the turn's GENERATION time, summed over
+    /// every stream it took. The viewer's turn header shows it; the flow's
+    /// own timestamps are whole seconds, which is guesswork for a 1.3 s turn.
+    /// One logical turn can take several streams (a checkpoint continuation
+    /// resumes the same `seq`), and the record is emitted once, when the
+    /// turn ends, so the time is the SUM, and the next turn starts from zero.
+    #[test]
+    #[serial]
+    fn a_turn_record_carries_the_turns_summed_generation_time() {
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-gen".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // Turn 1: an 8.0 s stream cut at the per-call cap (a continuation,
+        // no turn record yet), then a 6.2 s stream that ends the turn.
+        state.handle_event(r#"{"type":"model.streaming.start","seq":1,"ts":1000}"#);
+        state.handle_event(r#"{"type":"model.streaming.end","seq":1,"ts":9000}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":1,"finish_reason":"length","usage":{"completion_tokens":32000}}"#);
+        state.handle_event(r#"{"type":"model.streaming.start","seq":1,"ts":10000}"#);
+        state.handle_event(r#"{"type":"model.streaming.end","seq":1,"ts":16200}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"completion_tokens":900}}"#);
+        // Turn 2: one 1.3 s stream.
+        state.handle_event(r#"{"type":"model.streaming.start","seq":2,"ts":20000}"#);
+        state.handle_event(r#"{"type":"model.streaming.end","seq":2,"ts":21300}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":2,"finish_reason":"stop","usage":{"completion_tokens":64}}"#);
+        // Turn 3: no stream events at all (an older runtime): no field.
+        state.handle_event(r#"{"type":"model.completed","seq":3,"finish_reason":"stop","usage":{"completion_tokens":5}}"#);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-gen");
+        let turns: Vec<&serde_json::Value> =
+            records.iter().filter(|v| v["action"] == "dispatch.turn").collect();
+        assert_eq!(turns.len(), 3, "one record per logical turn; got {turns:?}");
+        assert_eq!(turns[0]["payload"]["turn_seq"], 1);
+        assert_eq!(turns[0]["payload"]["generation_ms"], 14200, "8.0 s + 6.2 s");
+        assert_eq!(turns[1]["payload"]["generation_ms"], 1300);
+        assert!(
+            turns[2]["payload"].get("generation_ms").is_none(),
+            "no streams recorded is absent, not a zero; got {:?}",
+            turns[2]
+        );
+    }

@@ -111,6 +111,19 @@ describe("turnItems (#2863)", () => {
     expect(seq.indexOf("dispatch.turn.heartbeat")).toBeGreaterThan(seq.indexOf("turn 2"));
   });
 
+  it("a turn's output is summed over its calls, not read from its last one", () => {
+    // A checkpointed turn takes several calls under one seq; the turn
+    // record's usage is only the LAST call's (measured producer behavior).
+    // The per-call telemetry.tokens records carry each call's share.
+    const calls = [
+      r(3, "telemetry.tokens", { turn_seq: 1, prompt_tokens: 6000, completion_tokens: 32000, reasoning_tokens: 31000 }),
+      r(9, "telemetry.tokens", { turn_seq: 1, prompt_tokens: 6366, completion_tokens: 392, reasoning_tokens: 126 }),
+    ];
+    const all = [...ALL, ...calls];
+    const t1 = turnItems(VISIBLE, all).find((i) => i.kind === "turn" && i.turn.seq === 1);
+    expect(t1 && t1.kind === "turn" && t1.turn).toMatchObject({ outTok: 32392, thinkTok: 31126, inTok: 6366 });
+  });
+
   it("shows every visible row exactly once", () => {
     expect(turnItems(VISIBLE, ALL).map((i) => i.rec)).toHaveLength(VISIBLE.length);
   });
