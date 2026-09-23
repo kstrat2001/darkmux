@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prettyArgs, recordDetail } from "./recordDetail";
+import { prettyArgs, recordDetail, recordObject } from "./recordDetail";
 import type { FlowRecord } from "../types/handwritten";
 
 /** A `dispatch.tool` record shaped exactly like the ones a live crawl emits
@@ -110,5 +110,55 @@ describe("recordDetail", () => {
   it("returns nothing for a record kind with no preview", () => {
     const r = { ts: "2026-08-25T14:45:41Z", action: "dispatch.turn.heartbeat", fields: {} } as unknown as FlowRecord;
     expect(recordDetail(r)).toBe("");
+  });
+});
+
+// ── (#2863) A row's object: what a person scans for, not a report ──────────
+describe("recordObject", () => {
+  const tool = (fields: Record<string, unknown>) =>
+    ({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } }) as never;
+
+  it("names a file tool by its file, with the container prefix dropped", () => {
+    const o = recordObject(tool({ tool_name: "edit", args: '{"path":"/workspace/test/refreshTokenService.test.js","edits":[]}', ok: true, outcome: "ok" }));
+    expect(o).toEqual({ chip: "edit", kind: "tool", text: "test/refreshTokenService.test.js", mono: false, outcome: "ok" });
+  });
+
+  it("reads arguments that arrive double-encoded (a JSON string of JSON)", () => {
+    // Measured on a live run: `edit`'s args are `"{\"path\":…}"`, so one
+    // parse yields a STRING and the row showed the raw JSON.
+    const args = JSON.stringify(JSON.stringify({ path: "/workspace/test/a.test.js", edits: [] }));
+    expect(recordObject(tool({ tool_name: "edit", args })).text).toBe("test/a.test.js");
+  });
+
+  it("names a command by the command, without the cd prefix or the redirect", () => {
+    const o = recordObject(tool({ tool_name: "bash", args: '{"command":"cd /workspace && npm test 2>&1","timeout_seconds":30}', outcome: "ok" }));
+    expect(o.text).toBe("npm test");
+    expect(o.mono).toBe(true);
+  });
+
+  it("names a search by its pattern", () => {
+    expect(recordObject(tool({ tool_name: "search", args: '{"path":"/workspace/src","pattern":"let _ ="}' })).text).toBe("let _ =");
+  });
+
+  it("carries the three outcomes #2008 distinguishes", () => {
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", outcome: "reported", exit_code: 1 })).outcome).toBe("reported");
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", outcome: "failed" })).outcome).toBe("failed");
+    // pre-1.22: `ok:false` meant failed when it was written
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", ok: false })).outcome).toBe("failed");
+    expect(recordObject(tool({ tool_name: "bash", args: "{}", ok: true })).outcome).toBe("ok");
+  });
+
+  it("falls back to the arguments when no field names the object", () => {
+    expect(recordObject(tool({ tool_name: "fetch", args: '{"url":"http://x"}' })).text).toBe("url=http://x");
+  });
+
+  it("a reasoning row is its first line, without the JSON-string quotes it sometimes carries", () => {
+    const r = { action: "dispatch.reasoning", fields: { reasoning_text: '"Let me analyze the implementation.\n\nMore."' } } as never;
+    expect(recordObject(r)).toEqual({ chip: "reasoning", kind: "think", text: "Let me analyze the implementation.", mono: false });
+  });
+
+  it("anything else keeps its existing one-line detail and no chip", () => {
+    const r = { action: "dispatch start", fields: { prompt_chars: 3204 } } as never;
+    expect(recordObject(r)).toEqual({ text: "start (prompt: 3204ch)", mono: false });
   });
 });

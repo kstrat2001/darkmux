@@ -481,7 +481,9 @@ describe("EventLogColumn", () => {
     rerender(<EventLogColumn scopeLabel="fleet" records={records} visible />);
 
     await waitFor(() => expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1));
-    expect(document.querySelector('[data-act="rec"]')!.textContent).toContain("s-late");
+    // (#2863) One session: its id is said once on the shared line, not on
+    // the row. The point here is that the late record rendered at all.
+    expect(document.querySelector(".eventlog")!.textContent).toContain("s-late");
   });
 
   // `.eventlog__rec` was a click-only div — no `role`, no `tabIndex`, no
@@ -521,16 +523,62 @@ describe("EventLogColumn", () => {
     });
   });
 
-  // Structural coverage for the two classNames that shipped matching
-  // nothing in styles.css (rendered as default sans-serif text, invisible
-  // to the innerText-based parity goldens).
-  it("renders the machine/session meta spans with their styling classes", () => {
-    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-1", machine_id: "MacBook-Pro" })];
+  // (#2863) Constants are said once. On a list that mixes machines or
+  // sessions (the fleet), each row names its own: that is information. On a
+  // list that is one session (a run's page), every row would repeat the same
+  // two values, so they move to one line under the header.
+  it("a list mixing sessions names each row's machine and session", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-1", machine_id: "MacBook-Pro" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "s-2", machine_id: "studio" }),
+    ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    expect(document.querySelector(".eventlog__recmachine")).toBeInTheDocument();
-    expect(document.querySelector(".eventlog__recsession")).toBeInTheDocument();
-    expect(document.querySelector(".eventlog__recmachine")!.textContent).toContain("MacBook-Pro");
-    expect(document.querySelector(".eventlog__recsession")!.textContent).toContain("s-1");
+    expect(document.querySelectorAll(".eventlog__recmachine")).toHaveLength(2);
+    expect(document.querySelectorAll(".eventlog__recsession")).toHaveLength(2);
+    expect(document.querySelector(".eventlog__shared")).toBeNull();
+  });
+
+  it("a one-session list says its machine and session once, not on every row", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "darkmux-coding-x-1790125784225", machine_id: "MacBook-Pro" }),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    expect(document.querySelector(".eventlog__recmachine")).toBeNull();
+    expect(document.querySelector(".eventlog__recsession")).toBeNull();
+    const shared = document.querySelector(".eventlog__shared")!;
+    expect(shared.textContent).toContain("MacBook-Pro");
+    expect(shared.textContent).toContain("…784225");
+    expect(shared.getAttribute("title")).toContain("darkmux-coding-x-1790125784225");
+  });
+
+  it("records that carry no session do not stop a list from being one session", () => {
+    // Measured on a live run's page: machine telemetry rides the same list
+    // with no session id, and every row still repeated the session.
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "sess-1", machine_id: "MacBook-Pro" }),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: undefined, machine_id: "MacBook-Pro", action: "machine.telemetry" } as never),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    expect(document.querySelector(".eventlog__recsession")).toBeNull();
+    expect(document.querySelector(".eventlog__shared")!.textContent).toContain("sess-1".slice(-6));
+  });
+
+  it("a tool row is its tool, its object and its outcome, not its raw arguments", () => {
+    const records = [
+      rec({
+        action: "dispatch.tool",
+        session_id: "s-1",
+        payload: { tool_name: "edit", args: '{"path":"/workspace/src/a.js","edits":[{"old_string":"x"}]}', result_chars: 88, outcome: "ok" },
+      } as never),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    const row = document.querySelector('[data-act="rec"]')!;
+    expect(row.querySelector(".eventlog__ractivity")!.textContent).toBe("edit");
+    expect(row.querySelector(".eventlog__recobj")!.textContent).toBe("src/a.js");
+    expect(row.querySelector(".eventlog__outcome--ok")).not.toBeNull();
+    expect(row.textContent).not.toContain("old_string");
+    expect(row.textContent).not.toContain("88ch");
   });
 
   // ── Collapse (#1066) ───────────────────────────────────────────────────
@@ -956,6 +1004,16 @@ describe("EventLogColumn — resizable width (#2863)", () => {
     expect(width()).toBe("380px");
     fireEvent.keyDown(handle(), { key: "Enter" });
     expect(column()).toHaveClass("eventlog--collapsed");
+  });
+
+  it("text selection is suspended across the page while dragging", () => {
+    // Measured: a drag highlighted the run page's text beside the column.
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.pointerDown(handle(), { clientX: 1000, pointerId: 1 });
+    expect(document.documentElement).toHaveClass("is-resizing");
+    fireEvent.pointerUp(handle(), { clientX: 900, pointerId: 1 });
+    expect(document.documentElement).not.toHaveClass("is-resizing");
   });
 
   it("is not offered on a phone, where the events live in the bottom sheet", () => {

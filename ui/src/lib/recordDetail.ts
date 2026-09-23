@@ -100,3 +100,90 @@ export function recordDetail(r: FlowRecord): string {
   }
   return "";
 }
+
+/** (#2863) What one event row shows: a kind chip, the object the event was
+ * about, and (for a tool) how it came out. Everything else about the record
+ * (arguments, output, full reasoning) belongs to the detail pane, so a row
+ * says what happened in a line a person can scan.
+ *
+ * Built on the same fields `recordDetail` reads, with the same #2008
+ * three-way outcome: a command that ran and reported a non-zero exit is the
+ * tool working (`reported`), not a failure. */
+export interface RecordObject {
+  /** The chip: a tool's name, or "reasoning". Absent for other actions,
+   * which keep their activity word. */
+  chip?: string;
+  kind?: "tool" | "think";
+  text: string;
+  /** Monospace: a command or pattern, where exact characters matter. */
+  mono: boolean;
+  outcome?: "ok" | "reported" | "failed";
+}
+
+const CONTAINER_ROOT = /^\/workspace\//;
+
+/** `cd /workspace && npm test 2>&1` → `npm test`: the working-directory hop
+ * and the stream redirect are how the runtime runs a command, not what the
+ * command is. */
+function commandText(cmd: string): string {
+  return cmd
+    .replace(/^cd\s+\S+\s*&&\s*/, "")
+    .replace(/\s*2>&1\s*$/, "")
+    .split("\n")[0]
+    .trim();
+}
+
+function unquote(s: string): string {
+  const t = s.trim();
+  return t.startsWith('"') ? t.replace(/^"+|"+$/g, "") : t;
+}
+
+export function recordObject(r: FlowRecord): RecordObject {
+  const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
+  const a = r.action || "";
+
+  if (a === "dispatch.tool" && f) {
+    let args: Record<string, unknown> | null = null;
+    if (typeof f.args === "string") {
+      try {
+        let parsed: unknown = JSON.parse(f.args);
+        // Some tools' arguments arrive double-encoded, a JSON string of JSON
+        // (measured on `edit`): one parse yields a string, so parse again.
+        if (typeof parsed === "string") parsed = JSON.parse(parsed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
+      } catch {
+        args = null;
+      }
+    }
+    let text = "";
+    let mono = false;
+    if (args && typeof args.command === "string") {
+      text = commandText(args.command);
+      mono = true;
+    } else if (args && typeof args.pattern === "string") {
+      text = args.pattern;
+      mono = true;
+    } else if (args && typeof args.path === "string") {
+      text = args.path.replace(CONTAINER_ROOT, "");
+    } else {
+      text = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
+      mono = true;
+    }
+    let outcome: RecordObject["outcome"];
+    if (typeof f.outcome === "string") {
+      outcome = f.outcome === "reported" ? "reported" : f.outcome === "failed" ? "failed" : "ok";
+    } else if (f.ok === false) {
+      outcome = "failed";
+    } else if (f.ok === true) {
+      outcome = "ok";
+    }
+    const o: RecordObject = { chip: String(f.tool_name ?? "tool"), kind: "tool", text, mono };
+    if (outcome) o.outcome = outcome;
+    return o;
+  }
+  if (a === "dispatch.reasoning" && typeof f?.reasoning_text === "string") {
+    const first = unquote(f.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
+    return { chip: "reasoning", kind: "think", text: first.trim(), mono: false };
+  }
+  return { text: recordDetail(r), mono: false };
+}

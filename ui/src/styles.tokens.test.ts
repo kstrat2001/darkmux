@@ -50,8 +50,9 @@ function definedTokens(): Set<string> {
  * heights as inline properties (`el.style.setProperty("--chrome-h", ...)`).
  * They are legitimately absent from the CSS, and their `var()` fallbacks are
  * the pre-measurement value, which is the one case where a fallback is
- * load-bearing. */
-const JS_SET_TOKENS = new Set(["--chrome-h", "--masthead-h"]);
+ * load-bearing. (#2863) `--eventlog-w` is the events column's dragged width,
+ * written inline by `EventLogColumn.tsx`; its fallback is the 380px minimum. */
+const JS_SET_TOKENS = new Set(["--chrome-h", "--masthead-h", "--eventlog-w"]);
 
 function tokenRefs(): Array<{ name: string; line: number; hasFallback: boolean }> {
   const out: Array<{ name: string; line: number; hasFallback: boolean }> = [];

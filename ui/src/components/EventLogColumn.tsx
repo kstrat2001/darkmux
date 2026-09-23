@@ -20,7 +20,7 @@ import {
 import { FiltersDialog, FiltersBody } from "./FiltersDialog";
 import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
-import { recordDetail } from "../lib/recordDetail";
+import { recordDetail, recordObject } from "../lib/recordDetail";
 import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
@@ -563,6 +563,22 @@ export function EventLogColumn({
 
   const capped = filtered.length > LOG_CAP;
   const visibleRecs = useMemo(() => filtered.slice(-LOG_CAP).reverse(), [filtered]);
+  // (#2863) Constants are said once. When every record this list was GIVEN
+  // shares one machine (or one session), naming it on each row is
+  // repetition; it moves to one line under the header. A list that mixes
+  // them keeps them per row, where they tell rows apart.
+  // Decided from `records`, not the filtered rows: otherwise narrowing a
+  // fleet list to one session would move that session from its rows to the
+  // header, and the layout would shift under the operator's own filter.
+  const shared = useMemo(() => {
+    // A record with no session (machine telemetry rides the same list) says
+    // nothing about which session this is, so it neither joins nor breaks
+    // the set; same for a record with no machine.
+    const machines = new Set(records.map((r) => r.machine_id).filter(Boolean) as string[]);
+    const sessions = new Set(records.map((r) => r.session_id).filter(Boolean) as string[]);
+    const one = (set: Set<string>) => (set.size === 1 ? [...set][0] : null);
+    return { machine: one(machines), session: one(sessions) };
+  }, [records]);
 
   // (#2068) The followed record is throttled: at playback speed the newest
   // record changed several times a second and the detail card swapped its
@@ -622,6 +638,9 @@ export function EventLogColumn({
   function onWidthPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     widthDragRef.current = { startX: e.clientX, startW: colWidth, proposed: colWidth };
     e.currentTarget.setPointerCapture?.(e.pointerId);
+    // Suspend text selection page-wide for the drag: without it, dragging
+    // highlighted the page's text beside the column.
+    document.documentElement.classList.add("is-resizing");
     setWidthReadout(`${colWidth}px`);
   }
   function onWidthPointerMove(e: React.PointerEvent<HTMLDivElement>) {
@@ -637,6 +656,7 @@ export function EventLogColumn({
     const drag = widthDragRef.current;
     widthDragRef.current = null;
     e.currentTarget.releasePointerCapture?.(e.pointerId);
+    document.documentElement.classList.remove("is-resizing");
     setWidthReadout(null);
     if (!drag) return;
     if (drag.proposed < MIN_COL_WIDTH_PX - COLLAPSE_SLACK_PX) {
@@ -1077,6 +1097,15 @@ export function EventLogColumn({
             </div>
           </div>
         </div>
+        {/* (#2863) The machine and session every visible row shares, said
+            once here instead of on each row. */}
+        {(shared.machine || shared.session) && (
+          <div className="eventlog__shared" title={[shared.machine, shared.session].filter(Boolean).join(" · ")}>
+            {shared.machine}
+            {shared.machine && shared.session ? " · " : ""}
+            {shared.session ? `session …${shared.session.slice(-6)}` : ""}
+          </div>
+        )}
         {/* (#2108, operator finding — one-tap expand) Expanded, the list
             collapses to a 1-ROW STRIP showing just the selected record —
             the pane above fills the rest of the sheet. Collapsing back
@@ -1120,11 +1149,11 @@ export function EventLogColumn({
           ) : visibleRecs.length ? (
             visibleRecs.map((r) => {
               const key = recKey(r);
-              const detail = recordDetail(r);
+              const obj = recordObject(r);
               return (
                 <div
                   key={key}
-                  className={`eventlog__rec${selected && recKey(selected) === key ? " sel" : ""}`}
+                  className={`eventlog__rec eventlog__rec--lean${selected && recKey(selected) === key ? " sel" : ""}`}
                   data-act="rec"
                   role="button"
                   tabIndex={0}
@@ -1142,15 +1171,34 @@ export function EventLogColumn({
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >
                   <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>{" "}
-                  <ActivityIcon act={activityOf(r)} />
-                  <span className="eventlog__ractivity">{activityOf(r)}</span>
-                  {r.machine_id ? <span className="eventlog__recmachine"> · {r.machine_id}</span> : null}
-                  {r.session_id ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
-                  {/* What the record DID — a tool call's name + arguments +
-                      result size, a turn's finish reason, a reasoning
-                      excerpt. Without it every tool call in the log read
-                      "tool call" and nothing else. */}
-                  {detail ? <span className="preview-text"> · {detail}</span> : null}
+                  {/* (#2863) A row says what happened in one scannable line:
+                      the kind (a tool's own name, or "reasoning") as a chip,
+                      the object it was about, and how a tool came out. The
+                      arguments, output and full reasoning live in the detail
+                      pane, one tap away. Other actions keep their icon and
+                      activity word. */}
+                  {obj.chip ? (
+                    <span className={`eventlog__ractivity eventlog__chip eventlog__chip--${obj.kind}`}>{obj.chip}</span>
+                  ) : (
+                    <>
+                      <ActivityIcon act={activityOf(r)} />
+                      <span className="eventlog__ractivity">{activityOf(r)}</span>
+                    </>
+                  )}
+                  {r.machine_id && !shared.machine ? <span className="eventlog__recmachine"> · {r.machine_id}</span> : null}
+                  {r.session_id && !shared.session ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
+                  {obj.text ? (
+                    <span className={`eventlog__recobj${obj.mono ? " eventlog__recobj--mono" : ""}${obj.kind === "think" ? " eventlog__recobj--dim" : ""}`}>
+                      {obj.text}
+                    </span>
+                  ) : null}
+                  {obj.outcome ? (
+                    <span
+                      className={`eventlog__outcome eventlog__outcome--${obj.outcome}`}
+                      role="img"
+                      aria-label={obj.outcome === "ok" ? "ran" : obj.outcome === "reported" ? "ran, reported a non-zero exit" : "failed to run"}
+                    />
+                  ) : null}
                 </div>
               );
             })
