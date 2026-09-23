@@ -70,15 +70,12 @@ import {
  *
  * Row-click destinations (drill-in packet — both now real, see `RunRow`'s
  * own doc for the split):
- * - a `kind==="lab"` row opens `LabRunDetail` (`data-act="labrun"` in
- *   legacy, `drillLabRun(dir)`) UNLESS it is still `status==="running"` AND
- *   carries a `session_id` (#2511) — that combination drills to the live
- *   session instead (the untracked-session branch below), because
- *   `LabRunDetail`'s funnels/scores have nothing to show before a terminal
- *   artifact exists, and the session is the only way to watch the dispatch
- *   while it's still in flight (see `runDestination`'s own doc, `format.ts`).
- *   The finished/abandoned case is unchanged: an in-component state swap
- *   (`labRunDir`),
+ * - (#2860) a `kind==="lab"` row that carries a `session_id` opens the
+ *   shared session view, running or finished, from the list, the series
+ *   view, or a `run=<dir>` deep link alike (see `runDestination`, `format.ts`).
+ *   A lab row WITHOUT one (a bench run, or a run from before lab rows
+ *   carried a session) opens `LabRunDetail`, its own record page: an
+ *   in-component state swap (`labRunDir`),
  *   NOT a route change, matching legacy's own mechanism exactly: `render()`
  *   just swaps `$("stage").innerHTML` and syncs the address bar via
  *   `history.replaceState` (`syncLabHash`), it never fires a real navigation
@@ -408,6 +405,21 @@ export function RunsBoard({
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
 
+  // (#2860) A `run=<dir>` deep link (the series view used to write these,
+  // and bookmarks keep them) follows the SAME rule as a list-row click: a
+  // lab run with a representative session opens the shared session view;
+  // only a run without one keeps its own record page. `location.replace`,
+  // so Back does not land on the redirect and bounce forward again.
+  const labRunRow =
+    labRunDir && runsQuery.data?.ok
+      ? runsQuery.data.data.runs.find((r) => r.kind === "lab" && r.id === labRunDir)
+      : undefined;
+  const labRunDest = labRunRow ? runDestination(labRunRow, missionGraphReachable()) : null;
+  const labRunRedirect = labRunDest?.kind === "hash" ? labRunDest.hash : null;
+  useEffect(() => {
+    if (labRunRedirect) location.replace(`#${labRunRedirect}`);
+  }, [labRunRedirect]);
+
   // (#1809) Also unconditional, same rules-of-hooks reason as the two
   // queries above — needed only to resolve a machine PIN's full alias set
   // (`machineNames`, see `format.ts::runsForMachine`'s own doc for why a
@@ -455,6 +467,15 @@ export function RunsBoard({
   // waiting on the two queries above and independent of `kind` (see
   // `labRunDir`'s own doc above for why it isn't gated to kind==="lab").
   if (labRunDir) {
+    // Wait for `/runs` to know which page this run belongs on; a failed
+    // fetch falls through to the record page, as before.
+    if (!runsQuery.data || labRunRedirect) {
+      return (
+        <div data-state="pending" role="status" aria-label="Loading run">
+          <div className="none">loading…</div>
+        </div>
+      );
+    }
     return <LabRunDetail dir={labRunDir} onBack={closeLabRun} onUnresolvable={onLabRunUnresolvable} />;
   }
 
@@ -470,6 +491,14 @@ export function RunsBoard({
   }
 
   const runs: Run[] = runsQuery.data.ok ? runsQuery.data.data.runs : [];
+  // (#2860) A series row routes by the same rule as a list row, through the
+  // board's own `Run` for that directory; with no row to route by, it opens
+  // the run's own record page as before.
+  const activateLabDir = (dir: string) => {
+    const row = runs.find((r) => r.kind === "lab" && r.id === dir);
+    if (row) activateRun(row);
+    else openLabRun(dir);
+  };
   const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
   const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
   const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
@@ -544,7 +573,7 @@ export function RunsBoard({
         {notice && <div className="labnotice">{notice}</div>}
         <div className="lablist">
           {groups.length ? (
-            groups.map((g) => <LabTaskCard key={g.key} group={g} onRowActivate={openLabRun} />)
+            groups.map((g) => <LabTaskCard key={g.key} group={g} onRowActivate={activateLabDir} />)
           ) : (
             <div className="none">
               no lab runs with a recorded corpus yet — run <code>darkmux lab eval --funnel …</code> to produce one.

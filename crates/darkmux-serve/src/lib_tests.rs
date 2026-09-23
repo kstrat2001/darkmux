@@ -4168,6 +4168,25 @@
         }
     }
 
+    /// (#2860 review F3) The manifest's `ok` is read off disk into
+    /// `run_ok`. The status decision built on it is tested in `runs.rs`
+    /// with a hand-built summary, which cannot catch the READ going wrong:
+    /// a wrong key or a dropped field passed the whole suite.
+    #[test]
+    fn scan_lab_runs_reads_the_manifests_ok_into_run_ok() {
+        for (manifest, want) in [
+            (r#"{"session_id":"s","ok":false}"#, Some(false)),
+            (r#"{"session_id":"s","ok":true}"#, Some(true)),
+            (r#"{"session_id":"s"}"#, None),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, Some(manifest));
+            let runs = scan_lab_runs(tmp.path());
+            assert_eq!(runs.len(), 1, "{runs:?}");
+            assert_eq!(runs[0].run_ok, want, "manifest {manifest}");
+        }
+    }
+
     /// (#2511) The actual join this issue exists to make possible: while a
     /// run is still LIVE (no `manifest.json` yet), the session id a
     /// single-dispatch provider already reported to `lifecycle.json`

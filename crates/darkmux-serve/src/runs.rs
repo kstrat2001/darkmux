@@ -293,12 +293,12 @@ pub struct Run {
     /// `session_id` resolution in `crates/darkmux-serve/src/lib.rs`, cover
     /// exactly which lab runs have one and from when — manifest-backed once
     /// finished, lifecycle-backed for the live window before that).
-    /// `runDestination` (`ui/src/lenses/runs/format.ts`) only reads it for a
-    /// lab row while `status == Running`: a finished/abandoned lab row
-    /// still drills to `LabRunDetail` (the funnels/scores artifact is the
-    /// richer destination once it exists), but a run with no terminal
-    /// artifact yet has none of that to show, and this field's live session
-    /// is the only thing left to drill into. Without this, the same
+    /// (#2860) `runDestination` (`ui/src/lenses/runs/format.ts`) opens the
+    /// shared session view for ANY lab row carrying this field, running or
+    /// finished; a lab row without one opens `LabRunDetail`, its own record
+    /// page. A finished BENCH run (it wrote `scores.json`) publishes none,
+    /// because its trials each ran under their own session and no single
+    /// one represents it (see `lab_summary_to_run`). Without this, the same
     /// #1982/#2511 fix that stops a live lab run's session from also
     /// surfacing as a duplicate `ghost_runs` row (see `known_session_ids`
     /// above) would leave that session with NO door in this view at all —
@@ -1816,7 +1816,12 @@ fn lab_summary_to_run(
         // terminal artifact exists. See this struct's `session_id` field
         // doc for why this and the record-side dedup fix have to ship
         // together.
-        session_id: summary.session_id.clone(),
+        // (#2860) A finished BENCH run (`scores.json` present) has no
+        // representative session: its trials each ran under their own, and
+        // tool-bench's manifest names one that no dispatch ever used. Its own
+        // record is what represents it, so it publishes none and keeps its
+        // scores page; every other lab run opens the shared session view.
+        session_id: if summary.finished { None } else { summary.session_id.clone() },
         abandoned_reason,
     }
 }
@@ -1857,11 +1862,24 @@ fn lab_run_status(summary: &LabRunSummary, now_ms: u64, session_live: Option<boo
     // gap RAII cannot close), and the second must never be read as a verdict.
     use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
     match summary.lifecycle_status {
+        // (#2860) `Complete` says the HARNESS ran to the end, not how the
+        // dispatch did; `run_ok` (the manifest's `ok`) is that. A run whose
+        // dispatch errored was listed complete while its own detail view
+        // said errored. Every other run kind already reports its outcome.
         Some(Lc::Complete) => {
-            return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
+            let failed = summary.degenerate || summary.run_ok == Some(false);
+            return if failed { RunStatus::Error } else { RunStatus::Complete };
         }
         Some(Lc::Error) => return RunStatus::Error,
         Some(Lc::Interrupted) => return RunStatus::Abandoned,
+        // (#2860) No lifecycle verdict (a run from before the record existed):
+        // a manifest is written only when the run ends, so its `ok` is a
+        // terminal record too, and outranks the staleness guess below.
+        None => {
+            if let Some(ok) = summary.run_ok {
+                return if !ok || summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
+            }
+        }
         _ => {}
     }
     if summary.finished {
@@ -4078,7 +4096,47 @@ mod tests {
             has_funnels: true,
             has_events: true,
             session_id: None,
+            run_ok: None,
         }
+    }
+
+    /// (#2860) `lifecycle.json`'s `complete` means the HARNESS ran to the
+    /// end; how the dispatch itself ended is `manifest.json`'s `ok`. The list
+    /// read `complete` as the outcome, so a run whose dispatch errored after
+    /// 3.5 minutes (`refresh-rotation-splash-qwen36-1789978023-1`, runtime
+    /// exit 1) was listed complete while its own detail view said errored.
+    /// Every other run kind already reports its outcome here.
+    #[test]
+    fn a_completed_lab_run_whose_dispatch_failed_is_an_error() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let now = 1_700_000_000_000u64;
+        let with_ok = |ok: Option<bool>| LabRunSummary {
+            run_ok: ok,
+            ..lab_summary_with_lifecycle("d", false, false, Some(Lc::Complete))
+        };
+        assert_eq!(lab_run_status(&with_ok(Some(false)), now, None), RunStatus::Error);
+        assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
+        // No manifest (a provider that writes none) is not evidence of failure.
+        assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
+    }
+
+    /// (#2860 review F4) A run from before `lifecycle.json` existed still has
+    /// a manifest, and a manifest is written only when the run ends, so it
+    /// is a terminal record. Without this such a run fell through to the
+    /// staleness guess and listed as abandoned, while its detail view (now
+    /// the shared session view) said complete or errored.
+    #[test]
+    fn a_manifest_is_a_terminal_record_when_there_is_no_lifecycle() {
+        let now = 1_700_000_000_000u64 + 30 * 24 * 3600 * 1000; // long stale
+        let old = |ok: Option<bool>| LabRunSummary { run_ok: ok, ..minimal_lab_summary("d", false, false) };
+        assert_eq!(lab_run_status(&old(Some(true)), now, Some(false)), RunStatus::Complete);
+        assert_eq!(lab_run_status(&old(Some(false)), now, Some(false)), RunStatus::Error);
+        // A degenerate run is an error even when its manifest says ok:
+        // tool-bench always writes `ok: true`.
+        let degenerate = LabRunSummary { degenerate: true, ..old(Some(true)) };
+        assert_eq!(lab_run_status(&degenerate, now, Some(false)), RunStatus::Error);
+        // CONTROL: no manifest outcome keeps the old inference.
+        assert_eq!(lab_run_status(&old(None), now, Some(false)), RunStatus::Abandoned);
     }
 
     /// (#1930) The run's own terminal record outranks every inference.
@@ -4182,6 +4240,26 @@ mod tests {
         summary.session_id = Some("sess-live-2".to_string());
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.session_id.as_deref(), Some("sess-live-2"));
+    }
+
+    /// (#2860 review F1) A finished BENCH run (it wrote `scores.json`) has no
+    /// representative session: tool-bench dispatches every trial under its
+    /// own session and writes a manifest `session_id` no dispatch ever used,
+    /// so linking it would open an empty page where its scores page used to
+    /// be. Its own record is what represents it. The three tool-bench runs
+    /// on disk have exactly this shape and no lifecycle record.
+    #[test]
+    fn a_finished_bench_run_publishes_no_representative_session() {
+        let mut bench = minimal_lab_summary("tool-bench-deep-1", true, false);
+        bench.session_id = Some("darkmux-toolbench-1783249302971".to_string());
+        let run = lab_summary_to_run(&bench, None, FIXTURE_NOW_MS, None);
+        assert_eq!(run.session_id, None);
+
+        // CONTROL: the same run without a bench record keeps its session.
+        let mut coding = minimal_lab_summary("refresh-rotation-1", false, false);
+        coding.session_id = Some("darkmux-coding-refresh-rotation-1".to_string());
+        let run = lab_summary_to_run(&coding, None, FIXTURE_NOW_MS, None);
+        assert_eq!(run.session_id.as_deref(), Some("darkmux-coding-refresh-rotation-1"));
     }
 
     /// The inverted case — without it, the test above would pass even if

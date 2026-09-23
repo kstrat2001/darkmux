@@ -71,12 +71,12 @@ tracked: boolean,
  * `session_id` resolution in `crates/darkmux-serve/src/lib.rs`, cover
  * exactly which lab runs have one and from when — manifest-backed once
  * finished, lifecycle-backed for the live window before that).
- * `runDestination` (`ui/src/lenses/runs/format.ts`) only reads it for a
- * lab row while `status == Running`: a finished/abandoned lab row
- * still drills to `LabRunDetail` (the funnels/scores artifact is the
- * richer destination once it exists), but a run with no terminal
- * artifact yet has none of that to show, and this field's live session
- * is the only thing left to drill into. Without this, the same
+ * (#2860) `runDestination` (`ui/src/lenses/runs/format.ts`) opens the
+ * shared session view for ANY lab row carrying this field, running or
+ * finished; a lab row without one opens `LabRunDetail`, its own record
+ * page. A finished BENCH run (it wrote `scores.json`) publishes none,
+ * because its trials each ran under their own session and no single
+ * one represents it (see `lab_summary_to_run`). Without this, the same
  * #1982/#2511 fix that stops a live lab run's session from also
  * surfacing as a duplicate `ghost_runs` row (see `known_session_ids`
  * above) would leave that session with NO door in this view at all —

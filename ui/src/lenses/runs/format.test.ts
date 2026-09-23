@@ -388,15 +388,23 @@ describe("runDestination", () => {
     expect(runDestination(tracked, false)).toEqual({ kind: "unreachable" });
   });
 
-  it("a FINISHED lab row opens its own dir, independent of tracked/session_id", () => {
-    const lab = run({
-      id: "lab-dir-1",
-      kind: "lab",
-      status: "complete",
-      tracked: true,
-      session_id: "some-session-that-must-be-ignored-once-finished",
-    });
-    expect(runDestination(lab, true)).toEqual({ kind: "lab", dir: "lab-dir-1" });
+  it("(#2860) a FINISHED lab row opens the same session detail as every other run", () => {
+    // Previously a finished lab row went to `LabRunDetail`, the funnel-eval
+    // page, which decides "finished" from funnel artifacts a `lab run
+    // <workload>` never writes: every finished workload run read RUNNING
+    // there, with an empty pipeline and no events, while the list said
+    // complete. One run, one detail view, whatever its status.
+    const lab = run({ id: "lab-dir-1", kind: "lab", status: "complete", tracked: true, session_id: "sess-done-1" });
+    expect(runDestination(lab, true)).toEqual({ kind: "hash", hash: "dispatch=sess-done-1" });
+  });
+
+  it("(#2860) a lab row with NO session_id falls back to its own dir, whatever its status", () => {
+    // Archived runs from before lab rows carried a session have nothing
+    // else to open.
+    for (const status of ["complete", "abandoned", "running"] as const) {
+      const lab = run({ id: "old-lab-dir", kind: "lab", status, tracked: true });
+      expect(runDestination(lab, true)).toEqual({ kind: "lab", dir: "old-lab-dir" });
+    }
   });
 
   it("(#2511) a RUNNING lab row with a session_id drills to its live session, not the funnels-only detail view", () => {
