@@ -233,7 +233,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("2:00");
   });
 
-  // (#2863 review, finding 1) `wall_ms` INCLUDES thermal rest time
+  // (#2863 review, finding 1) `wall_ms` INCLUDES rest time
   // (`dispatch_internal.rs`'s own comment: "wall stays wall"), so a tile
   // reading "model time" over that figure overstates how long the model
   // actually worked. Measured on `darkmux-coding-refresh-rotation-1790125784225`:
@@ -241,6 +241,15 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // ~127s of real model time — none of which this tile can show honestly, so
   // it names itself for what it actually is (run time) and surfaces the rest
   // separately rather than inventing a model-only figure.
+  //
+  // (#2863 review round 2, finding 4) The sub line said "thermal rest" for
+  // ALL of `rest_ms` — but `rest_ms` sums EVERY inter-turn rest (routine
+  // `turn_delay` cool-downs and battery/operator pauses included, not
+  // thermal-only; `dispatch_internal.rs`'s own doc on the `rest_ms` field).
+  // Only `paced_rest_ms` is the non-routine share, and even that is not
+  // thermal-only (a battery pause's `reason` is also `!= "turn_delay"`).
+  // So the base line names no cause ("incl. N rest") and only a non-zero
+  // `paced_rest_ms` gets its own, honestly-named clause ("N paced").
   it("(#2863 review) WALL CLOCK reads as run time, with a sub line for rested time", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
@@ -248,14 +257,31 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         ts: "2026-01-01T00:04:03.705Z",
         session_id: "s1",
         action: "dispatch.complete",
-        payload: { wall_ms: 243705, rest_ms: 90000, rests: 6 },
+        payload: { wall_ms: 243705, rest_ms: 90000, rests: 6, paced_rest_ms: 45000 },
       },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
     expect(wall?.value).toBe("4:03");
     expect(wall?.hint).toBe("run time");
-    expect(wall?.sub).toBe("incl. 1:30 thermal rest");
+    expect(wall?.sub).toBe("incl. 1:30 rest · 0:45 paced");
+  });
+
+  it("(#2863 review round 2) rest with no paced portion names no cause", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:04:03.705Z",
+        session_id: "s1",
+        action: "dispatch.complete",
+        payload: { wall_ms: 243705, rest_ms: 90000, rests: 6, paced_rest_ms: 0 },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.sub).toBe("incl. 1:30 rest");
+    expect(wall?.sub).not.toContain("thermal");
+    expect(wall?.sub).not.toContain("paced");
   });
 
   it("(#2863 review) a run with no rest gets no rest sub line", () => {
@@ -276,12 +302,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         ts: "2026-01-01T00:01:00Z",
         session_id: "s1",
         action: "dispatch.error",
-        payload: { exit_code: 1, wall_ms: 60000, rest_ms: 15000, rests: 1 },
+        payload: { exit_code: 1, wall_ms: 60000, rest_ms: 15000, rests: 1, paced_rest_ms: 15000 },
       },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("errored (exit 1) · incl. 0:15 thermal rest");
+    expect(wall?.sub).toBe("errored (exit 1) · incl. 0:15 rest · 0:15 paced");
   });
 
   it("a remote (endpoint-served) run names the endpoint and omits the local model track", () => {

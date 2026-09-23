@@ -611,7 +611,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         ? "killed (timeout)"
         : `errored${exitCode != null ? ` (exit ${exitCode})` : ""}`
       : undefined;
-  // (#2863 review, finding 1) `wall_ms` INCLUDES thermal-rest time ("wall
+  // (#2863 review, finding 1) `wall_ms` INCLUDES rest time ("wall
   // stays wall" — `dispatch_internal.rs`'s own comment), so a tile labeled
   // "model time" over that figure overstates how long the model actually
   // worked — a run resting 6 times for 1:30 total still reads as 4:03 of
@@ -620,7 +620,19 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // the tile names itself for what it measures (run time, wall_ms as-is) and
   // surfaces the rest separately from the recorded `rest_ms`/`rests`.
   const restMs = (c?.payload as DispatchCompletePayload | undefined)?.rest_ms;
-  const restSub = typeof restMs === "number" && Number.isFinite(restMs) && restMs > 0 ? `incl. ${fmtElapsed(restMs)} thermal rest` : undefined;
+  // (#2863 review round 2, finding 4) `rest_ms` sums EVERY inter-turn rest —
+  // routine `turn_delay` cool-downs, thermal governor pauses, battery
+  // pauses, and operator holds — not thermal-only (verified against
+  // `DispatchCompletePayload.rest_ms`'s own doc, not assumed). The base
+  // line names no cause. `paced_rest_ms` is the non-routine share
+  // (`reason != "turn_delay"`), and it is ALSO not thermal-only — a
+  // battery pause's reason is `"battery"`, also `!= "turn_delay"` — so it
+  // is labeled "paced", not "thermal".
+  const pacedRestMs = (c?.payload as DispatchCompletePayload | undefined)?.paced_rest_ms;
+  const restSub =
+    typeof restMs === "number" && Number.isFinite(restMs) && restMs > 0
+      ? `incl. ${fmtElapsed(restMs)} rest${typeof pacedRestMs === "number" && pacedRestMs > 0 ? ` · ${fmtElapsed(pacedRestMs)} paced` : ""}`
+      : undefined;
   const wallSub = [wallOutcome, restSub].filter(Boolean).join(" · ") || undefined;
 
   const role = String(handle || "").replace(/^darkmux\//, "").toUpperCase();

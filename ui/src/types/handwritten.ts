@@ -675,9 +675,22 @@ export interface DispatchCompletePayload {
   wall_ms?: number;
   /** (#2863 review) `wall_ms` INCLUDES this time — "wall stays wall"
    * (`dispatch_internal.rs`'s own comment on `build_dispatch_complete_payload`).
-   * The sum of every inter-turn rest this execution took, and how many. */
+   * The sum of EVERY inter-turn rest this execution took, and how many —
+   * routine `turn_delay` cool-downs, thermal governor pauses, battery
+   * pauses, and operator holds ALL land here. NOT thermal-only, so the UI
+   * must not label this figure "thermal rest". */
   rest_ms?: number;
   rests?: number;
+  /** (#2863 review round 2, finding 4) Of `rest_ms` above, the portion
+   * attributable to a PACED rest — `reason != "turn_delay"` on the
+   * runtime's own `runtime.rest` event (`dispatch_internal.rs`'s own
+   * comment: "a manual operator pause or the thermal governor, never
+   * routine turn-to-turn cool-down"). Verified against that comment rather
+   * than assumed thermal-only: it also covers a battery pause (whose
+   * `reason` is `"battery"`, also `!= "turn_delay"`) and an operator hold,
+   * so the UI labels this share "paced", not "thermal" — the field cannot
+   * distinguish which governor caused it. */
+  paced_rest_ms?: number;
   total_turns?: number;
   total_tools?: number;
   total_tokens?: number;
