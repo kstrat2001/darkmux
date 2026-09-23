@@ -83,6 +83,11 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   let window: number | null = null;
   let threshold: number | null = null;
   let current: string | null = null;
+  // (#2863 review, finding 3) A turn's SEQ, for a group whose only records
+  // are ones that name their own `turn_seq` but never got a `dispatch.turn`
+  // (a checkpoint before the turn that would have completed it) — used to
+  // synthesize that group's header below.
+  const seqForKey = new Map<string, number>();
   for (const r of byTime) {
     const f = fields(r);
     if (r.action === "dispatch start" || r.action === "dispatch.start") {
@@ -91,8 +96,15 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
     }
     const seq = num(f.turn_seq);
     const own = seq === null ? null : key(seq);
-    if (r.action === "dispatch.turn" || r.action === "dispatch.reasoning") {
-      if (own !== null) current = own;
+    // (#2863 review, finding 3) ANY record naming its own `turn_seq` advances
+    // `current` — not just `dispatch.turn`/`dispatch.reasoning`. A turn that
+    // never got a `dispatch.turn` record (it left a `dispatch.checkpoint`
+    // instead, then errored) still moved the run forward; a record with no
+    // seq of its own that arrives after it (the terminal error) belongs
+    // there, not filed under the last turn that DID complete.
+    if (own !== null) {
+      current = own;
+      if (seq !== null) seqForKey.set(own, seq);
     }
     turnOf.set(r, own ?? current);
     if (r.action === "dispatch.turn.heartbeat" && own !== null && !firstBeat.has(own)) {
@@ -154,7 +166,35 @@ export function turnItems(visible: FlowRecord[], all: FlowRecord[]): TurnItem[] 
   const out: TurnItem[] = [];
   for (const t of order) {
     out.push(...(rests.get(t) ?? []));
-    const h = headers.get(t);
+    let h = headers.get(t);
+    // (#2863 review, finding 3) A group with a real turn number (it holds a
+    // record naming its own `turn_seq`) but no `dispatch.turn` record — the
+    // turn started and left evidence (a checkpoint, a reasoning note) but
+    // never finished. Synthesize a header rather than leave the group
+    // floating with no row explaining what it is. No duration or context
+    // data unless the group's own records carry it (summed the same way a
+    // real turn's is, from `telemetry.tokens`); a turn that never completed
+    // has no `usage` to read an input count from.
+    if (!h && t !== null && seqForKey.has(t)) {
+      const anchor = groups.get(t)?.[0]?.rec ?? rests.get(t)?.[0]?.rec;
+      if (anchor) {
+        h = {
+          kind: "turn",
+          rec: anchor,
+          turn: {
+            seq: seqForKey.get(t)!,
+            why: "did not finish",
+            durationMs: null,
+            approx: true,
+            inTok: null,
+            outTok: callOut.get(t) ?? null,
+            thinkTok: callThink.get(t) ?? null,
+            window,
+            threshold,
+          },
+        };
+      }
+    }
     if (h) out.push(h);
     out.push(...groups.get(t)!);
   }
