@@ -528,8 +528,11 @@ fn battery_health_edge(
     let Some(h) = now else {
         return (prev.cloned(), None);
     };
+    // Unchanged health keeps the LAST RECORDED reading as the reference,
+    // not this one: otherwise a slow loss of a few mAh per poll never looks
+    // like a change from one poll to the next, and is never recorded.
     if prev.is_some_and(|p| same_health(p, h)) {
-        return (Some(h.clone()), None);
+        return (prev.cloned(), None);
     }
     (Some(h.clone()), Some(build_battery_health_record(h, poll_interval_ms, sampled_at_ms)))
 }
@@ -540,10 +543,18 @@ fn battery_health_edge(
 /// hour, which is exactly what the edge exists to prevent. Those fields still
 /// ride on each record that IS emitted.
 fn same_health(a: &BatteryHealth, b: &BatteryHealth) -> bool {
+    // Capacity estimates wobble by a few mAh between polls (live: raw max
+    // 5,702 then 5,700). Only a move of more than 1% of the original
+    // capacity counts as wear.
+    let tol = a.design_capacity_mah.or(b.design_capacity_mah).map(|d| d / 100).unwrap_or(0);
+    let close = |x: Option<u64>, y: Option<u64>| match (x, y) {
+        (Some(x), Some(y)) => x.abs_diff(y) <= tol,
+        (x, y) => x == y,
+    };
     a.cycle_count == b.cycle_count
         && a.design_capacity_mah == b.design_capacity_mah
-        && a.raw_max_capacity_mah == b.raw_max_capacity_mah
-        && a.nominal_charge_capacity_mah == b.nominal_charge_capacity_mah
+        && close(a.raw_max_capacity_mah, b.raw_max_capacity_mah)
+        && close(a.nominal_charge_capacity_mah, b.nominal_charge_capacity_mah)
         && a.condition == b.condition
         && a.health_condition == b.health_condition
         && a.permanent_failure_status == b.permanent_failure_status
@@ -1484,6 +1495,45 @@ mod tests {
             known = next;
             assert!(rec.is_none(), "hour {hour}: only temperature/totals moved, which is not a health change");
         }
+    }
+
+    #[test]
+    fn a_few_mah_of_capacity_jitter_is_not_a_health_change() {
+        // Live: raw max read 5,702 then 5,700, nominal 5,854 then 5,852, and
+        // each wobble wrote a row.
+        let mut h = health_with(28);
+        h.raw_max_capacity_mah = Some(5702);
+        h.nominal_charge_capacity_mah = Some(5854);
+        let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
+        for (hour, (raw, nom)) in [(5700, 5852), (5703, 5855), (5698, 5850), (5701, 5853)].into_iter().enumerate() {
+            let mut j = h.clone();
+            j.raw_max_capacity_mah = Some(raw);
+            j.nominal_charge_capacity_mah = Some(nom);
+            let (next, rec) = battery_health_edge(known.as_ref(), Some(&j), 3_600_000, (hour as u64 + 1) * 3_600_000);
+            known = next;
+            assert!(rec.is_none(), "{raw}/{nom} mAh is jitter, not wear");
+        }
+    }
+
+    #[test]
+    fn slow_capacity_loss_is_recorded_once_it_adds_up() {
+        // Compared against the last RECORDED reading, not the last seen:
+        // 10 mAh an hour never looks like a change hour-to-hour, but it is
+        // real wear once it passes the threshold.
+        let mut h = health_with(28);
+        h.raw_max_capacity_mah = Some(5700);
+        let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
+        let mut emitted = Vec::new();
+        for hour in 1..=10u64 {
+            let mut later = h.clone();
+            later.raw_max_capacity_mah = Some(5700 - 10 * hour);
+            let (next, rec) = battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
+            known = next;
+            if rec.is_some() {
+                emitted.push(hour);
+            }
+        }
+        assert_eq!(emitted.len(), 1, "one record once the loss passes 1% of original, got {emitted:?}");
     }
 
     #[test]
