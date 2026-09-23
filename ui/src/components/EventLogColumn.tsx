@@ -12,7 +12,9 @@ import {
   createFacetSeen,
   createStoredPicks,
   hiddenCauseLabel,
+  isPeriodicOnlyWindow,
   matchesFilters,
+  PERIODIC_SAMPLE_ACTIVITIES,
   type Facets,
   type FacetSeen,
   type StoredPicks,
@@ -744,6 +746,27 @@ export function EventLogColumn({
     });
   }
 
+  // (operator, 2026-09-23) The #2512/#2770 backstop's tier (c): every
+  // activity value this window offers is a periodic sample
+  // (`PERIODIC_SAMPLE_ACTIVITIES`), so the fallback legitimately settled on
+  // "show nothing" rather than flooding the list with sampler noise. The
+  // empty-state branch below names this explicitly instead of the generic
+  // "no events match your activity filter" — see `isPeriodicOnlyWindow`'s
+  // own doc for why it's keyed on `facets.act` (offered), not the current
+  // selection.
+  const periodicOnlyWindow = isPeriodicOnlyWindow(facets);
+  // Count against ALL records this pane received, not `filtered` (which is
+  // empty in exactly this case) — the number the operator actually cares
+  // about is "how many samples are sitting there", not "how many survived
+  // a filter that hid all of them by definition".
+  const periodicHiddenCount = useMemo(
+    () => (periodicOnlyWindow ? records.filter((r) => PERIODIC_SAMPLE_ACTIVITIES.has(activityOf(r))).length : 0),
+    [periodicOnlyWindow, records],
+  );
+  function showPeriodicActivities() {
+    setFacetMany("act", facets.act.filter((v) => PERIODIC_SAMPLE_ACTIVITIES.has(v)), true);
+  }
+
   // (#2417 round 2, MF2) How many records the facet filters themselves are
   // hiding — as opposed to `capped`, which is the separate "only the newest
   // LOG_CAP are rendered" disclosure. Omitted from the chip entirely when
@@ -1389,7 +1412,11 @@ export function EventLogColumn({
               );
             })
           ) : (
-            <div className="eventlog__empty" data-state={error ? "error" : loading ? "loading" : "empty"} role={error ? "alert" : undefined}>
+            <div
+              className="eventlog__empty"
+              data-state={error ? "error" : loading ? "loading" : periodicOnlyWindow ? "periodic-only" : "empty"}
+              role={error ? "alert" : undefined}
+            >
               {error
                 ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
                 : loading
@@ -1409,8 +1436,29 @@ export function EventLogColumn({
                     // (more than one facet narrowed, or a facet AND the
                     // query both narrowing) it stays the generic message
                     // rather than misattribute to just one of several.
+                    //
+                    // (operator, 2026-09-23) A THIRD case, checked first: a
+                    // window that offers nothing but periodic samples. The
+                    // generic "activity filter" message above is technically
+                    // true here too, but reads as an ordinary filter problem
+                    // rather than "this window genuinely has nothing but
+                    // telemetry in it" — and gives no way back without
+                    // opening the filter dialog. Names the count and gives a
+                    // one-tap path back, reusing the same link-styled button
+                    // `RecordView`'s own disclosure toggles use (`rv__toggle`)
+                    // rather than introducing a new control.
                     records.length > 0
-                    ? `no events match your${hiddenCause ? ` ${hiddenCause}` : " filters"}`
+                    ? periodicOnlyWindow
+                      ? (
+                        <>
+                          no events in this window · {periodicHiddenCount.toLocaleString("en-US")} telemetry sample
+                          {periodicHiddenCount === 1 ? "" : "s"} hidden{" "}
+                          <button className="rv__toggle" onClick={showPeriodicActivities}>
+                            show
+                          </button>
+                        </>
+                      )
+                      : `no events match your${hiddenCause ? ` ${hiddenCause}` : " filters"}`
                     : "no events yet"}
             </div>
           )}

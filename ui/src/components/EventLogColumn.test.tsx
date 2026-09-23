@@ -150,6 +150,50 @@ describe("EventLogColumn", () => {
     });
   });
 
+  // (operator, 2026-09-23) A quiet fleet's window is mostly `machine.telemetry`
+  // — the #2512/#2770 backstop's naive "show everything the corpus offers"
+  // used to turn every one of those samples on. This is the case where it
+  // must show NOTHING and say why, instead of flooding the list.
+  describe("a window of nothing but periodic samples explains itself instead of flooding or blanking silently", () => {
+    it("shows the count and an explanation, not the generic activity-filter message, not the telemetry rows", () => {
+      const records = [
+        rec({ action: "machine.telemetry", session_id: undefined }),
+        rec({ ts: "2026-08-08T12:00:02.000Z", action: "machine.telemetry", session_id: undefined }),
+      ];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      expect(document.querySelectorAll('[data-act="rec"]').length).toBe(0);
+      expect(screen.getByText(/no events in this window/)).toBeInTheDocument();
+      expect(screen.getByText(/2 telemetry samples hidden/)).toBeInTheDocument();
+      expect(screen.queryByText("no events match your activity filter")).toBeNull();
+    });
+
+    it("the singular count reads '1 telemetry sample', not '1 telemetry samples'", () => {
+      const records = [rec({ action: "machine.telemetry", session_id: undefined })];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      expect(screen.getByText(/1 telemetry sample hidden/)).toBeInTheDocument();
+    });
+
+    it("the one-tap 'show' control turns the periodic rows back on", () => {
+      const records = [
+        rec({ action: "machine.telemetry", session_id: undefined }),
+        rec({ ts: "2026-08-08T12:00:02.000Z", action: "machine.telemetry", session_id: undefined }),
+      ];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      fireEvent.click(screen.getByText("show"));
+      expect(document.querySelectorAll('[data-act="rec"]').length).toBe(2);
+      expect(screen.queryByText(/no events in this window/)).toBeNull();
+    });
+
+    it("a mixed window (periodic plus a real value) is unaffected — the normal curated/fallback message applies, not this one", () => {
+      // Sanity boundary: this branch must fire ONLY when EVERY offered
+      // activity value is periodic, never on a merely telemetry-heavy one.
+      const records = [rec({ action: "machine.telemetry", session_id: undefined }), rec({ action: "dispatch.reasoning" })];
+      render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+      expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1);
+      expect(screen.queryByText(/no events in this window/)).toBeNull();
+    });
+  });
+
   // (#1891) The entire nonzero-match branch of `qcountText` had exactly
   // zero coverage before this — only the zero-match "no match" case above
   // was ever exercised. These four pin the grammar, the cap disclosure,

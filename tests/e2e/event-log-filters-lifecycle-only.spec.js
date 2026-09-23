@@ -14,6 +14,15 @@
 // `resolveActivitySet` backstop is what this proves live, in a real
 // browser, through the real component wiring — not just the jsdom-free
 // unit tests in `eventFilters.test.ts`).
+//
+// (operator, 2026-09-23) UPDATED for the periodic-sample exclusion: this
+// fixture's one `machine.telemetry` ("host telemetry") record is now
+// EXCLUDED from the backstop's fallback — showing it flooded a quiet
+// fleet's real 24h window with sampler noise (see
+// `PERIODIC_SAMPLE_ACTIVITIES` in `eventFilters.ts`). So the backstop now
+// shows the other 10 lifecycle records, not all 11, and the chip/filter
+// button correctly read that one record as hidden rather than claiming
+// zero active filters.
 const { test, expect } = require('@playwright/test');
 
 const DESKTOP = { width: 1280, height: 900 };
@@ -23,34 +32,40 @@ const PHONE = { width: 390, height: 844 };
 // 11 records, 9 distinct `act` facet values, all lifecycle/telemetry:
 // machine online/offline, dispatch start/end, mission start/close, phase
 // begin/complete, step start/complete, host telemetry. No stored picks
-// means no explicit include/exclude for any of them, so the backstop must
-// show every one — 11 rows, 0 hidden, and the Filters button reads exactly
-// "filters" (no active count) because every facet ends up fully selected.
+// means no explicit include/exclude for any of them, so the backstop shows
+// every NON-PERIODIC one — 10 of the 11 rows (the `machine.telemetry` row
+// stays hidden), and the Filters button reads "filters, 1 active" because
+// that one value is the single facet member excluded from the fallback.
 async function assertLifecycleOnlyDefaults(page) {
   await expect(page.locator('.eventlog__rec').first()).toBeVisible();
 
   const rows = page.locator('.eventlog__rec');
-  await expect(rows).toHaveCount(11);
+  await expect(rows).toHaveCount(10);
 
   // The literal bug signature this issue reported: "0 events" with
   // everything hidden. Assert its exact opposite, not just "some text".
   //
   // Desktop renders the full text as the chip's own content; the phone
-  // drawer renders a `compactCountLabel`-shortened form ("11" instead of
-  // "11 events" — see `EventLogColumn.tsx`'s own doc) and keeps the full
+  // drawer renders a `compactCountLabel`-shortened form ("10" instead of
+  // "10 events" — see `EventLogColumn.tsx`'s own doc) and keeps the full
   // text only in `title`. Read both so this assertion holds on either
   // viewport without hardcoding which one carries the word "events".
   const chip = page.locator('.eventlog__qcount, .qcount').first();
   const chipReading = await chip.evaluate((el) => `${el.textContent ?? ''} ${el.getAttribute('title') ?? ''}`);
-  expect(chipReading).toContain('11 events');
-  expect(chipReading).not.toContain('0 events');
-  expect(chipReading).not.toContain('hidden');
+  expect(chipReading).toContain('10 events');
+  // Word-boundary regex, not a plain substring: "10 events" itself contains
+  // the substring "0 events", which a naive `.not.toContain('0 events')`
+  // would wrongly flag.
+  expect(chipReading).not.toMatch(/\b0 events\b/);
+  // The one periodic-sample record (`machine.telemetry`) is correctly
+  // hidden by the fallback now — honestly disclosed, not silently dropped.
+  expect(chipReading).toContain('1 hidden');
 
   const fbtn = page.locator('#fbtn');
   const ariaLabel = await fbtn.getAttribute('aria-label');
-  // Every facet is fully selected (no operator picks, and the backstop
-  // filled `act` completely) — zero active filters, not "filters, 9 active".
-  expect(ariaLabel).toBe('filters');
+  // One facet member (host telemetry) is excluded from the fallback, so
+  // this is genuinely "1 active", not "filters" (zero).
+  expect(ariaLabel).toBe('filters, 1 active');
 }
 
 test.describe('desktop', () => {

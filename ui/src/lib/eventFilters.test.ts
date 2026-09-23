@@ -11,8 +11,10 @@ import {
   defaultFilterState,
   groupActivitiesBySections,
   hiddenCauseLabel,
+  isPeriodicOnlyWindow,
   matchesFilters,
   MODEL_ACTIVITIES,
+  PERIODIC_SAMPLE_ACTIVITIES,
   activeFilterCount,
   restoreFilterState,
   persistFilterState,
@@ -689,7 +691,17 @@ describe("#2770 — event log blanks when no offered activity is default-on AND 
   // them map to a DEFAULT_ACTIVITIES value and none is failure-shaped.
   const BUSY_NON_DEFAULT_ACTIONS = ["machine.telemetry", "dispatch.turn.heartbeat", "step start", "dispatch.start", "phase begin"];
 
-  it("LOAD-BEARING: a fixture whose activity values are ALL non-default still renders events (fresh session, no history)", () => {
+  // (operator, 2026-09-23) `machine.telemetry` ("host telemetry") and
+  // `dispatch.turn.heartbeat` ("heartbeat") are PERIODIC_SAMPLE_ACTIVITIES
+  // as of the fix below — the fallback no longer turns them on, so these
+  // two assertions were updated from "all 5 records visible" to "the 3
+  // non-periodic records visible" alongside it. The corpus is otherwise
+  // unchanged from the original #2770 fixture: it still proves the
+  // backstop fires for lifecycle/scheduler noise with no DEFAULT_ACTIVITIES
+  // member, just no longer for the periodic-sample tail.
+  const NON_PERIODIC_COUNT = 3; // step start, dispatch start, phase begin
+
+  it("LOAD-BEARING: a fixture whose activity values are ALL non-default still renders its non-periodic events, but not the periodic-sample tail (fresh session, no history)", () => {
     const records = BUSY_NON_DEFAULT_ACTIONS.map((action) => rec({ action }));
     const facets = computeFacets(records);
     // Sanity per the requirement: a fixture containing even one default-on
@@ -698,11 +710,13 @@ describe("#2770 — event log blanks when no offered activity is default-on AND 
       expect(DEFAULT_ACTIVITIES.has(v)).toBe(false);
     }
     const filters = defaultFilterState(facets);
+    expect(filters.act.has("host telemetry")).toBe(false);
+    expect(filters.act.has("heartbeat")).toBe(false);
     const visible = records.filter((r) => matchesFilters(r, filters));
-    expect(visible.length).toBe(records.length);
+    expect(visible.length).toBe(NON_PERIODIC_COUNT);
   });
 
-  it("still renders events when the operator has a stored exclude for a value NOT in this corpus", () => {
+  it("still renders the non-periodic events when the operator has a stored exclude for a value NOT in this corpus", () => {
     // The actual #2770 shape: the operator excluded `note` at some earlier,
     // calmer point in the session. That pick is real, but it is an opinion
     // about a value this window does not even offer — it must not suppress
@@ -713,9 +727,9 @@ describe("#2770 — event log blanks when no offered activity is default-on AND 
     const picks = createStoredPicks();
     picks.act.exclude.add("note");
     const state = applyStoredPicks(picks, facets);
-    expect(state.act.size).toBe(facets.act.length);
+    expect(state.act.size).toBe(NON_PERIODIC_COUNT);
     const visible = records.filter((r) => matchesFilters(r, state));
-    expect(visible.length).toBe(records.length);
+    expect(visible.length).toBe(NON_PERIODIC_COUNT);
   });
 
   it("does NOT show everything when the operator explicitly excluded a value this corpus DOES offer", () => {
@@ -824,5 +838,84 @@ describe("activitySectionOf / groupActivitiesBySections (#2450-ish, filter panel
 
   it("groupActivitiesBySections on an empty list returns no sections", () => {
     expect(groupActivitiesBySections([])).toEqual([]);
+  });
+});
+
+// ── operator finding, 2026-09-23 — the #2512 backstop must never turn on
+// PERIODIC-SAMPLE activities. Live report: "EVENTS LAST 24H · 50 OF 2883
+// EVENTS · 103 HIDDEN", the list wall-to-wall `machine.telemetry` from two
+// idle machines sampling every ~2s. ─────────────────────────────────────
+describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, never sampler noise", () => {
+  it("a corpus of only host telemetry: defaultFilterState shows nothing, and isPeriodicOnlyWindow names why", () => {
+    const records = [rec({ action: "machine.telemetry" }), rec({ action: "machine.telemetry" })];
+    const facets = computeFacets(records);
+    expect(facets.act).toEqual(["host telemetry"]);
+    const filters = defaultFilterState(facets);
+    expect(filters.act.size).toBe(0);
+    const visible = records.filter((r) => matchesFilters(r, filters));
+    expect(visible.length).toBe(0);
+    expect(isPeriodicOnlyWindow(facets)).toBe(true);
+  });
+
+  it("telemetry plus dispatch start/step complete (no DEFAULT_ACTIVITIES member): the lifecycle rows show, telemetry does not", () => {
+    const records = [
+      rec({ action: "machine.telemetry" }),
+      rec({ action: "machine.telemetry" }),
+      rec({ action: "dispatch.start" }),
+      rec({ action: "step complete" }),
+    ];
+    const facets = computeFacets(records);
+    const filters = defaultFilterState(facets);
+    expect(filters.act.has("host telemetry")).toBe(false);
+    expect(filters.act.has("dispatch start")).toBe(true);
+    expect(filters.act.has("step complete")).toBe(true);
+    const visible = records.filter((r) => matchesFilters(r, filters));
+    expect(visible.length).toBe(2);
+    expect(visible.every((r) => r.action !== "machine.telemetry")).toBe(true);
+    expect(isPeriodicOnlyWindow(facets)).toBe(false);
+  });
+
+  it("DEFAULT_ACTIVITIES present in the corpus: unchanged — the fallback never runs, host telemetry stays off by the ordinary curated rule", () => {
+    const records = [
+      rec({ action: "machine.telemetry" }),
+      rec({ action: "dispatch.reasoning" }),
+      rec({ action: "dispatch.tool" }),
+    ];
+    const facets = computeFacets(records);
+    const filters = defaultFilterState(facets);
+    expect(filters.act.has("reasoning")).toBe(true);
+    expect(filters.act.has("tool call")).toBe(true);
+    expect(filters.act.has("host telemetry")).toBe(false);
+    expect(filters.act.size).toBe(2);
+  });
+
+  it("operator explicitly included host telemetry: shown, even on an otherwise periodic-only window", () => {
+    const records = [rec({ action: "machine.telemetry" }), rec({ action: "machine.telemetry" })];
+    const facets = computeFacets(records);
+    const picks = createStoredPicks();
+    picks.act.include.add("host telemetry");
+    const state = applyStoredPicks(picks, facets);
+    expect(state.act.has("host telemetry")).toBe(true);
+    const visible = records.filter((r) => matchesFilters(r, state));
+    expect(visible.length).toBe(2);
+  });
+
+  it("isPeriodicOnlyWindow is false for an empty facet set (nothing to backstop) and false once any non-periodic value is offered", () => {
+    expect(isPeriodicOnlyWindow({ act: [], cat: [], tier: [], src: [] })).toBe(false);
+    expect(isPeriodicOnlyWindow({ act: ["host telemetry", "heartbeat"], cat: [], tier: [], src: [] })).toBe(true);
+    expect(isPeriodicOnlyWindow({ act: ["host telemetry", "dispatch start"], cat: [], tier: [], src: [] })).toBe(false);
+  });
+
+  // Mutation-proof: PERIODIC_SAMPLE_ACTIVITIES must actually name the value
+  // the live report flooded on, or this whole fix protects nothing.
+  it("names every value the fix was written for", () => {
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("host telemetry")).toBe(true);
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("heartbeat")).toBe(true);
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("tokens")).toBe(true);
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("lms")).toBe(true);
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("telemetry")).toBe(true);
+    // event-triggered, not periodic — must stay OFF this list.
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("detector")).toBe(false);
+    expect(PERIODIC_SAMPLE_ACTIVITIES.has("dispatch start")).toBe(false);
   });
 });

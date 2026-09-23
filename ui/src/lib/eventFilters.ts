@@ -103,6 +103,40 @@ export const ACT_ORDER: string[] = [
 // than renamed; the section router already files it under DISPATCH.
 export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call", "turn", "dispatch error", "dispatch.rest"]);
 
+/** (operator, 2026-09-23) Activity values that are FIXED-CADENCE SAMPLES —
+ * a sampler thread emitting a new record roughly every N seconds for as
+ * long as the process/machine is up, independent of anything the operator
+ * asked it to do — as opposed to a value that marks something HAPPENING
+ * (a dispatch starting, a mission phase beginning, a detector firing). The
+ * distinction matters for exactly one consumer, `resolveActivitySet`'s
+ * fallback below: a quiet fleet's 24h window is mostly this vocabulary (two
+ * machines emitting `machine.telemetry` roughly every 2s dwarfs everything
+ * else in the corpus), so a fallback that means "show me whatever this
+ * window actually has" must not mean "show me the sampler noise" — that is
+ * the #2512 backstop turning the exact flood `DEFAULT_ACTIVITIES` exists to
+ * hide back on, just through a different door.
+ *
+ * Named from `activityOf`'s own output, checked against a live `/flow`
+ * payload (`machine.telemetry`) and the sampler doc comments in
+ * `darkmux-crew/src/telemetry_sampler.rs` (`source="lms"`/`source="process"`
+ * run on a fixed cadence by design — see that file's own header):
+ *
+ *   "host telemetry"  `machine.telemetry` / `category:telemetry,source:process` — ~2s/machine
+ *   "heartbeat"        `dispatch.turn.heartbeat` — mid-turn liveness ticks
+ *   "tokens"           `category:telemetry,source:tokens` — token-budget samples
+ *   "lms"              `category:telemetry,source:lms` — LMStudio load/unload polling
+ *   "telemetry"        `category:telemetry,source:runtime`'s generic fallback
+ *                       label ("telemetry.context" in practice) — per-turn
+ *                       context-usage sampling
+ *
+ * Deliberately EXCLUDED, despite also being `category:telemetry`: `detector`
+ * (a loop-pathology alarm — fires on a real event, not a clock) and
+ * `runtime` (`telemetry.runtime`'s own turn-scoped status, one per turn
+ * taken, not one per tick of a timer). Hiding those by default would be the
+ * exact "operator never sees it" failure `DEFAULT_ACTIVITIES`'s own
+ * `dispatch error` entry exists to prevent. */
+export const PERIODIC_SAMPLE_ACTIVITIES = new Set(["host telemetry", "heartbeat", "tokens", "lms", "telemetry"]);
+
 /** (silent-miss audit, 2026-09-06) Suffixes that mark an activity value as
  * failure- or abandonment-shaped, checked in ADDITION to `DEFAULT_ACTIVITIES`
  * membership by `isDefaultOn` below. `activityOf`'s literal `return a ||
@@ -177,7 +211,33 @@ function isDefaultOn(key: keyof Facets, value: string): boolean {
  * present corpus (see `does not override a deliberate operator choice to
  * exclude everything` in eventFilters.test.ts), not a default gone wrong,
  * and this function's job stays "what does the DEFAULT alone produce," not
- * "second-guess a deliberate choice." */
+ * "second-guess a deliberate choice."
+ *
+ * (operator, 2026-09-23) The no-opinion fallback is now THREE tiers, not
+ * two, because "show everything the corpus offers" turned out to have its
+ * own failure mode: a quiet fleet's 24h window (report: "50 OF 2883 EVENTS
+ * · 103 HIDDEN") is almost entirely `machine.telemetry` from two idle
+ * machines sampling every ~2s — none of it `DEFAULT_ACTIVITIES`, none of it
+ * failure-shaped, so tier (a) below folds to empty and the OLD tier (b)
+ * turned every one of those ~2,780 samples on, flooding the list with the
+ * exact noise `DEFAULT_ACTIVITIES` exists to hide, just reached through the
+ * empty-corpus door instead of around it.
+ *
+ *   (a) the curated per-value fold above (`DEFAULT_ACTIVITIES` plus
+ *       failure-shaped values plus the operator's own picks) — unchanged,
+ *       and skipped entirely (this fallback never runs) the moment it
+ *       produces anything.
+ *   (b) if (a) is empty and the operator has no opinion on anything this
+ *       call offers: every NON-periodic value on offer
+ *       (`PERIODIC_SAMPLE_ACTIVITIES` above) — lifecycle/scheduler noise
+ *       like `dispatch start`/`step complete` a busy-but-uncurated corpus
+ *       carries, which is exactly what #2512/#2770 needed shown.
+ *   (c) if (b) is ALSO empty — every value this window offers is a
+ *       periodic sample, i.e. a genuinely quiet window — `out` stays
+ *       empty. This is not a bug to fix here: `isPeriodicOnlyWindow` below
+ *       is how the caller (`EventLogColumn`) tells this case apart from an
+ *       ordinary "nothing matches" and explains it instead of rendering a
+ *       silent blank list. */
 function resolveActivitySet(values: string[], picks: { include: Set<string>; exclude: Set<string> }): Set<string> {
   const out = new Set<string>();
   for (const v of values) {
@@ -187,10 +247,30 @@ function resolveActivitySet(values: string[], picks: { include: Set<string>; exc
   if (out.size === 0 && values.length > 0) {
     const hasOpinionOnOffered = values.some((v) => picks.include.has(v) || picks.exclude.has(v));
     if (!hasOpinionOnOffered) {
-      for (const v of values) out.add(v);
+      for (const v of values) {
+        if (!PERIODIC_SAMPLE_ACTIVITIES.has(v)) out.add(v);
+      }
     }
   }
   return out;
+}
+
+/** (operator, 2026-09-23) True when EVERY activity value this window
+ * offers is a periodic sample — the shape `resolveActivitySet`'s tier (c)
+ * legitimately settles on "show nothing" for. Distinguishes that case from
+ * an ordinary operator-narrowed-to-zero result so `EventLogColumn`'s empty
+ * state can name it ("no events in this window · N telemetry samples
+ * hidden") instead of the generic "no events match your activity filter" —
+ * which is technically true but reads as a filter problem, not as "this
+ * window genuinely has nothing but sampler noise in it."
+ *
+ * Deliberately keyed on `facets.act` (everything OFFERED), not on the
+ * current `FilterState` (everything SELECTED): an operator who manually
+ * excluded every periodic value on a MIXED corpus (telemetry plus real
+ * activity) gets the ordinary "activity filter" message — that is a
+ * deliberate choice on a corpus that has more to show, not this case. */
+export function isPeriodicOnlyWindow(facets: Facets): boolean {
+  return facets.act.length > 0 && facets.act.every((v) => PERIODIC_SAMPLE_ACTIVITIES.has(v));
 }
 
 /** (#2416) The "model only" quick filter's underlying vocabulary — what
