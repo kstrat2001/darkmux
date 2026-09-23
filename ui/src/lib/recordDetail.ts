@@ -57,6 +57,14 @@ function firstLine(s: string, max: number): string {
 /** The row's trailing preview, or `""` when this record kind has none.
  * Branch-for-branch the legacy set. */
 export function recordDetail(r: FlowRecord): string {
+  // (#2863 review round 2, finding 5) Escaped at the SOURCE, not only at
+  // `recordObject()`'s fallback call site — `EventLogColumn.tsx`'s pushed-
+  // detail strip calls this function DIRECTLY for its preview text, a
+  // second render path that never went through `recordObject()` at all.
+  return escapeBidiControls(recordDetailRaw(r));
+}
+
+function recordDetailRaw(r: FlowRecord): string {
   const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
   const a = r.action || "";
 
@@ -122,6 +130,67 @@ export interface RecordObject {
 
 const CONTAINER_ROOT = /^\/workspace\//;
 
+/** (#2863 review round 2, finding 9, security) Splits ONE command line on
+ * top-level shell separators (`;`, `&&`, `||`, `|`) — quote-aware (a
+ * separator inside `'...'` or `"..."` is part of the string, not a real
+ * separator; a `\"` inside a double-quoted string does not end it) but
+ * deliberately not a full shell parser: no backslash handling outside
+ * double quotes, no subshells, no here-docs, no `$(...)`/backtick
+ * awareness. Good enough to stop `echo <200 chars of padding>; rm -rf
+ * /workspace` from hiding its second command behind the row's own
+ * fixed-width CSS ellipsis, which nothing in this function can see coming
+ * (there is no length at which a row IS or ISN'T going to be truncated —
+ * that is a runtime layout fact, not a string fact) — so the split (and
+ * the marker built from it) is unconditional rather than gated on length. */
+function splitTopLevelCommands(line: string): string[] {
+  const segments: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | null = null;
+  let i = 0;
+  while (i < line.length) {
+    const c = line[i];
+    if (quote) {
+      if (quote === '"' && c === "\\" && i + 1 < line.length) {
+        cur += c + line[i + 1];
+        i += 2;
+        continue;
+      }
+      cur += c;
+      if (c === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      cur += c;
+      i++;
+      continue;
+    }
+    if (c === ";") {
+      segments.push(cur);
+      cur = "";
+      i++;
+      continue;
+    }
+    if ((c === "&" && line[i + 1] === "&") || (c === "|" && line[i + 1] === "|")) {
+      segments.push(cur);
+      cur = "";
+      i += 2;
+      continue;
+    }
+    if (c === "|") {
+      segments.push(cur);
+      cur = "";
+      i++;
+      continue;
+    }
+    cur += c;
+    i++;
+  }
+  segments.push(cur);
+  return segments.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
 /** `cd /workspace && npm test 2>&1` → `npm test`: the working-directory hop
  * and the stream redirect are how the runtime runs a command, not what the
  * command is. */
@@ -134,6 +203,15 @@ function commandText(cmd: string): string {
     .replace(/\s*2>&1\s*$/, "");
   const lines = stripped.split("\n");
   const first = lines[0].trim();
+  // (#2863 review round 2, finding 9) A chained command on the SAME line —
+  // `cd X && Y` (already legitimately shown in full above) counts too:
+  // the marker means "this row is more than one command", true whether or
+  // not this particular render happens to be wide enough to show all of
+  // it.
+  const segments = splitTopLevelCommands(first);
+  const shown = segments[0] ?? first;
+  const markers: string[] = [];
+  if (segments.length > 1) markers.push(`⛓ +${segments.length - 1}`);
   // (#2863 review, finding 6, security) A command with more than one line
   // used to show only the first, no different from a genuinely single-line
   // one — `echo ok` and `echo ok\nrm -rf /workspace` were indistinguishable.
@@ -141,9 +219,9 @@ function commandText(cmd: string): string {
   // characters.
   if (lines.length > 1) {
     const extra = lines.length - 1;
-    return `${first} ⏎ +${extra} more line${extra === 1 ? "" : "s"}`;
+    markers.push(`⏎ +${extra} more line${extra === 1 ? "" : "s"}`);
   }
-  return first;
+  return markers.length ? `${shown} ${markers.join(" ")}` : shown;
 }
 
 /** (#2863 review, finding 5) A `write` call's `content` can be long enough
@@ -152,9 +230,18 @@ function commandText(cmd: string): string {
  * order) — `fieldFromRaw` cannot find a key that was never included in what
  * it was given. The runtime's own result names the path it wrote
  * (`runtime/src/tools/mod.rs`'s `write`: `"Wrote {n} bytes to {path}"`), so
- * that is read as the fallback before showing raw JSON. */
+ * that is read as the fallback before showing raw JSON.
+ *
+ * (#2863 review round 2, finding 7) Only called for a `write` tool call
+ * (see the caller below) — this phrase is specific to `write`'s own result
+ * text; an unrelated tool whose OWN result happened to contain it (an
+ * `echo` printing that exact string, a log line) must not have its row
+ * renamed after a file it never touched. Captures to the END OF THE LINE,
+ * not `\S+`'s first word: the runtime's message has nothing after the path
+ * (`format!("Wrote {} bytes to {}", content.len(), path.display())`), and
+ * `\S+` truncated "my notes.md" to "my". */
 function pathFromResult(result: string): string | null {
-  const m = result.match(/^Wrote \d+ bytes to (\S+)/);
+  const m = result.match(/^Wrote \d+ bytes to (.+)$/);
   return m ? m[1] : null;
 }
 
@@ -222,12 +309,18 @@ function fieldFromRaw(raw: string, keys: readonly string[]): { key: string; valu
 
 /** (#2863 review, finding 7, security — Trojan-Source class) A model-written
  * command, pattern, path or reasoning string can carry bidi override
- * (U+202A–U+202E, U+2066–U+2069) or zero-width (U+200B–U+200F) control
- * characters. Rendered raw, these REORDER what a row visually displays
- * without changing what actually runs — the same technique CVE-class as
- * Trojan Source. Each one is replaced with a visible, unambiguous escape
- * naming its own code point, so the row shows what is actually there. */
-const BIDI_CONTROL = /[‪-‮⁦-⁩​-‏]/g;
+ * (U+202A–U+202E, U+2066–U+2069), zero-width (U+200B–U+200F), or one of
+ * three MORE invisible/directional control points found in round 2's
+ * review: ARABIC LETTER MARK (U+061C, an implicit-directional signal — same
+ * risk class as the explicit overrides), WORD JOINER (U+2060), and ZERO
+ * WIDTH NO-BREAK SPACE (U+FEFF, the BOM character — invisible mid-string).
+ * Rendered raw, these REORDER or hide what a row visually displays without
+ * changing what actually runs — the same technique CVE-class as Trojan
+ * Source. Each one is replaced with a visible, unambiguous escape naming
+ * its own code point, so the row shows what is actually there. Written with
+ * explicit `\u` escapes, not literal characters, so the source itself never
+ * embeds an invisible/directional control point. */
+const BIDI_CONTROL = /[\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
 export function escapeBidiControls(s: string): string {
   return s.replace(BIDI_CONTROL, (ch) => `⟨U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}⟩`);
 }
@@ -266,7 +359,11 @@ export function recordObject(r: FlowRecord): RecordObject {
       text = args.path.replace(CONTAINER_ROOT, "");
     } else {
       const raw = typeof f.args === "string" && !args ? fieldFromRaw(f.args, ["command", "pattern", "path"]) : null;
-      const resultPath = typeof f.result === "string" ? pathFromResult(f.result) : null;
+      // (#2863 review round 2, finding 7) Gated on the ACTUAL write-tool
+      // name (`runtime/src/tools/mod.rs`'s `ToolName::Write => "write"` —
+      // one tool, one name, checked rather than assumed) — otherwise any
+      // OTHER tool's result matching the same phrase misnamed its row.
+      const resultPath = f.tool_name === "write" && typeof f.result === "string" ? pathFromResult(f.result) : null;
       if (raw?.key === "path") {
         text = raw.value.replace(CONTAINER_ROOT, "");
       } else if (raw) {
@@ -298,5 +395,8 @@ export function recordObject(r: FlowRecord): RecordObject {
     const first = unquote(f.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
     return { chip: "reasoning", kind: "think", text: escapeBidiControls(first.trim()) || "(no reasoning text)", mono: false };
   }
-  return { text: escapeBidiControls(recordDetail(r)), mono: false };
+  // (#2863 review round 2, finding 5) `recordDetail()` escapes its own
+  // output now, so no second pass is needed here — kept un-wrapped rather
+  // than double-escaped, which would be harmless but misleading to read.
+  return { text: recordDetail(r), mono: false };
 }

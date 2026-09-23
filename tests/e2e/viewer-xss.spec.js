@@ -203,6 +203,21 @@ test('viewer renders attacker-controlled flow records inertly across every view'
     const truncRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-truncated' }) }).first();
     await expect(truncRow).toBeVisible();
 
+    // (#2863 review round 2, finding 5) The detail pane's "raw JSON" view
+    // is a SEPARATE render path from the row above — `JSON.stringify`
+    // straight into a `<pre>`, bypassing every field-level escape. Select
+    // the plain-shape row and open it: the bidi override must show as its
+    // visible escape there too, not the raw control character.
+    await plainRow.click();
+    const rawToggle = page.getByText('raw JSON', { exact: true });
+    if (await rawToggle.count()) {
+      await rawToggle.click();
+      const pre = page.locator('.eventlog__detailpre');
+      await expect(pre).toContainText('⟨U+202E⟩');
+      const preText = await pre.innerText();
+      expect(preText).not.toContain('‮');
+    }
+
     // Back to the fleet stage for the machine-card drill below.
     await page.locator('[data-act="fleet"]').click();
     await page.waitForSelector('[data-act="machine"][data-arg]');

@@ -107,6 +107,20 @@ describe("RecordView", () => {
     expect(screen.queryByText(/‮/)).toBeNull();
   });
 
+  // (#2863 review round 2, finding 5) `Value()`'s escaping covers the
+  // rendered field rows, but "raw JSON" is a SEPARATE render path —
+  // `JSON.stringify(record, null, 2)` straight into a `<pre>`, bypassing
+  // `Value()` entirely. A bidi override anywhere in the record reached
+  // that view raw.
+  it("escapes a bidi override in the raw JSON view too, not just the rendered rows", () => {
+    render(<RecordView record={{ ...REC, source: "safe‮exe.txt" }} />);
+    fireEvent.click(screen.getByText("raw JSON"));
+    const pre = document.querySelector(".eventlog__detailpre")!;
+    expect(pre).not.toBeNull();
+    expect(pre.textContent).toContain("⟨U+202E⟩");
+    expect(pre.textContent).not.toContain("‮");
+  });
+
   it("expanding a multi-line value shows the hidden line as a real line break, not run together", () => {
     // `.rv__str` has no `white-space: pre-wrap` of its own, so a real
     // newline character collapses to whitespace visually under normal CSS —

@@ -210,7 +210,12 @@ export function RecordView({ record }: { record: Record<string, unknown> }) {
       <button className="rv__toggle rv__rawtoggle" onClick={() => setShowRaw(!showRaw)}>
         {showRaw ? "hide raw" : "raw JSON"}
       </button>
-      {showRaw ? <pre className="eventlog__detailpre">{JSON.stringify(record, null, 2)}</pre> : null}
+      {/* (#2863 review round 2, finding 5) A SEPARATE render path from
+          `Value()` above — `JSON.stringify` bypasses every field-level
+          escape, so a bidi override anywhere in the record reached this
+          view raw. Escaping the WHOLE serialized text is safe here: this
+          is a debug dump for a person to read, not re-parsed JSON. */}
+      {showRaw ? <pre className="eventlog__detailpre">{escapeBidiControls(JSON.stringify(record, null, 2))}</pre> : null}
     </div>
   );
 }
