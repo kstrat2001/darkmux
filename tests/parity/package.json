@@ -12,7 +12,7 @@
     "next-parity-live": "playwright test --config next-parity-live.playwright.config.js",
     "tripwire": "bun run tripwire.mjs",
     "test-lib": "node --test lib/*.test.mjs",
-    "check": "bun run tripwire && npm run -s test-lib",
+    "check": "bun run tripwire && bun run test-lib",
     "next-parity": "playwright test --config next-parity.playwright.config.js",
     "next-parity-catalog": "playwright test --config next-parity-catalog.playwright.config.js",
     "next-parity-chrome": "playwright test --config nav-chrome.playwright.config.js",
