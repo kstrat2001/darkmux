@@ -36,4 +36,6 @@ pub mod scores;
 pub mod stats;
 // (#2855) A set of runs summarized as ranges, with cost per successful outcome.
 pub mod stats_set;
+// (#2855) The text `lab run stats` prints, as tested pure functions.
+pub mod stats_render;
 pub mod tune;
