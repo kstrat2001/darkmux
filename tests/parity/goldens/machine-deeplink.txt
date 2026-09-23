@@ -19,113 +19,72 @@ MacBook-Pro
 
 === stage ===
 fleet › machine — Apple M5 Max · 128 GB
-darkmux/utility
-utility tier · darkmux:qwen3-4b-instruct-2507
-compaction · mission-compile · estimate · scribe
-resident
-machine total
-GREEN
-Σ potential 29.83 GB · Σ current 22.21 GB · limit 137.44 GB (physical pool (no budget configured)) · pool 137.44 GB / free 14.45 GB
-darkmux:qwen3.6-35b-a3b-turboquant-mlx
-DARKMUX
-GREEN
-ctx 262144 · weights 18.45 GB · kv@ctx 5.37 GB · potential 24.57 GB · current 19.35 GB
+0
+32
+64
+96
+128
+LIMIT
+GiB
+MACHINE USED
+darkmux
+36.53 GiB
+other
+78.57 GiB
+committed +
+5.53 GiB
+→
+120.63 GiB
+61
+%
+MARGIN
+15
+MiB
+SWAP USED
+44.94
+GiB
+COMPRESSOR
+limit source physical pool · available 45.98 GiB (38.38 GiB reclaimable) · unpriced 0 models
+DARKMUX-MANAGED · 2 RESIDENT
 darkmux:qwen3-4b-instruct-2507
-DARKMUX
-GREEN
-ctx 16000 · weights 2.15 GB · kv@ctx 2.36 GB · potential 5.26 GB · current 2.86 GB
-pressure
-swap used
-8.31 GB
-compressor
-1.12 GB
-memory free
-94%
-attribution: nostrud anim pariatur do nostrud cillum cupidatat duis fugiat nostrud ullamco anim pariatur amet amet quis voluptate proid
-gather 441 ms (zero model dispatches) · server cache 2000 ms · polled every 5s
-RUNS ON MACBOOK-PRO
-#30
-complete
-radio-router · qwen3-4b-instruct-2507
-1t 0⚙ 982tok 0⚡
-14:28:00 · just now · 0:00
-#29
-no start
-radio-router · ?
-#28
-complete
-radio-host · qwen3.6-35b-a3b-turboquant-mlx
-1t 0⚙ 2ktok 0⚡
-11:31:56 · 2h ago · 0:04
-#27
-complete
-radio-router · qwen3-4b-instruct-2507
-1t 0⚙ 978tok 0⚡
-11:31:52 · 2h ago · 0:01
-#26
-no start
-radio-router · ?
-#25
-complete
-radio-host · qwen3.6-35b-a3b-turboquant-mlx
-1t 0⚙ 2ktok 0⚡
-09:57:23 · 4h ago · 0:03
-#24
-complete
-radio-router · qwen3-4b-instruct-2507
-1t 0⚙ 980tok 0⚡
-09:57:20 · 4h ago · 0:01
-#23
-no start
-radio-router · ?
-#22
-complete
-radio-host · qwen3.6-35b-a3b-turboquant-mlx
-1t 0⚙ 4ktok 0⚡
-09:47:31 · 4h ago · 0:16
-#21
-complete
-radio-router · qwen3-4b-instruct-2507
-1t 0⚙ 978tok 0⚡
-09:47:15 · 4h ago · 0:01
-#20
-no start
-radio-router · ?
-#19
-no start
-merge-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
-#18
-no start
-gather-merge-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
-#17
-no start
-approve-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
-#16
-no start
-gather-approve-step · ? · acp-ephemeral-pr-ship-1786152707367180000-5
-#15
-complete
-radio-router · qwen3-4b-instruct-2507
-1t 0⚙ 984tok 0⚡
-01:16:43 · 13h ago · 0:01
-#14
-no start
-radio-router · ?
-#13
-no start
-view-step · ? · acp-ephemeral-pr-view-1786150088844151000-2
-#12
-complete
-radio-router · qwen3-4b-instruct-2507
-1t 0⚙ 965tok 0⚡
-16:44:34 · 21h ago · 0:01
-#11
-no start
-radio-router · ?
-show all 30 →
-UNSCOPED RECORDS · 10 TODAY
-unscoped records
-10 records without a session
-flow notes, ambient telemetry, etc.
-loose
+utility
+14.6
+ctx 120000 · weights 2.01 GiB · kv@ctx 16.48 GiB · potential 19.18 GiB · current 14.61 GiB
+darkmux:qwen3.6-35b-a3b-turboquant-mlx
+21.9
+ctx 262144 · weights 17.18 GiB · kv@ctx 5.00 GiB · potential 22.88 GiB · current 21.92 GiB
+snapshot just now
+how this was measured
+LIVE LOAD · LAST 10 MIN
+CPU
+15%
+14% avg · 65% max
+GPU
+1%
+3% avg · 37% max
+MEM
+64%
+64% avg · 67% max
+CPU CLUSTERS
+SUPER
+15%
+6 cores · 4608 MHz
+PERFORMANCE
+16%
+12 cores · 2847 MHz
+THERMAL
+NOMINAL
+FAIR
+SERIOUS
+CRITICAL
+ABOVE NOMINAL
+0s
+POWER
+TOTAL
+9.5 W now · 10.5 W avg · 21.0 W p95 · 39.0 W max
+CHANNELS
+CPU 9.5 W · GPU 14 mW · ANE 0 mW
+ENERGY
+1.79 Wh
+runs on MacBook-Pro →
 

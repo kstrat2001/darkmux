@@ -6,6 +6,7 @@
   "scripts": {
     "record": "bun run record.mjs",
     "record:graph": "bun run record.mjs --only graph",
+    "record:machine": "bun run record.mjs --only machine",
     "next-parity-runs": "playwright test --config next-playwright.config.js next-parity-runs.spec.ts",
     "next-parity-console": "playwright test --config next-parity-console.playwright.config.js",
     "next-parity-live": "playwright test --config next-parity-live.playwright.config.js",

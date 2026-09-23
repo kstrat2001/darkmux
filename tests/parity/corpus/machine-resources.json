@@ -1,22 +1,35 @@
 {
-  "schema_version": "1.0",
-  "generated_at_ms": 1786207256843,
-  "gather_ms": 441,
+  "schema_version": "2.1",
+  "generated_at_ms": 1790150526478,
+  "gather_ms": 453,
   "limit_bytes": 137438953472,
   "limit_source": "physical_pool",
   "pool": {
     "capacity_bytes": 137438953472,
-    "used_bytes": 69300000000,
-    "available_bytes": 63000000000,
-    "free_bytes": 14452359168
+    "used_bytes": 123592097792,
+    "available_bytes": 49372872704,
+    "free_bytes": 8165425152
   },
   "pressure": {
-    "swap_used_bytes": 8308129792,
-    "compressor_bytes": 1121665024,
-    "margin_percent": 94,
+    "swap_used_bytes": 15204352,
+    "compressor_bytes": 48259284992,
+    "margin_percent": 61,
     "red": false
   },
   "models": [
+    {
+      "identifier": "darkmux:qwen3-4b-instruct-2507",
+      "model_key": "qwen3-4b-instruct-2507",
+      "owner": "darkmux",
+      "loaded_ctx": 120000,
+      "weights_bytes": 2153225524,
+      "kv_per_token_bytes": 147456,
+      "kv_bytes_at_ctx": 17694720000,
+      "potential_bytes": 20597945524,
+      "potential_source": "arch",
+      "current_bytes": 15692049496,
+      "state": "green"
+    },
     {
       "identifier": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
       "model_key": "qwen3.6-35b-a3b-turboquant-mlx",
@@ -26,30 +39,154 @@
       "kv_per_token_bytes": 20480,
       "kv_bytes_at_ctx": 5368709120,
       "potential_bytes": 24565385183,
-      "current_bytes": 19351355392,
-      "state": "green"
-    },
-    {
-      "identifier": "darkmux:qwen3-4b-instruct-2507",
-      "model_key": "qwen3-4b-instruct-2507",
-      "owner": "darkmux",
-      "loaded_ctx": 16000,
-      "weights_bytes": 2153225524,
-      "kv_per_token_bytes": 147456,
-      "kv_bytes_at_ctx": 2359296000,
-      "potential_bytes": 5262521524,
-      "current_bytes": 2856615936,
+      "potential_source": "arch",
+      "current_bytes": 23534573960,
       "state": "green"
     }
   ],
   "machine": {
-    "potential_bytes": 29827906707,
+    "potential_bytes": 45163330707,
     "unpriced_models": 0,
-    "current_bytes": 22207971328,
+    "estimated_models": 0,
+    "over_price_models": 0,
+    "current_bytes": 39226623456,
+    "other_used_bytes": 84365474336,
+    "projected_total_bytes": 129528805043,
     "state": "green"
   },
   "attribution": "per_process",
-  "attribution_note": "nostrud anim pariatur do nostrud cillum cupidatat duis fugiat nostrud ullamco anim pariatur amet amet quis voluptate proid",
+  "attribution_note": "ea voluptate aliqua minim sit elit lorem ex esse deserunt ipsum elit occaecat velit aliquip sit sed veniam incididunt officia reprehenderit in magna enim sed eiu",
   "messages": [],
-  "cache_ttl_ms": 2000
+  "cache_ttl_ms": 2000,
+  "load": {
+    "battery_health": {
+      "cycle_count": 28,
+      "design_capacity_mah": 6249,
+      "raw_max_capacity_mah": 5701,
+      "nominal_charge_capacity_mah": 5853,
+      "raw_capacity_pct": 91.2,
+      "nominal_capacity_pct": 93.7,
+      "condition": "Check Battery",
+      "temperature_c": 31.01,
+      "time_at_soc_hours": [
+        0,
+        14,
+        1940,
+        683,
+        0,
+        0,
+        0,
+        0,
+        13,
+        15,
+        2,
+        0,
+        0,
+        0,
+        0,
+        71,
+        35,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1751,
+        648,
+        193,
+        0,
+        0,
+        0
+      ],
+      "total_operating_time_hours": 5368
+    },
+    "now": {
+      "sampled_at_ms": 1790150522987,
+      "sampler_cost_ms": 6,
+      "cpu_pct": 15,
+      "cpu_clusters": [
+        {
+          "name": "Super",
+          "cores": 6,
+          "pct": 15,
+          "mhz": 4608
+        },
+        {
+          "name": "Performance",
+          "cores": 12,
+          "pct": 16,
+          "mhz": 2847
+        }
+      ],
+      "mem_pct": 64,
+      "gpu_pct": 1,
+      "gpu_mhz": 338,
+      "gpu_mem_bytes": 995819520,
+      "thermal": {
+        "state": "nominal",
+        "cpu_speed_limit_pct": 100
+      },
+      "battery": {
+        "charge_pct": 100,
+        "on_ac": true,
+        "charging": false,
+        "minutes_to_empty": null
+      },
+      "power_mw": {
+        "cpu": 9508,
+        "gpu": 14,
+        "ane": 0,
+        "total": 9522
+      }
+    },
+    "window": {
+      "samples": 120,
+      "span_ms": 614575,
+      "interval_ms": 5164,
+      "cpu_pct": {
+        "mean": 14.1,
+        "p95": 29,
+        "max": 65
+      },
+      "gpu_pct": {
+        "mean": 2.8,
+        "p95": 4,
+        "max": 37
+      },
+      "mem_pct": {
+        "mean": 64.1,
+        "p95": 65,
+        "max": 67
+      },
+      "power_mw": {
+        "total": {
+          "mean": 10459.3,
+          "p95": 21009,
+          "max": 39039
+        },
+        "cpu": {
+          "mean": 10404.2,
+          "p95": 20928,
+          "max": 38963
+        },
+        "gpu": {
+          "mean": 48.2,
+          "p95": 79,
+          "max": 129
+        }
+      },
+      "thermal": {
+        "worst_state": "nominal",
+        "above_nominal_ms": 0,
+        "min_cpu_speed_limit_pct": 100,
+        "level_ms": {
+          "nominal": 614575
+        },
+        "level_entries": {
+          "nominal": 1
+        }
+      },
+      "energy_mwh": 1785.955
+    }
+  }
 }

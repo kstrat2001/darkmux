@@ -203,13 +203,16 @@
       "file": "machine-resources.json",
       "http_status": 200,
       "ok": true,
-      "extra": null,
-      "bytes": 1512,
+      "extra": {
+        "reason": "next-parity.spec.ts machine-lens body (gauges/lamps/odometers/battery), refreshed to carry the host-sampler `load` payload, #2826"
+      },
+      "bytes": 4310,
       "sanitized": {
         "identifiers": 0,
         "tickets": 0,
         "shas": 0,
         "ips": 0,
+        "magicdns": 0,
         "prose": 1,
         "paths": 0,
         "uuids": 0,

@@ -127,7 +127,7 @@ function parseArgs(argv) {
 
 /** The mission-graph parity fixture's own two endpoints (#1868 packet 1),
  * used both by a FULL record (below, folded into the named endpoint list)
- * and by `recordGraphOnly()`'s targeted `--only graph` mode. One definition
+ * and by `recordOnly()`'s targeted `--only graph` mode. One definition
  * so the two paths can't drift. */
 function graphFixtureEndpointSpecs() {
   return [
@@ -142,6 +142,21 @@ function graphFixtureEndpointSpecs() {
       urlPath: `/flow-mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}`,
       file: "flow-mission-sanity.json",
       extra: { reason: "next-parity-graph.spec.ts events panel backfill (recorded by the now-retired mission-graph-goldens.spec.ts, #1868 packet 1)", mission_id: GRAPH_FIXTURE_MISSION_ID },
+    },
+  ];
+}
+
+/** The machine-lens parity fixture's own endpoint (#2826): `machine-resources.json`
+ * predated the host-sampler `load` payload (battery/CPU/GPU/memory readings), so a
+ * widened machine-lens golden had nothing real to assert against. Same one-definition
+ * discipline as `graphFixtureEndpointSpecs()` above, used by `--only machine`. */
+function machineFixtureEndpointSpecs() {
+  return [
+    {
+      name: "machine-resources",
+      urlPath: "/machine/resources",
+      file: "machine-resources.json",
+      extra: { reason: "next-parity.spec.ts machine-lens body (gauges/lamps/odometers/battery), refreshed to carry the host-sampler `load` payload, #2826" },
     },
   ];
 }
@@ -209,25 +224,25 @@ async function recordEndpoint(entry, targetDir, spec) {
 }
 
 /**
- * `--only graph` (#1868 packet 1): records ONLY `graphFixtureEndpointSpecs()`
- * and writes them into the EXISTING `corpus/` in place. No whole-directory
- * swap (there is nothing to swap: 21 other fixtures are untouched), and
- * `meta.json`'s `recorded_at_ms`/`recorded_at_iso`/`daemon_health`/
+ * `--only <mode>` (#1868 packet 1, generalized #2826): records ONLY the
+ * named mode's endpoint specs and writes them into the EXISTING `corpus/`
+ * in place. No whole-directory swap (every OTHER fixture is untouched),
+ * and `meta.json`'s `recorded_at_ms`/`recorded_at_iso`/`daemon_health`/
  * `captured_date`/`captured_prev_date`/`freeze_offset_ms`/`frozen_clock_ms`
- * are NEVER rewritten by this mode; only the two targeted entries in
+ * are NEVER rewritten by this mode; only the targeted entries in
  * `meta.endpoints` are added or replaced. Sanitization and the residual
  * tripwire check are exactly as unconditional as the full path (both run
  * through the same `fetchAndSanitize`).
  *
- * All-or-nothing, same invariant as a full record: if either endpoint
- * fails, NOTHING is written (no partial fixture, no partial meta.json
- * update) and the process exits non-zero. Each surviving write is its own
+ * All-or-nothing, same invariant as a full record: if any endpoint fails,
+ * NOTHING is written (no partial fixture, no partial meta.json update) and
+ * the process exits non-zero. Each surviving write is its own
  * temp-file-then-rename (same filesystem, so the rename is atomic), so a
- * crash between the two files' writes still leaves each individual file
- * either fully old or fully new, never truncated.
+ * crash mid-write still leaves each individual file either fully old or
+ * fully new, never truncated.
  */
-async function recordGraphOnly() {
-  console.log(`Recording GRAPH-ONLY fixtures (--only graph) from ${DAEMON_URL} ...`);
+async function recordOnly(mode, specs) {
+  console.log(`Recording ${mode.toUpperCase()}-ONLY fixtures (--only ${mode}) from ${DAEMON_URL} ...`);
   const health = await fetchJson("/health");
   if (!health.ok) {
     console.error(`Daemon unreachable at ${DAEMON_URL} (health check: HTTP ${health.status}). Aborting, refusing to fabricate fixtures.`);
@@ -235,7 +250,7 @@ async function recordGraphOnly() {
   }
   if (!existsSync(CORPUS_DIR) || !existsSync(META_JSON)) {
     console.error(
-      `No existing corpus/meta.json found at ${CORPUS_DIR}. --only graph updates an EXISTING corpus in place; ` +
+      `No existing corpus/meta.json found at ${CORPUS_DIR}. --only ${mode} updates an EXISTING corpus in place; ` +
         `it does not create one from scratch. Run a full \`bun run record\` first (and then deliberately ` +
         `rebaseline the next-parity goldens, per README.md), or restore the committed corpus/.`
     );
@@ -243,7 +258,7 @@ async function recordGraphOnly() {
   }
 
   const results = [];
-  for (const spec of graphFixtureEndpointSpecs()) {
+  for (const spec of specs) {
     results.push(await fetchAndSanitize(spec));
   }
 
@@ -256,7 +271,7 @@ async function recordGraphOnly() {
 
   // Per-file atomic write: temp file, then rename over the final path (same
   // filesystem, so the rename is atomic); no whole-directory swap needed
-  // since only these two files are in scope.
+  // since only these files are in scope.
   for (const { rec, text } of results) {
     const finalPath = `${CORPUS_DIR}/${rec.file}`;
     const tmpPath = `${finalPath}.tmp-${process.pid}`;
@@ -285,17 +300,21 @@ async function recordGraphOnly() {
   renameSync(metaTmpPath, META_JSON);
 
   console.log("");
-  console.log(`Recorded ${results.length}/${results.length} graph endpoint(s) in place; every other corpus/ fixture and meta.json field is unchanged.`);
+  console.log(`Recorded ${results.length}/${results.length} ${mode} endpoint(s) in place; every other corpus/ fixture and meta.json field is unchanged.`);
 }
 
 async function main() {
   const { only } = parseArgs(process.argv.slice(2));
   if (only === "graph") {
-    await recordGraphOnly();
+    await recordOnly("graph", graphFixtureEndpointSpecs());
+    return;
+  }
+  if (only === "machine") {
+    await recordOnly("machine", machineFixtureEndpointSpecs());
     return;
   }
   if (only) {
-    console.error(`Unknown --only mode "${only}" (recognized: "graph"). Aborting.`);
+    console.error(`Unknown --only mode "${only}" (recognized: "graph", "machine"). Aborting.`);
     process.exit(1);
   }
 

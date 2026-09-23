@@ -180,13 +180,15 @@ function readGolden(label) {
  * reported` duplicated the page-level not-local placeholder. What survives
  * is one neutral `utility` badge on the residency row that renders anyway.
  *
- * What survives THIS byte comparison, narrower still than the prior cut:
- * ONLY the stage's header line (`.machine-lens__hdr` — "fleet › machine ·
- * <label> — <spec>") — see `goldenMachineHdrText`/`machineHdrText` below.
- * That line is real chrome untouched by any of it (it renders before
- * `.machine-lens__health` and always has), so it stays a meaningful
- * byte-exact tie. If it starts failing, that IS real coverage: the page
- * header broke, not a rubber stamp.
+ * What survived THIS byte comparison, narrower still than the prior cut, was
+ * for a time ONLY the stage's header line (`.machine-lens__hdr` — "fleet ›
+ * machine · <label> — <spec>") — that line is real chrome untouched by any
+ * of it (it renders before `.machine-lens__health` and always has), so it
+ * stayed a meaningful byte-exact tie, but everything below it went
+ * unasserted. #2826 (see `goldenMachineStageText`/`machineStageText` below)
+ * RE-WIDENED the comparison back to the full stage, against a fresh capture
+ * of the current body rather than the old frozen shape — the header line is
+ * still the first line of that comparison, so it stays covered the same way.
  *
  * **Where the coverage lives now**, since a byte-diff can no longer be it:
  * `memoryLedgerLines.test.ts`'s `utilityModelId` describe block (the id
@@ -244,28 +246,51 @@ function normalizeMachineCrumb(chromeText: string): string {
   return chromeText.slice(0, contentStart) + "(empty)\n" + chromeText.slice(metaIdx);
 }
 
-/** The golden's own stage text, sliced down to JUST the header line — the
- * one region of the OLD golden that still corresponds to something real in
- * the new markup (see this section's own doc for the full history of what
- * else used to be covered here and why each piece was retired). */
-function goldenMachineHdrText(goldenText: string): string {
+/**
+ * (#2826 — RE-WIDENED, not narrowed a fifth time) Every prior narrowing
+ * documented above (this section's own doc, up through "**Narrowed a THIRD
+ * time**") was a response to the port's rendering genuinely diverging from
+ * `goldens/machine.txt`'s frozen LEGACY shape — a real redesign, each time.
+ * The narrowing left only the stage's header line under byte comparison
+ * (`goldenMachineHdrText`/`machineHdrText`, the functions this replaces),
+ * with the doc's own words: "everything below it ... was deliberately
+ * redesigned" — true, but it meant the BODY had no regression gate at all
+ * (#2826's finding).
+ *
+ * This does not resurrect byte-for-byte comparison against the OLD frozen
+ * shape (that would just reintroduce the four-narrowings problem in
+ * reverse). Instead, `goldens/machine.txt` / `goldens/machine-deeplink.txt`
+ * had their `=== stage ===` section REPLACED with a fresh capture of the
+ * CURRENT port's real rendering (`tests/parity/corpus/machine-resources.json`
+ * refreshed from a live daemon via `bun run record.mjs --only machine`,
+ * #2826 — the corpus previously had no `load` key at all, so the gauges'
+ * CPU/GPU/MEM/thermal/power body this golden now covers could not have been
+ * driven even if asserted). The `=== topbar ===`/`=== crumb ===`/
+ * `=== meta ===`/`=== logscope ===` sections above `=== stage ===` are
+ * UNTOUCHED — still the frozen legacy chrome, still compared via
+ * `machineChromePrefixOf` exactly as before.
+ *
+ * Two things the body-body capture surfaced that are NOT covered by this
+ * golden today, recorded here rather than silently: (1) `load.battery_health`
+ * and `load.now.battery` (charge/on-AC/health/condition) are present in the
+ * corpus but rendered NOWHERE in the current machine lens or anywhere else
+ * in `ui/src` (verified: zero matches for "battery" in non-test source) —
+ * so this golden cannot gate battery regressions until that UI work lands;
+ * (2) the `RUNS ON <MACHINE>` list this golden's legacy chrome-adjacent
+ * region used to carry is gone by design (#1809, see the doc above), so it
+ * has no counterpart in the new stage capture either — the current
+ * `runs on <machine> →` link IS captured, at the tail of the stage.
+ */
+function goldenMachineStageText(goldenText: string): string {
   const stageMarker = "=== stage ===\n";
   const stageIdx = goldenText.indexOf(stageMarker);
-  if (stageIdx === -1) throw new Error(`goldenMachineHdrText: no "${stageMarker.trim()}" marker found`);
-  const stage = goldenText.slice(stageIdx + stageMarker.length);
-  // Just the header — "machine total" (Stage 2/3's ledger) and
-  // "darkmux/utility" (the utility-block redesign) both begin retired
-  // portions now.
-  const lines = stage.split("\n").slice(0, 1);
-  return normalize(lines.join("\n"));
+  if (stageIdx === -1) throw new Error(`goldenMachineStageText: no "${stageMarker.trim()}" marker found`);
+  return normalize(goldenText.slice(stageIdx + stageMarker.length));
 }
 
-async function machineHdrText(page): Promise<string> {
-  const got: string = await page.evaluate(() => {
-    const el = document.querySelector(".machine-lens__hdr") as HTMLElement | null;
-    return el ? el.innerText : "";
-  });
-  return normalize(got);
+async function machineStageText(page): Promise<string> {
+  const got = await regionText(page, "stage");
+  return normalize(got || "(empty)");
 }
 
 // NOTE: deliberately NOT `test.describe.configure({ mode: "serial" })` (QA
@@ -299,10 +324,12 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
 
   // (#1809, then narrowed further by #1806 Stage 2/3, then narrowed a THIRD
   // time by the utility-block redesign + its reorder follow-up, then a
-  // FOURTH time — operator finding, phone screenshot — for `#crumb` itself.
-  // See this file's own `machineChromePrefixOf`/`normalizeMachineCrumb`/
-  // `goldenMachineHdrText` doc for exactly which regions no longer
-  // correspond and why each is a deliberate divergence, not a regression.
+  // FOURTH time — operator finding, phone screenshot — for `#crumb` itself,
+  // then RE-WIDENED (#2826) to cover the full stage body again, against a
+  // fresh capture rather than the old frozen shape. See this file's own
+  // `machineChromePrefixOf`/`normalizeMachineCrumb`/`goldenMachineStageText`
+  // doc for exactly which regions no longer correspond and why each is a
+  // deliberate divergence, not a regression.
   const got = await extractLensText(page);
   const golden = readGolden("machine");
   // Prove `#crumb` is genuinely empty on THIS side before normalizing it
@@ -315,11 +342,11 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
   expect(machineChromePrefixOf(got), "topbar/meta/logscope must still match byte-for-byte; crumb is normalized, see normalizeMachineCrumb's doc").toBe(
     machineChromePrefixOf(golden),
   );
-  const gotHdr = await machineHdrText(page);
+  const gotStage = await machineStageText(page);
   expect(
-    gotHdr,
-    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block, which is now deleted outright) was deliberately redesigned, see this file's own doc for the replacement coverage",
-  ).toBe(goldenMachineHdrText(golden));
+    gotStage,
+    "the machine lens BODY (gauges, residency rows, live load/thermal/power) must match byte-for-byte — see goldenMachineStageText's doc for the #2826 re-widening and its known gaps",
+  ).toBe(goldenMachineStageText(golden));
 });
 
 test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", async ({ page }) => {
@@ -339,8 +366,8 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
 
   // (#1809, then narrowed further by #1806 Stage 2/3, then narrowed a THIRD
   // time by the utility-block redesign + its reorder follow-up, then a
-  // FOURTH time for `#crumb` itself) — same split as the click-navigation
-  // test above.
+  // FOURTH time for `#crumb` itself, then RE-WIDENED #2826) — same split as
+  // the click-navigation test above.
   const got = await extractLensText(page);
   const golden = readGolden("machine-deeplink");
   expect(await regionText(page, "crumb"), "#crumb must not render at all on the machine lens (operator finding)").toBe(
@@ -349,11 +376,11 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
   expect(machineChromePrefixOf(got), "topbar/meta/logscope must still match byte-for-byte; crumb is normalized, see normalizeMachineCrumb's doc").toBe(
     machineChromePrefixOf(golden),
   );
-  const gotHdr = await machineHdrText(page);
+  const gotStage = await machineStageText(page);
   expect(
-    gotHdr,
-    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block, which is now deleted outright) was deliberately redesigned, see this file's own doc for the replacement coverage",
-  ).toBe(goldenMachineHdrText(golden));
+    gotStage,
+    "the machine lens BODY (gauges, residency rows, live load/thermal/power) must match byte-for-byte — see goldenMachineStageText's doc for the #2826 re-widening and its known gaps",
+  ).toBe(goldenMachineStageText(golden));
 });
 
 // Red-prove — the SAME self-test discipline the legacy harness's

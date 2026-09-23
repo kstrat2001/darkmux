@@ -285,21 +285,32 @@ const UUID_FIELDS = new Set(["machine_uid"]);
 const SAFE_FIELDS = new Set([
   "_type", "action", "ansi_text", "args", "argv", "attribution", "build",
   "captured_date", "captured_prev_date", "case_ids", "category", "command",
-  "config_id", "cpu_brand", "crew", "daemon_url", "darkmux_version", "date",
-  "decision", "dir", "display_name", "endpoint", "event", "exec_mode",
-  "extra", "file", "finish_reason", "first_date", "first_ts",
-  "flow_schema_version", "handle", "http_status", "id", "identifier",
-  "image", "inputs_fingerprint", "kind", "label", "last_date", "last_ts",
-  "level", "limit_source", "machine", "machine_id", "machines",
+  "condition", "config_id", "cpu_brand", "crew", "daemon_url",
+  "darkmux_version", "date", "decision", "dir", "display_name", "endpoint",
+  "event", "exec_mode", "extra", "file", "finish_reason", "first_date",
+  "first_ts", "flow_schema_version", "handle", "http_status", "id",
+  "identifier", "image", "inputs_fingerprint", "kind", "label", "last_date",
+  "last_ts", "level", "limit_source", "machine", "machine_id", "machines",
   "mission_id", "mission_status", "missions", "model", "model_key", "name",
   "orchestrator", "origin", "os", "owner", "panel", "parentId", "path",
-  "phase_id", "phase_ids", "profile", "recorded_at_iso",
-  "redis_url_redacted", "reasoning_format", "result_class", "role",
-  "role_id", "route", "ruling", "runtime", "schema_version", "served_model",
-  "session_id", "size", "source", "stage", "state", "status", "step_id",
-  "surface", "target", "task_ids", "tier", "ts", "url", "version",
-  "workspace",
+  "phase_id", "phase_ids", "potential_source", "profile",
+  "recorded_at_iso", "redis_url_redacted", "reasoning_format",
+  "result_class", "role", "role_id", "route", "ruling", "runtime",
+  "schema_version", "served_model", "session_id", "size", "source",
+  "stage", "state", "status", "step_id", "surface", "target", "task_ids",
+  "tier", "ts", "url", "version", "workspace", "worst_state",
 ]);
+// (#2826) `condition` (battery_health's IOKit-reported condition string,
+// e.g. "Normal"/"Check Battery"), `potential_source` (the residency
+// estimator's provenance enum, e.g. "arch"/"estimated" — `machineGauge.ts`'s
+// `isEstimatedRow` branches on it), and `worst_state` (the load window's
+// thermal-ladder enum, rendered by `machineStatsContent.tsx`'s peak-thermal
+// row) added for `/machine/resources`'s host-sampler `load` payload. All
+// three are small, fixed enums off Apple's own IOKit/powermetrics
+// vocabulary, not client- or operator-identifying — the same character as
+// `state`/`limit_source` already on this list. Scrambling them (the
+// UNKNOWN-FIELDS default) would have broken the exact conditional renders
+// this corpus refresh exists to make drivable.
 // (#1868 packet 1) `label`, `mission_status`, `parentId`, `target` added for
 // /mission/:id/graph.json, the mission-graph parity fixture's node/edge
 // shape (crates/darkmux-serve/src/mission_graph.rs). Short structural
