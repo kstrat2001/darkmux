@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { RecordView } from "./RecordView";
 
@@ -131,5 +131,109 @@ describe("RecordView", () => {
     fireEvent.click(screen.getByText(/\+1 more line/));
     const val = screen.getByText(/rm -rf \/workspace/);
     expect(val.style.whiteSpace).toBe("pre-wrap");
+  });
+});
+
+// (operator, 2026-09-23) `sampled_at_ms 1790174634.5s` — the duration
+// formula (`value/1000` toFixed "s") run on an epoch millisecond value.
+// Below EPOCH_MS_THRESHOLD a `_ms` number is still a duration; at or above
+// it, it's a timestamp and renders in the pane's own clock format.
+describe("_ms fields: epoch timestamps vs durations", () => {
+  const FROZEN_NOW = new Date("2026-09-23T10:00:00Z").getTime();
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(FROZEN_NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a small _ms value still renders as a millisecond duration", () => {
+    render(<RecordView record={{ ...REC, payload: { sampler_cost_ms: 10 } }} />);
+    expect(screen.getByText("10ms")).toBeInTheDocument();
+  });
+
+  it("a multi-second _ms duration still renders in seconds", () => {
+    render(<RecordView record={{ ...REC, payload: { wall_ms: 1500 } }} />);
+    expect(screen.getByText("1.5s")).toBeInTheDocument();
+  });
+
+  it("an epoch-ms value on the SAME day renders as a clock time, not '<n>.<n>s'", () => {
+    const sameDayMs = FROZEN_NOW - 60_000;
+    render(<RecordView record={{ ...REC, payload: { sampled_at_ms: sameDayMs } }} />);
+    const expected = new Date(sameDayMs).toLocaleTimeString([], { hour12: false });
+    expect(screen.getByText(expected)).toBeInTheDocument();
+    // The bug this replaces: a 9+ digit decimal-seconds string.
+    expect(screen.queryByText(/^\d{9,}\.\d+s$/)).toBeNull();
+  });
+
+  it("an epoch-ms value on a DIFFERENT day is prefixed with the short date", () => {
+    const twoDaysAgoMs = FROZEN_NOW - 2 * 24 * 3600_000;
+    render(<RecordView record={{ ...REC, payload: { sampled_at_ms: twoDaysAgoMs } }} />);
+    const d = new Date(twoDaysAgoMs);
+    const expected = `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${d.toLocaleTimeString([], { hour12: false })}`;
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+});
+
+// (operator, 2026-09-23) `cpu_clusters [object Object],[object Object]` —
+// an array of objects fell through to the generic string branch, and
+// `String()` on an array of objects joins each element's own useless
+// `[object Object]`. Fixture trimmed from a real `machine.telemetry`
+// record fetched off the live daemon (`GET /flow/2026-09-23`), scrubbed to
+// the repo's synthetic machine_uid.
+const TELEMETRY_REC = {
+  ts: "2026-09-23T00:00:27Z",
+  level: "info",
+  category: "machinery",
+  tier: "local",
+  stage: "dispatch",
+  action: "machine.telemetry",
+  handle: "MacBook-Pro",
+  source: "host",
+  machine_id: "MacBook-Pro",
+  machine_uid: "ABFCA777-9F06-A6BF-52CB-589A5D164929",
+  payload: {
+    sampled_at_ms: 1790121627281,
+    sampler_cost_ms: 11,
+    cpu_pct: 40,
+    cpu_clusters: [
+      { name: "Super", cores: 6, pct: 72, mhz: 4601 },
+      { name: "Performance", cores: 12, pct: 24, mhz: 3720 },
+    ],
+    mem_pct: 67,
+  },
+};
+
+describe("arrays of objects render as nested groups, not '[object Object]'", () => {
+  it("cpu_clusters becomes one sub-group per element, labeled by its own 'name'", () => {
+    render(<RecordView record={TELEMETRY_REC} />);
+    expect(screen.queryByText(/\[object Object\]/)).toBeNull();
+    // Header text, not just present anywhere — each element's own `name`
+    // field ALSO renders as an ordinary row inside its group, so "Super"
+    // legitimately appears twice; the group headers are what this asserts.
+    const headers = [...document.querySelectorAll(".rv__grouphd")].map((el) => el.textContent);
+    expect(headers).toContain("Super");
+    expect(headers).toContain("Performance");
+    // A field inside one element, grouped like any other number on the panel.
+    expect(screen.getByText("4,601")).toBeInTheDocument();
+  });
+
+  it("arrays of primitives keep their current (comma-joined) rendering", () => {
+    render(<RecordView record={{ ...REC, payload: { tags: ["a", "b", "c"] } }} />);
+    expect(screen.getByText("a,b,c")).toBeInTheDocument();
+  });
+
+  it("a TOP-LEVEL array of primitives no longer vanishes (used to match neither filter)", () => {
+    render(<RecordView record={{ ...REC, tags: ["x", "y"] }} />);
+    expect(screen.getByText("x,y")).toBeInTheDocument();
+  });
+
+  it("a TOP-LEVEL array of objects renders as nested groups too", () => {
+    render(<RecordView record={{ ...REC, findings: [{ name: "f1" }, { name: "f2" }] }} />);
+    const headers = [...document.querySelectorAll(".rv__grouphd")].map((el) => el.textContent);
+    expect(headers).toContain("f1");
+    expect(headers).toContain("f2");
   });
 });
