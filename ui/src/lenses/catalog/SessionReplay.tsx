@@ -428,7 +428,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           {view.metricScope.model.length > 0 && (
             <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
               {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-            <div className="met" key={i} title={m.hintTitle}>
+            <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
               <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
@@ -465,7 +465,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
         <section className="runsec" data-head="system">
           <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
             {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-            <div className="met" key={i} title={m.hintTitle}>
+            <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
               <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}

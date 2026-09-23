@@ -1847,7 +1847,9 @@ body {
 }
 /* The reasoning icon's own color (`.aico.act-reasoning`), so a kind reads
    the same wherever it appears. */
-.eventlog__chip--think {
+/* Two classes: `.eventlog__ractivity`'s own color (later in this file, same
+   specificity) otherwise wins and the text renders --fg. */
+.eventlog__chip.eventlog__chip--think {
   color: var(--info);
   background: color-mix(in srgb, var(--info) 14%, transparent);
 }
@@ -5313,20 +5315,6 @@ body {
   .session-run .metrics {
     grid-template-columns: repeat(2, 1fr);
   }
-  /* (#2863 style pass) WALL CLOCK's `data-hint="model time"` appended
-     " model time" inline after the label, and at 390px inside a ~180px
-     tile that wrapped the LABEL itself onto a second line ("WALL CLOCK
-     model" / "time") — the one tile whose label wasn't one line, misaligning
-     its value against every sibling tile in the row. Same mechanism the
-     mission graph already uses for the same badge on a narrow node
-     (`.missionlens .mnode .steprow .mn-step-meter [data-hint]::after`):
-     suppress the generated hint text at this width rather than let it wrap.
-     The parent `.met`'s own `title={m.hintTitle}` still carries the long
-     form (same "pair it with a `title`" pattern the `.runsec::before`
-     comment above documents), so nothing is lost, just not always visible. */
-  .session-run .ml[data-hint]::after {
-    content: none;
-  }
 }
 /* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
    width, via `order` rather than DOM position. The DOM keeps `.mv` before
@@ -5383,6 +5371,22 @@ body {
    reserve a line via `min-height`; grid row `align-items: stretch` above
    does that job now, so an empty `.msub` would just be dead markup). */
 .session-run .msub {
+  order: 3;
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  margin-top: 3px;
+}
+/* (#2863) A tile's short hint ("model time") sits in the sub slot, under the
+   value, at every width. Appended to the label it wrapped WALL CLOCK onto two
+   lines in a ~150px tile, desktop included. The attribute stays on `.ml` (the
+   mission graph shares the mechanism); the tile mirrors it as `data-subhint`
+   and draws it here, CSS-generated so it never enters the goldens. A tile
+   with a real `.msub` does not carry the mirror (see SessionReplay). */
+.session-run .ml[data-hint]::after {
+  content: none;
+}
+.session-run .met[data-subhint]::after {
+  content: attr(data-subhint);
   order: 3;
   font-size: calc(10px * var(--fs-scale));
   color: var(--dim);

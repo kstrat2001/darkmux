@@ -207,6 +207,9 @@ describe("SessionReplay", () => {
     const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "WALL CLOCK");
     expect(wall, "the WALL CLOCK tile").toBeTruthy();
     expect(wall?.querySelector(".ml")?.getAttribute("data-hint")).toBe("model time");
+    // (#2863) Drawn under the value, not appended to the label, so the label
+    // stays one line in a narrow tile.
+    expect(wall?.getAttribute("data-subhint")).toBe("model time");
     const title = wall?.getAttribute("title") ?? "";
     expect(title).toContain("model time");
     // It has to name what it EXCLUDES, or the label is just another word.
