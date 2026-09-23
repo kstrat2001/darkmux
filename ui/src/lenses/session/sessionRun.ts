@@ -170,6 +170,10 @@ export interface SessionRunView {
    * `model (lms)` mean, and are these numbers about the model or about
    * darkmux?" */
   metricScope: { model: number[]; system: number[] };
+  /** (#2863) Whether the MODEL section shows its model card. False for an
+   * endpoint-served run: the card could only repeat the model name the
+   * brief's `model` row already shows. */
+  showModelCard: boolean;
   modelTrackLabel: string;
   modelTrackLines: string[];
   /** (#2863) The same loaded models as structure, for the card: the model
@@ -933,6 +937,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // (#2834) "endpoint model", not "remote model": the record says a model
   // was reached over HTTP, which is true of a server on this machine too.
   const modelTrackLabel = ep ? "endpoint model" : "loaded models";
+  const showModelCard = hasModelWork && !ep;
   // (#2759) When THIS session loaded nothing itself, fall back to whatever
   // the mission-wide rollup found on its inner executions — the same data
   // that just turned TURNS/TOKENS/CONTEXT on above. Unlabeled (no primary/
@@ -1213,6 +1218,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     disclosures,
     metrics,
     metricScope,
+    showModelCard,
     modelTrackLabel,
     modelTrackLines,
     modelEntries,

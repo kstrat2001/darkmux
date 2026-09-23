@@ -436,7 +436,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
               ))}
             </div>
           )}
-          {view.hasModelWork && (
+          {view.showModelCard && (
             <div className="track">
               <div className="lbl">{view.modelTrackLabel}</div>
               {/* (#2863) One row per model, the one that ran first and marked:
