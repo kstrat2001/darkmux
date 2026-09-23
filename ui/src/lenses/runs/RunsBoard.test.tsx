@@ -471,6 +471,51 @@ describe("RunsBoard", () => {
     expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
   });
 
+  // (#2860 review F2) The series view and a `run=<dir>` deep link used to
+  // open `LabRunDetail` directly, skipping the rule list rows follow. A lab
+  // run with a representative session opens the shared session view from
+  // EVERY entry point; only a run without one (a bench run) keeps its own
+  // record page.
+  const CODING_RUN = { id: "coding-1", kind: "lab", status: "complete", tracked: true, session_id: "sess-c1", updated_ts: 50 };
+  const CODING_LAB_RUN = {
+    dir: "coding-1", mtime_ms: 50, case_ids: [], bundles: 0, raw_flags: 0, deduped_flags: 0,
+    confirmed: 0, needs_check: 0, archived: 0, degenerate: false, finished: false,
+  };
+  function mockLabBoard() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: [CODING_RUN], generated_at_ms: 1 }), { status: 200 }));
+        if (url === "/lab/runs")
+          return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [CODING_LAB_RUN] }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("(#2860) a series row for a run with a session opens the shared session view, not the funnel page", async () => {
+    mockLabBoard();
+    renderBoard("lab");
+    await waitFor(() => expect(screen.getByText("◧ series")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("◧ series"));
+    await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
+    const before = history.length;
+    fireEvent.click(screen.getByText("coding-1").closest(".labrunrow")!);
+    expect(window.location.hash).toBe("#dispatch=sess-c1");
+    // A real navigation, not a replace: Back returns to the series list.
+    // Opening the record page and redirecting from there also lands on the
+    // session view, but REPLACES the list's history entry on the way.
+    expect(history.length).toBe(before + 1);
+    expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
+  });
+
+  it("(#2860) a run= deep link to a run with a session redirects to the shared session view", async () => {
+    mockLabBoard();
+    renderBoard("lab", "coding-1");
+    await waitFor(() => expect(window.location.hash).toBe("#dispatch=sess-c1"));
+    expect(screen.queryByText("‹ runs")).not.toBeInTheDocument();
+  });
+
   it("a deep-link into kind=lab with a run= param opens the lab-run detail pane directly, on first render", async () => {
     vi.stubGlobal(
       "fetch",
@@ -482,9 +527,9 @@ describe("RunsBoard", () => {
     );
     renderBoard("lab", "live/gate-1");
     await waitFor(() => expect(screen.getByText(/· live\/gate-1/)).toBeInTheDocument());
-    // Never fetched /runs or /lab/runs's list-only data path before landing
-    // here — the detail pane doesn't wait on it (matches legacy: drillLabRun
-    // never blocks on loadRuns()/loadLabRuns()).
+    // (#2860) The deep link now waits for `/runs` to apply the same routing
+    // rule as a list row. `/runs` 404s here, so there is no row to route by
+    // and the link falls back to the run's own record page, as before.
     expect(screen.getByText("‹ runs")).toBeInTheDocument();
   });
 
