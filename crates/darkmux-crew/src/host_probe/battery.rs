@@ -162,11 +162,31 @@ pub struct BatteryHealth {
     /// The OS's own reported condition word, verbatim from
     /// `IOPSCopyPowerSourcesInfo`'s `BatteryHealth` key (`"Good"`,
     /// `"Fair"`, `"Poor"`, `"Check Battery"` — whatever this macOS
-    /// publishes). Recorded as read; darkmux does not map it to a verdict
-    /// of its own, and an unrecognized future word is passed through rather
-    /// than clamped into a known one, the same posture
+    /// publishes).
+    ///
+    /// **This key is demonstrably unreliable on Apple Silicon and must
+    /// never be presented as THE condition.** Measured on the reference
+    /// machine (2026-09-23): this key reads `"Check Battery"` while both
+    /// `system_profiler SPPowerDataType` (`Condition: Normal`) and `pmset
+    /// -g rawbatt` agree the battery is healthy, and `PermanentFailureStatus`
+    /// — the field a genuine permanent-failure/service condition sets — is
+    /// `0`. The legacy IOKit enum is widely reported (other battery-health
+    /// tools work around it the same way) to lag/misreport on Apple Silicon
+    /// packs; System Settings does not appear to derive its displayed
+    /// condition from it. Recorded here as read, for completeness and
+    /// debugging, but [`Self::condition_word`] — derived from
+    /// `permanent_failure_status`, the signal `pmset`/`system_profiler`
+    /// agree with — is the field a UI should show as "condition". darkmux
+    /// does not map this raw word to a verdict of its own, and an
+    /// unrecognized future value is passed through rather than clamped into
+    /// a known one, the same posture
     /// [`super::thermal::thermal_state_name`] takes.
     pub condition: Option<String>,
+    /// `PermanentFailureStatus`, verbatim (`0` = no permanent failure
+    /// detected). This is the signal `pmset -g batt`/`system_profiler`'s
+    /// "Condition: Normal" agrees with on the reference machine, unlike
+    /// `condition` above. See [`Self::condition_word`].
+    pub permanent_failure_status: Option<i64>,
     /// `Temperature`, converted from the node's hundredths-of-a-degree
     /// units to degrees Celsius (`3094` -> `30.94`).
     pub temperature_c: Option<f64>,
@@ -213,6 +233,21 @@ impl BatteryHealth {
     /// one decimal. Labeled NOMINAL for the same reason.
     pub fn nominal_capacity_pct(&self) -> Option<f64> {
         capacity_pct(self.nominal_charge_capacity_mah, self.design_capacity_mah)
+    }
+
+    /// The condition word a UI should show as THE condition — `"Normal"` /
+    /// `"Service Battery"`, derived from `permanent_failure_status` rather
+    /// than the unreliable raw `condition` string (see that field's own
+    /// doc for the measurement backing this). `None` when
+    /// `permanent_failure_status` itself was not read (an older macOS
+    /// node, or the key genuinely absent) — a caller with no computed word
+    /// falls back to showing `condition` labeled precisely as the power
+    /// source's own report, never silently as "Normal".
+    pub fn condition_word(&self) -> Option<&'static str> {
+        match self.permanent_failure_status? {
+            0 => Some("Normal"),
+            _ => Some("Service Battery"),
+        }
     }
 }
 
@@ -433,6 +468,11 @@ mod imp {
                         .filter(|n| *n > 0)
                         .map(|n| n as u64),
                     condition: None,
+                    // #2821: the genuine health-verdict signal, read
+                    // straight (no `>= 0` filter — a negative value here
+                    // would itself be a fact worth keeping, not noise to
+                    // discard the way a negative cycle count would be).
+                    permanent_failure_status: iokit::dict_i64(props, "PermanentFailureStatus"),
                     temperature_c: iokit::dict_i64(props, "Temperature").map(|n| n as f64 / 100.0),
                     time_at_soc_hours: lifetime
                         .and_then(|ld| iokit::dict_bytes(ld, "TimeAtHighSoc"))
@@ -495,6 +535,34 @@ mod tests {
         // A pack can briefly read slightly over max right after a full
         // charge; 103% would be a worse answer than 100 for #2706's floor.
         assert_eq!(charge_pct_from(Some(103), Some(100)), Some(100));
+    }
+
+    // #2821: `condition_word` must agree with `pmset`/`system_profiler`
+    // rather than the unreliable raw `condition` string — this is the
+    // regression test for the Step-0 finding (reference machine,
+    // 2026-09-23): darkmux's own IOKit `condition` read "Check Battery"
+    // while `permanent_failure_status: 0` and `pmset`/`system_profiler`
+    // both agreed "Normal".
+    #[test]
+    fn condition_word_reads_normal_from_permanent_failure_status_even_when_raw_condition_disagrees() {
+        let h = BatteryHealth {
+            permanent_failure_status: Some(0),
+            condition: Some("Check Battery".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(h.condition_word(), Some("Normal"), "must not trust the stale raw condition word");
+    }
+
+    #[test]
+    fn condition_word_flags_service_battery_on_a_real_permanent_failure() {
+        let h = BatteryHealth { permanent_failure_status: Some(3), ..Default::default() };
+        assert_eq!(h.condition_word(), Some("Service Battery"));
+    }
+
+    #[test]
+    fn condition_word_is_absent_without_a_permanent_failure_status_reading() {
+        let h = BatteryHealth { permanent_failure_status: None, condition: Some("Good".to_string()), ..Default::default() };
+        assert_eq!(h.condition_word(), None, "no computed verdict without the signal it is derived from — never silently \"Normal\"");
     }
 
     #[test]

@@ -258,7 +258,17 @@ pub fn battery_health_json(h: &BatteryHealth) -> serde_json::Value {
         "nominal_charge_capacity_mah": h.nominal_charge_capacity_mah,
         "raw_capacity_pct": h.raw_capacity_pct(),
         "nominal_capacity_pct": h.nominal_capacity_pct(),
+        // (#2821) `condition` is the raw, demonstrably-unreliable IOKit
+        // word — kept for completeness/debugging, never the UI's primary.
+        // `condition_word` is the computed Normal/Service Battery verdict
+        // derived from `permanent_failure_status`, which is what agrees
+        // with `pmset`/`system_profiler`; see `BatteryHealth::condition`'s
+        // own doc for the measurement. A viewer shows `condition_word` when
+        // present and falls back to labeling `condition` precisely (never
+        // as "the" condition) only when `condition_word` is null.
         "condition": h.condition,
+        "condition_word": h.condition_word(),
+        "permanent_failure_status": h.permanent_failure_status,
         "temperature_c": h.temperature_c,
         "time_at_soc_hours": h.time_at_soc_hours,
         "total_operating_time_hours": h.total_operating_time_hours,
