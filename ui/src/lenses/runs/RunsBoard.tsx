@@ -1,5 +1,5 @@
 import { WorkStatus } from "../../components/WorkStatus";
-import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -12,7 +12,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { machineNames, nameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
-import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
+import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
@@ -22,22 +22,32 @@ import {
   runsAgo,
   runSubtitle,
   runStatusLabel,
-  groupLabRunsByTask,
-  labKnobSummary,
-  labKnobDiff,
-  labCounts,
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
-  type LabTaskGroup,
 } from "./format";
 
 /**
  * The runs board — `#lens=runs` (kind filter over mission/dispatch/lab,
- * `tracked:false` "untracked" ghost rows, the `◧ series` knob-diff sub-view
- * under kind=lab). Pure port of `renderLabRunsList`/`renderRunsBar`/
- * `renderRunRow`/`renderLabTaskCard` in `viewer.html`'s
- * `── the runs lens ──` section — see `format.ts` for the ported pure
- * functions this component composes.
+ * `tracked:false` "untracked" ghost rows). Pure port of `renderLabRunsList`/
+ * `renderRunsBar`/`renderRunRow` in `viewer.html`'s `── the runs lens ──`
+ * section — see `format.ts` for the ported pure functions this component
+ * composes.
+ *
+ * (#2860 follow-up) The `◧ series` knob-diff sub-view (grouping lab runs by
+ * review case ids and diffing their recorded staffing) was a port of the
+ * retired review-bench funnel view. It read every one of its own fields off
+ * `/lab/runs`'s funnel-era shape (`case_ids`, `finished`, `staffing`,
+ * `bundles`/`flags`/…) — fields a `coding-task`/`prompt` run (what `lab run
+ * <workload>` actually produces today) never populates, so a real coding
+ * run's series row showed "(case pending)" grouping, a permanently RUNNING
+ * badge, and every count at zero, no matter how long ago the run finished.
+ * #2861 fixed the flat LIST's status by reading the shared run-status
+ * derivation; the series view never got that fix and had no path to one
+ * that wasn't itself a from-scratch stats view. Removed rather than
+ * patched: `darkmux lab run stats --baseline` already covers run-over-run
+ * comparison from real counters, and the flat list (with #2861's honest
+ * status) covers browsing. See `format.ts`'s own former `labSeries`
+ * re-exports for what else this removal touched.
  *
  * Data: `GET /runs` (the flat cross-source view-model, every kind) and
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on
@@ -71,8 +81,8 @@ import {
  * Row-click destinations (drill-in packet — both now real, see `RunRow`'s
  * own doc for the split):
  * - (#2860) a `kind==="lab"` row that carries a `session_id` opens the
- *   shared session view, running or finished, from the list, the series
- *   view, or a `run=<dir>` deep link alike (see `runDestination`, `format.ts`).
+ *   shared session view, running or finished, from the list or a `run=<dir>`
+ *   deep link alike (see `runDestination`, `format.ts`).
  *   A lab row WITHOUT one (a bench run, or a run from before lab rows
  *   carried a session) opens `LabRunDetail`, its own record page: an
  *   in-component state swap (`labRunDir`),
@@ -164,7 +174,6 @@ export function RunsBoard({
   initialMachineUid: string | null;
 }) {
   const [kind, setKind] = useState<RunsKind>(initialKind);
-  const [series, setSeries] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
   const [machineUid, setMachineUid] = useState<string | null>(initialMachineUid);
@@ -262,9 +271,7 @@ export function RunsBoard({
 
   // `ACTIONS.labrun`/`ACTIONS.gomission` (viewer.html:2991, folded per-row
   // in `renderRunRow`'s own `data-act` choice) — the row-click dispatch
-  // every interactive `RunRow` funnels through. `LabRunRow` (the series
-  // view) skips this entirely and calls `openLabRun` directly — every row
-  // there is unconditionally a lab row, so there's no kind to dispatch on.
+  // every interactive `RunRow` funnels through.
   //
   // (#1900) `tracked` used to gate whether a row could be opened at all —
   // "an untracked ghost has nothing to open". That premise was false for a
@@ -329,8 +336,8 @@ export function RunsBoard({
   // `location.href` freshly) recomputes a `Route` whose `runsKind`/`run`
   // now match what the operator already clicked, and without this guard
   // `initialKind`/`initialRun` would look like a FRESH deep-link, silently
-  // resetting `series`/`showAll`/the row-click notice out from under an
-  // operator who touched nothing. The guard is exactly "only a GENUINE
+  // resetting `showAll`/the row-click notice out from under an operator who
+  // touched nothing. The guard is exactly "only a GENUINE
   // change resets" — true both for a real deep-link (arriving on a
   // different `kind=`/`run=`) and for the FIRST render after mount (`kind`/
   // `labRunDir` seeded from the initial props, so they're already equal
@@ -347,8 +354,8 @@ export function RunsBoard({
   // genuine deep-link onto a DIFFERENT machine pin re-syncs local state;
   // this component's OWN `clearMachinePin`/machine-chip writes echo back
   // through `writeHash` without a `hashchange`, so without the guard they'd
-  // look like a fresh deep-link and reset `series`/`showAll` right after
-  // the operator clicked.
+  // look like a fresh deep-link and reset `showAll` right after the
+  // operator clicked.
   useEffect(() => {
     // (drill-in packet) See `suppressResyncRef`'s own doc above
     // `onLabRunUnresolvable` — this run of the effect IS that call's own
@@ -362,7 +369,6 @@ export function RunsBoard({
     const deepLinkUnchanged = initialKind === kind && initialRun === labRunDir && initialMachineUid === machineUid;
     if (deepLinkUnchanged) return;
     setKind(initialKind);
-    setSeries(false);
     setShowAll(false);
     setRowClickNotice(null);
     setLabRunDir(initialRun);
@@ -405,8 +411,8 @@ export function RunsBoard({
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
 
-  // (#2860) A `run=<dir>` deep link (the series view used to write these,
-  // and bookmarks keep them) follows the SAME rule as a list-row click: a
+  // (#2860) A `run=<dir>` deep link (bookmarks, and the retired series view
+  // used to write these too) follows the SAME rule as a list-row click: a
   // lab run with a representative session opens the shared session view;
   // only a run without one keeps its own record page. `location.replace`,
   // so Back does not land on the redirect and bounce forward again.
@@ -491,43 +497,23 @@ export function RunsBoard({
   }
 
   const runs: Run[] = runsQuery.data.ok ? runsQuery.data.data.runs : [];
-  // (#2860) A series row routes by the same rule as a list row, through the
-  // board's own `Run` for that directory; with no row to route by, it opens
-  // the run's own record page as before.
-  const activateLabDir = (dir: string) => {
-    const row = runs.find((r) => r.kind === "lab" && r.id === dir);
-    if (row) activateRun(row);
-    else openLabRun(dir);
-  };
   const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
   const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
   const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
-  const labRuns: LabRun[] = labRunsQuery.data.ok ? labRunsQuery.data.data.runs : [];
 
   // (#1809) The machine pin, applied ONCE here so every derivation below
-  // (kind counts, the lab-source notice, `showMachine`, the series grouping,
-  // the flat row list) sees the already-scoped set rather than each
-  // re-deriving its own filter — see `format.ts::runsForMachine`'s own doc
-  // for the alias-matching rationale and the "50 missions + 15 dispatches
-  // carry no machine at all" exclusion it names.
+  // (kind counts, the lab-source notice, `showMachine`, the flat row list)
+  // sees the already-scoped set rather than each re-deriving its own filter
+  // — see `format.ts::runsForMachine`'s own doc for the alias-matching
+  // rationale and the "50 missions + 15 dispatches carry no machine at all"
+  // exclusion it names.
   const pinnedMachineName = machineUid != null ? nameOf(pinRecords, liveMachines, machineUid) : null;
   const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(pinRecords, liveMachines, machineUid)) : runs;
-  // `LabRun` (the `/lab/runs` series-view source) carries no machine field
-  // at all (`crates/darkmux-serve/src/lib.rs::LabRunSummary` — verified,
-  // not assumed) — bridged via the ONE field the two sources share: a lab
-  // run's `dir` IS its `Run.id` (`runs.rs::lab_summary_to_run`: `id:
-  // summary.dir.clone()`). So the lab-kind subset of `scopedRuns` (already
-  // machine-filtered) names exactly which dirs belong to the pin.
-  const scopedLabRuns =
-    machineUid != null
-      ? labRuns.filter((r) => scopedRuns.some((run) => run.kind === "lab" && run.id === r.dir))
-      : labRuns;
 
   function selectKind(k: RunsKind) {
     setKind(k);
     setShowAll(false);
     setRowClickNotice(null);
-    if (k !== "lab") setSeries(false);
     writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null, machine: machineUid }));
   }
 
@@ -548,41 +534,11 @@ export function RunsBoard({
     <RunsBar
       counts={countsByKind(scopedRuns)}
       kind={kind}
-      series={series}
       onKind={selectKind}
-      onSeries={() => setSeries((s) => !s)}
       pinnedMachineName={pinnedMachineName}
       onClearMachine={clearMachinePin}
     />
   );
-
-  if (kind === "lab" && series) {
-    const groups = groupLabRunsByTask(scopedLabRuns);
-    return (
-      <div data-state="data">
-        <div className="stagehdr">
-          runs · lab series · {scopedLabRuns.length} run{scopedLabRuns.length === 1 ? "" : "s"} · {groups.length} task
-          {groups.length === 1 ? "" : "s"}
-        </div>
-        {bar}
-        {rowClickNotice && (
-          <div className="labnotice" role="status">
-            {rowClickNotice}
-          </div>
-        )}
-        {notice && <div className="labnotice">{notice}</div>}
-        <div className="lablist">
-          {groups.length ? (
-            groups.map((g) => <LabTaskCard key={g.key} group={g} onRowActivate={activateLabDir} />)
-          ) : (
-            <div className="none">
-              no lab runs with a recorded corpus yet — run <code>darkmux lab eval --funnel …</code> to produce one.
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
 
   const rows = runsFiltered(scopedRuns, kind);
   const shown = showAll ? rows : rows.slice(0, RUNS_CAP);
@@ -639,8 +595,8 @@ function countsByKind(runs: Run[]): Record<string, number> {
 /** viewer.html: `function renderRunsBar()` — PLUS the machine-pin chip
  * (#1809), which has no legacy namesake (the runs lens gained a machine
  * dimension only in this port). Deliberately reuses the `.runchip` idiom
- * the kind/series chips already establish rather than inventing a second
- * visual language for "a filter is active, click to change it" — see
+ * the kind chips already establish rather than inventing a second visual
+ * language for "a filter is active, click to change it" — see
  * `RunsBoard.tsx`'s own module doc / #1809 for why this is the pinned
  * state's ONE required property: visible (the chip names the machine) and
  * clearable (clicking it is `clearMachinePin`, the "back to all machines"
@@ -650,17 +606,13 @@ function countsByKind(runs: Run[]): Record<string, number> {
 function RunsBar({
   counts,
   kind,
-  series,
   onKind,
-  onSeries,
   pinnedMachineName,
   onClearMachine,
 }: {
   counts: Record<string, number>;
   kind: RunsKind;
-  series: boolean;
   onKind: (k: RunsKind) => void;
-  onSeries: () => void;
   /** `null` = no machine pin — the pre-existing "every machine" board. */
   pinnedMachineName: string | null;
   onClearMachine: () => void;
@@ -681,19 +633,6 @@ function RunsBar({
           <span className="runchipn"> {counts[k] ?? 0}</span>
         </span>
       ))}
-      {kind === "lab" && (
-        <span
-          className={`runchip${series ? " on" : ""}`}
-          data-act="runsseries"
-          data-arg="series"
-          role="button"
-          tabIndex={0}
-          onClick={onSeries}
-          onKeyDown={onActivateKeyDown(onSeries)}
-        >
-          ◧ series
-        </span>
-      )}
       {pinnedMachineName != null && (
         <span
           className="runchip on"
@@ -794,60 +733,3 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
   );
 }
 
-/** viewer.html: `function labBadge(run)` — the SEPARATE lab-series badge
- * (finished/live), distinct from `runStatusBadge`'s six-status badge above
- * (#1881 added `unparseable`). */
-function LabBadge({ finished }: { finished: boolean }) {
-  return <WorkStatus status={finished ? "finished" : "live"} label={finished ? "finished" : undefined} className="labbadge" />;
-}
-
-/** viewer.html: `function renderLabRunRow(run)` (the series-view row, reading
- * `LabRun`'s own richer fields — NOT `renderRunRow`/`Run` above). Every
- * series row is interactive in legacy (it always opens the lab-run detail
- * pane) — `onActivate` now really does. */
-function LabRunRow({ run, onActivate }: { run: LabRun; onActivate: () => void }) {
-  return (
-    <div className="labrunrow" role="button" tabIndex={0} onClick={onActivate} onKeyDown={onActivateKeyDown(onActivate)}>
-      <div className="labrunmain">
-        <LabBadge finished={run.finished} />
-        <span className="labruncrew">{run.crew || "(crew unknown)"}</span>
-        <span className="labrundir">{run.dir}</span>
-      </div>
-      <div className="labrunmeta">{labKnobSummary(run)}</div>
-      <div className="labrunmeta dim">
-        {labCounts(run)}
-        {run.degenerate && <span className="labdegenerate"> · ⚠ degenerate</span>}
-      </div>
-    </div>
-  );
-}
-
-/** viewer.html: `function renderLabTaskCard(group)`. `onRowActivate` takes
- * the DIR to open (curried per-row below) — `openLabRun` itself. */
-function LabTaskCard({ group, onRowActivate }: { group: LabTaskGroup; onRowActivate: (dir: string) => void }) {
-  return (
-    <div className="labtaskcard">
-      <div className="labtaskhdr">
-        {group.key} <span className="labtaskcount">{group.runs.length} run{group.runs.length === 1 ? "" : "s"}</span>
-      </div>
-      {group.runs.map((r, i) => {
-        const prev = group.runs[i + 1]; // newest-first; i+1 = next OLDER run
-        const diff = prev ? labKnobDiff(prev, r) : null;
-        return (
-          <Fragment key={r.dir}>
-            <LabRunRow run={r} onActivate={() => onRowActivate(r.dir)} />
-            {prev &&
-              (diff && diff.length ? (
-                <div className={`labdiffline${diff.length > 1 ? " warn" : ""}`}>
-                  {diff.length > 1 ? "⚠ multi-variable change: " : "changed vs previous run: "}
-                  {diff.join(" · ")}
-                </div>
-              ) : (
-                <div className="labdiffline dim">no knob change vs previous run</div>
-              ))}
-          </Fragment>
-        );
-      })}
-    </div>
-  );
-}

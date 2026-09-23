@@ -126,58 +126,17 @@ test('kind chips filter the one list rather than navigating', async ({ page }) =
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('the lab series view stays reachable, under the lab filter only', async ({ page }) => {
-  const pageErrors = [];
-  page.on('pageerror', (e) => pageErrors.push(String(e)));
-
-  await page.goto('/index-lab.html#lens=runs');
-  // The series toggle is lab-specific (it diffs recorded staffing snapshots),
-  // so it does not exist while the list spans kinds.
-  await expect(page.locator('[data-act="runsseries"]')).toHaveCount(0);
-
-  await page.click('.runchip[data-arg="lab"]');
-  await page.click('[data-act="runsseries"]');
-
-  // Two task cards: the fixture's two `demo-case-a` runs group into one
-  // series; the single `demo-case-b` live run is its own card.
-  const cards = page.locator('.labtaskcard');
-  await expect(cards).toHaveCount(2);
-
-  const seriesCard = page.locator('.labtaskcard', { hasText: 'demo-case-a' });
-  await expect(seriesCard.locator('.labrunrow')).toHaveCount(2);
-  // Only the newer run gets a diff line (compared against the older one);
-  // the knob diff between the fixture's two runs (probe k 1→2) renders as a
-  // plain (single-variable) diff line, not the multi-variable warning.
-  await expect(seriesCard.locator('.labdiffline')).toHaveCount(1);
-  await expect(seriesCard.locator('.labdiffline')).toContainText('demo-probe.k 1→2');
-  await expect(seriesCard.locator('.labdiffline.warn')).toHaveCount(0);
-
-  const liveCard = page.locator('.labtaskcard', { hasText: 'demo-case-b' });
-  await expect(liveCard).toContainText('staffing pending');
-
-  expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
-});
-
-// (port note) `labKnobDiff surfaces a judge seat added or removed between
-// runs` — REMOVED, not ported, and this is the finding, same shape as the
-// LAB_FEED_CAP note below.
-//
-// The original drove `page.evaluate(() => labKnobDiff(...))` against a
-// legacy GLOBAL function (viewer.html). The port has no page globals at
-// all — `labKnobDiff` is a module-scoped export
-// (`ui/src/lenses/lab/labSeries.ts`), unreachable from `page.evaluate` by
-// design (React state/logic doesn't leak onto `window`), so this spec
-// cannot work as written against `/next`.
-//
-// Real replacement coverage already exists, and it's a better home for
-// this check than a browser ever was: `labSeries.test.ts`'s own
-// `describe("labKnobDiff")` block, specifically `"reports a judge seat
-// appearing or disappearing"` — asserting the EXACT scenario this e2e test
-// did (`+judge (m)` / `-judge`), plus `"reports NO judge change when
-// neither side has one"`, a case this e2e version never covered. It's a
-// pure function of two plain objects; unit-testing it directly is strictly
-// MORE precise than driving a browser to reach the same call, not a
-// downgrade — see `ui/src/lenses/lab/labSeries.test.ts`.
+// (port note) `the lab series view stays reachable, under the lab filter
+// only` and `labKnobDiff surfaces a judge seat added or removed between
+// runs` — both REMOVED, not ported, same shape as the LAB_FEED_CAP note
+// below. The `◧ series` knob-diff sub-view they exercised (`.labtaskcard`/
+// `.labdiffline`/`[data-act="runsseries"]`) was itself removed from
+// `RunsBoard.tsx` in the #2860 follow-up: it was a port of the retired
+// review-bench funnel view, reading fields off `/lab/runs`'s funnel-era
+// shape that a `coding-task`/`prompt` run (what `lab run <workload>`
+// actually produces) never populates — every real run's series row showed
+// a permanently-pending funnel case no matter how long ago it finished. See
+// `RunsBoard.tsx`'s own module doc for the full reasoning.
 
 test('deep link #lens=runs boots directly into the runs lens', async ({ page }) => {
   const pageErrors = [];

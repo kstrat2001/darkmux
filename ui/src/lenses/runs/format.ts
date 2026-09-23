@@ -12,36 +12,20 @@
  * live in `../../lib/route.ts` already (the scaffold's hash-grammar port);
  * imported from there rather than redeclared.
  *
- * The lab-series six (`shortModel`/`labFieldVal`/`labTaskKey`/
- * `groupLabRunsByTask`/`labKnobSummary`/`labKnobDiff`) used to be
- * hand-duplicated here — this file predates `../lab/labSeries.ts`, the lab
- * lens's own dedicated pure-logic module, extracted+differentially-tested
- * against the legacy viewer later. The two copies had already drifted:
- * this file's `labFieldVal` stringified every non-`darkmux:`-prefixed value
- * (`String(v)`), where legacy (and `labSeries.ts`) pass a number straight
- * through unchanged — invisible in the rendered DOM (template-literal
- * interpolation stringifies either way) but a real behavioral difference a
- * caller comparing the return value directly would see. Re-exported from
- * `labSeries.ts` below instead of maintained twice; only `labCounts` (not
- * one of the "six" — no `labSeries.ts` counterpart) stays defined here.
+ * `shortModel` used to be one of a "lab-series six" hand-duplicated here
+ * before `../lab/labSeries.ts` (the lab lens's own dedicated pure-logic
+ * module) existed; re-exported from there instead of maintained twice. The
+ * other five (`labFieldVal`/`labTaskKey`/`groupLabRunsByTask`/
+ * `labKnobSummary`/`labKnobDiff`) and this file's own `labCounts` backed the
+ * `◧ series` knob-diff sub-view, removed in the #2860 follow-up (see
+ * `RunsBoard.tsx`'s own module doc for why) — `shortModel` survives because
+ * `runSubtitle` below still uses it for every run kind, not just lab.
  */
 
 import type { Run } from "../../types/generated/Run";
-import type { LabRun } from "../../types/handwritten";
-import {
-  shortModel,
-  labFieldVal,
-  labTaskKey,
-  groupLabRunsByTask,
-  labKnobSummary,
-  labKnobDiff,
-} from "../lab/labSeries";
-import type { LabSeries } from "../lab/types";
+import { shortModel } from "../lab/labSeries";
 
-export { shortModel, labFieldVal, labTaskKey, groupLabRunsByTask, labKnobSummary, labKnobDiff };
-/** Same shape as `../lab/labSeries.ts`'s `LabSeries` — kept under this
- * file's pre-existing name so `RunsBoard.tsx`'s import site doesn't churn. */
-export type LabTaskGroup = LabSeries;
+export { shortModel };
 
 export const RUNS_CAP = 25; // viewer.html: `const RUNS_CAP=25`
 
@@ -110,12 +94,6 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
   return rows;
 }
 
-/** viewer.html: `function labCounts(run)` — text only (no HTML), the
- * "degenerate" flag is a boolean the component renders as its own element
- * rather than an inline HTML fragment (see `RunsBoard.tsx`). */
-export function labCounts(run: LabRun): string {
-  return `bundles ${run.bundles} · flags ${run.raw_flags}→${run.deduped_flags} · confirmed ${run.confirmed} · needs_check ${run.needs_check} · archived ${run.archived}`;
-}
 
 /**
  * (#1809, #1508 step 4) Filter a runs list down to ONE pinned machine — the

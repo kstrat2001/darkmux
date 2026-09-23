@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
   shortModel,
-  labFieldVal,
   runActivity,
   runsAgo,
   runSubtitle,
@@ -9,15 +8,9 @@ import {
   runsMultiMachine,
   runsFiltered,
   runsForMachine,
-  labTaskKey,
-  groupLabRunsByTask,
-  labKnobSummary,
-  labKnobDiff,
-  labCounts,
   runDestination,
 } from "./format";
 import type { Run } from "../../types/generated/Run";
-import type { LabRun } from "../../types/handwritten";
 
 function run(over: Partial<Run> & Pick<Run, "id" | "kind" | "status" | "tracked">): Run {
   return over;
@@ -33,28 +26,6 @@ describe("shortModel", () => {
   it("treats null/undefined as empty", () => {
     expect(shortModel(null)).toBe("");
     expect(shortModel(undefined)).toBe("");
-  });
-});
-
-describe("labFieldVal", () => {
-  it("renders an em-dash for null/undefined", () => {
-    expect(labFieldVal(null)).toBe("—");
-    expect(labFieldVal(undefined)).toBe("—");
-  });
-  it("shortens a darkmux-namespaced string value", () => {
-    expect(labFieldVal("darkmux:foo")).toBe("foo");
-  });
-  it("passes a non-string value through unchanged (a number stays a number)", () => {
-    // Pre-reconciliation, this file's OWN `labFieldVal` stringified every
-    // non-`darkmux:` value (`String(v)`) — a real divergence from legacy
-    // (`crates/darkmux-serve/assets/viewer.html`: `... : v`, no `String()`)
-    // that `../lab/labSeries.ts`'s differential-tested port caught (see its
-    // own `labFieldVal` test: "renders zero as zero, NOT as the em dash —
-    // 0 is a real knob value"). Invisible in the rendered DOM either way
-    // (template-literal interpolation stringifies a number regardless), but
-    // a real behavioral difference for any caller reading the return value
-    // directly — fixed here by reconciling onto the canonical function.
-    expect(labFieldVal(4)).toBe(4);
   });
 });
 
@@ -155,92 +126,6 @@ describe("runsFiltered", () => {
   });
   it("filters to one kind", () => {
     expect(runsFiltered(runs, "mission").map((r) => r.id)).toEqual(["a"]);
-  });
-});
-
-function labRun(over: Partial<LabRun> & Pick<LabRun, "dir" | "mtime_ms">): LabRun {
-  return {
-    case_ids: [],
-    bundles: 0,
-    raw_flags: 0,
-    deduped_flags: 0,
-    confirmed: 0,
-    needs_check: 0,
-    archived: 0,
-    degenerate: false,
-    finished: false,
-    ...over,
-  };
-}
-
-describe("labTaskKey / groupLabRunsByTask", () => {
-  it("groups runs with no case_ids into '(case pending)'", () => {
-    expect(labTaskKey(labRun({ dir: "a", mtime_ms: 1 }))).toBe("(case pending)");
-  });
-  it("sorts case_ids before joining, so run order doesn't fragment a series", () => {
-    expect(labTaskKey(labRun({ dir: "a", mtime_ms: 1, case_ids: ["b", "a"] }))).toBe("a, b");
-    expect(labTaskKey(labRun({ dir: "b", mtime_ms: 1, case_ids: ["a", "b"] }))).toBe("a, b");
-  });
-  it("groups by key and orders groups + within-group runs newest-first", () => {
-    const runs = [
-      labRun({ dir: "old-a", mtime_ms: 10, case_ids: ["c1"] }),
-      labRun({ dir: "new-a", mtime_ms: 30, case_ids: ["c1"] }),
-      labRun({ dir: "solo", mtime_ms: 20 }),
-    ];
-    const groups = groupLabRunsByTask(runs);
-    expect(groups.map((g) => g.key)).toEqual(["c1", "(case pending)"]);
-    expect(groups[0].runs.map((r) => r.dir)).toEqual(["new-a", "old-a"]);
-  });
-});
-
-describe("labKnobSummary", () => {
-  it("names why staffing is absent, distinguishing in-flight from an older finished artifact", () => {
-    expect(labKnobSummary(labRun({ dir: "a", mtime_ms: 1, finished: false }))).toMatch(/pending/);
-    expect(labKnobSummary(labRun({ dir: "a", mtime_ms: 1, finished: true }))).toMatch(/older artifact/);
-  });
-  it("summarizes probe count/k and the judge model/k/ctx", () => {
-    const r = labRun({
-      dir: "a",
-      mtime_ms: 1,
-      staffing: {
-        probes: [
-          { name: "p1", model: "m1", k: 3 },
-          { name: "p2", model: "m2", k: 2 },
-        ],
-        judge: { name: "j", model: "darkmux:big-model", k: 2, n_ctx: 68000 },
-      },
-    });
-    expect(labKnobSummary(r)).toBe("2 probes (k=3,2) · judge big-model k=2 · 68K ctx");
-  });
-});
-
-describe("labKnobDiff", () => {
-  it("returns null when either side is missing", () => {
-    // The canonical `labKnobDiff` (`../lab/labSeries.ts`, re-exported below)
-    // types "missing" as `| null`, not `| undefined` — matches `null`.
-    expect(labKnobDiff(null, labRun({ dir: "a", mtime_ms: 1 }))).toBeNull();
-  });
-  it("reports 'no change' as an empty array when nothing differs", () => {
-    const a = labRun({ dir: "a", mtime_ms: 1, crew: "c1" });
-    const b = labRun({ dir: "b", mtime_ms: 2, crew: "c1" });
-    expect(labKnobDiff(a, b)).toEqual([]);
-  });
-  it("names a crew change", () => {
-    const a = labRun({ dir: "a", mtime_ms: 1, crew: "c1" });
-    const b = labRun({ dir: "b", mtime_ms: 2, crew: "c2" });
-    expect(labKnobDiff(a, b)).toEqual(["crew c1→c2"]);
-  });
-  it("names a per-seat staffing field change by seat name", () => {
-    const a = labRun({ dir: "a", mtime_ms: 1, staffing: { probes: [{ name: "p1", model: "m1", k: 2 }] } });
-    const b = labRun({ dir: "b", mtime_ms: 2, staffing: { probes: [{ name: "p1", model: "m1", k: 4 }] } });
-    expect(labKnobDiff(a, b)).toEqual(["p1.k 2→4"]);
-  });
-});
-
-describe("labCounts", () => {
-  it("formats bundle/flag/confirm counts", () => {
-    const r = labRun({ dir: "a", mtime_ms: 1, bundles: 5, raw_flags: 10, deduped_flags: 7, confirmed: 3, needs_check: 2, archived: 1 });
-    expect(labCounts(r)).toBe("bundles 5 · flags 10→7 · confirmed 3 · needs_check 2 · archived 1");
   });
 });
 
