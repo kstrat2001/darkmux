@@ -714,6 +714,27 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ]);
   });
 
+  it("(#2863) the model that ran is found through darkmux's namespace, and listed first", () => {
+    // Since #2240 a local dispatch puts the NAMESPACED identifier on the wire
+    // (`darkmux:<key>`), while LM Studio's load telemetry reports the bare
+    // key. Compared as-is they never matched, so on a real run every model,
+    // including the one that did the work, read "also loaded".
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "darkmux:big-specialist" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "small-utility", gb: 2 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "big-specialist", gb: 18 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.modelTrackLines).toEqual([
+      "big-specialist · 18GB · primary",
+      "small-utility · 2GB · also loaded",
+    ]);
+    expect(view.modelEntries).toEqual([
+      { name: "big-specialist", gb: 18, ran: true },
+      { name: "small-utility", gb: 2, ran: false },
+    ]);
+  });
+
   it("(#1973) marks NOTHING primary when the dispatch record names no model — a guess must not be labelled ground truth", () => {
     // Without `record.model` the only candidate is the FIRST-LOADED model,
     // which is a heuristic. Marking it "primary" would assert something the

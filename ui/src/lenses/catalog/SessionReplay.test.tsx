@@ -829,8 +829,16 @@ describe("SessionReplay", () => {
     expect(screen.queryByText("loaded models")).not.toBeInTheDocument();
     expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();
     expect(screen.getByText("signals")).toBeInTheDocument();
-    expect(screen.getByText("✓ clean")).toBeInTheDocument();
-    expect(screen.getByText(/no behavioral flags/i)).toBeInTheDocument();
+    // (#2863) A clean run: the shared outcome chip labeled "clean", then one
+    // cell per detector that looked and found nothing.
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    expect(screen.getByText("no detector flagged this run")).toBeInTheDocument();
+    expect([...document.querySelectorAll(".sigcheck")].map((e) => e.textContent)).toEqual([
+      "cycle",
+      "tool failure",
+      "reasoning loop",
+      "edit drift",
+    ]);
   });
 
   it("URL-encodes the session id in the fetch path", async () => {

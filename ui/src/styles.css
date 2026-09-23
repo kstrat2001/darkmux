@@ -1943,6 +1943,75 @@ body {
 .eventlog__rec--rest .eventlog__ractivity {
   color: var(--warn);
 }
+/* (#2863) Loaded models, one row each; the model that ran is marked and
+   listed first. */
+.modelrow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 12px;
+  align-items: baseline;
+  padding: 6px 8px;
+  margin-inline: -8px;
+  border-radius: 6px;
+}
+.modelrow--ran {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.modelrow__name {
+  overflow-wrap: anywhere;
+}
+.modelrow--ran .modelrow__name {
+  color: var(--fg);
+  font-weight: 700;
+}
+.modelrow__size {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.modelrow__tag {
+  grid-column: 1 / -1;
+  justify-self: start;
+  font-size: calc(10px * var(--fs-scale));
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--dim);
+  background: var(--panel-4);
+}
+.modelrow__tag--ran {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+/* (#2863) A clean run: the shared outcome chip, then one cell per detector.
+   The check is drawn here so the page's text stays the detectors' names. */
+.sigclean {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.sigclean__note {
+  color: var(--dim);
+}
+.sigchecks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.sigcheck {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.sigcheck::before {
+  content: "✓";
+  color: var(--good);
+  font-weight: 700;
+}
 /* The machine and session every row shares, said once. */
 .eventlog__shared {
   font: calc(10.5px * var(--fs-scale))/1.3 var(--font-mono);

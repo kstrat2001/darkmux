@@ -106,6 +106,10 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   );
 }
 
+/** (#2863) The detectors a clean run passed, in the order the old sentence
+ * named them: `cycle, tool-failure, reasoning-loop, edit-drift`. */
+const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift"] as const;
+
 export function SessionReplay({ sessionId, playhead = null }: { sessionId: string; playhead?: number | null }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
   // its records ONCE, which is the defect a live dogfood run exposed: the
@@ -468,9 +472,23 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       {view.hasModelWork && (
         <div className="track">
           <div className="lbl">{view.modelTrackLabel}</div>
-          {view.modelTrackLines.map((line, i) => (
-            <div key={i}>{line}</div>
-          ))}
+          {/* (#2863) One row per model, the one that ran first and marked:
+              the name, its size, and what it was here for. The text lines
+              remain for the cases with no per-model structure (an endpoint,
+              no telemetry yet). */}
+          {view.modelEntries
+            ? view.modelEntries.map((m, i) => (
+                <div className={`modelrow${m.ran ? " modelrow--ran" : ""}`} key={i}>
+                  <span className="modelrow__name">{m.name}</span>
+                  <span className="modelrow__size">{m.gb != null ? `${m.gb} GB` : "?"}</span>
+                  {m.ran != null && (
+                    <span className={`modelrow__tag${m.ran ? " modelrow__tag--ran" : ""}`}>
+                      {m.ran ? "ran this run" : "also loaded"}
+                    </span>
+                  )}
+                </div>
+              ))
+            : view.modelTrackLines.map((line, i) => <div key={i}>{line}</div>)}
         </div>
       )}
 
@@ -481,9 +499,21 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       <div className="track signals">
         <div className="lbl">{view.signalsLabel}</div>
         {view.signalGroups.length === 0 ? (
+          // (#2863) State as shape: the shared outcome pill, then one cell
+          // per detector that looked and found nothing. The check marks are
+          // CSS, so the text stays the detectors' names.
           <>
-            <div>✓ clean</div>
-            <div>no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</div>
+            <div className="sigclean">
+              <WorkStatus status="complete" label="clean" className="pill" />
+              <span className="sigclean__note">no detector flagged this run</span>
+            </div>
+            <div className="sigchecks">
+              {CLEAN_DETECTORS.map((d) => (
+                <div className="sigcheck" key={d}>
+                  {d}
+                </div>
+              ))}
+            </div>
           </>
         ) : (
           view.signalGroups.map((g) => (

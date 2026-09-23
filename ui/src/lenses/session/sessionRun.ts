@@ -166,6 +166,10 @@ export interface SessionRunView {
   metricScope: { model: number[]; system: number[] };
   modelTrackLabel: string;
   modelTrackLines: string[];
+  /** (#2863) The same loaded models as structure, for the card: the model
+   * that ran first. Present only when this session loaded models itself;
+   * the endpoint and no-telemetry cases have only their `modelTrackLines`. */
+  modelEntries?: Array<{ name: string; gb: number | null; ran: boolean | null }>;
   /** (#1972) Is this run still going? Drives whether the page subscribes to
    *  the shared clock at all — a finished run's elapsed time is a fixed fact,
    *  and re-rendering it once a second is pure waste. */
@@ -925,13 +929,32 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // also-loaded tag): those tags read `d?.model` against `f.model`, both of
   // which are THIS session's own fields and mean nothing for a load that
   // happened on a different session entirely.
+  // (#2863) Compared WITHOUT darkmux's namespace. Since #2240 a local
+  // dispatch names the model `darkmux:<key>` on the wire, while LM Studio's
+  // load telemetry reports the bare key; compared as-is they never matched,
+  // and every model on a real run, including the one that ran, read "also
+  // loaded". The model that ran is listed first.
+  const bare = (m: unknown) => String(m ?? "").replace(/^darkmux:/, "");
+  const isRan = (r: FlowRecord) =>
+    primaryModel != null && bare((r.fields as Record<string, unknown>).model) === bare(primaryModel);
+  const orderedLoads = [...loads].sort((a, b) => Number(isRan(b)) - Number(isRan(a)));
+  const modelEntries =
+    !ep && orderedLoads.length
+      ? orderedLoads.map((r) => {
+          const f = r.fields as Record<string, unknown>;
+          return {
+            name: String(f.model ?? "?"),
+            gb: typeof f.gb === "number" ? f.gb : null,
+            ran: primaryModel == null ? null : isRan(r),
+          };
+        })
+      : undefined;
   const modelTrackLines = ep
     ? [`${model || "unknown"} · served by the endpoint above — no local model loaded`]
-    : loads.length
-      ? loads.map((r) => {
+    : orderedLoads.length
+      ? orderedLoads.map((r) => {
           const f = r.fields as Record<string, unknown>;
-          const isPrimary = primaryModel != null && f.model === primaryModel;
-          const tag = primaryModel == null ? "" : isPrimary ? " · primary" : " · also loaded";
+          const tag = primaryModel == null ? "" : isRan(r) ? " · primary" : " · also loaded";
           return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
         })
       : rollup && rollup.loadLines.length
@@ -1182,6 +1205,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     metricScope,
     modelTrackLabel,
     modelTrackLines,
+    modelEntries,
     // (#2759) Gates the "loaded models" track's own visibility
     // (`SessionReplay.tsx`'s `view.hasModelWork &&` render guard) — a rolled-
     // up mission execution must open that track the same as an own-session
