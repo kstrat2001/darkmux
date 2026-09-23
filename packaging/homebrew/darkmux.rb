@@ -17,29 +17,14 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v3.10.0 — the repeated-output detector gets a policy
-  # (#2846). It had one behavior, detect and act, so there was no way to run
-  # a dispatch with it measuring but not intervening.
-  # `runtime.detection.degeneracy.policy` now takes `enforce` (act, the
-  # unchanged default), `observe` (record, never act) or `off` (do not
-  # measure). `observe` holds every other variable fixed: check-in cadence,
-  # per-call token limit, and therefore the usable prompt budget. The old
-  # workaround, raising the per-call limit until the detector stopped being
-  # reached, also shrinks the prompt budget, because the endpoint requires
-  # prompt plus max_tokens to fit the context window. Both gates honor the
-  # policy, and records carry what the detector WOULD have done
-  # (`would_conclude`), so an observe run is measurable rather than merely
-  # quieter.
-  #
-  # CONFIG_SCHEMA 1.26 -> 1.27, additive — an older binary ignores the new
-  # `runtime.detection` block and behaves exactly as its default does.
-  # FLOW_SCHEMA unchanged at 1.52.0, RULES_SCHEMA at 3.0.0. Drop-in over
-  # v3.9.0.
-  # `brew install darkmux` builds from this source tarball; `brew install
-  # --HEAD darkmux` builds from main instead. The sha256 is of the
-  # GitHub-generated source tarball for the tag (`shasum -a 256`).
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.10.0.tar.gz"
-  sha256 "2d068a21993b809abfd6eba172dc674bec0fd4e73d3eea2d2841222ca0ed098e"
+  # Stable release: v3.11.0 — `darkmux lab run stats` derives per-run and
+  # per-set metrics from recorded lab runs (active time, billed tok/s,
+  # busy-only energy, cost per successful run) with a reconciliation check
+  # on every figure. A write-the-tests lab run now passes only when it did
+  # the work and broke nothing. The machine lens shows the battery, meters
+  # show how tight a resource is, and the run page reads by turn.
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.11.0.tar.gz"
+  sha256 "1538d08da150e6a8728cf1ef6501c490cf32ef9592cb3036dfd9c85425a3fa05"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
