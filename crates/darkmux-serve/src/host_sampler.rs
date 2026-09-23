@@ -511,7 +511,8 @@ fn build_battery_health_record(
 ///   all — which is exactly the "the charge number looked healthy every day
 ///   and the cost was only visible in the slow fields" failure the issue
 ///   was filed from.
-/// - Identical to the last reading: no record. Hour-over-hour capacity
+/// - The same HEALTH as the last reading (see [`same_health`]; temperature
+///   and running totals are ignored): no record. Hour-over-hour capacity
 ///   differences are below the noise floor, and emitting anyway would add
 ///   24 identical rows a day to a stream this feature is supposed to keep
 ///   quiet.
@@ -527,10 +528,25 @@ fn battery_health_edge(
     let Some(h) = now else {
         return (prev.cloned(), None);
     };
-    if prev == Some(h) {
+    if prev.is_some_and(|p| same_health(p, h)) {
         return (Some(h.clone()), None);
     }
     (Some(h.clone()), Some(build_battery_health_record(h, poll_interval_ms, sampled_at_ms)))
+}
+
+/// Whether two readings describe the same HEALTH: cycles, capacity and
+/// condition. Temperature, operating hours and the time-at-charge counters
+/// move every poll, so comparing the whole struct emitted a record every
+/// hour, which is exactly what the edge exists to prevent. Those fields still
+/// ride on each record that IS emitted.
+fn same_health(a: &BatteryHealth, b: &BatteryHealth) -> bool {
+    a.cycle_count == b.cycle_count
+        && a.design_capacity_mah == b.design_capacity_mah
+        && a.raw_max_capacity_mah == b.raw_max_capacity_mah
+        && a.nominal_charge_capacity_mah == b.nominal_charge_capacity_mah
+        && a.condition == b.condition
+        && a.health_condition == b.health_condition
+        && a.permanent_failure_status == b.permanent_failure_status
 }
 
 /// (#2705) The battery TRANSITIONS worth a record, as stable strings a
@@ -1446,6 +1462,38 @@ mod tests {
                  feature is supposed to keep quiet"
             );
         }
+    }
+
+    #[test]
+    fn temperature_and_running_totals_moving_is_not_a_health_change() {
+        // Live, the stream got one `machine.battery_health` row EVERY hour:
+        // the edge compared the whole struct, and temperature, operating
+        // hours and the time-at-charge counters move every poll. Health is
+        // cycles, capacity and condition; those didn't move.
+        let mut h = health_with(28);
+        h.temperature_c = Some(30.77);
+        h.total_operating_time_hours = Some(5358);
+        h.time_at_soc_hours = Some(vec![0, 14, 1938]);
+        let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
+        for hour in 1..=24u64 {
+            let mut later = h.clone();
+            later.temperature_c = Some(30.0 + hour as f64 / 10.0);
+            later.total_operating_time_hours = Some(5358 + hour);
+            later.time_at_soc_hours = Some(vec![0, 14, 1938 + hour as u32]);
+            let (next, rec) = battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
+            known = next;
+            assert!(rec.is_none(), "hour {hour}: only temperature/totals moved, which is not a health change");
+        }
+    }
+
+    #[test]
+    fn a_condition_change_alone_is_a_health_change() {
+        let h = health_with(28);
+        let (known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
+        let mut worse = h.clone();
+        worse.health_condition = Some("Service Recommended".into());
+        let (_, rec) = battery_health_edge(known.as_ref(), Some(&worse), 3_600_000, 3_600_000);
+        assert!(rec.is_some(), "a condition change must be recorded");
     }
 
     #[test]
