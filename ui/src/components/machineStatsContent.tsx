@@ -56,12 +56,15 @@ import { isLiveRoute, type Route } from "../lib/route";
 import { useDaemonLoad } from "../hooks/useDaemonLoad";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 import type {
+  BatteryHealth,
+  BatterySample,
   FlowRecord,
   MachineLoad,
   MachineSpecs,
   PresenceBeat,
   ThermalState,
 } from "../types/handwritten";
+import { capacityLine, chargeCaption, conditionRow, fmtOperatingHours, socHistogramBars } from "../lib/battery";
 
 /** Re-render on a light interval so the rolling 10-minute window keeps
  * aging samples out, and the compact line's live value stays current, even
@@ -379,6 +382,103 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
         </div>
       )}
     </>
+  );
+}
+
+/** (#2821, operator scope: LENS ONLY — never `body`/`HostExtras`, which
+ * `MachineDrawer.tsx`/`PhoneDrawer.tsx` also render) charge + health +
+ * time-at-charge histogram, for `MachineLens.tsx`'s `liveBlock` alone. A
+ * caller with neither a charge sample nor a health reading (no battery on
+ * this machine — every Mac Studio, mini, Pro) gets `null`: absent, not an
+ * empty section. */
+function BatteryLensBlock({ sample, health }: { sample: BatterySample | null; health: BatteryHealth | null }) {
+  if (sample === null && health === null) return null;
+  const cond = conditionRow(health);
+  const capacity = capacityLine(health);
+  const bars = socHistogramBars(health?.time_at_soc_hours ?? null);
+  const totalHours = fmtOperatingHours(health?.total_operating_time_hours ?? null);
+  // Bar geometry — a fixed viewBox that scales to 100% width via CSS
+  // (`.battery-histogram svg`), same responsive pattern `Meter`'s own SVGs
+  // use, so the chart reads correctly from desktop down to a 390px phone.
+  const chartW = 280;
+  const chartH = 56;
+  const gap = 2;
+  const barW = bars.length > 0 ? (chartW - gap * (bars.length - 1)) / bars.length : 0;
+  return (
+    <div className="battery-block hx-section">
+      <div className="hx-section__title">Battery</div>
+      {sample && (
+        <div className="meter-row">
+          <Meter
+            wrapperClassName="mm-gauge mm-gauge--compact"
+            width={COMPACT_METER_WIDTH}
+            height={COMPACT_METER_HEIGHT}
+            ariaLabel={`Battery: ${sample.charge_pct == null ? "unmeasured" : `${sample.charge_pct}%`}${chargeCaption(sample) ? `, ${chargeCaption(sample)}` : ""}`}
+            hideAvgMax
+            // No `label` prop: the section title ("Battery") right above
+            // already names this gauge, unlike the untitled CPU/GPU/MEM row
+            // (which relies on each gauge's own label). A second "BATTERY"
+            // caption directly under the dial would be a literal duplicate
+            // of the title one line up — caught live via the parity golden
+            // (#2821, playwright run: "BATTERY" rendered twice).
+            // (#2821) The charge dial's own reading never turns amber/red on
+            // this gauge — a LOW charge is the concerning direction here,
+            // the opposite of CPU/GPU/MEM's "high is bad" scale that
+            // `meterBandLevel`'s thresholds assume, and there is no single
+            // percent that means "low" independent of on_ac/charging. The
+            // health row below (condition) carries the real alarm; this
+            // dial stays neutral, same treatment the CPU-cluster tiles get.
+            warnAt={Number.POSITIVE_INFINITY}
+            criticalAt={Number.POSITIVE_INFINITY}
+            bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", sample.charge_pct)}
+            needleAngleDeg={sample.charge_pct == null ? undefined : angleForPct(sample.charge_pct)}
+            numerals={{ now: sample.charge_pct, avg: null, max: null }}
+          />
+          <div className="cluster-tile__caption battery-caption">{chargeCaption(sample)}</div>
+        </div>
+      )}
+      {health && (
+        <>
+          {cond && <Kv className={cond.warn ? "dialog__kv--warn" : ""} label="condition" value={cond.value} />}
+          {capacity && <Kv label="capacity" value={capacity} />}
+          <Kv label="cycles" value={health.cycle_count != null ? String(health.cycle_count) : ""} />
+          <Kv label="temperature" value={health.temperature_c != null ? `${health.temperature_c.toFixed(1)} °C` : ""} />
+          {bars.length > 0 && (
+            <div className="battery-histogram">
+              <div className="battery-histogram__title">
+                time at charge · {bars.length} state-of-charge bands (edges undocumented by Apple)
+                {totalHours ? ` · ${totalHours} total operating time` : ""}
+              </div>
+              <svg
+                viewBox={`0 0 ${chartW} ${chartH + 14}`}
+                role="img"
+                aria-label={`Cumulative operating hours per state-of-charge band, ${bars.length} bands: ${bars.map((b) => `band ${b.index + 1}: ${b.hours} h`).join(", ")}.`}
+              >
+                {bars.map((b) => (
+                  <rect
+                    key={b.index}
+                    x={b.index * (barW + gap)}
+                    y={chartH - (chartH * b.pct) / 100}
+                    width={barW}
+                    height={(chartH * b.pct) / 100}
+                    fill="var(--accent, var(--good))"
+                  />
+                ))}
+                {/* The axis line + endpoint labels — real units (hours),
+                    never a bare unlabeled bar row. */}
+                <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke="var(--border)" strokeWidth={1} />
+                <text x={0} y={chartH + 11} className="battery-histogram__axislabel" textAnchor="start">
+                  band 1
+                </text>
+                <text x={chartW} y={chartH + 11} className="battery-histogram__axislabel" textAnchor="end">
+                  band {bars.length}
+                </text>
+              </svg>
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -1011,6 +1111,13 @@ export function useMachineStatsContent({
         meters
       )}
       {hostExtras}
+      {/* (#2821, operator scope: the LIVE MACHINE LENS ONLY) charge + health
+          + time-at-charge histogram. Deliberately absent from `body` above
+          (the machine drawer / phone-drawer Machine tab) and from
+          `HostExtras` (shared by both) — see `BatteryLensBlock`'s own doc.
+          Reads `daemonLoad` directly, the same way `hostExtras` does: a
+          host fact, not scoped to any one dispatch. */}
+      <BatteryLensBlock sample={daemonLoad?.now?.battery ?? null} health={daemonLoad?.battery_health ?? null} />
     </>
   );
 

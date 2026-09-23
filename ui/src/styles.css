@@ -7228,6 +7228,42 @@ body {
   text-align: center;
 }
 
+/* (#2821) The battery charge dial's state caption ("on AC" / "charging" /
+   "2 h 10 m left") — reuses `.cluster-tile__caption`'s exact type
+   treatment (same quiet mono caption every compact gauge in this row
+   already uses) via the shared class on the element; this rule only widens
+   it, since a battery caption's phrase runs longer than a cluster's
+   "N cores · N MHz" line and must not truncate mid-word on a 100px gauge
+   column. */
+.battery-caption {
+  width: 100%;
+  white-space: normal;
+  text-align: center;
+}
+
+/* (#2821) The time-at-charge histogram — the machine LENS ONLY (see
+   `BatteryLensBlock`'s own doc; never rendered in the drawer). Scales to
+   100% width via the `viewBox` + `width:100%` pairing every other SVG
+   instrument in this file uses, so it stays legible at a 390px phone
+   width without its own breakpoint. */
+.battery-histogram {
+  margin-top: 10px;
+}
+.battery-histogram__title {
+  font: 500 calc(9px * var(--fs-scale))/1.3 var(--font-mono);
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+.battery-histogram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.battery-histogram__axislabel {
+  font: 500 calc(7.5px * var(--fs-scale))/1 var(--font-mono);
+  fill: var(--dim);
+}
+
 /* (#2108, operator finding — wrap fix) The mobile identity block — two
    stacked lines (machine name, then hardware) with NO separators,
    replacing the single dotted `headerLine` that wrapped after "128 GB ·"

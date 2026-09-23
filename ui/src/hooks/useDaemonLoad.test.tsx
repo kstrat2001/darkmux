@@ -67,6 +67,7 @@ const LOAD_PAYLOAD = {
       gpu_mem_bytes: null,
       thermal: null,
       power_mw: null,
+      battery: null,
     },
     window: {
       samples: 3,

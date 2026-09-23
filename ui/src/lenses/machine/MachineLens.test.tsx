@@ -671,6 +671,7 @@ const LOAD_WITH_EXTRAS = {
     gpu_mem_bytes: null,
     thermal: { state: "fair", cpu_speed_limit_pct: 87 },
     power_mw: null,
+    battery: { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130 },
   },
   window: {
     samples: 3,
@@ -683,7 +684,97 @@ const LOAD_WITH_EXTRAS = {
     thermal: null,
     energy_mwh: null,
   },
+  // (#2821) The Step-0 regression fixture, verbatim: the raw IOKit
+  // `condition` disagrees with the computed `condition_word` — the lens
+  // must render the LATTER as "condition", never the former.
+  battery_health: {
+    cycle_count: 28,
+    design_capacity_mah: 6249,
+    raw_max_capacity_mah: 5701,
+    nominal_charge_capacity_mah: 5853,
+    raw_capacity_pct: 91.2,
+    nominal_capacity_pct: 93.7,
+    condition: "Check Battery",
+    condition_word: "Normal",
+    permanent_failure_status: 0,
+    temperature_c: 31.0,
+    time_at_soc_hours: [10, 20, 40, 5],
+    total_operating_time_hours: 5368,
+  },
 };
+
+const LOAD_NO_BATTERY = {
+  ...LOAD_WITH_EXTRAS,
+  now: { ...LOAD_WITH_EXTRAS.now, battery: null },
+  battery_health: null,
+};
+
+describe("MachineLens — battery surfaces (#2821, lens only)", () => {
+  it("shows the charge gauge, its state caption, and the health row from the daemon fixture", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    // "Battery" — the raw DOM text; `.hx-section__title`'s uppercase is a
+    // CSS `text-transform`, invisible to jsdom/RTL's textContent-based
+    // queries (the parity golden, captured via a real browser's
+    // `innerText`, is where "BATTERY" is the correct assertion instead).
+    expect(screen.getByText("Battery")).toBeInTheDocument();
+    expect(screen.getByText("78%")).toBeInTheDocument();
+    expect(screen.getByText("2 h 10 m left")).toBeInTheDocument();
+    // The computed condition_word ("Normal"), never the raw unreliable
+    // IOKit string ("Check Battery") — the Step-0 regression this issue
+    // exists to fix.
+    expect(screen.getByText("Normal")).toBeInTheDocument();
+    expect(screen.queryByText(/Check Battery/)).toBeNull();
+    expect(screen.getByText(/5,701 of 6,249 mAh design/)).toBeInTheDocument();
+    expect(screen.getByText("28")).toBeInTheDocument();
+    expect(screen.getByText("31.0 °C")).toBeInTheDocument();
+    expect(screen.getByText(/4 state-of-charge bands/)).toBeInTheDocument();
+  });
+
+  it("renders no battery section at all on a machine with no battery", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "Mac-Studio", cpu_brand: "M1 Max", ram_total_bytes: 34359738368 },
+      resources: { ...RESOURCES, load: LOAD_NO_BATTERY },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(screen.queryByText("Battery")).toBeNull();
+    expect(screen.queryByText(/state-of-charge bands/)).toBeNull();
+  });
+
+  it("warns on Service Battery", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: {
+        ...RESOURCES,
+        load: {
+          ...LOAD_WITH_EXTRAS,
+          battery_health: { ...LOAD_WITH_EXTRAS.battery_health, condition_word: "Service Battery" },
+        },
+      },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("Service Battery")).toBeInTheDocument());
+    expect(screen.getByText("Service Battery").closest(".dialog__kv")).toHaveClass("dialog__kv--warn");
+  });
+
+  it("on AC while charging reads a plain state word, not a fabricated time estimate", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: {
+        ...RESOURCES,
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { charge_pct: 62, on_ac: true, charging: true, minutes_to_empty: null } } },
+      },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("charging")).toBeInTheDocument());
+    expect(screen.queryByText(/left$/)).toBeNull();
+  });
+});
 
 describe("MachineLens — the live block is the SAME shared component the sheet uses (#2108)", () => {
   it("the local machine page renders the thermal pill and CPU-cluster tiles from the daemon fixture", async () => {
