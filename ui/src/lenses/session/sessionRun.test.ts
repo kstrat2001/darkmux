@@ -287,7 +287,21 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 60000 } },
     ] as FlowRecord[];
     const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBe("incl. 1:30 rest (1:00 thermal · 0:30 cool-down)");
+    expect(wall?.sub).toBe("incl. 1:30 rest (1:00 thermal · 0:30 turn delay)");
+  });
+
+  it("(#2863) a configured turn delay alone is named as such, never as thermal", () => {
+    // The runtime writes `reason: "turn_delay"` for the operator's own
+    // `turn_delay_ms` sleep (`runtime/src/trajectory.rs` `append_rest`).
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "turn_delay" } },
+      { ts: "2026-01-01T00:01:10Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "turn_delay" } },
+      { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 0 } },
+    ] as FlowRecord[];
+    const wall = runRegions(flowToRenderModel(data), "s1").metrics.find((m) => m.label === "WALL CLOCK");
+    expect(wall?.sub).toBe("incl. 1:30 turn delay");
+    expect(wall?.sub).not.toContain("thermal");
   });
 
   it("(#2863) rest records that don't add up to the recorded total name no cause", () => {

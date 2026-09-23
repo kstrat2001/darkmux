@@ -632,10 +632,18 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const restCause = (reason: unknown): string => {
     const r = String(reason ?? "");
     if (r.startsWith("thermal")) return "thermal";
-    if (r === "turn_delay") return "cool-down";
+    if (r === "turn_delay") return "turn delay";
     if (r.startsWith("battery")) return "battery";
     if (r.startsWith("operator")) return "hold";
     return r || "rest";
+  };
+  // Alone, each cause reads as its own phrase; in a mixed breakdown the
+  // short names above are enough.
+  const REST_PHRASE: Record<string, string> = {
+    thermal: "thermal rest",
+    "turn delay": "turn delay",
+    battery: "battery pause",
+    hold: "operator hold",
   };
   const byCause = new Map<string, number>();
   for (const r of attemptRecs) {
@@ -653,7 +661,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     if (causes.length && causeSum === restMs) {
       restSub =
         causes.length === 1
-          ? `incl. ${total} ${causes[0][0]} rest`
+          ? `incl. ${total} ${REST_PHRASE[causes[0][0]] ?? `${causes[0][0]} rest`}`
           : `incl. ${total} rest (${causes.map(([k, ms]) => `${fmtElapsed(ms)} ${k}`).join(" · ")})`;
     } else {
       restSub = `incl. ${total} rest`;
