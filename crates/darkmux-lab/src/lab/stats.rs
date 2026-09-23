@@ -59,7 +59,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "1.0.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "1.1.0";
+
+/// How far `metrics.json`'s own `started_at_unix_ms` may drift from the
+/// run's OWN identity — `lifecycle.json`'s `started_at_ms` when present, else
+/// the epoch embedded in the run id itself
+/// (`<workload>-<profile>-<epoch_secs>-<n>`, see `lab::run::run_id`) — before
+/// the file is read as describing a DIFFERENT run entirely, not a late write
+/// of this one. Measured on disk: every stale `metrics.json` found (11 run
+/// dirs, 4 of them byte-identical copies) differed by days; none by minutes.
+/// Deliberately a separate constant from [`WINDOW_SLACK_MS`], which bounds
+/// file SELECTION for telemetry — a different question from file IDENTITY.
+pub const STALE_METRICS_SLACK_MS: u64 = 10 * 60 * 1000;
 
 /// Uniqueness ratio below which a slice is degenerate.
 ///
@@ -182,6 +193,13 @@ pub struct RunChecks {
     /// undercount; it fails the moment frames are assigned instead of summed.
     pub tokens_reconcile: Option<bool>,
     pub metrics_totals_zeroed: bool,
+    /// `metrics.json`'s own clock is outside this run's own window (by
+    /// identity — [`STALE_METRICS_SLACK_MS`] — not by content), or the
+    /// trajectory shows more generation time than `metrics.json` claims as
+    /// wall time. Either way this `metrics.json` belongs to a different run.
+    /// Wall, rest, active time and anything built from them (energy, cost
+    /// per success) must not be quoted.
+    pub metrics_stale: bool,
     pub rest_matches_trajectory: Option<bool>,
     pub turns_match_trajectory: Option<bool>,
     pub telemetry_covers_run: bool,
@@ -253,6 +271,11 @@ pub struct RunStats {
     pub ok: Option<bool>,
 
     // --- time -------------------------------------------------------------
+    /// `metrics.json`'s own start, kept so a SET can detect two runs whose
+    /// windows overlap (host telemetry is matched by time window only, and
+    /// cannot be apportioned between them). Absent for a run whose
+    /// `metrics.json` never recorded one.
+    pub started_at_unix_ms: Option<u64>,
     pub wall_ms: u64,
     pub rest_ms: u64,
     /// `wall_ms - rest_ms`. The cross-engine time figure; wall carries a
@@ -316,6 +339,10 @@ pub struct RunStats {
     /// Wall time spent busy, from the duty cycle. With `pkg_w_busy` this is
     /// the energy a run cost regardless of whether it finished.
     pub busy_ms: Option<u64>,
+    /// Mean BUSY-sample package watts × busy time — energy spent WHILE
+    /// BUSY, not the run's total energy (idle and rest samples are
+    /// excluded, same as [`RunStats::pkg_w_busy`]). Print it labeled that
+    /// way; "over the run" reads as the whole run's draw and overstates it.
     pub pkg_j_busy: Option<f64>,
     /// Billed seconds against billed tokens — mixing all-generation seconds
     /// with billed-only tokens inflates this by exactly the unbilled fraction.
@@ -347,6 +374,13 @@ impl RunStats {
             out.push(
                 "metrics.json totals were zeroed by the runtime's error path; turns and rest \
                  come from the trajectory, and tokens cannot be reconciled",
+            );
+        }
+        if c.metrics_stale {
+            out.push(
+                "metrics.json does not belong to this run (its clock is outside the run's own \
+                 window, or it claims less wall time than was spent generating); wall, rest, \
+                 active time and anything built from them must not be quoted",
             );
         }
         if c.tokens_reconcile == Some(false) {
@@ -978,22 +1012,36 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
 
     let wall_ms = m.wall_ms.unwrap_or(0);
     let started = m.started_at_unix_ms.unwrap_or(0);
-    let flows = read_flows(flows_dir, session_id.as_deref(), started, started + wall_ms);
+    let flows = read_flows(flows_dir, session_id.as_deref(), started, started.saturating_add(wall_ms));
 
-    let mut stats = derive_stats(
-        run_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string(),
-        m,
-        t,
-        flows,
-        verify,
-        ok,
-    );
+    let run_id = run_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    // The run's own identity clock, checked against what `metrics.json`
+    // CLAIMS its start was — never the other way around, since the claim is
+    // the thing under test. `lifecycle.json` carries it directly on newer
+    // runs; older runs only have the epoch embedded in the run id itself.
+    let identity_started_ms = side("lifecycle.json", "started_at_ms")
+        .and_then(|v| v.as_u64())
+        .or_else(|| run_id_epoch_ms(&run_id));
+    let identity_mismatch = match (m.started_at_unix_ms, identity_started_ms) {
+        (Some(claimed), Some(identity)) => claimed.abs_diff(identity) > STALE_METRICS_SLACK_MS,
+        _ => false,
+    };
+
+    let mut stats = derive_stats(run_id, m, t, flows, verify, ok);
+    stats.checks.metrics_stale = stats.checks.metrics_stale || identity_mismatch;
     stats.verify_ungated = verify_ungated;
     Ok(stats)
+}
+
+/// The epoch seconds embedded in a run id
+/// (`<workload>-<profile>-<epoch_secs>-<n>`, see `lab::run::run_id`), read
+/// from the right by position so a workload or profile name containing its
+/// own dashes (e.g. `long-agentic-balanced`) cannot be mistaken for the
+/// stamp. `None` for a name that doesn't have this shape at all.
+fn run_id_epoch_ms(run_id: &str) -> Option<u64> {
+    let mut parts = run_id.rsplit('-');
+    let _index = parts.next()?;
+    parts.next()?.parse::<u64>().ok().map(|secs| secs.saturating_mul(1000))
 }
 
 pub(crate) fn derive_stats(
@@ -1006,7 +1054,7 @@ pub(crate) fn derive_stats(
 ) -> RunStats {
     let wall_ms = m.wall_ms.unwrap_or(0);
     let run_from = m.started_at_unix_ms.unwrap_or(0);
-    let run_to = run_from + wall_ms;
+    let run_to = run_from.saturating_add(wall_ms);
 
     // --- turn and rest counters -------------------------------------------
     // `metrics.json` is the runtime's own count and normally matches the
@@ -1077,6 +1125,12 @@ pub(crate) fn derive_stats(
         .map(|(_, s)| s.ms())
         .sum();
     let unterminated = t.spans.iter().filter(|s| s.t1.is_none()).count();
+
+    // `metrics.json` claiming less wall time than the trajectory spent
+    // generating is a fingerprint of a metrics file that belongs to a
+    // DIFFERENT (shorter) run — measured: wall 439s beside "1234s of 1234s"
+    // of generation.
+    let generation_exceeds_wall = wall_ms > 0 && gen_ms_all > wall_ms;
 
     let completion_tokens: u64 = t.turns.values().map(|e| e.completion_tokens).sum();
     let reasoning_tokens: u64 = t.turns.values().map(|e| e.reasoning_tokens).sum();
@@ -1226,6 +1280,7 @@ pub(crate) fn derive_stats(
         // which exercise a baselined fixture.
         verify_ungated: false,
         ok,
+        started_at_unix_ms: m.started_at_unix_ms,
         wall_ms,
         rest_ms,
         active_ms: wall_ms.saturating_sub(rest_ms),
@@ -1295,6 +1350,7 @@ pub(crate) fn derive_stats(
             tokens_reconcile: (!zeroed)
                 .then(|| completion_tokens == m.total_completion_tokens.unwrap_or(0)),
             metrics_totals_zeroed: zeroed,
+            metrics_stale: generation_exceeds_wall,
             rest_matches_trajectory: rest_match,
             turns_match_trajectory: turns_match,
             telemetry_covers_run: cover.covers_run,

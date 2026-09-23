@@ -170,6 +170,60 @@ fn a_set_lists_every_model_it_contains() {
     assert_eq!(s.models, vec!["m".to_string(), "other".to_string()]);
 }
 
+/// Two runs whose windows overlap each claim the whole host's power
+/// (`scan_flow_lines` matches telemetry by time window only), so their
+/// energy figures cannot be summed without double-counting. Both are
+/// flagged, and the set's energy cost is withheld rather than divided up.
+#[test]
+fn overlapping_runs_are_flagged_and_their_energy_is_withheld() {
+    let mut a = costed("a", "pass", 100_000, 90_000, 3_000.0);
+    a.started_at_unix_ms = Some(1_000_000);
+    a.wall_ms = 100_000; // window [1_000_000, 1_100_000]
+    let mut b = costed("b", "pass", 100_000, 90_000, 3_000.0);
+    b.started_at_unix_ms = Some(1_050_000); // starts before `a` ends
+    b.wall_ms = 100_000;
+    let s = summarize(&[a, b]);
+    assert_eq!(s.flagged.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+    assert!(s.flagged.iter().all(|(_, f)| f.contains(&"OVERLAP")));
+    assert_eq!(s.cost_per_success.gpu_busy_ms, None);
+    assert_eq!(s.cost_per_success.pkg_joules, None);
+    // Active time is not host telemetry and is unaffected by the overlap.
+    assert_eq!(s.cost_per_success.active_ms, Some(100_000.0));
+    assert!(s.cost_per_success.withheld.iter().any(|w| w.contains("OVERLAP")));
+}
+
+/// Adjacent, non-overlapping runs (one starts exactly as the other ends)
+/// must not be flagged — the boundary itself is not an overlap.
+#[test]
+fn back_to_back_runs_do_not_overlap() {
+    let mut a = costed("a", "pass", 100_000, 90_000, 3_000.0);
+    a.started_at_unix_ms = Some(1_000_000);
+    a.wall_ms = 100_000; // ends at 1_100_000
+    let mut b = costed("b", "pass", 100_000, 90_000, 3_000.0);
+    b.started_at_unix_ms = Some(1_100_000); // starts exactly when `a` ends
+    b.wall_ms = 100_000;
+    let s = summarize(&[a, b]);
+    assert!(s.flagged.is_empty(), "{:?}", s.flagged);
+    assert_eq!(s.cost_per_success.pkg_joules, Some(3_000.0));
+}
+
+/// A `metrics_stale` run's active time AND host-telemetry energy are both
+/// built on that run's own `wall_ms`/window — which is exactly the value
+/// under suspicion — so neither feeds cost per success. Unlike a checks
+/// failure that leaves the FIGURE itself untouched (TOKENS, UNBILLED, etc.),
+/// which stays in every figure per the set's "never drop a run" doctrine.
+#[test]
+fn a_stale_metrics_run_is_excluded_from_cost_per_success() {
+    let mut stale = costed("a", "pass", 999_000, 900_000, 30_000.0);
+    stale.checks.metrics_stale = true;
+    let clean = costed("b", "pass", 100_000, 90_000, 3_000.0);
+    let s = summarize(&[stale, clean]);
+    assert_eq!(s.cost_per_success.active_ms, None, "the whole total is withheld, not read low");
+    assert_eq!(s.cost_per_success.gpu_busy_ms, None);
+    assert_eq!(s.cost_per_success.pkg_joules, None);
+    assert!(s.cost_per_success.withheld.iter().any(|w| w.contains("STALE-METRICS")));
+}
+
 #[test]
 fn a_ratio_never_divides_by_zero_or_missing() {
     assert_eq!(ratio(Some(3.0), Some(2.0)), Some(1.5));

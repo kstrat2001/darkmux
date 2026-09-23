@@ -339,6 +339,24 @@ fn distinct_rest_delays_expose_the_thermal_ratchet() {
     assert_eq!(s.rest_ms_per_turn, Some(15_000.0));
 }
 
+/// The same rest delay recurring is the ordinary case — one thermal budget,
+/// paid repeatedly at the same rate — and must NOT read as the ratchet
+/// having fired. (Mutation survivor: `rest_delays.len() > 1` mutated to
+/// `> 0` stayed green under the WHOLE suite, because nothing asserted the
+/// negative case — a repeated, not-yet-escalated delay.)
+#[test]
+fn a_repeated_identical_rest_delay_does_not_fire_the_ratchet() {
+    let traj = format!(
+        "{}{}",
+        line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
+        line(serde_json::json!({"type":"runtime.rest","ms":15_000,"reason":"thermal-duty-cycle","state":"fair"})),
+    );
+    let s = stats(&traj, metrics(200_000, 30_000, 4, 0));
+    assert_eq!(s.rest_events, 2);
+    assert_eq!(s.rest_delays_ms, vec![15_000], "one DISTINCT delay, paid twice");
+    assert!(!s.thermal_ratchet_fired);
+}
+
 /// A turn whose reasoning chars and reasoning tokens imply an impossible
 /// ratio is listed, not averaged in. Comparing against TOTAL completion
 /// tokens instead flagged three healthy turns whose output was mostly
@@ -503,7 +521,80 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
     assert!(s.unreconciled().is_empty(), "a clean run quotes cleanly: {:?}", s.unreconciled());
 }
 
-/// A run without runtime metrics has no derivable numbers, and says so
+// ---------------------------------------------------------------------------
+// Stale metrics.json (#2855 review)
+// ---------------------------------------------------------------------------
+
+/// `metrics.json` claiming less wall time than the trajectory spent
+/// generating is a metrics file for a DIFFERENT, shorter run — measured:
+/// wall 439s printed beside "1234s of 1234s" of generation.
+#[test]
+fn stale_metrics_is_flagged_when_generation_exceeds_the_claimed_wall_time() {
+    let traj = format!("{}{}", stream(1, 0, Some(500_000)), completed(1, Some(100), 5));
+    // wall_ms claims 100s but the stream alone ran 500s.
+    let s = stats(&traj, metrics(100_000, 0, 1, 100));
+    assert!(s.checks.metrics_stale);
+    assert!(s.unreconciled().iter().any(|c| c.contains("does not belong to this run")));
+}
+
+/// The ordinary case — generation comfortably inside the claimed wall time —
+/// must not be flagged.
+#[test]
+fn a_run_whose_generation_fits_inside_its_wall_time_is_not_flagged_stale() {
+    let traj = format!("{}{}", stream(1, 0, Some(5_000)), completed(1, Some(100), 5));
+    let s = stats(&traj, metrics(100_000, 0, 1, 100));
+    assert!(!s.checks.metrics_stale);
+}
+
+/// The other half of the detection: `metrics.json`'s own clock disagrees
+/// with the run's OWN identity (the epoch embedded in its run id) by more
+/// than the slack. This is the shape actually found on disk — 11 run dirs
+/// with a `metrics.json` that started before the run's own id timestamp, 4
+/// of them byte-identical copies from days earlier.
+#[test]
+fn stale_metrics_is_flagged_when_its_clock_disagrees_with_the_runs_own_id() {
+    let flows = tempfile::TempDir::new().unwrap();
+    let runs = tempfile::TempDir::new().unwrap();
+    // The run's OWN identity: epoch 1_780_000 seconds.
+    let run_dir = runs.path().join("long-agentic-balanced-1780000000-1");
+    std::fs::create_dir(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("metrics.json"),
+        // metrics.json's clock: ~5 days EARLIER than the run's own id.
+        serde_json::json!({
+            "started_at_unix_ms": 1_779_570_000_000u64, "wall_ms": 10_000, "rest_ms": 0,
+            "turns": 1, "total_completion_tokens": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
+    assert!(s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// A `metrics.json` clock a few seconds off its run's own id (ordinary
+/// dispatch-startup latency) stays within slack and is not flagged.
+#[test]
+fn a_metrics_clock_within_slack_of_the_runs_own_id_is_not_flagged() {
+    let flows = tempfile::TempDir::new().unwrap();
+    let runs = tempfile::TempDir::new().unwrap();
+    let run_dir = runs.path().join("long-agentic-balanced-1780000000-1");
+    std::fs::create_dir(&run_dir).unwrap();
+    std::fs::write(
+        run_dir.join("metrics.json"),
+        serde_json::json!({
+            // 3 seconds after the id's own stamp — ordinary startup lag.
+            "started_at_unix_ms": 1_780_000_003_000u64, "wall_ms": 10_000, "rest_ms": 0,
+            "turns": 1, "total_completion_tokens": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let s = compute_from_dir(&run_dir, flows.path()).unwrap();
+    assert!(!s.checks.metrics_stale, "checks: {:?}", s.checks);
+}
+
+/// A run without metrics has no derivable numbers, and says so
 /// rather than returning a page of zeros.
 #[test]
 fn a_run_without_metrics_is_an_error_not_a_page_of_zeros() {
