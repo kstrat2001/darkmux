@@ -134,8 +134,13 @@ export const DEFAULT_ACTIVITIES = new Set(["reasoning", "checkpoint", "tool call
  * `runtime` (`telemetry.runtime`'s own turn-scoped status, one per turn
  * taken, not one per tick of a timer). Hiding those by default would be the
  * exact "operator never sees it" failure `DEFAULT_ACTIVITIES`'s own
- * `dispatch error` entry exists to prevent. */
-export const PERIODIC_SAMPLE_ACTIVITIES = new Set(["host telemetry", "heartbeat", "tokens", "lms", "telemetry"]);
+ * `dispatch error` entry exists to prevent.
+ *
+ * Also here: `machine.battery_health`, a machine FACT (cycles, capacity,
+ * condition) recorded at daemon start and when health changes. It is not
+ * activity, and the machine lens already shows its current values
+ * (operator, 2026-09-24: the lens's events list was nothing but these). */
+export const PERIODIC_SAMPLE_ACTIVITIES = new Set(["host telemetry", "heartbeat", "tokens", "lms", "telemetry", "machine.battery_health"]);
 
 /** (silent-miss audit, 2026-09-06) Suffixes that mark an activity value as
  * failure- or abandonment-shaped, checked in ADDITION to `DEFAULT_ACTIVITIES`

@@ -857,6 +857,16 @@ describe("PERIODIC_SAMPLE_ACTIVITIES — the fallback shows lifecycle noise, nev
     expect(isPeriodicOnlyWindow(facets)).toBe(true);
   });
 
+  it("battery health is a machine fact, not activity: off by default like the samplers", () => {
+    // Operator, 2026-09-24: the machine lens's events list was all
+    // `machine.battery_health` rows. The lens already shows the values.
+    const records = [rec({ action: "machine.battery_health" }), rec({ action: "machine.battery_health" }), rec({ action: "step complete" })];
+    const facets = computeFacets(records);
+    const filters = defaultFilterState(facets);
+    expect(filters.act.has("machine.battery_health")).toBe(false);
+    expect(filters.act.has("step complete")).toBe(true);
+  });
+
   it("telemetry plus dispatch start/step complete (no DEFAULT_ACTIVITIES member): the lifecycle rows show, telemetry does not", () => {
     const records = [
       rec({ action: "machine.telemetry" }),
