@@ -100,7 +100,8 @@
       ],
       "total_operating_time_hours": 4000,
       "condition_word": "Normal",
-      "permanent_failure_status": 0
+      "permanent_failure_status": 0,
+      "health_condition": ""
     },
     "now": {
       "sampled_at_ms": 1790150522987,

@@ -285,7 +285,7 @@ const UUID_FIELDS = new Set(["machine_uid"]);
 const SAFE_FIELDS = new Set([
   "_type", "action", "ansi_text", "args", "argv", "attribution", "build",
   "captured_date", "captured_prev_date", "case_ids", "category", "command",
-  "condition", "condition_word", "config_id", "cpu_brand", "crew", "daemon_url",
+  "condition", "condition_word", "health_condition", "config_id", "cpu_brand", "crew", "daemon_url",
   "darkmux_version", "date", "decision", "dir", "display_name", "endpoint",
   "event", "exec_mode", "extra", "file", "finish_reason", "first_date",
   "first_ts", "flow_schema_version", "handle", "http_status", "id",
@@ -311,6 +311,13 @@ const SAFE_FIELDS = new Set([
 // `state`/`limit_source` already on this list. Scrambling them (the
 // UNKNOWN-FIELDS default) would have broken the exact conditional renders
 // this corpus refresh exists to make drivable.
+// (#2821 review) `health_condition` (`BatteryHealthCondition`, the
+// AUTHORITATIVE condition signal `condition_word` is derived from) joins
+// `condition`/`condition_word` here for the same reason: a small,
+// Apple-defined vocabulary, NOT an identifying value. Its empty string
+// ("" — the healthy reading) must survive verbatim, which is exactly what
+// SAFE_FIELDS guarantees (the UNKNOWN-FIELDS default would run it through
+// `syntheticIdentifier`, which does not preserve emptiness).
 // (#1868 packet 1) `label`, `mission_status`, `parentId`, `target` added for
 // /mission/:id/graph.json, the mission-graph parity fixture's node/edge
 // shape (crates/darkmux-serve/src/mission_graph.rs). Short structural
@@ -424,23 +431,56 @@ function syntheticSocHistogram(length) {
   return Array.from({ length }, (_, i) => (i + 1) * 10);
 }
 
+/** (#2821 review, item 4) The DEFAULT synthetic value for a `battery_health`
+ * numeric field this policy has no NAMED mapping for yet. Deliberately `0`
+ * — a suspicious, obviously-placeholder number a reviewer immediately
+ * reads as "not given an explicit synthetic value", rather than a
+ * plausible-looking round figure that could pass for a real reading.
+ *
+ * This exists because the FIRST version of `sanitizeBatteryHealth` was an
+ * ALLOWLIST: `typeof v === "number" && hasOwnProperty(..., k)` — a numeric
+ * key not already named in `BATTERY_HEALTH_SYNTHETIC_NUMERIC` fell straight
+ * through to the generic `walk`, which passes numbers through UNTOUCHED. A
+ * future probe field this module doesn't know about yet (a plausible name:
+ * `max_capacity_pct`, `manufacture_date_ms`) would have re-leaked real
+ * device data on the very next re-record. The policy below is DEFAULT-DENY
+ * instead: every numeric value anywhere in this block is replaced, named
+ * or not — see `sanitize.test.mjs` for the regression test. */
+const BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER = 0;
+
 /** `battery_health`'s own sanitizer, used in place of the generic `walk`
  * recursion for that one object. String fields (`condition`/
- * `condition_word`) still go through the normal field-name policy — both
- * are small fixed enums already on `SAFE_FIELDS`, the same character as
- * `state`/`limit_source`. Every numeric field is replaced with a fixed
- * synthetic value from `BATTERY_HEALTH_SYNTHETIC_NUMERIC` (or, for the
- * histogram array, `syntheticSocHistogram`) rather than passed through. */
+ * `condition_word`/`health_condition`) still go through the normal
+ * field-name policy — small fixed enums already on `SAFE_FIELDS`, the same
+ * character as `state`/`limit_source`. EVERY numeric value — named or not,
+ * scalar or inside an array — is replaced: a named field gets its own
+ * synthetic value from `BATTERY_HEALTH_SYNTHETIC_NUMERIC`,
+ * `time_at_soc_hours` gets `syntheticSocHistogram`, and anything else
+ * numeric this policy has no name for gets
+ * `BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER` — recorded into
+ * `matched.unknownFields` (as `battery_health.<key>`) so a human sees it in
+ * the record transcript and can add an explicit mapping, the same
+ * "never verbatim, but named for follow-up" discipline `sanitizeString`'s
+ * own `unknown` branch already uses for strings. */
 function sanitizeBatteryHealth(value, matched) {
   if (value === null) return null;
   const out = {};
   for (const [k, v] of Object.entries(value)) {
+    const known = Object.prototype.hasOwnProperty.call(BATTERY_HEALTH_SYNTHETIC_NUMERIC, k);
     if (k === "time_at_soc_hours") {
       out[k] = v === null ? null : syntheticSocHistogram(v.length);
       matched.batteryNumeric++;
-    } else if (typeof v === "number" && Object.prototype.hasOwnProperty.call(BATTERY_HEALTH_SYNTHETIC_NUMERIC, k)) {
-      out[k] = BATTERY_HEALTH_SYNTHETIC_NUMERIC[k];
+    } else if (typeof v === "number") {
+      out[k] = known ? BATTERY_HEALTH_SYNTHETIC_NUMERIC[k] : BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER;
       matched.batteryNumeric++;
+      if (!known) matched.unknownFields.add(`battery_health.${k}`);
+    } else if (Array.isArray(v) && v.every((x) => typeof x === "number")) {
+      // A numeric array this policy has no NAME for (distinct from
+      // time_at_soc_hours, handled above) — same default-deny policy,
+      // applied per element, length preserved for structural fidelity.
+      out[k] = v.map(() => BATTERY_HEALTH_UNKNOWN_NUMERIC_PLACEHOLDER);
+      matched.batteryNumeric++;
+      matched.unknownFields.add(`battery_health.${k}`);
     } else {
       out[k] = walk(v, matched, k);
     }
