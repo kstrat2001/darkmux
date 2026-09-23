@@ -76,4 +76,46 @@ describe("RecordView", () => {
     render(<RecordView record={{ ...REC, source: long }} />);
     expect(screen.getByText(/\+4,840 more/)).toBeInTheDocument();
   });
+
+  // (#2863 review, finding 6) A multi-line value under MAX_INLINE renders in
+  // full with no truncation button at all — the panel's own newline
+  // collapses to whitespace visually (no `white-space: pre-wrap`), so a
+  // SHORT second line (a second command, an injected instruction) reads as
+  // if it were never there. A char-count-only truncation is defeatable by
+  // padding line 1 out to just under the cutoff; a LINE count is not.
+  it("marks a short multi-line value as multi-line, not just a long one", () => {
+    const cmd = "echo ok\nrm -rf /workspace";
+    render(<RecordView record={{ ...REC, source: cmd }} />);
+    expect(screen.getByText(/\+1 more line/)).toBeInTheDocument();
+    expect(screen.queryByText(cmd)).toBeNull();
+  });
+
+  it("a padded first line cannot defeat the multi-line marker", () => {
+    // Padding line 1 out past MAX_INLINE does not change the fact that
+    // there are 2 lines — the marker still says "lines", not just "chars".
+    const cmd = "echo " + "x".repeat(200) + "\nrm -rf /workspace";
+    render(<RecordView record={{ ...REC, source: cmd }} />);
+    expect(screen.getByText(/\+1 more line/)).toBeInTheDocument();
+  });
+
+  // (#2863 review, finding 7, security — Trojan-Source class) A bidi
+  // override in a raw field value renders raw, so it can reorder what the
+  // panel visually displays without changing what actually ran.
+  it("escapes a bidi override in a plain string value so it cannot reorder the row", () => {
+    render(<RecordView record={{ ...REC, source: "safe‮exe.txt" }} />);
+    expect(screen.getByText(/⟨U\+202E⟩/)).toBeInTheDocument();
+    expect(screen.queryByText(/‮/)).toBeNull();
+  });
+
+  it("expanding a multi-line value shows the hidden line as a real line break, not run together", () => {
+    // `.rv__str` has no `white-space: pre-wrap` of its own, so a real
+    // newline character collapses to whitespace visually under normal CSS —
+    // the expanded text renders inline-styled so the break survives without
+    // depending on the stylesheet loading.
+    const cmd = "echo ok\nrm -rf /workspace";
+    render(<RecordView record={{ ...REC, source: cmd }} />);
+    fireEvent.click(screen.getByText(/\+1 more line/));
+    const val = screen.getByText(/rm -rf \/workspace/);
+    expect(val.style.whiteSpace).toBe("pre-wrap");
+  });
 });

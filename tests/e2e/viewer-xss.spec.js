@@ -175,6 +175,34 @@ test('viewer renders attacker-controlled flow records inertly across every view'
     await sess.click();
     await page.waitForSelector('.session-run');
     await assertInert(page, 'subsystem');
+
+    // (#2863 review, finding 7) Three `dispatch.tool` records appended to
+    // the fixture carry a script tag, a bidi override, and a multi-line
+    // command together — in plain, truncated, and double-encoded arg
+    // shapes (`tests/fixtures/xss-flow.jsonl`'s `xss-probe-*` tool names).
+    // `assertInert` above already proves no script executed and nothing
+    // parsed into a live element; this asserts the ROW TEXT itself: the
+    // bidi override is a visible escape, not the raw control character, and
+    // a multi-line command shows a marker rather than silently dropping the
+    // second line (findings 6 and 7 together — the same row exercises
+    // both).
+    const plainRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-plain' }) }).first();
+    await expect(plainRow.locator('.eventlog__recobj')).toContainText('⟨U+202E⟩');
+    await expect(plainRow.locator('.eventlog__recobj')).toContainText('more line');
+    const rowText = await plainRow.locator('.eventlog__recobj').innerText();
+    expect(rowText).not.toContain('‮');
+
+    const doubleRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-double' }) }).first();
+    await expect(doubleRow.locator('.eventlog__recobj')).toContainText('⟨U+202E⟩');
+    const doubleText = await doubleRow.locator('.eventlog__recobj').innerText();
+    expect(doubleText).not.toContain('‮');
+
+    // Truncated shape has no complete `command` value to recover (the cut
+    // lands mid-string) — it still must not execute or inject, which
+    // `assertInert` above already covers for the whole session.
+    const truncRow = page.locator('.eventlog__rec', { has: page.locator('.eventlog__chip', { hasText: 'xss-probe-truncated' }) }).first();
+    await expect(truncRow).toBeVisible();
+
     // Back to the fleet stage for the machine-card drill below.
     await page.locator('[data-act="fleet"]').click();
     await page.waitForSelector('[data-act="machine"][data-arg]');

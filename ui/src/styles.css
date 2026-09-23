@@ -1882,6 +1882,11 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--fg);
+  /* (#2863 review, finding 7, security) Defense in depth alongside the JS
+     escaping in `recordObject`: even an un-escaped bidi override could not
+     reorder this row's OWN characters into another row's, or the chip/time
+     beside it, outside its own box. */
+  unicode-bidi: isolate;
   /* (#2863 style pass) Mono, not the sans stack: the events pane is now
      mono root-to-leaf (`.eventlog`'s own font-family), and this size drops
      from 12px to 11px×scale onto the type scale's 11px step — the same
@@ -1941,9 +1946,25 @@ body {
 }
 .eventlog__turnctx {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  /* (#2863 review, finding 4) A bare `1fr` middle track can be squeezed to
+     0px: the outer two `auto` tracks are sized to their own max-content
+     first (inherited `overflow-wrap: anywhere` from `.eventlog__rec`
+     notwithstanding — the label and nums CAN still claim their full
+     max-content when the row has room, which a long "in 194.3k · out 34.0k
+     (32.3k thinking)" nums string does), leaving nothing for the bar. A
+     narrow `minmax(48px, 1fr)` floor keeps the bar visible; the label's own
+     `white-space: nowrap` below stops IT from being the one squeezed to
+     compensate (measured: without it, "context" wrapped to 3 lines at
+     390px). */
+  grid-template-columns: auto minmax(48px, 1fr) auto;
   align-items: center;
   gap: 10px;
+}
+/* (#2863 review, finding 4) `overflow-wrap: anywhere` inherits from
+   `.eventlog__rec`; without an explicit `nowrap` the label is the thing the
+   grid squeezes when the row is tight, breaking "context" mid-word. */
+.eventlog__ctxlbl {
+  white-space: nowrap;
 }
 .eventlog__ctxbar {
   position: relative;
@@ -1998,6 +2019,18 @@ body {
 }
 .eventlog__rec--rest .eventlog__ractivity {
   color: var(--warn);
+}
+/* (#2863 review, finding 2) The governor's pacing-change record — no rest
+   happened, so it does not borrow the `--rest` divider's warn coloring; it
+   is quieter (`--dim`, no side rules) so it does not read as a second rest
+   next to a real one. */
+.eventlog__rec--pacing {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--dim);
+  font-size: calc(10px * var(--fs-scale));
+  padding-block: 3px;
 }
 /* (#2863) Loaded models, one row each; the model that ran is marked and
    listed first. */

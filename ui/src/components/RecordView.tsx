@@ -31,6 +31,7 @@
  * record, which is what `LongText` handles.
  */
 import { useState } from "react";
+import { escapeBidiControls } from "../lib/recordDetail";
 
 /** Envelope fields measured as effectively constant within a session. Not a
  *  guess — see this module's header for the distinct-value counts. */
@@ -75,15 +76,33 @@ function clockOf(iso: string): string {
 
 /** A long value that would otherwise dominate the panel. The 46KB outlier is
  *  precisely when the panel matters most, so it truncates rather than either
- *  flooding the column or hiding the content behind a click. */
+ *  flooding the column or hiding the content behind a click.
+ *
+ * (#2863 review, finding 6) A CHAR-count truncation alone is defeatable: a
+ * short second line (a second command an operator never asked to run, an
+ * injected instruction) sits well under `MAX_INLINE` and rendered in full
+ * with no marker at all — `.rv__str` carries no `white-space: pre-wrap`, so
+ * the newline collapses to a space and the second line visually disappears
+ * into the first. Padding line 1 out past the cutoff does not change how
+ * many LINES there are, so the marker counts lines, not just characters —
+ * nothing a model-controlled string can pad away. */
 function LongText({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
-  if (text.length <= MAX_INLINE) return <span className="rv__str">{text}</span>;
+  const nl = text.indexOf("\n");
+  const multiline = nl !== -1;
+  if (!multiline && text.length <= MAX_INLINE) return <span className="rv__str">{text}</span>;
+  const firstLine = multiline ? text.slice(0, nl) : text;
+  const collapsed = firstLine.length > MAX_INLINE ? firstLine.slice(0, MAX_INLINE) : firstLine;
+  const lineCount = multiline ? text.split("\n").length : 1;
+  const hiddenChars = text.length - collapsed.length;
+  const label = multiline
+    ? `+${grouped(lineCount - 1)} more line${lineCount - 1 === 1 ? "" : "s"}`
+    : `+${grouped(hiddenChars)} more`;
   return (
     <span className="rv__str">
-      {open ? text : `${text.slice(0, MAX_INLINE)}…`}{" "}
+      {open ? <span style={{ whiteSpace: "pre-wrap" }}>{text}</span> : `${collapsed}…`}{" "}
       <button className="rv__more" onClick={() => setOpen(!open)}>
-        {open ? "less" : `+${grouped(text.length - MAX_INLINE)} more`}
+        {open ? "less" : label}
       </button>
     </span>
   );
@@ -102,7 +121,13 @@ function Value({ name, value }: { name: string; value: unknown }) {
     return <span className="rv__num">{grouped(value)}</span>;
   }
 
-  const s = String(value);
+  // (#2863 review, finding 7, security — Trojan-Source class) A raw field
+  // value can be model-written (a tool's command/path, a result, a stray
+  // top-level field on a hand-shaped record) and can carry bidi override or
+  // zero-width control characters that reorder what this panel visually
+  // shows. Escaped once, at the point every string value in this panel
+  // funnels through, rather than per-branch below.
+  const s = escapeBidiControls(String(value));
   if (/(^|_)ts$/.test(name)) {
     const rel = relTime(s);
     return <span className="rv__time">{clockOf(s)}{rel ? <span className="rv__dim"> · {rel}</span> : null}</span>;

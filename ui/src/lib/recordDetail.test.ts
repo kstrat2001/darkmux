@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prettyArgs, recordDetail, recordObject } from "./recordDetail";
+import { escapeBidiControls, prettyArgs, recordDetail, recordObject } from "./recordDetail";
 import type { FlowRecord } from "../types/handwritten";
 
 /** A `dispatch.tool` record shaped exactly like the ones a live crawl emits
@@ -114,6 +114,23 @@ describe("recordDetail", () => {
 });
 
 // ── (#2863) A row's object: what a person scans for, not a report ──────────
+// (#2863 review, finding 7, security — Trojan-Source class) A model-written
+// string can carry bidi/zero-width control characters that REORDER what a
+// row visually displays without changing what actually runs.
+describe("escapeBidiControls (#2863 review, finding 7)", () => {
+  it("replaces a RIGHT-TO-LEFT OVERRIDE with a visible, unambiguous escape", () => {
+    expect(escapeBidiControls("echo ok‮txt.exe‬")).toBe("echo ok⟨U+202E⟩txt.exe⟨U+202C⟩");
+  });
+
+  it("replaces a zero-width space, which is otherwise invisible", () => {
+    expect(escapeBidiControls("rm​ -rf")).toBe("rm⟨U+200B⟩ -rf");
+  });
+
+  it("leaves ordinary text untouched", () => {
+    expect(escapeBidiControls("npm test")).toBe("npm test");
+  });
+});
+
 describe("recordObject", () => {
   const tool = (fields: Record<string, unknown>) =>
     ({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } }) as never;
@@ -155,6 +172,51 @@ describe("recordObject", () => {
     }
   });
 
+  // (#2863 review, finding 5) A `write` whose `content` is long enough that
+  // the host's per-call args cap (~7018 chars, measured) is exhausted before
+  // reaching `path` — `content` precedes `path` in the call's own key order,
+  // so `fieldFromRaw` never even SEES `path`, not just fails to parse it.
+  // The runtime's own result names the path it wrote
+  // (`runtime/src/tools/mod.rs`'s `write`: "Wrote N bytes to <path>"), so
+  // that is the fallback before showing raw JSON.
+  it("names a write's path from the result when content ate the whole args cap", () => {
+    const content = "x".repeat(7018);
+    const args = JSON.stringify({ content, path: "/workspace/test/refreshTokenService.gaps.test.js" }).slice(0, 7018) + "…";
+    const o = recordObject(
+      tool({
+        tool_name: "write",
+        args,
+        result: "Wrote 6650 bytes to /workspace/test/refreshTokenService.gaps.test.js",
+      }),
+    );
+    expect(o.text).toBe("test/refreshTokenService.gaps.test.js");
+    expect(o.mono).toBe(false);
+  });
+
+  it("falls back to raw JSON when neither the args nor the result name a path", () => {
+    const args = JSON.stringify({ content: "x".repeat(7018) }).slice(0, 7018) + "…";
+    const o = recordObject(tool({ tool_name: "write", args, result: "ok" }));
+    expect(o.text).not.toBe("");
+    expect(o.mono).toBe(true);
+  });
+
+  // (#2863 review, finding 6, security) `commandText` used to silently drop
+  // every line after the first (`.split("\n")[0]`) — a command carrying a
+  // second, unrelated line rendered identically to a single, innocuous one,
+  // with no marker that anything was cut. The row now says how many lines
+  // were hidden, so a reader can tell "one command" from "more than one"
+  // without opening the detail pane.
+  it("marks a multi-line command instead of silently showing only its first line", () => {
+    const o = recordObject(tool({ tool_name: "bash", args: JSON.stringify({ command: "echo ok\nrm -rf /workspace" }) }));
+    expect(o.text).toBe("echo ok ⏎ +1 more line");
+  });
+
+  it("a padded first line does not defeat the multi-line marker", () => {
+    const cmd = "echo " + "y".repeat(200) + "\nrm -rf /workspace";
+    const o = recordObject(tool({ tool_name: "bash", args: JSON.stringify({ command: cmd }) }));
+    expect(o.text).toMatch(/⏎ \+1 more line$/);
+  });
+
   it("keeps a cd the model wrote itself; only the runtime's own /workspace hop is dropped", () => {
     // (#2863 review) Stripping any `cd X &&` rendered `cd /tmp && rm -rf *`
     // as `rm -rf *`, a different command.
@@ -190,6 +252,18 @@ describe("recordObject", () => {
 
   it("falls back to the arguments when no field names the object", () => {
     expect(recordObject(tool({ tool_name: "fetch", args: '{"url":"http://x"}' })).text).toBe("url=http://x");
+  });
+
+  it("(#2863 review, finding 7) escapes a bidi override in a command so it cannot reorder the row", () => {
+    const o = recordObject(tool({ tool_name: "bash", args: JSON.stringify({ command: "echo ok‮txt.exe" }) }));
+    expect(o.text).toBe("echo ok⟨U+202E⟩txt.exe");
+    expect(o.text).not.toContain("‮");
+  });
+
+  it("(#2863 review, finding 7) escapes a bidi override in a reasoning row", () => {
+    const r = { action: "dispatch.reasoning", fields: { reasoning_text: "Let me ‮esrever siht‬ read." } } as never;
+    expect(recordObject(r).text).not.toContain("‮");
+    expect(recordObject(r).text).toContain("⟨U+202E⟩");
   });
 
   it("a reasoning row is its first line, without the JSON-string quotes it sometimes carries", () => {

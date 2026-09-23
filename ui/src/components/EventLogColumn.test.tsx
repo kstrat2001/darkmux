@@ -1092,6 +1092,27 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(rest).toHaveAttribute("data-act", "rec");
   });
 
+  // (#2863 review, finding 2) The governor's own state-change record
+  // (`emit_rest`, `thermal_governor.rs`) shares the `dispatch.rest` action
+  // with a real rest but carries `{pause: false, delay_ms, state}` — no rest
+  // ever happened, only the pacing changed. The `?? f.delay_ms` fallback
+  // rendered it as "rested 15 s" too, so a run that never paused could show
+  // an extra rest divider. Only the `ms` shape is a rest.
+  it("a pacing-change record (no `ms`) reads as pacing, not a rest that happened", () => {
+    const pacing = [
+      ...records,
+      r(20, "dispatch.rest", { pause: false, delay_ms: 15000, state: "fair" }),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={pacing} visible />);
+    const rests = document.querySelectorAll(".eventlog__rec--rest");
+    expect(rests).toHaveLength(1);
+    expect(rests[0].textContent).toBe("rested 15 s · thermal: fair");
+    const pacingRow = document.querySelector(".eventlog__rec--pacing")!;
+    expect(pacingRow).not.toBeNull();
+    expect(pacingRow.textContent).toBe("pacing · 15 s between turns · thermal: fair");
+    expect(pacingRow).toHaveAttribute("data-act", "rec");
+  });
+
   it("a list mixing sessions shows no turn headers", () => {
     const mixed = [...records, rec({ ts: "2026-09-23T01:09:30.000Z", action: "dispatch.turn", session_id: "other", payload: { turn_seq: 1 } } as never)];
     render(<EventLogColumn scopeLabel="fleet" records={mixed} visible />);

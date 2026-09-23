@@ -126,14 +126,36 @@ const CONTAINER_ROOT = /^\/workspace\//;
  * and the stream redirect are how the runtime runs a command, not what the
  * command is. */
 function commandText(cmd: string): string {
-  return cmd
+  const stripped = cmd
     // Only the runtime's own hop into the sandbox root. A `cd` the model
     // wrote itself is part of the command: `cd /tmp && rm -rf *` is not
     // `rm -rf *` (#2863 review).
     .replace(/^cd\s+\/workspace\/?\s*&&\s*/, "")
-    .replace(/\s*2>&1\s*$/, "")
-    .split("\n")[0]
-    .trim();
+    .replace(/\s*2>&1\s*$/, "");
+  const lines = stripped.split("\n");
+  const first = lines[0].trim();
+  // (#2863 review, finding 6, security) A command with more than one line
+  // used to show only the first, no different from a genuinely single-line
+  // one — `echo ok` and `echo ok\nrm -rf /workspace` were indistinguishable.
+  // A visible marker survives padding line 1 long: it counts LINES, not
+  // characters.
+  if (lines.length > 1) {
+    const extra = lines.length - 1;
+    return `${first} ⏎ +${extra} more line${extra === 1 ? "" : "s"}`;
+  }
+  return first;
+}
+
+/** (#2863 review, finding 5) A `write` call's `content` can be long enough
+ * that the host's per-call args cap is exhausted before the raw args string
+ * ever reaches `path` (`content` precedes `path` in the call's own key
+ * order) — `fieldFromRaw` cannot find a key that was never included in what
+ * it was given. The runtime's own result names the path it wrote
+ * (`runtime/src/tools/mod.rs`'s `write`: `"Wrote {n} bytes to {path}"`), so
+ * that is read as the fallback before showing raw JSON. */
+function pathFromResult(result: string): string | null {
+  const m = result.match(/^Wrote \d+ bytes to (\S+)/);
+  return m ? m[1] : null;
 }
 
 /** The one field that names a tool call's object, read out of arguments
@@ -198,6 +220,18 @@ function fieldFromRaw(raw: string, keys: readonly string[]): { key: string; valu
   return null;
 }
 
+/** (#2863 review, finding 7, security — Trojan-Source class) A model-written
+ * command, pattern, path or reasoning string can carry bidi override
+ * (U+202A–U+202E, U+2066–U+2069) or zero-width (U+200B–U+200F) control
+ * characters. Rendered raw, these REORDER what a row visually displays
+ * without changing what actually runs — the same technique CVE-class as
+ * Trojan Source. Each one is replaced with a visible, unambiguous escape
+ * naming its own code point, so the row shows what is actually there. */
+const BIDI_CONTROL = /[‪-‮⁦-⁩​-‏]/g;
+export function escapeBidiControls(s: string): string {
+  return s.replace(BIDI_CONTROL, (ch) => `⟨U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}⟩`);
+}
+
 function unquote(s: string): string {
   const t = s.trim();
   return t.startsWith('"') ? t.replace(/^"+|"+$/g, "") : t;
@@ -232,11 +266,14 @@ export function recordObject(r: FlowRecord): RecordObject {
       text = args.path.replace(CONTAINER_ROOT, "");
     } else {
       const raw = typeof f.args === "string" && !args ? fieldFromRaw(f.args, ["command", "pattern", "path"]) : null;
+      const resultPath = typeof f.result === "string" ? pathFromResult(f.result) : null;
       if (raw?.key === "path") {
         text = raw.value.replace(CONTAINER_ROOT, "");
       } else if (raw) {
         text = raw.key === "command" ? commandText(raw.value) : raw.value;
         mono = true;
+      } else if (resultPath) {
+        text = resultPath.replace(CONTAINER_ROOT, "");
       } else {
         text = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
         mono = true;
@@ -250,13 +287,16 @@ export function recordObject(r: FlowRecord): RecordObject {
     } else if (f.ok === true) {
       outcome = "ok";
     }
-    const o: RecordObject = { chip: String(f.tool_name ?? "tool"), kind: "tool", text, mono };
+    // (#2863 review, finding 7) `text` above came from a model-controlled
+    // command/pattern/path — the one place bidi/zero-width control
+    // characters can reach this row.
+    const o: RecordObject = { chip: String(f.tool_name ?? "tool"), kind: "tool", text: escapeBidiControls(text), mono };
     if (outcome) o.outcome = outcome;
     return o;
   }
   if (a === "dispatch.reasoning" && typeof f?.reasoning_text === "string") {
     const first = unquote(f.reasoning_text).split("\n").find((l) => l.trim()) ?? "";
-    return { chip: "reasoning", kind: "think", text: first.trim() || "(no reasoning text)", mono: false };
+    return { chip: "reasoning", kind: "think", text: escapeBidiControls(first.trim()) || "(no reasoning text)", mono: false };
   }
-  return { text: recordDetail(r), mono: false };
+  return { text: escapeBidiControls(recordDetail(r)), mono: false };
 }

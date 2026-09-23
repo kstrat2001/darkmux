@@ -1262,11 +1262,28 @@ export function EventLogColumn({
               // (#2863) A rest is a divider between turns, not a row among them.
               if (item.kind === "rest") {
                 const f = (r.fields || r.payload || {}) as Record<string, unknown>;
-                const ms = typeof f.ms === "number" ? f.ms : typeof f.delay_ms === "number" ? f.delay_ms : null;
+                const ms = typeof f.ms === "number" ? f.ms : null;
+                if (ms !== null) {
+                  return (
+                    <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
+                      <span className="eventlog__ractivity">
+                        rested {Math.round(ms / 1000)} s
+                        {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
+                      </span>
+                    </div>
+                  );
+                }
+                // (#2863 review, finding 2) The governor's own state-change
+                // record shares the `dispatch.rest` action but carries
+                // `{pause, delay_ms, state}` — no rest happened, only the
+                // pacing between turns changed. Rendering it as "rested N s"
+                // (the old `?? f.delay_ms` fallback) claimed a pause that
+                // never occurred. This is quieter and names what it is.
+                const delay = typeof f.delay_ms === "number" ? f.delay_ms : null;
                 return (
-                  <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
+                  <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
                     <span className="eventlog__ractivity">
-                      rested{ms !== null ? ` ${Math.round(ms / 1000)} s` : ""}
+                      pacing{delay !== null ? ` · ${Math.round(delay / 1000)} s between turns` : ""}
                       {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
                     </span>
                   </div>
