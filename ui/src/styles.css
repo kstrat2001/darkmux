@@ -5235,6 +5235,13 @@ body {
      longer a space inside `.mv` for nowrap to trap against the tile edge. */
   white-space: nowrap;
 }
+/* (#2863) A unit naming the figure ("avg"), on the value's line, quieter. */
+.session-run .munit {
+  margin-left: 0.3em;
+  font-size: 0.7em;
+  font-weight: 500;
+  color: var(--dim);
+}
 .session-run .ml {
   order: 1;
   font-size: calc(10px * var(--fs-scale));

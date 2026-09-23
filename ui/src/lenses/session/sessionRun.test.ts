@@ -582,11 +582,14 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // or overflow the tile; a value can never again contain a second,
     // space-separated figure.
     expect(tileFor("CPU")?.value).toBe("27%");
-    expect(tileFor("CPU")?.sub).toBe("avg · 39% high");
+    expect(tileFor("CPU")?.sub).toBe("39% high");
+    expect(tileFor("CPU")?.unit).toBe("avg");
     expect(tileFor("RAM")?.value).toBe("63%");
-    expect(tileFor("RAM")?.sub).toBe("avg · 68% high");
+    expect(tileFor("RAM")?.sub).toBe("68% high");
+    expect(tileFor("RAM")?.unit).toBe("avg");
     expect(tileFor("GPU")?.value).toBe("43%");
-    expect(tileFor("GPU")?.sub).toBe("avg · 97% high");
+    expect(tileFor("GPU")?.sub).toBe("97% high");
+    expect(tileFor("GPU")?.unit).toBe("avg");
     // No metric's value smuggles a second figure back in via a space.
     for (const l of ["CPU", "RAM", "GPU"]) {
       expect(tileFor(l)?.value, `${l}'s value must be one figure`).not.toContain(" ");

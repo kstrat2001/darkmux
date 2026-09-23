@@ -430,7 +430,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
         {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
           <div className="met" key={i} title={m.hintTitle}>
-            <div className="mv">{m.value}</div>
+            <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
             <div className="ml" data-hint={m.hint}>{m.label}</div>
             {/* (operator, 2026-09-05, second pass) Rendered ONLY when
                 non-empty — grid row `align-items: stretch` (the default,
@@ -456,7 +456,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
         <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
           {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i} title={m.hintTitle}>
-              <div className="mv">{m.value}</div>
+              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>

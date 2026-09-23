@@ -153,7 +153,7 @@ export interface SessionRunView {
    * instead. Every tile renders its `sub` slot, empty or not, so the grid
    * doesn't go ragged the moment one tile has more to say than its
    * neighbors — see `.session-run .msub` in `styles.css`. */
-  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string }>;
+  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }>;
   /** (#1973) Which metrics describe the MODEL's work and which describe the
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
@@ -821,9 +821,13 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // `sub` — the same value/label/sub split CTX got, applied here because
   // this was the OTHER place a tile's value was a multi-stat phrase rather
   // than a figure.
-  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string } => ({
+  // (#2863) "avg" names the big figure, so it rides beside it as a `unit`
+  // (rendered small, same line) rather than leading the sub line, where it
+  // read as a label for the peak beneath it.
+  const avgHighSplit = (m: { avg: number | null; high: number | null }): { value: string; sub: string; unit: string } => ({
     value: `${roundPct(m.avg)}%`,
-    sub: `avg · ${roundPct(m.high)}% high`,
+    sub: `${roundPct(m.high)}% high`,
+    unit: "avg",
   });
 
   // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
@@ -831,12 +835,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // conditional (host tiles only exist when host telemetry does), and an
   // audit already flagged the hardcoded form as a positional contract nothing
   // enforced — this makes the two unable to drift because there is only one.
-  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string }> = [];
+  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }> = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string) => {
+  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string) => {
     into.push(metrics.length);
-    metrics.push({ value, label, hint, hintTitle, sub });
+    metrics.push({ value, label, hint, hintTitle, sub, unit });
   };
   push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
   push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
@@ -873,15 +877,15 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
   if (cpuPeak != null) {
     const s = avgHighSplit(hostAgg.cpu);
-    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub);
+    push(systemIdx, s.value, "CPU", undefined, undefined, s.sub, s.unit);
   }
   if (ramPeak != null) {
     const s = avgHighSplit(hostAgg.mem);
-    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub);
+    push(systemIdx, s.value, "RAM", undefined, undefined, s.sub, s.unit);
   }
   if (gpuPeak != null) {
     const s = avgHighSplit(hostAgg.gpu);
-    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub);
+    push(systemIdx, s.value, "GPU", undefined, undefined, s.sub, s.unit);
   }
   // (#2413 M4) CPU/RAM/GPU used to silently vanish here whenever the
   // machine-scoped join below found nothing for this run's window — no
