@@ -71,6 +71,25 @@ const MIN_DETAIL_PCT = 15;
 const MAX_DETAIL_PCT = 70;
 const DEFAULT_DETAIL_PCT = 38;
 
+/** (#2863) The column's width, set by dragging its left edge on desktop.
+ * 380px is the width it always had, and stays the MINIMUM: narrower and the
+ * rows stop being readable. Dragging `COLLAPSE_SLACK_PX` past the minimum
+ * collapses the column to the existing #1066 rail instead, so there is one
+ * collapsed state, not a second one. The page beside it keeps at least
+ * `PAGE_MIN_PX`. */
+export const MIN_COL_WIDTH_PX = 380;
+const COLLAPSE_SLACK_PX = 80;
+const PAGE_MIN_PX = 420;
+const COL_WIDTH_STEP_PX = 20;
+
+function maxColWidth(): number {
+  return Math.max(MIN_COL_WIDTH_PX, window.innerWidth - PAGE_MIN_PX);
+}
+
+function clampColWidth(w: number): number {
+  return Math.round(Math.min(maxColWidth(), Math.max(MIN_COL_WIDTH_PX, w)));
+}
+
 /** Enter/Space activates a `role="button"` `<div>` the same way a native
  * `<button>` would (matching `RunsBoard.tsx`'s own `onActivateKeyDown`) —
  * needed because `.eventlog__rec` is a click-only div with no other
@@ -195,6 +214,33 @@ function collapseKeyFor(pane: string): string {
  * `lib/drawerStorage.ts`'s own persistence for the phone drawer's height. */
 function detailPctKeyFor(pane: string): string {
   return `dmux.eventlog.detailpct.${pane}`;
+}
+
+/** (#2863) Per mount site, same scoping as the split ratio: the App-level
+ * column is ONE mount site across every route, so its width is app-wide,
+ * while a lens's own pane keeps its own. `localStorage`, like the ratio: a
+ * width is a deliberate layout preference worth keeping across a refresh. */
+function colWidthKeyFor(pane: string): string {
+  return `dmux.eventlog.width.${pane}`;
+}
+
+function loadColWidth(pane: string): number {
+  try {
+    const raw = window.localStorage.getItem(colWidthKeyFor(pane));
+    const n = raw === null ? NaN : Number(raw);
+    if (Number.isFinite(n)) return clampColWidth(n);
+  } catch {
+    // storage unavailable — fall through to the default
+  }
+  return MIN_COL_WIDTH_PX;
+}
+
+function persistColWidth(pane: string, w: number): void {
+  try {
+    window.localStorage.setItem(colWidthKeyFor(pane), String(Math.round(w)));
+  } catch {
+    // storage unavailable — the width just won't survive a refresh
+  }
 }
 
 function loadDetailPct(pane: string): number {
@@ -405,16 +451,15 @@ export function EventLogColumn({
       return false;
     }
   });
-  const toggleCollapsed = () => {
-    setCollapsed((c) => {
-      try {
-        window.sessionStorage.setItem(collapseKeyFor(paneId), c ? "0" : "1");
-      } catch {
-        // ignore — storage unavailable
-      }
-      return !c;
-    });
+  const setCollapsedPersisted = (next: boolean) => {
+    try {
+      window.sessionStorage.setItem(collapseKeyFor(paneId), next ? "1" : "0");
+    } catch {
+      // ignore — storage unavailable
+    }
+    setCollapsed(next);
   };
+  const toggleCollapsed = () => setCollapsedPersisted(!collapsed);
 
   // (operator, 2026-09-01) On a phone the filters render INLINE in this pane
   // rather than as a modal stacked over a small screen, and the `filters`
@@ -470,6 +515,10 @@ export function EventLogColumn({
 
   const columnRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startY: number; startPct: number } | null>(null);
+  // (#2863) The column's own width and the drag that sets it.
+  const [colWidth, setColWidth] = useState(() => loadColWidth(paneId));
+  const widthDragRef = useRef<{ startX: number; startW: number; proposed: number } | null>(null);
+  const [widthReadout, setWidthReadout] = useState<string | null>(null);
 
   const filtered = useMemo(() => records.filter((r) => matchesFilters(r, filters)), [records, filters]);
 
@@ -560,6 +609,50 @@ export function EventLogColumn({
       }
       return next;
     });
+  }
+
+  // (#2863) Left-edge drag. The column sits on the RIGHT, so dragging LEFT
+  // widens it. Past the minimum by `COLLAPSE_SLACK_PX`, releasing collapses
+  // it to the rail rather than squeezing it below readable.
+  function commitColWidth(w: number) {
+    const next = clampColWidth(w);
+    setColWidth(next);
+    persistColWidth(paneId, next);
+  }
+  function onWidthPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    widthDragRef.current = { startX: e.clientX, startW: colWidth, proposed: colWidth };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    setWidthReadout(`${colWidth}px`);
+  }
+  function onWidthPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = widthDragRef.current;
+    if (!drag) return;
+    drag.proposed = drag.startW + (drag.startX - e.clientX);
+    const willCollapse = drag.proposed < MIN_COL_WIDTH_PX - COLLAPSE_SLACK_PX;
+    const shown = clampColWidth(drag.proposed);
+    setColWidth(shown);
+    setWidthReadout(willCollapse ? "release to collapse" : `${shown}px${shown === MIN_COL_WIDTH_PX ? " · min" : ""}`);
+  }
+  function onWidthPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = widthDragRef.current;
+    widthDragRef.current = null;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    setWidthReadout(null);
+    if (!drag) return;
+    if (drag.proposed < MIN_COL_WIDTH_PX - COLLAPSE_SLACK_PX) {
+      commitColWidth(MIN_COL_WIDTH_PX);
+      setCollapsedPersisted(true);
+    } else {
+      commitColWidth(drag.proposed);
+    }
+  }
+  function onWidthKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "ArrowLeft") commitColWidth(colWidth + COL_WIDTH_STEP_PX);
+    else if (e.key === "ArrowRight") commitColWidth(colWidth - COL_WIDTH_STEP_PX);
+    else if (e.key === "Home") commitColWidth(MIN_COL_WIDTH_PX);
+    else if (e.key === "Enter") setCollapsedPersisted(true);
+    else return;
+    e.preventDefault();
   }
 
   // `.split` drag-to-resize — Pointer Events (not mouse-only), so this
@@ -703,7 +796,33 @@ export function EventLogColumn({
     <div
       className={`eventlog${visible ? "" : " eventlog--hidden"}${collapsed ? " eventlog--collapsed" : ""}`}
       ref={columnRef}
+      style={{ "--eventlog-w": `${colWidth}px` } as React.CSSProperties}
     >
+      {/* (#2863) The width handle: desktop only (on a phone the events live
+          in the bottom sheet, sized by its own handle), and absent while
+          collapsed, where the rail button is the way back. */}
+      {!isMobile && !pushDetail && !collapsed && (
+        <div
+          className={`eventlog__resize${widthReadout ? " eventlog__resize--dragging" : ""}`}
+          data-act="eventlog-resize"
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-label="Resize the event log"
+          aria-valuemin={MIN_COL_WIDTH_PX}
+          aria-valuemax={maxColWidth()}
+          aria-valuenow={colWidth}
+          title="Drag to resize · double-click to reset"
+          onPointerDown={onWidthPointerDown}
+          onPointerMove={onWidthPointerMove}
+          onPointerUp={onWidthPointerUp}
+          onPointerCancel={onWidthPointerUp}
+          onDoubleClick={() => commitColWidth(MIN_COL_WIDTH_PX)}
+          onKeyDown={onWidthKeyDown}
+        >
+          {widthReadout && <span className="eventlog__resize-readout">{widthReadout}</span>}
+        </div>
+      )}
       {/* (#1066) The rail is the whole reason "collapsed" differs from
           "hidden". `visible=false` is `display:none` with nothing left to
           click — a route decides for the operator. Collapsed leaves a

@@ -854,3 +854,113 @@ describe("count pill placement (#2447)", () => {
     expect(phone.container.querySelectorAll(".eventlog__qcount").length).toBe(1);
   });
 });
+
+// ── (#2863) The vertical divider: the events column's width is the operator's ──
+//
+// Desktop only. 380px (the column's long-standing width) is the MINIMUM;
+// dragging well past it collapses the column to the existing #1066 rail, so
+// there is one collapsed state, not two. The width is kept per mount site,
+// like the split ratio above, which makes the App-level column's width
+// app-wide.
+describe("EventLogColumn — resizable width (#2863)", () => {
+  const ORIGINAL = {
+    width: Object.getOwnPropertyDescriptor(window, "innerWidth"),
+    height: Object.getOwnPropertyDescriptor(window, "innerHeight"),
+  };
+  function setViewport(width: number, height: number) {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
+  }
+  afterEach(() => {
+    if (ORIGINAL.width) Object.defineProperty(window, "innerWidth", ORIGINAL.width);
+    if (ORIGINAL.height) Object.defineProperty(window, "innerHeight", ORIGINAL.height);
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+  });
+
+  const handle = () => document.querySelector('[data-act="eventlog-resize"]') as HTMLElement;
+  const column = () => document.querySelector(".eventlog") as HTMLElement;
+  const width = () => column().style.getPropertyValue("--eventlog-w");
+  function drag(dx: number) {
+    const h = handle();
+    fireEvent.pointerDown(h, { clientX: 1000, pointerId: 1 });
+    fireEvent.pointerMove(h, { clientX: 1000 + dx, pointerId: 1 });
+    fireEvent.pointerUp(h, { clientX: 1000 + dx, pointerId: 1 });
+  }
+
+  it("renders a vertical separator at the 380px minimum", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(handle()).toHaveAttribute("role", "separator");
+    expect(handle()).toHaveAttribute("aria-orientation", "vertical");
+    expect(handle()).toHaveAttribute("aria-valuenow", "380");
+    expect(width()).toBe("380px");
+  });
+
+  it("dragging left widens the column (it sits on the right)", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-100);
+    expect(width()).toBe("480px");
+    expect(handle()).toHaveAttribute("aria-valuenow", "480");
+  });
+
+  it("never narrower than 380px while short of the collapse point", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(60);
+    expect(width()).toBe("380px");
+    expect(column()).not.toHaveClass("eventlog--collapsed");
+  });
+
+  it("dragging well past the minimum collapses to the existing rail", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(120);
+    expect(column()).toHaveClass("eventlog--collapsed");
+    expect(width()).toBe("380px"); // reopening restores a usable width
+  });
+
+  it("never so wide that the page beside it drops under 420px", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-2000);
+    expect(width()).toBe(`${1440 - 420}px`);
+  });
+
+  it("the width persists per mount site and is restored on the next mount", () => {
+    setViewport(1440, 900);
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-100);
+    expect(window.localStorage.getItem("dmux.eventlog.width.app")).toBe("480");
+    unmount();
+    render(<EventLogColumn scopeLabel="runs" records={[]} visible />);
+    expect(width()).toBe("480px");
+  });
+
+  it("double-click resets to 380px", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    drag(-100);
+    fireEvent.doubleClick(handle());
+    expect(width()).toBe("380px");
+  });
+
+  it("keyboard: arrows resize by 20px, Enter collapses", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.keyDown(handle(), { key: "ArrowLeft" });
+    expect(width()).toBe("400px");
+    fireEvent.keyDown(handle(), { key: "ArrowRight" });
+    fireEvent.keyDown(handle(), { key: "ArrowRight" });
+    expect(width()).toBe("380px");
+    fireEvent.keyDown(handle(), { key: "Enter" });
+    expect(column()).toHaveClass("eventlog--collapsed");
+  });
+
+  it("is not offered on a phone, where the events live in the bottom sheet", () => {
+    setViewport(390, 844);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(handle()).toBeNull();
+  });
+});
