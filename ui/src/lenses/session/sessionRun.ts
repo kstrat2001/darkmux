@@ -960,7 +960,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         })
       : undefined;
   const modelTrackLines = ep
-    ? [`${model || "unknown"} · served by the endpoint above — no local model loaded`]
+    ? [model || "unknown"]
     : orderedLoads.length
       ? orderedLoads.map((r) => {
           const f = r.fields as Record<string, unknown>;

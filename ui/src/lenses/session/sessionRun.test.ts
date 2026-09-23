@@ -241,7 +241,10 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o");
     expect(view.modelTrackLabel).toBe("endpoint model");
-    expect(view.modelTrackLines[0]).toMatch(/served by the endpoint above — no local model loaded/);
+    // (#2863) Just the model. "no local model loaded" was false for an
+    // endpoint on this machine (a local server speaking an HTTP dialect), and
+    // the route line above already names where it was served.
+    expect(view.modelTrackLines).toEqual(["gpt-4o"]);
   });
 
   it("a jit-model-swap (more than one local model loaded in one run) surfaces as a warning detection", () => {
