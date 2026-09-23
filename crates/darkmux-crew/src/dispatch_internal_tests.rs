@@ -15204,3 +15204,62 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             turns[2]
         );
     }
+
+    /// (#2863) A turn record carries the turn's GENERATION time, summed over
+    /// every stream it took. The viewer's turn header shows it; the flow's
+    /// own timestamps are whole seconds, which is guesswork for a 1.3 s turn.
+    #[test]
+    #[serial]
+    fn a_turns_model_time_never_leaks_into_another_turn() {
+        // (#2863 review) Two guards, each unpinned before: a stream's end only
+        // counts toward the turn its OWN start opened, and a turn's time is
+        // consumed by its record, so a seq seen again never re-reports it.
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: serialized via `#[serial]`; no concurrent env reader.
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-leak".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // A start for seq 4 closed by an end naming seq 5: counts for neither.
+        state.handle_event(r#"{"type":"model.streaming.start","seq":4,"ts":1000}"#);
+        state.handle_event(r#"{"type":"model.streaming.end","seq":5,"ts":3000}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":5,"finish_reason":"stop","usage":{"completion_tokens":1}}"#);
+        // Seq 6: 2.0 s, reported once; the same seq completing again carries nothing.
+        state.handle_event(r#"{"type":"model.streaming.start","seq":6,"ts":10000}"#);
+        state.handle_event(r#"{"type":"model.streaming.end","seq":6,"ts":12000}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":6,"finish_reason":"stop","usage":{"completion_tokens":1}}"#);
+        state.handle_event(r#"{"type":"model.completed","seq":6,"finish_reason":"stop","usage":{"completion_tokens":1}}"#);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-leak");
+        let times: Vec<(serde_json::Value, Option<serde_json::Value>)> = records
+            .iter()
+            .filter(|v| v["action"] == "dispatch.turn")
+            .map(|v| (v["payload"]["turn_seq"].clone(), v["payload"].get("generation_ms").cloned()))
+            .collect();
+        assert_eq!(
+            times,
+            vec![
+                (serde_json::json!(5), None),
+                (serde_json::json!(6), Some(serde_json::json!(2000))),
+                (serde_json::json!(6), None),
+            ],
+            "got {times:?}"
+        );
+    }

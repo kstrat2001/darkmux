@@ -127,4 +127,30 @@ describe("turnItems (#2863)", () => {
   it("shows every visible row exactly once", () => {
     expect(turnItems(VISIBLE, ALL).map((i) => i.rec)).toHaveLength(VISIBLE.length);
   });
+
+  it("two role executions in one session keep their own turn 1 (keyed per execution, not by bare seq)", () => {
+    // (#2863 review) A second `dispatch start` restarts turn_seq at 1; keyed
+    // by the bare seq, one turn header overwrote the other and its output
+    // summed both executions' calls.
+    const e1 = r(0, "dispatch start");
+    const t1a = r(5, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: { prompt_tokens: 100 } });
+    const k1a = r(5, "telemetry.tokens", { turn_seq: 1, completion_tokens: 10 });
+    const e2 = r(20, "dispatch start");
+    const t1b = r(25, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: { prompt_tokens: 200 } });
+    const k1b = r(25, "telemetry.tokens", { turn_seq: 1, completion_tokens: 30 });
+    const all = [e1, t1a, k1a, e2, t1b, k1b];
+    const items = turnItems([t1b, e2, t1a, e1], all);
+    const heads = items.filter((i) => i.kind === "turn");
+    expect(heads.map((h) => (h.kind === "turn" ? h.turn.outTok : null))).toEqual([30, 10]);
+    expect(items).toHaveLength(4);
+  });
+
+  it("an approximate duration that would be negative is no duration", () => {
+    // The turn's first heartbeat stamped AFTER its turn record (whole-second
+    // clocks, out-of-order delivery) must not render as a negative time.
+    const late = r(12, "dispatch.turn.heartbeat", { turn_seq: 1 });
+    const t = r(10, "dispatch.turn", { turn_seq: 1, finish_reason: "stop", usage: {} });
+    const [head] = turnItems([t], [r(0, "dispatch start"), t, late]);
+    expect(head.kind === "turn" ? head.turn.durationMs : "not a turn").toBeNull();
+  });
 });

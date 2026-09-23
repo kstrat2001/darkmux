@@ -81,7 +81,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.53.0";
 // Version history:
 //   1.53.0 (#2863): additive payload key `generation_ms` on `dispatch.turn`.
 //
-//           The turn's generation time, summed over every stream it took (a
+//           The turn's model time (request sent to stream end: prompt processing
+//           plus generation), summed over every stream it took (a
 //           checkpoint continuation resumes the same `seq`), read from the
 //           trajectory's millisecond stream bookends. The viewer's turn
 //           header shows it; the flow's own timestamps are whole seconds,

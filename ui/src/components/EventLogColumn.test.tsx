@@ -1023,6 +1023,24 @@ describe("EventLogColumn — resizable width (#2863)", () => {
     expect(document.documentElement).not.toHaveClass("is-resizing");
   });
 
+  it("a pane that unmounts mid-drag does not leave text selection off page-wide", () => {
+    // (#2863 review) Navigating away during a drag skipped pointerup, so the
+    // class stayed on <html>.
+    setViewport(1440, 900);
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.pointerDown(handle(), { clientX: 1000, pointerId: 1 });
+    expect(document.documentElement).toHaveClass("is-resizing");
+    unmount();
+    expect(document.documentElement).not.toHaveClass("is-resizing");
+  });
+
+  it("only the primary button starts a drag", () => {
+    setViewport(1440, 900);
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.pointerDown(handle(), { clientX: 1000, pointerId: 1, button: 2 });
+    expect(document.documentElement).not.toHaveClass("is-resizing");
+  });
+
   it("is not offered on a phone, where the events live in the bottom sheet", () => {
     setViewport(390, 844);
     render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);

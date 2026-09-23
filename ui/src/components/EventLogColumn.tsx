@@ -596,6 +596,8 @@ export function EventLogColumn({
   // Decided from `records`, not the filtered rows: otherwise narrowing a
   // fleet list to one session would move that session from its rows to the
   // header, and the layout would shift under the operator's own filter.
+  // Grouped once per change, not on every render (playback re-renders often).
+  const listItems = useMemo(() => turnItems(visibleRecs, records), [visibleRecs, records]);
   const shared = useMemo(() => {
     // A record with no session (machine telemetry rides the same list) says
     // nothing about which session this is, so it neither joins nor breaks
@@ -662,7 +664,12 @@ export function EventLogColumn({
     setColWidth(next);
     persistColWidth(paneId, next);
   }
+  // A pane that unmounts mid-drag (navigating away) never sees pointerup,
+  // so the page-wide selection lock is released here too (#2863 review).
+  useEffect(() => () => document.documentElement.classList.remove("is-resizing"), []);
   function onWidthPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    // Primary button only: a right-click opens a context menu, not a drag.
+    if (e.button !== 0) return;
     widthDragRef.current = { startX: e.clientX, startW: colWidth, proposed: colWidth };
     e.currentTarget.setPointerCapture?.(e.pointerId);
     // Suspend text selection page-wide for the drag: without it, dragging
@@ -1188,7 +1195,7 @@ export function EventLogColumn({
               onSetQuery={setQuery}
             />
           ) : visibleRecs.length ? (
-            turnItems(visibleRecs, records).map((item) => {
+            listItems.map((item) => {
               const r = item.rec;
               const key = recKey(r);
               const isSel = !!selected && recKey(selected) === key;
@@ -1217,7 +1224,7 @@ export function EventLogColumn({
                       {t.durationMs !== null ? (
                         <span
                           className={`eventlog__turndur${t.durationMs >= SLOW_TURN_MS ? " eventlog__turndur--slow" : ""}`}
-                          title={t.approx ? "approximate: from whole-second timestamps" : "generation time"}
+                          title={t.approx ? "approximate: from whole-second timestamps" : "model time: request sent to turn complete"}
                         >
                           {fmtTurnDuration(t.durationMs, t.approx)}
                         </span>

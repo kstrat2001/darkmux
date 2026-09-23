@@ -139,6 +139,32 @@ describe("recordObject", () => {
     expect(recordObject(tool({ tool_name: "bash", args: cmd })).text).toBe("npm test");
   });
 
+  it("reads only the call's OWN top-level keys from cut-short arguments, never a key inside a value", () => {
+    // (#2863 review) A truncated write of a file whose CONTENT holds a
+    // `"command"` key rendered that command as the row, a command that never
+    // ran. Both encodings, both key orders.
+    const content = JSON.stringify({ version: "2.0.0", tasks: [{ command: "rm -rf build", label: "clean" }] });
+    const pathFirst = JSON.stringify({ path: "/workspace/.vscode/tasks.json", content }).slice(0, 95) + "…";
+    const contentFirst = JSON.stringify({ content, path: "/workspace/.vscode/tasks.json" });
+    for (const raw of [pathFirst, contentFirst.slice(0, -1) + "…"]) {
+      for (const args of [raw, JSON.stringify(raw)]) {
+        const o = recordObject(tool({ tool_name: "write", args }));
+        expect(o.text, args).not.toContain("rm -rf");
+        expect(o.text, args).toBe(".vscode/tasks.json");
+      }
+    }
+  });
+
+  it("keeps a cd the model wrote itself; only the runtime's own /workspace hop is dropped", () => {
+    // (#2863 review) Stripping any `cd X &&` rendered `cd /tmp && rm -rf *`
+    // as `rm -rf *`, a different command.
+    const cmd = (c: string) => recordObject(tool({ tool_name: "bash", args: JSON.stringify({ command: c }) })).text;
+    expect(cmd("cd /tmp && rm -rf *")).toBe("cd /tmp && rm -rf *");
+    expect(cmd("cd crates/a && cargo test 2>&1")).toBe("cd crates/a && cargo test");
+    expect(cmd("cd /workspace/ && npm test")).toBe("npm test");
+    expect(cmd("cd /workspace/sub && npm test")).toBe("cd /workspace/sub && npm test");
+  });
+
   it("a reasoning record with no text says so rather than showing a bare chip", () => {
     const r = { action: "dispatch.reasoning", fields: { reasoning_text: "\n\n" } } as never;
     expect(recordObject(r).text).toBe("(no reasoning text)");

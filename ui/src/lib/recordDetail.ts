@@ -127,7 +127,10 @@ const CONTAINER_ROOT = /^\/workspace\//;
  * command is. */
 function commandText(cmd: string): string {
   return cmd
-    .replace(/^cd\s+\S+\s*&&\s*/, "")
+    // Only the runtime's own hop into the sandbox root. A `cd` the model
+    // wrote itself is part of the command: `cd /tmp && rm -rf *` is not
+    // `rm -rf *` (#2863 review).
+    .replace(/^cd\s+\/workspace\/?\s*&&\s*/, "")
     .replace(/\s*2>&1\s*$/, "")
     .split("\n")[0]
     .trim();
@@ -135,14 +138,62 @@ function commandText(cmd: string): string {
 
 /** The one field that names a tool call's object, read out of arguments
  * that did not parse: the host clips long arguments, so a large edit's are
- * cut mid-JSON (and may be double-encoded too). Un-escape until stable, then
- * take the first complete `"key":"value"` pair. */
+ * cut mid-JSON (and may be double-encoded too).
+ *
+ * Only the call's OWN top-level keys count. A key nested inside a value (a
+ * written file's content holding `"command": "rm -rf build"`) is not the
+ * call's command (#2863 review). So: peel whole-document encoding layers (a
+ * leading `"` means the arguments are a JSON string of JSON), then walk the
+ * object tracking strings and depth, and read only complete `"key":"value"`
+ * pairs at depth 1. Among the keys found, `keys` order decides. */
 function fieldFromRaw(raw: string, keys: readonly string[]): { key: string; value: string } | null {
-  let t = raw;
-  for (let i = 0; i < 3 && t.includes('\\"'); i++) t = t.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  let t = raw.trim();
+  for (let i = 0; i < 3 && t.startsWith('"'); i++) {
+    t = t.slice(1).replace(/"?…?$/, "").replace(/\\(["\\/])/g, "$1");
+  }
+  const found = new Map<string, string>();
+  let depth = 0;
+  let i = 0;
+  // Reads a JSON string starting at `t[at] === '"'`; null if cut short.
+  const readString = (at: number): { value: string; end: number } | null => {
+    let v = "";
+    for (let j = at + 1; j < t.length; j++) {
+      const c = t[j];
+      if (c === "\\") {
+        if (j + 1 >= t.length) return null;
+        v += t[j + 1];
+        j++;
+      } else if (c === '"') return { value: v, end: j + 1 };
+      else v += c;
+    }
+    return null;
+  };
+  while (i < t.length) {
+    const c = t[i];
+    if (c === '"') {
+      const k = readString(i);
+      if (!k) break;
+      i = k.end;
+      // A string at depth 1 followed by `:` is one of the call's own keys.
+      const rest = t.slice(i).match(/^\s*:\s*/);
+      if (depth === 1 && rest) {
+        i += rest[0].length;
+        if (t[i] === '"') {
+          const v = readString(i);
+          if (!v) break;
+          if (keys.includes(k.value) && !found.has(k.value)) found.set(k.value, v.value);
+          i = v.end;
+        }
+      }
+      continue;
+    }
+    if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") depth--;
+    i++;
+  }
   for (const key of keys) {
-    const m = t.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
-    if (m) return { key, value: m[1] };
+    const value = found.get(key);
+    if (value !== undefined) return { key, value };
   }
   return null;
 }

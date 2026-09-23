@@ -9265,7 +9265,7 @@ impl TailerState {
                     .map(|f| f != "length")
                     .unwrap_or(true);
                 if finish_is_terminal {
-                    // (#2863) The turn's generation time, from the
+                    // (#2863) The turn's model time (request sent to stream end), from the
                     // trajectory's millisecond stream bookends. Absent (not
                     // zero) when no stream was recorded.
                     let mut payload = payload;
@@ -9601,7 +9601,7 @@ impl TailerState {
                 self.emit("dispatch.feedback.injected", darkmux_flow::Level::Info, payload);
             }
             // (#2863) Stream bookends: accumulate each logical turn's
-            // generation time for its `dispatch.turn` record.
+            // model time for its `dispatch.turn` record.
             "model.streaming.start" => {
                 let seq = event.get("seq").and_then(|v| v.as_u64());
                 if let Some(ts) = event.get("ts").and_then(|v| v.as_u64()) {
