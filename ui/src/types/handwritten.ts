@@ -533,6 +533,96 @@ export interface MachinePowerWindow {
   cpu: MachineLoadMetric;
 }
 
+/** (#2705, #2821) One battery CHARGE reading — `load.now.battery`. `null`
+ * on a machine with no battery (every Mac Studio, mini, Pro) — absent, not
+ * a zeroed placeholder. `minutes_to_empty` is `null` on AC, while charging,
+ * and whenever the OS declines to estimate — never a synthesized zero (see
+ * `crates/darkmux-crew/src/host_probe/battery.rs::minutes_to_empty_from`).
+ * Source: `darkmux_crew::host_probe::battery_sample_json`. */
+export interface BatterySample {
+  charge_pct: number | null;
+  on_ac: boolean;
+  charging: boolean;
+  minutes_to_empty: number | null;
+}
+
+/** (#2705, #2821) One battery HEALTH reading — `load.battery_health`, a
+ * slow-moving MACHINE FACT refreshed on an hourly cadence (never per
+ * telemetry sample), sitting beside `now`/`window` rather than inside
+ * either. `null` on a machine with no battery.
+ *
+ * **Three condition fields, and which one a UI shows** (corrected on
+ * review, #2821): `condition` is the raw, verbatim `IOPSCopyPowerSourcesInfo`
+ * `BatteryHealth` string and is demonstrably unreliable on Apple Silicon
+ * (measured on the reference machine, 2026-09-23: it read "Check Battery").
+ * `health_condition` is a DIFFERENT, AUTHORITATIVE raw signal — verbatim
+ * `IOPSGetPowerSourceDescription`'s `BatteryHealthCondition` key — verified
+ * on the SAME machine at the SAME instant to read `""` (empty, healthy),
+ * agreeing with `system_profiler -xml SPPowerDataType`'s
+ * `sppower_battery_health: "Good"`. `condition_word` is the COMPUTED
+ * verdict derived from `health_condition` (empty -> `"Normal"`, non-empty
+ * -> passed through verbatim) with `permanent_failure_status` acting only
+ * as a FAILURE OVERRIDE (non-zero -> `"Service Battery"` regardless) — see
+ * `BatteryHealth::condition_word`'s Rust doc
+ * (`crates/darkmux-crew/src/host_probe/battery.rs`) for the full
+ * derivation and why `permanent_failure_status` alone is NOT sufficient
+ * (an earlier revision used it alone and produced a false "Normal" for a
+ * battery macOS flags "Service Recommended" for ordinary wear). Render
+ * `condition_word` as the primary condition; fall back to labeling
+ * `condition` precisely (never as "the" condition) only when
+ * `condition_word` is `null`.
+ *
+ * Correction: an earlier revision of this doc also claimed `pmset -g
+ * rawbatt` "agrees the battery is healthy" — re-checked and that is wrong;
+ * `pmset -g batt`/`-g rawbatt` print no condition word at all on this
+ * macOS version, so pmset neither agrees nor disagrees with anything here.
+ *
+ * **Capacity**: two DIFFERENT ratios, both recorded, neither claimed to be
+ * macOS's own "Maximum Capacity" figure (measured: neither reproduces it —
+ * see the Rust module doc's capacity table). The battery lens shows only
+ * the RAW ratio as its headline "charge capacity" value, labeled `(raw)`
+ * inline; the nominal ratio moves into a hover/long-press disclosure
+ * (`ui/src/lib/battery.ts`'s `capacityLine`) rather than sitting beside the
+ * raw figure as a second headline number, which read too much like macOS's
+ * own single "Maximum Capacity" percentage.
+ *
+ * `time_at_soc_hours` is the battery's own 28-bucket lifetime counter
+ * (4 groups of 7 on the reference machine) — an undocumented FLAT array
+ * whose real shape likely clusters like a 2D table (state-of-charge band
+ * × something else) collapsed into one dimension. Apple documents neither
+ * the band edges nor the grouping, so a per-bucket chart (tried, then
+ * pulled — operator decision, 2026-09-23) implicitly claims a
+ * charge-distribution reading this data cannot back. RECORDED (probe +
+ * this field) but deliberately NOT rendered anywhere today — see
+ * `BatteryLensBlock`'s own doc in `machineStatsContent.tsx` before
+ * re-adding a visualization of it. */
+export interface BatteryHealth {
+  cycle_count: number | null;
+  design_capacity_mah: number | null;
+  raw_max_capacity_mah: number | null;
+  nominal_charge_capacity_mah: number | null;
+  raw_capacity_pct: number | null;
+  nominal_capacity_pct: number | null;
+  condition: string | null;
+  /** `BatteryHealthCondition`, verbatim — the AUTHORITATIVE raw signal
+   * `condition_word` is derived from. `Some("")` (empty, present) is a
+   * definite "no condition to report" answer, distinct from `null` (key
+   * unreadable). See the interface's own doc. */
+  health_condition: string | null;
+  /** `"Normal"` when healthy, a verbatim passthrough of `health_condition`
+   * when it reports something (e.g. `"Check Battery"`,
+   * `"Permanent Battery Failure"` — Apple's own documented values, never
+   * remapped to a fixed enum), or `"Service Battery"` on a real
+   * `permanent_failure_status` failure regardless of `health_condition`.
+   * `string` rather than a closed union, matching `ThermalState`'s own
+   * convention: an unrecognized future word must render, not vanish. */
+  condition_word: string | null;
+  permanent_failure_status: number | null;
+  temperature_c: number | null;
+  time_at_soc_hours: number[] | null;
+  total_operating_time_hours: number | null;
+}
+
 /** #2108 (host-sample-shape v2) — `GET /machine/resources`'s `load` block.
  * Every field except `now.sampled_at_ms` and `now.sampler_cost_ms` is
  * OPTIONAL/null — absent when the source isn't available on this host/
@@ -541,6 +631,11 @@ export interface MachinePowerWindow {
  * coerced to a zeroed placeholder (this file's own absence-never-zero
  * convention). Source: `crates/darkmux-serve/src/host_sampler.rs`. */
 export interface MachineLoad {
+  /** (#2821) The slow-moving battery HEALTH fact — see `BatteryHealth`'s
+   * own doc. Sits beside `now`/`window`, not inside either (it is neither
+   * an instantaneous reading nor a window reduction). `null`/absent on a
+   * machine with no battery, or a daemon that predates #2705. */
+  battery_health?: BatteryHealth | null;
   now: {
     sampled_at_ms: number;
     /** The probe's own wall cost for THIS sample — the observer-cost
@@ -562,6 +657,9 @@ export interface MachineLoad {
     gpu_mem_bytes: number | null;
     thermal: MachineThermalNow | null;
     power_mw: MachinePowerNow | null;
+    /** (#2705, #2821) `null` on a machine with no battery — absent, not a
+     * zeroed placeholder. See `BatterySample`'s own doc. */
+    battery: BatterySample | null;
   };
   window: {
     samples: number;

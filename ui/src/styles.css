@@ -4761,58 +4761,10 @@ body {
   margin: 4px 0;
 }
 
-/* (#1809) The link out to this machine's pinned runs lens, replacing the
-   per-run list that used to live here. Styled as a control rather than a
-   document link: a bare `<a>` renders as the browser's default blue
-   underline, which is the only such thing on a page built entirely from
-   bordered cards and chips. Carries the same box the expand-control that
-   used to sit here had (bordered, accent, 44px touch target), so the
-   affordance reads as the one operators already learned. */
-.machine-lens__runslink {
-  display: inline-block;
-  margin-top: 14px;
-  padding: 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--accent);
-  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  text-decoration: none;
-  position: relative;
-}
-/* 44px touch target without inflating the painted control — the same
-   `::after` technique the chrome controls use. */
-.machine-lens__runslink::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  height: 44px;
-  transform: translateY(-50%);
-}
-.machine-lens__runslink:hover,
-.machine-lens__runslink:focus-visible {
-  border-color: var(--accent);
-}
-/* (#2108, operator finding) On a phone this control sat at roughly HALF
-   the card's width with dead space beside it — an `inline-block` sized to
-   its own text, not to the card. The mobile variant (`useIsMobile`, the
-   drawer's own 768px breakpoint) makes it screen-wide within the card and
-   a real 48px iOS touch target (not the invisible `::after` overlay
-   desktop uses — full-width already gives it that height honestly);
-   "runs on <machine>" reads on the left, the `→` pins right via the
-   `justify-content: space-between` this needs `display: flex` for.
-   Desktop (`.machine-lens__runslink` alone, no modifier) is completely
-   unchanged. */
-.machine-lens__runslink--mobile {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  min-height: 48px;
-  box-sizing: border-box;
-  padding: 0 14px;
-}
+/* (#1809, removed 2026-09-23 — operator: "the runs link is out of place.
+   probably just remove it.") `.machine-lens__runslink`/`--mobile` used to
+   style the link out to this machine's pinned runs lens; deleted along
+   with the `<a>` it styled (`MachineLens.tsx`). */
 
 /* `.hint` is used by this lens's empty state and was likewise undefined —
    legacy defines it at viewer.html:455. */
@@ -6879,23 +6831,22 @@ body {
 .mm-gauge--compact svg {
   display: block;
 }
-.mm-gauge-fill-compact {
-  stroke: var(--accent);
-}
-/* (#2122) Band-threshold coloring for a compact gauge's fill — one class
-   per severity (`Meter.tsx`'s `bandLevelClass`), overriding whatever
-   literal `stroke` the caller passed. A CSS class rule outranks an SVG
-   presentation attribute (`stroke="..."` on the element) regardless of
-   selector order here, so this needs no `!important` and no extra
-   specificity games — same two tokens the thermal pill already uses
-   (`--warn` for fair, `--bad` for serious/critical), so a loaded GPU and
-   a loaded CPU speak the same color language on the same panel. */
-.mm-band-warn {
-  stroke: var(--warn);
-}
-.mm-band-critical {
-  stroke: var(--bad);
-}
+/* (gradient-everywhere pass, operator 2026-09-24) `.mm-gauge-fill-compact`
+   USED to set `stroke: var(--accent)` here — and because a CSS class rule
+   outranks an SVG presentation attribute (the exact mechanism the OLD
+   `.mm-band-warn`/`.mm-band-critical` arc rules relied on, immediately
+   below in `git blame`), that declaration would have silently overridden
+   every compact dial's new `stroke="url(#mm-compact-ramp)"` attribute and
+   the gradient would never have shown at all. Removed for that reason —
+   the fill's color now comes ONLY from the `stroke` attribute
+   `gradientBand()` sets in Meter.tsx, which is what the class is for.
+   `.mm-band-warn`/`.mm-band-critical`'s own ARC-level rules (which used to
+   live here, one `stroke:` declaration per severity) are retired for the
+   same reason `simpleBand`/`banded` are deleted (`gradientBand`'s own
+   doc): the fill is always the gradient now, and a class-driven flat-color
+   override on top of it would fight the very thing it's meant to reveal.
+   The PERCENTAGE TEXT keeps its own threshold color — that signal is
+   still real and non-redundant with the ramp. */
 .meter-now.mm-band-warn {
   color: var(--warn);
 }
@@ -7226,6 +7177,126 @@ body {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
   text-align: center;
+}
+
+/* (#2821, the full arc of this surface's own history — see
+   `BatteryBar`'s own doc in machineStatsContent.tsx for the operator
+   quotes behind each turn) The battery caption slot now carries ONLY the
+   time-remaining estimate ("2 h 10 m left"), shown while discharging with
+   an estimate — every other state speaks through the icon drawn inside
+   the meter instead. Reuses `.cluster-tile__caption`'s exact type
+   treatment (same quiet mono caption every compact gauge in this row
+   already uses); this rule only widens it since a time estimate can run
+   longer than a cluster's "N cores · N MHz" line. */
+.battery-caption {
+  width: 100%;
+  white-space: normal;
+  text-align: center;
+}
+
+/* The battery-shaped bar's own layout: the glyph, then the percent beside
+   it. */
+.battery-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.battery-bar {
+  width: 84px;
+  height: auto;
+  display: block;
+}
+.battery-bar-body {
+  fill: #222a3c; /* `.mm-gauge-track`'s own unfilled-track color */
+  stroke: var(--border);
+  stroke-width: 2;
+}
+.battery-bar-nub {
+  fill: var(--border);
+}
+/* (gradient-everywhere pass, operator 2026-09-24: "the solid meters do not
+   indicate when things are getting tight... give every small meter the
+   same gradient treatment the big gauge uses") The fill paints from
+   `#mm-battery-ramp` (`BATTERY_RAMP_ID`, machineStatsContent.tsx) — the
+   SAME three-stop palette every dial on this page uses, REVERSED (red at
+   the empty edge, green at the full edge; `batteryRampStops`,
+   `lib/battery.ts`). The `fill` attribute is set inline in JSX
+   (`url(#mm-battery-ramp)`), never here — this class carries no `fill`
+   declaration of its own for the SAME reason `.mm-gauge-fill-compact` lost
+   its `stroke: var(--accent)` above: a CSS declaration would outrank the
+   presentation attribute and silently hide the gradient underneath a flat
+   color. No discrete warn/critical threshold class here either (dropped
+   with the CPU/GPU/MEM fill's own — see `meterBandLevel`'s doc): the
+   reversed ramp already reddens toward empty on its own, state-invariant
+   (same on AC or discharging — "the gradient describes charge, not risk
+   of the source"), so a threshold on top would double up on the same
+   fact. */
+.battery-bar-fill {
+}
+/* (operator, 2026-09-24: "seems like a lightning bolt icon works inside
+   the battery or next to it") The charging/on-AC glyph, drawn centered
+   over the fill. Needs a color that reads against ANY point on the
+   red-to-green ramp underneath it — `var(--bg)` (the page's own
+   background, near-black) with a soft light stroke reads as an etched
+   knockout glyph rather than disappearing into whichever fill color is
+   under it at the moment. */
+.battery-bar-icon {
+  font-size: 13px;
+  fill: var(--bg);
+  paint-order: stroke;
+  stroke: var(--fg);
+  stroke-width: 0.6px;
+}
+.battery-bar-pct {
+  font: 700 calc(15px * var(--fs-scale))/1.2 var(--font-mono);
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* (operator, 2026-09-24) Desktop ("better use of space"): the meter sits
+   to the RIGHT of the info rows, vertically centered against them, via
+   ordinary flex — DOM order stays meter-then-info (so a narrow viewport's
+   default column stack, no media query matched, reads meter above rows
+   with no reordering needed) and `row-reverse` here flips ONLY the
+   visual order, placing the meter (first in DOM) at the trailing/right
+   edge and the info column (second in DOM) at the leading/left edge.
+   Phone: plain column stack, gap matching `.meter-row + .dialog__kv`'s
+   own established 14px block-to-block rhythm elsewhere on this page (not
+   a new number) so the caption/meter block doesn't sit tight against the
+   rows below it. */
+.battery-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.battery-meter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.battery-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+@media (min-width: 481px) {
+  /* Both columns take their content width and pack to the LEFT (with
+     row-reverse, `flex-end` is the left edge), so the meter sits a fixed
+     gap after the info rows instead of at the far edge of a wide lens
+     (operator: "too far to the right"). */
+  .battery-layout {
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 48px;
+  }
+  .battery-meter {
+    flex: 0 0 auto;
+  }
+  .battery-info {
+    flex: 0 1 auto;
+  }
 }
 
 /* (#2108, operator finding — wrap fix) The mobile identity block — two

@@ -24,6 +24,7 @@ const LOAD: MachineLoad = {
     gpu_mem_bytes: null,
     thermal: null,
     power_mw: null,
+    battery: null,
   },
   window: {
     samples: 5,

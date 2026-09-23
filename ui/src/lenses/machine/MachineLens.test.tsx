@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -204,15 +204,17 @@ describe("MachineLens", () => {
     expect(document.querySelector(".machine-lens__health")?.getAttribute("data-state")).not.toBe("remote");
   });
 
-  // (#2814) The other half of resolving self by uid, and it is a regression
-  // the uid fix CREATES if nothing catches it: every name on this page comes
-  // from `nameOf(targetUid)`, which answers with the raw uid when the window
-  // holds no record naming it. Before the uid fix, `targetUid` on an empty
-  // window WAS the machine's name (via `localMachineUid`'s `?? machineId`
-  // fallback), so the label read correctly by accident. Resolving the real
-  // uid is right, and it turns "runs on MacBook-Pro" into
-  // "runs on F9ACF59C-..." unless the name gets the same floor.
-  it("(#2814) labels this machine by its NAME on an empty window, never by its raw uid", async () => {
+  // (#2814) `label` (`displayNameOf(targetUid)`) used to be user-visible
+  // ONLY via the "runs on <machine> →" link (removed 2026-09-23); on a
+  // LOCAL render (this test) it has no other visible consumer today, so
+  // the positive "the resolved name shows up as text" half of this
+  // regression check no longer has anywhere to assert against. The
+  // NEGATIVE half — the raw uid must never leak into the page at all —
+  // stays meaningful on its own and is still worth pinning. The pure
+  // resolution logic itself (`displayNameOf` is a FLOOR, an observed name
+  // outranks the specs name, self-vs-other) is fully covered without a
+  // DOM render in `ui/src/lib/flow.test.ts`'s own `(#2814)`-tagged tests.
+  it("(#2814) never leaks the raw hardware uid into the page, even when the window names nothing", async () => {
     mockMachineFetch({
       specs: {
         machine_id: "MacBook-Pro",
@@ -223,32 +225,7 @@ describe("MachineLens", () => {
     });
     renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
-    expect(screen.getByText(/runs on MacBook-Pro/)).toBeInTheDocument();
     expect(document.body.textContent).not.toContain("F9ACF59C");
-  });
-
-  // Inverted: a name the window DID observe still wins, so the specs name is
-  // a floor rather than an override (#2030 — a value that cannot be outvoted
-  // is the defect).
-  it("(#2814) an observed alias still outranks the specs name in the label", async () => {
-    mockMachineFetch({
-      specs: {
-        machine_id: "MacBook-Pro",
-        machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
-        cpu_brand: "M5 Max",
-        ram_total_bytes: 137438953472,
-      },
-      flowToday: [
-        {
-          ts: `${todayUTC()}T00:00:00Z`,
-          machine_uid: "F9ACF59C-0E8B-5092-A6B4-7C07070737D2",
-          machine_id: "MacBook-Pro.local",
-        },
-      ],
-    });
-    renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
-    expect(screen.getByText(/runs on MacBook-Pro\.local/)).toBeInTheDocument();
   });
 
   // Inverted, so the fix cannot be "treat every drilled uid as local": a
@@ -311,7 +288,7 @@ describe("MachineLens", () => {
     expect(screen.getByText(/limit source/i)).toBeInTheDocument();
   });
 
-  it("an unrecognized/stale uid degrades gracefully — links to its (empty) runs lens by the raw uid, never crashes", async () => {
+  it("an unrecognized/stale uid degrades gracefully — never crashes", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine("totally-unknown-uid-nobody-has-ever-seen");
     // (#2108, operator finding) No name to show (unrecognized uid, no
@@ -322,13 +299,6 @@ describe("MachineLens", () => {
         "fleet › machine",
       ),
     );
-    // (#1809) The old "no runs recorded for this machine" hint text is gone
-    // with the runs list itself — a stale uid still gets a real, honestly
-    // zero-count link out (never a crash, never a stale-looking count).
-    // The raw uid survives HERE, in the link's own href, even though the
-    // header above no longer names it.
-    const link = screen.getByRole("link", { name: /runs on/i });
-    expect(link).toHaveAttribute("href", "#lens=runs&machine=totally-unknown-uid-nobody-has-ever-seen");
     expect(screen.getByText(/not reported from here/i)).toBeInTheDocument();
   });
 
@@ -503,149 +473,23 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
   });
 });
 
-function renderMachineLens(isMobileOverride?: boolean) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <MachineLens uid={null} isMobileOverride={isMobileOverride} />
-    </QueryClientProvider>,
-  );
-}
+// (#1809 shipped the runs-lens link this file used to test here; removed
+// 2026-09-23 — operator: "the runs link is out of place. probably just
+// remove it." `renderMachineLens`/`mockMachineRunsFetch`/
+// `machineFlowRecord` and the whole "MachineLens — the runs-lens link"
+// describe block existed solely to test it and are gone with it — a
+// bordered `<a>` this lens no longer renders has nothing left to assert.)
 
-/** One flow record per session. */
-function machineFlowRecord(sessionId: string) {
-  return {
-    ts: `${todayUTC()}T10:00:00.000Z`,
-    machine_uid: "u1",
-    machine_id: "MacBook-Pro",
-    session_id: sessionId,
-    handle: "coder",
-    model: "qwen3.6-35b-a3b",
-  };
-}
-
-function mockMachineRunsFetch(runCount: number) {
-  const today = todayUTC();
-  const yesterday = prevDateUTC(today);
-  const records = Array.from({ length: runCount }, (_, i) => machineFlowRecord(`s${i}`));
-  vi.stubGlobal(
-    "fetch",
-    vi.fn((url: string) => {
-      const path = String(url);
-      if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(records), { status: 200 }));
-      if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
-      if (path === "/fleet/machines/live") {
-        return Promise.resolve(
-          new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
-        );
-      }
-      if (path === "/machine/specs") {
-        return Promise.resolve(new Response(JSON.stringify({ machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" }), { status: 200 }));
-      }
-      if (path === "/machine/resources") {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              schema_version: "1.0",
-              generated_at_ms: 1,
-              gather_ms: 1,
-              limit_bytes: 1000,
-              limit_source: "test",
-              pool: { capacity_bytes: 1000, used_bytes: 600, available_bytes: 500, free_bytes: 400 },
-              pressure: { swap_used_bytes: 0, compressor_bytes: 0, margin_percent: 50, red: false },
-              models: [],
-              machine: { potential_bytes: 0, unpriced_models: 0, current_bytes: 0, state: "green" },
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      return Promise.resolve(new Response("not recorded\n", { status: 404 }));
-    }),
-  );
-}
-
-// (#1809, finishing #1508 step 4) The old "RUNS ON <MACHINE>" list — and
-// the "show all"/"show fewer" expand-collapse control the a11y packet
-// (#1767) hardened keyboard access for — is gone; this section replaces
-// those tests with coverage of what replaced it: a link out to the runs
-// lens, pinned to this machine.
-//
-// The link carries NO COUNT, and these tests pin that absence deliberately.
-// An earlier cut labeled it with `sessionsOn(...).length` and this suite
-// asserted the number — which passed while the live page LIED: that counts
-// distinct session ids in the 24h flow window, the destination lists /runs
-// rows over a 14-day window unioning missions, lab runs and ghosts. Measured
-// on a real daemon: the link read "0 runs" while the destination listed 282.
-// The tests were green the whole time, because they seeded the flow window
-// and asserted against the same window — never against what the destination
-// would actually show. A test that pins a number to its own fixture cannot
-// catch a number that means the wrong thing.
-describe("MachineLens — the runs-lens link (#1809)", () => {
-  it("names the machine and points at the pinned runs lens", async () => {
-    mockMachineRunsFetch(3);
-    renderMachineLens();
-    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    expect(link).toHaveAttribute("href", "#lens=runs&machine=u1");
-  });
-
-  // The regression guard for the lie described above: whatever the flow
-  // window happens to hold, the label must not claim a quantity. Seeded with
-  // three sessions precisely because the old implementation would have
-  // rendered "3" here.
-  it("claims no count, whatever this window's session total happens to be", async () => {
-    mockMachineRunsFetch(3);
-    renderMachineLens();
-    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    expect(link.textContent).toBe("runs on MacBook-Pro →");
-    expect(link.textContent).not.toMatch(/\d/);
-  });
-
-  it("renders the same label with an EMPTY window — no count to be wrong, nothing hidden", async () => {
-    mockMachineRunsFetch(0);
-    renderMachineLens();
-    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    expect(link.textContent).toBe("runs on MacBook-Pro →");
-  });
-
-  it("clicking the link navigates via a real hash write, not a page reload", async () => {
-    mockMachineRunsFetch(3);
-    renderMachineLens();
-    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    fireEvent.click(link);
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
-  });
-
-  // Red-provable regression guard: if the old list ever comes back, this
-  // fails — proving the removal actually happened, not just that the link
-  // exists alongside it.
-  it("the old per-run list markup is gone — no '.machine-lens__run' rows, no 'RUNS ON' header", async () => {
-    mockMachineRunsFetch(3);
-    const { container } = renderMachineLens();
-    await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    expect(container.querySelector(".machine-lens__run")).toBeNull();
-    expect(screen.queryByText(/RUNS ON/)).not.toBeInTheDocument();
-  });
-
-  // (#2108, operator finding) On a phone this control sat at roughly half
-  // the card's width with dead space beside it. On a narrow viewport it
-  // gets the `--mobile` full-width/48px-touch-target class, and the
-  // accessible name — arrow included — stays exactly what it was.
-  it("gets the full-width mobile class on a narrow viewport, keeping the same accessible name", async () => {
-    mockMachineRunsFetch(3);
-    renderMachineLens(true);
-    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    expect(link.className).toMatch(/\bmachine-lens__runslink--mobile\b/);
-    expect(link.className).toMatch(/\bmachine-lens__runslink\b/);
-    expect(link.textContent).toBe("runs on MacBook-Pro→");
-  });
-
-  it("stays the plain desktop class (no --mobile modifier) when not on a narrow viewport", async () => {
-    mockMachineRunsFetch(3);
-    renderMachineLens(false);
-    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
-    expect(link.className).not.toMatch(/--mobile/);
-    expect(link.textContent).toBe("runs on MacBook-Pro →");
+// Red-provable regression guard, the same shape #1809's own now-deleted
+// test used against the list it replaced: if the runs-lens link markup
+// ever comes back, this fails.
+describe("MachineLens — the runs-lens link is gone (2026-09-23)", () => {
+  it("renders no runs-lens link anywhere on the page", async () => {
+    mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 } });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(container.querySelector(".machine-lens__runslink")).toBeNull();
+    expect(screen.queryByRole("link", { name: /runs on/i })).toBeNull();
   });
 });
 
@@ -671,6 +515,7 @@ const LOAD_WITH_EXTRAS = {
     gpu_mem_bytes: null,
     thermal: { state: "fair", cpu_speed_limit_pct: 87 },
     power_mw: null,
+    battery: { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130 },
   },
   window: {
     samples: 3,
@@ -683,7 +528,206 @@ const LOAD_WITH_EXTRAS = {
     thermal: null,
     energy_mwh: null,
   },
+  // (#2821) The Step-0 regression fixture, verbatim: the raw IOKit
+  // `condition` disagrees with the computed `condition_word` — the lens
+  // must render the LATTER as "condition", never the former.
+  battery_health: {
+    cycle_count: 28,
+    design_capacity_mah: 6249,
+    raw_max_capacity_mah: 5701,
+    nominal_charge_capacity_mah: 5853,
+    raw_capacity_pct: 91.2,
+    nominal_capacity_pct: 93.7,
+    condition: "Check Battery",
+    condition_word: "Normal",
+    permanent_failure_status: 0,
+    temperature_c: 31.0,
+    time_at_soc_hours: [10, 20, 40, 5],
+    total_operating_time_hours: 5368,
+  },
 };
+
+const LOAD_NO_BATTERY = {
+  ...LOAD_WITH_EXTRAS,
+  now: { ...LOAD_WITH_EXTRAS.now, battery: null },
+  battery_health: null,
+};
+
+describe("MachineLens — battery surfaces (#2821, lens only)", () => {
+  it("shows the charge bar (gradient fill, no icon while discharging), the time-left text, and the health row", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    // "Battery" — the raw DOM text; `.hx-section__title`'s uppercase is a
+    // CSS `text-transform`, invisible to jsdom/RTL's textContent-based
+    // queries (the parity golden, captured via a real browser's
+    // `innerText`, is where "BATTERY" is the correct assertion instead).
+    expect(screen.getByText("Battery")).toBeInTheDocument();
+    expect(screen.getByText("78%")).toBeInTheDocument();
+    expect(screen.getByText("2 h 10 m left")).toBeInTheDocument();
+    expect(container.querySelector(".battery-bar-icon")).toBeNull(); // discharging: no icon
+    expect(container.querySelector(".battery-bar-fill")!.getAttribute("fill")).toMatch(/^url\(#mm-battery-ramp\)$/);
+    // The computed condition_word ("Normal"), never the raw unreliable
+    // IOKit string ("Check Battery") — the Step-0 regression this issue
+    // exists to fix.
+    expect(screen.getByText("Normal")).toBeInTheDocument();
+    expect(screen.queryByText(/Check Battery/)).toBeNull();
+    expect(screen.getByText(/^max charge$/i)).toBeInTheDocument();
+    expect(screen.getByText("5,701 mAh · 91.2%")).toBeInTheDocument();
+    expect(screen.getByText(/^original capacity$/i)).toBeInTheDocument();
+    expect(screen.getByText("6,249 mAh")).toBeInTheDocument();
+    expect(screen.getByText("28")).toBeInTheDocument();
+    expect(screen.getByText("31.0 °C")).toBeInTheDocument();
+    // (#2821, operator, 2026-09-23) The per-bucket histogram was pulled —
+    // `time_at_soc_hours` is an undocumented flat array that likely
+    // collapses a 2D table, so a chart of it overclaims. Only the lifetime
+    // cross-check total renders now.
+    expect(screen.getByText("5,368 h")).toBeInTheDocument();
+    expect(screen.queryByText(/state-of-charge bands/)).toBeNull();
+  });
+
+  it("renders no battery section at all on a machine with no battery", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "Mac-Studio", cpu_brand: "M1 Max", ram_total_bytes: 34359738368 },
+      resources: { ...RESOURCES, load: LOAD_NO_BATTERY },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    expect(screen.queryByText("Battery")).toBeNull();
+    expect(screen.queryByText(/operating time/i)).toBeNull();
+  });
+
+  it("warns on Service Battery", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: {
+        ...RESOURCES,
+        load: {
+          ...LOAD_WITH_EXTRAS,
+          battery_health: { ...LOAD_WITH_EXTRAS.battery_health, condition_word: "Service Battery" },
+        },
+      },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("Service Battery")).toBeInTheDocument());
+    expect(screen.getByText("Service Battery").closest(".dialog__kv")).toHaveClass("dialog__kv--warn");
+  });
+
+  // ── The battery BAR's own arc of history: dial -> solid bar -> reversed
+  //    gradient (operator, 2026-09-24: "the solid meters do not indicate
+  //    when things are getting tight... give every small meter the same
+  //    gradient treatment the big memory gauge uses"). No discrete
+  //    warn/critical threshold on the fill OR the percent text any more —
+  //    the reversed ramp (red empty -> green full) carries that
+  //    continuously, state-invariant (same on AC or discharging). ───────
+
+  function machineWithBattery(battery: { charge_pct: number; on_ac: boolean; charging: boolean; minutes_to_empty?: number | null }) {
+    return {
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: {
+        ...RESOURCES,
+        load: { ...LOAD_WITH_EXTRAS, now: { ...LOAD_WITH_EXTRAS.now, battery: { minutes_to_empty: null, ...battery } } },
+      },
+    };
+  }
+
+  it("fill width tracks the charge percent — 100% fills more than 35%", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 100, on_ac: true, charging: false }));
+    const { container: c100 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
+    const w100 = Number(c100.querySelector(".battery-bar-fill")!.getAttribute("width"));
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 60 }));
+    const { container: c35 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("35%")).toBeInTheDocument());
+    const w35 = Number(c35.querySelector(".battery-bar-fill")!.getAttribute("width"));
+
+    expect(w100).toBeGreaterThan(w35);
+    expect(w35).toBeGreaterThan(0);
+    // Exact scale: BATTERY_FILL_MAX_W is 44 viewBox units (machineStatsContent.tsx).
+    expect(w100).toBeCloseTo(44, 5);
+    expect(w35).toBeCloseTo(44 * 0.35, 5);
+  });
+
+  it("the fill and percent text carry NO threshold class at any percent — the gradient replaces it", async () => {
+    for (const pct of [100, 35, 8, 15]) {
+      mockMachineFetch(machineWithBattery({ charge_pct: pct, on_ac: false, charging: false, minutes_to_empty: 30 }));
+      const { container } = renderMachine(null);
+      await waitFor(() => expect(screen.getByText(`${pct}%`)).toBeInTheDocument());
+      expect(container.querySelector(".battery-bar-fill")!.getAttribute("class")).not.toMatch(/mm-band-/);
+      expect(container.querySelector(".battery-bar-pct")!.getAttribute("class")).not.toMatch(/mm-band-/);
+    }
+  });
+
+  it("the fill always paints from the reversed battery ramp url, on AC or discharging alike — state-invariant", async () => {
+    for (const battery of [
+      { charge_pct: 8, on_ac: false, charging: false },
+      { charge_pct: 8, on_ac: true, charging: true },
+    ]) {
+      mockMachineFetch(machineWithBattery(battery));
+      const { container } = renderMachine(null);
+      await waitFor(() => expect(screen.getByText("8%")).toBeInTheDocument());
+      expect(container.querySelector(".battery-bar-fill")!.getAttribute("fill")).toBe("url(#mm-battery-ramp)");
+      cleanup(); // same "8%" text in both iterations — must not match the PRIOR render's stale node
+    }
+  });
+
+  // ── Icon states (operator, 2026-09-24: "a lightning bolt icon works
+  //    inside the battery... on AC, not charging -> plug; on battery -> no
+  //    icon"). ──────────────────────────────────────────────────────────
+
+  it("bolt icon while charging", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: true }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    const icon = container.querySelector(".battery-bar-icon")!;
+    expect(icon).not.toBeNull();
+    expect(icon.textContent).toContain("⚡");
+  });
+
+  it("plug icon when on AC but not charging (topped off) — never a bolt", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 100, on_ac: true, charging: false }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
+    const icon = container.querySelector(".battery-bar-icon")!;
+    expect(icon).not.toBeNull();
+    expect(icon.textContent).toContain("🔌");
+  });
+
+  it("no icon while discharging", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 60 }));
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("35%")).toBeInTheDocument());
+    expect(container.querySelector(".battery-bar-icon")).toBeNull();
+  });
+
+  it("time-left text renders ONLY while discharging with an estimate — never on AC, never charging", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 80, on_ac: true, charging: true }));
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText("80%")).toBeInTheDocument());
+    expect(screen.queryByText(/left$/)).toBeNull();
+  });
+
+  it("aria-label per state: on AC not charging / charging / on battery with estimate", async () => {
+    mockMachineFetch(machineWithBattery({ charge_pct: 100, on_ac: true, charging: false }));
+    const { container: c1 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("100%")).toBeInTheDocument());
+    expect(c1.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 100%, on AC, not charging");
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 62, on_ac: true, charging: true }));
+    const { container: c2 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("62%")).toBeInTheDocument());
+    expect(c2.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 62%, charging");
+
+    mockMachineFetch(machineWithBattery({ charge_pct: 35, on_ac: false, charging: false, minutes_to_empty: 130 }));
+    const { container: c3 } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText("35%")).toBeInTheDocument());
+    expect(c3.querySelector(".battery-bar")!.getAttribute("aria-label")).toBe("battery 35%, on battery, 2 h 10 m left");
+  });
+});
 
 describe("MachineLens — the live block is the SAME shared component the sheet uses (#2108)", () => {
   it("the local machine page renders the thermal pill and CPU-cluster tiles from the daemon fixture", async () => {

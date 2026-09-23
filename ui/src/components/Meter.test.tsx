@@ -9,7 +9,10 @@ import {
   avgMaxTicks,
   compactMeterProps,
   fmtPct,
-  simpleBand,
+  gradientBand,
+  gaugeFillColor,
+  gaugeRampStops,
+  COMPACT_RAMP_ID,
   meterBandLevel,
   bandLevelClass,
   DEFAULT_WARN_AT,
@@ -233,20 +236,24 @@ describe("Meter — caption row + nowrap window line (#2108)", () => {
 //    plain {now, avg, high} reading into Meter's low-level props is
 //    tested without rendering anything. ───────────────────────────────
 
-describe("angleForPct / simpleBand / avgMaxTicks / compactMeterProps", () => {
+describe("angleForPct / gradientBand / avgMaxTicks / compactMeterProps", () => {
   it("angleForPct clamps into the 0-100 sweep before scaling by 1.8", () => {
     expect(angleForPct(50)).toBe(90);
     expect(angleForPct(150)).toBe(180);
     expect(angleForPct(-10)).toBe(0);
   });
 
-  it("simpleBand yields no band at all for a null reading", () => {
-    expect(simpleBand("c", "s", null)).toEqual([]);
+  it("gradientBand yields no band at all for a null reading", () => {
+    expect(gradientBand("c", null)).toEqual([]);
   });
 
-  it("simpleBand clamps an out-of-range reading into 0-100", () => {
-    expect(simpleBand("c", "s", 150)[0].lengthPct).toBe(100);
-    expect(simpleBand("c", "s", -10)[0].lengthPct).toBe(0);
+  it("gradientBand clamps an out-of-range reading into 0-100", () => {
+    expect(gradientBand("c", 150)[0].lengthPct).toBe(100);
+    expect(gradientBand("c", -10)[0].lengthPct).toBe(0);
+  });
+
+  it("gradientBand's stroke is a url() reference into the shared compact ramp, never a literal color", () => {
+    expect(gradientBand("c", 50)[0].stroke).toBe(`url(#${COMPACT_RAMP_ID})`);
   });
 
   it("avgMaxTicks omits whichever of avg/max is null", () => {
@@ -255,10 +262,11 @@ describe("angleForPct / simpleBand / avgMaxTicks / compactMeterProps", () => {
     expect(avgMaxTicks(null, null)).toEqual([]);
   });
 
-  it("compactMeterProps bundles bands/ticks/needle/numerals/label from one reading", () => {
-    const props = compactMeterProps("GPU", "mm-gauge-fill-compact", "green", { now: 90, avg: 60, high: 95 });
+  it("compactMeterProps bundles gradient/bands/ticks/needle/numerals/label from one reading", () => {
+    const props = compactMeterProps("GPU", "mm-gauge-fill-compact", { now: 90, avg: 60, high: 95 });
     expect(props.label).toBe("GPU");
-    expect(props.bands).toEqual([{ className: "mm-gauge-fill-compact", stroke: "green", lengthPct: 90, banded: true }]);
+    expect(props.gradient).toEqual({ id: COMPACT_RAMP_ID, stops: gaugeRampStops() });
+    expect(props.bands).toEqual([{ className: "mm-gauge-fill-compact", stroke: `url(#${COMPACT_RAMP_ID})`, lengthPct: 90 }]);
     expect(props.ticks).toEqual([
       { pct: 60, className: "mm-gauge-tick mm-gauge-tick-avg" },
       { pct: 95, className: "mm-gauge-tick mm-gauge-tick-max" },
@@ -268,10 +276,33 @@ describe("angleForPct / simpleBand / avgMaxTicks / compactMeterProps", () => {
   });
 
   it("compactMeterProps draws no needle and no fill band for a never-sampled metric", () => {
-    const props = compactMeterProps("MEM", "mm-gauge-fill-compact", "green", { now: null, avg: null, high: null });
+    const props = compactMeterProps("MEM", "mm-gauge-fill-compact", { now: null, avg: null, high: null });
     expect(props.bands).toEqual([]);
     expect(props.needleAngleDeg).toBeUndefined();
     expect(props.numerals).toEqual({ now: null, avg: null, max: null });
+  });
+});
+
+describe("gaugeFillColor / gaugeRampStops (moved from machineGauge.ts, gradient-everywhere pass)", () => {
+  it("pure green at 0%, the palette amber at 50%, pure red at 100%", () => {
+    expect(gaugeFillColor(0)).toBe("#4ade80");
+    expect(gaugeFillColor(50)).toBe("#f0b429");
+    expect(gaugeFillColor(100)).toBe("#f56565");
+  });
+
+  it("clamps past either end rather than extrapolating", () => {
+    expect(gaugeFillColor(140)).toBe(gaugeFillColor(100));
+    expect(gaugeFillColor(-20)).toBe(gaugeFillColor(0));
+    expect(gaugeFillColor(NaN)).toBe(gaugeFillColor(0));
+  });
+
+  it("gaugeRampStops returns cosine-spaced offsets tracking the arc, ending at 0 and 1", () => {
+    const stops = gaugeRampStops(4);
+    expect(stops).toHaveLength(5);
+    expect(stops[0].offset).toBe(0);
+    expect(stops[4].offset).toBe(1);
+    expect(stops[0].color).toBe(gaugeFillColor(0));
+    expect(stops[4].color).toBe(gaugeFillColor(100));
   });
 });
 
@@ -315,16 +346,32 @@ describe("meterBandLevel / bandLevelClass — the pure threshold lookup", () => 
     expect(meterBandLevel(97, MEM_WARN_AT, MEM_CRITICAL_AT)).toBe("critical");
     expect(meterBandLevel(96, MEM_WARN_AT, MEM_CRITICAL_AT)).toBe("warn");
   });
+
+  // (gradient-everywhere pass) `lowIsBad` lived here briefly (#2821 review
+  // item 5, for the battery bar's own low-charge severity) and was removed
+  // once the battery switched to a reversed color ramp that carries the
+  // same meaning continuously instead — see `meterBandLevel`'s own doc.
 });
 
-describe("Meter — band-colored fill + caption (#2122)", () => {
+// (gradient-everywhere pass, operator 2026-09-24: "give every small meter
+// the same gradient treatment the big memory gauge uses") The fill's own
+// SVG path no longer picks up a `.mm-band-warn`/`.mm-band-critical` CLASS
+// at any percent — that mechanism (`banded`, `simpleBand`) is deleted; the
+// fill instead always paints from the shared ramp gradient, and it is the
+// `strokeDasharray` EXTENT (how much of the arc is drawn) that changes
+// with the value, revealing more of the ramp's red end as the reading
+// climbs. The percentage TEXT (`.meter-now`) keeps its OWN independent
+// threshold-class coloring, unchanged — `nowLevelCls` never depended on
+// `bands`/`banded` in the first place.
+describe("Meter — gradient fill + caption class (gradient-everywhere pass)", () => {
   function renderAt(now: number) {
     return render(
       <Meter
         wrapperClassName="mm-gauge mm-gauge--compact"
         ariaLabel="GPU"
         label="GPU"
-        bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", now)}
+        gradient={{ id: COMPACT_RAMP_ID, stops: gaugeRampStops() }}
+        bands={gradientBand("mm-gauge-fill-compact", now)}
         numerals={{ now, avg: null, max: null }}
         hideAvgMax
         needleAngleDeg={angleForPct(now)}
@@ -332,41 +379,52 @@ describe("Meter — band-colored fill + caption (#2122)", () => {
     );
   }
 
-  it("79% — quiet: no band-level class on the fill or the caption", () => {
-    const { container } = renderAt(79);
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.getAttribute("class")).not.toMatch(/mm-band-/);
-    expect(container.querySelector(".meter-now")!.getAttribute("class")).not.toMatch(/mm-band-/);
+  it("the fill never picks up a band-level class at any percent — the ramp carries that now", () => {
+    for (const now of [10, 79, 80, 95, 100]) {
+      const { container } = renderAt(now);
+      expect(container.querySelector(".mm-gauge-fill-compact")!.getAttribute("class")).not.toMatch(/mm-band-/);
+    }
   });
 
-  it("80% — warn: the fill and the caption both pick up .mm-band-warn", () => {
-    const { container } = renderAt(80);
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.classList.contains("mm-band-warn")).toBe(true);
-    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-warn")).toBe(true);
+  it("the fill's dasharray extent (not a class) encodes the value — it grows monotonically with the reading", () => {
+    const { container: c10 } = renderAt(10);
+    const { container: c90 } = renderAt(90);
+    const extent = (c: typeof c10) => Number(c.querySelector(".mm-gauge-fill-compact")!.getAttribute("stroke-dasharray")!.split(" ")[0]);
+    expect(extent(c90)).toBeGreaterThan(extent(c10));
+    expect(extent(c10)).toBeCloseTo(10, 5);
+    expect(extent(c90)).toBeCloseTo(90, 5);
   });
 
-  it("95% — critical: the fill and the caption both pick up .mm-band-critical", () => {
-    const { container } = renderAt(95);
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.classList.contains("mm-band-critical")).toBe(true);
-    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(true);
+  it("the fill paints from the shared compact-ramp gradient url, not a literal color, at every percent", () => {
+    for (const now of [10, 90]) {
+      const { container } = renderAt(now);
+      expect(container.querySelector(".mm-gauge-fill-compact")!.getAttribute("stroke")).toBe(`url(#${COMPACT_RAMP_ID})`);
+    }
   });
 
-  it("100% — still critical, not some fourth unstyled band", () => {
-    const { container } = renderAt(100);
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.classList.contains("mm-band-critical")).toBe(true);
-    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(true);
+  it("the gradient <defs> stops are present and track gaugeFillColor's own palette", () => {
+    const { container } = renderAt(50);
+    const stops = [...container.querySelectorAll("linearGradient stop")];
+    expect(stops.length).toBeGreaterThan(0);
+    expect(stops[0].getAttribute("stop-color")).toBe(gaugeFillColor(0));
+    expect(stops[stops.length - 1].getAttribute("stop-color")).toBe(gaugeFillColor(100));
   });
 
-  it("a caller passing warnAt/criticalAt overrides the 80/95 default (MEM's own 90/97)", () => {
+  it("the caption still gets its own threshold class independently of the fill — 79% quiet, 80% warn, 95%/100% critical", () => {
+    expect(render(<Meter wrapperClassName="mm-gauge" ariaLabel="x" bands={[]} numerals={{ now: 79, avg: null, max: null }} />).container.querySelector(".meter-now")!.getAttribute("class")).not.toMatch(/mm-band-/);
+    expect(render(<Meter wrapperClassName="mm-gauge" ariaLabel="x" bands={[]} numerals={{ now: 80, avg: null, max: null }} />).container.querySelector(".meter-now")!.classList.contains("mm-band-warn")).toBe(true);
+    expect(render(<Meter wrapperClassName="mm-gauge" ariaLabel="x" bands={[]} numerals={{ now: 95, avg: null, max: null }} />).container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(true);
+    expect(render(<Meter wrapperClassName="mm-gauge" ariaLabel="x" bands={[]} numerals={{ now: 100, avg: null, max: null }} />).container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(true);
+  });
+
+  it("a caller passing warnAt/criticalAt overrides the 80/95 default for the CAPTION (MEM's own 90/97)", () => {
     const { container } = render(
       <Meter
         wrapperClassName="mm-gauge mm-gauge--compact"
         ariaLabel="MEM"
         label="MEM"
-        bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", 92)}
+        gradient={{ id: COMPACT_RAMP_ID, stops: gaugeRampStops() }}
+        bands={gradientBand("mm-gauge-fill-compact", 92)}
         numerals={{ now: 92, avg: null, max: null }}
         hideAvgMax
         warnAt={MEM_WARN_AT}
@@ -374,14 +432,13 @@ describe("Meter — band-colored fill + caption (#2122)", () => {
       />,
     );
     // 92% is above MEM's own warnAt (90) but below its own criticalAt
-    // (97) — warn, not critical, and NOT quiet (which the 80/95 default
-    // alone wouldn't distinguish from the default's own warn band).
-    const band = container.querySelector(".mm-gauge-fill-compact")!;
-    expect(band.classList.contains("mm-band-warn")).toBe(true);
-    expect(band.classList.contains("mm-band-critical")).toBe(false);
+    // (97) — the CAPTION reads warn, not critical (the fill itself never
+    // carries a band class at all, gradient-everywhere pass).
+    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-warn")).toBe(true);
+    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(false);
   });
 
-  it("a non-banded band (VRAM's own bands) never picks up a band-level class regardless of length", () => {
+  it("a non-banded VRAM-style band never picks up a band-level class either (unchanged)", () => {
     const { container } = render(
       <Meter
         wrapperClassName="mm-gauge"

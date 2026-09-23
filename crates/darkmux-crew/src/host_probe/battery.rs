@@ -162,11 +162,57 @@ pub struct BatteryHealth {
     /// The OS's own reported condition word, verbatim from
     /// `IOPSCopyPowerSourcesInfo`'s `BatteryHealth` key (`"Good"`,
     /// `"Fair"`, `"Poor"`, `"Check Battery"` — whatever this macOS
-    /// publishes). Recorded as read; darkmux does not map it to a verdict
-    /// of its own, and an unrecognized future word is passed through rather
+    /// publishes).
+    ///
+    /// **This key is demonstrably unreliable on Apple Silicon and must
+    /// never be presented as THE condition.** Measured on the reference
+    /// machine (2026-09-23, verified again in review — see
+    /// [`Self::health_condition`]'s doc for the corrected picture): this
+    /// key reads `"Check Battery"` while `system_profiler -xml
+    /// SPPowerDataType`'s `sppower_battery_health` reads `"Good"` and
+    /// `PermanentFailureStatus` is `0`. Earlier revisions of this doc
+    /// additionally claimed `pmset -g rawbatt` "agrees the battery is
+    /// healthy" — checked again and that is WRONG: `pmset -g rawbatt` (and
+    /// plain `pmset -g batt`) print no condition word at all on this macOS
+    /// version, so they neither agree nor disagree; only `system_profiler`
+    /// and the IOPS keys carry a condition. The legacy `BatteryHealth` enum
+    /// is widely reported (other battery-health tools work around it the
+    /// same way) to lag/misreport on Apple Silicon packs. Recorded here as
+    /// read, for completeness and debugging, but [`Self::condition_word`]
+    /// — derived from [`Self::health_condition`] and
+    /// [`Self::permanent_failure_status`] — is the field a UI should show
+    /// as "condition". darkmux does not map this raw word to a verdict of
+    /// its own, and an unrecognized future value is passed through rather
     /// than clamped into a known one, the same posture
     /// [`super::thermal::thermal_state_name`] takes.
     pub condition: Option<String>,
+    /// The OS's OWN separate condition signal, verbatim from
+    /// `IOPSGetPowerSourceDescription`'s `BatteryHealthCondition` key.
+    ///
+    /// **This is the authoritative source `condition_word()` derives
+    /// from — a different, better key than `condition` above, found on
+    /// review (#2821).** Apple's documented values include `"Check
+    /// Battery"` and `"Permanent Battery Failure"`; an EMPTY string means
+    /// no condition to report (healthy). Verified live on the reference
+    /// machine (2026-09-23, via a throwaway IOKit probe reading exactly
+    /// this one named key — never a broad dictionary dump): this key reads
+    /// `Some("")` (present, empty) while `condition` (`BatteryHealth`)
+    /// reads `Some("Check Battery")` on the SAME machine at the SAME
+    /// instant, and `system_profiler`'s `sppower_battery_health` agrees
+    /// with the empty reading (`"Good"`). `None` when the key itself is
+    /// absent (an older macOS, or the source unreadable) — distinct from
+    /// `Some("")`, which is a definite "no condition" answer.
+    pub health_condition: Option<String>,
+    /// `PermanentFailureStatus`, verbatim (`0` = no permanent failure
+    /// detected). A FAILURE OVERRIDE in [`Self::condition_word`] — it does
+    /// NOT by itself certify "Normal": #2821's review finding was that an
+    /// earlier revision of this module used exactly that shortcut
+    /// (`permanent_failure_status == 0` alone) and that reads "Normal" for
+    /// a battery macOS actually flags "Service Recommended" for WEAR (a
+    /// non-empty `BatteryHealthCondition` with `PermanentFailureStatus`
+    /// still `0`). See [`Self::condition_word`] for the corrected
+    /// derivation.
+    pub permanent_failure_status: Option<i64>,
     /// `Temperature`, converted from the node's hundredths-of-a-degree
     /// units to degrees Celsius (`3094` -> `30.94`).
     pub temperature_c: Option<f64>,
@@ -213,6 +259,44 @@ impl BatteryHealth {
     /// one decimal. Labeled NOMINAL for the same reason.
     pub fn nominal_capacity_pct(&self) -> Option<f64> {
         capacity_pct(self.nominal_charge_capacity_mah, self.design_capacity_mah)
+    }
+
+    /// The condition word a UI should show as THE condition.
+    ///
+    /// **Corrected derivation (#2821 review finding).** An earlier revision
+    /// derived this from `permanent_failure_status` ALONE
+    /// (`== 0 -> "Normal"`), which is a false all-clear: `0` means no
+    /// PERMANENT failure, not "no condition to report" — a battery macOS
+    /// flags "Service Recommended" for ordinary wear still reads
+    /// `permanent_failure_status == 0`, and the old code would have shown
+    /// "Normal" for it. The authoritative source is
+    /// [`Self::health_condition`] (`BatteryHealthCondition`), with
+    /// `permanent_failure_status` acting only as a FAILURE OVERRIDE:
+    ///
+    /// 1. `permanent_failure_status` non-zero → `"Service Battery"`,
+    ///    regardless of `health_condition` (a real failure overrides
+    ///    everything, even if `health_condition` happens to be empty).
+    /// 2. Else, `health_condition` empty (`Some("")`) → `"Normal"` — the
+    ///    key is readable and reports nothing wrong.
+    /// 3. Else, `health_condition` non-empty (`Some(word)`) → `word`,
+    ///    passed through verbatim (e.g. `"Check Battery"`, Apple's own
+    ///    documented values) — never remapped to a fixed enum, same
+    ///    unrecognized-value posture as `condition`'s own doc.
+    /// 4. Else (`health_condition` is `None` — the key itself unreadable)
+    ///    → `None`. Never `"Normal"` on missing data, even if
+    ///    `permanent_failure_status` happened to read `0`: that field only
+    ///    escalates, it does not clear.
+    pub fn condition_word(&self) -> Option<String> {
+        if let Some(pfs) = self.permanent_failure_status {
+            if pfs != 0 {
+                return Some("Service Battery".to_string());
+            }
+        }
+        match self.health_condition.as_deref() {
+            Some("") => Some("Normal".to_string()),
+            Some(word) => Some(word.to_string()),
+            None => None,
+        }
     }
 }
 
@@ -294,6 +378,13 @@ mod imp {
     /// word. Present only on an internal battery, which is what makes it
     /// the marker [`with_internal_power_source`] selects on.
     const K_HEALTH: &str = "BatteryHealth";
+    /// (#2821) The AUTHORITATIVE condition key — a sibling of `K_HEALTH` in
+    /// the same dictionary, verified present on the reference machine
+    /// (`BatteryHealthCondition` among the 19 keys a live probe enumerated)
+    /// with value `""` (empty — healthy) while `K_HEALTH` read `"Check
+    /// Battery"` at the same instant. See [`BatteryHealth::health_condition`]'s
+    /// doc.
+    const K_HEALTH_CONDITION: &str = "BatteryHealthCondition";
     const K_CURRENT_CAPACITY: &str = "Current Capacity";
     const K_MAX_CAPACITY: &str = "Max Capacity";
     const K_IS_CHARGING: &str = "Is Charging";
@@ -398,6 +489,15 @@ mod imp {
         with_internal_power_source(|desc| unsafe { iokit::dict_string(desc, K_HEALTH) })
     }
 
+    /// (#2821) The authoritative condition signal (`BatteryHealthCondition`),
+    /// verbatim — an empty string (`Some("")`) is a real, distinct answer
+    /// from `None` (key absent): see [`super::BatteryHealth::health_condition`].
+    fn reported_health_condition() -> Option<String> {
+        // SAFETY: see `with_internal_power_source` — `desc` is live for the
+        // callback and `dict_string` type-checks.
+        with_internal_power_source(|desc| unsafe { iokit::dict_string(desc, K_HEALTH_CONDITION) })
+    }
+
     /// One health reading.
     ///
     /// This is the half that pays for the `AppleSmartBattery` registry walk
@@ -433,6 +533,12 @@ mod imp {
                         .filter(|n| *n > 0)
                         .map(|n| n as u64),
                     condition: None,
+                    health_condition: None,
+                    // #2821: the genuine health-verdict signal, read
+                    // straight (no `>= 0` filter — a negative value here
+                    // would itself be a fact worth keeping, not noise to
+                    // discard the way a negative cycle count would be).
+                    permanent_failure_status: iokit::dict_i64(props, "PermanentFailureStatus"),
                     temperature_c: iokit::dict_i64(props, "Temperature").map(|n| n as f64 / 100.0),
                     time_at_soc_hours: lifetime
                         .and_then(|ld| iokit::dict_bytes(ld, "TimeAtHighSoc"))
@@ -446,6 +552,7 @@ mod imp {
         });
         let mut h = out?;
         h.condition = reported_condition();
+        h.health_condition = reported_health_condition();
         (!h.is_empty()).then_some(h)
     }
 }
@@ -495,6 +602,111 @@ mod tests {
         // A pack can briefly read slightly over max right after a full
         // charge; 103% would be a worse answer than 100 for #2706's floor.
         assert_eq!(charge_pct_from(Some(103), Some(100)), Some(100));
+    }
+
+    // (#2821 review, MUST-FIX 1) `condition_word` must be derived from
+    // `health_condition` (`BatteryHealthCondition`), with
+    // `permanent_failure_status` acting ONLY as a failure override — never
+    // from `permanent_failure_status` alone. An earlier revision used
+    // `permanent_failure_status == 0` as its whole signal, which is a false
+    // all-clear: a battery macOS flags "Service Recommended" for ordinary
+    // WEAR still has `permanent_failure_status == 0`, and that revision
+    // would have shown "Normal" for it. Five fixture cases, matching the
+    // review's own enumeration and the live verification below.
+    //
+    // The reference-machine numbers here are from a throwaway IOKit probe
+    // (2026-09-23) reading exactly the two named keys via
+    // `IOPSGetPowerSourceDescription` — never a broad dictionary dump, and
+    // never printing `Hardware Serial Number`, which the same dictionary
+    // also carries:
+    //   BatteryHealth:          "Check Battery" (the unreliable `condition`)
+    //   BatteryHealthCondition: ""               (empty — healthy)
+    //   system_profiler -xml SPPowerDataType -> sppower_battery_health: "Good"
+    // confirming `health_condition` (empty) is the one that agrees with
+    // what macOS shows the user, not `condition`.
+
+    /// Case 1 (healthy): `health_condition` present and empty,
+    /// `permanent_failure_status` zero -> "Normal", regardless of what the
+    /// unreliable raw `condition` string says.
+    #[test]
+    fn condition_word_case_healthy_empty_condition_reads_normal() {
+        let h = BatteryHealth {
+            health_condition: Some(String::new()),
+            permanent_failure_status: Some(0),
+            condition: Some("Check Battery".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(h.condition_word().as_deref(), Some("Normal"), "must not trust the stale raw condition word");
+    }
+
+    /// Case 2 (service-recommended string): `health_condition` present and
+    /// NON-empty, no permanent failure -> the string passes through
+    /// VERBATIM, never remapped to a fixed enum. This is exactly the false
+    /// all-clear the review's MUST-FIX names: the old
+    /// `permanent_failure_status`-only logic would have read "Normal" here.
+    #[test]
+    fn condition_word_case_service_recommended_string_passes_through_verbatim() {
+        let h = BatteryHealth {
+            health_condition: Some("Service Recommended".to_string()),
+            permanent_failure_status: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(h.condition_word().as_deref(), Some("Service Recommended"));
+    }
+
+    /// Case 3 (permanent failure): a real failure reads the fixed override
+    /// word, independent of whatever `health_condition` also says.
+    #[test]
+    fn condition_word_case_permanent_failure_overrides_to_service_battery() {
+        let h = BatteryHealth {
+            health_condition: Some("Permanent Battery Failure".to_string()),
+            permanent_failure_status: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(h.condition_word().as_deref(), Some("Service Battery"));
+    }
+
+    /// Case 4 (PFS≠0 with empty condition): the failure override fires
+    /// even when `health_condition` itself reports nothing (empty) — the
+    /// override is checked FIRST, unconditionally, not gated on
+    /// `health_condition` being non-empty.
+    #[test]
+    fn condition_word_case_permanent_failure_overrides_even_with_empty_health_condition() {
+        let h = BatteryHealth {
+            health_condition: Some(String::new()),
+            permanent_failure_status: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(h.condition_word().as_deref(), Some("Service Battery"));
+    }
+
+    /// Case 5 (sources absent): neither `health_condition` nor
+    /// `permanent_failure_status` was read -> `None`, never a default
+    /// "Normal" on missing data.
+    #[test]
+    fn condition_word_case_sources_absent_is_none_not_normal() {
+        let h = BatteryHealth {
+            health_condition: None,
+            permanent_failure_status: None,
+            condition: Some("Good".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            h.condition_word(),
+            None,
+            "no computed verdict without the signal it is derived from — never silently \"Normal\""
+        );
+    }
+
+    /// `health_condition` unreadable but `permanent_failure_status` reads
+    /// clean (`0`) is STILL `None` — `permanent_failure_status` only
+    /// escalates (case 3/4), it never clears on its own (this is the exact
+    /// shortcut the review's MUST-FIX 1 found and this suite guards
+    /// against regressing back to).
+    #[test]
+    fn condition_word_permanent_failure_status_alone_never_certifies_normal() {
+        let h = BatteryHealth { health_condition: None, permanent_failure_status: Some(0), ..Default::default() };
+        assert_eq!(h.condition_word(), None);
     }
 
     #[test]

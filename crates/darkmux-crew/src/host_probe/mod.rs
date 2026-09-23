@@ -258,7 +258,22 @@ pub fn battery_health_json(h: &BatteryHealth) -> serde_json::Value {
         "nominal_charge_capacity_mah": h.nominal_charge_capacity_mah,
         "raw_capacity_pct": h.raw_capacity_pct(),
         "nominal_capacity_pct": h.nominal_capacity_pct(),
+        // (#2821, corrected on review) `condition` is the raw,
+        // demonstrably-unreliable `BatteryHealth` IOKit word — kept for
+        // completeness/debugging, never the UI's primary. `health_condition`
+        // is the AUTHORITATIVE raw signal (`BatteryHealthCondition`);
+        // `condition_word` is the computed verdict derived from it (empty
+        // -> "Normal", non-empty -> passed through verbatim,
+        // `permanent_failure_status` non-zero -> "Service Battery"
+        // regardless) — see `BatteryHealth::condition_word`'s own doc for
+        // the full derivation and the measurement behind it. A viewer shows
+        // `condition_word` when present and falls back to labeling
+        // `condition` precisely (never as "the" condition) only when
+        // `condition_word` is null.
         "condition": h.condition,
+        "health_condition": h.health_condition,
+        "condition_word": h.condition_word(),
+        "permanent_failure_status": h.permanent_failure_status,
         "temperature_c": h.temperature_c,
         "time_at_soc_hours": h.time_at_soc_hours,
         "total_operating_time_hours": h.total_operating_time_hours,
@@ -1692,5 +1707,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    // (#2821 review, MUST-FIX 2) `battery_health_json`'s wire shape was
+    // unpinned — mutating `"condition_word": None` at the call site left
+    // every existing battery test green (both crates' full suites), and a
+    // consumer (the UI) would have silently fallen back to the OLD,
+    // false-alarm-prone text with no test anywhere catching it. This test
+    // pins every field this function adds beyond the plain struct fields
+    // (`condition_word`, `health_condition`, `permanent_failure_status`)
+    // to specific, non-null values from a specific fixture, so a mutation
+    // at the call site (or in `condition_word`'s own derivation) fails
+    // HERE, not silently downstream in a UI test that happens to use a
+    // different fixture.
+    #[test]
+    fn battery_health_json_pins_condition_word_and_its_two_source_fields() {
+        let h = crate::host_probe::battery::BatteryHealth {
+            health_condition: Some(String::new()),
+            permanent_failure_status: Some(0),
+            condition: Some("Check Battery".to_string()),
+            cycle_count: Some(28),
+            ..Default::default()
+        };
+        let v = battery_health_json(&h);
+        assert_eq!(v["condition_word"], "Normal", "the computed verdict, not the raw unreliable string");
+        assert_eq!(v["health_condition"], "");
+        assert_eq!(v["permanent_failure_status"], 0);
+        assert_eq!(v["condition"], "Check Battery", "the raw string stays on the wire too, for debugging");
+
+        // A real failure must show up on the wire too — proves the field
+        // isn't just echoed at the empty/healthy fixture above.
+        let failed = crate::host_probe::battery::BatteryHealth {
+            health_condition: Some(String::new()),
+            permanent_failure_status: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(battery_health_json(&failed)["condition_word"], "Service Battery");
     }
 }

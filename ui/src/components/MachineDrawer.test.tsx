@@ -705,6 +705,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         gpu_mem_bytes: null,
         thermal: null,
         power_mw: null,
+        battery: null,
       },
       window: {
         samples: 3,
@@ -1280,6 +1281,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         gpu_mem_bytes: null,
         thermal: null,
         power_mw: null,
+        battery: null,
       },
       window: {
         samples: 3,
@@ -1358,6 +1360,56 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     expect(screen.getByText("Efficiency")).toBeInTheDocument();
     expect(screen.getByText(/6 cores/)).toBeInTheDocument();
     expect(screen.getByText(/4400 MHz/)).toBeInTheDocument();
+  });
+
+  // (#2821, operator scope: battery is the LIVE MACHINE LENS ONLY) The
+  // regression this test guards: `BatteryLensBlock` is spliced into
+  // `liveBlock` only, never into `body`/`HostExtras` — both of which the
+  // drawer renders. Even with a full battery payload on the wire, the
+  // drawer must show none of it.
+  it("never renders battery content, even when the daemon reports a full battery payload", async () => {
+    stubFetch({
+      ...FULL_LOAD,
+      load: {
+        ...FULL_LOAD.load,
+        now: { ...FULL_LOAD.load.now, battery: { charge_pct: 78, on_ac: false, charging: false, minutes_to_empty: 130 } },
+        battery_health: {
+          cycle_count: 28,
+          design_capacity_mah: 6249,
+          raw_max_capacity_mah: 5701,
+          nominal_charge_capacity_mah: 5853,
+          raw_capacity_pct: 91.2,
+          nominal_capacity_pct: 93.7,
+          condition: "Check Battery",
+          condition_word: "Normal",
+          permanent_failure_status: 0,
+          temperature_c: 31.0,
+          time_at_soc_hours: [10, 20, 40, 5],
+          total_operating_time_hours: 5368,
+        },
+      },
+    });
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+
+    await waitFor(() => expect(screen.getByText("GPU clock")).toBeInTheDocument());
+    expect(screen.queryByText("Battery")).toBeNull();
+    expect(screen.queryByText("condition")).toBeNull();
+    expect(screen.queryByText(/operating time/i)).toBeNull();
+    expect(screen.queryByText(/mAh/)).toBeNull();
+    expect(document.querySelector(".battery-bar-fill")).toBeNull();
   });
 
   // (#2440 cut 6, operator finding) The ladder already lights CURRENT
@@ -1826,6 +1878,7 @@ describe("MachineDrawer — host stats only, never lms-derived model data", () =
         gpu_mem_bytes: null,
         thermal: null,
         power_mw: null,
+        battery: null,
       },
       window: {
         samples: 3,

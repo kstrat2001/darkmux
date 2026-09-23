@@ -101,17 +101,6 @@ export interface MeterBand {
    * other band (VRAM's `other`/`growth`, every CPU/GPU/MEM band) is
    * omitted entirely at `lengthPct <= 0`. */
   alwaysRender?: boolean;
-  /** (#2122) Marks this as the auto-colored compact-meter fill band — set
-   * by `simpleBand()`, the one producer every CPU/GPU/MEM gauge and the
-   * CPU-cluster tiles go through. `Meter` colors a `banded` band (and the
-   * caption's numeral) by `lengthPct` against `warnAt`/`criticalAt`,
-   * OVERRIDING its literal `stroke` once the value crosses a threshold —
-   * a quiet gauge stays whatever accent color the caller supplied, a
-   * loaded one goes amber then red regardless of what `stroke` says.
-   * VRAM's own bands (`mm-gauge-val`/`mm-gauge-other`/`mm-gauge-growth`)
-   * never set this — its color story is the ramp gradient + redline, and
-   * stays exactly as it was before this prop existed. */
-  banded?: boolean;
 }
 
 export interface MeterTick {
@@ -228,7 +217,20 @@ export const MEM_CRITICAL_AT = 97;
  * (MEM wants 90/97, see `MachineLens.tsx`'s own note on why) rather than
  * hardcoded here, so this stays one function for every caller. `>=` at
  * each edge: a reading AT the threshold is already the next band up,
- * matching the thermal pill's own `>= 80` / `>= 95` wording (#2122). */
+ * matching the thermal pill's own `>= 80` / `>= 95` wording (#2122).
+ * Still used for the compact dials' PERCENTAGE TEXT color (`nowLevelCls`,
+ * below) — the arc itself no longer uses this at all, see `gradientBand`'s
+ * own doc for why.
+ *
+ * **History: a `lowIsBad` 4th parameter lived here briefly** (#2821
+ * review item 5, for the battery bar's own low-charge severity) and was
+ * removed again in the SAME arc of work once the battery switched to a
+ * reversed color ramp (item 2, "gradient... reversed") that carries the
+ * same meaning continuously — a discrete low/high threshold on TOP of a
+ * ramp that already reddens toward empty would have doubled up on the one
+ * thing this whole pass exists to stop doing. Mentioned here so a future
+ * reader who finds this comment via `git blame` isn't left guessing why a
+ * parameter came and went in what looks like one feature. */
 export function meterBandLevel(now: number | null, warnAt: number, criticalAt: number): MeterBandLevel {
   if (now === null) return "quiet";
   if (now >= criticalAt) return "critical";
@@ -258,15 +260,117 @@ export function angleForPct(pct: number): number {
   return Math.max(0, Math.min(100, pct)) * 1.8;
 }
 
-/** A compact meter's single fill band — `now` percent, 0-100, clamped.
- * `null` (no reading yet) yields NO band at all, matching the same
- * absence-never-zero rule the needle already follows. `banded: true`
- * (#2122) opts this band into `Meter`'s threshold coloring — every
- * current caller of `simpleBand` IS a compact CPU/GPU/MEM/cluster gauge,
- * so this is the one place that needs to say so. */
-export function simpleBand(className: string, stroke: string, now: number | null): MeterBand[] {
+/** (gradient-everywhere pass) The dial fill's color ramp stops — `--good`,
+ * `--warn`, `--bad` from `styles.css`, duplicated here as literals because
+ * an SVG `stroke`/gradient `stop-color` has to be a concrete value and
+ * reading a CSS custom property at render time would mean a
+ * `getComputedStyle` call per frame.
+ *
+ * THREE stops, not two, and that is not a flourish. Interpolating this
+ * palette's green (`#4ade80`) straight to its red (`#f56565`) passes
+ * through `#9fa172` — a muddy olive, because both endpoints are pastels
+ * carrying a lot of blue. Routing through the palette's own amber puts a
+ * real yellow at the midpoint AND keeps every color the dial can show
+ * inside the vocabulary the rest of the page already uses.
+ *
+ * This constant, `mixHex`, `gaugeFillColor` and `gaugeRampStops` below
+ * used to live in `lenses/machine/machineGauge.ts`, built for the big
+ * "MACHINE USED" gauge alone. Moved HERE (operator: "give every small
+ * meter the same gradient treatment the big memory gauge uses... reuse
+ * THAT mechanism") because every compact `<Meter>` — CPU/GPU/MEM,
+ * CPU-cluster tiles, the remote-machine fallback dials — now paints from
+ * the SAME ramp, and `Meter.tsx` (not a lens file) is the shared home
+ * every one of those callers already imports from. `machineGauge.ts`
+ * re-exports `gaugeFillColor`/`gaugeRampStops` unchanged so its own
+ * callers and tests kept working without edits. */
+const FILL_STOPS = ["#4ade80", "#f0b429", "#f56565"] as const;
+
+function mixHex(a: string, b: string, k: number): string {
+  const ch = (h: string, i: number) => parseInt(h.slice(1 + i * 2, 3 + i * 2), 16);
+  const out = [0, 1, 2].map((i) => Math.round(ch(a, i) + (ch(b, i) - ch(a, i)) * k));
+  return `#${out.map((n) => n.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** (operator request) The fill color as a CONTINUOUS function of how full
+ * a 0-100 reading is: pure green at 0%, the palette's amber at 50%, pure
+ * red at 100%. Every dial's ramp (the big gauge AND every compact meter)
+ * draws from this one function — a gauge at 84% and one at 86% are not
+ * different in kind, and painting them different colors would assert that
+ * they were; a continuous ramp asserts nothing, it just maps the ratio
+ * already readable off the fill/needle onto a hue.
+ *
+ * Clamps rather than extrapolating: a reading past 100 is drawn at the red
+ * end, not at some color beyond red — and that includes `+Infinity`. Only
+ * `NaN` (no figure at all) falls to the green end, and it is the caller's
+ * job not to draw a band for a figure it does not have. */
+export function gaugeFillColor(pct: number): string {
+  const t = (Number.isNaN(pct) ? 0 : Math.max(0, Math.min(100, Number(pct)))) / 100;
+  return t < 0.5
+    ? mixHex(FILL_STOPS[0], FILL_STOPS[1], t * 2)
+    : mixHex(FILL_STOPS[1], FILL_STOPS[2], (t - 0.5) * 2);
+}
+
+/** The ramp painted ACROSS THE ARC'S SWEEP — green at 0, red at the scale's
+ * end — so a band takes its color from WHERE IT SITS on the dial rather
+ * than from a figure computed about it. The needle's position (or, for a
+ * compact meter, the fill's own leading edge) and the color under it then
+ * carry the same information.
+ *
+ * Returned as `{offset, color}` stops for an SVG `linearGradient` laid
+ * horizontally across the arc's bounding box.
+ *
+ * **The offsets are cosine-spaced, not linear, and that is the whole
+ * subtlety.** A horizontal gradient interpolates along X, while the arc
+ * advances by ANGLE; for a semicircle the two are related by
+ * `x = cx − r·cos(pct·π)`, so evenly-spaced colors in X would bunch
+ * visibly wrong against the tick marks — the 50% stop would not land at
+ * the top of the dial. Placing each stop at its own
+ * `(1 − cos(pct·π)) / 2` makes the gradient track the arc exactly, so the
+ * color at any tick is the color that tick's percentage maps to. Every
+ * `<Meter>` — big or compact — draws the SAME half-circle arc geometry
+ * (`HALF_ARC_D`, this file's own doc), so this one spacing rule is correct
+ * for all of them; a compact meter needs no linear variant.
+ *
+ * 24 segments is a legibility choice, not a precision one: the ramp is
+ * piecewise-linear between stops and the eye cannot resolve the banding
+ * past roughly this density at the dial's rendered size. */
+export function gaugeRampStops(segments = 24): { offset: number; color: string }[] {
+  return Array.from({ length: segments + 1 }, (_, i) => {
+    const pct = i / segments;
+    return { offset: (1 - Math.cos(pct * Math.PI)) / 2, color: gaugeFillColor(pct * 100) };
+  });
+}
+
+/** The one gradient id every compact meter's own `<linearGradient>` uses.
+ * Reused verbatim across every simultaneously-rendered compact `<Meter>`
+ * (CPU/GPU/MEM, several CPU-cluster tiles, the remote-machine fallback
+ * dials can all be on screen together) — safe because each `<Meter>`
+ * renders its OWN `<svg>` root with its OWN `<defs>`, and an SVG
+ * `url(#id)` paint reference resolves within that same `<svg>` fragment,
+ * not globally across the DOM (the same assumption the big gauge's fixed
+ * `RAMP_ID` already relies on, just exercised here with many instances at
+ * once instead of one). */
+export const COMPACT_RAMP_ID = "mm-compact-ramp";
+
+/** A compact meter's single fill band — `now` percent, 0-100, clamped,
+ * painted from the shared ramp (`COMPACT_RAMP_ID`) rather than a literal
+ * color. `null` (no reading yet) yields NO band at all, matching the same
+ * absence-never-zero rule the needle already follows.
+ *
+ * **Replaces `simpleBand` (deleted) and the `banded`/threshold-override
+ * mechanism it opted into** (operator: "give every small meter the same
+ * gradient treatment the big gauge uses... the fill should reveal the
+ * gradient up to the value"). The fill's own color now depends on WHERE
+ * its leading edge sits on the ramp — a gauge at 10% shows only green, one
+ * at 90% reaches into red — so a SEPARATE class-driven flat-color override
+ * at a warn/critical threshold would have fought the gradient it sits on
+ * top of (the exact "doubling up" the operator flagged). The PERCENTAGE
+ * TEXT keeps its own threshold-based severity color unchanged
+ * (`nowLevelCls`, computed independently of `bands`) — that signal is
+ * still real and non-redundant with the ramp. */
+export function gradientBand(className: string, now: number | null): MeterBand[] {
   if (now === null) return [];
-  return [{ className, stroke, lengthPct: Math.max(0, Math.min(100, now)), banded: true }];
+  return [{ className, stroke: `url(#${COMPACT_RAMP_ID})`, lengthPct: Math.max(0, Math.min(100, now)) }];
 }
 
 /** A compact meter's avg/max marks — small unlabeled ticks on the arc, the
@@ -281,23 +385,30 @@ export function avgMaxTicks(avg: number | null, max: number | null): MeterTick[]
 }
 
 /** Bundles EVERYTHING a compact CPU/GPU/MEM caller needs into one prop
- * spread — `bands`/`ticks`/`needleAngleDeg`/`numerals`/`label` — so the
- * "how do I feed a plain now/avg/max reading into `<Meter>`" logic lives
- * in exactly ONE place rather than being re-derived at each of the two
- * call sites (`MachineDrawer.tsx`, `MachineLens.tsx`'s live-load section).
- * `className`/`stroke` are the fill band's own CSS treatment — every
- * current caller passes the SAME `"mm-gauge-fill-compact"` / accent color,
- * kept as parameters rather than hardcoded here in case a future caller
- * genuinely needs its own color. */
+ * spread — `gradient`/`bands`/`ticks`/`needleAngleDeg`/`numerals`/`label`
+ * — so the "how do I feed a plain now/avg/max reading into `<Meter>`"
+ * logic lives in exactly ONE place rather than being re-derived at each
+ * call site (`MachineDrawer.tsx`/`machineStatsContent.tsx`'s live-load
+ * section, `MachineLens.tsx`'s remote-machine fallback). `className` is
+ * the fill band's own `className` (every current caller passes
+ * `"mm-gauge-fill-compact"`) — kept as a parameter rather than hardcoded
+ * in case a future caller genuinely needs its own.
+ *
+ * **No `stroke` parameter any more** (gradient-everywhere pass): every
+ * caller used to pass the SAME literal `"var(--accent, var(--good))"`
+ * here, which this function is what turned into a real color via
+ * `simpleBand`. Now the fill paints from the shared ramp
+ * (`gradientBand`/`COMPACT_RAMP_ID`) instead, so there is no literal color
+ * left for a caller to supply — passing one would be dead input. */
 export function compactMeterProps(
   label: string,
   className: string,
-  stroke: string,
   m: { now: number | null; avg: number | null; high: number | null },
-): Pick<MeterProps, "label" | "bands" | "ticks" | "needleAngleDeg" | "numerals"> {
+): Pick<MeterProps, "label" | "gradient" | "bands" | "ticks" | "needleAngleDeg" | "numerals"> {
   return {
     label,
-    bands: simpleBand(className, stroke, m.now),
+    gradient: { id: COMPACT_RAMP_ID, stops: gaugeRampStops() },
+    bands: gradientBand(className, m.now),
     ticks: avgMaxTicks(m.avg, m.high),
     needleAngleDeg: m.now == null ? undefined : angleForPct(m.now),
     numerals: { now: m.now, avg: m.avg, max: m.high },
@@ -343,30 +454,28 @@ export function Meter({
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={STROKE_W} pathLength={100} />
         {bands
           .filter((b) => b.alwaysRender || b.lengthPct > 0)
-          .map((b) => {
-            // (#2122) Only a `banded` band (every `simpleBand()` output —
-            // CPU/GPU/MEM, the CPU-cluster tiles) is eligible; VRAM's own
-            // bands never set the flag and always render exactly as
-            // before. The level's CSS class (`.mm-band-warn`/
-            // `.mm-band-critical`, styles.css) overrides the literal
-            // `stroke` prop via ordinary CSS cascade — SVG presentation
-            // attributes sit below any stylesheet rule in priority, so no
-            // conditional here is needed to suppress `b.stroke`.
-            const levelCls = b.banded ? bandLevelClass(meterBandLevel(b.lengthPct, warnAt, criticalAt)) : "";
-            return (
-              <path
-                key={b.className}
-                className={levelCls ? `${b.className} ${levelCls}` : b.className}
-                stroke={b.stroke}
-                d={HALF_ARC_D}
-                fill="none"
-                strokeWidth={STROKE_W}
-                pathLength={100}
-                strokeDasharray={b.hatchedDasharray ?? `${b.lengthPct} 100`}
-                strokeDashoffset={b.hatchedDasharray ? undefined : b.startPct ? -b.startPct : undefined}
-              />
-            );
-          })}
+          .map((b) => (
+            // (gradient-everywhere pass) Every band paints from its OWN
+            // `stroke` — a literal color, a hatch pattern via `className`,
+            // or (every compact-meter fill, via `gradientBand`) a
+            // `url(#COMPACT_RAMP_ID)` reference into the ramp `<defs>`
+            // above. No class-driven threshold override reaches the arc
+            // any more (`.mm-band-warn`/`.mm-band-critical`'s STROKE rules
+            // are retired with `simpleBand`/`banded` — see `gradientBand`'s
+            // own doc for why); the percentage TEXT still gets its own
+            // threshold color independently, below.
+            <path
+              key={b.className}
+              className={b.className}
+              stroke={b.stroke}
+              d={HALF_ARC_D}
+              fill="none"
+              strokeWidth={STROKE_W}
+              pathLength={100}
+              strokeDasharray={b.hatchedDasharray ?? `${b.lengthPct} 100`}
+              strokeDashoffset={b.hatchedDasharray ? undefined : b.startPct ? -b.startPct : undefined}
+            />
+          ))}
         {ticks.map((t, i) => (
           <line
             // Index, not `t.pct` — a compact meter's avg/max ticks can
