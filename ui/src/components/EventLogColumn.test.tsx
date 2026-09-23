@@ -19,7 +19,17 @@ const REPO_ROOT = path.resolve(__dirname, "../../..");
  * live daemon. Reused here (not a hand-built fixture) because the
  * duplicate-key bug this file's test below proves only reproduces against
  * the REAL record shapes — a hand-simplified version could accidentally
- * fix itself by construction. */
+ * fix itself by construction.
+ *
+ * (public-repo scrub) The captured `machine_uid` and `workspace` temp path
+ * named the real host that fetched this fixture — replaced with the
+ * corpus's existing synthetic `machine_uid`
+ * (`ABFCA777-9F06-A6BF-52CB-589A5D164929`, already used across
+ * `fleet-machines-live.json`/`flow-session-task-list.json`/`flow-today.json`
+ * and others, paired with the same `machine_id: "MacBook-Pro"` this fixture
+ * uses) and a neutral `/tmp/...` path. Every other field (the prompt, the
+ * diff it reviews, tool args/results, timings, turn structure) is the real
+ * captured shape — only the two host-identifying values were touched. */
 function readCorpus(name: string): FlowRecord[] {
   const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus", name), "utf8"));
   return raw.records as FlowRecord[];
