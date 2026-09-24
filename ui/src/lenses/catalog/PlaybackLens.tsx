@@ -7,7 +7,7 @@ import type { FlowRecord } from "../../types/handwritten";
 
 /** Legacy's own play-loop constants (viewer.html:2848-2860): a 100ms tick
  * advancing the playhead by the measured elapsed wall clock times the
- * labeled speed (`1h/s` by default). It used to be `(tMax-tMin)/120` per
+ * labeled speed (real time, `1s/s`, by default). It used to be `(tMax-tMin)/120` per
  * tick, a fixed ~12s per day under a "1×" label (#2071 follow-up). */
 
 /**

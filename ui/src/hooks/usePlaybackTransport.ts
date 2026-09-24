@@ -113,11 +113,14 @@ function focusRange(dayRecords: FlowRecord[], focus: PlaybackFocus): { tMin: num
  * played out in 12 seconds), which made the "1×" label a lie — a 13-hour
  * demo day ran at ~3,900× real time under it (operator: "1× doesn't seem
  * 1×"). Labeled as recorded time per second (`speedLabel`) because a bare
- * multiplier is meaningless to a reader: `1h/s` is. Cycle order steps
- * DOWN from the default (1h/s → 10m/s → 1m/s) and wraps. */
-export const SPEEDS = [3600, 600, 60] as const;
+ * multiplier is meaningless to a reader: `1h/s` is. The default is REAL
+ * TIME (operator, 2026-09-24): a replay then plays every animation (the
+ * token scope easing between 2s heartbeats, events arriving) at the pace a
+ * live viewer saw it. The cycle steps UP from there (1s/s → 1m/s → 10m/s →
+ * 1h/s) and wraps. */
+export const SPEEDS = [1, 60, 600, 3600] as const;
 export type Speed = (typeof SPEEDS)[number];
-export const DEFAULT_SPEED: Speed = 3600;
+export const DEFAULT_SPEED: Speed = 1;
 export const PLAY_TICK_MS = 100;
 
 export function speedLabel(speed: number): string {

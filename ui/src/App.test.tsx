@@ -87,6 +87,18 @@ const FLEET_OFF = (key: "machines" | "sessions") => ({
   meta: { sources: { fleet: { state: "off" } }, complete: true },
 });
 
+
+/** Click the transport's speed button until it reads 1h/s. Playback defaults
+ *  to real time, so a test that plays a recorded day through picks the fast
+ *  speed the way a user would. */
+function selectHourPerSecond() {
+  for (let i = 0; i < 4; i++) {
+    const btn = screen.getByRole("button", { name: /^playback speed/ });
+    if (btn.getAttribute("aria-label")?.endsWith("1h/s")) return;
+    fireEvent.click(btn);
+  }
+  expect(screen.getByRole("button", { name: /^playback speed/ })).toHaveAttribute("aria-label", "playback speed, 1h/s");
+}
 describe("App", () => {
 
   it("mounts without an infinite update-depth error and renders the fleet lens by default", async () => {
@@ -1160,6 +1172,7 @@ describe("App", () => {
       renderApp();
       await screen.findByRole("group", { name: "playback transport" });
       await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3)); // whole, at rest
+      selectHourPerSecond();
       fireEvent.click(screen.getByRole("button", { name: /^play$/i }));
       await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1)); // rewound: cut
       await vi.advanceTimersByTimeAsync(15000);
@@ -1569,6 +1582,7 @@ describe("App", () => {
     try {
       renderApp();
       await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+      selectHourPerSecond();
       fireEvent.click(screen.getByRole("button", { name: /^play$/i }));
       await waitFor(() => expect(screen.getByRole("slider")).toHaveValue("0"));
       expect(screen.getByRole("button", { name: /^pause$/i })).toBeInTheDocument();

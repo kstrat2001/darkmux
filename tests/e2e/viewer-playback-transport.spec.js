@@ -41,8 +41,9 @@ test('pressing play on the static build actually advances the playhead', async (
   // the play/pause button title carry the whole proof below, same as they
   // always did independently of the (now-removed) rec count.
   //
-  // The 13-second fixture day plays inside ONE 100 ms tick at the default
-  // 1h/s, so asserting the "rewound and playing" state from the test side
+  // Playback defaults to real time; this spec selects 1h/s through the speed
+  // button first (below), where the 13-second fixture day plays inside ONE
+  // 100 ms tick, so asserting the "rewound and playing" state from the test side
   // is a race against the loop. Record the transitions from INSIDE the page
   // instead: a requestAnimationFrame sampler (~16 ms, finer than the tick)
   // captures every distinct (range value, button title) state the
@@ -62,6 +63,10 @@ test('pressing play on the static build actually advances the playhead', async (
     };
     sample();
   });
+  // Playback defaults to real time (1s/s); pick 1h/s the way a user would.
+  const speedBtn = page.locator('button[aria-label^="playback speed"]');
+  for (let i = 0; i < 4 && !(await speedBtn.getAttribute('aria-label')).endsWith('1h/s'); i++) await speedBtn.click();
+  await expect(speedBtn).toHaveAttribute('aria-label', 'playback speed, 1h/s');
   await playBtn.click();
 
   // Real wall-clock, real `setInterval` — poll until the playhead has
@@ -70,7 +75,7 @@ test('pressing play on the static build actually advances the playhead', async (
   // so any nonzero value within a few real seconds is genuine motion, not
   // a fluke.
   // Speed is a real multiplier of elapsed time now ("1× doesn't seem 1×",
-  // the #2071 follow-up): at the default 1h/s this 13-second fixture day
+  // the #2071 follow-up): at 1h/s (selected above) this 13-second fixture day
   // plays out inside ONE tick, so sampling mid-flight is a race against
   // the loop. The advance is proven by the run COMPLETING instead: the
   // range returns to 100 and the play button flips back from "pause" —

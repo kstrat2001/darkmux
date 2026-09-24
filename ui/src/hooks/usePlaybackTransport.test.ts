@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
-import { usePlaybackTransport } from "./usePlaybackTransport";
+import { usePlaybackTransport, speedLabel, DEFAULT_SPEED } from "./usePlaybackTransport";
+
+/** Cycle to 1h/s. The default is real time, so a test that plays a
+ *  recorded hour to its end picks the fast speed explicitly. */
+function toHourPerSecond(result: { current: { speed: number; cycleSpeed: () => void } }) {
+  for (let i = 0; i < 4 && result.current.speed !== 3600; i++) act(() => result.current.cycleSpeed());
+  expect(result.current.speed).toBe(3600);
+}
 import type { FlowRecord } from "../types/handwritten";
 
 const DAY = [
@@ -54,11 +61,12 @@ describe("usePlaybackTransport", () => {
   it("play from the end starts over, advances on the tick, and stops at the end", () => {
     vi.useFakeTimers();
     const { result } = renderHook(() => usePlaybackTransport(DAY));
+    toHourPerSecond(result);
     act(() => result.current.togglePlay());
     expect(result.current.playing).toBe(true);
     expect(result.current.t).toBe(result.current.tMin);
     act(() => {
-      vi.advanceTimersByTime(500); // half a real second = half a recorded hour at the default 1h/s; the day is one hour
+      vi.advanceTimersByTime(500); // half a real second = half a recorded hour at 1h/s; the day is one hour
     });
     expect(result.current.t).toBeGreaterThan(result.current.tMin);
     expect(result.current.t).toBeLessThan(result.current.tMax);
@@ -69,6 +77,27 @@ describe("usePlaybackTransport", () => {
     expect(result.current.playing).toBe(false);
   });
 
+  it("defaults to REAL TIME: one real second replays one recorded second, so animations play as a live viewer saw them", () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => usePlaybackTransport(DAY));
+    expect(result.current.speed).toBe(1);
+    expect(speedLabel(result.current.speed)).toBe("1s/s");
+    act(() => result.current.togglePlay());
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(result.current.t - result.current.tMin).toBe(1000);
+    // The cycle steps UP from real time and wraps back to it.
+    act(() => result.current.cycleSpeed());
+    expect(result.current.speed).toBe(60);
+    act(() => result.current.cycleSpeed());
+    expect(result.current.speed).toBe(600);
+    act(() => result.current.cycleSpeed());
+    expect(result.current.speed).toBe(3600);
+    act(() => result.current.cycleSpeed());
+    expect(result.current.speed).toBe(1);
+  });
+
   it("speed is a real multiplier: at 1h/s one real second replays one recorded hour, at 1m/s one minute", () => {
     vi.useFakeTimers();
     const threeHours = [
@@ -76,7 +105,7 @@ describe("usePlaybackTransport", () => {
       { ts: "2026-08-07T03:00:00.000Z", action: "dispatch.complete" },
     ] as unknown as FlowRecord[];
     const { result } = renderHook(() => usePlaybackTransport(threeHours));
-    expect(result.current.speed).toBe(3600);
+    toHourPerSecond(result);
     act(() => result.current.togglePlay());
     act(() => {
       vi.advanceTimersByTime(1000);
@@ -85,9 +114,9 @@ describe("usePlaybackTransport", () => {
     // The step is MEASURED: a throttled interval (one late tick standing in
     // for ten) still replays the labeled amount of recorded time.
     act(() => result.current.rewind());
-    act(() => result.current.cycleSpeed()); // 1h/s -> 10m/s
-    expect(result.current.speed).toBe(600);
-    act(() => result.current.cycleSpeed()); // 10m/s -> 1m/s
+    act(() => result.current.cycleSpeed()); // 1h/s -> wraps to 1s/s
+    expect(result.current.speed).toBe(1);
+    act(() => result.current.cycleSpeed()); // 1s/s -> 1m/s
     expect(result.current.speed).toBe(60);
     act(() => {
       vi.advanceTimersByTime(1000);
@@ -101,11 +130,11 @@ describe("usePlaybackTransport", () => {
       result.current.rewind();
       result.current.cycleSpeed();
     });
-    expect(result.current.speed).toBe(600);
+    expect(result.current.speed).toBe(60);
     const other = [{ ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start" }, { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete" }] as unknown as FlowRecord[];
     rerender({ d: other });
     expect(result.current.t).toBe(Date.parse("2026-08-09T02:00:00.000Z"));
-    expect(result.current.speed).toBe(3600);
+    expect(result.current.speed).toBe(DEFAULT_SPEED);
     expect(result.current.playing).toBe(false);
   });
 
@@ -200,7 +229,7 @@ describe("usePlaybackTransport", () => {
         result.current.rewind();
         result.current.cycleSpeed();
       });
-      expect(result.current.speed).toBe(600);
+      expect(result.current.speed).toBe(60);
       const otherDaySc = [
         { ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start", session_id: "sC" },
         { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete", session_id: "sC" },
@@ -209,7 +238,7 @@ describe("usePlaybackTransport", () => {
       expect(result.current.tMin).toBe(Date.parse("2026-08-09T00:00:00.000Z"));
       expect(result.current.tMax).toBe(Date.parse("2026-08-09T02:00:00.000Z"));
       expect(result.current.t).toBe(Date.parse("2026-08-09T02:00:00.000Z"));
-      expect(result.current.speed).toBe(3600);
+      expect(result.current.speed).toBe(DEFAULT_SPEED);
       expect(result.current.playing).toBe(false);
     });
   });
@@ -352,11 +381,12 @@ describe("usePlaybackTransport", () => {
   it("(#2347 TEST GAP) play on a dispatch focus stops at the FOCUS's own tMax, never the day's later end", () => {
     vi.useFakeTimers();
     const { result } = renderHook(() => usePlaybackTransport(MIXED_DAY, { kind: "dispatch", sessionId: "sA", records: sARecords }));
+    toHourPerSecond(result);
     act(() => result.current.togglePlay());
     expect(result.current.playing).toBe(true);
     act(() => {
-      // Far more wall-clock than sA's own 30-minute span needs at the
-      // default 1h/s (0.5s would already finish it) — if the ceiling were
+      // Far more wall-clock than sA's own 30-minute span needs at
+      // 1h/s (0.5s would already finish it) — if the ceiling were
       // ever day-scoped instead of focus-scoped, this would still be
       // mid-flight toward 20:43 rather than stopped.
       vi.advanceTimersByTime(60_000);
