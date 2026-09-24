@@ -9565,6 +9565,136 @@
         assert!(payload["sampled_at_ms"].is_null());
     }
 
+    /// (#2889) A partial that names the tool call being written forwards the
+    /// phase and the tool name, so the viewer can read "writing" rather than
+    /// a rate. A partial without them forwards neither key (absent, not
+    /// null): the keys MEAN writing, so their absence is the other reading.
+    #[test]
+    fn heartbeat_payload_forwards_the_writing_phase_only_when_present() {
+        let writing = serde_json::json!({
+            "type": "model.partial", "seq": 2, "partial_index": 7,
+            "cumulative_chars": 0, "generated_chars": 812, "ts": 5_000u64,
+            "phase": "writing_tool_call", "tool_name": "edit",
+        });
+        let payload = heartbeat_payload(&writing);
+        assert_eq!(payload["phase"], "writing_tool_call");
+        assert_eq!(payload["tool_name"], "edit");
+        assert_eq!(payload["generated_chars"], 812);
+
+        let plain = serde_json::json!({
+            "type": "model.partial", "seq": 2, "partial_index": 3,
+            "cumulative_chars": 10, "generated_chars": 40, "ts": 4_000u64,
+        });
+        let payload = heartbeat_payload(&plain);
+        assert!(payload.get("phase").is_none(), "no phase key without a named call: {payload}");
+        assert!(payload.get("tool_name").is_none(), "no tool_name key without a named call: {payload}");
+    }
+
+    /// (#2889) Every `dispatch.turn.heartbeat` the tailer wrote into the
+    /// isolated flows dir, in order.
+    fn heartbeats_in(flows: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(flows) {
+            for e in entries.flatten() {
+                for line in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    if v.get("action").and_then(|a| a.as_str()) == Some("dispatch.turn.heartbeat") {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// (#2889) The opening heartbeat. A stream start becomes a heartbeat at
+    /// `generated_chars: 0` carrying the request's size in chars (system +
+    /// everything else, the runtime's `model.streaming.start` split summed),
+    /// so the viewer can say how much the model is reading WHILE it reads.
+    /// Before this the only context size arrived at turn end.
+    #[test]
+    #[serial]
+    fn tailer_stream_start_emits_an_opening_heartbeat_with_the_prompt_size() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":140000}}"#
+        )
+        .unwrap();
+        drop(f);
+        state.poll_and_emit();
+
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 1, "a stream start must emit exactly one opening heartbeat: {beats:?}");
+        let p = &beats[0]["payload"];
+        assert_eq!(p["turn_seq"], 3);
+        assert_eq!(p["generated_chars"], 0);
+        assert_eq!(p["sampled_at_ms"], 1_758_700_000_000u64);
+        assert_eq!(p["prompt_chars"], 144_000, "system + prompt chars: {p}");
+        // A stream start is not a chunk: it proves nothing about the model
+        // producing, so it must not reset the watchdog.
+        assert_eq!(*shared.lock().unwrap(), original_deadline);
+    }
+
+    /// (#2889) A silent tick while the model writes a tool call becomes a
+    /// heartbeat naming the phase and tool, with its counts unchanged — and
+    /// it is NOT proof of work. A tick shows only that the runtime is
+    /// waiting, which a wedged endpoint produces too, so the deadline stays
+    /// where the last real chunk put it.
+    #[test]
+    #[serial]
+    fn tailer_tool_call_writing_tick_emits_a_writing_heartbeat_without_resetting_the_deadline() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.tool_call.writing","seq":2,"partial_index":9,"cumulative_chars":0,"generated_chars":1500,"phase":"writing_tool_call","tool_name":"write","ts":1758700070000}}"#
+        )
+        .unwrap();
+        drop(f);
+        state.poll_and_emit();
+
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 1, "a writing tick must forward as a heartbeat: {beats:?}");
+        let p = &beats[0]["payload"];
+        assert_eq!(p["phase"], "writing_tool_call");
+        assert_eq!(p["tool_name"], "write");
+        assert_eq!(p["generated_chars"], 1500);
+        assert_eq!(p["sampled_at_ms"], 1_758_700_070_000u64);
+        assert_eq!(
+            *shared.lock().unwrap(),
+            original_deadline,
+            "a writing tick must not reset the inactivity deadline"
+        );
+    }
+
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory
     /// line through `handle_event` and assert the emitted FlowRecord is a
     /// telemetry record (`category:"telemetry"`, `source:"detector"`)

@@ -928,7 +928,12 @@ export function FleetLens({
                       // so, not "stalled".
                       selectedExec.state === null
                       ? "no signal"
-                      : liveStateLabel({ state: selectedExec.state, restSecondsLeft: selectedExec.restSecondsLeft })}
+                      : liveStateLabel({
+                          state: selectedExec.state,
+                          restSecondsLeft: selectedExec.restSecondsLeft,
+                          writing: selectedExec.writing,
+                          writingSeconds: selectedExec.writingSeconds,
+                        })}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —
@@ -1070,6 +1075,9 @@ export function FleetLens({
                     // rate line prints, so the tube shows static.
                     state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
                     toolName={selectedExec.toolName}
+                    // (#2889) The writing cue; no caption on the card — the
+                    // rate line above already says "writing · N s".
+                    toolWriting={selectedExec.writing === true}
                     size="card"
                   />
                 </div>

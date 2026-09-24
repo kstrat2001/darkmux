@@ -42,6 +42,11 @@ const TRAJECTORY_SUBDIR: &str = ".darkmux-runtime";
 const TRAJECTORY_FILE: &str = "trajectory.jsonl";
 const METRICS_FILE: &str = "metrics.json";
 
+/// (#2889) The `phase` value naming "the model is writing a tool call". The
+/// host forwards it on `dispatch.turn.heartbeat`, and the viewer matches the
+/// literal (`ui/src/lib/tokenRate.ts`), so it is spelled once here.
+pub const WRITING_TOOL_CALL_PHASE: &str = "writing_tool_call";
+
 /// Cap on the recorded tool-argument string. A search pattern, file path, or
 /// shell command is far under this; only a `write`/`edit` file-content arg
 /// exceeds it, and a truncated head is enough to recall what was attempted.
@@ -1261,6 +1266,7 @@ impl Trajectory {
     /// orders of magnitude. Operators tailing the file get a steady
     /// line cadence (= dispatch is alive) plus a running byte count
     /// (= roughly how much has been produced so far). (#205)
+    #[allow(clippy::too_many_arguments)]
     pub fn append_model_partial(
         &mut self,
         seq: u32,
@@ -1277,8 +1283,14 @@ impl Trajectory {
         // timestamps) rides this same event through to the flow layer as
         // `sampled_at_ms`.
         generated_chars: usize,
+        // (#2889) The tool call the model is writing, once its name has
+        // arrived. Stamps `phase: "writing_tool_call"` + `tool_name` so the
+        // viewer switches at the chunk that named the call. Absent (not
+        // null) while no call is named — the keys mean "writing", so their
+        // absence is the "not writing" reading.
+        writing_tool: Option<&str>,
     ) {
-        self.write_event(&serde_json::json!({
+        let mut event = serde_json::json!({
             "type": "model.partial",
             "seq": seq,
             "partial_index": partial_index,
@@ -1286,6 +1298,41 @@ impl Trajectory {
             "cumulative_chars": cumulative_chars,
             "tool_calls_present": tool_calls_present,
             "generated_chars": generated_chars,
+            "ts": unix_ms(),
+        });
+        if let Some(name) = writing_tool {
+            event["phase"] = serde_json::json!(WRITING_TOOL_CALL_PHASE);
+            event["tool_name"] = serde_json::json!(name);
+        }
+        self.write_event(&event);
+    }
+
+    /// model.tool_call.writing — (#2889) fires once per stream tick while the
+    /// endpoint is SILENT and a tool call has been named. LM Studio sends a
+    /// call's name at once and its arguments only when complete (measured: a
+    /// 7s gap, then 3,455 chars in one chunk), so without this nothing is
+    /// written while the model works and the viewer reads a stall.
+    ///
+    /// Its own type rather than a `model.partial`: no chunk arrived, and
+    /// every `model.partial` reader (the lab's stats, the host's
+    /// proof-of-work reset) treats one as a chunk. The counts are the last
+    /// chunk's, unchanged — nothing new was generated that the runtime saw.
+    pub fn append_tool_call_writing(
+        &mut self,
+        seq: u32,
+        partial_index: u32,
+        cumulative_chars: usize,
+        generated_chars: usize,
+        tool_name: &str,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "model.tool_call.writing",
+            "seq": seq,
+            "partial_index": partial_index,
+            "cumulative_chars": cumulative_chars,
+            "generated_chars": generated_chars,
+            "phase": WRITING_TOOL_CALL_PHASE,
+            "tool_name": tool_name,
             "ts": unix_ms(),
         }));
     }

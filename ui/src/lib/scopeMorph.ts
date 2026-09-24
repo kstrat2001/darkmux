@@ -36,6 +36,8 @@ export type ScopeState = LiveState | "nosignal" | "finished" | "idle";
  *  - `ember`: the STALL dot
  *  - `rscale`: ring radius scale
  *  - `tempo`: how fast the wave turns (1 live; slow for a finished run's echo)
+ *  - `scribe`: (#2889) TOOLS while the model WRITES the call — the comet's
+ *    tail stretches and its head scribbles, same color and icon as running
  *  - `r`/`g`/`b`: color */
 export interface ScopeParams {
   ring: number;
@@ -49,6 +51,7 @@ export interface ScopeParams {
   ember: number;
   rscale: number;
   tempo: number;
+  scribe: number;
   r: number;
   g: number;
   b: number;
@@ -69,23 +72,33 @@ export const SCOPE_SPEED = {
   ember: 5,
   rscale: 5,
   tempo: 4,
+  scribe: 4,
   rgb: 5,
 } as const;
 
 /** The morphing keys, in a fixed array so the per-frame loop does not call
  *  `Object.keys` (which allocates). Color is handled separately. */
-const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale", "tempo"] as const;
+const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale", "tempo", "scribe"] as const;
 
 function blankParams(): ScopeParams {
-  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, r: 0, g: 0, b: 0 };
+  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, scribe: 0, r: 0, g: 0, b: 0 };
 }
 
 /** The targets for `state`, `sinceSec` seconds after entering it, written
  *  into `out` (a fresh object when omitted). `rate` only matters for GEN
  *  and FINISHED (its average);
  *  `sinceSec` only for STALL, whose collapse runs in three phases: squash to
- *  a line, shrink the line to a dot, then leave an ember. */
-export function scopeTargets(state: ScopeState, sinceSec: number, rate: number, rgb: Rgb, out: ScopeParams = blankParams()): ScopeParams {
+ *  a line, shrink the line to a dot, then leave an ember. `writing` (#2889)
+ *  only matters for TOOLS: the model is generating the call's arguments
+ *  rather than darkmux running it, a variant of the same state. */
+export function scopeTargets(
+  state: ScopeState,
+  sinceSec: number,
+  rate: number,
+  rgb: Rgb,
+  out: ScopeParams = blankParams(),
+  writing = false,
+): ScopeParams {
   out.ring = 1;
   out.wave = 0;
   out.comet = 0;
@@ -97,6 +110,7 @@ export function scopeTargets(state: ScopeState, sinceSec: number, rate: number, 
   out.ember = 0;
   out.rscale = 1;
   out.tempo = 1;
+  out.scribe = 0;
   out.r = rgb[0];
   out.g = rgb[1];
   out.b = rgb[2];
@@ -111,6 +125,7 @@ export function scopeTargets(state: ScopeState, sinceSec: number, rate: number, 
     case "tools":
       out.ring = 0.3;
       out.comet = 1;
+      if (writing) out.scribe = 1;
       break;
     case "rest":
       out.ring = 0.8;
@@ -177,8 +192,10 @@ export function createMorph(): ScopeMorph {
  *  targets, and move every parameter toward them by `1 - exp(-speed * dt)`.
  *  Leaving a STALL powers the tube back on: for the first quarter second the
  *  trace is held as a line (the dot stretches out), then it opens into the
- *  next state's ring. Returns the (mutated, reused) current parameters. */
-export function advanceMorph(m: ScopeMorph, state: ScopeState, rate: number, rgb: Rgb, dt: number): ScopeParams {
+ *  next state's ring. Returns the (mutated, reused) current parameters.
+ *  `writing` is TOOLS' writing variant (#2889); a change of it alone is not a
+ *  state change, so it glides like every other parameter. */
+export function advanceMorph(m: ScopeMorph, state: ScopeState, rate: number, rgb: Rgb, dt: number, writing = false): ScopeParams {
   const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
   m.clock += step;
   if (state !== m.state) {
@@ -188,7 +205,7 @@ export function advanceMorph(m: ScopeMorph, state: ScopeState, rate: number, rgb
   } else {
     m.sinceSec += step;
   }
-  const tgt = scopeTargets(state, m.sinceSec, rate, rgb, m.tgt);
+  const tgt = scopeTargets(state, m.sinceSec, rate, rgb, m.tgt, writing);
   if (m.leftStall !== null) {
     m.leftStall += step;
     if (m.leftStall < 0.25) tgt.sy = 0.02;
@@ -212,11 +229,11 @@ export function advanceMorph(m: ScopeMorph, state: ScopeState, rate: number, rgb
 
 /** Jump straight to `state`'s settled look, with no glide: the static frame
  *  `prefers-reduced-motion: reduce` draws. A stall settles on its ember. */
-export function settleMorph(m: ScopeMorph, state: ScopeState, rate: number, rgb: Rgb): ScopeParams {
+export function settleMorph(m: ScopeMorph, state: ScopeState, rate: number, rgb: Rgb, writing = false): ScopeParams {
   m.state = state;
   m.sinceSec = state === "stalled" ? 1 : 0;
   m.leftStall = null;
-  const tgt = scopeTargets(state, m.sinceSec, rate, rgb, m.tgt);
+  const tgt = scopeTargets(state, m.sinceSec, rate, rgb, m.tgt, writing);
   m.p = { ...tgt };
   return m.p;
 }

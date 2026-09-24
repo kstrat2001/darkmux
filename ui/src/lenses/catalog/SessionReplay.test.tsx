@@ -1338,6 +1338,26 @@ describe("modelScopeHero (#2890)", () => {
     expect(h).toMatchObject({ state: "prompt", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "prompt" } });
   });
 
+  it("(#2889) PROMPT with the opening heartbeat's size: '~36k' over 'reading'", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptLabel: "~36k" }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "prompt", centerLabel: "~36k", centerUnit: "reading", tokensPerSec: 0 });
+  });
+
+  it("(#2889) PROMPT without a size (older records) keeps the brain: no label", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptLabel: null }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null });
+  });
+
+  it("(#2889) TOOLS while writing: the tool icon, the writing cue, and 'writing · N s' under it", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "tools", toolName: "edit", writing: true, writingSeconds: 70 }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: true, centerUnit: "writing · 70 s", tokensPerSec: 0 });
+  });
+
+  it("(#2889) TOOLS while darkmux runs the tool: no writing cue, no caption", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "tools", toolName: "edit" }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: false, centerUnit: null });
+  });
+
   it("no signal is its own state with the words under the lamps", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: null, noSignal: true }, finishedTokRate: null });
     expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "no signal" });

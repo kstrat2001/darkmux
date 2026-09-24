@@ -3229,7 +3229,11 @@ mod tests {
         //            `sampled_at_ms` / `generated_chars` (#2877, live
         //            token-rate scope): ms-precision sample time + a
         //            generated-char count that includes reasoning text.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.55.0");
+        //   1.56.0 — additive `dispatch.turn.heartbeat` payload keys
+        //            `phase` / `tool_name` / `prompt_chars` (#2889): the
+        //            model writing a named tool call, and the request size
+        //            on the turn's opening heartbeat.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.56.0");
     }
 
     #[test]

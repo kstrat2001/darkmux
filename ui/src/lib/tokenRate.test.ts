@@ -18,6 +18,8 @@ import {
   liveStateLabel,
   liveStateWhileConnected,
   lastHeartbeatMs,
+  promptTokensLabel,
+  promptEstimate,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -954,5 +956,111 @@ describe("liveStatePriority", () => {
 
   it("ranks null (no signal) worse than every real state, including stalled", () => {
     expect(liveStatePriority(null)).toBeGreaterThan(liveStatePriority("stalled"));
+  });
+});
+
+// (#2889) The model writing a tool call. LM Studio names the call at once,
+// then generates its arguments without sending anything; the runtime ticks
+// through that silence and the host forwards each tick as a heartbeat with
+// `phase: "writing_tool_call"`, `tool_name`, and `generated_chars` UNCHANGED.
+describe("(#2889) writing a tool call", () => {
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts: atSec(sec), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const hb = (sec: number, chars: number, extra: Record<string, unknown> = {}) =>
+    rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 1, ...extra });
+  const writing = (sec: number, chars: number, tool = "write") => hb(sec, chars, { phase: "writing_tool_call", tool_name: tool });
+
+  /** The probe's shape, stretched: 2s of reasoning, then the name at 4s,
+   *  then 36s of ticks at the same count, well past `STALL_AFTER_MS`. */
+  const probe = (): FlowRecord[] => {
+    const out = [rec(-5, "dispatch.start"), hb(0, 0, { prompt_chars: 144_000 }), hb(1, 400), hb(2, 800), writing(4, 812)];
+    for (let s = 6; s <= 40; s += 2) out.push(writing(s, 812));
+    return out;
+  };
+
+  it("derives TOOLS, writing, with the tool name — never STALL, PROMPT or GEN — through a gap longer than the stall threshold", () => {
+    const nowMs = Date.parse(atSec(41));
+    expect(nowMs - Date.parse(atSec(4))).toBeGreaterThan(STALL_AFTER_MS);
+    expect(deriveLiveState(probe(), nowMs)).toEqual({ state: "tools", toolName: "write", writing: true, writingSeconds: 37 });
+  });
+
+  it("the writing stretch counts from the first writing heartbeat of the current run of them", () => {
+    expect(deriveLiveState(probe(), Date.parse(atSec(10)))).toMatchObject({ state: "tools", writing: true, writingSeconds: 6 });
+  });
+
+  it("a writing heartbeat gone stale is still a stall — the tick stopped, so nothing is writing", () => {
+    expect(deriveLiveState(probe(), Date.parse(atSec(40)) + STALL_AFTER_MS + 1).state).toBe("stalled");
+  });
+
+  it("once the turn ends, the TOOLS reading names the written tool until a completion names one", () => {
+    const records = [...probe(), writing(41, 4_267), rec(42, "dispatch.turn", { turn_seq: 1, tool_calls_count: 1 })];
+    expect(deriveLiveState(records, Date.parse(atSec(43)))).toEqual({ state: "tools", toolName: "write" });
+  });
+
+  it("a writing sample never pairs into a rate: no zero dragging the live rate, no spike when the arguments land", () => {
+    // After the arguments land (812 -> 4,267 chars in 1s), the reading must
+    // be the last GENUINE pair (1s -> 2s: 400 chars/s = 100 tok/s), carried.
+    const records = [...probe(), writing(41, 4_267)];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading!.carried).toBe(true);
+  });
+
+  it("writing ticks do not move the chars-per-token calibration", () => {
+    const tokens = rec(43, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
+    const withTicks = [...probe(), writing(41, 4_267), tokens];
+    const withoutTicks = [hb(0, 0), hb(2, 800), writing(41, 4_267), tokens];
+    expect(measuredCharsPerToken(withTicks)).toBeCloseTo(measuredCharsPerToken(withoutTicks), 10);
+  });
+
+  it("the stretch never reaches back into an earlier turn's writing (an older host sends no opener between them)", () => {
+    const t1 = (sec: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: 500, turn_seq: 1, phase: "writing_tool_call", tool_name: "read" });
+    const t2 = (sec: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: 90, turn_seq: 2, phase: "writing_tool_call", tool_name: "edit" });
+    const records = [rec(-5, "dispatch.start"), t1(0), t1(2), t2(20), t2(22)];
+    expect(deriveLiveState(records, Date.parse(atSec(25)))).toMatchObject({ state: "tools", toolName: "edit", writingSeconds: 5 });
+  });
+
+  it("labels the writing stretch with its elapsed seconds; running a tool keeps the old word", () => {
+    expect(liveStateLabel({ state: "tools", toolName: "edit", writing: true, writingSeconds: 70 })).toBe("writing · 70 s");
+    expect(liveStateLabel({ state: "tools", toolName: "edit" })).toBe("tools");
+  });
+
+  it("executionTokenReading carries the writing flag and seconds for the fleet card", () => {
+    const reading = executionTokenReading(probe(), Date.parse(atSec(41)));
+    expect(reading).toMatchObject({ state: "tools", toolName: "write", writing: true, writingSeconds: 37, tokensPerSec: null });
+  });
+});
+
+describe("(#2889) the prompt size on the opening heartbeat", () => {
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts: atSec(sec), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const hb = (sec: number, chars: number, extra: Record<string, unknown> = {}) =>
+    rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 2, ...extra });
+
+  it("a fresh opener carrying prompt_chars reads PROMPT with that size", () => {
+    const records = [rec(-5, "dispatch.start"), hb(0, 0, { prompt_chars: 144_000 })];
+    expect(deriveLiveState(records, Date.parse(atSec(3)))).toEqual({ state: "prompt", promptChars: 144_000 });
+  });
+
+  it("an opener from an older host (no prompt_chars) reads PROMPT with no size", () => {
+    const records = [rec(-5, "dispatch.start"), hb(0, 0)];
+    expect(deriveLiveState(records, Date.parse(atSec(3)))).toEqual({ state: "prompt" });
+  });
+
+  it("promptEstimate reads the live execution's sized PROMPT with that execution's own calibration", () => {
+    const tokens = rec(-8, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
+    const turn1 = [hb(-12, 0), hb(-10, 3_000)].map((r) => ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, turn_seq: 1 } }) as unknown as FlowRecord);
+    const records = [rec(-15, "dispatch.start"), ...turn1, tokens, hb(0, 0, { prompt_chars: 144_000 })];
+    // 3,000 chars over 1,000 billed tokens = 3 chars/token -> 48k, not the default 4's 36k.
+    expect(promptEstimate([records], Date.parse(atSec(3)))).toBe("~48k");
+    expect(promptEstimate([[rec(-5, "dispatch.start"), hb(0, 0)]], Date.parse(atSec(3)))).toBeNull();
+  });
+
+  it("the size converts to an estimated token count with the session's own calibration", () => {
+    expect(promptTokensLabel(144_000, 4)).toBe("~36k");
+    expect(promptTokensLabel(144_000, 3)).toBe("~48k");
+    expect(promptTokensLabel(3_200, 4)).toBe("~800");
+    expect(promptTokensLabel(0, 4)).toBeNull();
   });
 });
