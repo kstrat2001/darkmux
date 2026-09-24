@@ -3582,11 +3582,13 @@ body {
 .mach-scope__rate[data-carried="true"] {
   opacity: 0.55;
 }
-/* (#2881) The pager: a small, FIXED-size row (never grows with the card),
-   under the rate line. Arrows are `role="button"` divs, matching
-   `.runs--live`'s own nested-tap-target shape (`FleetLens.tsx`'s doc next
-   to `selectPage`) — both need `stopPropagation` so a click doesn't ALSO
-   fire the card body's `machineDrillHash`. */
+/* (#2881) The pager: a small row under the rate line, sized by its own
+   text/tap-targets rather than any fixed constant — see `.mach-scope`'s own
+   doc for the ONE thing that must not grow the card (the tube), which this
+   row is not. Arrows are `role="button"` divs, matching `.runs--live`'s own
+   nested-tap-target shape (`FleetLens.tsx`'s doc next to `selectPage`) —
+   both need `stopPropagation` so a click doesn't ALSO fire the card body's
+   `machineDrillHash`. */
 .mach-scope__pager {
   margin-top: 4px;
   display: flex;
@@ -3595,10 +3597,21 @@ body {
   font: calc(11px * var(--fs-scale)) var(--font-mono);
   color: var(--dim);
 }
+/* (#2886 pass 5, MUST — fresh-reviewer finding F8) The GLYPH is ~11px, but
+   the TAP TARGET is >= 32px square (`min-width`/`min-height`, real layout
+   space, centered via `inline-flex` — not an invisible pseudo-element
+   expansion, which would silently overlap the rate line above or
+   `.runs--live` below and intercept taps meant for them). This is the only
+   place the pager row's height grows beyond its text — a real, visible
+   accommodation for the tap target, not the tube's own concern (that stays
+   governed entirely by the surrounding TEXT rows, unchanged by this rule). */
 .mach-scope__pager-btn {
   cursor: pointer;
-  padding: 0 2px;
-  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
   color: var(--dim);
 }
 .mach-scope__pager-btn:hover {
