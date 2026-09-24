@@ -461,6 +461,20 @@ describe("buildFleetCard", () => {
       expect(card.liveTokRate).toBe(0);
     });
 
+    it("a mission between model steps (only its run session beating) mounts no scope and claims no state", () => {
+      // The launcher beats presence for the mission's run session during a
+      // mod wait, a test gate, delivery: no model is involved, so the card
+      // must not say "reading prompt" or run a scope at 0.
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "mission", mission_id: "m1" }),
+        rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
+        rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.complete", mission_id: "m1" }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["m1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokRate).toBeNull();
+      expect(card.liveTokState ?? null).toBeNull();
+    });
+
     it("still works from an OLDER runtime's heartbeat shape (no sampled_at_ms/generated_chars)", () => {
       const data: FlowRecord[] = [
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),

@@ -186,7 +186,7 @@ export interface SessionRunView {
          *  `lib/tokenRate.ts::deriveLiveState`'s own doc. `stalled` above is
          *  now DERIVED from this (`state === "stalled"`), so the two can
          *  never disagree. */
-        state: LiveState;
+        state: LiveState | null;
         /** Present only when `state === "rest"` — whole seconds left in the
          *  reported rest window. */
         restSecondsLeft?: number;
@@ -840,7 +840,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // candidate would still read "stalled" under the old rule); they can't
   // any more, because there is only one rule now.
   const tokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
-  const tokRateStalled = tokRateLiveState.state === "stalled";
+  const tokRateStalled = tokRateLiveState?.state === "stalled";
 
   // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
   // `const procs = ...` followed by `void procs` to silence the unused
@@ -1375,8 +1375,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
         ? {
             tokensPerSec: aggregateTokenRate(tokRateRecordSets, nowMs),
             stalled: tokRateStalled,
-            state: tokRateLiveState.state,
-            restSecondsLeft: tokRateLiveState.restSecondsLeft,
+            // null: no live execution right now (a mission between model
+            // steps). Every lamp is off; nothing claims a state.
+            state: tokRateLiveState?.state ?? null,
+            restSecondsLeft: tokRateLiveState?.restSecondsLeft,
           }
         : null,
     showModelCard,

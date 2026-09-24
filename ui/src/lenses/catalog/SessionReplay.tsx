@@ -77,9 +77,17 @@ const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = 
   { state: "rest", label: "rest" },
   { state: "stalled", label: "stall" },
 ];
-function ScopeLamps({ reading }: { reading: LiveStateReading }) {
+function ScopeLamps({ reading }: { reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number } }) {
+  // `state: null` is no live execution (a mission between model steps):
+  // every lamp is off.
+  const aria =
+    reading.state === null
+      ? "no model working"
+      : reading.state === "generating"
+        ? "generating"
+        : liveStateLabel({ state: reading.state, restSecondsLeft: reading.restSecondsLeft } as LiveStateReading);
   return (
-    <div className="scope-lamps" role="status" aria-label={`run state: ${reading.state === "generating" ? "generating" : liveStateLabel(reading)}`}>
+    <div className="scope-lamps" role="status" aria-label={`run state: ${aria}`}>
       {SCOPE_LAMPS.map(({ state, label }) => {
         const on = reading.state === state;
         return (

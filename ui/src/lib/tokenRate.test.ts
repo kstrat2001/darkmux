@@ -312,8 +312,8 @@ describe("aggregateLiveState", () => {
     expect(aggregateLiveState([stalledExec], 1_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
   });
 
-  it("is prompt (the default) when there are no executions at all", () => {
-    expect(aggregateLiveState([], 1_000)).toEqual({ state: "prompt" });
+  it("is null when there are no executions at all", () => {
+    expect(aggregateLiveState([], 1_000)).toBeNull();
   });
 });
 
@@ -376,13 +376,31 @@ describe("which executions count: live ones only", () => {
   it("the mission's own run-grain session (a mission-sourced start) never reads as PROMPT over a stalled execution", () => {
     const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
     const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
-    expect(aggregateLiveState([runGrain, stalled], 3_000 + 60_000).state).toBe("stalled");
+    expect(aggregateLiveState([runGrain, stalled], 3_000 + 60_000)?.state).toBe("stalled");
+  });
+
+  // (fix-pass verifier, PROVEN on a real crawl) The page's candidate sessions
+  // include the mission's lifecycle session (`mission start`, `phase start`)
+  // and every scheduler task session (`step start`/`step complete`). None is
+  // an execution; each read as PROMPT and outranked a real stall.
+  it("a mission's lifecycle and task sessions are not executions and never read as PROMPT over a stall", () => {
+    const lifecycle = [rec("mission-m", 0, "mission start"), rec("mission-m", 0, "phase start")];
+    const task = [rec("task-1-m", 500, "step start"), rec("task-1-m", 900, "step timing")];
+    const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
+    expect(aggregateLiveState([lifecycle, task, stalled], 3_000 + 60_000)?.state).toBe("stalled");
+  });
+
+  it("is null, not PROMPT, when no live execution exists (a mission between model steps)", () => {
+    const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
+    const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), rec("a", 2_000, "dispatch.complete")];
+    const lifecycle = [rec("mission-m", 0, "mission start")];
+    expect(aggregateLiveState([runGrain, finished, lifecycle], 10_000)).toBeNull();
   });
 
   it("a finished execution never reads as PROMPT over a stalled one", () => {
     const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), rec("a", 2_000, "dispatch.turn", { turn_seq: 1 }), rec("a", 2_000, "dispatch.complete")];
     const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
-    expect(aggregateLiveState([finished, stalled], 3_000 + 60_000).state).toBe("stalled");
+    expect(aggregateLiveState([finished, stalled], 3_000 + 60_000)?.state).toBe("stalled");
   });
 });
 

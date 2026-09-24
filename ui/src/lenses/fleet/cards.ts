@@ -23,7 +23,7 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateLiveState, aggregateTokenRate } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, liveExecutions } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
@@ -587,7 +587,10 @@ export function buildFleetCard(
   // with its state word when nothing is generating (resting, tools, reading
   // prompt, stalled), rather than vanishing. Only a machine with nothing
   // running mounts no scope.
-  const rawLiveTokRate = active && liveTokRecordSets.length > 0 ? (aggregateTokenRate(liveTokRecordSets, t) ?? 0) : null;
+  // Only when a live EXECUTION exists: a mission between model steps (only
+  // its run session beating) has no model working, so no scope and no state.
+  const hasLiveExecution = liveExecutions(liveTokRecordSets, t).length > 0;
+  const rawLiveTokRate = active && hasLiveExecution ? (aggregateTokenRate(liveTokRecordSets, t) ?? 0) : null;
   const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
   const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
   const liveTokRestSecondsLeft = liveTokState === "rest" ? liveTokLiveState?.restSecondsLeft : undefined;

@@ -346,15 +346,30 @@ const isCloseEdge = (a: string | undefined): boolean =>
  *  and not a mission's own run-grain session (its `dispatch start` is
  *  mission-sourced and bookends the whole run; it never generates, and its
  *  start read as PROMPT over a genuinely stalled execution). */
-function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: number): FlowRecord[][] {
+export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: number): FlowRecord[][] {
   return perExecutionRecords.filter((recs) => {
     let runGrain = false;
+    // A set is an execution only if it carries execution evidence. A
+    // mission's lifecycle session (`mission start`, `phase start`) and its
+    // scheduler task sessions (`step start`/`step complete`) carry none;
+    // they read as PROMPT and outranked a real stall on every crawl.
+    let evidence = false;
     for (const r of recs) {
       if (Date.parse(r.ts) > nowMs) continue;
       if (isCloseEdge(r.action)) return false;
-      if ((r.action === "dispatch.start" || r.action === "dispatch start") && r.source === "mission") runGrain = true;
+      if (r.action === "dispatch.start" || r.action === "dispatch start") {
+        evidence = true;
+        if (r.source === "mission") runGrain = true;
+      } else if (
+        r.action === "dispatch.turn.heartbeat" ||
+        r.action === "dispatch.turn" ||
+        r.action === "dispatch.tool" ||
+        r.action === "dispatch.rest"
+      ) {
+        evidence = true;
+      }
     }
-    return !runGrain;
+    return evidence && !runGrain;
   });
 }
 
@@ -371,13 +386,15 @@ const STATE_PRIORITY: Record<LiveState, number> = { generating: 0, rest: 1, tool
  * card's `runningSessionIds`, or a mission's rolled-up sibling sessions) —
  * the best (lowest-`STATE_PRIORITY`) reading among them. `"prompt"` when
  * there are no executions at all, matching a fresh session's own default. */
-export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: number): LiveStateReading {
+export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: number): LiveStateReading | null {
   let best: LiveStateReading | null = null;
   for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
     const reading = deriveLiveState(recs, nowMs);
     if (!best || STATE_PRIORITY[reading.state] < STATE_PRIORITY[best.state]) best = reading;
   }
-  return best ?? { state: "prompt" };
+  // No live execution: no model is working (a mission between model steps,
+  // or nothing running at all), so there is no state to claim.
+  return best;
 }
 
 /** The short word (or `"rest Ns"`) a caller renders for every state except
