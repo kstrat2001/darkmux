@@ -583,7 +583,11 @@ export function buildFleetCard(
   // running session's heartbeats are stale" check.
   const liveTokLiveState = liveTokRecordSets.length > 0 ? aggregateLiveState(liveTokRecordSets, t) : null;
   const liveTokStalled = liveTokLiveState?.state === "stalled";
-  const rawLiveTokRate = active ? aggregateTokenRate(liveTokRecordSets) : null;
+  // While the machine has a running execution the scope stays mounted: at 0
+  // with its state word when nothing is generating (resting, tools, reading
+  // prompt, stalled), rather than vanishing. Only a machine with nothing
+  // running mounts no scope.
+  const rawLiveTokRate = active && liveTokRecordSets.length > 0 ? (aggregateTokenRate(liveTokRecordSets, t) ?? 0) : null;
   const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
   const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
   const liveTokRestSecondsLeft = liveTokState === "rest" ? liveTokLiveState?.restSecondsLeft : undefined;

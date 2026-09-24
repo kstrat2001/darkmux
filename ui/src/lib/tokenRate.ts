@@ -31,6 +31,9 @@ export interface HeartbeatSample {
   atMs: number;
   /** Generated chars so far (content + reasoning when available). */
   chars: number;
+  /** The turn this sample belongs to, when the record says. `generated_chars`
+   *  restarts every turn, so two samples from different turns never pair. */
+  turn?: unknown;
 }
 
 /** Every `dispatch.turn.heartbeat` in `records`, reduced to time-ordered
@@ -50,7 +53,7 @@ export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
     if (chars === null) continue;
     const atMs = num(f.sampled_at_ms) ?? Date.parse(r.ts);
     if (!Number.isFinite(atMs)) continue;
-    out.push({ atMs, chars });
+    out.push({ atMs, chars, turn: f.turn_seq });
   }
   out.sort((a, b) => a.atMs - b.atMs);
   return out;
@@ -165,6 +168,9 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
   if (samples.length < 2) return null;
   const prev = samples[samples.length - 2];
   const next = samples[samples.length - 1];
+  // `generated_chars` restarts every turn: a new turn's first sample paired
+  // with the previous turn's last spans the tool gap and read near 0.
+  if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return null;
   const cps = charsPerSecond(prev, next);
   if (cps === null) return null;
   const charsPerToken = measuredCharsPerToken(records);
@@ -257,19 +263,29 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   });
   const beats = heartbeatSamples(cut);
   const lastBeatAt = beats.length ? beats[beats.length - 1].atMs : null;
-  if (lastBeatAt !== null && !isStalled(cut, nowMs)) {
-    return { state: "generating" };
-  }
 
   let marker: StateMarker | null = null;
-  for (const r of cut) {
+  // `dispatch.tool` is emitted when a tool COMPLETES. A turn that ends with
+  // N tool calls is TOOLS until N completions have arrived; after that the
+  // model is reading the results, which is PROMPT. `pendingTools` is null
+  // when the turn record does not say how many calls it made (older
+  // records), and then a completion reads as TOOLS, the old behavior.
+  let pendingTools: number | null = null;
+  const ordered = [...cut].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  for (const r of ordered) {
     const atMs = Date.parse(r.ts);
     if (!Number.isFinite(atMs)) continue;
     let m: StateMarker | null = null;
-    if (r.action === "dispatch.start" || r.action === "dispatch.turn") {
+    if (r.action === "dispatch.start") {
+      pendingTools = null;
       m = { atMs, kind: "prompt" };
+    } else if (r.action === "dispatch.turn") {
+      const calls = num(fields(r).tool_calls_count);
+      pendingTools = calls;
+      m = { atMs, kind: calls !== null && calls > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.tool") {
-      m = { atMs, kind: "tools" };
+      if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
+      m = { atMs, kind: pendingTools === null || pendingTools > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.rest") {
       // Only the completed-rest shape (`ms` present) counts — the
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
@@ -306,7 +322,33 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     return { state: found.kind };
   }
 
+  // No marker since the last heartbeat: generating while it is fresh. This
+  // is checked AFTER the markers, so a turn end or a rest recorded in the
+  // seconds after the last heartbeat is shown at once rather than being
+  // masked as "generating" until the stall threshold passes.
+  if (lastBeatAt !== null && !isStalled(cut, nowMs)) return { state: "generating" };
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
+}
+
+const isCloseEdge = (a: string | undefined): boolean =>
+  a === "dispatch.complete" || a === "dispatch complete" || a === "dispatch.error" || a === "dispatch error" || a === "session.end";
+
+/** The executions a live reading may come from, as of `nowMs`: not one that
+ *  has already closed (its last rate and its last marker are history, and a
+ *  finished execution's trailing `dispatch.turn` read as PROMPT forever),
+ *  and not a mission's own run-grain session (its `dispatch start` is
+ *  mission-sourced and bookends the whole run; it never generates, and its
+ *  start read as PROMPT over a genuinely stalled execution). */
+function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: number): FlowRecord[][] {
+  return perExecutionRecords.filter((recs) => {
+    let runGrain = false;
+    for (const r of recs) {
+      if (Date.parse(r.ts) > nowMs) continue;
+      if (isCloseEdge(r.action)) return false;
+      if ((r.action === "dispatch.start" || r.action === "dispatch start") && r.source === "mission") runGrain = true;
+    }
+    return !runGrain;
+  });
 }
 
 /** Priority order for `aggregateLiveState` — the most informative state
@@ -324,7 +366,7 @@ const STATE_PRIORITY: Record<LiveState, number> = { generating: 0, rest: 1, tool
  * there are no executions at all, matching a fresh session's own default. */
 export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: number): LiveStateReading {
   let best: LiveStateReading | null = null;
-  for (const recs of perExecutionRecords) {
+  for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
     const reading = deriveLiveState(recs, nowMs);
     if (!best || STATE_PRIORITY[reading.state] < STATE_PRIORITY[best.state]) best = reading;
   }
@@ -362,11 +404,15 @@ export function liveStateLabel(reading: LiveStateReading): string {
  * it. Returns `null` only when NOT ONE execution has a reading, so the
  * caller can distinguish "genuinely 0 tok/s right now" reporting from
  * "nothing to report yet" (though today both render the same "0"). */
-export function aggregateTokenRate(perExecutionRecords: FlowRecord[][]): number | null {
+export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: number): number | null {
   let any = false;
   let total = 0;
-  for (const recs of perExecutionRecords) {
-    const reading = currentTokenRate(recs);
+  for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
+    // Only an execution that is generating right now contributes: a resting
+    // or tool-running one still has a "last rate" from its last turn, and a
+    // mission summed them (review: 350 tok/s with one execution at ~40).
+    if (deriveLiveState(recs, nowMs).state !== "generating") continue;
+    const reading = currentTokenRate(recs.filter((r) => !(Date.parse(r.ts) > nowMs)));
     if (reading) {
       total += reading.tokensPerSec;
       any = true;

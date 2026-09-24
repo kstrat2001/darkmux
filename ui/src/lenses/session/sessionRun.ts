@@ -1373,7 +1373,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     liveTokScope:
       effHasModelWork && !done
         ? {
-            tokensPerSec: aggregateTokenRate(tokRateRecordSets),
+            tokensPerSec: aggregateTokenRate(tokRateRecordSets, nowMs),
             stalled: tokRateStalled,
             state: tokRateLiveState.state,
             restSecondsLeft: tokRateLiveState.restSecondsLeft,

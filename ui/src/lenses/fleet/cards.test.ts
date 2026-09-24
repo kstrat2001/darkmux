@@ -371,14 +371,17 @@ describe("buildFleetCard", () => {
       expect(card.liveTokRate).toBeNull();
     });
 
-    it("is null for a running session with fewer than two heartbeats (not yet enough to derive a rate)", () => {
+    it("a running session with fewer than two heartbeats mounts the scope at 0, not no scope", () => {
       const data: FlowRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 40 } }),
       ];
       const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
       expect(card.stat).toBe("dispatch in flight");
-      expect(card.liveTokRate).toBeNull();
+      // One fresh heartbeat: generating, but not enough samples for a rate
+      // yet. The scope is up at 0 rather than absent.
+      expect(card.liveTokRate).toBe(0);
+      expect(card.liveTokState).toBe("generating");
     });
 
     it("is a positive number once a running session has two FRESH heartbeats to derive Δchars/Δms from", () => {

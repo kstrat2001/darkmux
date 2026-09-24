@@ -169,17 +169,17 @@ describe("aggregateTokenRate", () => {
   it("sums current readings across running executions", () => {
     const exec1 = [beat(1_000, 40), beat(3_000, 120)]; // 40 chars/sec / 4 = 10 tok/s
     const exec2 = [beat(1_000, 40), beat(3_000, 200)]; // 80 chars/sec / 4 = 20 tok/s
-    expect(aggregateTokenRate([exec1, exec2])).toBeCloseTo(30, 5);
+    expect(aggregateTokenRate([exec1, exec2], 3_500)).toBeCloseTo(30, 5);
   });
 
   it("treats a stalled/fresh execution as contributing 0, not dropping the machine's total", () => {
     const generating = [beat(1_000, 40), beat(3_000, 120)];
     const fresh: FlowRecord[] = [beat(5_000, 0)];
-    expect(aggregateTokenRate([generating, fresh])).toBeCloseTo(10, 5);
+    expect(aggregateTokenRate([generating, fresh], 5_500)).toBeCloseTo(10, 5);
   });
 
   it("is null only when NO execution has a reading at all", () => {
-    expect(aggregateTokenRate([[beat(1_000, 0)], []])).toBeNull();
+    expect(aggregateTokenRate([[beat(1_000, 0)], []], 1_500)).toBeNull();
   });
 });
 
@@ -349,5 +349,67 @@ describe("averageGenerationRate", () => {
 describe("liveStateLabel", () => {
   it("names the prompt wait as 'reading prompt', not the bare word the page's prompt disclosure also uses", () => {
     expect(liveStateLabel({ state: "prompt" } as never)).toBe("reading prompt");
+  });
+});
+
+// (pre-PR review, 2026-09-24) The findings below were each PROVEN on real
+// runs before these tests existed.
+describe("which executions count: live ones only", () => {
+  const rec = (sid: string, atMs: number, action: string, payload: Record<string, unknown> = {}, source?: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action, session_id: sid, ...(source ? { source } : {}), payload }) as unknown as FlowRecord;
+  const hb = (sid: string, atMs: number, chars: number, turn = 1) =>
+    rec(sid, atMs, "dispatch.turn.heartbeat", { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turn });
+
+  it("a FINISHED execution's last rate never adds to a live one's (a mission read 350 tok/s with one execution at ~40)", () => {
+    const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), hb("a", 3_000, 800), rec("a", 3_500, "dispatch.complete")];
+    const live = [rec("b", 10_000, "dispatch.start"), hb("b", 11_000, 0), hb("b", 13_000, 800)];
+    // Both measured 400 chars/s -> 100 tok/s at the default 4 chars/token.
+    expect(aggregateTokenRate([finished, live], 13_500)).toBeCloseTo(100, 5);
+  });
+
+  it("a resting or tool-running execution adds nothing while another generates", () => {
+    const resting = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), hb("a", 3_000, 800), rec("a", 3_500, "dispatch.rest", { ms: 15_000 })];
+    const live = [rec("b", 0, "dispatch.start"), hb("b", 3_000, 0), hb("b", 5_000, 800)];
+    expect(aggregateTokenRate([resting, live], 5_500)).toBeCloseTo(100, 5);
+  });
+
+  it("the mission's own run-grain session (a mission-sourced start) never reads as PROMPT over a stalled execution", () => {
+    const runGrain = [rec("m", 0, "dispatch.start", {}, "mission")];
+    const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
+    expect(aggregateLiveState([runGrain, stalled], 3_000 + 60_000).state).toBe("stalled");
+  });
+
+  it("a finished execution never reads as PROMPT over a stalled one", () => {
+    const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), rec("a", 2_000, "dispatch.turn", { turn_seq: 1 }), rec("a", 2_000, "dispatch.complete")];
+    const stalled = [rec("b", 0, "dispatch.start"), hb("b", 1_000, 0), hb("b", 3_000, 800)];
+    expect(aggregateLiveState([finished, stalled], 3_000 + 60_000).state).toBe("stalled");
+  });
+});
+
+describe("tools vs reading prompt, from the tool COMPLETION records", () => {
+  // `dispatch.tool` is emitted on `tool.completed`. A turn that ends with N
+  // tool calls is TOOLS until N completions; after that the model is
+  // reading the results: PROMPT. Before this, the next turn's prompt
+  // processing read as TOOLS.
+  const turn = (atMs: number, seq: number, calls: number): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: seq, tool_calls_count: calls } }) as unknown as FlowRecord;
+
+  it("is TOOLS between the turn end and the last of its tool completions", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000)];
+    expect(deriveLiveState(recs, 6_000).state).toBe("tools");
+  });
+
+  it("is PROMPT once every tool the turn called has completed", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000), tool(6_000)];
+    expect(deriveLiveState(recs, 7_000).state).toBe("prompt");
+  });
+});
+
+describe("a turn's first reading never pairs with the previous turn", () => {
+  it("returns no reading for a new turn's first sample instead of a near-zero rate across the tool gap", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // Turn 1 ended at 800 chars; turn 2's first sample is 900 chars 20s later.
+    expect(currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 900, 2)])).toBeNull();
   });
 });
