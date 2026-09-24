@@ -247,11 +247,14 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.fill();
     ctx.shadowBlur = 0;
   }
-  // PROMPT: rings drawing inward.
+  // PROMPT: rings expanding outward from the center.
   if (p.inward > 0.01) {
     for (let k = 0; k < 3; k++) {
       const q = (c.inwardT + k / 3) % 1;
-      const r = R * 1.08 * (1 - q * 0.82);
+      // (#2890 operator review) Outward: each ring starts near the center
+      // (clear of the center label) and expands toward the rim, the context
+      // being worked through radiating out.
+      const r = R * (0.3 + q * 0.78);
       const a = Math.sin(q * Math.PI) * 0.9 * p.inward;
       for (const [lw, al] of INWARD_PASSES) {
         ctx.beginPath();
