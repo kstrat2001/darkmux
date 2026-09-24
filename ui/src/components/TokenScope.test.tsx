@@ -27,7 +27,8 @@ describe("TokenScope center, per state (#2890)", () => {
 
   it("TOOLS ignores a center label: the icon is the whole message", () => {
     const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="bash" centerLabel="12" />);
-    expect(center(container)?.textContent).toBe("");
+    expect(container.querySelector(".token-scope-n")).toBeNull();
+    expect(container.querySelector(".token-scope-screen")?.textContent).toBe("");
     expect(container.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("bash");
   });
 

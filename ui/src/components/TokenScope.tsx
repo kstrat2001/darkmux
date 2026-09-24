@@ -211,19 +211,30 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.fill();
     ctx.shadowBlur = 0;
   }
-  // TOOLS: a comet sweeping at a constant tempo.
+  // TOOLS: a comet sweeping at a constant tempo. The prototype blurred each
+  // of the 36 tail segments; measured in a headless render that cost ~16 ms
+  // per frame (5x any other state) because canvas shadow blur is paid per
+  // stroke. The glow is now ONE blurred stroke under the leading half of the
+  // tail, and the segments that taper it are drawn unblurred on top, which
+  // reads the same at a fraction of the cost (#2890).
   if (p.comet > 0.01) {
     const head = c.sweep;
     const len = Math.PI * 0.55;
     const n = 36;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * 0.5, head);
+    ctx.strokeStyle = rgba(cr, cg, cb, 0.45 * p.comet);
+    ctx.lineWidth = 3;
+    ctx.shadowColor = rgba(cr, cg, cb, 0.8);
+    ctx.shadowBlur = 8 * p.comet;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
     for (let i = 0; i < n; i++) {
       const f = 1 - i / n;
       ctx.beginPath();
       ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * ((i + 1) / n), head - len * (i / n));
       ctx.strokeStyle = rgba(cr, cg, cb, 0.9 * f * p.comet);
       ctx.lineWidth = 1.4 + 2.2 * f;
-      ctx.shadowColor = rgba(cr, cg, cb, 0.8);
-      ctx.shadowBlur = 8 * f * p.comet;
       ctx.stroke();
     }
     ctx.beginPath();
