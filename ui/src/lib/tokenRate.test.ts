@@ -95,9 +95,35 @@ describe("measuredCharsPerToken", () => {
   });
 
   it("measures generated chars over summed billed completion tokens once usage lands", () => {
-    // 400 chars over 100 completion tokens = 4 chars/token exactly.
-    const ratio = measuredCharsPerToken([beat(1_000, 400), tokensRecord(60), tokensRecord(40)]);
+    // 4,000 chars over 1,000 completion tokens = 4 chars/token exactly.
+    const ratio = measuredCharsPerToken([beat(1_000, 4_000), tokensRecord(600), tokensRecord(400)]);
     expect(ratio).toBeCloseTo(4, 5);
+  });
+
+  // The live shape that read 11 tok/s for a model generating ~50: chars reset
+  // every turn, and the in-flight turn has chars but no billed tokens yet.
+  // Taking the max chars across turns over the finished turns' tokens
+  // divided turn 2's 33k chars by turn 1's 391 tokens.
+  const turnBeat = (turn: number, ms: number, chars: number): FlowRecord =>
+    ({ ...beat(ms, chars), payload: { sampled_at_ms: ms, generated_chars: chars, turn_seq: turn } }) as unknown as FlowRecord;
+  const turnTokens = (turn: number, completion: number): FlowRecord =>
+    ({ ...tokensRecord(completion), payload: { completion_tokens: completion, turn_seq: turn } }) as unknown as FlowRecord;
+
+  it("pairs each turn's chars with that turn's tokens and ignores the in-flight turn", () => {
+    const ratio = measuredCharsPerToken([
+      turnBeat(1, 1_000, 1_200),
+      turnBeat(1, 3_000, 2_400),
+      turnTokens(1, 600),
+      turnBeat(2, 5_000, 8_000),
+      turnBeat(2, 7_000, 40_000),
+    ]);
+    expect(ratio).toBeCloseTo(4, 5);
+  });
+
+  it("does not calibrate from a short turn: its tail after the last heartbeat and its tool-call tokens dominate", () => {
+    // Turn 1 of the live run: 566 chars seen, 391 tokens billed (1.45).
+    const ratio = measuredCharsPerToken([turnBeat(1, 1_000, 566), turnTokens(1, 391)]);
+    expect(ratio).toBe(DEFAULT_CHARS_PER_TOKEN);
   });
 });
 
