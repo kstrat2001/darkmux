@@ -8,8 +8,11 @@ import {
   charsPerSecond,
   currentTokenRate,
   deriveLiveState,
+  executionRole,
+  executionTokenReading,
   heartbeatSamples,
   isStalled,
+  liveStatePriority,
   measuredCharsPerToken,
   averageGenerationRate,
   liveStateLabel,
@@ -756,5 +759,117 @@ describe("a turn's first reading never pairs with the previous turn", () => {
     expect(reading).not.toBeNull();
     expect(reading!.carried).toBe(true);
     expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+  });
+});
+
+// (#2881) The fleet card pager's per-execution data.
+describe("executionRole", () => {
+  const rec = (action: string, handle?: string): FlowRecord =>
+    ({ ts: atSec(0), action, session_id: SID, ...(handle ? { handle } : {}), payload: {} }) as unknown as FlowRecord;
+
+  it("strips the darkmux/ prefix and lowercases", () => {
+    expect(executionRole([rec("dispatch.start", "darkmux/coder")])).toBe("coder");
+  });
+
+  it("lowercases a bare handle with no prefix", () => {
+    expect(executionRole([rec("dispatch.start", "CODER")])).toBe("coder");
+  });
+
+  it("is empty when nothing in the set carries a handle", () => {
+    expect(executionRole([rec("dispatch.turn.heartbeat")])).toBe("");
+  });
+
+  it("falls back to any record's handle when no dispatch.start carries one", () => {
+    expect(executionRole([rec("dispatch.turn.heartbeat", "darkmux/reviewer")])).toBe("reviewer");
+  });
+
+  it("prefers the LATEST dispatch.start's handle over an earlier one", () => {
+    const early = { ts: atSec(0), action: "dispatch.start", session_id: SID, handle: "darkmux/coder", payload: {} } as unknown as FlowRecord;
+    const later = { ts: atSec(10), action: "dispatch.start", session_id: SID, handle: "darkmux/reviewer", payload: {} } as unknown as FlowRecord;
+    expect(executionRole([early, later])).toBe("reviewer");
+  });
+});
+
+describe("executionTokenReading", () => {
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, handle?: string): FlowRecord =>
+    ({ ts: atSec(sec), action, session_id: SID, ...(handle ? { handle } : {}), payload }) as unknown as FlowRecord;
+  const hb = (sec: number, chars: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 1 });
+
+  it("carries the session id, role, generating state and rate", () => {
+    const records = [rec(0, "dispatch.start", {}, "darkmux/coder"), hb(0, 0), hb(2, 400)];
+    const reading = executionTokenReading(records, Date.parse(atSec(2)));
+    expect(reading.sessionId).toBe(SID);
+    expect(reading.role).toBe("coder");
+    expect(reading.state).toBe("generating");
+    // 400 chars / 2s = 200 chars/s -> 50 tok/s at the default 4 chars/token.
+    expect(reading.tokensPerSec).toBeCloseTo(50, 5);
+    expect(reading.carried).toBe(false);
+  });
+
+  it("reports null tokensPerSec while generating with no same-turn pair yet — never 0", () => {
+    // The start marker sits 5s before the heartbeat so its second-floor tie
+    // rule (`deriveLiveState`'s own doc: a marker in the SAME second as the
+    // last heartbeat wins) doesn't fire — this fixture is testing the fresh
+    // "one heartbeat, no pair" case, not that tie.
+    const records = [rec(-5, "dispatch.start", {}, "darkmux/coder"), hb(0, 40)];
+    const reading = executionTokenReading(records, Date.parse(atSec(0)));
+    expect(reading.state).toBe("generating");
+    expect(reading.tokensPerSec).toBeNull();
+  });
+
+  it("reports the rest state with restSecondsLeft, and no rate", () => {
+    const records = [
+      rec(0, "dispatch.start", {}, "darkmux/coder"),
+      hb(0, 0),
+      hb(2, 400),
+      rec(3, "dispatch.rest", { ms: 15_000 }),
+    ];
+    const reading = executionTokenReading(records, Date.parse(atSec(3)) + 5_000);
+    expect(reading.state).toBe("rest");
+    expect(reading.restSecondsLeft).toBe(10);
+    expect(reading.tokensPerSec).toBeNull();
+  });
+
+  it("marks a carried reading — the previous turn's rate, into a fresh turn's lone first heartbeat", () => {
+    // (rebase onto fix/2886-tokrate-checkpoints) `carriedTokenRate` now
+    // skips a pair whose EARLIER sample has 0 chars, so turn 1's first
+    // heartbeat starts at a nonzero count here — the 400-char delta over
+    // the same 2s window is unchanged, so the expected 50 tok/s below still
+    // holds.
+    const records = [
+      rec(0, "dispatch.start", {}, "darkmux/coder"),
+      hb(0, 40),
+      hb(2, 440),
+      rec(20, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(20)), generated_chars: 50, turn_seq: 2 }),
+    ];
+    const reading = executionTokenReading(records, Date.parse(atSec(20)));
+    expect(reading.state).toBe("generating");
+    expect(reading.carried).toBe(true);
+    expect(reading.tokensPerSec).toBeCloseTo(50, 5);
+  });
+
+  // (#2886 pass 3 downgrade, applied per execution) A false STALL claim from
+  // a lost connection must not survive at the PAGE grain either.
+  it("downgrades a stalled reading to null (no signal) when disconnected, same rule as the aggregate", () => {
+    const records = [rec(0, "dispatch.start", {}, "darkmux/coder"), hb(0, 0), hb(2, 400)];
+    const nowMs = Date.parse(atSec(2)) + STALL_AFTER_MS + 5_000;
+    const connected = executionTokenReading(records, nowMs, true);
+    expect(connected.state).toBe("stalled");
+    const disconnected = executionTokenReading(records, nowMs, false);
+    expect(disconnected.state).toBeNull();
+    expect(disconnected.restSecondsLeft).toBeUndefined();
+  });
+});
+
+describe("liveStatePriority", () => {
+  it("ranks generating best and stalled worst among real states", () => {
+    expect(liveStatePriority("generating")).toBeLessThan(liveStatePriority("rest"));
+    expect(liveStatePriority("rest")).toBeLessThan(liveStatePriority("tools"));
+    expect(liveStatePriority("tools")).toBeLessThan(liveStatePriority("prompt"));
+    expect(liveStatePriority("prompt")).toBeLessThan(liveStatePriority("stalled"));
+  });
+
+  it("ranks null (no signal) worse than every real state, including stalled", () => {
+    expect(liveStatePriority(null)).toBeGreaterThan(liveStatePriority("stalled"));
   });
 });

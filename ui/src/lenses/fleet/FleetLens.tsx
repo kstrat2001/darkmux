@@ -443,6 +443,14 @@ export function FleetLens({
    * values the consumers below receive. */
   const livePolling = liveMode && getSource().kind === "daemon";
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
+  // (#2881) The pager's sticky pick, per machine uid — the session id the
+  // operator last chose with an arrow, if any. `FleetCard.executions` no
+  // longer including it (that execution ended) falls back to
+  // `card.defaultExecutionSessionId` on the very next render below, which is
+  // the whole of "sticks until that execution ends, then moves to the next
+  // [busiest]" — there is no separate cleanup step, and no live/playback
+  // branch: the same fallback rule applies to a replayed instant too.
+  const [pinnedPageByUid, setPinnedPageByUid] = useState<Record<string, string>>({});
 
   const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
@@ -732,7 +740,36 @@ export function FleetLens({
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
       <div className="fleet">
-        {cards.map((card) => (
+        {cards.map((card) => {
+          // (#2881) Pager selection for this card. `execs` is already
+          // sorted by session id (`cards.ts::buildFleetCard`'s own doc) —
+          // that sort order IS the pager's page order, so page numbers stay
+          // put tick to tick. The sticky pick lives in `pinnedPageByUid`
+          // (component state, above): it applies only while the picked
+          // session is still among `execs`; the moment it isn't (the
+          // execution ended), this falls straight through to
+          // `card.defaultExecutionSessionId` (the busiest of what's left)
+          // with no separate cleanup step, and no live/playback branch —
+          // the same fallback rule for a replayed instant too.
+          const execs = card.executions;
+          const pagerActive = execs.length >= 2;
+          const pinnedSid = pinnedPageByUid[card.uid];
+          const selectedSid = pinnedSid != null && execs.some((e) => e.sessionId === pinnedSid) ? pinnedSid : card.defaultExecutionSessionId;
+          const selectedIdx = selectedSid != null ? execs.findIndex((e) => e.sessionId === selectedSid) : -1;
+          const selectedExec = selectedIdx >= 0 ? execs[selectedIdx] : null;
+          // `card.liveTokRate !== null` (the scope's mount gate below) only
+          // ever holds when at least one execution is running, so
+          // `selectedExec` is non-null everywhere it's read below — this is
+          // the ONE per-execution reading that N=1 and N=2+ both render
+          // from; there is no separate "aggregate" rendering path left for
+          // N=1 to keep in sync with this one.
+          const selectPage = (e: { stopPropagation: () => void }, dir: 1 | -1) => {
+            e.stopPropagation();
+            if (execs.length < 2 || selectedIdx < 0) return;
+            const next = execs[(selectedIdx + dir + execs.length) % execs.length];
+            setPinnedPageByUid((m) => ({ ...m, [card.uid]: next.sessionId }));
+          };
+          return (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`
           // (viewer.html:1711) — the fleet-card drill-in: `ACTIONS.machine`
           // (viewer.html:2991) calls `drillMachine(uid)` for an explicit
@@ -831,19 +868,68 @@ export function FleetLens({
                   label exists on this card, so the rate line itself carries
                   the word: `N tok/s` while generating, else the same state
                   word the run page's tile shows (`liveStateLabel`, one
-                  derivation, no mode branch). */}
-              {card.liveTokRate !== null && (
-                <div className="mach-scope__rate" data-tone={card.liveTokState ?? "none"} data-carried={card.liveTokCarried ? "true" : "false"}>
-                  {card.liveTokState === "generating"
-                    ? `${fmtN(Math.round(card.liveTokRate))} tok/s`
+                  derivation, no mode branch). (#2881) Reads the PAGE's own
+                  execution now (`selectedExec` — the sole one when there's
+                  only one running), not a machine-wide aggregate: the tube,
+                  its color and this word all belong to one run. */}
+              {card.liveTokRate !== null && selectedExec && (
+                <div className="mach-scope__rate" data-tone={selectedExec.state ?? "none"} data-carried={selectedExec.carried ? "true" : "false"}>
+                  {selectedExec.state === "generating"
+                    ? `${fmtN(Math.round(selectedExec.tokensPerSec ?? 0))} tok/s`
                     : // (#2886 pass 3) `state: null` here (rather than the
                       // "no live execution" case, ruled out since
-                      // `liveTokRate !== null` implies something IS
+                      // `card.liveTokRate !== null` implies something IS
                       // running) is `liveStateWhileConnected`'s
-                      // disconnection downgrade — say so, not "stalled".
-                      card.liveTokState === null
+                      // disconnection downgrade, applied per execution — say
+                      // so, not "stalled".
+                      selectedExec.state === null
                       ? "no signal"
-                      : liveStateLabel({ state: card.liveTokState, restSecondsLeft: card.liveTokRestSecondsLeft })}
+                      : liveStateLabel({ state: selectedExec.state, restSecondsLeft: selectedExec.restSecondsLeft })}
+                </div>
+              )}
+              {/* (#2881) The pager: shown only with 2+ running executions —
+                  "no pager with one execution" is `pagerActive`'s own
+                  `execs.length >= 2` gate. The arrows are their own tap
+                  targets, matching the running-count control directly below
+                  (`.runs--live`, #1903) — same nested-interactive-control
+                  shape, same reason: a click here must not ALSO fire the
+                  card body's `machineDrillHash` handler underneath it. */}
+              {pagerActive && selectedExec && (
+                <div className="mach-scope__pager" data-testid="fleet-pager">
+                  <div
+                    className="mach-scope__pager-btn"
+                    role="button"
+                    tabIndex={0}
+                    aria-label="previous execution"
+                    onClick={(e) => selectPage(e, -1)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        selectPage(e, -1);
+                      }
+                    }}
+                  >
+                    ‹
+                  </div>
+                  <span className="mach-scope__pager-n">
+                    {selectedIdx + 1}/{execs.length}
+                  </span>
+                  {selectedExec.role && <span className="mach-scope__pager-role">{selectedExec.role}</span>}
+                  <div
+                    className="mach-scope__pager-btn"
+                    role="button"
+                    tabIndex={0}
+                    aria-label="next execution"
+                    onClick={(e) => selectPage(e, 1)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        selectPage(e, 1);
+                      }
+                    }}
+                  >
+                    ›
+                  </div>
                 </div>
               )}
               {/* (#1903) The running count's own tap target — a SIBLING
@@ -861,15 +947,20 @@ export function FleetLens({
                   interactive, matching #1900's lesson in the other
                   direction: a clickable-but-inert-looking control is as
                   dishonest as an inert-looking one that's secretly a broken
-                  link. */}
+                  link.
+                  (#2881) With the pager active, the machine TOTAL moves
+                  here ("3 running · 180 tok/s") — there is no separate
+                  "all" page; `card.liveTokRate` is still the machine-wide
+                  aggregate this line always showed before, just no longer
+                  the rate line's own number once there's more than one
+                  execution to attribute it to. */}
               {(() => {
                 const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+                const countText = pagerActive
+                  ? `${card.runsCount} ${card.runsLabel} · ${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`
+                  : `${card.runsCount} ${card.runsLabel}`;
                 if (!runsHash) {
-                  return (
-                    <div className="runs">
-                      {card.runsCount} {card.runsLabel}
-                    </div>
-                  );
+                  return <div className="runs">{countText}</div>;
                 }
                 const activate = (e: { stopPropagation: () => void }) => {
                   e.stopPropagation();
@@ -889,28 +980,30 @@ export function FleetLens({
                       }
                     }}
                   >
-                    {card.runsCount} {card.runsLabel}
+                    {countText}
                   </div>
                 );
               })()}
-              {card.liveTokRate !== null && (
+              {card.liveTokRate !== null && selectedExec && (
                 <div className="mach-scope" data-testid="fleet-token-scope">
                   <TokenScope
                     // Same rule as the run page's tile — a stale rate from
                     // the last generating stretch must not still drive the
                     // wave once the state has moved on (only `stalled` used
-                    // to zero this).
-                    tokensPerSec={card.liveTokState === "generating" ? card.liveTokRate : 0}
-                    stalled={card.liveTokStalled}
-                    resting={card.liveTokState === "rest"}
-                    tone={card.liveTokState ?? "none"}
+                    // to zero this). (#2881) The PAGE's own execution, not
+                    // the machine aggregate.
+                    tokensPerSec={selectedExec.state === "generating" ? (selectedExec.tokensPerSec ?? 0) : 0}
+                    stalled={selectedExec.state === "stalled"}
+                    resting={selectedExec.state === "rest"}
+                    tone={selectedExec.state ?? "none"}
                     size="card"
                   />
                 </div>
               )}
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
       {uids.length ? (
         <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>

@@ -663,3 +663,102 @@ export function liveStateWhileConnected(
   }
   return reading;
 }
+
+/** (#2881) The pager's per-page role label: one execution's `dispatch.start`
+ *  `handle` field, stripped of the `darkmux/` role-handle prefix and
+ *  lowercased ("coder", matching the issue's own example) — NOT
+ *  `sessionRun.ts`'s header-cased "CODER", a different placement's own
+ *  convention. Prefers the LATEST `dispatch.start` in the set (an
+ *  execution's handle does not change mid-run in practice, but matching
+ *  that module's own "prefer the latest start" rule costs nothing and keeps
+ *  the two readers agreeing if it ever did) and falls back to any record's
+ *  own `handle` so an execution mid-stream, before its own start record has
+ *  landed, still gets a label rather than "". Returns `""` when nothing in
+ *  `records` carries a `handle` at all. */
+export function executionRole(records: FlowRecord[]): string {
+  let latestAtMs = -Infinity;
+  let latestHandle: string | undefined;
+  let fallback: string | undefined;
+  for (const r of records) {
+    if (fallback === undefined && r.handle) fallback = r.handle;
+    if (r.action !== "dispatch.start" && r.action !== "dispatch start") continue;
+    if (!r.handle) continue;
+    const atMs = Date.parse(r.ts);
+    const rank = Number.isFinite(atMs) ? atMs : -Infinity;
+    if (latestHandle === undefined || rank >= latestAtMs) {
+      latestAtMs = rank;
+      latestHandle = r.handle;
+    }
+  }
+  const handle = latestHandle ?? fallback;
+  return handle ? handle.replace(/^darkmux\//, "").toLowerCase() : "";
+}
+
+/** One execution's own reading, as of `nowMs` — the pager's per-page data
+ *  (#2881, "the tube, color, and rate/state word all belong to that one
+ *  run"). Callers pass records already narrowed to ONE execution (one entry
+ *  of `liveExecutions`'s return) and already cut to the page clock, the
+ *  same convention `deriveLiveState`/`aggregateTokenRate` already use — this
+ *  adds no live/playback branch of its own, and no second cut rule. */
+export interface ExecutionTokenReading {
+  sessionId: string;
+  role: string;
+  /** `null` exactly like `FleetCard.liveTokState` — the disconnection
+   *  downgrade (`liveStateWhileConnected`) applied to THIS execution: "we
+   *  cannot say" rather than a false STALL claim for this one run, same
+   *  rule as the aggregate reading, applied per page instead of once for
+   *  the card. */
+  state: LiveState | null;
+  /** Present only when `state === "rest"`. */
+  restSecondsLeft?: number;
+  /** This execution's own current reading. `null` outside `"generating"`
+   *  (the caller renders the state word instead) or while generating with
+   *  no same-turn heartbeat pair yet — mirrors `FleetCard.liveTokRate`'s
+   *  null convention, one execution at a time. */
+  tokensPerSec: number | null;
+  /** Meaningful only alongside a non-null `tokensPerSec` — see
+   *  `TokenRateReading.carried`'s own doc. */
+  carried: boolean;
+}
+
+export function executionTokenReading(
+  records: FlowRecord[],
+  nowMs: number,
+  connected = true,
+  /** (#2886 pass 4 parity) The SAME half-open-connection evidence
+   *  `liveStateWhileConnected` takes for the machine-wide aggregate — see
+   *  that function's own doc. `undefined` (every pre-pass-4 caller, every
+   *  test) skips the check exactly as before; a caller that has it passes
+   *  `lastHeartbeatMs` as THIS EXECUTION's own last heartbeat (its own
+   *  `lastHeartbeatMs([records])`, not the aggregate's machine-wide max —
+   *  see `cards.ts::buildFleetCard`'s own doc next to this call for why a
+   *  shared machine-wide deadline would be the wrong per-page evidence). */
+  halfOpen?: { lastContactMs: number | null; lastHeartbeatMs: number | null },
+): ExecutionTokenReading {
+  const liveState = liveStateWhileConnected(deriveLiveState(records, nowMs), connected, halfOpen);
+  const state = liveState?.state ?? null;
+  // Defensive re-cut, matching `aggregateTokenRate`'s own `recs.filter(...)`
+  // immediately before this same call — `records` is expected pre-cut by
+  // the caller, but a caller handing over a raw array must not read a
+  // heartbeat from beyond the page clock.
+  const reading = state === "generating" ? currentTokenRate(records.filter((r) => !(Date.parse(r.ts) > nowMs))) : null;
+  return {
+    sessionId: records.find((r) => r.session_id)?.session_id ?? "",
+    role: executionRole(records),
+    state,
+    restSecondsLeft: state === "rest" ? liveState?.restSecondsLeft : undefined,
+    tokensPerSec: reading?.tokensPerSec ?? null,
+    carried: reading?.carried ?? false,
+  };
+}
+
+/** Accessor for `STATE_PRIORITY` — the pager's default-page pick
+ *  (`lenses/fleet/cards.ts::busiestExecution`) ranks executions by the same
+ *  "most informative state wins" rule `aggregateLiveState` already uses, so
+ *  the two must read one table, not two that could drift apart. `null` (the
+ *  disconnection downgrade, "no signal") ranks WORST — an execution this
+ *  page cannot currently say anything about must never out-rank one with a
+ *  real reading. */
+export function liveStatePriority(state: LiveState | null): number {
+  return state === null ? STATE_PRIORITY.stalled + 1 : STATE_PRIORITY[state];
+}

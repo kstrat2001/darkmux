@@ -23,8 +23,16 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateLiveState, aggregateTokenRate, lastHeartbeatMs, liveExecutions, liveStateWhileConnected } from "../../lib/tokenRate";
-import type { LiveState } from "../../lib/tokenRate";
+import {
+  aggregateLiveState,
+  aggregateTokenRate,
+  executionTokenReading,
+  lastHeartbeatMs,
+  liveExecutions,
+  liveStatePriority,
+  liveStateWhileConnected,
+} from "../../lib/tokenRate";
+import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -382,6 +390,39 @@ export function specUnknownLabel(reason: SpecUnknownReason): string {
   return reason === "not-seen" ? "hardware unknown — nothing received" : "hardware not reported";
 }
 
+/** (#2881) The pager's default page when the operator hasn't picked one:
+ *  the busiest running execution — generating first, then the lamps' own
+ *  priority (`liveStatePriority`, the same ranking `aggregateLiveState`
+ *  already uses to pick the card's single aggregate state). A tie within a
+ *  priority band goes to the higher current rate (meaningful only among
+ *  generating executions, where a real tie is otherwise plausible — two
+ *  coders that both started producing at once), and a final tie goes to the
+ *  lower session id so the pick is deterministic rather than depending on
+ *  array order. `null` for an empty list. */
+export function busiestExecution(executions: ExecutionTokenReading[]): ExecutionTokenReading | null {
+  let best: ExecutionTokenReading | null = null;
+  for (const e of executions) {
+    if (!best) {
+      best = e;
+      continue;
+    }
+    const bestPriority = liveStatePriority(best.state);
+    const ePriority = liveStatePriority(e.state);
+    if (ePriority !== bestPriority) {
+      if (ePriority < bestPriority) best = e;
+      continue;
+    }
+    const bestRate = best.tokensPerSec ?? -1;
+    const eRate = e.tokensPerSec ?? -1;
+    if (eRate !== bestRate) {
+      if (eRate > bestRate) best = e;
+      continue;
+    }
+    if (e.sessionId < best.sessionId) best = e;
+  }
+  return best;
+}
+
 export interface FleetCard {
   /** (#2802 regression fix) The operator's own roster name for this machine,
    * when they declared one AND it differs from what the machine calls
@@ -456,6 +497,19 @@ export interface FleetCard {
    *  — the card dims the rate line. See
    *  `lib/tokenRate.ts::AggregatedTokenRate`. */
   liveTokCarried: boolean;
+  /** (#2881) One entry per currently-running execution on this machine, as
+   *  of `t` — the pager's per-page data. Sorted by session id, a STABLE
+   *  order independent of state/rate, so a pager's page numbers do not
+   *  reshuffle tick to tick while the operator is looking at one page (see
+   *  `FleetLens.tsx`'s sticky-pick doc). Empty when nothing is running,
+   *  same condition as `liveTokRate === null`. The single machine-wide
+   *  `liveTokRate` above is unchanged — it is still the card's TOTAL (moved
+   *  to the count line once there are 2+ executions, #2881); this is each
+   *  execution's OWN reading. */
+  executions: ExecutionTokenReading[];
+  /** (#2881) The pager's default page's session id — the busiest of
+   *  `executions` (`busiestExecution`). `null` when `executions` is empty. */
+  defaultExecutionSessionId: string | null;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -646,6 +700,32 @@ export function buildFleetCard(
   // shows a state word otherwise), so a carried reading during rest/tools/
   // prompt/stalled would dim text that isn't the rate at all.
   const liveTokCarried = liveTokState === "generating" ? (rawTokReading?.carried ?? false) : false;
+  // (#2881) Per-execution readings for the pager — ONE derivation, live or
+  // replay, over the SAME `liveTokRecordSets` the aggregate reading above
+  // already narrowed to this machine's running sessions as of `t` and
+  // `liveExecutions` already filtered down to genuine execution evidence
+  // (see that function's own doc). Sorted by session id — see `executions`'
+  // own field doc on `FleetCard` for why the order must be stable rather
+  // than resorted by business every tick.
+  // (#2886 pass 4 parity) Same half-open-connection evidence the aggregate
+  // reading above threads into `liveStateWhileConnected` — but per
+  // EXECUTION, `lastHeartbeatMs` is THIS execution's own last heartbeat
+  // (`lastHeartbeatMs([recs])`), not the machine-wide max the aggregate
+  // uses. Sharing the machine-wide max here would let one execution's
+  // fresher heartbeat wrongly excuse another, quieter execution's own
+  // genuine stall — the whole point of per-page state is that each page
+  // answers for its OWN run, not the busiest one on the card.
+  const executions: ExecutionTokenReading[] = liveExecutions(liveTokRecordSets, t)
+    .map((recs) =>
+      executionTokenReading(
+        recs,
+        t,
+        connected,
+        lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs([recs]) } : undefined,
+      ),
+    )
+    .sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
+  const defaultExecutionSessionId = busiestExecution(executions)?.sessionId ?? null;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -677,5 +757,7 @@ export function buildFleetCard(
     liveTokState,
     liveTokRestSecondsLeft,
     liveTokCarried,
+    executions,
+    defaultExecutionSessionId,
   };
 }

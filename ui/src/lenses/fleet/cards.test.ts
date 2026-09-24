@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { ExecutionTokenReading } from "../../lib/tokenRate";
 import type { Run } from "../../types/generated/Run";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
@@ -975,5 +976,103 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
 
   it("the two labels are different sentences — a regression that collapsed them would be invisible otherwise", () => {
     expect(specUnknownLabel("not-seen")).not.toBe(specUnknownLabel("not-reported"));
+  });
+});
+
+// (#2881) The pager's default-page pick.
+describe("busiestExecution", () => {
+  const exec = (overrides: Partial<ExecutionTokenReading> & Pick<ExecutionTokenReading, "sessionId" | "state">): ExecutionTokenReading => ({
+    role: "coder",
+    tokensPerSec: null,
+    carried: false,
+    ...overrides,
+  });
+
+  it("is null for an empty list", () => {
+    expect(busiestExecution([])).toBeNull();
+  });
+
+  it("picks the sole entry when there is only one", () => {
+    const e = exec({ sessionId: "a", state: "rest" });
+    expect(busiestExecution([e])).toBe(e);
+  });
+
+  it("picks generating over every quieter state, regardless of array order", () => {
+    const resting = exec({ sessionId: "a", state: "rest" });
+    const generating = exec({ sessionId: "b", state: "generating", tokensPerSec: 10 });
+    const stalled = exec({ sessionId: "c", state: "stalled" });
+    expect(busiestExecution([resting, generating, stalled])?.sessionId).toBe("b");
+    expect(busiestExecution([stalled, generating, resting])?.sessionId).toBe("b");
+  });
+
+  it("ranks the quiet states by the lamps' own priority: rest, then tools, then prompt, then stalled", () => {
+    const tools = exec({ sessionId: "a", state: "tools" });
+    const rest = exec({ sessionId: "b", state: "rest" });
+    const prompt = exec({ sessionId: "c", state: "prompt" });
+    const stalled = exec({ sessionId: "d", state: "stalled" });
+    expect(busiestExecution([tools, prompt, stalled, rest])?.sessionId).toBe("b");
+    expect(busiestExecution([prompt, stalled, tools])?.sessionId).toBe("a");
+  });
+
+  it("ranks a real state over no-signal (null), even a quiet one over a stalled no-signal", () => {
+    const noSignal = exec({ sessionId: "a", state: null });
+    const stalled = exec({ sessionId: "b", state: "stalled" });
+    expect(busiestExecution([noSignal, stalled])?.sessionId).toBe("b");
+  });
+
+  it("ties within generating go to the HIGHER current rate", () => {
+    const slower = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
+    const faster = exec({ sessionId: "b", state: "generating", tokensPerSec: 40 });
+    expect(busiestExecution([slower, faster])?.sessionId).toBe("b");
+  });
+
+  it("a final tie (same state, same rate) goes to the LOWER session id — deterministic, not array order", () => {
+    const first = exec({ sessionId: "b", state: "generating", tokensPerSec: 10 });
+    const second = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
+    expect(busiestExecution([first, second])?.sessionId).toBe("a");
+    expect(busiestExecution([second, first])?.sessionId).toBe("a");
+  });
+});
+
+describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () => {
+  const BEAT1 = T_MAX - 2000;
+  const BEAT2 = T_MAX;
+
+  it("is empty while idle", () => {
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", true, T_MAX);
+    expect(card.executions).toEqual([]);
+    expect(card.defaultExecutionSessionId).toBeNull();
+  });
+
+  it("has exactly one entry for a single running execution, matching the aggregate fields", () => {
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+    expect(card.executions).toHaveLength(1);
+    expect(card.executions[0].sessionId).toBe("s1");
+    expect(card.executions[0].role).toBe("coder");
+    expect(card.executions[0].tokensPerSec).toBeCloseTo(card.liveTokRate!, 5);
+    expect(card.defaultExecutionSessionId).toBe("s1");
+  });
+
+  it("sorts by session id (a stable order independent of state) and defaults to the busiest", () => {
+    const data: FlowRecord[] = [
+      // s2 is RESTING.
+      rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" }),
+      rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.rest", ts: new Date(BEAT2).toISOString(), payload: { ms: 15_000 } }),
+      // s1 is GENERATING.
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", true, T_MAX);
+    expect(card.executions.map((e) => e.sessionId)).toEqual(["s1", "s2"]);
+    expect(card.executions.find((e) => e.sessionId === "s2")?.state).toBe("rest");
+    // Busiest = generating, not array/session-id order.
+    expect(card.defaultExecutionSessionId).toBe("s1");
   });
 });

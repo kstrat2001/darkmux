@@ -880,6 +880,102 @@ describe("FleetLens", () => {
   });
 });
 
+// (#2881) The fleet card pager. Uses the `records`/`historical` render path
+// directly (same as the scrubbed-playhead test above), not `mockFleetFetch`
+// — the pager reads only `buildFleetCard`'s output, which this path drives
+// with no separate live/playback branch to mock around.
+describe("FleetLens pager (#2881)", () => {
+  const D0 = Date.parse("2026-08-26T10:00:00.000Z");
+  const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
+
+  // s1: CODER, generating (~100 tok/s, the two heartbeats 2s apart).
+  // s2: REVIEWER, resting (a dispatch.rest 15s window opened at 3s).
+  // s3: FETCH-RENDER, prompt (a bare dispatch.start, no heartbeat yet).
+  const threeExecutionRecords: FlowRecord[] = [
+    { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+    { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+    { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+    { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "reviewer" },
+    { ts: at(3), machine_uid: "u1", session_id: "s2", action: "dispatch.rest", payload: { ms: 15_000 } },
+    { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s3", action: "dispatch.start", handle: "fetch-render" },
+  ] as FlowRecord[];
+
+  function renderThree(playheadSec: number) {
+    return render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={threeExecutionRecords} tMax={D0 + playheadSec * 1000} tMin={D0} playhead={D0 + playheadSec * 1000} historical />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("defaults to the busiest (generating) execution's own tube, role and rate — not the machine aggregate", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/3");
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    // The rate line shows s1's OWN reading (100 tok/s), not the machine's
+    // summed total (also 100 here, since only s1 is generating — see the
+    // next assertion for where the total actually shows up).
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    // (#2881) "the machine total moves to the count line" — no separate
+    // "all" page.
+    expect(document.querySelector(".runs--live")!.textContent).toBe("3 running · 100 tok/s");
+  });
+
+  it("no pager renders for exactly one running execution — same as before this issue", async () => {
+    const oneExecution = threeExecutionRecords.filter((r) => r.session_id === "s1");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={oneExecution} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__pager")).toBeNull();
+    // The count line has NO tok/s suffix at N=1 — that's still the rate
+    // line's job, as before.
+    expect(document.querySelector(".runs--live")!.textContent).toBe("1 running");
+  });
+
+  it("an arrow click changes the page and does not fire the card's machine drill-in", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(window.location.hash).toBe("");
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("2/3");
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 13s");
+    // (#1903-shaped) The arrow is its own tap target — stopPropagation kept
+    // it from ALSO firing the outer card's `machineDrillHash` click.
+    expect(window.location.hash).toBe("");
+  });
+
+  it("the picked page sticks until that execution ends, then falls forward to the new busiest among what's left", async () => {
+    const { rerender } = renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    // Pick s2 (reviewer, resting) — one click forward from the default s1.
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+
+    // s2 ends; s1 (generating) and s3 (prompt) are still running.
+    const afterS2Ends: FlowRecord[] = [
+      ...threeExecutionRecords,
+      { ts: at(4), machine_uid: "u1", session_id: "s2", action: "dispatch.complete" } as FlowRecord,
+    ];
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={afterS2Ends} tMax={D0 + 6000} tMin={D0} playhead={D0 + 6000} historical />
+      </QueryClientProvider>,
+    );
+
+    // Still a pager (2 executions left), but the sticky pick (s2) is gone —
+    // falls forward to the new busiest (s1, generating), not to whichever
+    // index s2 used to occupy.
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/2"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+  });
+});
+
 // ── (#1855) a rostered-but-silent machine must still render a card ──
 //
 // Before this fix, the fleet card list was `machineUids(flowData,
