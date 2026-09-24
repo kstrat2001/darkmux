@@ -9493,6 +9493,45 @@
         assert_eq!(payload["total_tokens"], 500);
     }
 
+    /// (#2877) A `model.partial` event carrying the new runtime fields
+    /// (`ts` at ms precision, `generated_chars` including reasoning)
+    /// forwards both, renamed to the flow-facing `sampled_at_ms` /
+    /// `generated_chars`.
+    #[test]
+    fn heartbeat_payload_forwards_new_fields() {
+        let event = serde_json::json!({
+            "type": "model.partial",
+            "seq": 1,
+            "partial_index": 3,
+            "cumulative_chars": 120,
+            "generated_chars": 340,
+            "ts": 1_758_700_000_123u64,
+        });
+        let payload = heartbeat_payload(&event);
+        assert_eq!(payload["cumulative_chars"], 120);
+        assert_eq!(payload["generated_chars"], 340);
+        assert_eq!(payload["sampled_at_ms"], 1_758_700_000_123u64);
+    }
+
+    /// (#2877) An OLDER runtime's `model.partial` — no `ts`, no
+    /// `generated_chars` — must still produce a valid heartbeat payload:
+    /// the two new keys degrade to JSON `null` rather than panicking or
+    /// dropping the record. This is the backward-compat guard the flow
+    /// schema minor bump promises readers.
+    #[test]
+    fn heartbeat_payload_degrades_gracefully_on_older_runtime_shape() {
+        let event = serde_json::json!({
+            "type": "model.partial",
+            "seq": 1,
+            "partial_index": 0,
+            "cumulative_chars": 10,
+        });
+        let payload = heartbeat_payload(&event);
+        assert_eq!(payload["cumulative_chars"], 10);
+        assert!(payload["generated_chars"].is_null());
+        assert!(payload["sampled_at_ms"].is_null());
+    }
+
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory
     /// line through `handle_event` and assert the emitted FlowRecord is a
     /// telemetry record (`category:"telemetry"`, `source:"detector"`)

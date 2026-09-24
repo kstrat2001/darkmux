@@ -5197,12 +5197,17 @@ fn run_streaming_turn(
         let cumulative = accumulator.content_bytes();
         let delta_bytes = cumulative.saturating_sub(last_content_bytes);
         last_content_bytes = cumulative;
+        // (#2877) `generated_chars` includes the separate-field reasoning
+        // buffer alongside answer content, so the viewer's token-rate scope
+        // sees a nonzero rate while a model reasons before answering.
+        let generated_chars = cumulative.saturating_add(accumulator.reasoning_bytes());
         trajectory.append_model_partial(
             seq,
             partial_index,
             delta_bytes,
             cumulative,
             accumulator.has_tool_calls(),
+            generated_chars,
         );
         *last_proof_of_work = std::time::Instant::now();
         *inactivity_soft_warning_fired_in_window = false;

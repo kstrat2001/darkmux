@@ -3225,7 +3225,11 @@ mod tests {
         //            `battery_pause_enabled` / `battery_pause_floor_pct`
         //            (run-page rest-reason cards): whether thermal/battery
         //            pacing was armed for this dispatch.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.54.0");
+        //   1.55.0 — additive `dispatch.turn.heartbeat` payload keys
+        //            `sampled_at_ms` / `generated_chars` (#2877, live
+        //            token-rate scope): ms-precision sample time + a
+        //            generated-char count that includes reasoning text.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.55.0");
     }
 
     #[test]

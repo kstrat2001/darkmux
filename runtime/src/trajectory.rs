@@ -1268,6 +1268,15 @@ impl Trajectory {
         delta_chars: usize,
         cumulative_chars: usize,
         tool_calls_present: bool,
+        // (#2877) Generated chars INCLUDING separate-field reasoning text —
+        // `cumulative_chars` above stays answer-text-only for back-compat
+        // (existing readers key on it), this is the additive field the
+        // viewer's live token-rate scope derives Δchars/Δms from, so the
+        // rate doesn't read as 0 tok/s while a model reasons before
+        // answering. `ts` (already ms precision, unlike flow's whole-second
+        // timestamps) rides this same event through to the flow layer as
+        // `sampled_at_ms`.
+        generated_chars: usize,
     ) {
         self.write_event(&serde_json::json!({
             "type": "model.partial",
@@ -1276,6 +1285,7 @@ impl Trajectory {
             "delta_chars": delta_chars,
             "cumulative_chars": cumulative_chars,
             "tool_calls_present": tool_calls_present,
+            "generated_chars": generated_chars,
             "ts": unix_ms(),
         }));
     }
