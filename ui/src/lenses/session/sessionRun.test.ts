@@ -1412,4 +1412,151 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.briefLines.some((e) => e.href?.startsWith("#mission="))).toBe(false);
   });
 
+  // (#2887) The central defect this packet fixes: a run the degeneracy gate
+  // flagged must never read CLEAN. Fixture mirrors the forwarder's real
+  // output shape (`category=telemetry, source=detector, action=telemetry.
+  // detector, fields.kind="repetition"`).
+  it("(#2887) a degenerate gate observation forwarded to flow makes the run NOT read CLEAN", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition",
+          severity: "warn",
+          detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836)",
+          observation: 17,
+          tail_ratio: 0.242,
+          slice_chars: 68000,
+          policy: "enforce",
+          acted: true,
+        },
+      },
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.length).toBeGreaterThan(0);
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeDefined();
+    expect(view.signalGroups.find((g) => g.kind === "repetition")?.severity).toBe("warn");
+  });
+
+  // (#2887) Companion to the above: under `observe` policy the record still
+  // flags (never CLEAN) but its wording says so was NOT enforced — the
+  // operator-visible distinction the issue asks for.
+  it("(#2887) an observe-policy gate finding reads 'observed, not enforced', never CLEAN", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition",
+          severity: "warn",
+          detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836) — flagged (observed), not enforced",
+          observation: 17,
+          tail_ratio: 0.242,
+          slice_chars: 68000,
+          policy: "observe",
+          acted: false,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeDefined();
+    const sig = view.signalGroups.find((g) => g.kind === "repetition")!.signals[0];
+    expect(sig.detail).toMatch(/observed/);
+    expect(sig.detail).toMatch(/not enforced/);
+  });
+
+  // (#2887) A reasoning checkpoint that WOULD have concluded under an
+  // observe policy — `verdict:"continue"`, `would_conclude:true` — must
+  // also flag, worded as observed, even though the harness let the turn
+  // keep going. `dispatch.checkpoint` DOES reach the flow stream already
+  // (unlike the gate above); the defect here was that nothing counted it.
+  it("(#2887) a would-conclude checkpoint under observe policy flags as repetition (observed)", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.2026,
+          verdict: "continue",
+          policy: "observe",
+          would_conclude: true,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/observed/);
+    expect(group!.signals[0].detail).toMatch(/not enforced/);
+  });
+
+  // (#2887) The paired case: a checkpoint that actually CONCLUDED
+  // (`verdict:"conclude"`, `enforce` policy) flags too, worded as acted —
+  // exercising the `acted` branch of the checkpoint wording, not just the
+  // observe branch above.
+  it("(#2887) a concluded checkpoint under enforce policy flags as repetition, worded as concluded", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.05,
+          verdict: "conclude",
+          policy: "enforce",
+          would_conclude: true,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/concluded/);
+    expect(group!.signals[0].detail).not.toMatch(/observed/);
+  });
+
+  // (#2887) A checkpoint that never judged the turn repetitive at all
+  // (`would_conclude:false`) must NOT flag — otherwise every ordinary
+  // checkpoint on a healthy run would light up the SIGNALS card.
+  it("(#2887) a checkpoint with would_conclude:false does not flag", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.9,
+          verdict: "continue",
+          policy: "enforce",
+          would_conclude: false,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeUndefined();
+  });
+
 });

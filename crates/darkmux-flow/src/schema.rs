@@ -77,8 +77,27 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.55.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
 // Version history:
+//   1.56.0 (#2887, degeneracy-gate signals reach the flow stream): additive.
+//           The in-stream degeneracy gate's `dispatch.gate.observation`
+//           (degenerate only) and `dispatch.gate.abort` trajectory events now
+//           forward as `category=telemetry, source=detector,
+//           action=telemetry.detector` records with `kind:"repetition"` —
+//           previously dropped on the floor entirely (`darkmux-crew`'s
+//           trajectory-to-flow forwarder had no arm for either type), so a
+//           run the gate flagged repeatedly still read CLEAN on the run
+//           page. New payload keys on that record: `observation`,
+//           `tail_ratio`, `slice_chars`, `generated_chars` (null on an
+//           observation), `policy` (`"enforce"`/`"observe"`/`"off"`, the
+//           degeneracy detector's policy at the time this dispatch ran) and
+//           `acted` (true only for `dispatch.gate.abort` — an observation,
+//           even a degenerate one, never itself ended the call). Also
+//           additive: `dispatch.checkpoint` records now carry `policy` and
+//           `would_conclude` (the reasoning check-in's verdict BEFORE its
+//           own policy is applied) — both already rode the runtime's
+//           trajectory event but were dropped by the forwarder, same defect
+//           as the gate's.
 //   1.55.0 (#2877, live token-rate scope): additive payload keys
 //           `sampled_at_ms` and `generated_chars` on `dispatch.turn.
 //           heartbeat`.

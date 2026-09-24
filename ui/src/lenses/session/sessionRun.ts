@@ -75,8 +75,18 @@ function pillClsFor(label: string): PillCls {
 /** (#2863) The detectors a clean run passed, in the order the old sentence
  * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
  * read by the signals card and by the text mirror its tests compare against
- * the parity golden, so the two cannot drift apart. */
-export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift"] as const;
+ * the parity golden, so the two cannot drift apart.
+ *
+ * (#2887) `repetition` covers TWO producers under one name: the in-stream
+ * degeneracy gate (`dispatch.gate.observation`/`dispatch.gate.abort`,
+ * forwarded as `telemetry.detector` records with `kind:"repetition"`) and
+ * the reasoning check-in's own judgment (`dispatch.checkpoint` with
+ * `would_conclude:true`, read directly below — it is not a detector
+ * telemetry record, so it cannot ride the `kind` field the same way, but it
+ * is pushed into `finds` under the SAME `"repetition"` kind). Before this,
+ * neither producer had ANY entry here, which is the defect the issue names:
+ * a run the gate flagged 14 times still read CLEAN. */
+export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift", "repetition"] as const;
 
 export interface SessionHeader {
   /** Pre-uppercased (`.sub h2{text-transform:uppercase}` in legacy CSS —
@@ -1313,6 +1323,41 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       // Serializing keeps the data where a human can read it — the operator
       // can act on a JSON blob and cannot act on `[object Object]`.
       detail: signalDetail(f.detail),
+      atMs,
+      offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
+    });
+  }
+
+  // (#2887) The reasoning check-in's own judgment. `dispatch.checkpoint` is
+  // NOT a detector telemetry record (`category=work`, `source` unset — it
+  // rides `self.emit`, not `self.emit_telemetry`), so it never reached
+  // `dets`/`tel` above; read it straight off `visible` instead, scoped to
+  // this session's attempt window the same way every other region here is.
+  //
+  // A checkpoint counts as a flag whenever `would_conclude` is `true` —
+  // the judge found the turn repetitive — REGARDLESS of `verdict`. Under
+  // `enforce`, `verdict:"conclude"` means the harness acted on it; under
+  // `observe`, `verdict:"continue"` with `would_conclude:true` means the
+  // judge flagged it but the policy in force did not let it act. Both are
+  // real findings; only the wording differs — matching the issue's own
+  // ask ("An observe-only finding reads flagged (observed), never CLEAN").
+  const checkpoints = visible.filter((r) => inAttempt(r) && r.action === "dispatch.checkpoint");
+  for (const r of checkpoints) {
+    const f = r.fields as Record<string, unknown>;
+    if (f.would_conclude !== true) continue;
+    const atMs = r.ts ? T(r.ts) : null;
+    const checkpointNum = typeof f.checkpoint === "number" ? f.checkpoint : "?";
+    const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : "?";
+    const acted = f.verdict === "conclude";
+    const observedOnly = !acted && f.policy === "observe";
+    finds.push({
+      kind: "repetition",
+      severity: "warn",
+      detail: acted
+        ? `checkpoint ${checkpointNum}: the reasoning check-in judged this turn repetitive (tail_ratio=${ratio}) and concluded it (#1221)`
+        : observedOnly
+          ? `checkpoint ${checkpointNum}: the reasoning check-in judged this turn repetitive (tail_ratio=${ratio}) — flagged (observed), not enforced (#2846)`
+          : `checkpoint ${checkpointNum}: the reasoning check-in judged this turn repetitive (tail_ratio=${ratio}) (#1221)`,
       atMs,
       offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
     });

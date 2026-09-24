@@ -893,6 +893,9 @@ describe("SessionReplay", () => {
       "tool failure",
       "reasoning loop",
       "edit drift",
+      // (#2887) The degeneracy gate + reasoning-checkpoint repetition
+      // finding joined the checklist — see CLEAN_DETECTORS' own doc.
+      "repetition",
     ]);
   });
 

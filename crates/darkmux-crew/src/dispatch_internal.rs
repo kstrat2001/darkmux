@@ -9576,6 +9576,16 @@ impl TailerState {
                     // trajectory.jsonl — without this, the #2165 fix never
                     // reached the surface the miss actually happened on.
                     "bound": event.get("bound"),
+                    // (#2887) `policy` (enforce/observe/off) and
+                    // `would_conclude` (the judge's verdict BEFORE policy is
+                    // applied) already ride the runtime's own trajectory
+                    // event (`trajectory::append_checkpoint`) but were
+                    // dropped here — the SIGNALS card could not tell an
+                    // enforced conclusion from an observe-mode "would have
+                    // concluded", nor count either as a flag at all. Forward
+                    // both verbatim, same as `bound` above.
+                    "policy": event.get("policy"),
+                    "would_conclude": event.get("would_conclude"),
                 });
                 // (#1955) Reduce as we go: the caller wants "13 checkpoints,
                 // one concluded, final ratio 0.29", never 65 records.
@@ -9703,7 +9713,14 @@ impl TailerState {
             // (#2190) The escalation record itself — see
             // `detector_telemetry_payload`'s own arm for why this rides the
             // same detector-telemetry path rather than a bespoke one.
-            | "dispatch.escalation.triggered" => {
+            | "dispatch.escalation.triggered"
+            // (#2887) The in-stream degeneracy gate's own findings. Only a
+            // DEGENERATE observation reaches here — `detector_telemetry_payload`
+            // drops a clean one, the same filter that keeps `dispatch.context`
+            // from flooding this stream. `dispatch.gate.abort` always forwards:
+            // it only ever fires when the gate actually ended the call.
+            | "dispatch.gate.observation"
+            | "dispatch.gate.abort" => {
                 // (#2169, merge-gate MUST FIX 1 split by `reason`) Live
                 // running totals — a call that never dispatches can't
                 // reach `tool.completed`/`self.summary.tool_calls` at
@@ -9731,7 +9748,41 @@ impl TailerState {
                         }
                     }
                 }
-                if let Some(payload) = detector_telemetry_payload(event_type, &event) {
+                if let Some(mut payload) = detector_telemetry_payload(event_type, &event) {
+                    // (#2887) The gate's trajectory event carries no policy —
+                    // the runtime crate is deliberately independent of
+                    // `darkmux-types` (see `runtime/src/detection.rs`'s own
+                    // doc) and only ever sees the raw env var. The HOST
+                    // already resolves that same policy once, above, to set
+                    // `DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY` for the
+                    // container this dispatch is running in — reusing that
+                    // resolution here (rather than threading it through the
+                    // pure, env-free `detector_telemetry_payload` mapping)
+                    // stamps the record with the SAME policy the runtime
+                    // itself was told to run under.
+                    //
+                    // `acted` is derivable from the event type alone: a
+                    // `dispatch.gate.abort` only exists because the gate's
+                    // policy allowed it to act (see `StreamGate::ingest`'s
+                    // `Degenerate` variant, which the runtime only returns
+                    // when `may_abort`); an observation record — even a
+                    // degenerate one — never itself cut the call.
+                    if matches!(event_type, "dispatch.gate.observation" | "dispatch.gate.abort") {
+                        let policy = darkmux_types::config_access::detection_degeneracy_policy();
+                        let acted = event_type == "dispatch.gate.abort";
+                        payload["policy"] = serde_json::json!(policy.as_str());
+                        payload["acted"] = serde_json::json!(acted);
+                        // Bake the distinction into the human-readable detail
+                        // too, so the SIGNALS card reads "flagged (observed)"
+                        // straight off the sentence, same as every other
+                        // detector's `detail` being a complete thought.
+                        if !acted && policy == darkmux_types::config::DetectionPolicy::Observe {
+                            if let Some(s) = payload.get("detail").and_then(|v| v.as_str()) {
+                                payload["detail"] =
+                                    serde_json::json!(format!("{s} — flagged (observed), not enforced"));
+                            }
+                        }
+                    }
                     // (#1955) Same payload to the envelope. One producer, so
                     // the viewer and the orchestrator cannot disagree about
                     // what fired.
@@ -10366,6 +10417,52 @@ fn detector_telemetry_payload(
                 ),
             )
         }
+        // (#2887) The in-stream degeneracy gate's own finding. Forwarded
+        // ONLY when `degenerate` is true — the runtime records EVERY
+        // observation boundary (#2844, so the detector's threshold can be
+        // checked against a real distribution rather than the corpus it was
+        // set on), which is ~30 clean looks per real finding on a run that
+        // actually trips it (34 observations, 14 degenerate, on the run that
+        // surfaced this gap in #2887's issue). Forwarding all of them would
+        // turn the flow stream into that same noise; only a degenerate one
+        // is a finding.
+        "dispatch.gate.observation" => {
+            if !event.get("degenerate").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return None;
+            }
+            let observation = u64_field("observation");
+            let slice_chars = u64_field("slice_chars");
+            let ratio = event
+                .get("tail_ratio")
+                .and_then(|v| v.as_f64())
+                .map(|r| format!("{r:.3}"))
+                .unwrap_or_else(|| "?".to_string());
+            (
+                "repetition",
+                "warn",
+                format!(
+                    "observation {observation}: tail_ratio={ratio} over {slice_chars} \
+                     characters — the degeneracy gate judged this repeating (#2836)"
+                ),
+            )
+        }
+        // (#2887) The gate actually ending the call — only ever fires when
+        // the policy in force may act (see `StreamGate::ingest`'s
+        // `Degenerate` variant), so unlike the observation above this always
+        // forwards.
+        "dispatch.gate.abort" => {
+            let observation = u64_field("observation");
+            let slice_chars = u64_field("slice_chars");
+            let generated_chars = u64_field("generated_chars");
+            (
+                "repetition",
+                "warn",
+                format!(
+                    "observation {observation}: the degeneracy gate ended the call at \
+                     {slice_chars} characters ({generated_chars} from this call) (#2836)"
+                ),
+            )
+        }
         _ => return None,
     };
 
@@ -10427,6 +10524,20 @@ fn detector_telemetry_payload(
         payload["model"] = event.get("model").cloned().unwrap_or(serde_json::Value::Null);
         payload["prompt_tokens"] =
             event.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null);
+    }
+
+    // (#2887) Same explicit-field pattern — the numbers the sentence above
+    // is built from, so a consumer aggregating "how repetitive" across a run
+    // doesn't have to parse the human-readable string. `policy`/`acted` are
+    // NOT stamped here — this mapping is pure (no process env), and those
+    // two are added by the caller, which already resolves the host's policy
+    // once for the container spawn (see `handle_event`'s gate arm).
+    if event_type == "dispatch.gate.observation" || event_type == "dispatch.gate.abort" {
+        payload["observation"] = event.get("observation").cloned().unwrap_or(serde_json::Value::Null);
+        payload["tail_ratio"] = event.get("tail_ratio").cloned().unwrap_or(serde_json::Value::Null);
+        payload["slice_chars"] = event.get("slice_chars").cloned().unwrap_or(serde_json::Value::Null);
+        payload["generated_chars"] =
+            event.get("generated_chars").cloned().unwrap_or(serde_json::Value::Null);
     }
 
     // (#994 engagement-context capture) Key the firing to the file it happened
