@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from "../lib/scopeTone";
 import {
   advanceMorph,
@@ -444,30 +444,84 @@ export function TokenScope({
   const showBrain = state === "prompt" && centerLabel == null;
   const showNumber = !showIcon && !showBrain && centerLabel != null;
 
+  // One center layer, keyed by WHAT it shows (not its value), so a number
+  // ticking within a state never fades, only a change of kind does.
+  let centerKey = "none";
+  let centerNode: ReactNode = null;
+  if (showIcon) {
+    const kind = toolIconKind(toolName);
+    centerKey = `tools:${kind}`;
+    centerNode = (
+      <div className="token-scope-center token-scope-center--icon" data-state={state}>
+        <ToolIcon kind={kind} className="token-scope-ico" />
+      </div>
+    );
+  } else if (showBrain) {
+    centerKey = "brain";
+    centerNode = (
+      <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state}>
+        <BrainGlyph className="token-scope-ico" />
+      </div>
+    );
+  } else if (showNumber) {
+    centerKey = `num:${state}`;
+    centerNode = (
+      <div className="token-scope-center" data-state={state}>
+        <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
+          {shownLabel}
+        </span>
+        {centerUnit ? <span className="token-scope-u">{centerUnit}</span> : null}
+      </div>
+    );
+  }
+  const ghost = useCrossfade(centerKey, centerNode);
+
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
     <div className={cls} data-tone={stateTone(state)} data-state={state}>
       <div className="token-scope-screen">
         <canvas ref={canvasRef} aria-hidden="true" />
-        {showIcon && (
-          <div className="token-scope-center token-scope-center--icon">
-            <ToolIcon kind={toolIconKind(toolName)} className="token-scope-ico" />
+        {ghost && (
+          <div key={`ghost-${ghost.id}`} className="token-scope-fade token-scope-fade--out" aria-hidden="true">
+            {ghost.node}
           </div>
         )}
-        {showBrain && (
-          <div className="token-scope-center token-scope-center--icon token-scope-center--brain">
-            <BrainGlyph className="token-scope-ico" />
-          </div>
-        )}
-        {showNumber && (
-          <div className="token-scope-center">
-            <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
-              {shownLabel}
-            </span>
-            {centerUnit ? <span className="token-scope-u">{centerUnit}</span> : null}
+        {centerNode && (
+          <div key={centerKey} className="token-scope-fade token-scope-fade--in">
+            {centerNode}
           </div>
         )}
       </div>
     </div>
   );
+}
+
+/** Length of the center's crossfade, in ms; matches `token-scope-fade-*` in
+ *  `styles.css`. */
+const CENTER_FADE_MS = 180;
+
+/** (#2890 operator review) The center's content changes kind at a state
+ *  switch (rate, tool icon, brain, countdown) while the trace MORPHS, so a
+ *  hard swap read as a pop. This keeps the previous content on screen,
+ *  fading out, for one short crossfade while the new one fades in. The
+ *  ghost is captured in a layout effect so it lands in the same frame as
+ *  the switch, before paint. */
+function useCrossfade(key: string, node: ReactNode): { id: number; node: ReactNode } | null {
+  const last = useRef<{ key: string; node: ReactNode } | null>(null);
+  const seq = useRef(0);
+  const [ghost, setGhost] = useState<{ id: number; node: ReactNode } | null>(null);
+  useLayoutEffect(() => {
+    const prev = last.current;
+    if (prev && prev.key !== key && prev.node) {
+      seq.current += 1;
+      setGhost({ id: seq.current, node: prev.node });
+    }
+    last.current = { key, node };
+  });
+  useEffect(() => {
+    if (!ghost) return;
+    const t = setTimeout(() => setGhost(null), CENTER_FADE_MS);
+    return () => clearTimeout(t);
+  }, [ghost]);
+  return ghost;
 }

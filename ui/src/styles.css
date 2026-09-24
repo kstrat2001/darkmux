@@ -8447,8 +8447,8 @@ body {
    turn) keeps the full glow: dimming it flickered at every turn's start.
    `data-carried` is still stamped on the element, unstyled. */
 /* (#2890) REST's countdown in the center takes the rest lamp's amber. */
-.token-scope-bezel[data-state="rest"] .token-scope-n,
-.token-scope-bezel[data-state="rest"] .token-scope-u {
+.token-scope-center[data-state="rest"] .token-scope-n,
+.token-scope-center[data-state="rest"] .token-scope-u {
   color: var(--lamp-rest);
   text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
 }
@@ -8488,6 +8488,33 @@ body {
   height: var(--ico);
   color: var(--lamp-tools);
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-tools) 80%, transparent));
+}
+/* (#2890) The center crossfades at a change of kind. Each layer fills the
+   screen like `.token-scope-center`, so the two overlap during the fade.
+   The rest color rides the LAYER's own data-state, so a fading-out
+   countdown keeps its amber. */
+.token-scope-fade {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.token-scope-fade--in {
+  animation: token-scope-fade-in 180ms ease-out both;
+}
+.token-scope-fade--out {
+  animation: token-scope-fade-out 180ms ease-in both;
+}
+@keyframes token-scope-fade-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes token-scope-fade-out {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: scale(1.06); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-fade--in { animation: none; }
+  .token-scope-fade--out { display: none; }
 }
 /* PROMPT: the brain takes the prompt lamp's color and breathes. */
 .token-scope-center--brain .token-scope-ico {

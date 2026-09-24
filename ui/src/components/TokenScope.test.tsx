@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { render } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, act } from "@testing-library/react";
 import { TokenScope } from "./TokenScope";
 
 // (#2890) What the operator SEES inside the tube, per state. The canvas
@@ -84,5 +84,31 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(tools.container.querySelector(".token-scope-bezel")?.getAttribute("data-state")).toBe("tools");
     const none = render(<TokenScope tokensPerSec={0} size="card" tone="none" />);
     expect(none.container.querySelector(".token-scope-bezel")?.getAttribute("data-state")).toBe("idle");
+  });
+});
+
+describe("TokenScope center crossfade (#2890)", () => {
+  it("keeps the old center fading out for one short crossfade at a change of kind", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, rerender } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="read" />);
+      rerender(<TokenScope tokensPerSec={120} size="tile" state="generating" centerLabel="120" centerUnit="tok/s" />);
+      const out = container.querySelector(".token-scope-fade--out");
+      expect(out?.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("read");
+      expect(container.querySelector(".token-scope-fade--in .token-scope-u")?.textContent).toBe("tok/s");
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+      expect(container.querySelector(".token-scope-fade--out")).toBeNull();
+      expect(container.querySelector("[data-tool-icon]")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a number changing within one state does not fade", () => {
+    const { container, rerender } = render(<TokenScope tokensPerSec={100} size="tile" state="generating" centerLabel="100" centerUnit="tok/s" />);
+    rerender(<TokenScope tokensPerSec={140} size="tile" state="generating" centerLabel="140" centerUnit="tok/s" />);
+    expect(container.querySelector(".token-scope-fade--out")).toBeNull();
   });
 });
