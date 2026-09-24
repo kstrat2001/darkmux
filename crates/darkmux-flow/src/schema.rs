@@ -88,8 +88,9 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.55.0";
 //           through — flow's own timestamps are whole seconds, too coarse
 //           to derive a rate from a ~2s heartbeat cadence (the same
 //           coarseness 1.53.0's `generation_ms` addressed for turn
-//           duration). `generated_chars` is the generated character count
-//           INCLUDING separate-field reasoning text; the existing
+//           duration). `generated_chars` is everything the model emitted this
+//           turn: answer content, separate-field reasoning text, and
+//           streamed tool-call names and arguments; the existing
 //           `cumulative_chars` field is unchanged (answer text only, so it
 //           reads 0 while a model reasons before answering) and both ride
 //           the same record so a reader can prefer the richer field and

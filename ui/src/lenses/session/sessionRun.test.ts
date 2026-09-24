@@ -217,8 +217,32 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.liveTokScope).toBeNull();
-    // 200 completion tokens over a 10s wall clock = 20 tok/s.
-    expect(view.metrics.find((m) => m.label === "TOK/S")?.value).toBe("20");
+    // No `generation_ms` (a pre-1.53 runtime): 200 completion tokens over a
+    // 10s wall clock = 20 tok/s, and the tile says which average it is.
+    const tile = view.metrics.find((m) => m.label === "TOK/S");
+    expect(tile?.value).toBe("20");
+    expect(tile?.sub).toBe("avg · wall clock");
+  });
+
+  it("a FINISHED run's TOK/S averages over GENERATION time when turns carry generation_ms, labeled avg", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 2_500 } },
+      {
+        ts: "2026-01-01T00:00:04Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "tokens",
+        action: "telemetry.tokens",
+        payload: { turn_seq: 1, prompt_tokens: 100, completion_tokens: 200 },
+      },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 200 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    // 200 tokens over 2.5s of generation = 80, not 200 over the 10s wall clock.
+    const tile = view.metrics.find((m) => m.label === "TOK/S");
+    expect(tile?.value).toBe("80");
+    expect(tile?.sub).toBe("avg");
   });
 
   it("an errored (non-killed) dispatch names the exit code and reads red", () => {

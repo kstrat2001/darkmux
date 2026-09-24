@@ -113,6 +113,38 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
  *  ratio is trusted over the default. */
 export const MIN_CALIBRATION_CHARS = 2_000;
 
+/** A FINISHED run's generation rate: billed completion tokens over the time
+ *  the model spent generating (`dispatch.turn`'s `generation_ms`), paired by
+ *  turn within each execution. Not the wall clock, which includes rests,
+ *  tools and prompt reading (a real run read 45 tok/s over wall clock
+ *  against ~80 over generation time). `null` when no turn carries
+ *  `generation_ms` (a runtime older than flow schema 1.53). */
+export function averageGenerationRate(recordSets: FlowRecord[][]): number | null {
+  let tokens = 0;
+  let ms = 0;
+  for (const records of recordSets) {
+    const genMs = new Map<unknown, number>();
+    const tok = new Map<unknown, number>();
+    for (const r of records) {
+      const f = fields(r);
+      if (r.action === "dispatch.turn") {
+        const g = num(f.generation_ms);
+        if (g !== null && g > 0) genMs.set(f.turn_seq, g);
+      } else if (r.action === "telemetry.tokens") {
+        const t = num(f.completion_tokens);
+        if (t !== null) tok.set(f.turn_seq, (tok.get(f.turn_seq) ?? 0) + t);
+      }
+    }
+    for (const [turn, g] of genMs) {
+      const t = tok.get(turn);
+      if (t == null) continue;
+      tokens += t;
+      ms += g;
+    }
+  }
+  return ms > 0 ? tokens / (ms / 1000) : null;
+}
+
 export interface TokenRateReading {
   tokensPerSec: number;
   /** The sample the reading is as-of — lets a caller judge freshness. */

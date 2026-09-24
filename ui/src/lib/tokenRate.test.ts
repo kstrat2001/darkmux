@@ -11,6 +11,7 @@ import {
   heartbeatSamples,
   isStalled,
   measuredCharsPerToken,
+  averageGenerationRate,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -312,5 +313,34 @@ describe("aggregateLiveState", () => {
 
   it("is prompt (the default) when there are no executions at all", () => {
     expect(aggregateLiveState([], 1_000)).toEqual({ state: "prompt" });
+  });
+});
+
+describe("averageGenerationRate", () => {
+  // A finished run's TOK/S is the model's generation rate: billed completion
+  // tokens over the time it spent generating (`generation_ms` per turn), not
+  // over the wall clock, which includes rests, tools and prompt reading
+  // (a real run read 45 over wall clock against ~80 over generation time).
+  const turn = (sid: string, seq: number, genMs: number | undefined): FlowRecord =>
+    ({ ts: atSec(seq), action: "dispatch.turn", session_id: sid, payload: genMs == null ? { turn_seq: seq } : { turn_seq: seq, generation_ms: genMs } }) as unknown as FlowRecord;
+  const tok = (sid: string, seq: number, completion: number): FlowRecord =>
+    ({ ts: atSec(seq), action: "telemetry.tokens", session_id: sid, payload: { turn_seq: seq, completion_tokens: completion } }) as unknown as FlowRecord;
+
+  it("sums billed tokens over summed generation time, paired per turn", () => {
+    const rate = averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 400), turn("a", 2, 5_000), tok("a", 2, 600)]]);
+    expect(rate).toBeCloseTo(100, 5);
+  });
+
+  it("pairs by session as well as turn, across a mission's executions", () => {
+    const rate = averageGenerationRate([
+      [turn("a", 1, 4_000), tok("a", 1, 400)],
+      [turn("b", 1, 6_000), tok("b", 1, 200)],
+    ]);
+    expect(rate).toBeCloseTo(60, 5);
+  });
+
+  it("skips a turn with no generation_ms, and is null when no turn has one", () => {
+    expect(averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 500), turn("a", 2, undefined), tok("a", 2, 900)]])).toBeCloseTo(100, 5);
+    expect(averageGenerationRate([[turn("a", 1, undefined), tok("a", 1, 500)]])).toBeNull();
   });
 });

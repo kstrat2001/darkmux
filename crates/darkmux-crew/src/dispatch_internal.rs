@@ -10106,7 +10106,7 @@ impl TailerState {
 /// bump alongside this change): the trajectory's `model.partial` event
 /// already carries `ts` at millisecond precision (`trajectory::unix_ms`),
 /// and — once the runtime side of #2877 lands — a `generated_chars` count
-/// that includes reasoning text, unlike `cumulative_chars` (answer text
+/// that includes reasoning text and tool-call arguments, unlike `cumulative_chars` (answer text
 /// only, stays 0 while a separate-field-reasoning model reasons). Both
 /// read via `.get()`, so an OLDER runtime's event (neither field present)
 /// still forwards a valid heartbeat — `.get()` on a missing key yields

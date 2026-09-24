@@ -56,7 +56,7 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateLiveState, aggregateTokenRate } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, averageGenerationRate } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
@@ -923,8 +923,20 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // is reconcilable against its neighbors rather than a third, opaque
   // measurement.
   if (done) {
-    const finalTokPerSec = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
-    push(modelIdx, finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—", "TOK/S", undefined, undefined, "estimate");
+    // The model's generation rate: billed tokens over generation time, an
+    // exact average, not an estimate. Wall clock is only the fallback for a
+    // runtime that predates `generation_ms`, and the label says so.
+    const genRate = averageGenerationRate(tokRateRecordSets);
+    const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
+    const finalTokPerSec = genRate ?? wallRate;
+    push(
+      modelIdx,
+      finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—",
+      "TOK/S",
+      undefined,
+      undefined,
+      genRate != null ? "avg" : "avg · wall clock",
+    );
   }
   // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
   // the model's work, and the gate — while this tile is the dispatch's own
