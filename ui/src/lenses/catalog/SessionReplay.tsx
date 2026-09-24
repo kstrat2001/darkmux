@@ -22,7 +22,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
-import { liveStateLabel } from "../../lib/tokenRate";
+import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
@@ -66,6 +66,34 @@ function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
  * intermediate frame. A value that ISN'T one plain number — a duration
  * like "10:15", a model name, "—" — renders exactly as it always did, no
  * animation, because there is nothing here safe to interpolate. */
+/** The TOK/S tile's state lamps: one per state, grey when off, exactly one
+ *  lit in its state's color. Seeing every state at once is what makes the
+ *  current one legible (operator: "is this resting? can't tell"). The rest
+ *  lamp carries its countdown while lit. */
+const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = [
+  { state: "generating", label: "gen" },
+  { state: "prompt", label: "prompt" },
+  { state: "tools", label: "tools" },
+  { state: "rest", label: "rest" },
+  { state: "stalled", label: "stall" },
+];
+function ScopeLamps({ reading }: { reading: LiveStateReading }) {
+  return (
+    <div className="scope-lamps" role="status" aria-label={`run state: ${reading.state === "generating" ? "generating" : liveStateLabel(reading)}`}>
+      {SCOPE_LAMPS.map(({ state, label }) => {
+        const on = reading.state === state;
+        return (
+          <span key={state} className="scope-lamp" data-state={state} data-on={on ? "true" : "false"}>
+            <span className="scope-lamp__dot" aria-hidden="true" />
+            {label}
+            {on && state === "rest" && reading.restSecondsLeft != null ? ` ${reading.restSecondsLeft}s` : ""}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 function AnimatedMetricValue({ value }: { value: string }) {
   const parsed = parseNumericLike(value);
   // `useCountUp` is called unconditionally either way — only the target it
@@ -622,9 +650,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
                         : null
                     }
                   />
-                  {view.liveTokScope.state !== "generating" && (
-                    <div className="scopetile__state">{liveStateLabel(view.liveTokScope)}</div>
-                  )}
+                  <ScopeLamps reading={view.liveTokScope} />
                 </div>
               )}
             </div>

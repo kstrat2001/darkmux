@@ -8105,19 +8105,47 @@ body {
   --d: 40px;
   --rim: 4px;
 }
-/* The TOK/S tile's state caption: under the tube, never inside it. The
-   tiles lay out by `order` (label, value, sub), and the bezel is order 3, so
-   the caption must say 4 or it sorts above the label. */
-.scopetile__state {
+/* The TOK/S tile's state lamps: grey when off, one lit in its state's own
+   color with a glow. The tiles lay out by `order` and the bezel is order 3,
+   so the lamps say 4 or they sort above the label. */
+.scope-lamps {
   order: 4;
-  margin-top: 8px;
-  text-align: center;
-  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 12px;
+}
+.scope-lamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: calc(10px * var(--fs-scale)) var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
+  opacity: 0.55;
   font-variant-numeric: tabular-nums;
 }
+.scope-lamp__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3a4048;
+}
+.scope-lamp[data-on="true"] {
+  opacity: 1;
+  color: var(--lamp);
+}
+.scope-lamp[data-on="true"] .scope-lamp__dot {
+  background: var(--lamp);
+  box-shadow: 0 0 6px var(--lamp), 0 0 12px var(--lamp);
+}
+.scope-lamp[data-state="generating"] { --lamp: #7dffa0; }
+.scope-lamp[data-state="prompt"] { --lamp: #5eead4; }
+.scope-lamp[data-state="tools"] { --lamp: #7aa2ff; }
+.scope-lamp[data-state="rest"] { --lamp: #fbbf24; }
+.scope-lamp[data-state="stalled"] { --lamp: #f87171; }
 .token-scope-bezel--card {
   --d: 64px;
   --rim: 5px;

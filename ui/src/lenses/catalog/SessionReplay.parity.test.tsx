@@ -118,7 +118,7 @@ describe("parity: fleet card, live vs playback at the same recorded instant", ()
   });
 });
 
-describe("TOK/S tile: a state is a caption under the tube, never text inside it", () => {
+describe("TOK/S tile: a state is a lit lamp under the tube, never text inside it", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
@@ -128,7 +128,7 @@ describe("TOK/S tile: a state is a caption under the tube, never text inside it"
   // Operator, on a phone: "prompt" set at the number's size ran straight
   // through the ring. The number is the reading and sits inside; a state is
   // a caption about the reading and sits under the tube.
-  it("waiting for the first token: empty tube center, 'reading prompt' caption", async () => {
+  it("waiting for the first token: empty tube center, the PROMPT lamp lit and every other lamp off", async () => {
     const start = T((ALL.find((r) => r.session_id === SID && /dispatch.start|dispatch start/.test(String(r.action))) as { ts: string }).ts);
     const at = start + 1_000;
     vi.useFakeTimers();
@@ -144,6 +144,15 @@ describe("TOK/S tile: a state is a caption under the tube, never text inside it"
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
     const tile = document.querySelector('[data-testid="run-token-scope"]')!;
     expect(tile.querySelector(".token-scope-n")).toBeNull();
-    expect(tile.querySelector(".scopetile__state")?.textContent).toBe("reading prompt");
+    // A lamp per state, exactly one lit: the operator's "is this resting?
+    // can't tell" answered by seeing every state at once.
+    const lamps = [...tile.querySelectorAll(".scope-lamp")].map((l) => [l.getAttribute("data-state"), l.getAttribute("data-on")]);
+    expect(lamps).toEqual([
+      ["generating", "false"],
+      ["prompt", "true"],
+      ["tools", "false"],
+      ["rest", "false"],
+      ["stalled", "false"],
+    ]);
   });
 });
