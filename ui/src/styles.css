@@ -3599,11 +3599,19 @@ body {
    nested-tap-target shape (`FleetLens.tsx`'s doc next to `selectPage`) —
    both need `stopPropagation` so a click doesn't ALSO fire the card body's
    `machineDrillHash`. */
+/* (#2881, UI review 2026-09-25) A grid, not flex: both arrows sit in fixed
+   32px tracks and the label takes `minmax(0, 1fr)`, so a long label
+   ellipsizes on one line instead of wrapping (a flex item's automatic
+   minimum size forced the wrap) and paging never moves a tap target. One
+   line matters beyond looks: every extra row grows the text block the
+   tube is sized from. */
 .mach-scope__pager {
   margin-top: 4px;
-  display: flex;
+  display: grid;
+  grid-template-columns: 32px auto minmax(0, 1fr) 32px;
   align-items: center;
-  gap: 5px;
+  column-gap: 5px;
+  min-width: 0;
   font: calc(11px * var(--fs-scale)) var(--font-mono);
   color: var(--dim);
 }
@@ -3634,14 +3642,26 @@ body {
 .mach-scope__pager-n {
   color: var(--fg);
   font-variant-numeric: tabular-nums;
+  min-width: 3ch;
+  text-align: right;
 }
 .mach-scope__pager-role {
   opacity: 0.8;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
   color: var(--fg);
+  /* (#2881) One line, ellipsized: a wrapped count grows the text block the
+     tube is sized from, and the card with it. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* (#1903) The running-count's own tap target — see `FleetLens.tsx`'s
    `machineRunsHash` doc for why it exists distinct from `.mach` itself.
@@ -3656,6 +3676,9 @@ body {
   text-decoration: underline;
   text-underline-offset: 2px;
   width: fit-content;
+  /* (#2881) `fit-content` alone let a long count run past the text column
+     to the card's edge; capped, it ellipsizes like `.mach .runs`. */
+  max-width: 100%;
 }
 .mach .runs--live:hover {
   color: var(--fg);

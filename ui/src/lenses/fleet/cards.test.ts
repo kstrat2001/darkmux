@@ -557,6 +557,22 @@ describe("buildFleetCard", () => {
       expect(card.liveTokState ?? null).toBeNull();
     });
 
+    it("(#2881) a pre-#2310 review run's bookend (source \"review\") is a run, not a pager execution", () => {
+      // Archives are append-only (contract 8): the retired review launcher
+      // bookended the WHOLE run with `source: "review"` and a crew-summary
+      // handle, and it never bookended a seat, so that record is run-grain
+      // exactly like today's `source: "mission"`. Paging it read as a second
+      // execution labeled `deep+diff-review+probe-4b+probe-qwen38`.
+      const data: FlowRecord[] = [
+        rec({ ts: "2026-08-08T23:59:50.000Z", machine_uid: "u1", session_id: "m1", action: "dispatch start", source: "review", handle: "deep+diff-review+probe-4b", mission_id: "m1" }),
+        rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.start", handle: "reviewer", mission_id: "m1" }),
+        rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
+        rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
+      expect(card.executions.map((e) => e.sessionId)).toEqual(["e1"]);
+    });
+
     it("still works from an OLDER runtime's heartbeat shape (no sampled_at_ms/generated_chars)", () => {
       const data: FlowRecord[] = [
         rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),

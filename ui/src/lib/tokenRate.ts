@@ -525,6 +525,12 @@ const isCloseEdge = (a: string | undefined): boolean =>
  *  and not a mission's own run-grain session (its `dispatch start` is
  *  mission-sourced and bookends the whole run; it never generates, and its
  *  start read as PROMPT over a genuinely stalled execution). */
+/** (#2881) The retired review launcher's whole-run bookend source (deleted
+ *  in #2310 P4d). It bookended the WHOLE run, never a seat, so on an
+ *  archived record it is run-grain exactly like today's `"mission"`, and
+ *  archives are append-only (contract 8): readers stay bilingual. */
+const RETIRED_REVIEW_RUN_SOURCE = "review";
+
 export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: number): FlowRecord[][] {
   return perExecutionRecords.filter((recs) => {
     let runGrain = false;
@@ -538,7 +544,7 @@ export function liveExecutions(perExecutionRecords: FlowRecord[][], nowMs: numbe
       if (isCloseEdge(r.action)) return false;
       if (r.action === "dispatch.start" || r.action === "dispatch start") {
         evidence = true;
-        if (r.source === "mission") runGrain = true;
+        if (r.source === "mission" || r.source === RETIRED_REVIEW_RUN_SOURCE) runGrain = true;
       } else if (
         r.action === "dispatch.turn.heartbeat" ||
         r.action === "dispatch.turn" ||

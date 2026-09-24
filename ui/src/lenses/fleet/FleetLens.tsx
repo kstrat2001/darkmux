@@ -958,7 +958,12 @@ export function FleetLens({
                   <span className="mach-scope__pager-n">
                     {selectedIdx + 1}/{execs.length}
                   </span>
-                  {selectedExec.role && <span className="mach-scope__pager-role">{selectedExec.role}</span>}
+                  {/* (#2881) Always rendered, even empty, so the right arrow's
+                      column never moves between pages; one line, ellipsized,
+                      with the full label in the tooltip. */}
+                  <span className="mach-scope__pager-role" title={selectedExec.role ?? undefined}>
+                    {selectedExec.role ?? ""}
+                  </span>
                   <div
                     className="mach-scope__pager-btn"
                     role="button"
