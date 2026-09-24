@@ -248,21 +248,29 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.fill();
     ctx.shadowBlur = 0;
   }
-  // PROMPT: rings drawn in from the screen's edge toward the brain, the
+  // PROMPT: rings peel off the base ring and sink toward the brain, the
   // prompt being absorbed.
   if (p.inward > 0.01) {
-    const edge = R * 1.47; // the screen's radius
-    const sink = rBase * 0.78; // where a ring is fully absorbed
     for (let k = 0; k < 3; k++) {
       const q = (c.inwardT + k / 3) % 1;
-      // (#2890 operator review) Each ring enters at the edge, brightens as it
-      // closes on the base ring, and is absorbed just inside it, short of the
-      // brain, so the center stays clear like every other state's.
-      const r = edge - q * (edge - sink);
-      const a = Math.min(1, q / 0.2) * Math.pow(1 - q, 0.45) * 0.9 * p.inward;
+      // (#2890 operator review) Each ring is born ON the base ring, wave and
+      // all, then shrinks toward the brain, its wave flattening as it goes,
+      // and fades out at half the base radius so the center stays clear.
+      const shrink = 1 - 0.5 * q;
+      const waveAmp = amp * (1 - q);
+      const a = Math.min(1, q / 0.12) * Math.pow(1 - q, 1.1) * 0.9 * p.inward;
       for (const [lw, al] of INWARD_PASSES) {
         ctx.beginPath();
-        ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, 0, Math.PI * 2);
+        for (let i = 0; i <= 120; i++) {
+          const t = (i / 120) * Math.PI * 2;
+          const wave = Math.sin(lobes * t - c.phase) + 0.12 * Math.sin((lobes * 2 + 1) * t + c.phase * 1.7);
+          const r = (rBase + waveAmp * wave) * shrink;
+          const x = cx + Math.cos(t) * r * p.sx;
+          const y = cy + Math.sin(t) * r * p.sy;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
         ctx.strokeStyle = rgba(cr, cg, cb, al * a);
         ctx.lineWidth = lw;
         ctx.shadowColor = rgba(cr, cg, cb, 0.8);
