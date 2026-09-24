@@ -1428,7 +1428,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
         fields: {
           kind: "repetition",
           severity: "warn",
-          detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836)",
+          detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836) and ended the call",
+          turn_seq: 14,
           observation: 17,
           tail_ratio: 0.242,
           slice_chars: 68000,
@@ -1460,6 +1461,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
           kind: "repetition",
           severity: "warn",
           detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836) — flagged (observed), not enforced",
+          turn_seq: 14,
           observation: 17,
           tail_ratio: 0.242,
           slice_chars: 68000,
@@ -1509,7 +1511,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // (`verdict:"conclude"`, `enforce` policy) flags too, worded as acted —
   // exercising the `acted` branch of the checkpoint wording, not just the
   // observe branch above.
-  it("(#2887) a concluded checkpoint under enforce policy flags as repetition, worded as concluded", () => {
+  it("(#2887) a concluded checkpoint under enforce policy flags as repetition, worded as acted (not observed)", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -1530,7 +1532,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     const group = view.signalGroups.find((g) => g.kind === "repetition");
     expect(group).toBeDefined();
-    expect(group!.signals[0].detail).toMatch(/concluded/);
+    expect(group!.signals[0].detail).toMatch(/ended it/);
     expect(group!.signals[0].detail).not.toMatch(/observed/);
   });
 
@@ -1557,6 +1559,182 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeUndefined();
+  });
+
+  // (#2887 F1, fix-pass) A HISTORICAL checkpoint from before #2846 shipped
+  // `would_conclude` at all — only `verdict` exists. 85 real sessions on
+  // this machine have this exact shape, 53 with no detector record at all,
+  // so `verdict==="conclude"` alone must still flag; the old
+  // `would_conclude !== true` filter read every one of them as CLEAN with
+  // "repetition" ticked.
+  it("(#2887 F1) a historical checkpoint with verdict:conclude and NO would_conclude key still flags", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.05,
+          verdict: "conclude",
+          // no `would_conclude`, no `policy` — the pre-#2846 shape.
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/ended it/);
+  });
+
+  // (#2887 F2) Under a run-level policy of `off` (read from `dispatch.
+  // start`'s `payload.bounds.detection_degeneracy_policy.value`), the gate
+  // never ran — `repetitionOff` must be true, and even a STRAY
+  // repetition-shaped record in the window (a policy flipped mid-
+  // investigation, a malformed fixture) must not manufacture a finding for
+  // a detector that measured nothing.
+  it("(#2887 F2) run-level policy 'off' suppresses repetition entirely and sets repetitionOff", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        fields: { bounds: { detection_degeneracy_policy: { value: "off", source: "config" } } },
+      },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition", severity: "warn", detail: "stray record",
+          turn_seq: 5, policy: "enforce", acted: true,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionOff).toBe(true);
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeUndefined();
+  });
+
+  // (#2887 F2) A run-level policy that IS armed (`enforce`/`observe`) must
+  // read `repetitionOff:false` — the false case covers BOTH "ran and found
+  // nothing" and "unknown", so a run with real findings under enforce must
+  // not read as off.
+  it("(#2887 F2) run-level policy 'enforce' does not set repetitionOff", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        fields: { bounds: { detection_degeneracy_policy: { value: "enforce", source: "config" } } },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionOff).toBe(false);
+  });
+
+  // (#2887 F2) The run-level policy is PREFERRED for the observed/enforced
+  // wording over a record's own (possibly absent) `policy` field — here the
+  // gate observation carries no `policy` of its own (an older-runtime
+  // shape), but the run's `dispatch.start` says `observe`, so the wording
+  // must still read as observed-not-enforced rather than falling through to
+  // the bare "judged repeating" sentence.
+  it("(#2887 F2) run-level policy fills in wording when the record's own policy is absent", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        fields: { bounds: { detection_degeneracy_policy: { value: "observe", source: "config" } } },
+      },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition", severity: "warn", detail: "no policy on the record itself",
+          turn_seq: 5, acted: false,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/observed/);
+    expect(group!.signals[0].detail).toMatch(/not enforced/);
+  });
+
+  // (#2887 F4) Built from the REAL enforce-policy trajectory
+  // (`refresh-rotation-splash-qwen36-1790241677-1/trajectory.jsonl`,
+  // 2026-09-24 bake-off, read-only): 3 cuts total — turn_seq 2 cut once
+  // (one degenerate observation, one abort, one concluding checkpoint),
+  // turn_seq 3 cut TWICE (two of each). That is 9 raw signal-bearing
+  // records across only 2 DISTINCT turns. Grouped by turn, the SIGNALS
+  // card must show exactly ONE "repetition" group with count 2 — not 9,
+  // not 3.
+  it("(#2887 F4) real enforce trajectory shape: 3 cuts across 2 turns collapse to one group, count 2", () => {
+    const gateRecord = (turnSeq: number, observation: number) => ({
+      ts: `2026-01-01T00:0${observation}:00Z`,
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: judged repeating`,
+        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+      },
+    });
+    const abortRecord = (turnSeq: number, observation: number) => ({
+      ts: `2026-01-01T00:0${observation}:01Z`,
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: ended the call`,
+        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+      },
+    });
+    const checkpointRecord = (turnSeq: number) => ({
+      ts: "2026-01-01T00:05:00Z",
+      session_id: "s1",
+      action: "dispatch.checkpoint",
+      fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
+    });
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // turn_seq 2: one cut.
+      gateRecord(2, 14),
+      abortRecord(2, 14),
+      checkpointRecord(2),
+      // turn_seq 3: two cuts (a continuation after the first).
+      gateRecord(3, 17),
+      abortRecord(3, 17),
+      checkpointRecord(3),
+      gateRecord(3, 3),
+      abortRecord(3, 3),
+      checkpointRecord(3),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.signals).toHaveLength(2);
+    const turnsNamed = group!.signals.map((s) => s.detail).sort();
+    expect(turnsNamed[0]).toMatch(/turn 2/);
+    expect(turnsNamed[1]).toMatch(/turn 3/);
   });
 
 });

@@ -229,6 +229,20 @@ export interface SessionRunView {
    *  a flat list of grey strings. */
   signalsLabel: string;
   signalGroups: SignalGroup[];
+  /** (#2887 F2) The run-level `detection_degeneracy_policy.value` the
+   * dispatch actually ran under (`payload.bounds.detection_degeneracy_
+   * policy` on the `dispatch.start` record — the SAME resolved value the
+   * host stamps for the container, distinct from any per-record `policy`
+   * field an individual gate/checkpoint record may or may not carry).
+   * `true` only when that value is literally `"off"` — the gate never ran
+   * at all, so the SIGNALS card must not claim "repetition: clean" (which
+   * asserts the detector looked and found nothing); it renders the
+   * checklist cell as "off" instead. `false` covers both "ran, found
+   * nothing" (enforce/observe with no findings) and "unknown" (no
+   * `dispatch.start`, or an older record predating this field) — an
+   * unknown run-level policy must NOT render as off, since that would be
+   * claiming something the data doesn't say either. */
+  repetitionOff: boolean;
 }
 
 /** (#1989) Render a detector's `detail` without destroying it.
@@ -1303,8 +1317,32 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     }
   }
   const runStartMs = d?.ts ? T(d.ts) : null;
+  // (#2887 F2) The run-level policy the dispatch actually ran under, read
+  // from `dispatch.start`'s own `payload.bounds.detection_degeneracy_
+  // policy.value` — the SAME resolved value the host stamps into the
+  // container's env for this run, so it is the one true "what was this run
+  // configured to do" answer, independent of whether any individual
+  // gate/checkpoint record happens to carry its own `policy` field (an
+  // older runtime image may not). `null` when unknown (no dispatch.start in
+  // the window, or a record predating this field) — unknown is never
+  // treated as "off".
+  const runDegeneracyPolicy = (() => {
+    const sf = d?.fields as Record<string, unknown> | undefined;
+    const bounds = sf?.bounds as Record<string, unknown> | undefined;
+    const block = bounds?.detection_degeneracy_policy as Record<string, unknown> | undefined;
+    return typeof block?.value === "string" ? block.value : null;
+  })();
+  const repetitionOff = runDegeneracyPolicy === "off";
+
   for (const r of dets) {
     const f = r.fields as Record<string, unknown>;
+    // (#2887 F4) `repetition`-kind detector records are handled below,
+    // grouped by turn — NOT pushed one-per-record here. Under enforce a
+    // single cut produces a degenerate observation AND an abort AND
+    // (usually) a concluding checkpoint for the SAME turn; pushed through
+    // this generic per-record loop that reads as three-to-six findings for
+    // one operator-visible event.
+    if (f.kind === "repetition") continue;
     const atMs = r.ts ? T(r.ts) : null;
     finds.push({
       // (#1989) `String(f.kind)` turned a missing field into the literal
@@ -1328,38 +1366,97 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     });
   }
 
-  // (#2887) The reasoning check-in's own judgment. `dispatch.checkpoint` is
-  // NOT a detector telemetry record (`category=work`, `source` unset — it
-  // rides `self.emit`, not `self.emit_telemetry`), so it never reached
-  // `dets`/`tel` above; read it straight off `visible` instead, scoped to
-  // this session's attempt window the same way every other region here is.
+  // (#2887 F4) One flagged TURN, not one raw record. Under enforce the
+  // runtime writes a degenerate `dispatch.gate.observation`, a
+  // `dispatch.gate.abort` for the SAME moment, and a concluding
+  // `dispatch.checkpoint` for the same turn — three (or, across a turn's
+  // several continuations, more) records for what the operator experiences
+  // as ONE cut. Every one of those record kinds names the turn it belongs
+  // to (`turn_seq`, forwarded from the runtime's own `seq`), so they
+  // collapse here into a single Signal per distinct turn.
   //
-  // A checkpoint counts as a flag whenever `would_conclude` is `true` —
-  // the judge found the turn repetitive — REGARDLESS of `verdict`. Under
-  // `enforce`, `verdict:"conclude"` means the harness acted on it; under
-  // `observe`, `verdict:"continue"` with `would_conclude:true` means the
-  // judge flagged it but the policy in force did not let it act. Both are
-  // real findings; only the wording differs — matching the issue's own
-  // ask ("An observe-only finding reads flagged (observed), never CLEAN").
+  // `dispatch.checkpoint` is NOT a detector telemetry record (`category=
+  // work`, `source` unset — it rides `self.emit`, not `self.emit_
+  // telemetry`), so it never reached `dets`/`tel` above; read it straight
+  // off `visible` instead, scoped to this session's attempt window the same
+  // way every other region here is.
   const checkpoints = visible.filter((r) => inAttempt(r) && r.action === "dispatch.checkpoint");
-  for (const r of checkpoints) {
-    const f = r.fields as Record<string, unknown>;
-    if (f.would_conclude !== true) continue;
-    const atMs = r.ts ? T(r.ts) : null;
-    const checkpointNum = typeof f.checkpoint === "number" ? f.checkpoint : "?";
-    const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : "?";
-    const acted = f.verdict === "conclude";
-    const observedOnly = !acted && f.policy === "observe";
+
+  type TurnFlag = { turnSeq: number | string; acted: boolean; policy: string | null; atMs: number | null; ratio: string | null };
+  const byTurn = new Map<string, TurnFlag>();
+  const mergeTurn = (turnSeqRaw: unknown, acted: boolean, policy: string | null, atMs: number | null, ratio: string | null) => {
+    const turnSeq = typeof turnSeqRaw === "number" ? turnSeqRaw : "?";
+    const key = String(turnSeq);
+    const existing = byTurn.get(key);
+    if (!existing) {
+      byTurn.set(key, { turnSeq, acted, policy, atMs, ratio });
+      return;
+    }
+    if (acted) existing.acted = true;
+    if (policy && !existing.policy) existing.policy = policy;
+    if (atMs != null && (existing.atMs == null || atMs < existing.atMs)) existing.atMs = atMs;
+    if (ratio && !existing.ratio) existing.ratio = ratio;
+  };
+
+  // (#2887 F2) `off` means the gate never ran — there is nothing to flag,
+  // and any stray repetition-shaped record in the window (a policy change
+  // mid-investigation, a malformed fixture) must not manufacture a finding
+  // for a detector this run's own bounds say was not measuring anything.
+  if (!repetitionOff) {
+    for (const r of dets) {
+      const f = r.fields as Record<string, unknown>;
+      if (f.kind !== "repetition") continue;
+      const atMs = r.ts ? T(r.ts) : null;
+      const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
+      mergeTurn(
+        f.turn_seq,
+        f.acted === true,
+        typeof f.policy === "string" ? f.policy : null,
+        atMs,
+        ratio,
+      );
+    }
+    // A checkpoint counts as a flag when `would_conclude` is `true` (the
+    // judge found the turn repetitive under a runtime that measures) OR
+    // `verdict === "conclude"` (F1: a HISTORICAL checkpoint from before
+    // #2846 shipped `would_conclude` at all carries only `verdict` — a
+    // conclude with no `would_conclude` key must still flag, or every
+    // pre-#2846 enforced conclusion on record reads CLEAN).
+    for (const r of checkpoints) {
+      const f = r.fields as Record<string, unknown>;
+      const acted = f.verdict === "conclude";
+      const flagged = f.would_conclude === true || acted;
+      if (!flagged) continue;
+      const atMs = r.ts ? T(r.ts) : null;
+      const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
+      mergeTurn(
+        f.turn_seq,
+        acted,
+        typeof f.policy === "string" ? f.policy : null,
+        atMs,
+        ratio,
+      );
+    }
+  }
+
+  for (const acc of byTurn.values()) {
+    // (#2887 F2) Prefer the RUN-LEVEL policy for the observed/enforced
+    // wording — it is the one resolved value every record in this run
+    // shares, where an individual record's own `policy` field may be
+    // absent (an older runtime image) or, in principle, stale.
+    const effectivePolicy = runDegeneracyPolicy ?? acc.policy;
+    const ratioClause = acc.ratio ? ` (tail_ratio=${acc.ratio})` : "";
+    const detail = acc.acted
+      ? `turn ${acc.turnSeq}: judged repeating${ratioClause} and ended it (#2836)`
+      : effectivePolicy === "observe"
+        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — flagged (observed), not enforced (#2846)`
+        : `turn ${acc.turnSeq}: judged repeating${ratioClause} (#2836)`;
     finds.push({
       kind: "repetition",
       severity: "warn",
-      detail: acted
-        ? `checkpoint ${checkpointNum}: the reasoning check-in judged this turn repetitive (tail_ratio=${ratio}) and concluded it (#1221)`
-        : observedOnly
-          ? `checkpoint ${checkpointNum}: the reasoning check-in judged this turn repetitive (tail_ratio=${ratio}) — flagged (observed), not enforced (#2846)`
-          : `checkpoint ${checkpointNum}: the reasoning check-in judged this turn repetitive (tail_ratio=${ratio}) (#1221)`,
-      atMs,
-      offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
+      detail,
+      atMs: acc.atMs,
+      offsetLabel: acc.atMs != null && runStartMs != null ? runOffset(acc.atMs - runStartMs) : "",
     });
   }
 
@@ -1440,5 +1537,6 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     lastBeatMs,
     signalsLabel,
     signalGroups,
+    repetitionOff,
   };
 }

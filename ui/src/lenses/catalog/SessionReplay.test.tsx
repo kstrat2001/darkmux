@@ -899,6 +899,35 @@ describe("SessionReplay", () => {
     ]);
   });
 
+  // (#2887 F2) A clean run whose degeneracy policy was `off` (read from
+  // `dispatch.start`'s own `payload.bounds.detection_degeneracy_policy.
+  // value`) must render the "repetition" checklist cell distinctly from
+  // the other four, which genuinely ran and found nothing — a plain
+  // checkmark there would claim the detector looked, which it did not.
+  it("(#2887 F2) renders the repetition checklist cell as 'off' when the run's policy was off", async () => {
+    const records = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        action: "dispatch.start",
+        session_id: "s-off",
+        machine_id: "M",
+        payload: { role: "coder", bounds: { detection_degeneracy_policy: { value: "off", source: "config" } } },
+      },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-off", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-off");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    const cells = [...document.querySelectorAll(".sigcheck")];
+    const repetitionCell = cells.find((c) => c.textContent?.startsWith("repetition"));
+    expect(repetitionCell).toBeDefined();
+    expect(repetitionCell!.textContent).toBe("repetition (off)");
+    expect(repetitionCell!.className).toContain("sigcheck--off");
+    // The other four DID run and found nothing — plain cells, no "(off)".
+    expect(cells.find((c) => c.textContent === "cycle")).toBeDefined();
+  });
+
   it("URL-encodes the session id in the fetch path", async () => {
     const fetchMock = vi.fn((_url: string) =>
       Promise.resolve(new Response(JSON.stringify({ records: [], count: 0, truncated: false, generated_at_ms: 0 }), { status: 200 })),

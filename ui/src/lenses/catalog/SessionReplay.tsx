@@ -720,11 +720,18 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
               <span className="sigclean__note">no detector flagged this run</span>
             </div>
             <div className="sigchecks">
-              {CLEAN_DETECTORS.map((d) => (
-                <div className="sigcheck" key={d}>
-                  {d}
-                </div>
-              ))}
+              {CLEAN_DETECTORS.map((d) => {
+                // (#2887 F2) `repetition` under a run-level policy of `off`
+                // was never measured — rendering it as a plain checkmark
+                // claims the detector looked and found nothing, which is a
+                // different (and false) fact from "it didn't run".
+                const off = d === "repetition" && view.repetitionOff;
+                return (
+                  <div className={`sigcheck${off ? " sigcheck--off" : ""}`} key={d}>
+                    {off ? `${d} (off)` : d}
+                  </div>
+                );
+              })}
             </div>
           </>
         ) : (

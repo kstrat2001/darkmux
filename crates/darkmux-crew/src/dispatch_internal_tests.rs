@@ -9313,26 +9313,28 @@
         assert_eq!(record["payload"]["would_conclude"], true);
     }
 
-    /// (#2887) The central defect: a trajectory holding one DEGENERATE
+    /// (#2887 F3/F4) The central defect: a trajectory holding one DEGENERATE
     /// `dispatch.gate.observation` must reach the flow stream as a
     /// `telemetry.detector` record with `kind:"repetition"` — before this
     /// fix there was no forwarder arm at all, so the SIGNALS card read
-    /// CLEAN no matter how many times the gate fired. Also asserts the
-    /// policy stamp: under `observe`, the record must say `acted:false` and
-    /// its `policy` field must be `"observe"`, and the detail sentence must
-    /// read as observed-not-enforced, matching the operator-visible
-    /// distinction the issue asks for ("flagged, not acted on").
+    /// CLEAN no matter how many times the gate fired.
+    ///
+    /// The fixture carries `policy`/`acted` on the RAW event, the shape the
+    /// runtime now emits (`trajectory::append_gate_observation`) — the host
+    /// no longer resolves policy from its own env (a fresh reviewer found
+    /// that reading stale or ambient host state, not what the runtime
+    /// actually ran under). Asserts the forward is a verbatim passthrough:
+    /// under `observe`/`acted:false`, the record's own `policy` and `acted`
+    /// survive, and the detail sentence reads as observed-not-enforced.
     #[test]
-    #[serial] // env var + DARKMUX_FLOWS_DIR tempdir
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
     fn handle_event_degenerate_gate_observation_forwards_repetition_stamped_observe() {
         let tmp = TempDir::new().unwrap();
         let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
-        let prev_policy = std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").ok();
         unsafe {
             std::env::remove_var("DARKMUX_REDIS_URL");
             std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
-            std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", "observe");
         }
 
         let traj_path = tmp.path().join("trajectory.jsonl");
@@ -9345,7 +9347,7 @@
         state.handle_event(
             r#"{"type":"dispatch.gate.observation","seq":2,"ts":1,"observation":17,
                 "slice_chars":68000,"tail_ratio":0.2423332,"interval_tokens":1000,
-                "degenerate":true}"#,
+                "degenerate":true,"policy":"observe","acted":false}"#,
         );
 
         unsafe {
@@ -9356,10 +9358,6 @@
             match prev_redis {
                 Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
-            }
-            match prev_policy {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"),
             }
         }
 
@@ -9378,6 +9376,7 @@
             .find(|v| v["session_id"] == "sess-gate-observe" && v["action"] == "telemetry.detector")
             .expect("a telemetry.detector record must exist for the degenerate observation");
         assert_eq!(record["payload"]["kind"], "repetition");
+        assert_eq!(record["payload"]["turn_seq"], 2);
         assert_eq!(record["payload"]["policy"], "observe");
         assert_eq!(record["payload"]["acted"], false);
         let detail = record["payload"]["detail"].as_str().unwrap();
@@ -9387,23 +9386,19 @@
         );
     }
 
-    /// (#2887) `dispatch.gate.abort` under the default (enforce) policy
-    /// forwards with `acted:true` and `policy:"enforce"` — the paired
-    /// event to the observe-mode test above, exercising the other branch of
-    /// the `acted` derivation (`event_type == "dispatch.gate.abort"`).
+    /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
+    /// verbatim from the runtime-stamped event, same passthrough discipline
+    /// as the observe-mode test above, exercising the enforce/acted:true
+    /// shape.
     #[test]
     #[serial]
     fn handle_event_gate_abort_forwards_repetition_stamped_enforce() {
         let tmp = TempDir::new().unwrap();
         let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
         let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
-        let prev_policy = std::env::var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY").ok();
         unsafe {
             std::env::remove_var("DARKMUX_REDIS_URL");
             std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
-            // Default is enforce; scrub any operator-shell leak so the
-            // assertion below is testing the DEFAULT, not an ambient value.
-            std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY");
         }
 
         let traj_path = tmp.path().join("trajectory.jsonl");
@@ -9416,7 +9411,7 @@
         state.handle_event(
             r#"{"type":"dispatch.gate.abort","seq":2,"ts":1,"observation":6,
                 "slice_chars":24000,"generated_chars":8000,"interval_tokens":1000,
-                "tool_call_in_flight":false}"#,
+                "tool_call_in_flight":false,"policy":"enforce","acted":true}"#,
         );
 
         unsafe {
@@ -9427,10 +9422,6 @@
             match prev_redis {
                 Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
                 None => std::env::remove_var("DARKMUX_REDIS_URL"),
-            }
-            match prev_policy {
-                Some(v) => std::env::set_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY", v),
-                None => std::env::remove_var("DARKMUX_RUNTIME_DETECTION_DEGENERACY_POLICY"),
             }
         }
 
@@ -9449,8 +9440,75 @@
             .find(|v| v["session_id"] == "sess-gate-abort" && v["action"] == "telemetry.detector")
             .expect("a telemetry.detector record must exist for the abort");
         assert_eq!(record["payload"]["kind"], "repetition");
+        assert_eq!(record["payload"]["turn_seq"], 2);
         assert_eq!(record["payload"]["policy"], "enforce");
         assert_eq!(record["payload"]["acted"], true);
+    }
+
+    /// (#2887 F3) An older runtime image that predates policy stamping on
+    /// gate events sends neither `policy` nor `acted` at all. The host must
+    /// NOT fill in a guessed value from its own environment — the whole
+    /// point of moving the stamp into the runtime was that the host's env
+    /// can disagree with (or postdate) what the runtime actually ran under.
+    /// Missing means null, not "assume enforce" or "assume the current env".
+    #[test]
+    #[serial]
+    fn handle_event_gate_observation_from_a_pre_policy_runtime_forwards_policy_as_null() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-legacy".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // No `policy`/`acted` keys — the pre-#2887-F3 runtime shape.
+        state.handle_event(
+            r#"{"type":"dispatch.gate.observation","seq":2,"ts":1,"observation":17,
+                "slice_chars":68000,"tail_ratio":0.2423332,"interval_tokens":1000,
+                "degenerate":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-legacy" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the degenerate observation");
+        assert!(record["payload"]["policy"].is_null(), "got {}", record["payload"]);
+        assert!(record["payload"]["acted"].is_null(), "got {}", record["payload"]);
+        // Neither acted (unknown) nor definitely-observe, so the wording
+        // must fall back to the base sentence, no "flagged (observed)"
+        // clause and no "and ended the call" clause.
+        let detail = record["payload"]["detail"].as_str().unwrap();
+        assert!(!detail.contains("observed"), "got {detail:?}");
+        assert!(!detail.contains("ended the call"), "got {detail:?}");
     }
 
     /// (#795) A `model.completed` event with a full `usage` object maps
