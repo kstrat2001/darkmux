@@ -893,9 +893,10 @@ describe("SessionReplay", () => {
       "tool failure",
       "reasoning loop",
       "edit drift",
-      // (#2887) The degeneracy gate + reasoning-checkpoint repetition
-      // finding joined the checklist — see CLEAN_DETECTORS' own doc.
-      "repetition",
+      // (#2887 N2) This corpus's `dispatch.start` predates `flow_schema`
+      // entirely — the run page cannot claim the gate looked and found
+      // nothing, so it reads "(not recorded)", not a plain checkmark.
+      "repetition (not recorded)",
     ]);
   });
 
@@ -926,6 +927,61 @@ describe("SessionReplay", () => {
     expect(repetitionCell!.className).toContain("sigcheck--off");
     // The other four DID run and found nothing — plain cells, no "(off)".
     expect(cells.find((c) => c.textContent === "cycle")).toBeDefined();
+  });
+
+  // (#2887 N2) A clean run with NO `flow_schema` on `dispatch.start` at
+  // all (every run before the field existed) must NOT claim the gate
+  // looked and found nothing — a plain checkmark there would be exactly
+  // the false claim the SESSIONS N2 finding names.
+  it("(#2887 N2) renders the repetition checklist cell as 'not recorded' when dispatch.start carries no flow_schema", async () => {
+    const records = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        action: "dispatch.start",
+        session_id: "s-old",
+        machine_id: "M",
+        payload: { role: "coder", bounds: { detection_degeneracy_policy: { value: "enforce", source: "config" } } },
+      },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-old", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-old");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    const cells = [...document.querySelectorAll(".sigcheck")];
+    const repetitionCell = cells.find((c) => c.textContent?.startsWith("repetition"));
+    expect(repetitionCell).toBeDefined();
+    expect(repetitionCell!.textContent).toBe("repetition (not recorded)");
+    expect(repetitionCell!.className).toContain("sigcheck--off");
+  });
+
+  // (#2887 N2) A clean run with a CURRENT `flow_schema` on `dispatch.start`
+  // — the gate genuinely ran (enforce, not off) and found nothing, so the
+  // plain checkmark is an honest claim.
+  it("(#2887 N2) renders the repetition checklist cell as a plain checkmark when flow_schema is current", async () => {
+    const records = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        action: "dispatch.start",
+        session_id: "s-new",
+        machine_id: "M",
+        payload: {
+          role: "coder",
+          bounds: { detection_degeneracy_policy: { value: "enforce", source: "config" } },
+          flow_schema: "1.56.0",
+        },
+      },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-new", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-new");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    const cells = [...document.querySelectorAll(".sigcheck")];
+    const repetitionCell = cells.find((c) => c.textContent?.startsWith("repetition"));
+    expect(repetitionCell).toBeDefined();
+    expect(repetitionCell!.textContent).toBe("repetition");
+    expect(repetitionCell!.className).not.toContain("sigcheck--off");
   });
 
   it("URL-encodes the session id in the fetch path", async () => {

@@ -1674,58 +1674,88 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(group!.signals[0].detail).toMatch(/not enforced/);
   });
 
-  // (#2887 F4) Built from the REAL enforce-policy trajectory
-  // (`refresh-rotation-splash-qwen36-1790241677-1/trajectory.jsonl`,
-  // 2026-09-24 bake-off, read-only): 3 cuts total — turn_seq 2 cut once
-  // (one degenerate observation, one abort, one concluding checkpoint),
-  // turn_seq 3 cut TWICE (two of each). That is 9 raw signal-bearing
-  // records across only 2 DISTINCT turns. Grouped by turn, the SIGNALS
-  // card must show exactly ONE "repetition" group with count 2 — not 9,
-  // not 3.
+  // (#2887 F4, fixed per a fresh reviewer's N1) Built from the REAL
+  // enforce-policy trajectory
+  // (`~/.darkmux/runs/refresh-rotation-splash-qwen36-1790241677-1/
+  // trajectory.jsonl`, 2026-09-24 bake-off, read-only — never modified):
+  // 3 cuts total — turn_seq 2 cut once (one degenerate observation, one
+  // abort, one concluding checkpoint), turn_seq 3 cut TWICE (a
+  // continuation after the first cut, so two of each). That is 9 raw
+  // signal-bearing records across only 2 DISTINCT turns. Grouped by turn,
+  // the SIGNALS card must show exactly ONE "repetition" group with count
+  // 2 — not 9, not 3.
+  //
+  // N1: the FIRST version of this test built `ts` as
+  // `` `2026-01-01T00:0${observation}:00Z` ``, and observation numbers 14
+  // and 17 produced the literal string `"2026-01-01T00:014:00Z"` — an
+  // invalid minute component. `Date.parse` on that returns `NaN`, and
+  // `runRegions`'s `visible = data.filter((r) => T(r.ts) <= nowMs)` drops
+  // any record whose `ts` doesn't parse (`NaN <= nowMs` is always false),
+  // so 4 of the 6 gate records never reached `mergeTurn` at all — the
+  // three checkpoint records (a FIXED, always-valid `"...:05:00Z"`
+  // literal) were carrying the whole assertion. Proven vacuous: keying
+  // `mergeTurn` on `f.observation` instead of `f.turn_seq` left every one
+  // of the 105 UI tests green, because the gate records that would have
+  // exposed the wrong key were silently absent from `visible`.
+  //
+  // The fix uses the trajectory's OWN epoch-ms timestamps (`ts` fields on
+  // the real `dispatch.gate.observation`/`dispatch.gate.abort`/
+  // `dispatch.checkpoint` lines), converted to ISO — real values, not a
+  // template that can silently overflow a field again.
   it("(#2887 F4) real enforce trajectory shape: 3 cuts across 2 turns collapse to one group, count 2", () => {
-    const gateRecord = (turnSeq: number, observation: number) => ({
-      ts: `2026-01-01T00:0${observation}:00Z`,
+    const gateRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
       session_id: "s1",
       category: "telemetry" as const,
       source: "detector" as const,
       action: "telemetry.detector",
+      handle: "coder",
       fields: {
         kind: "repetition", severity: "warn",
         detail: `observation ${observation}: judged repeating`,
         turn_seq: turnSeq, observation, policy: "enforce", acted: true,
       },
     });
-    const abortRecord = (turnSeq: number, observation: number) => ({
-      ts: `2026-01-01T00:0${observation}:01Z`,
+    const abortRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      // The real trajectory's abort record shares the observation's
+      // millisecond exactly (`ts` is whole-second-truncated on the wire in
+      // practice, but this fixture keeps the source file's own values).
+      ts: new Date(tsMs).toISOString(),
       session_id: "s1",
       category: "telemetry" as const,
       source: "detector" as const,
       action: "telemetry.detector",
+      handle: "coder",
       fields: {
         kind: "repetition", severity: "warn",
         detail: `observation ${observation}: ended the call`,
         turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+        // (#2887 N4) Only a real `dispatch.gate.abort` ever carries this —
+        // it is the signal `mergeTurn` uses to count DISTINCT cuts without
+        // double-counting the degenerate OBSERVATION for the same moment.
+        generated_chars: 8000,
       },
     });
-    const checkpointRecord = (turnSeq: number) => ({
-      ts: "2026-01-01T00:05:00Z",
+    const checkpointRecord = (turnSeq: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
       session_id: "s1",
       action: "dispatch.checkpoint",
+      handle: "coder",
       fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
     });
     const data: FlowRecord[] = [
-      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
-      // turn_seq 2: one cut.
-      gateRecord(2, 14),
-      abortRecord(2, 14),
-      checkpointRecord(2),
+      { ts: new Date(1790241677181).toISOString(), session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // turn_seq 2: one cut. Real ts from the trajectory's own lines.
+      gateRecord(2, 14, 1790241731958),
+      abortRecord(2, 14, 1790241731958),
+      checkpointRecord(2, 1790241731962),
       // turn_seq 3: two cuts (a continuation after the first).
-      gateRecord(3, 17),
-      abortRecord(3, 17),
-      checkpointRecord(3),
-      gateRecord(3, 3),
-      abortRecord(3, 3),
-      checkpointRecord(3),
+      gateRecord(3, 17, 1790241807319),
+      abortRecord(3, 17, 1790241807319),
+      checkpointRecord(3, 1790241807323),
+      gateRecord(3, 3, 1790241856862),
+      abortRecord(3, 3, 1790241856862),
+      checkpointRecord(3, 1790241856867),
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const group = view.signalGroups.find((g) => g.kind === "repetition");
@@ -1735,6 +1765,150 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const turnsNamed = group!.signals.map((s) => s.detail).sort();
     expect(turnsNamed[0]).toMatch(/turn 2/);
     expect(turnsNamed[1]).toMatch(/turn 3/);
+    // (#2887 N4) turn_seq 2 was cut ONCE — no "N×" clause; turn_seq 3 was
+    // cut TWICE (a continuation after the first abort) — "2×".
+    const turn2 = group!.signals.find((s) => s.detail.includes("turn 2"))!;
+    const turn3 = group!.signals.find((s) => s.detail.includes("turn 3"))!;
+    expect(turn2.detail).not.toMatch(/×/);
+    expect(turn3.detail).toMatch(/2×/);
+    // Both were ended by the GATE (an abort record contributed), so both
+    // cite #2836, not the checkpoint's #1221.
+    expect(turn2.detail).toMatch(/#2836/);
+    expect(turn3.detail).toMatch(/#2836/);
+  });
+
+  // (#2887 N3) A dispatch session id is TASK-scoped — sibling seats fanned
+  // out within one task can share ONE session_id, so two DIFFERENT seats
+  // can each be on their own "turn 2" concurrently. Keying only on
+  // turn_seq would collapse them into one finding, hiding that TWO
+  // distinct executions were flagged. `handle` + `payload.step_id`
+  // distinguish the seats even though `session_id` cannot.
+  it("(#2887 N3) two sibling seats sharing a session each flag their own turn 2 as SEPARATE findings", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "reviewer",
+        fields: { kind: "repetition", severity: "warn", detail: "seat A", turn_seq: 2, step_id: "step-a", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+      {
+        ts: "2026-01-01T00:01:05Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "reviewer",
+        fields: { kind: "repetition", severity: "warn", detail: "seat B", turn_seq: 2, step_id: "step-b", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.signals).toHaveLength(2);
+  });
+
+  // (#2887 N3) Records with NO turn_seq at all must not collapse into one
+  // shared "turn ?" bucket — a malformed/older record naming no turn is
+  // still real evidence, and merging two unrelated ones would either lose
+  // one entirely or falsely combine their gate-abort counts.
+  it("(#2887 N3) records with no turn_seq stay as separate findings, not one shared 'turn ?' group", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "coder",
+        fields: { kind: "repetition", severity: "warn", detail: "no turn_seq A", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+      {
+        ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "coder",
+        fields: { kind: "repetition", severity: "warn", detail: "no turn_seq B", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.signals).toHaveLength(2);
+  });
+
+  // (#2887 N4) A turn flagged ONLY by the reasoning check-in's own
+  // post-hoc judge (no gate-sourced record at all for that turn) must cite
+  // #1221, not #2836 — the two are independent detectors.
+  it("(#2887 N4) a checkpoint-only flag cites #1221, not the gate's #2836", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.checkpoint", handle: "coder",
+        fields: { turn_seq: 9, checkpoint: 1, tail_ratio: 0.05, verdict: "conclude", would_conclude: true, policy: "enforce" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/#1221/);
+    expect(group!.signals[0].detail).not.toMatch(/#2836/);
+  });
+
+  // (#2887 N2) A pre-1.56 session shape: `dispatch.start` carries no
+  // `flow_schema` key at all (every run before this field existed). The
+  // card must NOT claim the gate looked and found nothing.
+  it("(#2887 N2) a run with no flow_schema on dispatch.start reads repetitionRecorded:false", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionRecorded).toBe(false);
+    expect(view.repetitionOff).toBe(false);
+  });
+
+  // (#2887 N2) An explicit pre-1.56.0 flow_schema (not just absent) must
+  // read the same way — "too old" and "absent" are the same case.
+  it("(#2887 N2) a run with flow_schema below 1.56.0 reads repetitionRecorded:false", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.55.0" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionRecorded).toBe(false);
+  });
+
+  // (#2887 N2) A run recorded at 1.56.0 or later — the checklist may
+  // legitimately claim the gate looked and found nothing.
+  it("(#2887 N2) a run with flow_schema 1.56.0 or later reads repetitionRecorded:true", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.56.0" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionRecorded).toBe(true);
+
+    const later: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.60.2" },
+      },
+    ];
+    expect(runRegions(flowToRenderModel(later), "s1").repetitionRecorded).toBe(true);
+  });
+
+  // (#2887 N2) `"1.9.0"` must read as GREATER than `"1.56.0"` — a plain
+  // string compare gets this backwards (`'9' < '5'`... no, `'9' > '5'` as
+  // characters, but `"1.56.0" < "1.9.0"` lexicographically is still WRONG
+  // because it compares the second component as strings "56" vs "9", and
+  // "5" < "9" puts 1.56.0 after 1.9.0 alphabetically despite 56 > 9
+  // numerically) unless components are compared as numbers.
+  it("(#2887 N2) version comparison is numeric per component, not lexicographic", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.9.0" },
+      },
+    ];
+    // 1.9.0 < 1.56.0 numerically (minor 9 < minor 56) — must read as NOT
+    // recorded, even though "1.9.0" > "1.56.0" as a bare string compare.
+    expect(runRegions(flowToRenderModel(data), "s1").repetitionRecorded).toBe(false);
   });
 
 });

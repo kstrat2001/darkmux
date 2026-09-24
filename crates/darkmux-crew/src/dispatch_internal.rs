@@ -6473,6 +6473,20 @@ fn dispatch_start_payload_json(
             max_turns_override,
             timeout_override_seconds,
         ),
+        // (#2887 N2) The flow schema this run's own records were written
+        // against, from the ONE constant every writer shares
+        // (`darkmux_flow::FLOW_SCHEMA_VERSION`). Additive — see that
+        // constant's own version-history comment for the full rationale —
+        // stamped so a CONSUMER can tell "this run's records genuinely
+        // predate a forwarder fix" from "this run has no findings" without
+        // guessing. The concrete case: the degeneracy gate's own findings
+        // (#2887) only started reaching the flow stream at 1.56.0 — a run
+        // recorded before that has real trajectory evidence the OLD
+        // forwarder simply dropped, and its `dispatch.start` record is the
+        // one place that can say so, since the gap is everywhere ELSE by
+        // definition (no `telemetry.detector` record for it exists to
+        // carry a schema stamp of its own).
+        "flow_schema": darkmux_flow::FLOW_SCHEMA_VERSION,
     })
 }
 

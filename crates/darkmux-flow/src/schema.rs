@@ -87,17 +87,37 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
 //           previously dropped on the floor entirely (`darkmux-crew`'s
 //           trajectory-to-flow forwarder had no arm for either type), so a
 //           run the gate flagged repeatedly still read CLEAN on the run
-//           page. New payload keys on that record: `observation`,
-//           `tail_ratio`, `slice_chars`, `generated_chars` (null on an
-//           observation), `policy` (`"enforce"`/`"observe"`/`"off"`, the
-//           degeneracy detector's policy at the time this dispatch ran) and
-//           `acted` (true only for `dispatch.gate.abort` — an observation,
-//           even a degenerate one, never itself ended the call). Also
-//           additive: `dispatch.checkpoint` records now carry `policy` and
-//           `would_conclude` (the reasoning check-in's verdict BEFORE its
-//           own policy is applied) — both already rode the runtime's
-//           trajectory event but were dropped by the forwarder, same defect
-//           as the gate's.
+//           page. New payload keys on that record: `turn_seq` (the
+//           runtime's own `seq`, same field name `dispatch.checkpoint`
+//           already uses — the join key a consumer needs to attribute an
+//           observation/abort/checkpoint triple to ONE flagged turn),
+//           `observation`, `tail_ratio`, `slice_chars`, `generated_chars`
+//           (null on an observation, only ever populated by an abort — also
+//           the field a consumer uses to tell the two record shapes apart
+//           without a dedicated discriminator key), `policy`
+//           (`"enforce"`/`"observe"`/`"off"`) and `acted` (true only for
+//           `dispatch.gate.abort` — an observation, even a degenerate one,
+//           never itself ended the call). `policy`/`acted` are stamped by
+//           the RUNTIME itself (`trajectory::append_gate_observation`/
+//           `append_gate_abort`), not reconstructed by the host from its
+//           own environment — a record from a runtime image that predates
+//           this carries neither key, and the host forwards that absence
+//           verbatim rather than guessing. Also additive: `dispatch.
+//           checkpoint` records now carry `policy` and `would_conclude`
+//           (the reasoning check-in's verdict BEFORE its own policy is
+//           applied) — both already rode the runtime's trajectory event but
+//           were dropped by the forwarder, same defect as the gate's.
+//
+//           Also additive: `dispatch.start`'s payload gains a
+//           `flow_schema` key — the `FLOW_SCHEMA_VERSION` this dispatch's
+//           OWN records were written against, from this same constant. A
+//           run recorded before 1.56.0 has no way to say "the degeneracy
+//           gate genuinely never flagged anything" apart from "the
+//           forwarder that reports flags didn't exist yet"; the run page
+//           uses this stamp (present + >= 1.56.0, and the run's own
+//           `bounds.detection_degeneracy_policy` not `"off"`) to tell the
+//           two apart rather than silently reading the second as the
+//           first.
 //   1.55.0 (#2877, live token-rate scope): additive payload keys
 //           `sampled_at_ms` and `generated_chars` on `dispatch.turn.
 //           heartbeat`.

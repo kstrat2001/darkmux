@@ -726,9 +726,19 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
                 // claims the detector looked and found nothing, which is a
                 // different (and false) fact from "it didn't run".
                 const off = d === "repetition" && view.repetitionOff;
+                // (#2887 N2) `repetition` on a run whose records predate
+                // FLOW_SCHEMA_VERSION 1.56.0 (or carry no `flow_schema` at
+                // all) — the gate's own findings only started reaching the
+                // flow stream at that version, so a clean-looking record
+                // set here may simply be evidence the OLD forwarder
+                // dropped. Same visual family as "(off)" (a dash, not a
+                // checkmark — see `.sigcheck--off`), distinct wording: this
+                // is "we don't know", not "it didn't run".
+                const notRecorded = d === "repetition" && !off && !view.repetitionRecorded;
+                const unmeasured = off || notRecorded;
                 return (
-                  <div className={`sigcheck${off ? " sigcheck--off" : ""}`} key={d}>
-                    {off ? `${d} (off)` : d}
+                  <div className={`sigcheck${unmeasured ? " sigcheck--off" : ""}`} key={d}>
+                    {off ? `${d} (off)` : notRecorded ? `${d} (not recorded)` : d}
                   </div>
                 );
               })}

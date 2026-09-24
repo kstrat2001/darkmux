@@ -1154,6 +1154,17 @@
         assert_eq!(payload["image"], serde_json::json!("darkmux-runtime:latest"));
         assert_eq!(payload["prompt_chars"], serde_json::json!("read x.txt".chars().count()));
         assert_eq!(payload["workspace"], serde_json::json!("/tmp/ws"));
+        // (#2887 N2) `flow_schema` names the schema version this run's
+        // records were written against, from the ONE shared constant — so
+        // a viewer reading an older run can tell "genuinely predates a
+        // forwarder fix" from "ran clean" instead of guessing. Asserted
+        // against the constant itself, not a literal, so this test can't
+        // silently go stale on the next bump.
+        assert_eq!(
+            payload["flow_schema"],
+            serde_json::json!(darkmux_flow::FLOW_SCHEMA_VERSION),
+            "dispatch.start must stamp the flow schema version: {payload}"
+        );
 
         unsafe {
             match prev {
