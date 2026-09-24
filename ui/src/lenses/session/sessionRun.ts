@@ -1363,11 +1363,14 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // to tell "the gate genuinely never flagged anything" from "the forwarder
   // that reports flags didn't exist yet for this run" — the degeneracy
   // gate's own findings only started reaching the flow stream at 1.56.0
-  // (see `schema.rs`'s own history entry). `dispatch.start`'s
-  // `payload.flow_schema` (the SAME `FLOW_SCHEMA_VERSION` constant the host
-  // stamped this run's records against) is the one place that can say
-  // which case applies. Absent entirely on any run older than this field
-  // itself, which reads the same as "too old" — both must render as
+  // (see `schema.rs`'s own history entry, which also names this stamp's
+  // real scope: it proves the HOST forwarder's version, not that the
+  // runtime IMAGE the container ran actually executed the gate — that
+  // narrower gap is `darkmux doctor`'s job, not this field's). `dispatch.
+  // start`'s `payload.flow_schema` (the SAME `FLOW_SCHEMA_VERSION` constant
+  // the host stamped this run's records against) is the one place that can
+  // say which case applies. Absent entirely on any run older than this
+  // field itself, which reads the same as "too old" — both must render as
   // unmeasured, never as a checked-and-clean tick.
   const runFlowSchema = (() => {
     const sf = d?.fields as Record<string, unknown> | undefined;
@@ -1479,7 +1482,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       byTurn.set(key, {
         turnSeq,
         acted,
-        gateAbortCount: isGateAbort && acted ? 1 : 0,
+        gateAbortCount: isGateAbort ? 1 : 0,
         sawGate: isGateSourced,
         policy,
         atMs,
@@ -1488,7 +1491,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       return;
     }
     if (acted) existing.acted = true;
-    if (isGateAbort && acted) existing.gateAbortCount += 1;
+    if (isGateAbort) existing.gateAbortCount += 1;
     if (isGateSourced) existing.sawGate = true;
     if (policy && !existing.policy) existing.policy = policy;
     if (atMs != null && (existing.atMs == null || atMs < existing.atMs)) existing.atMs = atMs;
@@ -1510,10 +1513,20 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       // writes it); a degenerate OBSERVATION for the SAME cut carries
       // `acted:true` too, and must not be double-counted as a second abort.
       const isGateAbort = f.generated_chars != null;
+      // (#2887 F2 second pass) `f.acted === true` alone is NOT a safe
+      // "did this end the call" test — a run recorded by a host predating
+      // the runtime-stamped `acted` field forwards it as an explicit
+      // `null` (see `detector_telemetry_payload`'s `.unwrap_or(Value::
+      // Null)`), so `f.acted === true` reads `false` for a REAL abort. An
+      // abort record's own existence IS the acted outcome regardless of
+      // whether the field is present (same fact `append_gate_abort`'s own
+      // doc states server-side: `"acted": true` is written unconditionally
+      // there) — `isGateAbort` alone already proves it.
+      const acted = f.acted === true || isGateAbort;
       mergeTurn(
         f.turn_seq,
         seatKeyFor(r, f),
-        f.acted === true,
+        acted,
         isGateAbort,
         true,
         typeof f.policy === "string" ? f.policy : null,

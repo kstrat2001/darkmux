@@ -87,7 +87,20 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   if (view.signalGroups.length === 0) {
     // (#2863) The shared chip renders its label upper-cased, as it does
     // COMPLETE; the detector cells read from the one list the card uses.
-    lines.push("CLEAN", "no detector flagged this run", ...CLEAN_DETECTORS);
+    // (#2887 N2/F1) `repetition`'s cell text varies with `repetitionOff`/
+    // `repetitionRecorded` the same way `SessionReplay.tsx`'s own render
+    // does — kept in sync here so THIS golden-compared mirror can catch a
+    // wording drift too, not just `SessionReplay.test.tsx`'s DOM assertions.
+    lines.push(
+      "CLEAN",
+      "no detector flagged this run",
+      ...CLEAN_DETECTORS.map((d) => {
+        if (d !== "repetition") return d;
+        if (view.repetitionOff) return `${d} (off)`;
+        if (!view.repetitionRecorded) return `${d} (not recorded)`;
+        return d;
+      }),
+    );
   } else {
     for (const g of view.signalGroups) {
       lines.push(`${g.severity === "warn" ? "⚠" : "✓"}${g.kind}${g.count > 1 ? `×${g.count}` : ""}`);
@@ -1674,8 +1687,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(group!.signals[0].detail).toMatch(/not enforced/);
   });
 
-  // (#2887 F4, fixed per a fresh reviewer's N1) Built from the REAL
-  // enforce-policy trajectory
+  // (#2887 F4, fixed per a fresh reviewer's N1, gate fields fixed per F2)
+  // Built from the REAL enforce-policy trajectory
   // (`~/.darkmux/runs/refresh-rotation-splash-qwen36-1790241677-1/
   // trajectory.jsonl`, 2026-09-24 bake-off, read-only — never modified):
   // 3 cuts total — turn_seq 2 cut once (one degenerate observation, one
@@ -1702,6 +1715,21 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   // the real `dispatch.gate.observation`/`dispatch.gate.abort`/
   // `dispatch.checkpoint` lines), converted to ISO — real values, not a
   // template that can silently overflow a field again.
+  //
+  // F2 (second review pass): this trajectory was recorded BEFORE the
+  // runtime was changed to stamp `policy`/`acted` on the gate's own
+  // events (verified against the raw file: its `dispatch.gate.observation`
+  // / `dispatch.gate.abort` lines carry neither key at all — only
+  // `observation`, `slice_chars`, `tail_ratio`/`degenerate` or
+  // `generated_chars`/`tool_call_in_flight`). The CURRENT host forwarder
+  // passes `policy`/`acted` through VERBATIM from the trajectory event, so
+  // fed this real (pre-stamp) trajectory it forwards them as explicit
+  // `null` — the gate fixtures below carry NEITHER field, matching that
+  // real shape. (The checkpoint fields `policy`/`would_conclude` DO stay,
+  // correctly — those predate this run by #2846, well before #2887, and
+  // the real trajectory's checkpoint lines carry them.) A companion test
+  // right after this one covers the OPPOSITE case: a run recorded by the
+  // runtime AFTER it started stamping the gate's own `policy`/`acted`.
   it("(#2887 F4) real enforce trajectory shape: 3 cuts across 2 turns collapse to one group, count 2", () => {
     const gateRecord = (turnSeq: number, observation: number, tsMs: number) => ({
       ts: new Date(tsMs).toISOString(),
@@ -1713,7 +1741,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       fields: {
         kind: "repetition", severity: "warn",
         detail: `observation ${observation}: judged repeating`,
-        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+        turn_seq: turnSeq, observation,
+        // No `policy`/`acted` — this trajectory predates the runtime
+        // stamping either on a gate event (see the test's own doc above).
       },
     });
     const abortRecord = (turnSeq: number, observation: number, tsMs: number) => ({
@@ -1729,10 +1759,13 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       fields: {
         kind: "repetition", severity: "warn",
         detail: `observation ${observation}: ended the call`,
-        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
-        // (#2887 N4) Only a real `dispatch.gate.abort` ever carries this —
-        // it is the signal `mergeTurn` uses to count DISTINCT cuts without
-        // double-counting the degenerate OBSERVATION for the same moment.
+        turn_seq: turnSeq, observation,
+        // (#2887 N4/F2) Only a real `dispatch.gate.abort` ever carries
+        // this — it is the signal `mergeTurn` uses to count DISTINCT cuts
+        // without double-counting the degenerate OBSERVATION for the same
+        // moment, and (F2) the ONLY signal it relies on: an abort's own
+        // existence is the acted outcome, whether or not `acted` itself is
+        // present on the record.
         generated_chars: 8000,
       },
     });
@@ -1773,6 +1806,75 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(turn3.detail).toMatch(/2×/);
     // Both were ended by the GATE (an abort record contributed), so both
     // cite #2836, not the checkpoint's #1221.
+    expect(turn2.detail).toMatch(/#2836/);
+    expect(turn3.detail).toMatch(/#2836/);
+  });
+
+  // (#2887 F2, second review pass) The OTHER case: a run recorded by a
+  // runtime AFTER it started stamping `policy`/`acted` on the gate's own
+  // trajectory events. Same shape as the real-trajectory test above (one
+  // cut on turn 2, two cuts on turn 3), but the gate records carry the
+  // stamped fields explicitly — confirms the counting/acted logic gives
+  // the SAME answer whether or not the fields are present, since it must
+  // never depend on `acted` being there (that was the exact bug: an
+  // abort's own existence — `generated_chars != null` — is what proves the
+  // call ended, not the newer `acted` field, which older runtimes and
+  // hosts alike may still forward as `null`).
+  it("(#2887 F2) a run with the runtime's stamped policy/acted fields counts and cites the same as the historical shape", () => {
+    const gateRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      handle: "coder",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: judged repeating`,
+        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+      },
+    });
+    const abortRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      handle: "coder",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: ended the call`,
+        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+        generated_chars: 8000,
+      },
+    });
+    const checkpointRecord = (turnSeq: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      action: "dispatch.checkpoint",
+      handle: "coder",
+      fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
+    });
+    const data: FlowRecord[] = [
+      { ts: new Date(1790241677181).toISOString(), session_id: "s1", action: "dispatch.start", handle: "coder" },
+      gateRecord(2, 14, 1790241731958),
+      abortRecord(2, 14, 1790241731958),
+      checkpointRecord(2, 1790241731962),
+      gateRecord(3, 17, 1790241807319),
+      abortRecord(3, 17, 1790241807319),
+      checkpointRecord(3, 1790241807323),
+      gateRecord(3, 3, 1790241856862),
+      abortRecord(3, 3, 1790241856862),
+      checkpointRecord(3, 1790241856867),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    const turn2 = group!.signals.find((s) => s.detail.includes("turn 2"))!;
+    const turn3 = group!.signals.find((s) => s.detail.includes("turn 3"))!;
+    expect(turn2.detail).not.toMatch(/×/);
+    expect(turn3.detail).toMatch(/2×/);
     expect(turn2.detail).toMatch(/#2836/);
     expect(turn3.detail).toMatch(/#2836/);
   });
