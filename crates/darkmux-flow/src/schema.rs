@@ -77,8 +77,30 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.55.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
 // Version history:
+//   1.56.0 (#2889, the model writing a tool call): additive payload keys on
+//           `dispatch.turn.heartbeat` — `phase`, `tool_name`, `prompt_chars`.
+//
+//           `phase: "writing_tool_call"` + `tool_name` ride a heartbeat
+//           while the model is writing a named tool call. LM Studio sends a
+//           call's name at once and its arguments only when complete
+//           (measured: a 7s silence, then 3,455 chars in one chunk), so the
+//           runtime now ticks during that silence (trajectory event
+//           `model.tool_call.writing`) and the host forwards each tick as a
+//           heartbeat with `generated_chars` UNCHANGED. Both keys are ABSENT,
+//           not null, on every other heartbeat: they mean "writing".
+//           `prompt_chars` rides the turn's OPENING heartbeat, which the
+//           host now emits from `model.streaming.start` at
+//           `generated_chars: 0`: the request's size in chars (system +
+//           every other message), known before the model starts reading.
+//           Null when the runtime did not report a size; absent on every
+//           other heartbeat.
+//           MINOR: an older reader ignores the unknown keys. A reader
+//           deriving a rate must expect a zero-delta sample (a writing tick,
+//           or the opener) — a zero Δchars is a real reading of "nothing new
+//           was counted", not a stall.
+//
 //   1.55.0 (#2877, live token-rate scope): additive payload keys
 //           `sampled_at_ms` and `generated_chars` on `dispatch.turn.
 //           heartbeat`.

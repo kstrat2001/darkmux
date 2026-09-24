@@ -9626,6 +9626,20 @@ impl TailerState {
                 if let Some(ts) = event.get("ts").and_then(|v| v.as_u64()) {
                     self.open_stream = Some((seq, ts));
                 }
+                // (#2889) The opening heartbeat: `generated_chars: 0` plus the
+                // request's size, written before the request is sent, so the
+                // viewer can say how much the model is reading while it
+                // reads. Always emitted (never rate-limited away: a turn
+                // starting within 2s of the last heartbeat would otherwise
+                // lose its only prompt size), and never proof of work — a
+                // request going out says nothing about the model producing.
+                self.last_heartbeat_at = Some(Instant::now());
+                self.summary.heartbeats += 1;
+                self.emit(
+                    "dispatch.turn.heartbeat",
+                    darkmux_flow::Level::Info,
+                    opening_heartbeat_payload(&event),
+                );
             }
             "model.streaming.end" => {
                 let seq = event.get("seq").and_then(|v| v.as_u64());
@@ -9637,7 +9651,12 @@ impl TailerState {
                     }
                 }
             }
-            "model.partial" => {
+            // (#2889) `model.tool_call.writing` is the runtime's tick while
+            // the endpoint is silent and a tool call has been named. It rides
+            // the same coalescing as a chunk, so the heartbeat cadence the
+            // viewer sees is unchanged; it is NOT proof of work (see below).
+            "model.partial" | "model.tool_call.writing" => {
+                let is_chunk = event_type == "model.partial";
                 // Per-SSE-chunk events coalesced into a coarser heartbeat
                 // (rate-limited via HEARTBEAT_MIN_INTERVAL). Keeps
                 // topology edges animated during long streaming turns
@@ -9665,7 +9684,12 @@ impl TailerState {
                     // patterns, max_turns/max_tokens bound totals. Reset
                     // rides the heartbeat rate-limit gate, so it costs one
                     // mutex write per HEARTBEAT_MIN_INTERVAL, not per chunk.
-                    if let Some(deadline) = &self.inactivity_deadline {
+                    //
+                    // (#2889) A writing tick is not a chunk: it shows only
+                    // that the runtime is waiting, which a wedged endpoint
+                    // also produces. It forwards a heartbeat but leaves the
+                    // deadline where the last real chunk put it.
+                    if let (true, Some(deadline)) = (is_chunk, &self.inactivity_deadline) {
                         *lock_deadline(deadline) =
                             Instant::now() + Duration::from_secs(self.inactivity_secs);
                     }
@@ -10112,14 +10136,48 @@ impl TailerState {
 /// still forwards a valid heartbeat — `.get()` on a missing key yields
 /// `None`, which `serde_json::json!` serializes as `null`, and the UI rate
 /// module falls back to `cumulative_chars` + the record's own flow `ts`.
+///
+/// (#2889) `phase` + `tool_name` are forwarded when the runtime stamped
+/// them (the model is writing a named tool call) and are ABSENT otherwise,
+/// never null: the keys mean "writing", so absence is the other reading.
 fn heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "runtime": "internal",
         "turn_seq": event.get("seq"),
         "partial_index": event.get("partial_index"),
         "cumulative_chars": event.get("cumulative_chars"),
         "sampled_at_ms": event.get("ts"),
         "generated_chars": event.get("generated_chars"),
+    });
+    for key in ["phase", "tool_name"] {
+        if let Some(v) = event.get(key).filter(|v| !v.is_null()) {
+            payload[key] = cap_json_str(Some(v), MAX_TRAJ_FIELD_BYTES);
+        }
+    }
+    payload
+}
+
+/// (#2889) The turn's OPENING heartbeat, from `model.streaming.start`:
+/// `generated_chars: 0` and `prompt_chars`, the size of the request about to
+/// be sent. The runtime splits that size into `system_chars` + `prompt_chars`
+/// (non-system messages); the model reads both, so the heartbeat carries the
+/// sum. A field the event lacks (an older runtime) counts as zero, and when
+/// both are absent `prompt_chars` is null — the viewer then keeps its
+/// sizeless PROMPT display.
+fn opening_heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
+    let system = event.get("system_chars").and_then(|v| v.as_u64());
+    let prompt = event.get("prompt_chars").and_then(|v| v.as_u64());
+    let total = match (system, prompt) {
+        (None, None) => None,
+        (s, p) => Some(s.unwrap_or(0) + p.unwrap_or(0)),
+    };
+    serde_json::json!({
+        "runtime": "internal",
+        "turn_seq": event.get("seq"),
+        "cumulative_chars": 0,
+        "sampled_at_ms": event.get("ts"),
+        "generated_chars": 0,
+        "prompt_chars": total,
     })
 }
 
