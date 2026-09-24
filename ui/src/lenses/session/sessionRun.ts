@@ -56,7 +56,7 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateLiveState, aggregateTokenRate, averageGenerationRate } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
@@ -181,6 +181,11 @@ export interface SessionRunView {
   liveTokScope:
     | {
         tokensPerSec: number | null;
+        /** (#2885) `true` when `tokensPerSec` is carried forward from an
+         *  earlier turn rather than freshly measured from the current
+         *  turn's own two most recent heartbeats — the caller renders the
+         *  number dimmed. See `lib/tokenRate.ts::AggregatedTokenRate`. */
+        carried: boolean;
         stalled: boolean;
         /** (#2877 pass 2) The legible between-heartbeats state — see
          *  `lib/tokenRate.ts::deriveLiveState`'s own doc. `stalled` above is
@@ -455,8 +460,17 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
  * Passing a real clock here fixes that. It is never allowed to run BACKWARDS
  * of the records, though: `max(nowOverride, tMax)` keeps a machine whose
  * clock lags a peer's from rendering a negative elapsed time.
+ *
+ * @param connected (#2886 pass 3, "STALL while disconnected") Whether the
+ * PAGE currently has a working connection to the daemon — read by the
+ * caller from the same liveness source the header renders
+ * (`hooks/useLiveTail.ts`'s `LiveTailStatus`). Defaults to `true` (assume
+ * connected) so every existing caller/test that doesn't pass it keeps
+ * behaving exactly as before; `SessionReplay.tsx` is the one caller that
+ * passes the real value. See `lib/tokenRate.ts::liveStateWhileConnected`'s
+ * own doc for why only a `"stalled"` reading is affected.
  */
-export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number): SessionRunView {
+export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number, connected = true): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
@@ -839,8 +853,19 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // used to be able to disagree (a marker explaining the gap on every
   // candidate would still read "stalled" under the old rule); they can't
   // any more, because there is only one rule now.
-  const tokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
+  // (#2886 pass 3, "STALL while disconnected") Downgrades a "stalled"
+  // reading to `null` (no live execution — every lamp off, no rate) when
+  // the page itself has lost its connection to the daemon: no new record
+  // could have arrived either way, so a false STALL claim is worse than
+  // saying nothing. `connected` defaults to `true` for every caller that
+  // doesn't pass it, so this is a no-op everywhere except the real
+  // `SessionReplay.tsx` render. `tokRateStalled` reads the ADJUSTED state,
+  // so it can never disagree with what `liveTokScope.state` below shows.
+  const tokRateLiveState = liveStateWhileConnected(aggregateLiveState(tokRateRecordSets, nowMs), connected);
   const tokRateStalled = tokRateLiveState?.state === "stalled";
+  // Computed once, here, and read both by `liveTokScope` below and nowhere
+  // else — a single call, not one per read site.
+  const liveTokRate = aggregateTokenRate(tokRateRecordSets, nowMs);
 
   // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
   // `const procs = ...` followed by `void procs` to silence the unused
@@ -926,17 +951,33 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     // The model's generation rate: billed tokens over generation time, an
     // exact average, not an estimate. Wall clock is only the fallback for a
     // runtime that predates `generation_ms`, and the label says so.
+    //
+    // (#2886) `genRate` now also says how many of the turns that PAIRED a
+    // `generation_ms` with billed tokens actually went into the average —
+    // a checkpointed turn is excluded (see `averageGenerationRate`'s own
+    // doc). Three outcomes, per the issue's acceptance:
+    // 1. Every paired turn billed: the ordinary "avg" label, unchanged.
+    // 2. Some excluded, at least one remains: "avg · M of N turns" so the
+    //    reader knows the average is partial, not silently wrong.
+    // 3. Turns existed but ALL were checkpointed (`tokensPerSec: null`):
+    //    show "—", never the wall-clock fallback — that fallback is for
+    //    when there is NO generation_ms data at all (an older runtime),
+    //    not for "every measured turn turned out to be unbillable".
     const genRate = averageGenerationRate(tokRateRecordSets);
     const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
-    const finalTokPerSec = genRate ?? wallRate;
-    push(
-      modelIdx,
-      finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—",
-      "TOK/S",
-      undefined,
-      undefined,
-      genRate != null ? "avg" : "avg · wall clock",
-    );
+    let finalTokPerSec: number | null;
+    let tokSub: string;
+    if (genRate == null) {
+      finalTokPerSec = wallRate;
+      tokSub = "avg · wall clock";
+    } else if (genRate.tokensPerSec == null) {
+      finalTokPerSec = null;
+      tokSub = "avg · unbilled";
+    } else {
+      finalTokPerSec = genRate.tokensPerSec;
+      tokSub = genRate.billedTurns === genRate.totalTurns ? "avg" : `avg · ${genRate.billedTurns} of ${genRate.totalTurns} turns`;
+    }
+    push(modelIdx, finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—", "TOK/S", undefined, undefined, tokSub);
   }
   // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
   // the model's work, and the gate — while this tile is the dispatch's own
@@ -1373,10 +1414,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     liveTokScope:
       effHasModelWork && !done
         ? {
-            tokensPerSec: aggregateTokenRate(tokRateRecordSets, nowMs),
+            tokensPerSec: liveTokRate?.tokensPerSec ?? null,
+            carried: liveTokRate?.carried ?? false,
             stalled: tokRateStalled,
             // null: no live execution right now (a mission between model
-            // steps). Every lamp is off; nothing claims a state.
+            // steps), OR downgraded by `liveStateWhileConnected` above.
+            // Every lamp is off; nothing claims a state.
             state: tokRateLiveState?.state ?? null,
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
           }

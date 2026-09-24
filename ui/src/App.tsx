@@ -26,6 +26,7 @@ import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
+import type { LiveTailStatus } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
@@ -856,7 +857,7 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader)}
+            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader, liveStatus)}
           </LensErrorBoundary>
         </main>
         {!isMobile && (
@@ -1013,10 +1014,27 @@ function renderRoute(
   onMissionEvents: (events: FlowRecord[], srvTruncated: boolean) => void,
   onSelectStep: (stepId: string | null) => void,
   onStepHeader: (fields: StepHeaderField[] | null) => void,
+  /** (#2886 pass 3, "STALL while disconnected") The SAME `useLiveTail`
+   *  status the header already renders — used to derive `connected` below
+   *  so the fleet card and the run tile's TOK/S scope can tell "the run
+   *  stalled" apart from "the page lost its connection". Every route other
+   *  than `fleet`/`dispatch` ignores it; those two are the only lenses that
+   *  render the TOK/S scope (see the dispatch brief's file list). */
+  liveStatus: LiveTailStatus,
 ) {
+  // (#2886 pass 3) `isLiveRoute(route)` — NOT merely `liveStatus === "live"`
+  // — matters here: a static/demo build's `useLiveTail` never runs at all
+  // (`isLiveRoute` returns `false` for `getSource().kind === "static"`,
+  // checked FIRST in that function), so `liveStatus` sits at its pessimistic
+  // default, `"reconnecting"`, forever. That is not the same fact as a real
+  // daemon connection dropping mid-session, and a static build must never
+  // read as "no signal" — there is no signal to have lost. `connected` is
+  // therefore true whenever this route was never live-tail-backed in the
+  // first place, and otherwise follows the real status.
+  const connected = !isLiveRoute(route) || liveStatus === "live";
   switch (route.kind) {
     case "fleet":
-      return <FleetLens />;
+      return <FleetLens connected={connected} />;
     case "runs":
       return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
     case "machine":
@@ -1031,7 +1049,7 @@ function renderRoute(
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
-      return <SessionReplay sessionId={route.dispatchId} playhead={playhead} />;
+      return <SessionReplay sessionId={route.dispatchId} playhead={playhead} connected={connected} />;
     case "mission":
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this

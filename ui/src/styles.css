@@ -3512,6 +3512,11 @@ body {
   color: var(--scope-phosphor);
   font-variant-numeric: tabular-nums;
 }
+/* (#2885) Same carried-reading dim as the run tile's `.token-scope-n` — a
+   real number, just from an earlier turn, not this instant. */
+.mach-scope__rate[data-carried="true"] {
+  opacity: 0.55;
+}
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
@@ -8216,6 +8221,13 @@ body {
   font-variant-numeric: tabular-nums;
   color: var(--scope-phosphor);
   text-shadow: 0 0 10px var(--scope-phosphor-glow);
+}
+/* (#2885) A carried reading — the number is real but from an earlier turn,
+   not the current one's own two most recent heartbeats — reads dimmed and
+   without the phosphor glow, distinct from a fresh sample. */
+.token-scope-center .token-scope-n[data-carried="true"] {
+  opacity: 0.55;
+  text-shadow: none;
 }
 /* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
    frame and never animates again (see `TokenScope.tsx`), so nothing here

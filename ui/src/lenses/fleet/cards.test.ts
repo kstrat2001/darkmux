@@ -396,6 +396,42 @@ describe("buildFleetCard", () => {
       expect(card.liveTokStalled).toBe(false);
     });
 
+    // (#2885) A short turn's lone first heartbeat carries the previous
+    // turn's rate forward — marked `liveTokCarried` so the card can dim it.
+    it("carries the last measured rate (marked liveTokCarried) into a new turn's lone first heartbeat", () => {
+      const t1a = T_MAX - 22_000;
+      const t1b = T_MAX - 20_000;
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1a, generated_chars: 0, turn_seq: 1 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1b, generated_chars: 800, turn_seq: 1 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: T_MAX, generated_chars: 50, turn_seq: 2 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokState).toBe("generating");
+      // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
+      expect(card.liveTokRate).toBeCloseTo(100, 5);
+      expect(card.liveTokCarried).toBe(true);
+    });
+
+    it("is NOT carried once a turn has produced its own two fresh heartbeats", () => {
+      const card = buildFleetCard(
+        [
+          rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+          rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+          rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+        ],
+        new Map(),
+        null,
+        new Set(["s1"]),
+        false,
+        "u1",
+        true,
+        T_MAX,
+      );
+      expect(card.liveTokCarried).toBe(false);
+    });
+
     it("sums across two concurrently running sessions on the same machine", () => {
       const data: FlowRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
@@ -459,6 +495,25 @@ describe("buildFleetCard", () => {
       const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
       expect(card.liveTokStalled).toBe(true);
       expect(card.liveTokRate).toBe(0);
+    });
+
+    // (#2886 pass 3, "STALL while disconnected") Same records, same stale
+    // gap — the ONLY thing that changed is the page's own connection to the
+    // daemon. A false STALL claim from a disconnection must not survive.
+    it("reads no state (not stalled) for the SAME stale gap when the page is disconnected", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
+      ];
+      const connectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true);
+      expect(connectedCard.liveTokStalled).toBe(true);
+      expect(connectedCard.liveTokState).toBe("stalled");
+      const disconnectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, false);
+      expect(disconnectedCard.liveTokStalled).toBe(false);
+      expect(disconnectedCard.liveTokState).toBeNull();
+      // Still mounted (a running session exists) — just no state to claim.
+      expect(disconnectedCard.liveTokRate).not.toBeNull();
     });
 
     it("a mission between model steps (only its run session beating) mounts no scope and claims no state", () => {

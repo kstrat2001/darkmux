@@ -77,12 +77,23 @@ const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = 
   { state: "rest", label: "rest" },
   { state: "stalled", label: "stall" },
 ];
-function ScopeLamps({ reading }: { reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number } }) {
+function ScopeLamps({
+  reading,
+  noSignal = false,
+}: {
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number };
+  /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
+   *  stall reads as (`liveStateWhileConnected`) — visually identical
+   *  (every lamp off) but a different fact, so the aria text says which. */
+  noSignal?: boolean;
+}) {
   // `state: null` is no live execution (a mission between model steps):
   // every lamp is off.
   const aria =
     reading.state === null
-      ? "no model working"
+      ? noSignal
+        ? "no signal — page disconnected from the daemon"
+        : "no model working"
       : reading.state === "generating"
         ? "generating"
         : liveStateLabel({ state: reading.state, restSecondsLeft: reading.restSecondsLeft } as LiveStateReading);
@@ -254,7 +265,27 @@ function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   );
 }
 
-export function SessionReplay({ sessionId, playhead = null }: { sessionId: string; playhead?: number | null }) {
+export function SessionReplay({
+  sessionId,
+  playhead = null,
+  connected = true,
+}: {
+  sessionId: string;
+  playhead?: number | null;
+  /** (#2886 pass 3, "STALL while disconnected") Whether the page has a
+   *  working connection to the daemon — derived by `App.tsx` from the
+   *  header's own liveness read (`useLiveTail`'s `LiveTailStatus`), the same
+   *  value `Masthead`/`MachineDrawer` already render, ALSO folding in
+   *  `isLiveRoute`: a static/demo build's `useLiveTail` never runs at all
+   *  (`isLiveRoute` returns `false` for `getSource().kind === "static"`) and
+   *  sits at `"reconnecting"` forever, which is not the same fact as a real
+   *  daemon connection dropping — `App.tsx` computes `!isLiveRoute(route) ||
+   *  liveStatus === "live"` before passing this down, so a static build
+   *  never falsely reads "no signal". Defaults to `true` so a bare
+   *  `<SessionReplay sessionId=... />` (every existing test) keeps behaving
+   *  as before. */
+  connected?: boolean;
+}) {
   // (#1972) POLLS while the session is live. Without this the page fetched
   // its records ONCE, which is the defect a live dogfood run exposed: the
   // wall clock advanced (it reads the browser clock), while turns, tokens,
@@ -517,7 +548,11 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // (Playback parity, Change A) Run ONCE, with `clockOverride`, in both
   // modes — no more `ticking ? ... : base` branch selecting between a
   // moving clock and a frozen one keyed on live/playback.
-  const view = runRegions(data, sessionId, clockOverride);
+  //
+  // (#2886 pass 3) `connected` matters only while a scope could be showing —
+  // a scrubbed/finished view has no `liveTokScope` to affect either way, so
+  // this is passed unconditionally rather than gated on `playhead`.
+  const view = runRegions(data, sessionId, clockOverride, connected);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
@@ -658,8 +693,12 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
                           : "—"
                         : null
                     }
+                    // (#2885) Dims the number when it's carried forward from
+                    // an earlier turn rather than the current one's own two
+                    // most recent heartbeats.
+                    centerCarried={view.liveTokScope.state === "generating" && view.liveTokScope.carried}
                   />
-                  <ScopeLamps reading={view.liveTokScope} />
+                  <ScopeLamps reading={view.liveTokScope} noSignal={!connected} />
                 </div>
               )}
             </div>

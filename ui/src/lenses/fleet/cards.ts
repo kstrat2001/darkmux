@@ -23,7 +23,7 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateLiveState, aggregateTokenRate, liveExecutions } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, liveExecutions, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
@@ -451,6 +451,11 @@ export interface FleetCard {
   liveTokState: LiveState | null;
   /** Present only when `liveTokState === "rest"`. */
   liveTokRestSecondsLeft?: number;
+  /** (#2885) `true` when `liveTokRate` is carried forward from an earlier
+   *  turn on at least one contributing session rather than freshly measured
+   *  — the card dims the rate line. See
+   *  `lib/tokenRate.ts::AggregatedTokenRate`. */
+  liveTokCarried: boolean;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -487,6 +492,15 @@ export function buildFleetCard(
    * there too — nothing here branches on mode; the data simply isn't
    * fetched (the one thing mode is still allowed to decide). */
   machineRuns: Run[] = [],
+  /** (#2886 pass 3, "STALL while disconnected") Whether the PAGE has a
+   * working connection to the daemon right now — read by the caller from
+   * the same liveness source the header renders (`hooks/useLiveTail.ts`'s
+   * `LiveTailStatus`). Defaults to `true` so every existing call site
+   * (tests, and a replay call — see `liveStateWhileConnected`'s own doc for
+   * why disconnection is meaningless there) keeps behaving exactly as
+   * before; `FleetLens.tsx`'s live-mode render is the one caller that
+   * passes the real value. */
+  connected = true,
 ): FleetCard {
   const flowActive = machActive(data, liveSet, m, t);
   const labRunning = runningLabRunCount(machineRuns);
@@ -581,7 +595,12 @@ export function buildFleetCard(
   // deriveLiveState`'s own doc. `liveTokStalled` is now DERIVED from it
   // (`=== "stalled"`) rather than a second, separately-computed "every
   // running session's heartbeats are stale" check.
-  const liveTokLiveState = liveTokRecordSets.length > 0 ? aggregateLiveState(liveTokRecordSets, t) : null;
+  // (#2886 pass 3, "STALL while disconnected") Downgraded the same way the
+  // run page's `sessionRun.ts` downgrades it — see
+  // `lib/tokenRate.ts::liveStateWhileConnected`'s own doc. `connected`
+  // defaults to `true`, so this is a no-op for every caller that doesn't
+  // pass it (tests, and a replay call, where disconnection is meaningless).
+  const liveTokLiveState = liveTokRecordSets.length > 0 ? liveStateWhileConnected(aggregateLiveState(liveTokRecordSets, t), connected) : null;
   const liveTokStalled = liveTokLiveState?.state === "stalled";
   // While the machine has a running execution the scope stays mounted: at 0
   // with its state word when nothing is generating (resting, tools, reading
@@ -590,10 +609,19 @@ export function buildFleetCard(
   // Only when a live EXECUTION exists: a mission between model steps (only
   // its run session beating) has no model working, so no scope and no state.
   const hasLiveExecution = liveExecutions(liveTokRecordSets, t).length > 0;
-  const rawLiveTokRate = active && hasLiveExecution ? (aggregateTokenRate(liveTokRecordSets, t) ?? 0) : null;
+  // (#2885) `aggregateTokenRate` now returns `{tokensPerSec, carried}` —
+  // `rawTokReading` is `null` exactly when there is nothing running or no
+  // execution has a reading yet, same as before.
+  const rawTokReading = active && hasLiveExecution ? aggregateTokenRate(liveTokRecordSets, t) : null;
+  const rawLiveTokRate = active && hasLiveExecution ? (rawTokReading?.tokensPerSec ?? 0) : null;
   const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
   const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
   const liveTokRestSecondsLeft = liveTokState === "rest" ? liveTokLiveState?.restSecondsLeft : undefined;
+  // Only meaningful while `liveTokState === "generating"` — that's the one
+  // state whose rate line shows the NUMBER (`FleetLens.tsx`'s rate line
+  // shows a state word otherwise), so a carried reading during rest/tools/
+  // prompt/stalled would dim text that isn't the rate at all.
+  const liveTokCarried = liveTokState === "generating" ? (rawTokReading?.carried ?? false) : false;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -624,5 +652,6 @@ export function buildFleetCard(
     liveTokStalled,
     liveTokState,
     liveTokRestSecondsLeft,
+    liveTokCarried,
   };
 }

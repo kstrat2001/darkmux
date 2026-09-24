@@ -58,6 +58,12 @@ export interface TokenScopeProps {
   /** Placement 2's "only the number centered inside the tube" — the run
    *  page passes the tok/s readout here; the fleet card leaves it unset. */
   centerLabel?: string | null;
+  /** (#2885) `true` when `centerLabel` is a rate carried forward from an
+   *  earlier turn rather than freshly measured — dims the number
+   *  (`data-carried` on `.token-scope-n`, see `styles.css`) so it reads as
+   *  "last known", not a fresh sample. No effect when `centerLabel` is
+   *  unset. */
+  centerCarried?: boolean;
   className?: string;
   /** The live state, which colors the trace to match its lit lamp
    *  (`lib/scopeTone.ts`). `"none"`: no live execution, phosphor green. */
@@ -190,7 +196,16 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: Sc
   ctx.shadowBlur = 0;
 }
 
-export function TokenScope({ tokensPerSec, stalled = false, resting = false, size, centerLabel, className, tone = "generating" }: TokenScopeProps) {
+export function TokenScope({
+  tokensPerSec,
+  stalled = false,
+  resting = false,
+  size,
+  centerLabel,
+  centerCarried = false,
+  className,
+  tone = "generating",
+}: TokenScopeProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animRef = useRef<ScopeAnim>({ shown: 0, target: 0, phase: Math.random() * 6, bright: 1, breath: Math.random() * 6 });
   const targetRef = useRef({ target: 0, stalled: false, resting: false, rgb: PHOSPHOR_FALLBACK as Rgb });
@@ -293,7 +308,9 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
         <canvas ref={canvasRef} aria-hidden="true" />
         {centerLabel != null && (
           <div className="token-scope-center">
-            <span className="token-scope-n">{centerLabel}</span>
+            <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
+              {centerLabel}
+            </span>
           </div>
         )}
       </div>

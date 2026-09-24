@@ -13,6 +13,7 @@ import {
   measuredCharsPerToken,
   averageGenerationRate,
   liveStateLabel,
+  liveStateWhileConnected,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -129,6 +130,32 @@ describe("measuredCharsPerToken", () => {
     const ratio = measuredCharsPerToken([turnBeat(1, 1_000, 566), turnTokens(1, 391)]);
     expect(ratio).toBe(DEFAULT_CHARS_PER_TOKEN);
   });
+
+  // (#2886/#2885, real recorded shape — Splash bake-off run
+  // `darkmux-coding-refresh-rotation-1790242191590`) Turn 2 was cut by a
+  // reasoning checkpoint: 74,617 generated chars, only 91 billed tokens
+  // (≈820 chars/token). Turn 3 was ordinary: 7,227 chars, 1,943 tokens
+  // (≈3.72 chars/token, close to the real measured ratio). Blended together
+  // the pair calibrates to ≈40 chars/token — this must calibrate from turn
+  // 3 ALONE.
+  const checkpoint = (turn: number): FlowRecord =>
+    ({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "conclude" } }) as unknown as FlowRecord;
+
+  it("excludes a checkpointed turn from calibration, keyed on the dispatch.checkpoint record (#2886)", () => {
+    const ratio = measuredCharsPerToken([
+      turnBeat(2, 1_000, 74_617),
+      turnTokens(2, 91),
+      checkpoint(2),
+      turnBeat(3, 5_000, 7_227),
+      turnTokens(3, 1_943),
+    ]);
+    expect(ratio).toBeCloseTo(7_227 / 1_943, 5);
+  });
+
+  it("falls back to DEFAULT_CHARS_PER_TOKEN when the ONLY turn with usage is checkpointed", () => {
+    const ratio = measuredCharsPerToken([turnBeat(2, 1_000, 74_617), turnTokens(2, 91), checkpoint(2)]);
+    expect(ratio).toBe(DEFAULT_CHARS_PER_TOKEN);
+  });
 });
 
 describe("currentTokenRate", () => {
@@ -151,6 +178,23 @@ describe("currentTokenRate", () => {
     // Last pair: 80 chars over 2000ms = 40 chars/sec / 4 default = 10 tok/s.
     expect(a!.tokensPerSec).toBeCloseTo(10, 5);
   });
+
+  // (#2885, acceptance criterion) "previous turn measured, new turn with
+  // one heartbeat gives a carried reading, not null."
+  it("carries the last measured rate into a new turn's lone first heartbeat, marked carried", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // Turn 1: 800 chars over 2s = 400 chars/s -> 100 tok/s at the default 4
+    // chars/token. Turn 2's own first (and only) sample follows 20s later.
+    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 50, 2)]);
+    expect(reading).not.toBeNull();
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading!.carried).toBe(true);
+  });
+
+  it("is null, not carried, with only ONE heartbeat ever (nothing to carry from)", () => {
+    expect(currentTokenRate([beat(1_000, 40)])).toBeNull();
+  });
 });
 
 describe("isStalled", () => {
@@ -169,17 +213,34 @@ describe("aggregateTokenRate", () => {
   it("sums current readings across running executions", () => {
     const exec1 = [beat(1_000, 40), beat(3_000, 120)]; // 40 chars/sec / 4 = 10 tok/s
     const exec2 = [beat(1_000, 40), beat(3_000, 200)]; // 80 chars/sec / 4 = 20 tok/s
-    expect(aggregateTokenRate([exec1, exec2], 3_500)).toBeCloseTo(30, 5);
+    const reading = aggregateTokenRate([exec1, exec2], 3_500);
+    expect(reading?.tokensPerSec).toBeCloseTo(30, 5);
+    expect(reading?.carried).toBe(false);
   });
 
   it("treats a stalled/fresh execution as contributing 0, not dropping the machine's total", () => {
     const generating = [beat(1_000, 40), beat(3_000, 120)];
     const fresh: FlowRecord[] = [beat(5_000, 0)];
-    expect(aggregateTokenRate([generating, fresh], 5_500)).toBeCloseTo(10, 5);
+    expect(aggregateTokenRate([generating, fresh], 5_500)?.tokensPerSec).toBeCloseTo(10, 5);
   });
 
   it("is null only when NO execution has a reading at all", () => {
     expect(aggregateTokenRate([[beat(1_000, 0)], []], 1_500)).toBeNull();
+  });
+
+  // (#2885) A carried reading from any ONE contributing execution marks the
+  // whole aggregate carried — the caller renders a single number, dimmed or
+  // not, never a per-execution split.
+  it("marks the aggregate carried when any contributing execution's own reading is carried", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // exec1: turn 1 measured, then turn 2's lone first sample — carried.
+    const exec1 = [hbT(0, 0, 1), hbT(2_000, 400, 1), hbT(23_000, 50, 2)];
+    // exec2: an ordinary fresh same-turn pair — not carried.
+    const exec2 = [beat(23_000, 0), beat(25_000, 200)];
+    const reading = aggregateTokenRate([exec1, exec2], 25_500);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
   });
 });
 
@@ -328,27 +389,85 @@ describe("averageGenerationRate", () => {
     ({ ts: atSec(seq), action: "telemetry.tokens", session_id: sid, payload: { turn_seq: seq, completion_tokens: completion } }) as unknown as FlowRecord;
 
   it("sums billed tokens over summed generation time, paired per turn", () => {
-    const rate = averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 400), turn("a", 2, 5_000), tok("a", 2, 600)]]);
-    expect(rate).toBeCloseTo(100, 5);
+    const reading = averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 400), turn("a", 2, 5_000), tok("a", 2, 600)]]);
+    expect(reading?.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading?.billedTurns).toBe(2);
+    expect(reading?.totalTurns).toBe(2);
   });
 
   it("pairs by session as well as turn, across a mission's executions", () => {
-    const rate = averageGenerationRate([
+    const reading = averageGenerationRate([
       [turn("a", 1, 4_000), tok("a", 1, 400)],
       [turn("b", 1, 6_000), tok("b", 1, 200)],
     ]);
-    expect(rate).toBeCloseTo(60, 5);
+    expect(reading?.tokensPerSec).toBeCloseTo(60, 5);
   });
 
   it("skips a turn with no generation_ms, and is null when no turn has one", () => {
-    expect(averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 500), turn("a", 2, undefined), tok("a", 2, 900)]])).toBeCloseTo(100, 5);
+    expect(averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 500), turn("a", 2, undefined), tok("a", 2, 900)]])?.tokensPerSec).toBeCloseTo(
+      100,
+      5,
+    );
     expect(averageGenerationRate([[turn("a", 1, undefined), tok("a", 1, 500)]])).toBeNull();
+  });
+
+  // (#2886) Real recorded shape: a checkpointed turn's billed tokens cover
+  // only its final continuation while `generation_ms` spans the whole
+  // chain — including it drags a real ~150 tok/s down to ~34.
+  const checkpoint = (sid: string, seq: number): FlowRecord =>
+    ({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "conclude" } }) as unknown as FlowRecord;
+
+  it("excludes a checkpointed turn from the average, labeling how many of the paired turns were billed", () => {
+    const reading = averageGenerationRate([
+      [
+        turn("a", 1, 200), // billed, ordinary
+        tok("a", 1, 20), // 100 tok/s
+        turn("a", 2, 220_000), // checkpointed: huge generation_ms, tiny billed tokens
+        tok("a", 2, 91),
+        checkpoint("a", 2),
+      ],
+    ]);
+    expect(reading).not.toBeNull();
+    // Only turn 1 is billed: 20 tokens / 0.2s = 100 tok/s, not the ~0.5
+    // tok/s a naive (20+91)/(200+220000)ms average would read.
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading!.billedTurns).toBe(1);
+    expect(reading!.totalTurns).toBe(2);
+  });
+
+  it("returns a null rate (not a fallback average) when EVERY paired turn is checkpointed", () => {
+    const reading = averageGenerationRate([[turn("a", 1, 220_000), tok("a", 1, 91), checkpoint("a", 1)]]);
+    expect(reading).toEqual({ tokensPerSec: null, billedTurns: 0, totalTurns: 1 });
   });
 });
 
 describe("liveStateLabel", () => {
   it("names the prompt wait as 'reading prompt', not the bare word the page's prompt disclosure also uses", () => {
     expect(liveStateLabel({ state: "prompt" } as never)).toBe("reading prompt");
+  });
+});
+
+// (#2886 pass 3, "STALL while disconnected") A lost daemon connection must
+// not let a false STALL claim through.
+describe("liveStateWhileConnected", () => {
+  it("downgrades a stalled reading to null (the shared 'no live execution' rendering) when disconnected", () => {
+    expect(liveStateWhileConnected({ state: "stalled" }, false)).toBeNull();
+  });
+
+  it("leaves a stalled reading alone while connected", () => {
+    expect(liveStateWhileConnected({ state: "stalled" }, true)).toEqual({ state: "stalled" });
+  });
+
+  it("leaves every non-stalled state alone even while disconnected — only STALL is a false claim", () => {
+    expect(liveStateWhileConnected({ state: "generating" }, false)).toEqual({ state: "generating" });
+    expect(liveStateWhileConnected({ state: "rest", restSecondsLeft: 5 }, false)).toEqual({ state: "rest", restSecondsLeft: 5 });
+    expect(liveStateWhileConnected({ state: "tools" }, false)).toEqual({ state: "tools" });
+    expect(liveStateWhileConnected({ state: "prompt" }, false)).toEqual({ state: "prompt" });
+  });
+
+  it("passes a null reading through unchanged regardless of connection", () => {
+    expect(liveStateWhileConnected(null, false)).toBeNull();
+    expect(liveStateWhileConnected(null, true)).toBeNull();
   });
 });
 
@@ -364,13 +483,13 @@ describe("which executions count: live ones only", () => {
     const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), hb("a", 3_000, 800), rec("a", 3_500, "dispatch.complete")];
     const live = [rec("b", 10_000, "dispatch.start"), hb("b", 11_000, 0), hb("b", 13_000, 800)];
     // Both measured 400 chars/s -> 100 tok/s at the default 4 chars/token.
-    expect(aggregateTokenRate([finished, live], 13_500)).toBeCloseTo(100, 5);
+    expect(aggregateTokenRate([finished, live], 13_500)?.tokensPerSec).toBeCloseTo(100, 5);
   });
 
   it("a resting or tool-running execution adds nothing while another generates", () => {
     const resting = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), hb("a", 3_000, 800), rec("a", 3_500, "dispatch.rest", { ms: 15_000 })];
     const live = [rec("b", 0, "dispatch.start"), hb("b", 3_000, 0), hb("b", 5_000, 800)];
-    expect(aggregateTokenRate([resting, live], 5_500)).toBeCloseTo(100, 5);
+    expect(aggregateTokenRate([resting, live], 5_500)?.tokensPerSec).toBeCloseTo(100, 5);
   });
 
   it("the mission's own run-grain session (a mission-sourced start) never reads as PROMPT over a stalled execution", () => {
@@ -424,10 +543,23 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
 });
 
 describe("a turn's first reading never pairs with the previous turn", () => {
-  it("returns no reading for a new turn's first sample instead of a near-zero rate across the tool gap", () => {
+  // (#2885) Pre-#2885 this returned `null` outright — "no reading yet" for
+  // several seconds every short turn, the exact tile-reads-dead defect the
+  // issue reports. It now falls back to the CARRIED reading instead (see
+  // `currentTokenRate` describe above): still never a near-zero rate spanning
+  // the tool gap between turn 1's last sample and turn 2's first, but also
+  // never a bare "—" while the run is plainly still generating.
+  it("never pairs a new turn's first sample with the previous turn's last (no near-zero rate across the tool gap)", () => {
     const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
       ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
-    // Turn 1 ended at 800 chars; turn 2's first sample is 900 chars 20s later.
-    expect(currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 900, 2)])).toBeNull();
+    // Turn 1: 800 chars over 2s = 400 chars/s. Turn 2's first sample is 900
+    // chars 20s later — if this paired turn 1's last (800) against turn 2's
+    // first (900) across that 20s gap it would read a near-zero rate
+    // (100 chars / 20s = 5 chars/s); instead it carries turn 1's own
+    // 400 chars/s reading forward.
+    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 900, 2)]);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
   });
 });

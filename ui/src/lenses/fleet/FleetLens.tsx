@@ -381,6 +381,7 @@ export function FleetLens({
   tMin,
   playhead,
   historical = false,
+  connected = true,
 }: {
   records?: FlowRecord[];
   tMax?: number;
@@ -396,6 +397,15 @@ export function FleetLens({
    * fixed while a marker sweeps across it. */
   playhead?: number;
   historical?: boolean;
+  /** (#2886 pass 3, "STALL while disconnected") Whether the PAGE has a
+   * working connection to the daemon right now — `App.tsx`'s live render
+   * passes `useLiveTail`'s status. Defaults to `true`, so a `historical`
+   * (playback) render — which never passes this — always reads as
+   * connected: disconnection is meaningless there, since `useLiveTail`
+   * never even runs on a playback route (`isLiveRoute` excludes it) and
+   * would otherwise report a permanent, misleading "reconnecting". See
+   * `lib/tokenRate.ts::liveStateWhileConnected`'s own doc. */
+  connected?: boolean;
 } = {}) {
   // (Playback parity, Change A) `wallNow` feeds ONLY the live fetch window
   // below (`useFlowWindow`) — "what is fetched" is the one thing liveMode
@@ -637,6 +647,7 @@ export function FleetLens({
           // carries only a display NAME (`runsForMachine`'s own doc), same
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
+          connected,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -670,10 +681,12 @@ export function FleetLens({
           liveMode,
           playheadT,
           specBeats,
+          undefined,
+          connected,
         ),
       ),
     ],
-    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster],
+    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected],
   );
 
   const timeline = useMemo(
@@ -810,10 +823,17 @@ export function FleetLens({
                   word the run page's tile shows (`liveStateLabel`, one
                   derivation, no mode branch). */}
               {card.liveTokRate !== null && (
-                <div className="mach-scope__rate" data-tone={card.liveTokState ?? "none"}>
+                <div className="mach-scope__rate" data-tone={card.liveTokState ?? "none"} data-carried={card.liveTokCarried ? "true" : "false"}>
                   {card.liveTokState === "generating"
                     ? `${fmtN(Math.round(card.liveTokRate))} tok/s`
-                    : liveStateLabel({ state: card.liveTokState ?? "stalled", restSecondsLeft: card.liveTokRestSecondsLeft })}
+                    : // (#2886 pass 3) `state: null` here (rather than the
+                      // "no live execution" case, ruled out since
+                      // `liveTokRate !== null` implies something IS
+                      // running) is `liveStateWhileConnected`'s
+                      // disconnection downgrade — say so, not "stalled".
+                      card.liveTokState === null
+                      ? "no signal"
+                      : liveStateLabel({ state: card.liveTokState, restSecondsLeft: card.liveTokRestSecondsLeft })}
                 </div>
               )}
               {/* (#1903) The running count's own tap target — a SIBLING

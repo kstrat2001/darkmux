@@ -87,6 +87,7 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
   // tok/s as 11.
   const charsByTurn = new Map<unknown, number>();
   const tokensByTurn = new Map<unknown, number>();
+  const checkpointed = checkpointedTurns(records);
   for (const r of records) {
     const f = fields(r);
     if (r.action === "dispatch.turn.heartbeat") {
@@ -100,6 +101,18 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
   let chars = 0;
   let tokens = 0;
   for (const [turn, t] of tokensByTurn) {
+    // (#2886) A turn cut by a reasoning checkpoint streams its FULL text
+    // into `generated_chars` (every continuation the checkpoint judged) but
+    // bills only the final continuation's tokens — numerator and
+    // denominator cover different spans, the same trap
+    // `crates/darkmux-lab/src/lab/stats.rs`'s `billed_gen_fraction`/
+    // `UNBILLED` exists to close on the lab side (that module reads
+    // trajectory spans the viewer doesn't have; this is the flow-record
+    // equivalent). Keyed on the `dispatch.checkpoint` record for this
+    // turn_seq, never a ratio: measured, a checkpointed turn read 74,617
+    // chars against 91 billed tokens (≈820 chars/token), a ratio no
+    // heuristic threshold could distinguish from a genuinely terse turn.
+    if (checkpointed.has(turn)) continue;
     const c = charsByTurn.get(turn) ?? 0;
     // A short turn is a bad calibration: text generated after its last 2s
     // heartbeat is never seen, and tool-call arguments bill as tokens but
@@ -112,22 +125,62 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
   return chars / tokens;
 }
 
+/** Every turn_seq with at least one `dispatch.checkpoint` record — the
+ *  harness's own record that the reasoning checkpoint judged this turn
+ *  mid-stream (`crates/darkmux-crew/src/dispatch_internal.rs`'s
+ *  `"dispatch.checkpoint" =>` handler forwards `turn_seq` on the payload).
+ *  Shared by `measuredCharsPerToken` and `averageGenerationRate` (#2886) so
+ *  the two derivations can't disagree on what counts as checkpointed. */
+function checkpointedTurns(records: FlowRecord[]): Set<unknown> {
+  const out = new Set<unknown>();
+  for (const r of records) {
+    if (r.action === "dispatch.checkpoint") out.add(fields(r).turn_seq);
+  }
+  return out;
+}
+
 /** The fewest chars a finished turn must have produced before its chars/token
  *  ratio is trusted over the default. */
 export const MIN_CALIBRATION_CHARS = 2_000;
+
+/** A FINISHED run's generation rate reading: how many of the turns that
+ *  paired a `generation_ms` with billed `completion_tokens` actually went
+ *  into `tokensPerSec`, so the caller can label a partial average (the
+ *  issue's "avg · 3 of 5 turns") instead of presenting it as unqualified. */
+export interface GenerationRateReading {
+  /** `null` when `totalTurns > 0` but every one of them was excluded as
+   *  checkpointed — the caller must show "—", not fall back to a looser
+   *  measurement, since NO turn here can be trusted (#2886). */
+  tokensPerSec: number | null;
+  /** Turns actually summed into `tokensPerSec` — excludes any turn with a
+   *  `dispatch.checkpoint` record for its turn_seq. */
+  billedTurns: number;
+  /** Turns that paired a `generation_ms` with a billed `completion_tokens`
+   *  entry, before the checkpoint exclusion. */
+  totalTurns: number;
+}
 
 /** A FINISHED run's generation rate: billed completion tokens over the time
  *  the model spent generating (`dispatch.turn`'s `generation_ms`), paired by
  *  turn within each execution. Not the wall clock, which includes rests,
  *  tools and prompt reading (a real run read 45 tok/s over wall clock
  *  against ~80 over generation time). `null` when no turn carries
- *  `generation_ms` (a runtime older than flow schema 1.53). */
-export function averageGenerationRate(recordSets: FlowRecord[][]): number | null {
+ *  `generation_ms` (a runtime older than flow schema 1.53).
+ *
+ * (#2886) A turn cut by a reasoning checkpoint bills only its final
+ * continuation's tokens while `generation_ms` spans every continuation the
+ * checkpoint judged — dividing the two together reads a model generating
+ * ~150 tok/s as ~34. Excluded the same way `measuredCharsPerToken` excludes
+ * it: keyed on a `dispatch.checkpoint` record for the turn_seq. */
+export function averageGenerationRate(recordSets: FlowRecord[][]): GenerationRateReading | null {
   let tokens = 0;
   let ms = 0;
+  let billedTurns = 0;
+  let totalTurns = 0;
   for (const records of recordSets) {
     const genMs = new Map<unknown, number>();
     const tok = new Map<unknown, number>();
+    const checkpointed = checkpointedTurns(records);
     for (const r of records) {
       const f = fields(r);
       if (r.action === "dispatch.turn") {
@@ -141,11 +194,15 @@ export function averageGenerationRate(recordSets: FlowRecord[][]): number | null
     for (const [turn, g] of genMs) {
       const t = tok.get(turn);
       if (t == null) continue;
+      totalTurns += 1;
+      if (checkpointed.has(turn)) continue;
+      billedTurns += 1;
       tokens += t;
       ms += g;
     }
   }
-  return ms > 0 ? tokens / (ms / 1000) : null;
+  if (totalTurns === 0) return null;
+  return { tokensPerSec: billedTurns > 0 && ms > 0 ? tokens / (ms / 1000) : null, billedTurns, totalTurns };
 }
 
 export interface TokenRateReading {
@@ -157,24 +214,63 @@ export interface TokenRateReading {
    * (which only lands once the turn completes). Named per the issue's
    * "label it an estimate until billed usage arrives". */
   estimate: true;
+  /** (#2885) `true` when this reading is NOT from the current turn's own
+   *  two most recent heartbeats — the current turn has produced only one
+   *  sample so far (or none), so the number is carried forward from the
+   *  last turn (or earlier stretch) that DID produce a same-turn pair.
+   *  Absent (not merely `false`) on a fresh reading, matching this file's
+   *  existing convention for a flag that is meaningful only sometimes
+   *  (`restSecondsLeft` on `LiveStateReading`). The caller renders a
+   *  carried reading dimmed rather than as a fresh sample. */
+  carried?: true;
 }
 
 /** The CURRENT tok/s reading for one execution — the rate between its two
- * most recent heartbeats. `null` before there are two samples yet (a fresh
- * execution, or one still on its very first heartbeat) — the caller reads
- * `null` as "no reading yet", distinct from a genuine `0`. */
+ * most recent same-turn heartbeats. `null` only when NO same-turn pair
+ * exists anywhere in `records` yet (a fresh execution, or one still on its
+ * very first heartbeat ever) — the caller reads `null` as "no reading yet",
+ * distinct from a genuine `0`.
+ *
+ * (#2885, "GEN lit but a flat ring and '—' at the start of every short
+ * turn") A turn needs TWO heartbeats of its own before it has a rate, and on
+ * a workload of short turns that can take several seconds — long enough for
+ * the tile to read dead while the lamp says GEN. When the current turn
+ * hasn't produced a pair yet, this falls back to `carriedTokenRate`, which
+ * scans backward for the most recent turn that DID, per the issue's
+ * "carry... the previous turn's, or the run's most recent reading". */
 export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null {
   const samples = heartbeatSamples(records);
-  if (samples.length < 2) return null;
+  if (samples.length < 2) return carriedTokenRate(records, samples);
   const prev = samples[samples.length - 2];
   const next = samples[samples.length - 1];
   // `generated_chars` restarts every turn: a new turn's first sample paired
   // with the previous turn's last spans the tool gap and read near 0.
-  if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return null;
+  if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return carriedTokenRate(records, samples);
   const cps = charsPerSecond(prev, next);
   if (cps === null) return null;
   const charsPerToken = measuredCharsPerToken(records);
   return { tokensPerSec: cps / charsPerToken, atMs: next.atMs, estimate: true };
+}
+
+/** (#2885) Scans backward from the end of `samples` for the most recent
+ *  PRIOR same-turn pair — the last turn (or earlier stretch within the
+ *  in-flight one) that did measure a rate — and returns it marked
+ *  `carried: true`. `records`/`samples` cover the same set; `samples` is
+ *  passed in rather than recomputed since every caller already has it.
+ *  Returns `null` when no same-turn pair exists anywhere (a genuinely fresh
+ *  execution), matching `currentTokenRate`'s pre-#2885 behavior for that
+ *  case. */
+function carriedTokenRate(records: FlowRecord[], samples: HeartbeatSample[]): TokenRateReading | null {
+  for (let i = samples.length - 1; i > 0; i--) {
+    const next = samples[i];
+    const prev = samples[i - 1];
+    if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) continue;
+    const cps = charsPerSecond(prev, next);
+    if (cps === null) continue;
+    const charsPerToken = measuredCharsPerToken(records);
+    return { tokensPerSec: cps / charsPerToken, atMs: next.atMs, estimate: true, carried: true };
+  }
+  return null;
 }
 
 /** How long with no fresh heartbeat before a live execution reads as
@@ -420,6 +516,18 @@ export function liveStateLabel(reading: LiveStateReading): string {
   }
 }
 
+export interface AggregatedTokenRate {
+  tokensPerSec: number;
+  /** (#2885) `true` when ANY contributing execution's reading is carried
+   *  forward rather than freshly measured from its own two most recent
+   *  same-turn heartbeats — the caller dims the number instead of showing
+   *  it as a fresh sample. Kept OUT of `tokensPerSec` itself (no separate
+   *  "carried total") since a caller only ever renders one dimmed/not-dimmed
+   *  number for the whole reading, matching the run tile and fleet card's
+   *  existing single-number renderers. */
+  carried: boolean;
+}
+
 /** Aggregate tok/s across several running executions — a fleet machine
  * card's total across its `runningSessionIds`. Sums each execution's
  * current reading; an execution with no reading yet (fresh, or stalled
@@ -428,9 +536,10 @@ export function liveStateLabel(reading: LiveStateReading): string {
  * it. Returns `null` only when NOT ONE execution has a reading, so the
  * caller can distinguish "genuinely 0 tok/s right now" reporting from
  * "nothing to report yet" (though today both render the same "0"). */
-export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: number): number | null {
+export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: number): AggregatedTokenRate | null {
   let any = false;
   let total = 0;
+  let carried = false;
   for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
     // Only an execution that is generating right now contributes: a resting
     // or tool-running one still has a "last rate" from its last turn, and a
@@ -440,7 +549,33 @@ export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: n
     if (reading) {
       total += reading.tokensPerSec;
       any = true;
+      if (reading.carried) carried = true;
     }
   }
-  return any ? total : null;
+  return any ? { tokensPerSec: total, carried } : null;
+}
+
+/** (#2886 pass 3, "STALL while disconnected") Whether a `"stalled"` reading
+ *  may be trusted, or must be treated as "we cannot say". A stall is a claim
+ *  that the RUN has gone silent; when the PAGE has lost its own connection
+ *  to the daemon, no new record could have arrived regardless of what the
+ *  run is actually doing, so the same 30s silence means something
+ *  different — the run might be generating right now. `connected` is read
+ *  by the caller from the SAME liveness source the header renders
+ *  (`hooks/useLiveTail.ts`'s `LiveTailStatus`) — this function adds no
+ *  second liveness mechanism of its own; it only knows a boolean.
+ *
+ *  Only `"stalled"` is downgraded. Every other state
+ *  (`generating`/`rest`/`tools`/`prompt`) is read from records already in
+ *  hand, which a lost connection does not retroactively invalidate — those
+ *  may be a little stale, not actively WRONG the way a false STALL claim is.
+ *
+ *  Returns `null` on a downgrade — the exact "no live execution" reading
+ *  both callers already render as every lamp off and no rate
+ *  (`ScopeLamps`'s `state === null` branch, `TokenScope`'s `tone="none"`),
+ *  so "no signal" needs no new visual vocabulary, only a caller that knows
+ *  the connection is down. */
+export function liveStateWhileConnected(reading: LiveStateReading | null, connected: boolean): LiveStateReading | null {
+  if (!connected && reading?.state === "stalled") return null;
+  return reading;
 }

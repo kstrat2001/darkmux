@@ -245,6 +245,81 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(tile?.sub).toBe("avg");
   });
 
+  // (#2886) A checkpointed turn is excluded from the finished-run average,
+  // and the tile says how many of the paired turns were billed.
+  it("a FINISHED run's TOK/S excludes a checkpointed turn and labels 'avg · N of M turns'", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // Turn 1: ordinary, billed. 20 tokens / 0.2s = 100 tok/s.
+      { ts: "2026-01-01T00:00:00.200Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 200 } },
+      { ts: "2026-01-01T00:00:00.200Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 1, completion_tokens: 20 } },
+      // Turn 2: checkpointed. Huge generation_ms, tiny billed tokens — must
+      // not drag the average down.
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 2, generation_ms: 220_000 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 2, completion_tokens: 91 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.checkpoint", payload: { turn_seq: 2, checkpoint: 1, verdict: "conclude" } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 111 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const tile = view.metrics.find((m) => m.label === "TOK/S");
+    expect(tile?.value).toBe("100");
+    expect(tile?.sub).toBe("avg · 1 of 2 turns");
+  });
+
+  it("a FINISHED run's TOK/S shows '—' (not a wrong number) when EVERY paired turn is checkpointed", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 220_000 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 1, completion_tokens: 91 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.checkpoint", payload: { turn_seq: 1, checkpoint: 1, verdict: "conclude" } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 91 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const tile = view.metrics.find((m) => m.label === "TOK/S");
+    expect(tile?.value).toBe("—");
+  });
+
+  // (#2885) A short turn's own first heartbeat carries the previous turn's
+  // measured rate rather than reading "no reading yet".
+  it("a live run's scope carries the last measured rate into a new turn's lone first heartbeat", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:00Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:02Z");
+    const beat3Ms = Date.parse("2026-01-01T00:00:22Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:00Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 0, turn_seq: 1 } },
+      { ts: "2026-01-01T00:00:02Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 800, turn_seq: 1 } },
+      { ts: "2026-01-01T00:00:22Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat3Ms, generated_chars: 50, turn_seq: 2 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1", beat3Ms);
+    expect(view.liveTokScope).not.toBeNull();
+    // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
+    expect(view.liveTokScope!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(view.liveTokScope!.carried).toBe(true);
+  });
+
+  // (#2886 pass 3, "STALL while disconnected") A page that has lost its own
+  // connection to the daemon must not claim the run stalled from the same
+  // silence a healthy connection just hasn't reported yet.
+  it("reads no live state (not stalled) when disconnected, even past STALL_AFTER_MS", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    const nowMs = beat2Ms + 60_000; // well past STALL_AFTER_MS (30s)
+    // Connected (the default): reads stalled, as before.
+    const connectedView = runRegions(flowToRenderModel(data), "s1", nowMs, true);
+    expect(connectedView.liveTokScope!.stalled).toBe(true);
+    expect(connectedView.liveTokScope!.state).toBe("stalled");
+    // Disconnected: the SAME records and clock must not read stalled.
+    const disconnectedView = runRegions(flowToRenderModel(data), "s1", nowMs, false);
+    expect(disconnectedView.liveTokScope!.stalled).toBe(false);
+    expect(disconnectedView.liveTokScope!.state).toBeNull();
+  });
+
   it("an errored (non-killed) dispatch names the exit code and reads red", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
