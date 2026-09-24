@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { isLiveRoute, parseRoute, showsEventLog, type Route } from "./route";
+import { isLiveRoute, parseRoute, showsEventLog, tokRateConnectionEvidence, type Route } from "./route";
 
 function setHash(hash: string) {
   window.location.hash = hash;
@@ -496,5 +496,46 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
   it("an unrelated darkmux meta does not make a page static — flow-src is the signal", () => {
     injectMeta("darkmux-mode", "play");
     expect(isLiveRoute({ kind: "fleet" })).toBe(true);
+  });
+});
+
+// (#2886 pass 4, do-it — fresh-reviewer finding 5+7) `tokRateConnectionEvidence`
+// is the fold `App.tsx`'s `renderRoute` used to inline — extracted here so it
+// has its own tests that don't need to import `App.tsx` (and drag in
+// `MissionGraphLens`'s `reactflow` dependency, unavailable in this checkout).
+describe("tokRateConnectionEvidence", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+  });
+
+  it("behind a daemon: follows the real liveStatus and passes lastContactMs through", () => {
+    expect(tokRateConnectionEvidence({ kind: "fleet" }, "live", 12_345)).toEqual({ connected: true, lastContactMs: 12_345 });
+    expect(tokRateConnectionEvidence({ kind: "fleet" }, "reconnecting", 12_345)).toEqual({ connected: false, lastContactMs: 12_345 });
+  });
+
+  it("a playback route is always connected, with lastContactMs withheld — never live-tail-backed regardless of liveStatus", () => {
+    const route: Route = { kind: "playback", date: "2026-08-07" };
+    expect(tokRateConnectionEvidence(route, "reconnecting", 12_345)).toEqual({ connected: true, lastContactMs: null });
+    expect(tokRateConnectionEvidence(route, "live", 12_345)).toEqual({ connected: true, lastContactMs: null });
+  });
+
+  it("a static/demo build is always connected, with lastContactMs withheld, even though liveStatus sits at reconnecting forever", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    // A static build's `useLiveTail` never runs, so its `liveStatus` is
+    // pessimistically stuck at "reconnecting" — that must NOT read as "no
+    // signal" on the demo, and `lastContactMs` (a stale ref value with no
+    // real contact behind it) must not leak through either.
+    expect(tokRateConnectionEvidence({ kind: "fleet" }, "reconnecting", 999_999_999)).toEqual({ connected: true, lastContactMs: null });
+  });
+
+  it("null lastContactMs passes through unchanged on a live route", () => {
+    expect(tokRateConnectionEvidence({ kind: "dispatch", dispatchId: "s1" }, "live", null)).toEqual({ connected: true, lastContactMs: null });
   });
 });

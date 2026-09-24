@@ -62,15 +62,28 @@ export type LiveTailStatus = "live" | "reconnecting";
  * brief reconnect gap is still caught without re-pulling the whole day. */
 const RECONCILE_OVERLAP_MS = 30 * 60 * 1000;
 
-/** Injectable seams for testing — none of these are ever passed in
- * production (`App.tsx` calls `useLiveTail(enabled)` with no second arg),
- * matching `lib/sse.ts`'s own factory-injection precedent. */
+/** Injectable seams for testing — `eventSourceFactory`/`fetchImpl`/`tickMs`
+ * are never passed in production (`App.tsx` calls `useLiveTail(enabled)`
+ * with no second arg for those three), matching `lib/sse.ts`'s own
+ * factory-injection precedent. `onContact` is the one exception: `App.tsx`
+ * DOES pass it in production — see its own doc. */
 export interface UseLiveTailDeps {
   eventSourceFactory?: (url: string) => EventSource;
   fetchImpl?: typeof fetchJson;
   /** Overrides the 5s ticker (`PRESENCE_POLL_MS`) — tests use this to avoid
    * waiting on real wall-clock intervals. */
   tickMs?: number;
+  /** (#2886 pass 4, "half-open connection race") Invoked with `Date.now()`
+   * every time this hook records CONTACT with the daemon — the exact same
+   * events that drive `markContact()` below and the silence watchdog's own
+   * `lastContactMs`. Exposing it this way, rather than changing this hook's
+   * return value from a bare `LiveTailStatus` to a richer object, keeps
+   * every existing `LiveTailStatus` consumer (`Masthead`, `MachineDrawer`,
+   * `PhoneDrawer`, `machineStatsContent`) untouched — only `App.tsx` (the
+   * one caller) reads the extra signal, by writing it into a ref rather
+   * than `useState`, so a message every ~2s never forces a re-render on its
+   * own; see `App.tsx`'s own doc. */
+  onContact?: (ms: number) => void;
 }
 
 /** `nd!==LIVE_ES_DATE` viewer.html:3792's reload half —
@@ -139,7 +152,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
   // "live" on a real `onOpen` fixes both: a route where streaming is
   // impossible now correctly reports "reconnecting" for its whole life.
   const [status, setStatus] = useState<LiveTailStatus>("reconnecting");
-  const { eventSourceFactory, fetchImpl, tickMs } = deps;
+  const { eventSourceFactory, fetchImpl, tickMs, onContact } = deps;
 
   useEffect(() => {
     if (!enabled) return;
@@ -171,6 +184,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
     let lastContactMs = Date.now();
     const markContact = () => {
       lastContactMs = Date.now();
+      onContact?.(lastContactMs);
     };
     const runReconcile = (date: string) => {
       void reconcile(queryClient, date, doFetch).then((contacted) => {
@@ -252,7 +266,7 @@ export function useLiveTail(enabled: boolean, deps: UseLiveTailDeps = {}): LiveT
       clearInterval(timer);
       handle?.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- eventSourceFactory/fetchImpl/tickMs are test-only seams, stable (undefined) in production.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- eventSourceFactory/fetchImpl/tickMs are test-only seams, stable (undefined) in production; onContact IS passed in production but App.tsx gives it a stable (useCallback) identity, so omitting it here costs nothing and avoids tearing this effect down on every App render.
   }, [enabled, queryClient, eventSourceFactory, fetchImpl, tickMs]);
 
   return status;

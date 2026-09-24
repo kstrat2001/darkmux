@@ -124,6 +124,35 @@ describe("useLiveTail", () => {
     unmount();
   });
 
+  // (#2886 pass 4, finding 5 — "half-open connection race") `onContact`
+  // exposes the SAME `markContact()` bookkeeping the watchdog itself reads
+  // — every event that counts as contact for the watchdog must also fire
+  // this callback with that moment's timestamp, so a caller (the tok/s
+  // scope) can tell a genuine stall from a half-open gap the watchdog
+  // hasn't noticed yet.
+  it("calls onContact with the current time on open and on every message — the same events the watchdog counts", () => {
+    const queryClient = new QueryClient();
+    const onContact = vi.fn();
+    const { unmount } = renderHook(() => useLiveTail(true, { eventSourceFactory: factory, tickMs: 5000, onContact }), {
+      wrapper: wrapper(queryClient),
+    });
+
+    expect(onContact).not.toHaveBeenCalled();
+
+    act(() => {
+      MockEventSource.instances[0].open();
+    });
+    expect(onContact).toHaveBeenLastCalledWith(Date.now());
+
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+      MockEventSource.instances[0].emit(JSON.stringify({ action: "dispatch.start", ts: "2026-08-09T12:00:01Z" }));
+    });
+    expect(onContact).toHaveBeenLastCalledWith(Date.now());
+
+    unmount();
+  });
+
   it("does NOT reconcile on the very first connect, but DOES on every reconnect after (#1480 part 1)", async () => {
     const queryClient = new QueryClient();
     const { calls, impl } = makeFetchImpl(() => ({ ok: true, data: [] }));

@@ -23,7 +23,7 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateLiveState, aggregateTokenRate, liveExecutions, liveStateWhileConnected } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, lastHeartbeatMs, liveExecutions, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
@@ -501,6 +501,14 @@ export function buildFleetCard(
    * before; `FleetLens.tsx`'s live-mode render is the one caller that
    * passes the real value. */
   connected = true,
+  /** (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+   * race") The last moment the page confirmed contact with the daemon
+   * (`App.tsx`'s `lastContactRef`, sourced from `useLiveTail`'s
+   * `onContact`) — `null` when unknown (tests, a replay call, or a
+   * genuinely never-live route), in which case the half-open check inside
+   * `liveStateWhileConnected` is skipped and only `connected` governs, same
+   * as before this parameter existed. */
+  lastContactMs: number | null = null,
 ): FleetCard {
   const flowActive = machActive(data, liveSet, m, t);
   const labRunning = runningLabRunCount(machineRuns);
@@ -595,12 +603,28 @@ export function buildFleetCard(
   // deriveLiveState`'s own doc. `liveTokStalled` is now DERIVED from it
   // (`=== "stalled"`) rather than a second, separately-computed "every
   // running session's heartbeats are stale" check.
-  // (#2886 pass 3, "STALL while disconnected") Downgraded the same way the
-  // run page's `sessionRun.ts` downgrades it — see
+  // (#2886 pass 3, "STALL while disconnected"; pass 4 finding 5, "half-open
+  // connection race") Downgraded the same way the run page's
+  // `sessionRun.ts` downgrades it — see
   // `lib/tokenRate.ts::liveStateWhileConnected`'s own doc. `connected`
   // defaults to `true`, so this is a no-op for every caller that doesn't
   // pass it (tests, and a replay call, where disconnection is meaningless).
-  const liveTokLiveState = liveTokRecordSets.length > 0 ? liveStateWhileConnected(aggregateLiveState(liveTokRecordSets, t), connected) : null;
+  // `lastHeartbeatMs` is this MACHINE's most recent heartbeat across its
+  // running sessions — the deadline the half-open check compares
+  // `lastContactMs` against; `null` when unknown skips that check too.
+  const liveTokLiveState =
+    liveTokRecordSets.length > 0
+      ? liveStateWhileConnected(
+          aggregateLiveState(liveTokRecordSets, t),
+          connected,
+          // Only construct the half-open evidence when this caller actually
+          // HAS it — `lastContactMs === null` means "not wired for this
+          // route" (App.tsx's own fold), not "confirmed no contact ever",
+          // and must skip the check entirely rather than distrust every
+          // stall on principle.
+          lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs(liveTokRecordSets) } : undefined,
+        )
+      : null;
   const liveTokStalled = liveTokLiveState?.state === "stalled";
   // While the machine has a running execution the scope stays mounted: at 0
   // with its state word when nothing is generating (resting, tools, reading

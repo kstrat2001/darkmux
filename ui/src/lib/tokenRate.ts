@@ -125,16 +125,30 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
   return chars / tokens;
 }
 
-/** Every turn_seq with at least one `dispatch.checkpoint` record — the
- *  harness's own record that the reasoning checkpoint judged this turn
- *  mid-stream (`crates/darkmux-crew/src/dispatch_internal.rs`'s
- *  `"dispatch.checkpoint" =>` handler forwards `turn_seq` on the payload).
+/** Every turn_seq with at least one CUTTING `dispatch.checkpoint` record —
+ *  the harness's own record that the reasoning checkpoint forced this turn
+ *  to conclude mid-stream (`crates/darkmux-crew/src/dispatch_internal.rs`'s
+ *  `"dispatch.checkpoint" =>` handler forwards `turn_seq`/`verdict` on the
+ *  payload; the runtime side, `runtime/src/loop_runner.rs`, sets
+ *  `verdict: if degenerate { "conclude" } else { "continue" }` — `conclude`
+ *  is the ONLY verdict that hands the model a forced prefill and ends the
+ *  call early).
+ *
+ *  (#2886 pass 4, MUST — fresh-reviewer finding 1) A `continue` verdict did
+ *  NOT cut anything: the checkpoint judged the turn mid-thought and let it
+ *  keep going, so its `telemetry.tokens` bills the turn normally and it
+ *  must stay in both the calibration and the average. Excluding EVERY
+ *  checkpointed turn (the pre-pass-4 behavior) is the same class of bug
+ *  this whole pass exists to fix — a real 6-turn run read 102 tok/s
+ *  "avg · 5 of 6 turns" instead of ~210, because its one `continue`
+ *  checkpoint (a genuinely fine, fully-billed turn) was thrown out too.
+ *
  *  Shared by `measuredCharsPerToken` and `averageGenerationRate` (#2886) so
  *  the two derivations can't disagree on what counts as checkpointed. */
 function checkpointedTurns(records: FlowRecord[]): Set<unknown> {
   const out = new Set<unknown>();
   for (const r of records) {
-    if (r.action === "dispatch.checkpoint") out.add(fields(r).turn_seq);
+    if (r.action === "dispatch.checkpoint" && fields(r).verdict === "conclude") out.add(fields(r).turn_seq);
   }
   return out;
 }
@@ -237,7 +251,15 @@ export interface TokenRateReading {
  * the tile to read dead while the lamp says GEN. When the current turn
  * hasn't produced a pair yet, this falls back to `carriedTokenRate`, which
  * scans backward for the most recent turn that DID, per the issue's
- * "carry... the previous turn's, or the run's most recent reading". */
+ * "carry... the previous turn's, or the run's most recent reading".
+ *
+ * (#2886 pass 4, MUST — fresh-reviewer finding 3) A reasoning checkpoint
+ * restarts `generated_chars` WITHIN the same turn_seq (real shapes measured:
+ * 119,547 -> 1; 74,617 -> 3) — the current turn's own last two heartbeats
+ * then read a negative Δchars and `charsPerSecond` returns `null`. That is
+ * also a "nothing to read from THIS pair" case, same as the other two
+ * branches above, so it falls back to the carry too instead of surfacing
+ * `null` outright. */
 export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null {
   const samples = heartbeatSamples(records);
   if (samples.length < 2) return carriedTokenRate(records, samples);
@@ -247,7 +269,7 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
   // with the previous turn's last spans the tool gap and read near 0.
   if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return carriedTokenRate(records, samples);
   const cps = charsPerSecond(prev, next);
-  if (cps === null) return null;
+  if (cps === null) return carriedTokenRate(records, samples);
   const charsPerToken = measuredCharsPerToken(records);
   return { tokensPerSec: cps / charsPerToken, atMs: next.atMs, estimate: true };
 }
@@ -257,14 +279,24 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
  *  in-flight one) that did measure a rate — and returns it marked
  *  `carried: true`. `records`/`samples` cover the same set; `samples` is
  *  passed in rather than recomputed since every caller already has it.
- *  Returns `null` when no same-turn pair exists anywhere (a genuinely fresh
- *  execution), matching `currentTokenRate`'s pre-#2885 behavior for that
- *  case. */
+ *  Returns `null` when no such pair exists anywhere (a genuinely fresh
+ *  execution, or every pair so far spans only prompt reading), matching
+ *  `currentTokenRate`'s pre-#2885 behavior for that case.
+ *
+ *  (#2886 pass 4, MUST — fresh-reviewer finding 2) A pair whose EARLIER
+ *  sample reads `generated_chars: 0` is skipped, not carried. Every turn
+ *  opens with a heartbeat at 0 chars sent before the first token, so that
+ *  pair's span covers prompt reading (and whatever "still thinking" gap
+ *  precedes the first token), not generation — carrying it read as a
+ *  dimmed near-zero rate under a lit GEN lamp on the very next turn (real
+ *  shape: turn 3 went 0 -> 4 chars over 13s). The scan keeps going past it
+ *  for the most recent pair with real progress. */
 function carriedTokenRate(records: FlowRecord[], samples: HeartbeatSample[]): TokenRateReading | null {
   for (let i = samples.length - 1; i > 0; i--) {
     const next = samples[i];
     const prev = samples[i - 1];
     if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) continue;
+    if (prev.chars === 0) continue;
     const cps = charsPerSecond(prev, next);
     if (cps === null) continue;
     const charsPerToken = measuredCharsPerToken(records);
@@ -429,7 +461,15 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // is checked AFTER the markers, so a turn end or a rest recorded in the
   // seconds after the last heartbeat is shown at once rather than being
   // masked as "generating" until the stall threshold passes.
-  if (lastBeatAt !== null && !isStalled(cut, nowMs)) return { state: "generating" };
+  //
+  // (#2886 pass 4, CONSIDER-do-it — fresh-reviewer finding 4) A fresh
+  // heartbeat reading `generated_chars: 0` is the turn's OWN opener,
+  // emitted before the first token — the model is still reading the
+  // prompt / thinking, not generating yet. Lighting GEN here would drive
+  // the wave over a stretch that hasn't produced anything.
+  if (lastBeatAt !== null && !isStalled(cut, nowMs)) {
+    return beats[beats.length - 1].chars === 0 ? { state: "prompt" } : { state: "generating" };
+  }
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
 }
 
@@ -555,6 +595,23 @@ export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: n
   return any ? { tokensPerSec: total, carried } : null;
 }
 
+/** The most recent `dispatch.turn.heartbeat` sample across several
+ *  executions' records — `null` when none of them has ever produced one.
+ *  (#2886 pass 4, finding 5) This is the timestamp
+ *  `liveStateWhileConnected`'s half-open check compares the daemon's last
+ *  confirmed contact against: the deadline a genuine stall claim needs
+ *  contact evidence AFTER. */
+export function lastHeartbeatMs(perExecutionRecords: FlowRecord[][]): number | null {
+  let latest: number | null = null;
+  for (const recs of perExecutionRecords) {
+    const samples = heartbeatSamples(recs);
+    if (!samples.length) continue;
+    const at = samples[samples.length - 1].atMs;
+    if (latest === null || at > latest) latest = at;
+  }
+  return latest;
+}
+
 /** (#2886 pass 3, "STALL while disconnected") Whether a `"stalled"` reading
  *  may be trusted, or must be treated as "we cannot say". A stall is a claim
  *  that the RUN has gone silent; when the PAGE has lost its own connection
@@ -563,7 +620,8 @@ export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: n
  *  different — the run might be generating right now. `connected` is read
  *  by the caller from the SAME liveness source the header renders
  *  (`hooks/useLiveTail.ts`'s `LiveTailStatus`) — this function adds no
- *  second liveness mechanism of its own; it only knows a boolean.
+ *  second liveness mechanism of its own; it only knows a boolean (and,
+ *  below, a timestamp read from that same source).
  *
  *  Only `"stalled"` is downgraded. Every other state
  *  (`generating`/`rest`/`tools`/`prompt`) is read from records already in
@@ -574,8 +632,34 @@ export function aggregateTokenRate(perExecutionRecords: FlowRecord[][], nowMs: n
  *  both callers already render as every lamp off and no rate
  *  (`ScopeLamps`'s `state === null` branch, `TokenScope`'s `tone="none"`),
  *  so "no signal" needs no new visual vocabulary, only a caller that knows
- *  the connection is down. */
-export function liveStateWhileConnected(reading: LiveStateReading | null, connected: boolean): LiveStateReading | null {
-  if (!connected && reading?.state === "stalled") return null;
+ *  the connection is down.
+ *
+ *  (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+ *  race") `STALL_AFTER_MS` (30s) can fire before the header's own watchdog
+ *  notices the connection dropped (`LIVE_CONTACT_TIMEOUT_MS`, ~40s,
+ *  `hooks/useLiveTail.ts`) — a half-open connection (the host slept, the
+ *  path went away with no TCP reset) delivers no visible `error` event, so
+ *  `connected` stays `true` for that whole gap while heartbeats have
+ *  already gone silent. `halfOpen`, when provided, closes it: a stall is
+ *  trusted only when the daemon has answered (`lastContactMs` — the SAME
+ *  `useLiveTail` bookkeeping the header's watchdog itself reads, exposed
+ *  rather than re-derived) AFTER the deadline the stalled execution's own
+ *  last heartbeat (`lastHeartbeatMs`) missed — i.e. `lastContactMs >=
+ *  lastHeartbeatMs + STALL_AFTER_MS`. Omitted entirely (the pre-pass-4
+ *  2-arg call), this check is skipped and only the coarse `connected`
+ *  boolean governs — every existing caller/test that doesn't pass it is
+ *  unaffected. Also skipped when `lastHeartbeatMs` is itself `null` —
+ *  nothing to compare a contact deadline against. */
+export function liveStateWhileConnected(
+  reading: LiveStateReading | null,
+  connected: boolean,
+  halfOpen?: { lastContactMs: number | null; lastHeartbeatMs: number | null },
+): LiveStateReading | null {
+  if (reading?.state !== "stalled") return reading;
+  if (!connected) return null;
+  if (halfOpen && halfOpen.lastHeartbeatMs != null) {
+    const deadline = halfOpen.lastHeartbeatMs + STALL_AFTER_MS;
+    if (halfOpen.lastContactMs == null || halfOpen.lastContactMs < deadline) return null;
+  }
   return reading;
 }

@@ -14,6 +14,7 @@ import {
   averageGenerationRate,
   liveStateLabel,
   liveStateWhileConnected,
+  lastHeartbeatMs,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -156,6 +157,35 @@ describe("measuredCharsPerToken", () => {
     const ratio = measuredCharsPerToken([turnBeat(2, 1_000, 74_617), turnTokens(2, 91), checkpoint(2)]);
     expect(ratio).toBe(DEFAULT_CHARS_PER_TOKEN);
   });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 1) A `continue` checkpoint
+  // did NOT cut the stream — the harness judged the turn mid-thought and let
+  // it keep going, so its telemetry.tokens bills the WHOLE turn normally.
+  // Only `verdict: "conclude"` (the harness forcing a hand-off) actually
+  // truncates. Real shape, session
+  // `darkmux-coding-refresh-rotation-1790243027020` turn 2: checkpointed
+  // with `verdict: "continue"`, still billed normally.
+  const continueCheckpoint = (turn: number): FlowRecord =>
+    ({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "continue" } }) as unknown as FlowRecord;
+
+  it("does NOT exclude a turn whose checkpoint verdict is 'continue' — it billed normally", () => {
+    const ratio = measuredCharsPerToken([turnBeat(2, 1_000, 8_050), continueCheckpoint(2), turnTokens(2, 2_300)]);
+    // 8,050 / 2,300 ≈ 3.5 chars/token, the real measured ratio — must NOT
+    // fall back to DEFAULT_CHARS_PER_TOKEN as if this turn were excluded.
+    expect(ratio).toBeCloseTo(8_050 / 2_300, 5);
+  });
+
+  it("a turn with BOTH a continue and a later conclude checkpoint is still excluded (the conclude cut it)", () => {
+    const ratio = measuredCharsPerToken([
+      turnBeat(2, 1_000, 74_617),
+      continueCheckpoint(2),
+      turnTokens(2, 91),
+      checkpoint(2),
+      turnBeat(3, 5_000, 7_227),
+      turnTokens(3, 1_943),
+    ]);
+    expect(ratio).toBeCloseTo(7_227 / 1_943, 5);
+  });
 });
 
 describe("currentTokenRate", () => {
@@ -184,9 +214,12 @@ describe("currentTokenRate", () => {
   it("carries the last measured rate into a new turn's lone first heartbeat, marked carried", () => {
     const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
       ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
-    // Turn 1: 800 chars over 2s = 400 chars/s -> 100 tok/s at the default 4
-    // chars/token. Turn 2's own first (and only) sample follows 20s later.
-    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 50, 2)]);
+    // Turn 1: opens at 0 (every turn does — finding 2), then 800 chars over
+    // 2s, then another 800 over 2s = 400 chars/s -> 100 tok/s at the
+    // default 4 chars/token. The carry must read the (800, 1600) pair, not
+    // the opening (0, 800) one (finding 2). Turn 2's own first (and only)
+    // sample follows 18s later.
+    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(5_000, 1_600, 1), hbT(23_000, 50, 2)]);
     expect(reading).not.toBeNull();
     expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
     expect(reading!.carried).toBe(true);
@@ -194,6 +227,67 @@ describe("currentTokenRate", () => {
 
   it("is null, not carried, with only ONE heartbeat ever (nothing to carry from)", () => {
     expect(currentTokenRate([beat(1_000, 40)])).toBeNull();
+  });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 2) Every turn opens with a
+  // heartbeat at `generated_chars: 0`, sent before the first token — a pair
+  // whose EARLIER sample is 0 chars spans prompt reading, not generation,
+  // and reads near-zero. Real shape, session
+  // `darkmux-coding-refresh-rotation-1790243027020`: turn 3 went 0 -> 4
+  // chars over 13s; turn 4 then showed a dimmed "0" on a flat ring. The
+  // carry must skip that near-zero pair and reach further back for the
+  // most recent pair with real progress.
+  it("never carries a pair whose earlier sample is 0 chars — reaches further back for real progress", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [
+      // Turn 2: opens at 0 (every turn does), then real progress: 800 chars
+      // over 2s, then another 800 over 2s = 400 chars/s -> 100 tok/s.
+      hbT(0, 0, 2),
+      hbT(2_000, 800, 2),
+      hbT(4_000, 1_600, 2),
+      // Turn 3: near-zero — its earlier sample (0) must be skipped, not carried.
+      hbT(10_000, 0, 3),
+      hbT(23_000, 4, 3),
+      // Turn 4: lone first heartbeat — nothing of its own to read from yet.
+      hbT(30_000, 1, 4),
+    ];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+  });
+
+  it("returns null (not a near-zero carry) when the ONLY prior pair has a 0-chars earlier sample", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [hbT(0, 0, 3), hbT(13_000, 4, 3), hbT(30_000, 1, 4)];
+    expect(currentTokenRate(records)).toBeNull();
+  });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 3) After a checkpoint,
+  // `generated_chars` restarts within the SAME turn_seq (real shapes:
+  // 119,547 -> 1; 74,617 -> 3), so the current turn's own last two
+  // heartbeats read a NEGATIVE Δchars and `charsPerSecond` returns null.
+  // Before this fix `currentTokenRate` returned null right there without
+  // ever trying the carried rate — must fall back instead.
+  it("falls back to the carried rate when the current turn's own last pair has restarted (post-checkpoint) chars", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [
+      // Turn 4: real progress to carry from. 800 chars/2s = 400 chars/s.
+      hbT(0, 0, 4),
+      hbT(2_000, 800, 4),
+      hbT(4_000, 1_600, 4),
+      // Turn 5 (current): a checkpoint reset the counter mid-turn — the
+      // SAME turn_seq's own last pair goes backward (119,547 -> 1).
+      hbT(6_000, 119_547, 5),
+      hbT(8_000, 1, 5),
+    ];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
   });
 });
 
@@ -234,8 +328,10 @@ describe("aggregateTokenRate", () => {
   it("marks the aggregate carried when any contributing execution's own reading is carried", () => {
     const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
       ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
-    // exec1: turn 1 measured, then turn 2's lone first sample — carried.
-    const exec1 = [hbT(0, 0, 1), hbT(2_000, 400, 1), hbT(23_000, 50, 2)];
+    // exec1: turn 1 opens at 0, then two real-progress intervals, then
+    // turn 2's lone first sample — carried (from turn 1's second interval,
+    // not its 0-opening one — finding 2).
+    const exec1 = [hbT(0, 0, 1), hbT(2_000, 400, 1), hbT(4_000, 800, 1), hbT(23_000, 50, 2)];
     // exec2: an ordinary fresh same-turn pair — not carried.
     const exec2 = [beat(23_000, 0), beat(25_000, 200)];
     const reading = aggregateTokenRate([exec1, exec2], 25_500);
@@ -269,6 +365,22 @@ const restAnnounceOnly = (atMs: number): FlowRecord =>
 describe("deriveLiveState", () => {
   it("is generating while a heartbeat is fresh — same threshold currentTokenRate uses", () => {
     const recs = [beat(1_000, 40), beat(3_000, 120)];
+    expect(deriveLiveState(recs, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "generating" });
+  });
+
+  // (#2886 pass 4, CONSIDER-do-it — fresh-reviewer finding 4) A turn whose
+  // only heartbeat(s) read `generated_chars: 0` is still reading the prompt
+  // / thinking before its first token — GENERATING would light the lamp and
+  // drive the wave over a stretch that hasn't produced anything yet.
+  it("is prompt, not generating, while the only fresh heartbeat(s) read 0 chars", () => {
+    const oneZero = [beat(1_000, 0)];
+    expect(deriveLiveState(oneZero, 1_000 + STALL_AFTER_MS - 1)).toEqual({ state: "prompt" });
+    const twoZero = [beat(1_000, 0), beat(3_000, 0)];
+    expect(deriveLiveState(twoZero, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "prompt" });
+  });
+
+  it("is generating once the fresh heartbeat shows real progress, even right after a 0-chars opener", () => {
+    const recs = [beat(1_000, 0), beat(3_000, 40)];
     expect(deriveLiveState(recs, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "generating" });
   });
 
@@ -439,6 +551,23 @@ describe("averageGenerationRate", () => {
     const reading = averageGenerationRate([[turn("a", 1, 220_000), tok("a", 1, 91), checkpoint("a", 1)]]);
     expect(reading).toEqual({ tokensPerSec: null, billedTurns: 0, totalTurns: 1 });
   });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 1) Real shape, session
+  // `darkmux-coding-refresh-rotation-1790243027020` turn 2: checkpointed
+  // with `verdict: "continue"` — NOT cut, billed 32,000 + 1,803 = 33,803
+  // completion tokens over 127,348 ms of generation (~265 tok/s). Excluding
+  // it (treating `continue` the same as `conclude`) is the bug that made
+  // this run read 102 tok/s "avg · 5 of 6 turns" instead of ~210.
+  const continueCheckpoint = (sid: string, seq: number): FlowRecord =>
+    ({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "continue" } }) as unknown as FlowRecord;
+
+  it("does NOT exclude a turn whose checkpoint verdict is 'continue' from the average", () => {
+    const reading = averageGenerationRate([[turn("a", 2, 127_348), tok("a", 2, 33_803), continueCheckpoint("a", 2)]]);
+    expect(reading).not.toBeNull();
+    expect(reading!.billedTurns).toBe(1);
+    expect(reading!.totalTurns).toBe(1);
+    expect(reading!.tokensPerSec).toBeCloseTo(33_803 / (127_348 / 1000), 5);
+  });
 });
 
 describe("liveStateLabel", () => {
@@ -468,6 +597,71 @@ describe("liveStateWhileConnected", () => {
   it("passes a null reading through unchanged regardless of connection", () => {
     expect(liveStateWhileConnected(null, false)).toBeNull();
     expect(liveStateWhileConnected(null, true)).toBeNull();
+  });
+
+  // (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+  // race") STALL_AFTER_MS (30s) can fire before the header's own watchdog
+  // notices a half-open connection (LIVE_CONTACT_TIMEOUT_MS, ~40s) — a
+  // half-open connection delivers no visible `error` event, so `connected`
+  // stays `true` while heartbeats have already gone silent. A stall claim
+  // is trusted only when the daemon has answered (`lastContactMs`) AFTER
+  // the point the stalled execution's own last heartbeat
+  // (`lastHeartbeatMs`) plus STALL_AFTER_MS — i.e. after the deadline that
+  // heartbeat missed.
+  describe("the half-open connection race (finding 5)", () => {
+    const lastBeat = 1_000_000;
+
+    it("trusts a stalled reading when contact is confirmed AFTER the stall deadline", () => {
+      const halfOpen = { lastContactMs: lastBeat + STALL_AFTER_MS + 1, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toEqual({ state: "stalled" });
+    });
+
+    it("downgrades to no-signal when the last confirmed contact predates the stall deadline", () => {
+      // Contact was confirmed, but BEFORE the point a stall claim needs one.
+      const halfOpen = { lastContactMs: lastBeat + STALL_AFTER_MS - 1, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toBeNull();
+    });
+
+    it("downgrades to no-signal when there is no contact evidence at all", () => {
+      const halfOpen = { lastContactMs: null, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toBeNull();
+    });
+
+    it("skips the half-open check entirely when omitted — old 2-arg behavior unchanged", () => {
+      expect(liveStateWhileConnected({ state: "stalled" }, true)).toEqual({ state: "stalled" });
+    });
+
+    it("skips the half-open check when there is no heartbeat to compare against", () => {
+      const halfOpen = { lastContactMs: null, lastHeartbeatMs: null };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toEqual({ state: "stalled" });
+    });
+
+    it("the plain disconnected check still wins outright, before the half-open check ever runs", () => {
+      const halfOpen = { lastContactMs: lastBeat + STALL_AFTER_MS + 1, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, false, halfOpen)).toBeNull();
+    });
+
+    it("never touches a non-stalled reading, even with failing half-open evidence", () => {
+      const halfOpen = { lastContactMs: null, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "generating" }, true, halfOpen)).toEqual({ state: "generating" });
+    });
+  });
+});
+
+describe("lastHeartbeatMs", () => {
+  it("is null when no execution has ever produced a heartbeat", () => {
+    expect(lastHeartbeatMs([[], []])).toBeNull();
+  });
+
+  it("is the MOST RECENT heartbeat across several executions", () => {
+    const execA = [beat(1_000, 40), beat(3_000, 120)];
+    const execB = [beat(2_000, 10), beat(5_000, 90)];
+    expect(lastHeartbeatMs([execA, execB])).toBe(5_000);
+  });
+
+  it("ignores an execution with no heartbeats without throwing", () => {
+    const execA = [beat(1_000, 40)];
+    expect(lastHeartbeatMs([execA, []])).toBe(1_000);
   });
 });
 
@@ -552,12 +746,13 @@ describe("a turn's first reading never pairs with the previous turn", () => {
   it("never pairs a new turn's first sample with the previous turn's last (no near-zero rate across the tool gap)", () => {
     const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
       ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
-    // Turn 1: 800 chars over 2s = 400 chars/s. Turn 2's first sample is 900
-    // chars 20s later — if this paired turn 1's last (800) against turn 2's
-    // first (900) across that 20s gap it would read a near-zero rate
-    // (100 chars / 20s = 5 chars/s); instead it carries turn 1's own
-    // 400 chars/s reading forward.
-    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 900, 2)]);
+    // Turn 1: opens at 0, then 800 chars over 2s, then another 800 over 2s
+    // = 400 chars/s throughout. Turn 2's first sample is 18s later — if
+    // this paired turn 1's last (1,600) against turn 2's first across that
+    // 18s gap it would read a near-zero rate; instead it carries turn 1's
+    // own (800, 1,600) interval — its 0-opening interval is skipped
+    // (finding 2) even though it would have given the same number here.
+    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(5_000, 1_600, 1), hbT(23_000, 900, 2)]);
     expect(reading).not.toBeNull();
     expect(reading!.carried).toBe(true);
     expect(reading!.tokensPerSec).toBeCloseTo(100, 5);

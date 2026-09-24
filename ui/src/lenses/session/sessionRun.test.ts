@@ -284,14 +284,20 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
   it("a live run's scope carries the last measured rate into a new turn's lone first heartbeat", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:00Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:02Z");
-    const beat3Ms = Date.parse("2026-01-01T00:00:22Z");
+    const beat3Ms = Date.parse("2026-01-01T00:00:04Z");
+    const beat4Ms = Date.parse("2026-01-01T00:00:22Z");
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // Turn 1 opens at 0 (every turn does — #2886 pass 4 finding 2), then
+      // two real-progress intervals (400 chars/s each) before turn 2's lone
+      // first heartbeat. The carry must read the SECOND interval, not the
+      // 0-opening one.
       { ts: "2026-01-01T00:00:00Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 0, turn_seq: 1 } },
       { ts: "2026-01-01T00:00:02Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 800, turn_seq: 1 } },
-      { ts: "2026-01-01T00:00:22Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat3Ms, generated_chars: 50, turn_seq: 2 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat3Ms, generated_chars: 1_600, turn_seq: 1 } },
+      { ts: "2026-01-01T00:00:22Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat4Ms, generated_chars: 50, turn_seq: 2 } },
     ];
-    const view = runRegions(flowToRenderModel(data), "s1", beat3Ms);
+    const view = runRegions(flowToRenderModel(data), "s1", beat4Ms);
     expect(view.liveTokScope).not.toBeNull();
     // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
     expect(view.liveTokScope!.tokensPerSec).toBeCloseTo(100, 5);
@@ -318,6 +324,51 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const disconnectedView = runRegions(flowToRenderModel(data), "s1", nowMs, false);
     expect(disconnectedView.liveTokScope!.stalled).toBe(false);
     expect(disconnectedView.liveTokScope!.state).toBeNull();
+    // (#2886 pass 4, finding 7) This IS the connection-downgrade case, so
+    // it must read noSignal — distinct from the "genuinely no live
+    // execution" case covered below.
+    expect(disconnectedView.liveTokScope!.noSignal).toBe(true);
+    expect(connectedView.liveTokScope!.noSignal).toBe(false);
+  });
+
+  // (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+  // race") Same fixture as above — connected=true, but the last confirmed
+  // daemon contact predates the deadline (last heartbeat + STALL_AFTER_MS,
+  // 3,000 + 30,000 = 33,000ms).
+  it("downgrades a stall to no-signal via the half-open check even while connected=true", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    const nowMs = beat2Ms + 60_000;
+    // Contact confirmed BEFORE the 33,000ms-from-epoch deadline.
+    const staleContact = runRegions(flowToRenderModel(data), "s1", nowMs, true, beat2Ms + 29_999);
+    expect(staleContact.liveTokScope!.stalled).toBe(false);
+    expect(staleContact.liveTokScope!.state).toBeNull();
+    expect(staleContact.liveTokScope!.noSignal).toBe(true);
+    // Contact confirmed AFTER the deadline — a genuine, trustworthy stall.
+    const freshContact = runRegions(flowToRenderModel(data), "s1", nowMs, true, beat2Ms + 30_001);
+    expect(freshContact.liveTokScope!.stalled).toBe(true);
+    expect(freshContact.liveTokScope!.state).toBe("stalled");
+    expect(freshContact.liveTokScope!.noSignal).toBe(false);
+  });
+
+  it("never reads noSignal for a genuinely idle run (no live execution) even though state is also null", () => {
+    // A mission's own run-grain session never generates — its own
+    // `dispatch.start` is mission-sourced, so `liveExecutions` excludes it:
+    // there is model work (this session DID start), but no live EXECUTION
+    // to derive a state from. `state` reads null the same as the
+    // disconnected case above, for a wholly unrelated reason — and even
+    // while `connected` is explicitly `false` here, `noSignal` must stay
+    // `false`, since nothing about THIS null came from a connection problem.
+    const data: FlowRecord[] = [{ ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", source: "mission" }];
+    const view = runRegions(flowToRenderModel(data), "s1", Date.parse(BASE_TS) + 1_000, false);
+    expect(view.liveTokScope).not.toBeNull();
+    expect(view.liveTokScope!.state).toBeNull();
+    expect(view.liveTokScope!.noSignal).toBe(false);
   });
 
   it("an errored (non-killed) dispatch names the exit code and reads red", () => {

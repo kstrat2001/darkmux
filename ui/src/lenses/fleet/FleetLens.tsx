@@ -382,6 +382,7 @@ export function FleetLens({
   playhead,
   historical = false,
   connected = true,
+  lastContactMs = null,
 }: {
   records?: FlowRecord[];
   tMax?: number;
@@ -406,6 +407,13 @@ export function FleetLens({
    * would otherwise report a permanent, misleading "reconnecting". See
    * `lib/tokenRate.ts::liveStateWhileConnected`'s own doc. */
   connected?: boolean;
+  /** (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+   * race") `App.tsx`'s `lastContactRef.current` — the last moment
+   * `useLiveTail` confirmed contact with the daemon. `null` (the default)
+   * on every call that doesn't pass it (a `historical` render, or a test),
+   * which skips the half-open check in `buildFleetCard` entirely and falls
+   * back to the plain `connected` boolean — see that function's own doc. */
+  lastContactMs?: number | null;
 } = {}) {
   // (Playback parity, Change A) `wallNow` feeds ONLY the live fetch window
   // below (`useFlowWindow`) — "what is fetched" is the one thing liveMode
@@ -648,6 +656,7 @@ export function FleetLens({
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
           connected,
+          lastContactMs,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -683,10 +692,11 @@ export function FleetLens({
           specBeats,
           undefined,
           connected,
+          lastContactMs,
         ),
       ),
     ],
-    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected],
+    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs],
   );
 
   const timeline = useMemo(

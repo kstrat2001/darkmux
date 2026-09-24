@@ -269,6 +269,7 @@ export function SessionReplay({
   sessionId,
   playhead = null,
   connected = true,
+  lastContactMs = null,
 }: {
   sessionId: string;
   playhead?: number | null;
@@ -285,6 +286,11 @@ export function SessionReplay({
    *  `<SessionReplay sessionId=... />` (every existing test) keeps behaving
    *  as before. */
   connected?: boolean;
+  /** (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+   *  race") `App.tsx`'s `lastContactRef.current`. `null` (the default) on
+   *  every call that doesn't pass it, which skips the half-open check
+   *  entirely — see `runRegions`'s own doc. */
+  lastContactMs?: number | null;
 }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
   // its records ONCE, which is the defect a live dogfood run exposed: the
@@ -549,10 +555,21 @@ export function SessionReplay({
   // modes — no more `ticking ? ... : base` branch selecting between a
   // moving clock and a frozen one keyed on live/playback.
   //
-  // (#2886 pass 3) `connected` matters only while a scope could be showing —
-  // a scrubbed/finished view has no `liveTokScope` to affect either way, so
-  // this is passed unconditionally rather than gated on `playhead`.
-  const view = runRegions(data, sessionId, clockOverride, connected);
+  // (#2886 pass 4, do-it — fresh-reviewer finding 6) A SCRUBBED view
+  // (`playhead !== null`) is looking at a moment in the past, not the live
+  // edge — the page's CURRENT connection status says nothing about whether
+  // that past moment's heartbeats went quiet, so it must never drive a
+  // scrubbed render's STALL/no-signal read. (An earlier version of this
+  // comment claimed a scrubbed/finished view "has no `liveTokScope` to
+  // affect either way" — wrong: a scrubbed view of a run that was STILL
+  // RUNNING as of the playhead has one, and the live `connected` value was
+  // leaking into it.) `effectiveConnected` is `true` whenever scrubbed,
+  // regardless of the real live status, and the half-open evidence
+  // (`lastContactMs`) is withheld the same way — it is equally a fact about
+  // "right now", not about the playhead's moment.
+  const effectiveConnected = connected || playhead !== null;
+  const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails
@@ -686,19 +703,36 @@ export function SessionReplay({
                     // Only the reading goes inside the tube. A state is a
                     // caption about the reading and sits under it: set at
                     // the number's size, "prompt" ran through the ring.
+                    //
+                    // (#2886 pass 4, do-it — fresh-reviewer finding 7) A
+                    // `noSignal` reading (the connection was lost, not the
+                    // run) gets its own visible word, the SAME "no signal"
+                    // the fleet card's rate line already shows — distinct
+                    // from the bare blank a genuine "no live execution"
+                    // reading leaves (that case has nothing wrong to name).
                     centerLabel={
                       view.liveTokScope.state === "generating"
                         ? view.liveTokScope.tokensPerSec != null
                           ? String(Math.round(view.liveTokScope.tokensPerSec))
                           : "—"
-                        : null
+                        : view.liveTokScope.noSignal
+                          ? "no signal"
+                          : null
                     }
                     // (#2885) Dims the number when it's carried forward from
                     // an earlier turn rather than the current one's own two
                     // most recent heartbeats.
                     centerCarried={view.liveTokScope.state === "generating" && view.liveTokScope.carried}
                   />
-                  <ScopeLamps reading={view.liveTokScope} noSignal={!connected} />
+                  {/* (#2886 pass 4, finding 7) `noSignal` is the PRECISE flag
+                      `sessionRun.ts` computes from whether a downgrade
+                      actually fired, not the raw `!connected` this used to
+                      read — that mislabeled a genuinely idle run (no live
+                      execution at all, e.g. a mission between model steps)
+                      as "no signal" whenever the page happened to be
+                      disconnected at the same time, even though THAT null
+                      had nothing to do with the connection. */}
+                  <ScopeLamps reading={view.liveTokScope} noSignal={view.liveTokScope.noSignal} />
                 </div>
               )}
             </div>

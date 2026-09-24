@@ -56,7 +56,7 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, liveStateWhileConnected } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
@@ -195,6 +195,13 @@ export interface SessionRunView {
         /** Present only when `state === "rest"` — whole seconds left in the
          *  reported rest window. */
         restSecondsLeft?: number;
+        /** (#2886 pass 4, finding 7) `true` exactly when `state === null`
+         *  because the connection was lost/half-open, NOT because there is
+         *  genuinely no live execution to have a state for (a mission
+         *  between model steps). The caller uses this to render a DISTINCT
+         *  "no signal" word rather than reusing the ambiguous "no model
+         *  working" wording both cases would otherwise share. */
+        noSignal: boolean;
       }
     | null;
   /** (#2863) Whether the MODEL section shows its model card. False for an
@@ -469,8 +476,15 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
  * behaving exactly as before; `SessionReplay.tsx` is the one caller that
  * passes the real value. See `lib/tokenRate.ts::liveStateWhileConnected`'s
  * own doc for why only a `"stalled"` reading is affected.
+ *
+ * @param lastContactMs (#2886 pass 4, do-it — fresh-reviewer finding 5,
+ * "half-open connection race") The last moment the page confirmed contact
+ * with the daemon — `App.tsx`'s `lastContactRef.current`, sourced from
+ * `useLiveTail`'s `onContact`. `null` (the default) skips the half-open
+ * check inside `liveStateWhileConnected` and falls back to the plain
+ * `connected` boolean, same as omitting it there.
  */
-export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number, connected = true): SessionRunView {
+export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number, connected = true, lastContactMs: number | null = null): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
@@ -853,16 +867,35 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // used to be able to disagree (a marker explaining the gap on every
   // candidate would still read "stalled" under the old rule); they can't
   // any more, because there is only one rule now.
-  // (#2886 pass 3, "STALL while disconnected") Downgrades a "stalled"
-  // reading to `null` (no live execution — every lamp off, no rate) when
-  // the page itself has lost its connection to the daemon: no new record
-  // could have arrived either way, so a false STALL claim is worse than
-  // saying nothing. `connected` defaults to `true` for every caller that
-  // doesn't pass it, so this is a no-op everywhere except the real
-  // `SessionReplay.tsx` render. `tokRateStalled` reads the ADJUSTED state,
-  // so it can never disagree with what `liveTokScope.state` below shows.
-  const tokRateLiveState = liveStateWhileConnected(aggregateLiveState(tokRateRecordSets, nowMs), connected);
+  // (#2886 pass 3, "STALL while disconnected"; pass 4 finding 5, "half-open
+  // connection race") Downgrades a "stalled" reading to `null` (no live
+  // execution — every lamp off, no rate) when the page itself has lost its
+  // connection to the daemon: no new record could have arrived either way,
+  // so a false STALL claim is worse than saying nothing. `connected`
+  // defaults to `true` for every caller that doesn't pass it, so this is a
+  // no-op everywhere except the real `SessionReplay.tsx` render.
+  // `lastContactMs` (also defaulted, also a no-op when absent) additionally
+  // closes the half-open gap: a stall is trusted only once the daemon has
+  // answered AFTER this session's own last heartbeat's deadline — see
+  // `lib/tokenRate.ts::liveStateWhileConnected`'s own doc.
+  const rawTokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
+  const tokRateLiveState = liveStateWhileConnected(
+    rawTokRateLiveState,
+    connected,
+    lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs(tokRateRecordSets) } : undefined,
+  );
+  // `tokRateStalled` reads the ADJUSTED state, so it can never disagree
+  // with what `liveTokScope.state` below shows.
   const tokRateStalled = tokRateLiveState?.state === "stalled";
+  // (#2886 pass 4, do-it — fresh-reviewer finding 7, "fix the aria
+  // relabeling a real idle state as no signal") `state === null` is ALSO
+  // what a genuine "no live execution" reading looks like (a mission
+  // between model steps, or nothing running) — that is NOT a connectivity
+  // problem and must not read "no signal". This is `true` ONLY when the
+  // downgrade above is what produced the `null` — i.e. the raw reading
+  // (before any connection knowledge) WAS a stall, and connection evidence
+  // is what erased it.
+  const tokRateNoSignal = rawTokRateLiveState?.state === "stalled" && tokRateLiveState === null;
   // Computed once, here, and read both by `liveTokScope` below and nowhere
   // else — a single call, not one per read site.
   const liveTokRate = aggregateTokenRate(tokRateRecordSets, nowMs);
@@ -1422,6 +1455,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
             // Every lamp is off; nothing claims a state.
             state: tokRateLiveState?.state ?? null,
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
+            noSignal: tokRateNoSignal,
           }
         : null,
     showModelCard,

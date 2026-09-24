@@ -1310,4 +1310,70 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       .map((el) => `${el.className}="${el.textContent}"`);
     expect(leaked, "no figure text may render while unsettled").toEqual([]);
   });
+
+  // (#2886 pass 4, do-it — fresh-reviewer finding 7, "add tests for... both
+  // dimmed renders") The DOM-level counterparts to `cards.test.ts`'s
+  // data-layer coverage of `liveTokCarried`/the half-open no-signal read —
+  // this proves the JSX actually stamps `data-carried`/"no signal" from
+  // those fields, not just that the underlying derivation is correct.
+  describe("the TOK/S rate line's carried and no-signal renders", () => {
+    // Hardcoded to FROZEN_NOW's own date rather than `todayUTC()` — this
+    // `describe` body runs at COLLECTION time, before `beforeEach`'s fake
+    // timers are installed, so `todayUTC()` here would read the REAL
+    // wall-clock date and build timestamps chronologically AFTER
+    // FROZEN_NOW, which fails every `T(ts) <= t` liveness check silently
+    // (found live: `machActive` read false, `sessionRunning` still read
+    // true via a different path, so the card rendered "idle" with a
+    // contradictory "1 running" tap target).
+    // Anchored so the LAST heartbeat sits 2s before FROZEN_NOW (10:02:00) —
+    // fresh under STALL_AFTER_MS (30s).
+    const t1a = "2026-06-15T10:00:00.000Z";
+    const t1b = "2026-06-15T10:00:02.000Z";
+    const t1c = "2026-06-15T10:00:04.000Z";
+    const t2 = "2026-06-15T10:01:58.000Z";
+
+    it("dims the rate line (data-carried=true) when the reading is carried forward from an earlier turn", async () => {
+      mockFleetFetch({
+        flowToday: [
+          { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+          // Turn 1 opens at 0 (every turn does — finding 2), then two
+          // real-progress intervals (400 chars/s each).
+          { ts: t1a, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1a), generated_chars: 0, turn_seq: 1 } },
+          { ts: t1b, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1b), generated_chars: 800, turn_seq: 1 } },
+          { ts: t1c, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1c), generated_chars: 1_600, turn_seq: 1 } },
+          // Turn 2: lone first heartbeat — nothing of its own to read from yet.
+          { ts: t2, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t2), generated_chars: 50, turn_seq: 2 } },
+        ],
+      });
+      renderFleetLens({ connected: true });
+
+      const rate = await waitFor(() => {
+        const el = document.querySelector(".mach-scope__rate");
+        expect(el, "the rate line should be mounted").toBeTruthy();
+        return el as HTMLElement;
+      });
+      // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
+      expect(rate.textContent).toContain("100");
+      expect(rate.getAttribute("data-carried")).toBe("true");
+    });
+
+    it("shows literal 'no signal' text, not 'stalled', when the page is disconnected over an otherwise-stale heartbeat", async () => {
+      mockFleetFetch({
+        flowToday: [
+          { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+          { ts: t1a, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1a), generated_chars: 40 } },
+          { ts: t1b, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1b), generated_chars: 120 } },
+        ],
+      });
+      renderFleetLens({ connected: false });
+
+      const rate = await waitFor(() => {
+        const el = document.querySelector(".mach-scope__rate");
+        expect(el, "the rate line should be mounted").toBeTruthy();
+        return el as HTMLElement;
+      });
+      expect(rate.textContent?.toLowerCase()).toContain("no signal");
+      expect(rate.textContent?.toLowerCase()).not.toContain("stalled");
+    });
+  });
 });

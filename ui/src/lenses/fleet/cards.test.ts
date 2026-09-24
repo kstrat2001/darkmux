@@ -401,10 +401,15 @@ describe("buildFleetCard", () => {
     it("carries the last measured rate (marked liveTokCarried) into a new turn's lone first heartbeat", () => {
       const t1a = T_MAX - 22_000;
       const t1b = T_MAX - 20_000;
+      const t1c = T_MAX - 18_000;
       const data: FlowRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        // Turn 1 opens at 0 (every turn does — #2886 pass 4 finding 2), then
+        // two real-progress intervals before turn 2's lone first heartbeat.
+        // The carry must read the SECOND interval, not the 0-opening one.
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1a, generated_chars: 0, turn_seq: 1 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1b, generated_chars: 800, turn_seq: 1 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1c, generated_chars: 1_600, turn_seq: 1 } }),
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: T_MAX, generated_chars: 50, turn_seq: 2 } }),
       ];
       const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
@@ -514,6 +519,27 @@ describe("buildFleetCard", () => {
       expect(disconnectedCard.liveTokState).toBeNull();
       // Still mounted (a running session exists) — just no state to claim.
       expect(disconnectedCard.liveTokRate).not.toBeNull();
+    });
+
+    // (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+    // race") Even while `connected` (the header's own status) says `true`,
+    // a stall claim needs the daemon to have answered SINCE the point the
+    // last heartbeat's own deadline passed. Same fixture as above (last
+    // heartbeat at 3,000ms) — `STALL_AFTER_MS` past it is 33,000ms.
+    it("downgrades a stall to no-signal via the half-open check even while connected=true", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
+      ];
+      // Contact confirmed BEFORE the 33,000ms deadline — the half-open gap.
+      const staleContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true, 32_999);
+      expect(staleContact.liveTokStalled).toBe(false);
+      expect(staleContact.liveTokState).toBeNull();
+      // Contact confirmed AFTER the deadline — a genuine, trustworthy stall.
+      const freshContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true, 33_001);
+      expect(freshContact.liveTokStalled).toBe(true);
+      expect(freshContact.liveTokState).toBe("stalled");
     });
 
     it("a mission between model steps (only its run session beating) mounts no scope and claims no state", () => {
