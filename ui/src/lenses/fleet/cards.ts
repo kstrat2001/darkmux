@@ -26,7 +26,7 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateTokenRate } from "../../lib/tokenRate";
+import { aggregateTokenRate, isStalled } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -431,6 +431,11 @@ export interface FleetCard {
    * render plain "idle" text and never mount a scope when this is `null` —
    * an idle machine has zero `TokenScope` instances, not one sitting at 0. */
   liveTokRate: number | null;
+  /** (#2877) No fresh heartbeat from anything running on this machine —
+   * the scope should decay to its flat-ring stall state. `liveTokRate` is
+   * already forced to `0` in this case (see `buildFleetCard`), so this is
+   * purely the VISUAL flag; the number is already honest either way. */
+  liveTokStalled: boolean;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -525,7 +530,22 @@ export function buildFleetCard(
   // producing right now. Never computed in replay (`liveMode` false) — a
   // historical rate reads as a live instrument reading "something's
   // generating right now", which a replayed day is not.
-  const liveTokRate = liveMode && active ? aggregateTokenRate(liveSids.map((sid) => data.filter((r) => r.session_id === sid))) : null;
+  const liveTokRecordSets = liveSids.map((liveSid) => data.filter((r) => r.session_id === liveSid));
+  // (#2877 dogfood finding) A session can be `active` (no terminal record
+  // yet — a mission genuinely stuck open, observed live: `status: "running"`
+  // hours after its last real heartbeat) while its heartbeat stream has long
+  // gone quiet. Without this, `aggregateTokenRate` happily reports whatever
+  // its LAST two heartbeats measured, however old — a fleet card reading
+  // "42 tok/s" for a session that stopped producing hours ago. Zeroing the
+  // NUMBER (not hiding the tile — a stalled scope still mounts and shows the
+  // decaying-ring visual, per the issue's own state list) keeps the readout
+  // honest about what "right now" means. `t`, not `Date.now()`: this
+  // function is otherwise pure over its inputs (`machActive` above uses the
+  // same playhead), and a wall-clock read here would make an identical call
+  // non-deterministic and untestable.
+  const liveTokStalled = liveTokRecordSets.length > 0 && liveTokRecordSets.every((recs) => isStalled(recs, t));
+  const rawLiveTokRate = liveMode && active ? aggregateTokenRate(liveTokRecordSets) : null;
+  const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -549,5 +569,6 @@ export function buildFleetCard(
     runsLabel: liveMode ? "running" : `specialist${runsCount === 1 ? "" : "s"}`,
     runningSessionIds,
     liveTokRate,
+    liveTokStalled,
   };
 }

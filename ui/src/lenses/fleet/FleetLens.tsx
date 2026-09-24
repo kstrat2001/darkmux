@@ -786,7 +786,7 @@ export function FleetLens({
                 honor internally. */}
             {card.liveTokRate !== null && (
               <div className="mach-scope" data-testid="fleet-token-scope">
-                <TokenScope tokensPerSec={card.liveTokRate} size="mini" />
+                <TokenScope tokensPerSec={card.liveTokRate} stalled={card.liveTokStalled} size="mini" />
                 <span className="mach-scope__rate">{fmtN(Math.round(card.liveTokRate))} tok/s</span>
               </div>
             )}
