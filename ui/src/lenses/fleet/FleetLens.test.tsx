@@ -1131,6 +1131,76 @@ describe("FleetLens pager (#2881)", () => {
       expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("250 tok/s");
     });
   });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F4) The half-open evidence
+  // threaded into each execution's OWN reading (`cards.ts`'s
+  // `executionTokenReading` call — `lastHeartbeatMs([recs])`, not the
+  // machine-wide `lastHeartbeatMs(liveTokRecordSets)` the AGGREGATE uses)
+  // was previously only asserted on `card.executions[i].state` directly —
+  // nothing rendered proved it reached the screen. This pins it at the
+  // rendered surface: s1 (fresh, generating) and s2 (stale, would read
+  // STALLED on its own) share one card. `lastContactMs` sits AFTER s2's own
+  // deadline (so a CORRECT per-execution check trusts s2's stall) but
+  // BEFORE s1's much-later deadline (so a WRONG machine-wide check — using
+  // s1's fresher heartbeat as the deadline for BOTH executions — would
+  // wrongly downgrade s2 to "no signal" instead).
+  it("downgrades a stalled execution using ITS OWN last heartbeat as the half-open deadline, not the machine-wide one", async () => {
+    const records: FlowRecord[] = [
+      // s1: CODER, fresh — generating, last heartbeat at 95s.
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
+      { ts: at(95), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 95_000, generated_chars: 800 } },
+      // s2: REVIEWER, stale — one heartbeat at 0s, long past STALL_AFTER_MS
+      // (30s) by the t=100s playhead. Its OWN deadline is 0 + 30 = 30s.
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
+      { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        {/* lastContactMs = 40s: past s2's own 30s deadline (trust s2's
+            stall) but nowhere near s1's 95+30=125s deadline (a machine-wide
+            check would NOT trust it). */}
+        <FleetLens records={records} tMax={D0 + 100_000} tMin={D0} playhead={D0 + 100_000} historical connected lastContactMs={D0 + 40_000} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    // Default page is s1 (generating beats stalled/no-signal either way).
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("stalled");
+    expect(latestTokenScopeProps()).toMatchObject({ stalled: true, tone: "stalled" });
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F4, second half) The test
+  // above alone does not prove the half-open evidence is CONSULTED at all —
+  // `lastContactMs=40s` trusts s2's stall either way: with the correct
+  // per-execution deadline (30s) OR with no check running at all (passing
+  // `undefined`, which trusts every stall unconditionally while connected).
+  // This one moves `lastContactMs` BEFORE s2's own deadline, so the CORRECT
+  // behavior downgrades to "no signal" — a result "no check ran" cannot
+  // produce (it would still read "stalled").
+  it("downgrades to 'no signal' when contact came BEFORE the stalled execution's own deadline", async () => {
+    const records: FlowRecord[] = [
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
+      { ts: at(95), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 95_000, generated_chars: 800 } },
+      // s2's own deadline is 0 + 30 = 30s.
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
+      { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        {/* lastContactMs = 20s: BEFORE s2's own 30s deadline. */}
+        <FleetLens records={records} tMax={D0 + 100_000} tMin={D0} playhead={D0 + 100_000} historical connected lastContactMs={D0 + 20_000} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("no signal");
+    expect(latestTokenScopeProps()).toMatchObject({ stalled: false, tone: "none" });
+  });
 });
 
 // ── (#1855) a rostered-but-silent machine must still render a card ──

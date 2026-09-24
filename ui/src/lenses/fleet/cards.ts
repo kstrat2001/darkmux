@@ -495,6 +495,31 @@ export interface FleetCard {
    * never mount a scope when this is `null` — an idle machine has zero
    * `TokenScope` instances, not one sitting at 0. */
   liveTokRate: number | null;
+  /** (#2886 pass 5, MUST — fresh-reviewer finding F4) `liveTokStalled`,
+   *  `liveTokState`, `liveTokRestSecondsLeft`, `liveTokCarried` below, and
+   *  `defaultExecutionSessionId` further down, are NOT read by
+   *  `FleetLens.tsx` any more — the pager reads the equivalent per-PAGE data
+   *  off `executions` instead (one entry per execution) once #2881 landed,
+   *  including for a single running execution (verified:
+   *  `card.executions[0]` matches these aggregate fields exactly in that
+   *  case, so no separate rendering path was ever needed for it).
+   *
+   *  Kept anyway, deliberately, rather than deleted:
+   *  1. They are still a genuine part of `buildFleetCard`'s PURE snapshot —
+   *     the machine-wide stall/state/carry answer, independent of which
+   *     execution a pager happens to be showing, which is a reasonable
+   *     thing for a card snapshot to expose even to a consumer that never
+   *     renders a pager (a future export, a different summary view).
+   *  2. The render-level gap the finding actually named — the per-page
+   *     half-open evidence and per-page `lastHeartbeatMs` were asserted
+   *     only on `card.executions[i]` fields, never on what reaches the
+   *     screen — is closed by NEW tests in `FleetLens.test.tsx` that pin
+   *     the rendered rate-line text and the mocked `TokenScope`'s own
+   *     props, not by these fields regaining a consumer.
+   *  3. Deleting five fields with a decade of pre-existing #2877/#2885/
+   *     #2886 unit coverage (stall detection, the half-open race, carried
+   *     detection) to chase a render-path gap that's already closed here
+   *     would be churn for its own sake, not a fix. */
   /** (#2877) No fresh heartbeat from anything running on this machine —
    * the scope should decay to its flat-ring stall state. `liveTokRate` is
    * already forced to `0` in this case (see `buildFleetCard`), so this is
