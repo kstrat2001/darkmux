@@ -29,6 +29,10 @@ export interface LiveSessionsResult {
    * session was live at record time); `lib/flow.ts::liveSessionSet` falls
    * back to the flow-derived heuristic when this is empty, same as legacy. */
   sessions: Set<string>;
+  /** The missions those sessions run under (the beat's optional
+   * `mission_id`). A mission's own run-grain session never beats, so its run
+   * page is live while this set names its mission. */
+  missions: Set<string>;
   /** Degraded fleet coverage for THIS read, in the shared vocabulary
    * (`lib/fleetCoverage.ts`), or `null` when presence is healthy, switched
    * off, or has not answered yet. `null` is the ordinary case and says
@@ -51,9 +55,11 @@ export function useLiveSessionIds(enabled = true): LiveSessionsResult {
 
   return useMemo(() => {
     const set = new Set<string>();
+    const missions = new Set<string>();
     if (query.data?.ok) {
       for (const beat of query.data.data.sessions ?? []) {
         if (beat?.session_id) set.add(beat.session_id);
+        if (beat?.mission_id) missions.add(beat.mission_id);
       }
     }
     // `query.data === undefined` is pending (or disabled) — no claim either
@@ -61,6 +67,6 @@ export function useLiveSessionIds(enabled = true): LiveSessionsResult {
     // Only a SETTLED `ok:false` is a failed read.
     const unreadable = query.data !== undefined && !query.data.ok;
     const meta = query.data?.ok ? (query.data.data.meta ?? null) : null;
-    return { sessions: set, coverage: degradedFleetSource(meta, unreadable) };
+    return { sessions: set, missions, coverage: degradedFleetSource(meta, unreadable) };
   }, [query.data]);
 }

@@ -56,6 +56,7 @@ import { relAgoFrom } from "../lib/format";
 import { replayPlaybackKvValue } from "../lib/replayMeta";
 import { isLiveRoute, type Route } from "../lib/route";
 import { useDaemonLoad } from "../hooks/useDaemonLoad";
+import { useCountUp } from "../hooks/useCountUp";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 import type {
   BatteryHealth,
@@ -530,7 +531,11 @@ function BatteryBar({ sample }: { sample: BatterySample }) {
           </text>
         )}
       </svg>
-      <span className="battery-bar-pct">{fmtPct(sample.charge_pct)}</span>
+      {/* (#2878) Counts up/down to a new reading rather than snapping —
+          the same `useCountUp` mechanism every other live readout on this
+          page uses, formatted with the SAME `fmtPct` this span always
+          used. */}
+      <span className="battery-bar-pct">{useCountUp(sample.charge_pct, fmtPct)}</span>
     </div>
   );
 }

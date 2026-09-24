@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
@@ -10,6 +11,9 @@ import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS,
 import type { FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
+import { Shimmer } from "../../components/Placeholder";
+import { TokenScope } from "../../components/TokenScope";
+import { liveStateLabel } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
@@ -92,11 +96,19 @@ function machineRunsHash(uid: string, runningSessionIds: string[]): string | nul
   return `lens=runs&machine=${encodeURIComponent(uid)}`;
 }
 
-/** `sc()` — viewer.html:1633. One token-class chip (value over label). */
-function Chip({ value, label, cls }: { value: string | number; label: string; cls?: string }) {
+/** `sc()` — viewer.html:1633. One token-class chip (value over label).
+ *
+ * `loading` (#2862) renders the shared `Shimmer` in place of `value` — the
+ * `settled ? fmtC(...) : ""` sentinel this used to take as `value` moved to
+ * the call site, which was doing the SAME masking `Shimmer` now owns, just
+ * without leaving a box for the CSS overlay to sit in (see `.ph-shimmer`'s
+ * own doc in `styles.css`). `.scv` is a `<div>`, matching `.savnum`'s own
+ * block-fills-its-track sizing, so only a height floor (`minHeight="1.1em"`,
+ * `.savc .scv`'s own line-height) is needed. */
+function Chip({ value, label, cls, loading }: { value?: string | number; label: string; cls?: string; loading?: boolean }) {
   return (
     <div className={`savc${cls ? ` ${cls}` : ""}`}>
-      <div className="scv">{value}</div>
+      {loading ? <Shimmer as="div" className="scv" minHeight="1.1em" /> : <div className="scv">{value}</div>}
       <div className="scl">{label}</div>
     </div>
   );
@@ -143,6 +155,18 @@ function SavingsHero({
   settled: boolean;
 }) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
+  // (#2878) `null` while unsettled, so the first real total lands instantly;
+  // a later change counts up, and only up (the 24h window slides past old
+  // records on every poll with nothing running). (Playback parity, Change
+  // B) NOT gated on `liveMode` any more — `useCountUp` itself reads the
+  // one shared seek signal and snaps only across an actual scrub/rewind;
+  // an ADVANCE (a play tick, or a live poll) tweens in both modes now,
+  // which is the parity fix (finding #5: a 30s advance tweened live and
+  // jumped in playback for the identical figure).
+  const heroTotal = useCountUp(settled ? t.local + t.cloud + t.unknown : null, (n) => (n === null ? "" : fmtN(n)), undefined, {
+    upOnly: true,
+  });
+
   return (
     // The silhouette is applied in CSS off this one attribute so the figures
     // keep their exact geometry — same elements, same sizes, digits hidden.
@@ -193,15 +217,18 @@ function SavingsHero({
             FROM — the tokens were dispatched by darkmux either way, which
             is the only claim being made. */}
         <div className="savlead">
-          <div className="savnum">{settled ? fmtN(t.local + t.cloud + t.unknown) : ""}</div>
+          {/* (#2862) A shimmer while unsettled; (#2878) once settled the
+              total counts up on new work. The count-up hook is hoisted above
+              the return (hooks cannot sit in a conditional branch). */}
+          {settled ? <div className="savnum">{heroTotal}</div> : <Shimmer as="div" className="savnum" minHeight="1em" />}
           <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
         </div>
         <div className="savclasses">
-          <Chip value={settled ? fmtC(t.completion) : ""} label="generated" cls="gen" />
-          <Chip value={settled ? fmtC(t.fresh) : ""} label="fresh input" />
-          <Chip value={settled ? fmtC(t.reread) : ""} label="re-read" />
-          {t.uncls ? <Chip value={settled ? fmtC(t.uncls) : ""} label="unclassified" cls="uncls" /> : null}
-          <Chip value={settled ? t.runs : ""} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
+          <Chip value={fmtC(t.completion)} loading={!settled} label="generated" cls="gen" />
+          <Chip value={fmtC(t.fresh)} loading={!settled} label="fresh input" />
+          <Chip value={fmtC(t.reread)} loading={!settled} label="re-read" />
+          {t.uncls ? <Chip value={fmtC(t.uncls)} loading={!settled} label="unclassified" cls="uncls" /> : null}
+          <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>
       <div className="hybnote">
@@ -370,7 +397,13 @@ export function FleetLens({
   playhead?: number;
   historical?: boolean;
 } = {}) {
-  const nowMs = Date.now();
+  // (Playback parity, Change A) `wallNow` feeds ONLY the live fetch window
+  // below (`useFlowWindow`) — "what is fetched" is the one thing liveMode
+  // is still allowed to decide. Every RENDER-TIME derivation reads
+  // `playheadT` instead (defined below as `playhead ?? wallNow` — a
+  // literal `Date.now()`, not this frozen value, so a replay's `wallNow` is
+  // never mistaken for its own clock).
+  const wallNow = Date.now();
   const liveMode = !historical;
   /** (U5-1) Whether a daemon exists to ASK — a different question from
    * `liveMode`, which is the caller's intent ("this mount is a replay").
@@ -393,14 +426,21 @@ export function FleetLens({
   const livePolling = liveMode && getSource().kind === "daemon";
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
 
-  const liveWindow = useFlowWindow(nowMs);
+  const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
     ? { data: records, tMax: tMax ?? 0, settled: true }
     : liveWindow;
-  // The playhead every bracketing derivation below reads — `flowWindow.tMax`
-  // when the caller didn't separate the two (live mode; any pre-#1869
-  // caller), or the real scrub position when it did.
-  const playheadT = playhead ?? flowWindow.tMax;
+  // (Playback parity, Change A — "one clock") The clock every bracketing
+  // derivation below reads: the playhead when scrubbed, the real wall
+  // clock at the live edge. This USED to be `playhead ?? flowWindow.tMax`
+  // — the newest RECORD's timestamp, not now — which is the Side finding
+  // in the parity spec: the live fleet card judged staleness against
+  // whenever a record last happened to arrive, so the stalled ring only
+  // appeared once another record showed up, sometimes long after the run
+  // actually went quiet. `flowWindow.tMax` is still used as the FIXED axis
+  // ceiling it always was (see `timeline.ts`'s own doc) — this is the
+  // separate, moving "now" value.
+  const playheadT = playhead ?? wallNow;
   // `enabled: false` stops the REQUEST, not just the result: an earlier draft
   // discarded the data while the hook kept polling `/fleet/machines/live`
   // every few seconds behind a replay.
@@ -543,8 +583,8 @@ export function FleetLens({
     // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
     // would route around the disabled presence hooks above and re-derive
     // "running" from the day's own records — presence-agnostic in name only.
-    () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs, liveMode),
-    [flowWindow.data, liveSessionIds, nowMs, liveMode],
+    () => liveSessionSet(flowWindow.data, liveSessionIds, playheadT, liveMode),
+    [flowWindow.data, liveSessionIds, playheadT, liveMode],
   );
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //
@@ -647,13 +687,13 @@ export function FleetLens({
         // doc + this component's `playhead` prop doc for why the two must
         // stay separate arguments once a replay can scrub.
         flowWindow.tMax,
-        nowMs,
+        playheadT,
         windowMinutes,
         liveMode,
         tMin ?? 0,
         playheadT,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes, liveMode, tMin, playheadT],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutes, liveMode, tMin, playheadT],
   );
 
   return (
@@ -663,7 +703,7 @@ export function FleetLens({
         note={note}
         liveMode={liveMode}
         data={scopedData}
-        nowMs={nowMs}
+        nowMs={playheadT}
         settled={flowWindow.settled}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
@@ -747,57 +787,98 @@ export function FleetLens({
                 <span className="specdim">{specUnknownLabel(card.specUnknown ?? "not-reported")}</span>
               )}
             </div>
-            <div className="stat">
-              <span className="dot" />
-              {card.stat}
-            </div>
-            {/* (#1903) The running count's own tap target — a SIBLING
-                affordance to the card body's `machineDrillHash` click
-                above, not a replacement for it. `runsHash` is `null`
-                (falls through to the old plain, non-interactive count)
-                whenever there's nothing running to open — see
-                `machineRunsHash`'s own doc. `stopPropagation` on both
-                handlers keeps a click/Enter on the count from ALSO firing
-                the card body's own handler underneath it (this is a
-                nested interactive control by necessity — the issue is
-                explicit that the card body's destination must stay
-                unchanged, which rules out restructuring the card to avoid
-                the nesting). `.runs--live`'s own CSS is what makes it LOOK
-                interactive, matching #1900's lesson in the other
-                direction: a clickable-but-inert-looking control is as
-                dishonest as an inert-looking one that's secretly a broken
-                link. */}
-            {(() => {
-              const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
-              if (!runsHash) {
+            {/* (#2877) Status, rate and running count on the left; while the
+                machine generates, the scope sits to their right at the
+                concept's card size, spanning those rows, so the card does
+                not grow taller and an idle card reserves no empty slot. */}
+            <div className={card.liveTokRate !== null ? "mach-body mach-body--scope" : "mach-body"}>
+              <div className="stat">
+                <span className="dot" />
+                {card.stat}
+              </div>
+              {/* (#2877) Live token-rate scope. Rendered ONLY when the card
+                  computed a reading (`liveTokRate !== null` — live mode,
+                  active, and at least one running session has produced two
+                  heartbeats) — an idle machine mounts zero `TokenScope`
+                  instances, never one sitting at 0, which is what makes "idle
+                  machines keep plain text and never animate" true by
+                  construction rather than by a prop the component has to
+                  honor internally. */}
+              {/* (#2877 pass 2, "is this resting? can't tell") No center
+                  label exists on this card, so the rate line itself carries
+                  the word: `N tok/s` while generating, else the same state
+                  word the run page's tile shows (`liveStateLabel`, one
+                  derivation, no mode branch). */}
+              {card.liveTokRate !== null && (
+                <div className="mach-scope__rate" data-tone={card.liveTokState ?? "none"}>
+                  {card.liveTokState === "generating"
+                    ? `${fmtN(Math.round(card.liveTokRate))} tok/s`
+                    : liveStateLabel({ state: card.liveTokState ?? "stalled", restSecondsLeft: card.liveTokRestSecondsLeft })}
+                </div>
+              )}
+              {/* (#1903) The running count's own tap target — a SIBLING
+                  affordance to the card body's `machineDrillHash` click
+                  above, not a replacement for it. `runsHash` is `null`
+                  (falls through to the old plain, non-interactive count)
+                  whenever there's nothing running to open — see
+                  `machineRunsHash`'s own doc. `stopPropagation` on both
+                  handlers keeps a click/Enter on the count from ALSO firing
+                  the card body's own handler underneath it (this is a
+                  nested interactive control by necessity — the issue is
+                  explicit that the card body's destination must stay
+                  unchanged, which rules out restructuring the card to avoid
+                  the nesting). `.runs--live`'s own CSS is what makes it LOOK
+                  interactive, matching #1900's lesson in the other
+                  direction: a clickable-but-inert-looking control is as
+                  dishonest as an inert-looking one that's secretly a broken
+                  link. */}
+              {(() => {
+                const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+                if (!runsHash) {
+                  return (
+                    <div className="runs">
+                      {card.runsCount} {card.runsLabel}
+                    </div>
+                  );
+                }
+                const activate = (e: { stopPropagation: () => void }) => {
+                  e.stopPropagation();
+                  location.hash = runsHash;
+                };
                 return (
-                  <div className="runs">
+                  <div
+                    className="runs runs--live"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
+                    onClick={activate}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        activate(e);
+                      }
+                    }}
+                  >
                     {card.runsCount} {card.runsLabel}
                   </div>
                 );
-              }
-              const activate = (e: { stopPropagation: () => void }) => {
-                e.stopPropagation();
-                location.hash = runsHash;
-              };
-              return (
-                <div
-                  className="runs runs--live"
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
-                  onClick={activate}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      activate(e);
-                    }
-                  }}
-                >
-                  {card.runsCount} {card.runsLabel}
+              })()}
+              {card.liveTokRate !== null && (
+                <div className="mach-scope" data-testid="fleet-token-scope">
+                  <TokenScope
+                    // Same rule as the run page's tile — a stale rate from
+                    // the last generating stretch must not still drive the
+                    // wave once the state has moved on (only `stalled` used
+                    // to zero this).
+                    tokensPerSec={card.liveTokState === "generating" ? card.liveTokRate : 0}
+                    stalled={card.liveTokStalled}
+                    resting={card.liveTokState === "rest"}
+                    tone={card.liveTokState ?? "none"}
+                    size="card"
+                  />
                 </div>
-              );
-            })()}
+              )}
+            </div>
           </div>
         ))}
       </div>
@@ -805,22 +886,24 @@ export function FleetLens({
         <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
           <div className="tlhdr">
             <span>{timeline.headerText}</span>
-            {/* `const winCtl=liveMode?...:''` (viewer.html:1764) — LIVE-ONLY.
-                A replay shows the full recorded day, so there is no window to
-                slide over and the control would be a dead knob. */}
-            {liveMode ? (
-              <span className="twin">
-                {ACTIVITY_WINDOW_PRESETS.map((p) => (
-                  <button
-                    key={p.minutes}
-                    className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
-                    onClick={() => setWindowMinutes(p.minutes)}
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </span>
-            ) : null}
+            {/* (Playback parity, Change A, finding #8) Shown in BOTH modes
+                now — a replay draws the same rolling window as live,
+                anchored at the playhead, so the window control is a live
+                knob there too, not a dead one. Used to be LIVE-ONLY
+                (`const winCtl=liveMode?...:''`, viewer.html:1764), back when
+                a replay drew the whole recorded day with nothing to slide
+                over. */}
+            <span className="twin">
+              {ACTIVITY_WINDOW_PRESETS.map((p) => (
+                <button
+                  key={p.minutes}
+                  className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
+                  onClick={() => setWindowMinutes(p.minutes)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </span>
           </div>
           {timeline.lanes.map((lane) => (
             <div className="lane" key={lane.uid}>

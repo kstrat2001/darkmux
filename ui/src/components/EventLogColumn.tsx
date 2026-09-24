@@ -2,9 +2,11 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { useThrottledValue } from "../hooks/useThrottledValue";
+import { useArrivalKeys } from "../hooks/useArrivalKeys";
 import { LIVE_WINDOW_MS } from "../lib/flow";
 import { clk } from "../lib/format";
 import { RecordView } from "./RecordView";
+import { Shimmer } from "./Placeholder";
 import {
   absorbNewFacetValues,
   activityOf,
@@ -600,6 +602,16 @@ export function EventLogColumn({
   // header, and the layout would shift under the operator's own filter.
   // Grouped once per change, not on every render (playback re-renders often).
   const listItems = useMemo(() => turnItems(visibleRecs, records), [visibleRecs, records]);
+  // (#2878) Arrival motion. Keyed off `records` (the FULL, unfiltered set
+  // this pane was given), never `visibleRecs`/`listItems` — a record
+  // revealed by loosening a filter is not "new", only one this pane never
+  // had before is (`useArrivalKeys.ts`'s own doc). `scopeLabel` is this
+  // pane's own "which route is this" signal (its doc: "changes per
+  // route"), so switching which session/machine/fleet view is open
+  // re-arms as a fresh mount instead of animating every row in the newly
+  // opened scope as if it had all just arrived.
+  const recordKeys = useMemo(() => records.map(recKey), [records]);
+  const arrivingKeys = useArrivalKeys(recordKeys, scopeLabel);
   const shared = useMemo(() => {
     // A record with no session (machine telemetry rides the same list) says
     // nothing about which session this is, so it neither joins nor breaks
@@ -1233,6 +1245,12 @@ export function EventLogColumn({
               const synthId = item.kind === "turn" ? item.id : undefined;
               const key = synthId ?? recKey(r);
               const isSel = !synthId && !!selected && recKey(selected) === key;
+              // (#2878) A synthesized header's `key` is `synth:<id>`, never
+              // a real `recKey()` value, so it never matches here — a
+              // borrowed-timestamp header never gets arrival motion of its
+              // own, only a row standing for a genuinely new record does.
+              const isArriving = arrivingKeys.has(key);
+              const arriveCls = isArriving ? " eventlog__rec--arriving" : "";
               const common = synthId
                 ? {}
                 : {
@@ -1251,8 +1269,11 @@ export function EventLogColumn({
               if (item.kind === "turn") {
                 const t = item.turn;
                 const pct = t.window && t.inTok !== null ? Math.min(100, (100 * t.inTok) / t.window) : null;
+                // (#2878) The turn still generating — `turnGroups.ts`'s own
+                // synthesized "in progress" header, never a finished turn's.
+                const liveCls = t.why === "in progress" ? " eventlog__rec--live" : "";
                 return (
-                  <div key={key} className={`eventlog__rec eventlog__rec--turn${isSel ? " sel" : ""}`} {...common}>
+                  <div key={key} className={`eventlog__rec eventlog__rec--turn${isSel ? " sel" : ""}${liveCls}${arriveCls}`} {...common}>
                     <div className="eventlog__turnline">
                       <span className="eventlog__ractivity eventlog__turnname">Turn {t.seq}</span>
                       <span className="eventlog__turnwhy">{t.why}</span>
@@ -1301,9 +1322,12 @@ export function EventLogColumn({
                 const ms = typeof f.ms === "number" ? f.ms : null;
                 if (ms !== null) {
                   return (
-                    <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}`} {...common}>
+                    <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}${arriveCls}`} {...common}>
                       <span className="eventlog__ractivity">
-                        rested {Math.round(ms / 1000)} s
+                        {/* Present tense: the runtime records a rest as it
+                            starts (#2877), so this row appears at the start
+                            of the rest it describes. */}
+                        rest {Math.round(ms / 1000)} s
                         {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
                       </span>
                     </div>
@@ -1326,7 +1350,7 @@ export function EventLogColumn({
                   // of which carry `ms`/`delay_ms`. Warn-colored: the run
                   // is stopped, not merely paced.
                   return (
-                    <div key={key} className={`eventlog__rec eventlog__rec--paused${isSel ? " sel" : ""}`} {...common}>
+                    <div key={key} className={`eventlog__rec eventlog__rec--paused${isSel ? " sel" : ""}${arriveCls}`} {...common}>
                       <span className="eventlog__ractivity">paused{detail ? ` · ${detail}` : ""}</span>
                     </div>
                   );
@@ -1340,7 +1364,7 @@ export function EventLogColumn({
                 const delay = typeof f.delay_ms === "number" ? f.delay_ms : null;
                 if (delay !== null) {
                   return (
-                    <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
+                    <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}${arriveCls}`} {...common}>
                       <span className="eventlog__ractivity">
                         pacing · {Math.round(delay / 1000)} s between turns{state ? ` · thermal: ${state}` : ""}
                       </span>
@@ -1353,7 +1377,7 @@ export function EventLogColumn({
                 // Nothing is happening between turns any more; "pacing"
                 // would claim an ongoing delay that ended.
                 return (
-                  <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}`} {...common}>
+                  <div key={key} className={`eventlog__rec eventlog__rec--pacing${isSel ? " sel" : ""}${arriveCls}`} {...common}>
                     <span className="eventlog__ractivity">resumed{detail ? ` · ${detail}` : ""}</span>
                   </div>
                 );
@@ -1362,7 +1386,7 @@ export function EventLogColumn({
               return (
                 <div
                   key={key}
-                  className={`eventlog__rec eventlog__rec--lean${selected && recKey(selected) === key ? " sel" : ""}`}
+                  className={`eventlog__rec eventlog__rec--lean${selected && recKey(selected) === key ? " sel" : ""}${arriveCls}`}
                   data-act="rec"
                   role="button"
                   tabIndex={0}
@@ -1415,12 +1439,16 @@ export function EventLogColumn({
             <div
               className="eventlog__empty"
               data-state={error ? "error" : loading ? "loading" : periodicOnlyWindow ? "periodic-only" : "empty"}
-              role={error ? "alert" : undefined}
+              role={error ? "alert" : loading ? "status" : undefined}
+              aria-label={loading ? "Loading events" : undefined}
             >
               {error
                 ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
                 : loading
-                  ? "loading…"
+                  ? // (#2862) Not one of the issue's two named surfaces, but
+                    // no bare "loading…" text either — a shimmer line the
+                    // size of a real event row stands in.
+                    <Shimmer as="span" minWidth="10em" />
                   : // (broadened from "no events match your search") A
                     // filtered-to-empty result can now come from an
                     // unchecked facet, not just the text search — the two

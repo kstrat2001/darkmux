@@ -780,10 +780,12 @@ fn apply_pace_duty_cycle_delay(
     if delay_ms == 0 {
         return;
     }
+    // (#2877) Recorded as the rest STARTS, carrying its planned length, so
+    // a live viewer can show the rest while it happens.
+    trajectory.append_paced_rest(turns, delay_ms, "thermal-duty-cycle", pace.state.as_deref());
     sleeper.sleep(delay_ms);
     *rest_ms = rest_ms.saturating_add(delay_ms);
     *rests = rests.saturating_add(1);
-    trajectory.append_paced_rest(turns, delay_ms, "thermal-duty-cycle", pace.state.as_deref());
     (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
         absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, delay_ms);
 }
@@ -856,10 +858,11 @@ fn honor_pace_pause(
             break;
         }
         let reason = pace.reason_or_default();
+        // (#2877) Recorded as each increment starts; see the duty-cycle rest.
+        trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason, pace.state.as_deref());
         sleeper.sleep(PACE_POLL_INCREMENT_MS);
         *rest_ms = rest_ms.saturating_add(PACE_POLL_INCREMENT_MS);
         *rests = rests.saturating_add(1);
-        trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason, pace.state.as_deref());
         (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
             absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, PACE_POLL_INCREMENT_MS);
     }
@@ -2522,10 +2525,11 @@ fn run_with_sleeper(
         //   own doc above), not a turn boundary; the model is still
         //   actively mid-thought and this is not "between turns."
         if turns > 0 && !resuming_after_checkpoint && turn_delay_ms > 0 {
+            // (#2877) Recorded as the rest starts; see the duty-cycle rest.
+            trajectory.append_rest(turns, turn_delay_ms);
             sleeper.sleep(turn_delay_ms);
             rest_ms = rest_ms.saturating_add(turn_delay_ms);
             rests = rests.saturating_add(1);
-            trajectory.append_rest(turns, turn_delay_ms);
             // (#2094 finding 3b) Harness-owned time, not a stall: EXTEND
             // (never reset to "now") the soft-inactivity clock by exactly
             // the rest duration, and clear the edge-trigger flag so a
@@ -5197,12 +5201,18 @@ fn run_streaming_turn(
         let cumulative = accumulator.content_bytes();
         let delta_bytes = cumulative.saturating_sub(last_content_bytes);
         last_content_bytes = cumulative;
+        // (#2877) `generated_chars` counts everything the model is emitting:
+        // answer content, the separate-field reasoning buffer, and streamed
+        // tool-call arguments, so the viewer's token-rate scope reads a real
+        // rate while a model reasons and while it writes a tool call.
+        let generated_chars = accumulator.generated_bytes();
         trajectory.append_model_partial(
             seq,
             partial_index,
             delta_bytes,
             cumulative,
             accumulator.has_tool_calls(),
+            generated_chars,
         );
         *last_proof_of_work = std::time::Instant::now();
         *inactivity_soft_warning_fired_in_window = false;
@@ -6429,6 +6439,73 @@ mod tests {
         assert_eq!(rests, 1);
     }
 
+    /// (#2877) A rest is recorded when it STARTS, so a live viewer can show
+    /// "rest 15s" during the rest. Recorded after the sleep, the record
+    /// arrived as the rest ended and the viewer read the 15s as tools or a
+    /// stall. This sleeper counts the `runtime.rest` events already in the
+    /// trajectory at the moment it is asked to sleep.
+    struct RestVisibleAtSleepSleeper {
+        traj_path: std::path::PathBuf,
+        rests_seen_at_sleep: std::cell::RefCell<Vec<usize>>,
+        flip_pause_off: Option<std::path::PathBuf>,
+    }
+    impl TurnSleeper for RestVisibleAtSleepSleeper {
+        fn sleep(&self, _ms: u64) {
+            let body = std::fs::read_to_string(&self.traj_path).unwrap_or_default();
+            let n = body.lines().filter(|l| l.contains("\"type\":\"runtime.rest\"")).count();
+            self.rests_seen_at_sleep.borrow_mut().push(n);
+            if let Some(dir) = &self.flip_pause_off {
+                write_pace(dir, r#"{"pause": false, "reason": "thermal", "state": "fair"}"#);
+            }
+        }
+    }
+
+    #[test]
+    fn duty_cycle_rest_is_recorded_before_the_sleep_not_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(
+            tmp.path(),
+            r#"{"pause": false, "reason": "thermal-duty-cycle", "state": "fair", "turn_delay_ms": 15000}"#,
+        );
+        let mut reader = pace::PaceReader::new();
+        let sleeper = RestVisibleAtSleepSleeper {
+            traj_path: tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+            rests_seen_at_sleep: Default::default(),
+            flip_pause_off: None,
+        };
+        let mut traj = Trajectory::open(tmp.path());
+        let (mut rest_ms, mut rests) = (0u64, 0u32);
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+        apply_pace_duty_cycle_delay(
+            &mut reader, tmp.path(), 900_000, 600, &sleeper, &mut traj, 3,
+            &mut rest_ms, &mut rests, &mut last_pow, &mut soft_fired,
+        );
+        assert_eq!(sleeper.rests_seen_at_sleep.borrow().as_slice(), &[1], "the rest event exists when the sleep begins");
+    }
+
+    #[test]
+    fn pause_poll_rest_is_recorded_before_each_sleep_not_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pace(tmp.path(), r#"{"pause": true, "reason": "thermal", "state": "serious"}"#);
+        let mut reader = pace::PaceReader::new();
+        let sleeper = RestVisibleAtSleepSleeper {
+            traj_path: tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+            rests_seen_at_sleep: Default::default(),
+            flip_pause_off: Some(tmp.path().to_path_buf()),
+        };
+        let mut traj = Trajectory::open(tmp.path());
+        let (mut rest_ms, mut rests) = (0u64, 0u32);
+        let mut last_pow = std::time::Instant::now();
+        let mut soft_fired = false;
+        let mut expiry_warned = false;
+        honor_pace_pause(
+            &mut reader, tmp.path(), 900_000, 600, &mut expiry_warned, &sleeper, &mut traj, 3,
+            &mut rest_ms, &mut rests, &mut last_pow, &mut soft_fired,
+        );
+        assert_eq!(sleeper.rests_seen_at_sleep.borrow().as_slice(), &[1], "the poll increment's rest event exists when its sleep begins");
+    }
+
     /// (#2774 review F3) The WIRING, not the function. Seven tests call
     /// `apply_pace_duty_cycle_delay` directly and `honor_pace_pause` — the
     /// only thing that calls it in production — had no direct test at all,
@@ -7017,6 +7094,47 @@ mod tests {
         let body = std::fs::read_to_string(&traj_file).unwrap();
         let rest_events = body.lines().filter(|l| l.contains("\"type\":\"runtime.rest\"")).count();
         assert_eq!(rest_events, 2, "one runtime.rest trajectory event per rest");
+    }
+
+    /// (#2877, pre-PR review) The turn-delay rest, the most common one, had
+    /// no test that it is recorded BEFORE its sleep: moving `append_rest`
+    /// back after the sleep left the whole crate green. Same real loop as
+    /// the test above; at each sleep the matching rest event must already
+    /// be in the trajectory.
+    #[test]
+    #[serial_test::serial]
+    fn turn_delay_rest_is_recorded_before_each_sleep_not_after() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
+        let server = crate::test_support::GuardedMockServer::start();
+        register_three_turn_tool_then_stop_script(&server);
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-delay-order").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let sleeper = RestVisibleAtSleepSleeper {
+            traj_path: tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+            rests_seen_at_sleep: Default::default(),
+            flip_pause_off: None,
+        };
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+        )
+        .expect("3-turn scripted dispatch returns Ok");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+        assert_eq!(outcome.rests, 2);
+        assert_eq!(
+            sleeper.rests_seen_at_sleep.borrow().as_slice(),
+            &[1, 2],
+            "each turn-delay rest is on disk when its sleep begins"
+        );
     }
 
     /// (#2114) A sleeper that, on its SECOND call, flips `pace.json` to

@@ -97,12 +97,17 @@ export interface SessionLiveness {
   coverage: DegradedFleetSource | null;
 }
 
-export function useSessionLiveness(sessionId: string | null): SessionLiveness {
+export function useSessionLiveness(sessionId: string | null, missionId: string | null = null): SessionLiveness {
   // The `enabled` gate #1800 P2 added: a replay must not poll live presence.
   // Passing the result away is not enough — the query still fires and still
   // describes NOW.
-  const { sessions: liveSessions, coverage } = useLiveSessionIds(sessionId !== null && getSource().kind === "daemon");
-  const isLive = sessionId !== null && liveSessions.has(sessionId);
+  const { sessions: liveSessions, missions: liveMissions, coverage } = useLiveSessionIds(
+    sessionId !== null && getSource().kind === "daemon",
+  );
+  // A mission's run-grain session never beats; its executions do, under their
+  // own ids. So a run that belongs to a mission is live while any beat names it.
+  const isLive =
+    sessionId !== null && (liveSessions.has(sessionId) || (missionId !== null && liveMissions.has(missionId)));
   // (#2725) The presence read that produced `liveSessions` could not see the
   // fleet. Held in a ref so the effect below reads it WITHOUT re-running when
   // it changes: coverage recovering is not itself an edge, and re-running on

@@ -1,4 +1,5 @@
 import { WorkStatus } from "../../components/WorkStatus";
+import { Shimmer } from "../../components/Placeholder";
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -183,6 +184,10 @@ export function LabRunDetail({
   }, [dir, detailErrored]);
 
   if (!detailQuery.data) {
+    // (#2862) The dir is already known (the caller resolved it to reach this
+    // component) — same shape as the dispatch page's own pending state: draw
+    // the real header immediately, shimmer only the pipeline body nobody has
+    // fetched yet, rather than a bare "loading…" under it.
     return (
       <div data-state="pending" role="status" aria-label={`Loading run ${dir}`}>
         <div className="stagehdr">
@@ -191,7 +196,8 @@ export function LabRunDetail({
           </button>
           {` · ${dir}`}
         </div>
-        <div className="none">loading…</div>
+        <Shimmer as="div" minHeight="1em" style={{ maxWidth: "70%", marginBottom: "8px" }} />
+        <Shimmer as="div" minHeight="1em" style={{ maxWidth: "45%" }} />
       </div>
     );
   }

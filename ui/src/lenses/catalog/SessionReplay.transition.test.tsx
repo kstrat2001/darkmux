@@ -21,11 +21,13 @@ import { SessionReplay } from "./SessionReplay";
  * no fixture may mix a fixed timestamp with a clock-relative assertion.
  */
 
-const h = vi.hoisted(() => ({ liveIds: new Set<string>() }));
+const h = vi.hoisted(() => ({ liveIds: new Set<string>(), liveMissions: new Set<string>() }));
 // (#2725) `{ sessions, coverage }` — see `useSessionLiveness.test.tsx`.
 vi.mock("../../hooks/useLiveSessionIds", () => ({
   useLiveSessionIds: (enabled = true) =>
-    enabled ? { sessions: h.liveIds, coverage: null } : { sessions: new Set<string>(), coverage: null },
+    enabled
+      ? { sessions: h.liveIds, missions: h.liveMissions, coverage: null }
+      : { sessions: new Set<string>(), missions: new Set<string>(), coverage: null },
 }));
 
 const SID = "s-live";
@@ -69,6 +71,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   h.liveIds = new Set<string>();
+  h.liveMissions = new Set<string>();
 });
 
 describe("SessionReplay — the run finishing while the page is open (#2011)", () => {
@@ -105,6 +108,42 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // record timestamps gives.
     expect(wallText()).toContain("10:15");
     expect(wallText()).not.toContain("so far");
+  });
+
+  it("a mission run: live while an execution under its mission beats, then snaps to COMPLETE when it drops", async () => {
+    // A mission's run-grain session never beats; only its executions do,
+    // under their own ids. Keyed on the run's id alone the page was never
+    // live, never saw the drop edge, and sat on RUNNING for the whole run.
+    // Spelled as a mission really records it (`dispatch start`, space).
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const M = "m-2759";
+    const mStart = { ...START, action: "dispatch start", mission_id: M };
+    const mDone = { ...DONE, action: "dispatch complete", mission_id: M };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.startsWith("/flow-mission/")) return new Response(JSON.stringify({ records: [], count: 0 }), { status: 200 });
+        const records = h.liveMissions.has(M) ? [mStart, BEAT] : [mStart, BEAT, mDone];
+        return new Response(JSON.stringify({ records, count: records.length }), { status: 200 });
+      }),
+    );
+    h.liveIds = new Set(["an-execution-under-m"]);
+    h.liveMissions = new Set([M]);
+
+    const { again } = renderReplay();
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(pillText()).toContain("running");
+
+    // The last execution ends and presence drops it.
+    h.liveIds = new Set<string>();
+    h.liveMissions = new Set<string>();
+    await act(async () => {
+      again();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    await vi.waitFor(() => expect(pillText()).toContain("COMPLETE"));
   });
 
   it("stops the elapsed counter when presence says the run is gone, even with no terminal record", async () => {

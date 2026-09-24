@@ -1182,7 +1182,7 @@ describe("EventLogColumn — turns (#2863)", () => {
   it("a rest is a divider between turns, still a selectable row", () => {
     render(<EventLogColumn scopeLabel="runs" records={records} visible />);
     const rest = document.querySelector(".eventlog__rec--rest")!;
-    expect(rest.textContent).toBe("rested 15 s · thermal: fair");
+    expect(rest.textContent).toBe("rest 15 s · thermal: fair");
     expect(rest).toHaveAttribute("data-act", "rec");
   });
 
@@ -1200,7 +1200,7 @@ describe("EventLogColumn — turns (#2863)", () => {
     render(<EventLogColumn scopeLabel="runs" records={pacing} visible />);
     const rests = document.querySelectorAll(".eventlog__rec--rest");
     expect(rests).toHaveLength(1);
-    expect(rests[0].textContent).toBe("rested 15 s · thermal: fair");
+    expect(rests[0].textContent).toBe("rest 15 s · thermal: fair");
     const pacingRow = document.querySelector(".eventlog__rec--pacing")!;
     expect(pacingRow).not.toBeNull();
     expect(pacingRow.textContent).toBe("pacing · 15 s between turns · thermal: fair");

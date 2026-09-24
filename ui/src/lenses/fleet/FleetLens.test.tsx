@@ -824,7 +824,18 @@ describe("FleetLens", () => {
     expect(card).toHaveAccessibleName("MacBook-Pro");
   });
 
-  it("a scrubbed playhead moves the hero and the bars, but the activity axis stays the day's whole fixed span", async () => {
+  // (Playback parity, Change A, finding #8 — 2026-09-24, operator decision)
+  // This used to assert the OLD "replay draws the day's own fixed span"
+  // behavior directly: scrubbing back moved the hero/bars but the
+  // TIMELINE'S AXIS stayed pinned to the day's whole recorded range. That
+  // premise is retired by design now — a replay draws the SAME rolling
+  // window as live, anchored at the playhead, so scrubbing back MOVES the
+  // whole window with it, exactly like a live viewer watching a session
+  // recede out of a rolling window as time passes. The header text itself
+  // (always "recent activity" now) is unaffected either way — this test is
+  // rewritten to check the axis TIMES and the playhead marker position,
+  // which are what actually move.
+  it("a scrubbed playhead MOVES the rolling activity window with it (parity — not the old fixed day-span)", async () => {
     const today = todayUTC();
     const dayTMin = Date.parse(`${today}T10:00:00.000Z`);
     const dayTMax = Date.parse(`${today}T12:00:00.000Z`);
@@ -839,11 +850,15 @@ describe("FleetLens", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector(".fleettl")).not.toBeNull());
-    // Read the un-scrubbed axis text off the DOM (rather than asserting a
-    // literal) — `clkhm`/`clkrange` render in the runner's local timezone,
-    // so the only portable assertion is "unchanged after scrubbing", below.
-    const axisBefore = document.querySelector(".tlhdr span")!.textContent;
-    expect(axisBefore).toBeTruthy();
+    // The header LABEL never changes (always "recent activity" now — see
+    // this module's own doc); read the AXIS TIMES off the DOM instead
+    // (rather than asserting a literal — `clkhm` renders in the runner's
+    // local timezone), which is what actually moves with the playhead.
+    expect(document.querySelector(".tlhdr span")!.textContent).toBe("recent activity");
+    const axisBefore = [...document.querySelectorAll(".tlaxis span")].map((e) => e.textContent);
+    expect(axisBefore.every(Boolean)).toBe(true);
+    // The playhead marker sits at the window's own right edge at rest.
+    expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("100%");
 
     rerender(
       <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -851,11 +866,15 @@ describe("FleetLens", () => {
       </QueryClientProvider>,
     );
 
-    // The axis header is BYTE-IDENTICAL before and after scrubbing to tMin —
-    // the bug this test guards collapsed it to a single repeated instant.
-    expect(document.querySelector(".tlhdr span")!.textContent).toBe(axisBefore);
-    // The playhead marker DID move, to the left edge of that fixed axis.
-    expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("0%");
+    // The rolling window MOVED with the scrub — the axis times are now
+    // different (centered on `dayTMin`, not `dayTMax`), not byte-identical
+    // to before. This is the parity behavior: the same thing scrubbing
+    // live would do to its own rolling window.
+    const axisAfter = [...document.querySelectorAll(".tlaxis span")].map((e) => e.textContent);
+    expect(axisAfter).not.toEqual(axisBefore);
+    // The playhead marker still sits at the window's own right edge —
+    // scrubbing moves the WINDOW, not the marker's position within it.
+    expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("100%");
     // The hero moved too — the completion is no longer visible at tMin.
     expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
   });

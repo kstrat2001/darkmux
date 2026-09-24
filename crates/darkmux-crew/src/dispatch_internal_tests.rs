@@ -6612,6 +6612,39 @@
         );
     }
 
+    /// (#2877) The runtime records a rest as it STARTS (so a live viewer can
+    /// show it). The deadline reset must then cover the rest itself: a rest
+    /// longer than `inactivity_secs` would otherwise let the watchdog kill a
+    /// dispatch that is resting by design.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(), same as its neighbors
+    fn tailer_rest_event_extends_the_deadline_past_the_rest_it_starts() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let inactivity_secs = 10u64;
+        let shared = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(f, r#"{{"type":"runtime.rest","seq":3,"ts":1,"ms":60000,"reason":"thermal-duty-cycle"}}"#).unwrap();
+        drop(f);
+        let before = Instant::now();
+        state.poll_and_emit();
+        let new_deadline = *shared.lock().unwrap();
+        assert!(
+            new_deadline >= before + Duration::from_secs(inactivity_secs + 60) - Duration::from_millis(50),
+            "a 60s rest must not leave the watchdog only {inactivity_secs}s of margin"
+        );
+    }
+
     /// (#457 → #464) Counter-test: events that don't indicate
     /// observable progress (model turn completions, reasoning,
     /// streaming markers) must NOT reset the inactivity deadline.
@@ -9491,6 +9524,45 @@
         assert_eq!(payload["prompt_tokens"], 0);
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
+    }
+
+    /// (#2877) A `model.partial` event carrying the new runtime fields
+    /// (`ts` at ms precision, `generated_chars` including reasoning)
+    /// forwards both, renamed to the flow-facing `sampled_at_ms` /
+    /// `generated_chars`.
+    #[test]
+    fn heartbeat_payload_forwards_new_fields() {
+        let event = serde_json::json!({
+            "type": "model.partial",
+            "seq": 1,
+            "partial_index": 3,
+            "cumulative_chars": 120,
+            "generated_chars": 340,
+            "ts": 1_758_700_000_123u64,
+        });
+        let payload = heartbeat_payload(&event);
+        assert_eq!(payload["cumulative_chars"], 120);
+        assert_eq!(payload["generated_chars"], 340);
+        assert_eq!(payload["sampled_at_ms"], 1_758_700_000_123u64);
+    }
+
+    /// (#2877) An OLDER runtime's `model.partial` — no `ts`, no
+    /// `generated_chars` — must still produce a valid heartbeat payload:
+    /// the two new keys degrade to JSON `null` rather than panicking or
+    /// dropping the record. This is the backward-compat guard the flow
+    /// schema minor bump promises readers.
+    #[test]
+    fn heartbeat_payload_degrades_gracefully_on_older_runtime_shape() {
+        let event = serde_json::json!({
+            "type": "model.partial",
+            "seq": 1,
+            "partial_index": 0,
+            "cumulative_chars": 10,
+        });
+        let payload = heartbeat_payload(&event);
+        assert_eq!(payload["cumulative_chars"], 10);
+        assert!(payload["generated_chars"].is_null());
+        assert!(payload["sampled_at_ms"].is_null());
     }
 
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory

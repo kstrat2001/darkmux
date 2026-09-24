@@ -687,6 +687,8 @@ export interface MachineLoad {
  * Source: `crates/darkmux-flow/src/presence.rs`. */
 export interface LiveSessionBeat {
   session_id: string;
+  /** The mission the execution runs under, when it does. */
+  mission_id?: string;
 }
 
 /** A raw flow record — the JSONL shape every `/flow/<date>` entry and SSE

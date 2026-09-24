@@ -67,6 +67,11 @@ pub struct SessionBeat {
     /// The model the dispatch is running, best-effort enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The mission this execution belongs to, when it runs under one. A
+    /// mission's own run-grain session never beats, so its run page counts
+    /// as live while any beat names its mission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
     /// Unix-ms at beat-write time. Diagnostic / "last beat" only — liveness
     /// is governed by Redis key existence (TTL), not by clock comparison.
     pub beat_ts_ms: u64,
@@ -289,11 +294,12 @@ pub fn spawn_session_emitter(
     session_id: String,
     role: Option<String>,
     model: Option<String>,
+    mission_id: Option<String>,
 ) -> Option<SessionEmitter> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     let url = crate::redis_url()?;
     let client = redis::Client::open(url.expose_for_probe()).ok()?;
-    spawn_with_client(client, session_id, role, model)
+    spawn_with_client(client, session_id, role, model, mission_id)
 }
 
 /// (#2227) The emitter body, taking an explicit client. Split out of
@@ -308,6 +314,7 @@ fn spawn_with_client(
     session_id: String,
     role: Option<String>,
     model: Option<String>,
+    mission_id: Option<String>,
 ) -> Option<SessionEmitter> {
     let machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
     let display_name = crate::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
@@ -327,6 +334,7 @@ fn spawn_with_client(
                     display_name: display_name.clone(),
                     role: role.clone(),
                     model: model.clone(),
+                    mission_id: mission_id.clone(),
                     beat_ts_ms: crate::presence::now_ms(),
                 };
                 // Best-effort: a failed write just means the key may lapse;
@@ -582,7 +590,7 @@ mod tests {
         let key = session_key(&sid);
         let claim_key = edge_claim_key(&sid);
 
-        let emitter = spawn_with_client(client, sid, Some("coder".into()), None)
+        let emitter = spawn_with_client(client, sid, Some("coder".into()), None, None)
             .expect("spawn emitter");
         wait_until(|| fake.contains(&key), "the first beat to land");
 
@@ -624,7 +632,7 @@ mod tests {
         let key = session_key(&sid);
         let claim_key = edge_claim_key(&sid);
         {
-            let _emitter = spawn_with_client(client, sid, Some("coder".into()), None)
+            let _emitter = spawn_with_client(client, sid, Some("coder".into()), None, None)
                 .expect("spawn emitter");
             wait_until(|| fake.contains(&key), "the first beat to land");
             // Scope ends here with NO explicit `.stop()` call — simulating
@@ -676,7 +684,7 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _emitter = spawn_with_client(client, sid, Some("coder".into()), None)
+            let _emitter = spawn_with_client(client, sid, Some("coder".into()), None, None)
                 .expect("spawn emitter");
             wait_until(|| fake.contains(&key), "the first beat to land");
             panic!("simulated mid-dispatch panic while the session emitter is in scope (#2344)");
@@ -714,6 +722,7 @@ mod tests {
             display_name: "laptop".into(),
             role: Some("coder".into()),
             model: Some("qwen3.6-35b".into()),
+            mission_id: None,
             beat_ts_ms: 1_780_000_000_000,
         }
     }
@@ -745,6 +754,7 @@ mod tests {
             display_name: "mini".into(),
             role: None,
             model: None,
+            mission_id: None,
             beat_ts_ms: 1,
         };
         let json = serde_json::to_string(&beat).unwrap();
@@ -753,6 +763,22 @@ mod tests {
         assert!(!json.contains("model"), "None model omitted: {json}");
         let back: SessionBeat = serde_json::from_str(&json).unwrap();
         assert_eq!(beat, back);
+    }
+
+    #[test]
+    fn mission_id_rides_the_beat_and_is_optional() {
+        // A mission's run page is live while ANY of its executions is
+        // present; it can only know that if the beat names the mission.
+        let mut beat = sample_beat();
+        beat.mission_id = Some("crawl-1-abc".into());
+        let json = serde_json::to_string(&beat).unwrap();
+        assert!(json.contains(r#""mission_id":"crawl-1-abc""#), "mission_id on the wire: {json}");
+        beat.mission_id = None;
+        let json = serde_json::to_string(&beat).unwrap();
+        assert!(!json.contains("mission_id"), "None mission_id omitted: {json}");
+        // An older beat without the field still parses.
+        let old: SessionBeat = serde_json::from_str(r#"{"session_id":"s","display_name":"m","beat_ts_ms":1}"#).unwrap();
+        assert_eq!(old.mission_id, None);
     }
 
     #[test]
@@ -790,6 +816,7 @@ mod tests {
             display_name: "selftest".into(),
             role: Some("coder".into()),
             model: None,
+            mission_id: None,
             beat_ts_ms: crate::presence::now_ms(),
         };
         write_session_beat(&client, &beat, DEFAULT_TTL_SECS).expect("write_session_beat");
@@ -850,6 +877,7 @@ mod tests {
             "sid-2227-teardown".to_string(),
             Some("coder".to_string()),
             None,
+            None,
         )
         .expect("spawn emitter");
 
@@ -891,6 +919,7 @@ mod tests {
                 "sid-2227-drop-teardown".to_string(),
                 Some("coder".to_string()),
                 None,
+                None,
             )
             .expect("spawn emitter");
 
@@ -926,6 +955,7 @@ mod tests {
             display_name: "test".into(),
             role: None,
             model: None,
+            mission_id: None,
             beat_ts_ms: 1,
         };
 

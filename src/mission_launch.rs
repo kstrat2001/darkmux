@@ -1248,6 +1248,22 @@ pub fn launch(
             serde_json::json!({ "runtime": "mission" }),
         ),
     );
+    // (#2877, pre-PR review) The mission's own run session beats presence for
+    // as long as the launch runs. Its executions beat only while a model call
+    // is live, so during the steps between them (a summary, a mod wait, a test
+    // gate, delivery) nothing was live, the run page stopped polling, and it
+    // could miss its own COMPLETE. Dropped explicitly before every
+    // `reap_and_exit_on_signal` (it calls `process::exit`, which runs no
+    // destructors: the key would linger ~15s and the reconciler would write a
+    // redundant `session.end`), and otherwise at scope end after the bookend
+    // has closed. The drop removes the key and suppresses the reconciler's
+    // abandoned edge, same as a dispatch's.
+    let mission_presence = flow::session_presence::spawn_session_emitter(
+        mission_id.clone(),
+        None,
+        None,
+        Some(mission_id.clone()),
+    );
 
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only
@@ -1734,6 +1750,7 @@ pub fn launch(
         // unless a signal was actually observed, in which case this reaps
         // every child the watchdog above may not have caught yet and
         // exits with the conventional signal-terminated code.
+        drop(mission_presence);
         crate::launch_guard::reap_and_exit_on_signal();
         return Err(e);
     }
@@ -1808,6 +1825,7 @@ pub fn launch(
         // here regardless of whether THIS invocation ended by a signal
         // or by simply returning after printing the gate banner — same
         // as any other gated run.
+        drop(mission_presence);
         crate::launch_guard::reap_and_exit_on_signal();
         return outcome;
     }
@@ -1920,6 +1938,7 @@ pub fn launch(
         ),
     );
     // (#2131) A no-op unless a signal was actually observed.
+    drop(mission_presence);
     crate::launch_guard::reap_and_exit_on_signal();
     Ok(exit_code)
 }

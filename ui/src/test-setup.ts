@@ -24,6 +24,27 @@ if (typeof window !== "undefined") {
   window.scrollTo = () => {};
 }
 
+// (#2878) Tests render the REDUCED-MOTION experience unless they opt in.
+// jsdom has no `matchMedia`, which read as "motion allowed", so every number
+// behind a count-up tween took ~700ms to reach its value, and a test waiting
+// up to 1s for that value passed or failed with machine load (two gauge
+// tests failed only when run alongside a larger set). Motion is asserted
+// where it is the subject: those tests install their own `matchMedia`,
+// which replaces this one.
+if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
+  window.matchMedia = (q: string) =>
+    ({
+      matches: q.includes("prefers-reduced-motion: reduce"),
+      media: q,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }) as unknown as MediaQueryList;
+}
+
 // (#2027) Storage is per-test state, and nothing was clearing it.
 //
 // Once the event log began persisting filters and its collapse choice to

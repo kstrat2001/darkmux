@@ -977,7 +977,7 @@ impl DispatchSingleShotStepKind {
     fn run_single_shot(
         &self,
         step: &Step,
-        _task: &Task,
+        task: &Task,
         input: &BTreeMap<String, String>,
         ctx: Option<&StepRunCtx>,
     ) -> Result<StepOutcome> {
@@ -1072,6 +1072,8 @@ impl DispatchSingleShotStepKind {
             darkmux_types::session_id::task(&step.task_id),
             None,
             Some(wire_model.to_string()),
+            // A mission's run page is live while any beat names its mission.
+            crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id)),
         );
 
         let mut flow_records = Vec::new();
@@ -1934,6 +1936,8 @@ impl DispatchMapStepKind {
             darkmux_types::session_id::task(&step.task_id),
             task.role_id.clone(),
             Some(wire_model.to_string()),
+            // A mission's run page is live while any beat names its mission.
+            crate::dispatch::resolve_mission_for_phase(Some(&task.phase_id)),
         );
 
         // Per-EXECUTION remote allowance. When the step named a

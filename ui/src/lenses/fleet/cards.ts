@@ -4,28 +4,27 @@
  * `machActive()` (viewer.html:1315-1322) and `specOf()`
  * (viewer.html:1120-1125).
  *
- * (#1800 P2) `liveMode` is REAL here now. It used to be assumed true, because
- * `/next` had no historical route — so both of legacy's `liveMode?...:...`
- * branches collapsed to their live arm. `PlaybackLens` reaches this code with
- * a recorded day, where the live arm is wrong twice over: `runs` counted
- * sessions against a live set that describes NOW (a replayed day reads "0
- * running"), and the label said "running" for work that finished hours ago.
- * Legacy's replay arm counts ALL of the day's sessions and labels them
- * "specialist(s)" — `goldens/playback-date.txt` reads "48 specialists" where
- * `goldens/fleet.txt` reads "0 running", from this one branch.
- *
- * (#1869) `t` (named `tMax` at some call sites, but it is the PLAYHEAD, see
- * `buildFleetCard`'s own doc) is now genuinely scrubbable — `PlaybackLens`
- * owns a `t` state and can hand this module anything from `tMin` to the
- * day's true max, not just the max. `runsCount` deliberately still counts
- * the WHOLE day's sessions in replay mode regardless of the playhead
- * (`all.length`, unchanged — legacy's own `runs=liveMode?...:all.length`
- * reads the same unfiltered `sessionsOn(m)`); `machActive` is the one
- * derivation that DOES need the playhead honored, and its own doc explains
- * why.
+ * (Playback parity, Change A, 2026-09-24) `liveMode` used to select which of
+ * TWO implementations ran: live counted sessions against a live set that
+ * describes NOW; replay counted ALL of the day's sessions and labeled them
+ * "specialist(s)" regardless of whether anything was actually running at
+ * the playhead — `goldens/playback-date.txt` used to read "48 specialists"
+ * at 5% into the day with zero sessions started, where `goldens/fleet.txt`
+ * read "0 running" for the live arm of the identical instant (findings #3,
+ * #4 in the parity audit). `runsCount`/`runsLabel`/`runningSessionIds`/
+ * `liveTokRate`/`liveTokStalled` are now ONE derivation, run over records
+ * up to `t` through `sessionRunning()` (which itself takes an optional,
+ * purely ADDITIVE `liveSet` — presence, empty in every real replay call) in
+ * BOTH modes: "N running" at the instant the playhead sits on, live or
+ * replayed. `liveMode` is kept as a parameter for now (dozens of existing
+ * call sites), but nothing in this file's returned `FleetCard` fields reads
+ * it any more — it decides nothing here. `machActive` needs the playhead
+ * honored for its own "hasn't started yet" guard; see its own doc.
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
+import { aggregateLiveState, aggregateTokenRate, liveExecutions } from "../../lib/tokenRate";
+import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -37,8 +36,9 @@ import type { Run } from "../../types/generated/Run";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
  * of its started sessions is still running — routed through the shared
- * `sessionRunning()` (live = presence, replay = close-edge at the playhead)
- * so the running-forever bug class can't be fixed at one site and linger at
+ * `sessionRunning()` (ONE algorithm over records up to `t` in both modes —
+ * see that function's own doc, Playback parity Change A) so the
+ * running-forever bug class can't be fixed at one site and linger at
  * another.
  *
  * (#1869) `T(r.ts) <= t` restores legacy's own `visible()` gate — legacy's
@@ -55,7 +55,6 @@ export function machActive(
   data: FlowRecord[],
   liveSet: Set<string>,
   m: string,
-  liveMode: boolean,
   t: number,
 ): boolean {
   return data.some(
@@ -63,7 +62,7 @@ export function machActive(
       T(r.ts) <= t &&
       uidOf(r) === m &&
       r.action === "dispatch.start" &&
-      sessionRunning(data, liveSet, r.session_id ?? "", liveMode, t),
+      sessionRunning(data, liveSet, r.session_id ?? "", t),
   );
 }
 
@@ -400,14 +399,18 @@ export interface FleetCard {
   absent: boolean;
   stat: string;
   runsCount: number;
-  /** `${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')}` —
-   * viewer.html:1713. The whole label, not just the noun, so the pluralization
-   * rule lives beside the count it describes. */
+  /** Always `"running"` (Playback parity, Change A) — the same word at the
+   * same instant, live or replayed. Used to be `liveMode?'running':
+   * 'specialist'+(runs===1?'':'s')` (viewer.html:1713); see this file's own
+   * module doc for why that branch was a parity defect, not a feature. */
   runsLabel: string;
   /** (#1903) The machine's currently-running FLOW sessions, collapsed to
-   * top-level runs — LIVE MODE ONLY, always empty in replay, where
-   * `runsCount` counts the day's whole session set rather than
-   * currently-running work (see `runsCount`'s own comment above).
+   * top-level runs — as of `t`, in BOTH modes now (Playback parity, Change
+   * A): `sessionRunning()` is one algorithm over records up to `t`, with
+   * presence as an optional additive input that a replay caller simply
+   * never has (see that function's own doc). This used to be live-mode-only,
+   * always empty in replay — see `runsCount`'s own comment for the defect
+   * that produced.
    *
    * (#1923 review) This is the flow HALF of `runsCount`, no longer
    * necessarily its whole basis: `runsCount` merges this with the lab-row
@@ -422,6 +425,32 @@ export interface FleetCard {
    * lens pinned to this machine otherwise — without re-deriving the
    * running session set from raw flow data a second time. */
   runningSessionIds: string[];
+  /** (#2877) This machine's total tok/s across whatever is running as of
+   * `t` — `null` when there is nothing running (idle/absent) OR when
+   * running sessions exist but none has produced two heartbeats yet to
+   * derive a rate from. (Playback parity, Change A) Computed the same way
+   * in replay now too — a replayed instant where something was genuinely
+   * generating shows the same rate a live viewer saw at that instant; see
+   * `buildFleetCard`'s own note. The card must render plain "idle" text and
+   * never mount a scope when this is `null` — an idle machine has zero
+   * `TokenScope` instances, not one sitting at 0. */
+  liveTokRate: number | null;
+  /** (#2877) No fresh heartbeat from anything running on this machine —
+   * the scope should decay to its flat-ring stall state. `liveTokRate` is
+   * already forced to `0` in this case (see `buildFleetCard`), so this is
+   * purely the VISUAL flag; the number is already honest either way.
+   * (#2877 pass 2) Now DERIVED from `liveTokState` (`=== "stalled"`) — one
+   * rule, not two that could disagree. */
+  liveTokStalled: boolean;
+  /** (#2877 pass 2, "is this resting? can't tell") The same legible
+   * between-heartbeats state `sessionRun.ts`'s `liveTokScope` derives, here
+   * aggregated across every running session on this machine
+   * (`aggregateLiveState`) — see `lib/tokenRate.ts`'s own doc. `null`
+   * exactly when `liveTokRate` is `null` (nothing running to have a state
+   * for). */
+  liveTokState: LiveState | null;
+  /** Present only when `liveTokState === "rest"`. */
+  liveTokRestSecondsLeft?: number;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -435,11 +464,17 @@ export function buildFleetCard(
   liveSet: Set<string>,
   machAbsent: boolean,
   m: string,
-  liveMode: boolean,
+  /** (Playback parity, Change A) No longer read by anything this function
+   * RETURNS — kept as a parameter only so the many existing call sites
+   * (live and replay alike) don't all need a positional-argument rewrite.
+   * `runsCount`/`runsLabel`/`runningSessionIds`/`liveTokRate`/
+   * `liveTokStalled` are now ONE derivation over records up to `t` in both
+   * modes; see this module's own doc. */
+  _liveMode: boolean,
   /** The playhead — `PlaybackLens`'s scrubbable `t` (#1869), pinned to the
    * day's true max in live mode (there is no scrubber on `/next`'s default
-   * route). `sessionRunning`'s replay arm and `machActive`'s `T(r.ts) <= t`
-   * gate are both defined against it. */
+   * route). `sessionRunning`'s close-edge/TTL check and `machActive`'s
+   * `T(r.ts) <= t` gate are both defined against it. */
   t: number,
   /** (#2067) See `specOf`'s own doc — the spec source, when it is not the
    * presence beats (a static build). */
@@ -447,28 +482,31 @@ export function buildFleetCard(
   /** (#1923) This machine's rows from `GET /runs` — see `runningLabRunCount`'s
    * own doc for why reading this here is a display-layer join, not a sink
    * crossing. Defaults to `[]` so every pre-#1923 call site (none of which
-   * has `/runs` data to hand) keeps behaving exactly as before. LIVE MODE
-   * ONLY, same as `runningSessionIds` — replay's "specialists" tally is a
-   * different, already-flow-complete question (see that field's own
-   * comment). */
+   * has `/runs` data to hand) keeps behaving exactly as before. A replay
+   * caller has no `/runs` fetch to hand either, so this is naturally `[]`
+   * there too — nothing here branches on mode; the data simply isn't
+   * fetched (the one thing mode is still allowed to decide). */
   machineRuns: Run[] = [],
 ): FleetCard {
-  const flowActive = machActive(data, liveSet, m, liveMode, t);
-  const labRunning = liveMode ? runningLabRunCount(machineRuns) : 0;
+  const flowActive = machActive(data, liveSet, m, t);
+  const labRunning = runningLabRunCount(machineRuns);
   const active = flowActive || labRunning > 0;
   const stat = machAbsent ? "offline" : active ? "dispatch in flight" : "idle";
   const all = sessionsOn(data, m);
-  // (#691 Slice 2 / viewer.html:1704) Live counts only RUNNING sessions —
-  // completed dispatches from earlier today must not read as current crew.
-  // A replay counts the whole window: that IS the day's work.
+  // (Playback parity, Change A, findings #3/#4) ONE question now, asked the
+  // same way in both modes: which of this machine's sessions are RUNNING as
+  // of `t` — through the shared `sessionRunning()`, whose own doc explains
+  // why an empty `liveSet` (every real replay call) simply never adds
+  // anything presence-only would have. This used to be `all.length` (the
+  // day's whole session roster) in replay — the "48 specialists at 5% into
+  // the day with zero sessions started" defect.
   //
   // (#2060) `topLevelRunSessionIds` then collapses a mission's own session
   // together with any of its seat/step dispatches into ONE entry — a
-  // mission with one seat running must read "1 running", not "2 running".
-  // Replay's `all` stays UNCOLLAPSED on purpose: it tallies the day's whole
-  // specialist roster (`runsCount`'s own module doc), which is a different
-  // question from "how many things are running right now."
-  const runningSessionIds = liveMode ? topLevelRunSessionIds(data, all.filter((sid) => liveSet.has(sid))) : [];
+  // mission with one seat running reads "1 running", not "2 running", in
+  // both modes now.
+  const runningSids = all.filter((sid) => sessionRunning(data, liveSet, sid, t));
+  const runningSessionIds = topLevelRunSessionIds(data, runningSids);
   // (#1923) The two sources OVERLAP — they are not disjoint, and summing
   // them double-counts. A lab run in its dispatch phase appears on BOTH:
   // once as its `/runs` lab row, once as the flow session its provider's
@@ -502,7 +540,60 @@ export function buildFleetCard(
   // `topLevelRunSessionIds` collapses a mission's seats — so the arithmetic
   // above is unchanged for now; that collapse is a follow-up to this
   // card specifically, not a producer-side gap any more.
-  const runsCount = liveMode ? Math.max(runningSessionIds.length, labRunning) : all.length;
+  const runsCount = Math.max(runningSessionIds.length, labRunning);
+  // (#2877) Scoped by the RAW per-session running ids (`runningSids`), not
+  // the mission-collapsed `runningSessionIds` above: a mission's own
+  // top-level session never carries heartbeats (its inner role executions
+  // do — same fact `sessionRun.ts::rollUpMissionModelWork`'s doc names),
+  // and `topLevelRunSessionIds` picks EITHER representative depending on
+  // which happened to land in the running set. Reading every running
+  // session's own heartbeats sidesteps that ambiguity entirely: a session
+  // with no heartbeats (a mission's top-level session, or one between
+  // turns) contributes nothing, `aggregateTokenRate` sums what real
+  // generation IS producing as of `t`. (Playback parity, Change A) Computed
+  // the same way in replay now too — a replayed instant where something was
+  // genuinely generating reads the same "N tok/s" a live viewer saw at that
+  // instant (finding #3): the tok/s scope is a fact about the recorded
+  // instant, not a live-only instrument.
+  // `T(r.ts) <= t` is load-bearing here, not redundant with the LIVE
+  // caller's window already being time-bounded: a REPLAY caller hands this
+  // function the WHOLE day's records (`sessionRunning`'s own doc — presence
+  // is empty, so the running verdict comes from records up to `t`), and
+  // without this filter `currentTokenRate`'s "two most recent heartbeats"
+  // would read heartbeats from AFTER the playhead too, inflating/changing
+  // the rate a live viewer actually saw at `t` (measured: 122 tok/s off a
+  // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
+  const liveTokRecordSets = runningSids.map((sid) => data.filter((r) => r.session_id === sid && T(r.ts) <= t));
+  // (#2877 dogfood finding) A session can be `active` (no terminal record
+  // yet — a mission genuinely stuck open, observed live: `status: "running"`
+  // hours after its last real heartbeat) while its heartbeat stream has long
+  // gone quiet. Without this, `aggregateTokenRate` happily reports whatever
+  // its LAST two heartbeats measured, however old — a fleet card reading
+  // "42 tok/s" for a session that stopped producing hours ago. Zeroing the
+  // NUMBER (not hiding the tile — a stalled scope still mounts and shows the
+  // decaying-ring visual, per the issue's own state list) keeps the readout
+  // honest about what "right now" means. `t`, not `Date.now()`: this
+  // function is otherwise pure over its inputs (`machActive` above uses the
+  // same playhead), and a wall-clock read here would make an identical call
+  // non-deterministic and untestable.
+  // (#2877 pass 2) One state derivation shared with the run page
+  // (`sessionRun.ts`'s `liveTokScope`) — see `lib/tokenRate.ts::
+  // deriveLiveState`'s own doc. `liveTokStalled` is now DERIVED from it
+  // (`=== "stalled"`) rather than a second, separately-computed "every
+  // running session's heartbeats are stale" check.
+  const liveTokLiveState = liveTokRecordSets.length > 0 ? aggregateLiveState(liveTokRecordSets, t) : null;
+  const liveTokStalled = liveTokLiveState?.state === "stalled";
+  // While the machine has a running execution the scope stays mounted: at 0
+  // with its state word when nothing is generating (resting, tools, reading
+  // prompt, stalled), rather than vanishing. Only a machine with nothing
+  // running mounts no scope.
+  // Only when a live EXECUTION exists: a mission between model steps (only
+  // its run session beating) has no model working, so no scope and no state.
+  const hasLiveExecution = liveExecutions(liveTokRecordSets, t).length > 0;
+  const rawLiveTokRate = active && hasLiveExecution ? (aggregateTokenRate(liveTokRecordSets, t) ?? 0) : null;
+  const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
+  const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
+  const liveTokRestSecondsLeft = liveTokState === "rest" ? liveTokLiveState?.restSecondsLeft : undefined;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -523,7 +614,15 @@ export function buildFleetCard(
     absent: machAbsent,
     stat,
     runsCount,
-    runsLabel: liveMode ? "running" : `specialist${runsCount === 1 ? "" : "s"}`,
+    // (Playback parity, Change A, finding #3) Always "running" now — a
+    // replayed instant with genuinely running sessions reads the same word
+    // a live viewer would have seen. `liveMode` no longer changes this, and
+    // "running" (a gerund, not a count noun) never pluralizes.
+    runsLabel: "running",
     runningSessionIds,
+    liveTokRate,
+    liveTokStalled,
+    liveTokState,
+    liveTokRestSecondsLeft,
   };
 }

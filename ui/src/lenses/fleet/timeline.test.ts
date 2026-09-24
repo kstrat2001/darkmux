@@ -117,64 +117,57 @@ describe("buildActivityTimeline — lanes and bars", () => {
  * so a 2026-08-07 page drew today's axis with every bar filtered out for
  * falling before `tlMin`.
  */
-describe("buildActivityTimeline — replay (liveMode = false)", () => {
+// (Playback parity, Change A, finding #8 — 2026-09-24, operator decision)
+// This describe block used to be "replay (liveMode = false)" and asserted
+// the OLD divergent behavior: replay drew the recorded day's own fixed span
+// with no window control, headed "activity" (no "recent"), while live drew a
+// rolling window ending at `now`. That is a parity defect, not a feature —
+// a replay now draws the SAME rolling window as live, anchored at the
+// playhead (`tlMax = playheadT` unconditionally), same header, same window
+// control; `liveMode`/`tMin`/`nowMs` no longer affect any of it (kept as
+// dead parameters — see `timeline.ts`'s own doc — so existing positional
+// call sites don't need a rewrite). This block is rewritten to prove that.
+describe("buildActivityTimeline — parity: liveMode no longer changes the window, header, or verdicts", () => {
   const TMIN = Date.parse("2026-08-08T02:09:42.000Z");
-  // NOW is days after the recorded day — the whole point: the live arm would
-  // anchor here and leave the day off the left edge of the axis entirely.
-  const NOW = Date.parse("2026-08-12T09:00:00.000Z");
   const uids = ["m1"];
   const day: FlowRecord[] = [
     rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: new Date(TMIN).toISOString(), handle: "coder" }),
     rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.complete", ts: new Date(TMAX).toISOString() }),
   ];
 
-  it("spans tMin..tMax — the recorded day, NOT a window ending at now", () => {
-    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
-    // The AXIS is what proves the span now that the header carries no range.
-    expect(tl.axis).toEqual([clkhm(TMIN), clkhm(TMIN + (TMAX - TMIN) / 2), clkhm(TMAX)]);
-    // The playhead sits at the right edge (state.t = tMax on boot).
-    expect(tl.playheadPct).toBe(100);
-  });
-
-  it("drops 'recent' from the header — the day is not recent", () => {
-    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
-    expect(tl.headerText).toBe("activity");
-    expect(tl.headerText).not.toContain("recent");
-  });
-
-  it("the day's bars SURVIVE — the live arm drops every one of them", () => {
-    const replay = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+  it("the rolling window is anchored at the playhead — identical axis/header/bars whichever way `liveMode` is passed", () => {
+    // `TMAX - TMIN` is ~14.5h, inside the 24h (1440min) window, so the
+    // window ending AT the playhead (TMAX, the default) covers the whole
+    // recorded span here — same as it would live, probed at the same
+    // instant. `_nowMs`/`_liveMode`/`_tMin` (positions 6/8/9) are passed as
+    // their old values on purpose, to prove they are now inert.
+    const replay = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
+    const live = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, TMAX, 1440, true, TMIN);
+    expect(replay.headerText).toBe("recent activity");
+    expect(live.headerText).toBe("recent activity");
+    expect(replay.axis).toEqual(live.axis);
+    expect(replay.lanes).toEqual(live.lanes);
     expect(replay.lanes[0].bars.map((b) => b.sid)).toEqual(["s1"]);
-
-    // The inverted case, on the SAME inputs: this is the render the QA gate
-    // caught — an "AUG 12–AUG 13" header over a 2026-08-08 day, with zero
-    // bars because all of them ended before `nowMs - 24h`.
-    const live = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, true, TMIN);
-    expect(live.lanes[0].bars).toHaveLength(0);
-    // The live arm's window is anchored at NOW, not at the recorded day. The
-    // header used to say so; the axis says it now.
-    expect(live.axis[2]).toBe(clkhm(NOW));
-    expect(live.axis[0]).toBe(clkhm(NOW - 1440 * 60000));
   });
 
-  it("a closed session reads 'done', not 'run', on an EMPTY live set", () => {
-    // The live arm would read `!liveSet.has(sid)` -> done here too, so this
-    // alone proves nothing. The next test is the one that separates them.
-    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+  it("a closed session reads 'done', not 'run', regardless of the liveMode flag", () => {
+    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
     expect(tl.lanes[0].bars[0].cls).toBe("done");
   });
 
-  it("an UNCLOSED session reads 'run' on that same empty live set — close-edge, not presence", () => {
+  it("an UNCLOSED session, fresh as of the playhead, reads 'run' regardless of the liveMode flag", () => {
     const open: FlowRecord[] = [
       rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.start", ts: new Date(TMIN).toISOString() }),
       rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.turn", ts: new Date(TMAX).toISOString() }),
     ];
-    const tl = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
-    expect(tl.lanes[0].bars[0].cls).toBe("run");
-    // …and the live arm, given the same empty set, calls it done. Same data,
-    // opposite verdicts: the mode argument is genuinely load-bearing.
+    const replay = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
+    expect(replay.lanes[0].bars[0].cls).toBe("run");
+    // Same data, same empty presence set, the OTHER value of the now-inert
+    // `liveMode` flag: the SAME verdict, which is the parity fix (this used
+    // to be the one test proving `liveMode` was "genuinely load-bearing" —
+    // it no longer is, by design).
     const live = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, TMAX, 1440, true, TMIN);
-    expect(live.lanes[0].bars[0].cls).not.toBe("run");
+    expect(live.lanes[0].bars[0].cls).toBe("run");
   });
 
   // (#1869) Omitting the 10th argument (`playheadT`) defaults it to `tMax`
@@ -191,26 +184,26 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
     const notYetStarted: FlowRecord[] = [
       rec({ machine_uid: "m1", session_id: "s-future", action: "dispatch.start", ts: new Date(TMAX + 60000).toISOString() }),
     ];
-    const tl = buildActivityTimeline(notYetStarted, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    const tl = buildActivityTimeline(notYetStarted, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN);
     expect(tl.lanes[0].bars).toHaveLength(0);
   });
 
-  // (#1869, QA gate — caught live, not by any prior test) `tMax` (the axis
-  // CEILING) and `playheadT` (the scrub position) are separate arguments
-  // now — this is the regression test for what happens when they're NOT
-  // the same number, which every test above this one never exercises
-  // (`playheadT` always defaults to `tMax` when omitted). Scrubbing all the
-  // way back to `tMin` must NOT collapse the axis down to a single instant
-  // — `tlMin..tlMax` stays the day's whole recorded span; only the
-  // PLAYHEAD marker (`playheadPct`) moves. The bug this guards: a first
-  // cut fed the SAME number as both the axis ceiling and the playhead, so
-  // rewinding drew "16:56–16:56" (an axis with zero width) instead of the
-  // full day with the marker swept to its left edge.
-  it("scrubbing the playhead back to tMin does NOT collapse the axis — it stays the day's whole span", () => {
-    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN, TMIN);
-    expect(tl.axis).toEqual([clkhm(TMIN), clkhm(TMIN + (TMAX - TMIN) / 2), clkhm(TMAX)]);
-    // The marker itself DID move — to the axis's own left edge.
-    expect(tl.playheadPct).toBe(0);
+  // (Playback parity, Change A, finding #8) This used to be "scrubbing the
+  // playhead back to tMin does NOT collapse the axis — it stays the day's
+  // whole span", the regression test for the OLD "replay draws a fixed
+  // day-span" behavior. Under the parity fix that premise is gone BY
+  // DESIGN: the window now follows the playhead exactly like live's does,
+  // so scrubbing back MOVES the whole window left with it — the same
+  // behavior a live viewer gets from watching a session recede out of a
+  // rolling window as time passes. The axis is expected to be centered on
+  // `TMIN`, not pinned to the day's original span.
+  it("scrubbing the playhead back to tMin MOVES the rolling window with it (parity — not the old fixed day-span)", () => {
+    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, TMAX, 1440, false, TMIN, TMIN);
+    const winMs = 1440 * 60000;
+    expect(tl.axis).toEqual([clkhm(TMIN - winMs), clkhm(TMIN - winMs / 2), clkhm(TMIN)]);
+    // The marker sits at the window's own right edge now — this IS the live
+    // edge behavior, applied uniformly.
+    expect(tl.playheadPct).toBe(100);
   });
 });
 
