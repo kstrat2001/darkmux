@@ -442,9 +442,14 @@ describe("buildFleetCard", () => {
     // confident "N tok/s" for a session that stopped producing hours ago.
     it("reads 0, not a stale historical rate, once the session's heartbeats go quiet", () => {
       const data: FlowRecord[] = [
-        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
-        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
-        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
+        // `ts` matches the heartbeats' own (equally ancient) clock —
+        // `dispatch.start`'s `ts` is the only clock it has, and a mismatched
+        // one here (the old `rec()` default, 2026) would read as a NEWER
+        // marker than the stale heartbeats and wrongly explain the gap as
+        // "prompt" rather than genuinely stalled.
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
       ];
       // The playhead is T_MAX (2026) while the heartbeats above are near
       // epoch 0 — many hours stale by any measure, well past STALL_AFTER_MS.

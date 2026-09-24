@@ -22,6 +22,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
+import { liveStateLabel } from "../../lib/tokenRate";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
@@ -589,15 +590,33 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
                   done), and disappears the moment the run finishes, per the
                   issue's "when the run finishes, the scope goes and the
                   tile shows the final measured tok/s". */}
+              {/* (#2877 pass 2, "is this resting? can't tell") While
+                  generating, the center stays the tok/s number — unchanged.
+                  Otherwise it names the state a flat ring used to hide:
+                  `rest 12s` (counting down), `prompt` (a turn has started, no
+                  heartbeat for it yet), `tools` (waiting on a dispatched
+                  tool), or `stalled` (the existing stall rule). One
+                  derivation (`lib/tokenRate.ts::deriveLiveState`), read here
+                  and by `FleetLens.tsx`'s rate line — no branch on mode. */}
               {view.liveTokScope && (
                 <div className="met scopetile" data-testid="run-token-scope">
                   <div className="ml">TOK/S</div>
                   <TokenScope
-                    tokensPerSec={view.liveTokScope.tokensPerSec}
+                    // A stale reading from the LAST generating stretch must
+                    // not still drive the wave once the state has moved on
+                    // to rest/tools/prompt (only `stalled` used to zero it) —
+                    // otherwise the tube looks busy while the label says
+                    // "tools".
+                    tokensPerSec={view.liveTokScope.state === "generating" ? view.liveTokScope.tokensPerSec : 0}
                     stalled={view.liveTokScope.stalled}
+                    resting={view.liveTokScope.state === "rest"}
                     size="tile"
                     centerLabel={
-                      view.liveTokScope.tokensPerSec != null ? String(Math.round(view.liveTokScope.tokensPerSec)) : "—"
+                      view.liveTokScope.state === "generating"
+                        ? view.liveTokScope.tokensPerSec != null
+                          ? String(Math.round(view.liveTokScope.tokensPerSec))
+                          : "—"
+                        : liveStateLabel(view.liveTokScope)
                     }
                   />
                 </div>

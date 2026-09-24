@@ -13,6 +13,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { TokenScope } from "../../components/TokenScope";
+import { liveStateLabel } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
@@ -803,8 +804,17 @@ export function FleetLens({
                   machines keep plain text and never animate" true by
                   construction rather than by a prop the component has to
                   honor internally. */}
+              {/* (#2877 pass 2, "is this resting? can't tell") No center
+                  label exists on this card, so the rate line itself carries
+                  the word: `N tok/s` while generating, else the same state
+                  word the run page's tile shows (`liveStateLabel`, one
+                  derivation, no mode branch). */}
               {card.liveTokRate !== null && (
-                <div className="mach-scope__rate">{fmtN(Math.round(card.liveTokRate))} tok/s</div>
+                <div className="mach-scope__rate">
+                  {card.liveTokState === "generating"
+                    ? `${fmtN(Math.round(card.liveTokRate))} tok/s`
+                    : liveStateLabel({ state: card.liveTokState ?? "stalled", restSecondsLeft: card.liveTokRestSecondsLeft })}
+                </div>
               )}
               {/* (#1903) The running count's own tap target — a SIBLING
                   affordance to the card body's `machineDrillHash` click
@@ -855,7 +865,16 @@ export function FleetLens({
               })()}
               {card.liveTokRate !== null && (
                 <div className="mach-scope" data-testid="fleet-token-scope">
-                  <TokenScope tokensPerSec={card.liveTokRate} stalled={card.liveTokStalled} size="card" />
+                  <TokenScope
+                    // Same rule as the run page's tile — a stale rate from
+                    // the last generating stretch must not still drive the
+                    // wave once the state has moved on (only `stalled` used
+                    // to zero this).
+                    tokensPerSec={card.liveTokState === "generating" ? card.liveTokRate : 0}
+                    stalled={card.liveTokStalled}
+                    resting={card.liveTokState === "rest"}
+                    size="card"
+                  />
                 </div>
               )}
             </div>

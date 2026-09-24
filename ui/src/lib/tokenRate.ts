@@ -157,6 +157,154 @@ export function isStalled(records: FlowRecord[], nowMs: number): boolean {
   return nowMs - samples[samples.length - 1].atMs > STALL_AFTER_MS;
 }
 
+/** (#2877 pass 2, "is this resting? can't tell") The legible word a stopped
+ * tube reads between heartbeats — the operator's phone note: a flat ring and
+ * "—" is indistinguishable between a thermal rest, a model still doing
+ * prompt processing on its first token, a tool executing, and a genuine
+ * stall.
+ *
+ * `"generating"` is deliberately included (not just the four "quiet" states)
+ * so a caller can derive its centered readout from ONE value: while
+ * generating, show the number; otherwise, show the word — never a branch on
+ * mode or on which caller is asking. */
+export type LiveState = "generating" | "rest" | "prompt" | "tools" | "stalled";
+
+export interface LiveStateReading {
+  state: LiveState;
+  /** Whole seconds remaining in the rest window this state was derived from
+   * (`Math.ceil` of the ms remaining) — present only when `state ===
+   * "rest"`. */
+  restSecondsLeft?: number;
+}
+
+/** A record whose action marks a state transition, reduced to its ordering
+ * key (`atMs`) and what state it implies. `dispatch.rest` carries its own
+ * `ms` (the window a countdown is measured against); the other two markers
+ * don't need one. */
+interface StateMarker {
+  atMs: number;
+  kind: "prompt" | "tools" | "rest";
+  restMs?: number;
+}
+
+/** The single state derivation both the run page (`sessionRun.ts`'s
+ * `liveTokScope`) and the fleet card (`cards.ts`'s `buildFleetCard`) read —
+ * one function, no live/playback branch, because both callers already pass
+ * records already cut to the page's clock (`playhead ?? now`) the same way
+ * `heartbeatSamples`/`isStalled` are called today. `nowMs` is still honored
+ * defensively here (any record timestamped after it is ignored) so the
+ * function is correct even when handed a caller's raw, un-cut array.
+ *
+ * Priority, most recent evidence wins:
+ * 1. A heartbeat within `STALL_AFTER_MS` → `"generating"` (the existing
+ *    `isStalled` threshold, reused rather than re-derived).
+ * 2. Otherwise, the latest of {`dispatch.start`/`dispatch.turn` →
+ *    `"prompt"`, `dispatch.tool` → `"tools"`, `dispatch.rest` with a real
+ *    `ms` → `"rest"`} that is AT OR AFTER the last heartbeat (a marker
+ *    older than the last heartbeat explains nothing — the heartbeat is
+ *    still the most recent evidence, so it falls through to stalled below).
+ *    A `dispatch.rest` marker further resolves to `"prompt"` once `nowMs`
+ *    has moved past its `ms` window — the rest already elapsed as far as
+ *    this reading can tell, and the runtime is presumed to be starting the
+ *    next turn's prompt processing.
+ * 3. A heartbeat exists but has gone stale, and nothing marks the gap →
+ *    `"stalled"` (the pre-existing `isStalled` rule, unchanged).
+ * 4. No heartbeat at all and no marker → `"prompt"` (a session that has
+ *    started producing no evidence yet reads the same as right after
+ *    `dispatch.start`). */
+export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveStateReading {
+  // Cut ONCE, up front — every downstream read (`heartbeatSamples`,
+  // `isStalled`, the marker scan) then agrees on "as of `nowMs`" instead of
+  // each re-deriving its own future-safe view (or, worse, some doing it and
+  // some not, which is what produced the bug this comment is guarding
+  // against in review: `isStalled` on the UNCUT array would pick up a
+  // heartbeat from beyond `nowMs` as its "last sample").
+  const cut = records.filter((r) => {
+    const atMs = Date.parse(r.ts);
+    return !Number.isFinite(atMs) || atMs <= nowMs;
+  });
+  const beats = heartbeatSamples(cut);
+  const lastBeatAt = beats.length ? beats[beats.length - 1].atMs : null;
+  if (lastBeatAt !== null && !isStalled(cut, nowMs)) {
+    return { state: "generating" };
+  }
+
+  let marker: StateMarker | null = null;
+  for (const r of cut) {
+    const atMs = Date.parse(r.ts);
+    if (!Number.isFinite(atMs)) continue;
+    let m: StateMarker | null = null;
+    if (r.action === "dispatch.start" || r.action === "dispatch.turn") {
+      m = { atMs, kind: "prompt" };
+    } else if (r.action === "dispatch.tool") {
+      m = { atMs, kind: "tools" };
+    } else if (r.action === "dispatch.rest") {
+      // Only the completed-rest shape (`ms` present) counts — the
+      // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
+      // governor changing its PACING, not a rest (same filter
+      // `sessionRun.ts`'s REST tiles already apply).
+      const ms = num(fields(r).ms);
+      if (ms !== null && ms > 0) m = { atMs, kind: "rest", restMs: ms };
+    }
+    if (m && (!marker || m.atMs >= marker.atMs)) marker = m;
+  }
+
+  if (marker && (lastBeatAt === null || marker.atMs >= lastBeatAt)) {
+    const found: StateMarker = marker;
+    if (found.kind === "rest" && found.restMs != null) {
+      const remaining = found.restMs - (nowMs - found.atMs);
+      if (remaining > 0) return { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
+      return { state: "prompt" };
+    }
+    return { state: found.kind };
+  }
+
+  return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
+}
+
+/** Priority order for `aggregateLiveState` — the most informative state
+ * wins when several executions disagree. Generating always wins (matches
+ * `aggregateTokenRate` summing whatever IS producing); among the quiet
+ * states, `rest` is surfaced first since it is the one this pass exists to
+ * make legible ("is this resting? can't tell" — the operator's own note),
+ * then `tools` and `prompt` (both genuine, if less specific, evidence of
+ * activity), and `stalled` only when nothing else explains the quiet. */
+const STATE_PRIORITY: Record<LiveState, number> = { generating: 0, rest: 1, tools: 2, prompt: 3, stalled: 4 };
+
+/** Aggregate state across several running executions (a fleet machine
+ * card's `runningSessionIds`, or a mission's rolled-up sibling sessions) —
+ * the best (lowest-`STATE_PRIORITY`) reading among them. `"prompt"` when
+ * there are no executions at all, matching a fresh session's own default. */
+export function aggregateLiveState(perExecutionRecords: FlowRecord[][], nowMs: number): LiveStateReading {
+  let best: LiveStateReading | null = null;
+  for (const recs of perExecutionRecords) {
+    const reading = deriveLiveState(recs, nowMs);
+    if (!best || STATE_PRIORITY[reading.state] < STATE_PRIORITY[best.state]) best = reading;
+  }
+  return best ?? { state: "prompt" };
+}
+
+/** The short word (or `"rest Ns"`) a caller renders for every state except
+ * `"generating"` — that one is deliberately NOT handled here, since its
+ * center readout is the tok/s NUMBER, a decision that belongs to the
+ * caller (which also knows whether it has a number to show). Both
+ * placements (`SessionReplay.tsx`'s tile, `FleetLens.tsx`'s rate line) call
+ * this for the same four words, so the wording can't drift between them. */
+export function liveStateLabel(reading: LiveStateReading): string {
+  switch (reading.state) {
+    case "rest":
+      return `rest ${reading.restSecondsLeft ?? 0}s`;
+    case "prompt":
+      return "prompt";
+    case "tools":
+      return "tools";
+    case "stalled":
+      return "stalled";
+    case "generating":
+      return "";
+  }
+}
+
 /** Aggregate tok/s across several running executions — a fleet machine
  * card's total across its `runningSessionIds`. Sums each execution's
  * current reading; an execution with no reading yet (fresh, or stalled

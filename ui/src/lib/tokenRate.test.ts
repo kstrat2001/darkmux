@@ -3,9 +3,11 @@ import type { FlowRecord } from "../types/handwritten";
 import {
   DEFAULT_CHARS_PER_TOKEN,
   STALL_AFTER_MS,
+  aggregateLiveState,
   aggregateTokenRate,
   charsPerSecond,
   currentTokenRate,
+  deriveLiveState,
   heartbeatSamples,
   isStalled,
   measuredCharsPerToken,
@@ -176,5 +178,117 @@ describe("aggregateTokenRate", () => {
 
   it("is null only when NO execution has a reading at all", () => {
     expect(aggregateTokenRate([[beat(1_000, 0)], []])).toBeNull();
+  });
+});
+
+// (#2877 pass 2 — "is this resting? can't tell") The legible state a stopped
+// tube reads while between heartbeats. Real record shapes from
+// `~/.darkmux/flows/2026-09-24.jsonl`, session
+// `darkmux-coding-refresh-rotation-1790224432369`:
+//   dispatch.tool  {tool_seq, tool_name, ...}                — a tool call
+//   dispatch.turn  {turn_seq, finish_reason, usage, ...}     — ENDS a turn
+//   dispatch.rest  {ms, turn, rest_ms, rests, reason, state} — a completed
+//                  thermal rest (`ms` present); the announce-only sibling
+//                  `{reason, state, pause: false, delay_ms}` carries no `ms`
+//                  and is a pacing nudge, not a rest (matches sessionRun.ts's
+//                  existing `dispatch.rest`-with-`ms` filter).
+const start = (atMs: number): FlowRecord =>
+  ({ ts: new Date(atMs).toISOString(), action: "dispatch.start", session_id: SID, payload: {} }) as unknown as FlowRecord;
+const turnEnd = (atMs: number, turnSeq: number): FlowRecord =>
+  ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn", session_id: SID, payload: { turn_seq: turnSeq } }) as unknown as FlowRecord;
+const tool = (atMs: number): FlowRecord =>
+  ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: "bash" } }) as unknown as FlowRecord;
+const rest = (atMs: number, ms: number): FlowRecord =>
+  ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload: { ms, reason: "thermal-duty-cycle" } }) as unknown as FlowRecord;
+const restAnnounceOnly = (atMs: number): FlowRecord =>
+  ({ ts: new Date(atMs).toISOString(), action: "dispatch.rest", session_id: SID, payload: { reason: "thermal-duty-cycle", pause: false, delay_ms: 15_000 } }) as unknown as FlowRecord;
+
+describe("deriveLiveState", () => {
+  it("is generating while a heartbeat is fresh — same threshold currentTokenRate uses", () => {
+    const recs = [beat(1_000, 40), beat(3_000, 120)];
+    expect(deriveLiveState(recs, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "generating" });
+  });
+
+  it("is prompt right after dispatch.start, before the first heartbeat", () => {
+    expect(deriveLiveState([start(0)], 500)).toEqual({ state: "prompt" });
+  });
+
+  it("is prompt once a turn has ended and no heartbeat for the next one has landed yet", () => {
+    // The turn-end marker lands well after the last heartbeat has gone
+    // stale (past STALL_AFTER_MS) — without it this would read "stalled".
+    const turnEndAt = 1_000 + STALL_AFTER_MS + 200;
+    const recs = [beat(0, 10), beat(1_000, 200), turnEnd(turnEndAt, 1)];
+    expect(deriveLiveState(recs, turnEndAt + 100)).toEqual({ state: "prompt" });
+  });
+
+  it("is tools while a dispatch.tool is the latest thing and no heartbeat has followed it", () => {
+    const toolAt = 1_000 + STALL_AFTER_MS + 200;
+    const recs = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];
+    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools" });
+  });
+
+  it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
+    const recs = [tool(0), rest(1_000, 15_000)];
+    // 1s into the 15s window → 14s left (ceil).
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "rest", restSecondsLeft: 14 });
+    // Right at the boundary the window has fully elapsed.
+    expect(deriveLiveState(recs, 1_000 + 15_000)).toEqual({ state: "prompt" });
+    // Comfortably past it too.
+    expect(deriveLiveState(recs, 20_000)).toEqual({ state: "prompt" });
+  });
+
+  it("ignores the announce-only rest record (no ms) — a pacing nudge, not a rest", () => {
+    const recs = [tool(0), restAnnounceOnly(1_000)];
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools" });
+  });
+
+  it("is stalled once a heartbeat has gone stale with nothing after it to explain the gap", () => {
+    const recs = [beat(0, 10), beat(1_000, 200)];
+    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("prefers a marker newer than the last stale heartbeat over calling it stalled", () => {
+    const recs = [beat(0, 10), beat(1_000, 200), tool(1_000 + STALL_AFTER_MS + 500)];
+    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools" });
+  });
+
+  it("ignores records after the given clock — never reads the future", () => {
+    // The rest record technically exists in the array, but its ts is after
+    // `nowMs`; the state must read as if it had not happened yet.
+    const recs = [tool(0), rest(5_000, 15_000)];
+    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools" });
+  });
+
+  it("mutation self-check: without the rest branch this would read prompt/tools instead", () => {
+    // Documents the case the rest branch exists to catch — asserted for real
+    // above; this is the paired "what breaks if the branch is removed" case
+    // referenced in the report's Self-QA section.
+    const recs = [tool(0), rest(1_000, 15_000)];
+    const reading = deriveLiveState(recs, 2_000);
+    expect(reading.state).toBe("rest");
+    expect(reading.state).not.toBe("tools");
+  });
+});
+
+describe("aggregateLiveState", () => {
+  it("is generating when any execution is generating", () => {
+    const generating = [beat(0, 10), beat(2_000, 90)];
+    const resting = [tool(0), rest(1_000, 15_000)];
+    expect(aggregateLiveState([generating, resting], 2_000)).toEqual({ state: "generating" });
+  });
+
+  it("surfaces rest over tools/prompt when nothing is generating", () => {
+    const toolsOnly = [tool(0)];
+    const resting = [tool(0), rest(1_000, 15_000)];
+    expect(aggregateLiveState([toolsOnly, resting], 2_000)).toEqual({ state: "rest", restSecondsLeft: 14 });
+  });
+
+  it("falls back to stalled only when every execution is stalled", () => {
+    const stalledExec = [beat(0, 10), beat(1_000, 200)];
+    expect(aggregateLiveState([stalledExec], 1_000 + STALL_AFTER_MS + 1)).toEqual({ state: "stalled" });
+  });
+
+  it("is prompt (the default) when there are no executions at all", () => {
+    expect(aggregateLiveState([], 1_000)).toEqual({ state: "prompt" });
   });
 });

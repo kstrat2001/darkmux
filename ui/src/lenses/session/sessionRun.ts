@@ -56,7 +56,8 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateTokenRate, isStalled } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate } from "../../lib/tokenRate";
+import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
 export type PillCls = "run" | "err" | "done" | "canceled";
@@ -177,7 +178,20 @@ export interface SessionRunView {
    * finished run's TOK/S tile is a plain `push()`'d metric instead (see
    * the "TOK/S" push below), matching the issue's "when the run finishes,
    * the scope goes and the tile shows the final measured tok/s". */
-  liveTokScope: { tokensPerSec: number | null; stalled: boolean } | null;
+  liveTokScope:
+    | {
+        tokensPerSec: number | null;
+        stalled: boolean;
+        /** (#2877 pass 2) The legible between-heartbeats state — see
+         *  `lib/tokenRate.ts::deriveLiveState`'s own doc. `stalled` above is
+         *  now DERIVED from this (`state === "stalled"`), so the two can
+         *  never disagree. */
+        state: LiveState;
+        /** Present only when `state === "rest"` — whole seconds left in the
+         *  reported rest window. */
+        restSecondsLeft?: number;
+      }
+    | null;
   /** (#2863) Whether the MODEL section shows its model card. False for an
    * endpoint-served run: the card could only repeat the model name the
    * brief's `model` row already shows. */
@@ -817,10 +831,16 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
           return set.size ? [...set] : [sid];
         })();
   const tokRateRecordSets = tokRateSids.map((s) => data.filter((r) => r.session_id === s));
-  // ALL candidates must be stale — one active sibling among several
-  // (a mission with one seat still generating) must not read as stalled
-  // just because another candidate session has gone quiet.
-  const tokRateStalled = tokRateRecordSets.length > 0 && tokRateRecordSets.every((recs) => isStalled(recs, nowMs));
+  // (#2877 pass 2) ONE state derivation, `lib/tokenRate.ts::deriveLiveState`,
+  // aggregated across the same sibling-session candidates the tok/s reading
+  // already sums (`aggregateLiveState`'s own doc: the best/most-informative
+  // reading wins). `tokRateStalled` is now DERIVED from it rather than a
+  // second, separately-computed "every candidate stale" check — the two
+  // used to be able to disagree (a marker explaining the gap on every
+  // candidate would still read "stalled" under the old rule); they can't
+  // any more, because there is only one rule now.
+  const tokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
+  const tokRateStalled = tokRateLiveState.state === "stalled";
 
   // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
   // `const procs = ...` followed by `void procs` to silence the unused
@@ -1340,7 +1360,12 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     metricScope,
     liveTokScope:
       effHasModelWork && !done
-        ? { tokensPerSec: aggregateTokenRate(tokRateRecordSets), stalled: tokRateStalled }
+        ? {
+            tokensPerSec: aggregateTokenRate(tokRateRecordSets),
+            stalled: tokRateStalled,
+            state: tokRateLiveState.state,
+            restSecondsLeft: tokRateLiveState.restSecondsLeft,
+          }
         : null,
     showModelCard,
     modelTrackLabel,

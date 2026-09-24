@@ -5485,6 +5485,26 @@ body {
   .session-run .metrics {
     grid-template-columns: repeat(2, 1fr);
   }
+  /* (#2877 pass 2, "grow it so the effect is large") The TOK/S scope tile
+     spans the full 2-column row at phone width, and its bezel grows to
+     match — the whole reason to give it the row. `--d`/`--rim` are
+     overridden here, not `aspect-ratio` + percentage padding — see the
+     token-scope block's own doc for why that renders as an oval in Safari;
+     this keeps the SAME explicit-square mechanism, just with bigger
+     numbers. Diameter sits in the 180-220px band the report asked for;
+     the center label scales up with it (below) so the number stays
+     legible at the new size instead of looking lost in the middle of a
+     much bigger tube. */
+  .session-run .met.scopetile {
+    grid-column: 1 / -1;
+  }
+  .session-run .met.scopetile .token-scope-bezel--tile {
+    --d: 200px;
+    --rim: 8px;
+  }
+  .session-run .met.scopetile .token-scope-center .token-scope-n {
+    font-size: 40px;
+  }
 }
 /* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
    width, via `order` rather than DOM position. The DOM keeps `.mv` before

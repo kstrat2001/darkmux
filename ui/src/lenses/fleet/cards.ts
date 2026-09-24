@@ -23,7 +23,8 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateTokenRate, isStalled } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate } from "../../lib/tokenRate";
+import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -437,8 +438,19 @@ export interface FleetCard {
   /** (#2877) No fresh heartbeat from anything running on this machine —
    * the scope should decay to its flat-ring stall state. `liveTokRate` is
    * already forced to `0` in this case (see `buildFleetCard`), so this is
-   * purely the VISUAL flag; the number is already honest either way. */
+   * purely the VISUAL flag; the number is already honest either way.
+   * (#2877 pass 2) Now DERIVED from `liveTokState` (`=== "stalled"`) — one
+   * rule, not two that could disagree. */
   liveTokStalled: boolean;
+  /** (#2877 pass 2, "is this resting? can't tell") The same legible
+   * between-heartbeats state `sessionRun.ts`'s `liveTokScope` derives, here
+   * aggregated across every running session on this machine
+   * (`aggregateLiveState`) — see `lib/tokenRate.ts`'s own doc. `null`
+   * exactly when `liveTokRate` is `null` (nothing running to have a state
+   * for). */
+  liveTokState: LiveState | null;
+  /** Present only when `liveTokState === "rest"`. */
+  liveTokRestSecondsLeft?: number;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -564,9 +576,17 @@ export function buildFleetCard(
   // function is otherwise pure over its inputs (`machActive` above uses the
   // same playhead), and a wall-clock read here would make an identical call
   // non-deterministic and untestable.
-  const liveTokStalled = liveTokRecordSets.length > 0 && liveTokRecordSets.every((recs) => isStalled(recs, t));
+  // (#2877 pass 2) One state derivation shared with the run page
+  // (`sessionRun.ts`'s `liveTokScope`) — see `lib/tokenRate.ts::
+  // deriveLiveState`'s own doc. `liveTokStalled` is now DERIVED from it
+  // (`=== "stalled"`) rather than a second, separately-computed "every
+  // running session's heartbeats are stale" check.
+  const liveTokLiveState = liveTokRecordSets.length > 0 ? aggregateLiveState(liveTokRecordSets, t) : null;
+  const liveTokStalled = liveTokLiveState?.state === "stalled";
   const rawLiveTokRate = active ? aggregateTokenRate(liveTokRecordSets) : null;
   const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
+  const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
+  const liveTokRestSecondsLeft = liveTokState === "rest" ? liveTokLiveState?.restSecondsLeft : undefined;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -595,5 +615,7 @@ export function buildFleetCard(
     runningSessionIds,
     liveTokRate,
     liveTokStalled,
+    liveTokState,
+    liveTokRestSecondsLeft,
   };
 }

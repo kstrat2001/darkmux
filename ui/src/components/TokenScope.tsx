@@ -65,6 +65,11 @@ interface ScopeAnim {
   target: number;
   phase: number;
   bright: number;
+  /** (#2877 pass 2) A slow accumulator that advances regardless of rate —
+   *  the "minimum ripple that breathes" a quiet-but-alive tube needs so it
+   *  never reads as a dead flat ring, distinct from `stalled`'s jittery
+   *  decay (see `drawFrame`'s own doc). */
+  breath: number;
 }
 
 function prefersReducedMotion(): boolean {
@@ -79,34 +84,65 @@ function prefersReducedMotion(): boolean {
 /** One frame of the phosphor trace, at the given radius fraction of
  * `min(w, h)`. Ported from the concept's `drawScope` — two passes (a soft
  * wide glow pass + a bright thin core pass), additive blending
- * ("lighter"), lobes/amplitude driven by the current shown rate. */
-function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: ScopeAnim, stalled: boolean) {
+ * ("lighter"), plus a phosphor sweep dot on top.
+ *
+ * (#2877 pass 2, operator phone screenshot at 88 tok/s) The original lobe
+ * count (`3 + round(min(tps,200)/12)`, ~10 lobes at 88 tok/s) PLUS a
+ * same-strength second harmonic (`lobes*2+1` peaks at 0.35 amplitude) PLUS
+ * the afterglow trail together read as "a fuzzy glowing donut, not a
+ * waveform" — too much density smeared together for the eye to resolve
+ * individual peaks. Three changes, all in the direction of "speed and
+ * brightness carry the busier signal, not density":
+ * 1. Lobes are CAPPED (8) and grow more slowly (`tps / 22`, not `/12`) —
+ *    individually countable at speed, at both the card and the grown mobile
+ *    tile size.
+ * 2. The second harmonic drops from an equal-weight second wave (0.35) to a
+ *    faint texture (0.12) — it no longer doubles the perceived peak count.
+ * 3. The afterglow trail itself fades FASTER as the rate climbs
+ *    (`trailAlpha` rises with `active`), so a faster-moving trace does not
+ *    smear into a longer, denser streak than a slow one already read fine
+ *    at.
+ * Busy still reads busier: phase velocity (rotation speed) and the sweep
+ * dot's speed and brightness both still scale with the rate directly. */
+function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: ScopeAnim, stalled: boolean, resting: boolean) {
   const cx = w / 2;
   const cy = h / 2;
   const R = Math.min(w, h) * 0.34;
   ctx.globalCompositeOperation = "source-over";
-  // Low-alpha fill (not a hard clear) is the afterglow trail: the previous
-  // frame's trace fades rather than vanishing outright.
-  ctx.fillStyle = "rgba(5,8,6,0.22)";
-  ctx.fillRect(0, 0, w, h);
 
   const tps = anim.shown;
   const active = stalled ? 0 : Math.min(1, tps / 25);
-  anim.phase += 0.6 + tps * 0.09;
-  const lobes = 3 + Math.round(Math.min(tps, 200) / 12);
-  const amp = R * (0.02 + 0.16 * active);
+  // Low-alpha fill (not a hard clear) is the afterglow trail: the previous
+  // frame's trace fades rather than vanishing outright. Faster at higher
+  // rates — see this function's own doc, point 3.
+  const trailAlpha = 0.22 + 0.14 * active;
+  ctx.fillStyle = `rgba(5,8,6,${trailAlpha})`;
+  ctx.fillRect(0, 0, w, h);
+
+  // Rest and stall both slow the rotation — a rest is a deliberate pause,
+  // not merely "zero rate", so it reads calmer than an ordinary quiet tube.
+  const rate = resting ? 0.4 : 1;
+  anim.phase += (0.6 + tps * 0.09) * rate;
+  anim.breath += (resting ? 0.012 : 0.028) * rate;
+  const lobes = Math.min(8, 3 + Math.floor(tps / 22));
+  // The minimum-ripple floor breathes slowly on its own clock (`anim.breath`,
+  // independent of `tps`) so a quiet-but-not-stalled tube stays visibly
+  // alive rather than a dead flat ring — calmer than a busy one (the floor
+  // does not grow with `active`), but never perfectly still.
+  const breathe = 0.5 + 0.5 * Math.sin(anim.breath);
+  const amp = R * (0.03 + 0.012 * breathe + 0.16 * active);
   const noise = stalled ? R * 0.004 : 0;
 
   ctx.globalCompositeOperation = "lighter";
   const passes: Array<{ w: number; a: number }> = [
-    { w: 3, a: 0.25 },
-    { w: 1.2, a: 0.95 },
+    { w: 3, a: 0.22 },
+    { w: 1.2, a: 0.88 },
   ];
   for (const p of passes) {
     ctx.beginPath();
     for (let i = 0; i <= 240; i++) {
       const t = (i / 240) * Math.PI * 2;
-      const wave = Math.sin(lobes * t - anim.phase) + 0.35 * Math.sin((lobes * 2 + 1) * t + anim.phase * 1.7);
+      const wave = Math.sin(lobes * t - anim.phase) + 0.12 * Math.sin((lobes * 2 + 1) * t + anim.phase * 1.7);
       const r = R + amp * wave + noise * (Math.random() - 0.5);
       const x = cx + Math.cos(t) * r;
       const y = cy + Math.sin(t) * r;
@@ -120,12 +156,29 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: Sc
     ctx.shadowBlur = p.w * 3 * anim.bright;
     ctx.stroke();
   }
+
+  // Phosphor sweep — a bright leading dot travelling the ring, radar-trace
+  // style. Its angular speed and brightness both follow the rate directly,
+  // the clearest "busier" signal at a glance since it doesn't depend on
+  // resolving individual wave peaks the way lobe density did.
+  if (!stalled) {
+    const sweepAngle = -anim.phase * 0.5;
+    const sweepR = R + amp * Math.sin(lobes * sweepAngle - anim.phase);
+    const sx = cx + Math.cos(sweepAngle) * sweepR;
+    const sy = cy + Math.sin(sweepAngle) * sweepR;
+    ctx.beginPath();
+    ctx.arc(sx, sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(205,255,215,${(0.5 + 0.45 * active) * anim.bright})`;
+    ctx.shadowColor = "rgba(180,255,200,0.9)";
+    ctx.shadowBlur = 10 * anim.bright;
+    ctx.fill();
+  }
   ctx.shadowBlur = 0;
 }
 
 export function TokenScope({ tokensPerSec, stalled = false, resting = false, size, centerLabel, className }: TokenScopeProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const animRef = useRef<ScopeAnim>({ shown: 0, target: 0, phase: Math.random() * 6, bright: 1 });
+  const animRef = useRef<ScopeAnim>({ shown: 0, target: 0, phase: Math.random() * 6, bright: 1, breath: Math.random() * 6 });
   const targetRef = useRef({ target: 0, stalled: false, resting: false });
 
   // Live values the rAF loop reads without needing to restart the effect
@@ -167,8 +220,11 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
       // the concept: k = 1 - e^(-dt*2.2)).
       const k = 1 - Math.exp(-dtSec * 2.2);
       anim.shown += (target - anim.shown) * k;
-      anim.bright += ((isResting ? 0.35 : 1) - anim.bright) * k;
-      if (w && h) drawFrame(ctx!, w, h, anim, targetRef.current.stalled);
+      // (#2877 pass 2) 0.22, not 0.35 — the operator's note was that the
+      // existing dim wasn't legible; lower still reads the sweep/wave (never
+      // fully dark) while being unmistakably dimmer than an active tube.
+      anim.bright += ((isResting ? 0.22 : 1) - anim.bright) * k;
+      if (w && h) drawFrame(ctx!, w, h, anim, targetRef.current.stalled, isResting);
       rafId = requestAnimationFrame(frame);
     }
 
@@ -187,9 +243,10 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
     if (reduce) {
       // Static readout: draw once at the target value, never loop.
       animRef.current.shown = targetRef.current.target;
+      animRef.current.bright = targetRef.current.resting ? 0.22 : 1;
       const w = canvas.clientWidth;
       const h = canvas.clientHeight;
-      if (w && h) drawFrame(ctx, w, h, animRef.current, targetRef.current.stalled);
+      if (w && h) drawFrame(ctx, w, h, animRef.current, targetRef.current.stalled, targetRef.current.resting);
     } else {
       const onVisibility = () => {
         if (document.hidden) stop();
