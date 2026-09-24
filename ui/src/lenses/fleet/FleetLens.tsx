@@ -443,7 +443,15 @@ export function FleetLens({
    * a static build today, so their gated-off results were already the empty
    * values the consumers below receive. */
   const livePolling = liveMode && getSource().kind === "daemon";
-  const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
+  // (#2890) A replay opens on the smallest preset that covers the whole
+  // recording, so a short recording (the demo is about half an hour) fills
+  // the timeline instead of sitting as a sliver at the right edge of 24h.
+  // Live keeps the 24h default. A preset the operator picks still wins.
+  const [windowMinutes, setWindowMinutes] = useState(() => {
+    if (!historical || tMin == null || tMax == null) return DEFAULT_ACTIVITY_WINDOW_MIN;
+    const spanMin = (tMax - tMin) / 60_000;
+    return ACTIVITY_WINDOW_PRESETS.find((p) => p.minutes >= spanMin)?.minutes ?? DEFAULT_ACTIVITY_WINDOW_MIN;
+  });
   // (#2881) The pager's sticky PICK, per machine uid — the session id the
   // operator last chose with an arrow, if any. `FleetCard.executions` no
   // longer including it (that execution ended) falls back to the AUTO

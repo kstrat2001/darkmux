@@ -3444,14 +3444,19 @@ body {
   outline-offset: 1px;
 }
 
+/* (#2881, operator 2026-09-25: "plenty of room to make these cards bigger so
+   that 3 fit across") A grid, not a wrapping row of fixed 248px cards: each
+   track is at least a third of the row (so never more than three across)
+   and at least 260px (so a narrow window drops to two, then one). The cards
+   fill the row instead of leaving most of it empty. */
 .fleet {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(max(260px, calc((100% - 32px) / 3)), 1fr));
   gap: 16px;
-  flex-wrap: wrap;
   align-items: stretch;
 }
 .mach {
-  width: 248px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background: var(--panel-2);
@@ -3541,6 +3546,13 @@ body {
      see the `@media` block below for the real gain, on a card with room to
      give it. */
   padding-right: 80px;
+  /* (#2881) With the cards now a third of the row, the status text fits on
+     one line and the block got SHORTER than the tube it used to size, so
+     the tube is a fixed size the block grows to, the same rule the phone
+     layout uses below. */
+  --tube: 96px;
+  padding-right: calc(var(--tube) + 12px);
+  min-height: var(--tube);
 }
 /* (#2881) The tube itself. `top`/`bottom: 0` give it a DEFINITE height —
    its parent's own height, already resolved from the in-flow text per this
@@ -3567,8 +3579,8 @@ body {
      WIDTH down to match that unclamped height's square, which is what an
      oval bezel (found in an actual screenshot, not predicted) turns out to
      mean in practice. Matches `padding-right` above — see its own comment. */
-  max-width: 80px;
-  max-height: 80px;
+  max-width: var(--tube, 80px);
+  max-height: var(--tube, 80px);
 }
 /* (Mobile fix pass, #2877; widened #2881) The SAME width fix this file's
    `.mach { width: 100% }` rule already makes at this breakpoint turns a

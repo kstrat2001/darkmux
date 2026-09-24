@@ -521,6 +521,23 @@ describe("FleetLens", () => {
     }
   });
 
+  it("(#2890) a replay's activity window defaults to the smallest preset covering the recording", async () => {
+    // A 34-minute recording under the 24h default was a sliver at the right
+    // edge of the timeline (operator, 2026-09-25: "I'm spending most of my
+    // time watching nothing happen").
+    const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    const records = [mk("2026-08-26T10:00:00.000Z", "dispatch.start"), mk("2026-08-26T10:34:00.000Z", "dispatch.complete")];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T10:00:00.000Z"), tMax: Date.parse("2026-08-26T10:34:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("1h"));
+  });
+
+  it("(#2890) a replay longer than 4h keeps the 24h window; live keeps the 24h default", async () => {
+    const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    const records = [mk("2026-08-26T01:00:00.000Z", "dispatch.start"), mk("2026-08-26T09:00:00.000Z", "dispatch.complete")];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("24h"));
+  });
+
   it("(#2834) a session whose endpoint is unknown still counts: darkmux dispatched those tokens either way", async () => {
     const today = todayUTC();
     mockFleetFetch({
