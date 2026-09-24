@@ -1010,3 +1010,57 @@ describe("SessionReplay — dispatch-focus playhead never precedes the run's own
     await waitFor(() => expect(screen.getByRole("status", { name: /not started yet/i })).toBeInTheDocument());
   });
 });
+
+// (#2862) The session page drew a bare "loading…" line while `/flow-session`
+// was in flight, even though the session id is already known from the URL.
+// The fix draws the real header (with the known id), the info card's labels
+// (route, runtime, model, workspace, timing), and the MODEL/SYSTEM tile
+// grids with their labels — only the not-yet-known VALUES shimmer.
+describe("SessionReplay — the pending state draws the page, not a bare line (#2862)", () => {
+  it("shows the known session id, the info-card labels, and the MODEL/SYSTEM tile labels while the fetch is in flight", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+
+    renderReplay("s-pending");
+
+    const pending = await waitFor(() => {
+      const el = screen.getByRole("status", { name: `Loading session s-pending` });
+      expect(el).toBeInTheDocument();
+      return el;
+    });
+
+    // The session id is already known from the URL — it must be on screen,
+    // not hidden behind a shimmer along with everything else.
+    expect(pending.textContent).toMatch(/s-pending/);
+
+    // No bare "loading…" text.
+    expect(pending.textContent).not.toMatch(/loading…/);
+
+    // The info card's labels are real text, not placeholders.
+    for (const label of ["route", "runtime", "model", "workspace", "timing"]) {
+      expect(pending.querySelector(`.brief-label`)?.parentElement, "brief grid should exist").toBeTruthy();
+      const labels = Array.from(pending.querySelectorAll(".brief-label")).map((el) => el.textContent);
+      expect(labels, `expected the "${label}" label to be drawn immediately`).toContain(label);
+    }
+    // Every corresponding value shimmers rather than showing text.
+    const values = pending.querySelectorAll(".brief-value");
+    expect(values.length).toBeGreaterThan(0);
+    for (const v of values) {
+      expect(v.querySelector(".ph-shimmer"), "brief value should shimmer while pending").toBeTruthy();
+      expect((v.textContent ?? "").trim()).toBe("");
+    }
+
+    // The MODEL and SYSTEM tile grids draw their labels, values shimmer.
+    const modelSection = pending.querySelector('.runsec[data-head="model"]');
+    const systemSection = pending.querySelector('.runsec[data-head="system"]');
+    expect(modelSection, "MODEL section should be drawn").toBeTruthy();
+    expect(systemSection, "SYSTEM section should be drawn").toBeTruthy();
+    for (const section of [modelSection, systemSection]) {
+      const tiles = section!.querySelectorAll(".met");
+      expect(tiles.length, "expected at least one tile").toBeGreaterThan(0);
+      for (const tile of tiles) {
+        expect(tile.querySelector(".ml")?.textContent?.trim(), "tile label must be real text").not.toBe("");
+        expect(tile.querySelector(".mv .ph-shimmer"), "tile value should shimmer").toBeTruthy();
+      }
+    }
+  });
+});

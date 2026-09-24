@@ -11,6 +11,7 @@ import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS,
 import type { FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
+import { Shimmer } from "../../components/Placeholder";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
@@ -93,11 +94,19 @@ function machineRunsHash(uid: string, runningSessionIds: string[]): string | nul
   return `lens=runs&machine=${encodeURIComponent(uid)}`;
 }
 
-/** `sc()` — viewer.html:1633. One token-class chip (value over label). */
-function Chip({ value, label, cls }: { value: string | number; label: string; cls?: string }) {
+/** `sc()` — viewer.html:1633. One token-class chip (value over label).
+ *
+ * `loading` (#2862) renders the shared `Shimmer` in place of `value` — the
+ * `settled ? fmtC(...) : ""` sentinel this used to take as `value` moved to
+ * the call site, which was doing the SAME masking `Shimmer` now owns, just
+ * without leaving a box for the CSS overlay to sit in (see `.ph-shimmer`'s
+ * own doc in `styles.css`). `.scv` is a `<div>`, matching `.savnum`'s own
+ * block-fills-its-track sizing, so only a height floor (`minHeight="1.1em"`,
+ * `.savc .scv`'s own line-height) is needed. */
+function Chip({ value, label, cls, loading }: { value?: string | number; label: string; cls?: string; loading?: boolean }) {
   return (
     <div className={`savc${cls ? ` ${cls}` : ""}`}>
-      <div className="scv">{value}</div>
+      {loading ? <Shimmer as="div" className="scv" minHeight="1.1em" /> : <div className="scv">{value}</div>}
       <div className="scl">{label}</div>
     </div>
   );
@@ -144,6 +153,17 @@ function SavingsHero({
   settled: boolean;
 }) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
+  // (#2878) `null` while unsettled, so the first real total lands instantly;
+  // a later change counts up, and only up (the 24h window slides past old
+  // records on every poll with nothing running). Off outside live mode: a
+  // scrub or replay is a seek, not a figure moving.
+  const heroTotal = useCountUp(
+    settled ? t.local + t.cloud + t.unknown : null,
+    (n) => (n === null ? "" : fmtN(n)),
+    liveMode ? undefined : 0,
+    { upOnly: true },
+  );
+
   return (
     // The silhouette is applied in CSS off this one attribute so the figures
     // keep their exact geometry — same elements, same sizes, digits hidden.
@@ -194,32 +214,18 @@ function SavingsHero({
             FROM — the tokens were dispatched by darkmux either way, which
             is the only claim being made. */}
         <div className="savlead">
-          {/* (#2878) `null` while unsettled — the FIRST real total lands
-              instantly (this is a reading arriving, not a change to
-              tween through, matching `useCountUp`'s absence rule); only a
-              LATER change to an already-settled total counts up/down.
-              Tweening is also OFF (`durationMs: 0`) outside `liveMode`: a
-              scrubbed playhead or a replayed day is a seek to a different
-              already-happened instant, not a live figure moving — see
-              `useCountUp`'s own doc on this exact distinction. */}
-          <div className="savnum">
-            {useCountUp(
-              settled ? t.local + t.cloud + t.unknown : null,
-              (n) => (n === null ? "" : fmtN(n)),
-              liveMode ? undefined : 0,
-              // The window slides past old records on every poll, so the total
-              // falls with nothing running; only new work counts up.
-              { upOnly: true },
-            )}
-          </div>
+          {/* (#2862) A shimmer while unsettled; (#2878) once settled the
+              total counts up on new work. The count-up hook is hoisted above
+              the return (hooks cannot sit in a conditional branch). */}
+          {settled ? <div className="savnum">{heroTotal}</div> : <Shimmer as="div" className="savnum" minHeight="1em" />}
           <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
         </div>
         <div className="savclasses">
-          <Chip value={settled ? fmtC(t.completion) : ""} label="generated" cls="gen" />
-          <Chip value={settled ? fmtC(t.fresh) : ""} label="fresh input" />
-          <Chip value={settled ? fmtC(t.reread) : ""} label="re-read" />
-          {t.uncls ? <Chip value={settled ? fmtC(t.uncls) : ""} label="unclassified" cls="uncls" /> : null}
-          <Chip value={settled ? t.runs : ""} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
+          <Chip value={fmtC(t.completion)} loading={!settled} label="generated" cls="gen" />
+          <Chip value={fmtC(t.fresh)} loading={!settled} label="fresh input" />
+          <Chip value={fmtC(t.reread)} loading={!settled} label="re-read" />
+          {t.uncls ? <Chip value={fmtC(t.uncls)} loading={!settled} label="unclassified" cls="uncls" /> : null}
+          <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>
       <div className="hybnote">

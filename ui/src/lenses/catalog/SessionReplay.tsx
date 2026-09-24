@@ -1,4 +1,5 @@
 import { WorkStatus } from "../../components/WorkStatus";
+import { Shimmer } from "../../components/Placeholder";
 import { useEffect, useMemo, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
@@ -111,6 +112,95 @@ function groupBriefEntries(entries: BriefEntry[]): BriefGroup[] {
     }
   }
   return groups;
+}
+
+/** One label/value pair in the pending info card — real label, shimmered
+ *  value. Mirrors the shape `groupBriefEntries`'s `"pair"` case renders once
+ *  data lands (`.brief-pair` > `.brief-label` + `.brief-value`), so nothing
+ *  shifts when the real value replaces the shimmer (#2068's CLS lesson). */
+function PendingBriefPair({ label }: { label: string }) {
+  return (
+    <div className="brief-pair">
+      <div className="brief-label">{label}</div>
+      <div className="brief-value">
+        <Shimmer minWidth="8em" />
+      </div>
+    </div>
+  );
+}
+
+/** One MODEL/SYSTEM tile in the pending state — real label, shimmered value,
+ *  same `.met`/`.mv`/`.ml` shape the loaded grid renders (see the `view.metrics`
+ *  map in the main render below). */
+function PendingTile({ label }: { label: string }) {
+  return (
+    <div className="met">
+      <div className="mv">
+        <Shimmer minWidth="3em" />
+      </div>
+      <div className="ml">{label}</div>
+    </div>
+  );
+}
+
+/**
+ * (#2862) The pending state for `#dispatch=<session_id>` — the session id is
+ * already known from the URL (the caller passed it in), so this draws the
+ * REAL header, the info card's labels (route/runtime/model/workspace/timing
+ * — the five `pushKv` calls in `sessionRun.ts` that are always present,
+ * unlike `image`/`mission` which are conditional), and the MODEL/SYSTEM tile
+ * grids with their labels. Only the values — which depend on records nobody
+ * has fetched yet — shimmer.
+ *
+ * The MODEL tiles shown (TURNS, TOKENS IN, TOKENS OUT, CONTEXT) and the
+ * SYSTEM tile shown (WALL CLOCK) are the set `sessionRun.ts` always produces
+ * for a model-bearing run before any telemetry has arrived (`CONTEXT` is
+ * literally `ctxLabel`'s own pre-data default, `!effNctx ? "CONTEXT" : ...`).
+ * A `procedural.shell`-only run's real page never shows a MODEL section at
+ * all (`hasModelWork` gates it) — this skeleton cannot know that in advance
+ * (nothing has been fetched), so it draws the common case, same as guessing
+ * six rows for the runs list. That is an inherent skeleton approximation,
+ * not a regression: the alternative is the bare "loading…" line this issue
+ * replaces.
+ */
+function SessionPendingHeader({ sessionId }: { sessionId: string }) {
+  // `.session-ph`, deliberately NOT `.session-run`/`.session-run__header`/
+  // `.pill` — a long list of existing specs use those bare classes (no
+  // `[data-state="data"]` qualifier) as their "real session data has
+  // landed" signal (`SessionReplay.test.tsx`, its transition sibling,
+  // `App.test.tsx`'s scrubber suite). See `.session-ph`'s own doc in
+  // styles.css for the collision this avoids and the CSS it stands in for.
+  return (
+    <div className="session-ph" data-state="pending" role="status" aria-label={`Loading session ${sessionId}`}>
+      <h2 className="session-ph__header">
+        <Shimmer as="span" className="pill" minWidth="5em" minHeight="1.3em" />{" "}
+        <Shimmer as="span" minWidth="6em" />{" "}
+        <span className="session-ph__meta">
+          ({sessionId} on <Shimmer as="span" minWidth="5em" />)
+        </span>
+      </h2>
+      <div className="track brief-grid">
+        <PendingBriefPair label="route" />
+        <PendingBriefPair label="runtime" />
+        <PendingBriefPair label="model" />
+        <PendingBriefPair label="workspace" />
+        <PendingBriefPair label="timing" />
+      </div>
+      <section className="runsec" data-head="model">
+        <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
+          <PendingTile label="TURNS" />
+          <PendingTile label="TOKENS IN" />
+          <PendingTile label="TOKENS OUT" />
+          <PendingTile label="CONTEXT" />
+        </div>
+      </section>
+      <section className="runsec" data-head="system">
+        <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
+          <PendingTile label="WALL CLOCK" />
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function BriefEntryContent({ entry }: { entry: BriefEntry }) {
@@ -327,12 +417,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   const nowMs = useNowMs(ticking);
 
   if (!session) {
-    return (
-      <div data-state="pending" role="status" aria-label={`Loading session ${sessionId}`}>
-        <div className="stagehdr">session replay</div>
-        <div className="none">loading…</div>
-      </div>
-    );
+    return <SessionPendingHeader sessionId={sessionId} />;
   }
 
   if (!session.ok) {

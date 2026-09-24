@@ -1,4 +1,5 @@
 import { useRef } from "react";
+import { Shimmer } from "../../components/Placeholder";
 import {
   computeGaugeGeometry,
   computeBandGeometry,
@@ -26,7 +27,7 @@ import {
   type ResidencyRowView,
 } from "./machineGauge";
 import { memBytes, reclaimableNote, relAgoFrom } from "../../lib/format";
-import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, estimatedSummaryLine, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
+import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, estimatedSummaryLine, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
@@ -677,7 +678,13 @@ export function MachineHealthRegion({
     return <div className="none">{DAEMON_UNREACHABLE_MESSAGE}</div>;
   }
   if (!resources) {
-    return <div className="none">{LOADING_MESSAGE}</div>;
+    // (#2862) Not one of the issue's two named surfaces, but no bare
+    // "loading…" text either.
+    return (
+      <div className="memcard" role="status" aria-label="Loading machine resources">
+        <Shimmer as="div" minHeight="1em" style={{ maxWidth: "60%" }} />
+      </div>
+    );
   }
 
   const b = resources;

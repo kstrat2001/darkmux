@@ -6,6 +6,7 @@ import { useArrivalKeys } from "../hooks/useArrivalKeys";
 import { LIVE_WINDOW_MS } from "../lib/flow";
 import { clk } from "../lib/format";
 import { RecordView } from "./RecordView";
+import { Shimmer } from "./Placeholder";
 import {
   absorbNewFacetValues,
   activityOf,
@@ -1435,12 +1436,16 @@ export function EventLogColumn({
             <div
               className="eventlog__empty"
               data-state={error ? "error" : loading ? "loading" : periodicOnlyWindow ? "periodic-only" : "empty"}
-              role={error ? "alert" : undefined}
+              role={error ? "alert" : loading ? "status" : undefined}
+              aria-label={loading ? "Loading events" : undefined}
             >
               {error
                 ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
                 : loading
-                  ? "loading…"
+                  ? // (#2862) Not one of the issue's two named surfaces, but
+                    // no bare "loading…" text either — a shimmer line the
+                    // size of a real event row stands in.
+                    <Shimmer as="span" minWidth="10em" />
                   : // (broadened from "no events match your search") A
                     // filtered-to-empty result can now come from an
                     // unchecked facet, not just the text search — the two
