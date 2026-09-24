@@ -104,8 +104,14 @@ function ScopeLamps({
         return (
           <span key={state} className="scope-lamp" data-state={state} data-on={on ? "true" : "false"}>
             <span className="scope-lamp__dot" aria-hidden="true" />
-            {label}
-            {on && state === "rest" && reading.restSecondsLeft != null ? ` ${reading.restSecondsLeft}s` : ""}
+            {/* Only the lit lamp shows its word; the rest read as dots, so
+                the row stays one line in a narrow tile (operator, 2026-09-24:
+                "the lights are too big, taking too much space"). The text
+                stays in the DOM for the status role. */}
+            <span className="scope-lamp__label">
+              {label}
+              {on && state === "rest" && reading.restSecondsLeft != null ? ` ${reading.restSecondsLeft}s` : ""}
+            </span>
           </span>
         );
       })}

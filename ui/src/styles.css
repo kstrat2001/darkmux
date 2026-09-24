@@ -8246,9 +8246,20 @@ body {
   order: 4;
   margin-top: 10px;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: center;
-  gap: 6px 12px;
+  align-items: center;
+  gap: 8px;
+}
+/* Unlit lamps are dots only; the lit one carries its word. Visually hidden,
+   not removed, so the status text stays readable to assistive tech. */
+.scope-lamp[data-on="false"] .scope-lamp__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 .scope-lamp {
   display: inline-flex;
