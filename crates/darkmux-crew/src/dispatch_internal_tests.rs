@@ -1154,6 +1154,17 @@
         assert_eq!(payload["image"], serde_json::json!("darkmux-runtime:latest"));
         assert_eq!(payload["prompt_chars"], serde_json::json!("read x.txt".chars().count()));
         assert_eq!(payload["workspace"], serde_json::json!("/tmp/ws"));
+        // (#2887 N2) `flow_schema` names the schema version this run's
+        // records were written against, from the ONE shared constant — so
+        // a viewer reading an older run can tell "genuinely predates a
+        // forwarder fix" from "ran clean" instead of guessing. Asserted
+        // against the constant itself, not a literal, so this test can't
+        // silently go stale on the next bump.
+        assert_eq!(
+            payload["flow_schema"],
+            serde_json::json!(darkmux_flow::FLOW_SCHEMA_VERSION),
+            "dispatch.start must stamp the flow schema version: {payload}"
+        );
 
         unsafe {
             match prev {
@@ -8510,6 +8521,76 @@
         );
     }
 
+    /// (#2887) A CLEAN `dispatch.gate.observation` (`degenerate:false`) must
+    /// NOT map to a flow record — forwarding all of them would flood the
+    /// stream with ~30 clean looks per real finding (#2844's own doc: 34
+    /// observations, 14 degenerate, on the run that surfaced this gap).
+    #[test]
+    fn detector_telemetry_payload_drops_clean_gate_observation() {
+        let event = serde_json::json!({
+            "type": "dispatch.gate.observation",
+            "seq": 2,
+            "observation": 1,
+            "slice_chars": 4000,
+            "tail_ratio": 1.0,
+            "interval_tokens": 1000,
+            "degenerate": false,
+        });
+        assert!(
+            detector_telemetry_payload("dispatch.gate.observation", &event).is_none(),
+            "a clean observation must not become a flow record"
+        );
+    }
+
+    /// (#2887) A DEGENERATE `dispatch.gate.observation` maps to
+    /// `{kind:"repetition", severity:"warn"}` — this is the central defect
+    /// the issue names: this event previously had NO forwarder arm at all,
+    /// so a run the gate flagged 14 times could still read CLEAN.
+    #[test]
+    fn detector_telemetry_payload_maps_degenerate_gate_observation() {
+        let event = serde_json::json!({
+            "type": "dispatch.gate.observation",
+            "seq": 2,
+            "observation": 17,
+            "slice_chars": 68000,
+            "tail_ratio": 0.242_333_2,
+            "interval_tokens": 1000,
+            "degenerate": true,
+        });
+        let payload = detector_telemetry_payload("dispatch.gate.observation", &event)
+            .expect("a degenerate observation must map to a record");
+        assert_eq!(payload["kind"], "repetition");
+        assert_eq!(payload["severity"], "warn");
+        assert_eq!(payload["observation"], 17);
+        assert_eq!(payload["slice_chars"], 68000);
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(!detail.is_empty());
+        assert!(detail.contains("17") && detail.contains("68000"), "got {detail:?}");
+    }
+
+    /// (#2887) `dispatch.gate.abort` always maps — it only ever fires when
+    /// the gate's policy allowed it to act, so there is no clean/noisy case
+    /// to filter the way there is for the observation above.
+    #[test]
+    fn detector_telemetry_payload_maps_gate_abort() {
+        let event = serde_json::json!({
+            "type": "dispatch.gate.abort",
+            "seq": 3,
+            "observation": 6,
+            "slice_chars": 24000,
+            "generated_chars": 8000,
+            "interval_tokens": 1000,
+            "tool_call_in_flight": false,
+        });
+        let payload = detector_telemetry_payload("dispatch.gate.abort", &event)
+            .expect("an abort must always map to a record");
+        assert_eq!(payload["kind"], "repetition");
+        assert_eq!(payload["severity"], "warn");
+        assert_eq!(payload["observation"], 6);
+        assert_eq!(payload["slice_chars"], 24000);
+        assert_eq!(payload["generated_chars"], 8000);
+    }
+
     /// `intra_turn_stall.recovered` with a null `completion_tokens`
     /// (upstream omitted `usage`) renders "unknown", not a misleading 0.
     #[test]
@@ -9181,6 +9262,264 @@
             serde_json::json!({"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "config"}),
             "dispatch.checkpoint's payload must forward the runtime's bound verbatim"
         );
+    }
+
+    /// (#2887) `dispatch.checkpoint`'s payload must carry `policy` and
+    /// `would_conclude` through — both already ride the runtime's own
+    /// trajectory event but were dropped by the forwarder, so an
+    /// observe-policy checkpoint that WOULD have concluded read
+    /// indistinguishably from one that never judged the turn repetitive at
+    /// all.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_dispatch_checkpoint_forwards_policy_and_would_conclude() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-checkpoint-policy".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.checkpoint","seq":1,"ts":1,"checkpoint":1,"slice_tokens":900,
+                "tail_ratio":0.17,"verdict":"continue","judged_chars":121276,"policy":"observe",
+                "would_conclude":true,
+                "bound":{"kind":"reasoning_checkpoint_interval","value":1000,"source":"built-in"}}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-checkpoint-policy" && v["action"] == "dispatch.checkpoint")
+            .expect("dispatch.checkpoint record must exist");
+        assert_eq!(record["payload"]["policy"], "observe");
+        assert_eq!(record["payload"]["would_conclude"], true);
+    }
+
+    /// (#2887 F3/F4) The central defect: a trajectory holding one DEGENERATE
+    /// `dispatch.gate.observation` must reach the flow stream as a
+    /// `telemetry.detector` record with `kind:"repetition"` — before this
+    /// fix there was no forwarder arm at all, so the SIGNALS card read
+    /// CLEAN no matter how many times the gate fired.
+    ///
+    /// The fixture carries `policy`/`acted` on the RAW event, the shape the
+    /// runtime now emits (`trajectory::append_gate_observation`) — the host
+    /// no longer resolves policy from its own env (a fresh reviewer found
+    /// that reading stale or ambient host state, not what the runtime
+    /// actually ran under). Asserts the forward is a verbatim passthrough:
+    /// under `observe`/`acted:false`, the record's own `policy` and `acted`
+    /// survive, and the detail sentence reads as observed-not-enforced.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_degenerate_gate_observation_forwards_repetition_stamped_observe() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-observe".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.gate.observation","seq":2,"ts":1,"observation":17,
+                "slice_chars":68000,"tail_ratio":0.2423332,"interval_tokens":1000,
+                "degenerate":true,"policy":"observe","acted":false}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-observe" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the degenerate observation");
+        assert_eq!(record["payload"]["kind"], "repetition");
+        assert_eq!(record["payload"]["turn_seq"], 2);
+        assert_eq!(record["payload"]["policy"], "observe");
+        assert_eq!(record["payload"]["acted"], false);
+        let detail = record["payload"]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("observed") && detail.contains("not enforced"),
+            "got {detail:?}"
+        );
+    }
+
+    /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
+    /// verbatim from the runtime-stamped event, same passthrough discipline
+    /// as the observe-mode test above, exercising the enforce/acted:true
+    /// shape.
+    #[test]
+    #[serial]
+    fn handle_event_gate_abort_forwards_repetition_stamped_enforce() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-abort".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.gate.abort","seq":2,"ts":1,"observation":6,
+                "slice_chars":24000,"generated_chars":8000,"interval_tokens":1000,
+                "tool_call_in_flight":false,"policy":"enforce","acted":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-abort" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the abort");
+        assert_eq!(record["payload"]["kind"], "repetition");
+        assert_eq!(record["payload"]["turn_seq"], 2);
+        assert_eq!(record["payload"]["policy"], "enforce");
+        assert_eq!(record["payload"]["acted"], true);
+    }
+
+    /// (#2887 F3) An older runtime image that predates policy stamping on
+    /// gate events sends neither `policy` nor `acted` at all. The host must
+    /// NOT fill in a guessed value from its own environment — the whole
+    /// point of moving the stamp into the runtime was that the host's env
+    /// can disagree with (or postdate) what the runtime actually ran under.
+    /// Missing means null, not "assume enforce" or "assume the current env".
+    #[test]
+    #[serial]
+    fn handle_event_gate_observation_from_a_pre_policy_runtime_forwards_policy_as_null() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-legacy".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // No `policy`/`acted` keys — the pre-#2887-F3 runtime shape.
+        state.handle_event(
+            r#"{"type":"dispatch.gate.observation","seq":2,"ts":1,"observation":17,
+                "slice_chars":68000,"tail_ratio":0.2423332,"interval_tokens":1000,
+                "degenerate":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-legacy" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the degenerate observation");
+        assert!(record["payload"]["policy"].is_null(), "got {}", record["payload"]);
+        assert!(record["payload"]["acted"].is_null(), "got {}", record["payload"]);
+        // Neither acted (unknown) nor definitely-observe, so the wording
+        // must fall back to the base sentence, no "flagged (observed)"
+        // clause and no "and ended the call" clause.
+        let detail = record["payload"]["detail"].as_str().unwrap();
+        assert!(!detail.contains("observed"), "got {detail:?}");
+        assert!(!detail.contains("ended the call"), "got {detail:?}");
     }
 
     /// (#795) A `model.completed` event with a full `usage` object maps

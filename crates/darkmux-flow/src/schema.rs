@@ -101,6 +101,64 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
 //           or the opener) — a zero Δchars is a real reading of "nothing new
 //           was counted", not a stall.
 //
+//   1.56.0 (#2887, degeneracy-gate signals reach the flow stream): additive.
+//           The in-stream degeneracy gate's `dispatch.gate.observation`
+//           (degenerate only) and `dispatch.gate.abort` trajectory events now
+//           forward as `category=telemetry, source=detector,
+//           action=telemetry.detector` records with `kind:"repetition"` —
+//           previously dropped on the floor entirely (`darkmux-crew`'s
+//           trajectory-to-flow forwarder had no arm for either type), so a
+//           run the gate flagged repeatedly still read CLEAN on the run
+//           page. New payload keys on that record: `turn_seq` (the
+//           runtime's own `seq`, same field name `dispatch.checkpoint`
+//           already uses — the join key a consumer needs to attribute an
+//           observation/abort/checkpoint triple to ONE flagged turn),
+//           `observation`, `tail_ratio`, `slice_chars`, `generated_chars`
+//           (null on an observation, only ever populated by an abort — also
+//           the field a consumer uses to tell the two record shapes apart
+//           without a dedicated discriminator key), `policy`
+//           (`"enforce"`/`"observe"`/`"off"`) and `acted` (true only for
+//           `dispatch.gate.abort` — an observation, even a degenerate one,
+//           never itself ended the call). `policy`/`acted` are stamped by
+//           the RUNTIME itself (`trajectory::append_gate_observation`/
+//           `append_gate_abort`), not reconstructed by the host from its
+//           own environment — a record from a runtime image that predates
+//           this carries neither key, and the host forwards that absence
+//           verbatim rather than guessing. Also additive: `dispatch.
+//           checkpoint` records now carry `policy` and `would_conclude`
+//           (the reasoning check-in's verdict BEFORE its own policy is
+//           applied) — both already rode the runtime's trajectory event but
+//           were dropped by the forwarder, same defect as the gate's.
+//           `policy`/`acted` predating this runtime change forward as a
+//           PRESENT key holding an explicit JSON `null` (the host's
+//           `.cloned().unwrap_or(Value::Null)` on a missing trajectory
+//           field), never as an absent key — a consumer distinguishing
+//           "unknown" from "false" reads `null`, not a missing field.
+//
+//           Also additive: `dispatch.start`'s payload gains a
+//           `flow_schema` key — the `FLOW_SCHEMA_VERSION` this dispatch's
+//           OWN records were written against, from this same constant,
+//           stamped by the HOST at dispatch-start time. **What this
+//           proves, precisely: the HOST-SIDE forwarder that wrote this
+//           run's records is at least 1.56.0 — nothing about the RUNTIME
+//           IMAGE the container actually executed.** A host on 1.56.0+
+//           talking to a stale runtime image that predates the gate
+//           stamping its own `policy`/`acted` (or, further back, predates
+//           the degeneracy gate existing at all, #2836) still writes a
+//           current `flow_schema`, because that constant lives in the
+//           HOST binary, not the image. Such a run reads `flow_schema`
+//           OK and genuinely has no `repetition` finding — but "the gate
+//           found nothing" and "the gate never ran in that container" are
+//           indistinguishable from this field alone, and the run page
+//           does not attempt to tell them apart (deliberately — no
+//           image-provenance machinery is built for this; that gap is
+//           `darkmux doctor`'s job, which already flags a stale runtime
+//           image, not the flow schema's). The run page's own use of this
+//           stamp is narrower than that: `repetition` reads as checked
+//           only when `flow_schema` is present and >= 1.56.0 AND the
+//           run's own `bounds.detection_degeneracy_policy` is not
+//           `"off"` — otherwise it renders "(not recorded)", never a
+//           silent checkmark.
 //   1.55.0 (#2877, live token-rate scope): additive payload keys
 //           `sampled_at_ms` and `generated_chars` on `dispatch.turn.
 //           heartbeat`.

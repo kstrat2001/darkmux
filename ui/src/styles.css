@@ -2240,6 +2240,17 @@ body {
   color: var(--good);
   font-weight: 700;
 }
+/* (#2887 F2) A detector this run's own bounds say never ran (policy "off")
+   is neither a pass nor a struggle — a dash, not a checkmark, and dimmed
+   text so it reads as "not measured" rather than "measured, clean". */
+.sigcheck--off {
+  color: var(--dim);
+}
+.sigcheck--off::before {
+  content: "–";
+  color: var(--dim);
+  font-weight: 400;
+}
 /* (#2863) The panel's own scope, said once: which session, then who ran it
    where. */
 .eventlog__shared {

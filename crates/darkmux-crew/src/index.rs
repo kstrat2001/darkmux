@@ -851,6 +851,15 @@ fn derive_cautions(tx: &Connection) -> Result<()> {
                 continue;
             }
             let (kind, severity, detail, file, code_hash) = caution_fields(&rec);
+            // (#2887 F5) Same exclusion as `coder_phase::mission_cautions`'s
+            // own copy — keep them in sync, per this module's own doc a few
+            // lines up. `repetition` (the degeneracy gate + reasoning
+            // checkpoint) is not a finding about a file or a pattern the
+            // next dispatch should be cautioned about; it is an
+            // operator-facing signal about THIS run's own output.
+            if kind == "repetition" {
+                continue;
+            }
             insert.execute(params![
                 file,
                 kind,
@@ -1282,6 +1291,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(engagement_level, None, "engagement-level firing → NULL file");
+    }
+
+    /// (#2887 F5) `repetition` (the degeneracy gate + reasoning checkpoint)
+    /// must never become a caution — it is a signal about THIS run's own
+    /// output, not a finding about a file or pattern the next dispatch
+    /// should be cautioned about. Same exclusion as `coder_phase::
+    /// mission_cautions`'s own copy — this module's own doc on
+    /// `is_detector_caution` says to keep the two in sync.
+    #[serial_test::serial]
+    #[test]
+    fn derive_cautions_excludes_repetition_kind() {
+        let crew = CrewDirGuard::new();
+        crew.write_flow_day(
+            "2026-06-22.jsonl",
+            &[
+                detector_line(
+                    "detector",
+                    serde_json::json!({
+                        "kind": "cycle", "severity": "warn", "detail": "`edit` called 3×",
+                        "area": { "files": ["src/x.rs"] }
+                    }),
+                ),
+                detector_line(
+                    "detector",
+                    serde_json::json!({
+                        "kind": "repetition", "severity": "warn",
+                        "detail": "observation 17: tail_ratio=0.242 over 68000 characters — \
+                                    the degeneracy gate judged this repeating (#2836)"
+                    }),
+                ),
+            ],
+        );
+
+        let idx = index_path(crew.path());
+        rebuild_at(&idx).unwrap();
+
+        let conn = open_index(&idx).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cautions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the cycle firing becomes a caution");
+        let repetition_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cautions WHERE kind='repetition'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(repetition_count, 0, "repetition must never reach the cautions store");
     }
 
     // (#999) The former `knowledge_preserved_but_cautions_rederived_across_rebuild`

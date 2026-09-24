@@ -431,6 +431,48 @@ edit loop detected on src/widget.rs in an earlier dispatch
         assert!(unknown.is_empty(), "an empty session-id set reads as none");
     }
 
+    /// (#2887 F5) `repetition` (the degeneracy gate + reasoning checkpoint,
+    /// #2887) is darkmux-internal vocabulary about THIS run's own output —
+    /// not a finding about a file or pattern the next dispatch should be
+    /// cautioned about. Before this exclusion, a mission whose gate fired
+    /// repeatedly would inject up to one bullet per flagged observation into
+    /// every future dispatch's brief.
+    #[test]
+    #[serial_test::serial]
+    fn mission_cautions_excludes_repetition_kind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-06-22.jsonl"),
+            concat!(
+                r#"{"ts":"2026-06-22T10:00:00Z","category":"telemetry","source":"detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"cycle","severity":"warn","detail":"`edit` called 3×","area":{"files":["src/x.rs"]}}}"#, "\n",
+                r#"{"ts":"2026-06-22T10:01:00Z","category":"telemetry","source":"detector","session_id":"mission-run-rep-s1","handle":"coder","payload":{"kind":"repetition","severity":"warn","detail":"observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836)"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        // SAFETY: serialized via #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+
+        let ids: std::collections::HashSet<String> =
+            ["mission-run-rep-s1"].iter().map(|s| s.to_string()).collect();
+        let no_intent = std::collections::HashSet::new();
+        let cautions = mission_cautions(&ids, &no_intent, tmp.path());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+
+        assert_eq!(cautions.len(), 1, "only the cycle caution survives: {cautions:?}");
+        assert!(cautions[0].contains("[cycle]"), "{cautions:?}");
+        assert!(
+            !cautions.iter().any(|c| c.contains("[repetition]") || c.contains("degeneracy gate")),
+            "repetition must never reach the model-facing brief: {cautions:?}"
+        );
+    }
+
     // ─── (#1002) intent extraction + file-in-play / staleness ranking ────
 
     #[test]

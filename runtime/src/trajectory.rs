@@ -719,6 +719,22 @@ impl Trajectory {
     ///
     /// `ratio` is `None` when the slice was too short for the token metric;
     /// the char fallback may still have produced `degenerate`.
+    ///
+    /// (#2887 F3/F4) `policy` and `acted` are the regime this observation
+    /// was judged under, stamped HERE rather than left for a downstream
+    /// forwarder to reconstruct. The host previously re-resolved the
+    /// degeneracy policy from its OWN environment at forward time — wrong
+    /// whenever the record is read later than the env reflects (a fleet
+    /// reader, a replay, an operator who flipped the config after the run),
+    /// and it silently invented a value for any record the runtime never
+    /// stamped at all. `policy` is the same string `degeneracy_policy()`
+    /// resolved for THIS call — the runtime already computes it to build
+    /// the gate itself, so this is the one true source, not a second
+    /// resolution that can disagree with the first. `acted` says whether
+    /// THIS observation's verdict is what ended the call: `false` for the
+    /// `Observed` branch (which by construction never aborts, degenerate or
+    /// not), `true` for the `Degenerate` branch's own observation (the one
+    /// immediately followed by `append_gate_abort` for the same moment).
     pub fn append_gate_observation(
         &mut self,
         seq: u32,
@@ -727,6 +743,8 @@ impl Trajectory {
         ratio: Option<f32>,
         interval_tokens: u32,
         degenerate: bool,
+        policy: &str,
+        acted: bool,
     ) {
         self.write_event(&serde_json::json!({
             "type": "dispatch.gate.observation",
@@ -737,6 +755,8 @@ impl Trajectory {
             "tail_ratio": ratio,
             "interval_tokens": interval_tokens,
             "degenerate": degenerate,
+            "policy": policy,
+            "acted": acted,
         }));
     }
 
@@ -773,6 +793,16 @@ impl Trajectory {
         // load-bearing field for the SILENT abort, where a stream dying
         // mid-tool-call is exactly what the operator needs to know.
         tool_call_in_flight: bool,
+        // (#2887 F3/F4) Same reasoning as `append_gate_observation`'s own
+        // doc: the policy this call ran under, stamped by the runtime that
+        // resolved it, not reconstructed by a downstream forwarder. `acted`
+        // is not a parameter here — an abort's mere existence IS the acted
+        // outcome (see `StreamGate::ingest`'s `Degenerate` variant, only
+        // reachable when the policy's `acts()` allowed it) — but the field
+        // is still written, literally `true`, so a consumer reading either
+        // record type can check the SAME key rather than inferring it from
+        // which event type arrived.
+        policy: &str,
     ) {
         self.write_event(&serde_json::json!({
             "type": "dispatch.gate.abort",
@@ -783,6 +813,8 @@ impl Trajectory {
             "slice_chars": slice_chars,
             "generated_chars": generated_chars,
             "interval_tokens": interval_tokens,
+            "policy": policy,
+            "acted": true,
         }));
     }
 

@@ -5175,6 +5175,12 @@ fn run_streaming_turn(
     trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
+    // (#2887 F3) Resolved ONCE and reused for the gate's own bounds AND for
+    // stamping every trajectory event it writes below — two separate calls
+    // to `degeneracy_policy()` (as this used to read) can only ever agree
+    // by chance, since each is a fresh env read; a single value read once is
+    // the one true source for both.
+    let policy = crate::detection::degeneracy_policy();
     let mut gate = StreamGate::new(
         crate::stream_gate::GateBounds { interval_tokens: watch.interval },
         crate::reasoning_loop::measure_and_judge,
@@ -5182,8 +5188,8 @@ fn run_streaming_turn(
         // (#2846) The stream gate is the FIRST of two gates; suppressing only
         // the checkpoint gate would still let this one cut generation short,
         // which is a second variable.
-        crate::detection::degeneracy_policy().measures(),
-        crate::detection::degeneracy_policy().acts(),
+        policy.measures(),
+        policy.acts(),
     );
     let mut cut = CutSource::None;
     // (#2889) Ticking, so the loop wakes during a silence and can say the
@@ -5290,6 +5296,12 @@ fn run_streaming_turn(
                     ratio,
                     watch.interval,
                     would_abort,
+                    policy.as_str(),
+                    // (#2887 F3) `Observed` never itself ends the call — that
+                    // is the branch's whole definition (see `GateAction`'s
+                    // own doc) — so this observation never acted, degenerate
+                    // or not.
+                    false,
                 );
             }
             crate::stream_gate::GateAction::Degenerate { slice_chars, ratio, generated_chars } => {
@@ -5299,6 +5311,11 @@ fn run_streaming_turn(
                     slice_chars,
                     ratio,
                     watch.interval,
+                    true,
+                    policy.as_str(),
+                    // (#2887 F3) This observation's own verdict is what
+                    // ends the call — the `append_gate_abort` call just
+                    // below is for this SAME moment.
                     true,
                 );
                 eprintln!(
@@ -5322,6 +5339,7 @@ fn run_streaming_turn(
                     generated_chars,
                     watch.interval,
                     gate.tool_call_in_flight(),
+                    policy.as_str(),
                 );
                 cut = CutSource::RuntimeAbort(AbortReason::Degenerate);
                 // Dropping the stream drops ureq's pooled reader, so the
@@ -9012,6 +9030,37 @@ mod tests {
             !traj_text.contains("dispatch.tool_call.discarded"),
             "and it must not have destroyed anything doing it"
         );
+        // (#2887 F3) The gate stamps its own policy + outcome now, rather
+        // than leaving a downstream host to reconstruct them from its own
+        // (possibly stale, possibly absent) environment. Under the default
+        // (enforce) policy this test runs with, the degenerate observation
+        // and the abort it produced both say `acted:true` — this IS the
+        // call that ended the stream. Parsed per-record (not a raw
+        // substring match) so the assertion pins the FIELD ON THE RIGHT
+        // RECORD, not merely somewhere in the file — `"acted":true` is
+        // also unconditionally present on every `dispatch.gate.abort`
+        // record, so a substring check alone cannot tell a correctly-
+        // stamped observation from a wrongly-stamped one sharing a file
+        // with a correctly-stamped abort.
+        let observation = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
+            .expect("a degenerate observation record must exist");
+        assert_eq!(observation["policy"], "enforce", "got {observation}");
+        assert_eq!(
+            observation["acted"], true,
+            "the degenerate observation that led to the abort must say it \
+             acted — under enforce it is the SAME moment as the abort \
+             below; got {observation}"
+        );
+        let abort = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.abort")
+            .expect("the stream gate itself must have aborted the call");
+        assert_eq!(abort["policy"], "enforce", "got {abort}");
+        assert_eq!(abort["acted"], true, "got {abort}");
     }
 
     /// (#2846) `observe` measures and records without acting.
@@ -9093,6 +9142,23 @@ mod tests {
             "observe must not let the STREAM gate abort either; the claim is \
              that only the verdict's EFFECT changes, and an aborted stream is \
              an effect; got:\n{traj_text}"
+        );
+        // (#2887 F3) Same policy/acted stamping this issue adds to the
+        // enforce path above — under observe the degenerate observation
+        // must say `policy:"observe"` and `acted:false`: the judge found it
+        // repeating, but nothing ended the call because of it. Parsed
+        // per-record, same discipline as the enforce test's own version of
+        // this assertion.
+        let observation = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
+            .expect("a degenerate observation record must exist");
+        assert_eq!(observation["policy"], "observe", "got {observation}");
+        assert_eq!(
+            observation["acted"], false,
+            "a degenerate observation under observe must say it did NOT \
+             act — that is the entire point of the policy; got {observation}"
         );
     }
 

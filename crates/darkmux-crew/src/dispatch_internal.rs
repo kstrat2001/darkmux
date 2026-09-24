@@ -6473,6 +6473,20 @@ fn dispatch_start_payload_json(
             max_turns_override,
             timeout_override_seconds,
         ),
+        // (#2887 N2) The flow schema this run's own records were written
+        // against, from the ONE constant every writer shares
+        // (`darkmux_flow::FLOW_SCHEMA_VERSION`). Additive — see that
+        // constant's own version-history comment for the full rationale —
+        // stamped so a CONSUMER can tell "this run's records genuinely
+        // predate a forwarder fix" from "this run has no findings" without
+        // guessing. The concrete case: the degeneracy gate's own findings
+        // (#2887) only started reaching the flow stream at 1.56.0 — a run
+        // recorded before that has real trajectory evidence the OLD
+        // forwarder simply dropped, and its `dispatch.start` record is the
+        // one place that can say so, since the gap is everywhere ELSE by
+        // definition (no `telemetry.detector` record for it exists to
+        // carry a schema stamp of its own).
+        "flow_schema": darkmux_flow::FLOW_SCHEMA_VERSION,
     })
 }
 
@@ -9576,6 +9590,16 @@ impl TailerState {
                     // trajectory.jsonl — without this, the #2165 fix never
                     // reached the surface the miss actually happened on.
                     "bound": event.get("bound"),
+                    // (#2887) `policy` (enforce/observe/off) and
+                    // `would_conclude` (the judge's verdict BEFORE policy is
+                    // applied) already ride the runtime's own trajectory
+                    // event (`trajectory::append_checkpoint`) but were
+                    // dropped here — the SIGNALS card could not tell an
+                    // enforced conclusion from an observe-mode "would have
+                    // concluded", nor count either as a flag at all. Forward
+                    // both verbatim, same as `bound` above.
+                    "policy": event.get("policy"),
+                    "would_conclude": event.get("would_conclude"),
                 });
                 // (#1955) Reduce as we go: the caller wants "13 checkpoints,
                 // one concluded, final ratio 0.29", never 65 records.
@@ -9727,7 +9751,14 @@ impl TailerState {
             // (#2190) The escalation record itself — see
             // `detector_telemetry_payload`'s own arm for why this rides the
             // same detector-telemetry path rather than a bespoke one.
-            | "dispatch.escalation.triggered" => {
+            | "dispatch.escalation.triggered"
+            // (#2887) The in-stream degeneracy gate's own findings. Only a
+            // DEGENERATE observation reaches here — `detector_telemetry_payload`
+            // drops a clean one, the same filter that keeps `dispatch.context`
+            // from flooding this stream. `dispatch.gate.abort` always forwards:
+            // it only ever fires when the gate actually ended the call.
+            | "dispatch.gate.observation"
+            | "dispatch.gate.abort" => {
                 // (#2169, merge-gate MUST FIX 1 split by `reason`) Live
                 // running totals — a call that never dispatches can't
                 // reach `tool.completed`/`self.summary.tool_calls` at
@@ -10424,6 +10455,66 @@ fn detector_telemetry_payload(
                 ),
             )
         }
+        // (#2887) The in-stream degeneracy gate's own finding. Forwarded
+        // ONLY when `degenerate` is true — the runtime records EVERY
+        // observation boundary (#2844, so the detector's threshold can be
+        // checked against a real distribution rather than the corpus it was
+        // set on), which is ~30 clean looks per real finding on a run that
+        // actually trips it (34 observations, 14 degenerate, on the run that
+        // surfaced this gap in #2887's issue). Forwarding all of them would
+        // turn the flow stream into that same noise; only a degenerate one
+        // is a finding.
+        // (#2887 F3/F4) `policy`/`acted` are read straight off the event —
+        // the RUNTIME stamps both now (`trajectory::append_gate_observation`/
+        // `append_gate_abort`), so this mapping stays pure (no process env,
+        // no host-side resolution that could disagree with, or postdate,
+        // what the runtime actually ran under). An event from a runtime
+        // image that predates this (no `policy` key at all) reads as
+        // `None`/absent here, never a guessed value — F3's own rule: missing
+        // means unknown, not "assume the host's current env".
+        "dispatch.gate.observation" => {
+            if !event.get("degenerate").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return None;
+            }
+            let observation = u64_field("observation");
+            let slice_chars = u64_field("slice_chars");
+            let ratio = event
+                .get("tail_ratio")
+                .and_then(|v| v.as_f64())
+                .map(|r| format!("{r:.3}"))
+                .unwrap_or_else(|| "?".to_string());
+            let acted = event.get("acted").and_then(|v| v.as_bool()).unwrap_or(false);
+            let policy = event.get("policy").and_then(|v| v.as_str());
+            let base = format!(
+                "observation {observation}: tail_ratio={ratio} over {slice_chars} \
+                 characters — the degeneracy gate judged this repeating (#2836)"
+            );
+            let detail = if acted {
+                format!("{base} and ended the call")
+            } else if policy == Some("observe") {
+                format!("{base} — flagged (observed), not enforced")
+            } else {
+                base
+            };
+            ("repetition", "warn", detail)
+        }
+        // (#2887) The gate actually ending the call — only ever fires when
+        // the policy in force may act (see `StreamGate::ingest`'s
+        // `Degenerate` variant), so unlike the observation above this always
+        // forwards, and `acted` is always true on this record type.
+        "dispatch.gate.abort" => {
+            let observation = u64_field("observation");
+            let slice_chars = u64_field("slice_chars");
+            let generated_chars = u64_field("generated_chars");
+            (
+                "repetition",
+                "warn",
+                format!(
+                    "observation {observation}: the degeneracy gate ended the call at \
+                     {slice_chars} characters ({generated_chars} from this call) (#2836)"
+                ),
+            )
+        }
         _ => return None,
     };
 
@@ -10485,6 +10576,30 @@ fn detector_telemetry_payload(
         payload["model"] = event.get("model").cloned().unwrap_or(serde_json::Value::Null);
         payload["prompt_tokens"] =
             event.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null);
+    }
+
+    // (#2887 F3/F4) Same explicit-field pattern — the numbers the sentence
+    // above is built from, so a consumer aggregating "how repetitive" across
+    // a run doesn't have to parse the human-readable string. `turn_seq`
+    // (forwarded from the runtime's own `seq`, same field `dispatch.
+    // checkpoint` calls `turn_seq`) is what lets the viewer collapse the
+    // observation + abort + any checkpoint that follow ONE cut into a
+    // single flagged-turn finding instead of counting raw records.
+    // `policy`/`acted` are forwarded VERBATIM from the event — the runtime
+    // stamps both now, so there is nothing left for the host to compute or
+    // fill in; an event from an older runtime image that predates this
+    // carries neither key, and `.get()` on a missing key yields `null`
+    // rather than a guessed value (same lenient-on-read discipline `bound`
+    // already follows on `dispatch.checkpoint`).
+    if event_type == "dispatch.gate.observation" || event_type == "dispatch.gate.abort" {
+        payload["turn_seq"] = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
+        payload["observation"] = event.get("observation").cloned().unwrap_or(serde_json::Value::Null);
+        payload["tail_ratio"] = event.get("tail_ratio").cloned().unwrap_or(serde_json::Value::Null);
+        payload["slice_chars"] = event.get("slice_chars").cloned().unwrap_or(serde_json::Value::Null);
+        payload["generated_chars"] =
+            event.get("generated_chars").cloned().unwrap_or(serde_json::Value::Null);
+        payload["policy"] = event.get("policy").cloned().unwrap_or(serde_json::Value::Null);
+        payload["acted"] = event.get("acted").cloned().unwrap_or(serde_json::Value::Null);
     }
 
     // (#994 engagement-context capture) Key the firing to the file it happened
