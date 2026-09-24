@@ -3490,21 +3490,86 @@ body {
   font: calc(12px * var(--fs-scale)) var(--font-mono);
 }
 /* (#2877) Only present while the card computed a live tok/s reading — see
-   `FleetLens.tsx`'s render note next to `.mach-scope`. */
+   `FleetLens.tsx`'s render note next to `.mach-scope`. (#2881, "bigger
+   scope: sized from the available height rather than a fixed 64px") A CSS
+   Grid two-column layout was tried first here and reverted: giving
+   `.mach-scope` `align-self: stretch` + `aspect-ratio: 1` so it fills the
+   row's own cross size measures correctly ONLY after the row's height is
+   already resolved, but browsers resolve an AUTO row's height by asking
+   every item in it for an intrinsic contribution FIRST — including this
+   one, whose `aspect-ratio` then fed back a large contribution and blew the
+   row itself out past its old fixed-scope height, growing the card (the
+   thing this issue explicitly rules out) and overlapping the tube onto the
+   status text (found by looking at the actual screenshot, not by reasoning
+   about the algorithm).
+   `position: relative`/`absolute` sidesteps that circularity entirely: a
+   spec-guaranteed rule, not a browser quirk, is that an absolutely
+   positioned child contributes NOTHING to its container's own size — so
+   this container's height is set ONLY by its in-flow text children
+   (`.stat`/`.mach-scope__rate`/`.mach-scope__pager`/`.runs`, however many of
+   those a given card has), before the tube's size is computed at all. */
 .mach-body--scope {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  column-gap: 12px;
-  align-items: center;
+  position: relative;
+  /* Reserves the tube's own gutter so the text never renders under it,
+     matched below by `.mach-scope`'s `max-width`/`max-height` (same pixel
+     value — a percentage was tried first and reverted: percentage
+     `max-height` on an absolutely positioned box resolves against the
+     containing block's HEIGHT, not its width, so sharing one percentage
+     between `padding-right` — meant as a fraction of WIDTH — and
+     `max-height` produced a squashed, undersized tube instead of the
+     shared clamp intended; found in an actual screenshot, not predicted).
+     80px, not the old fixed 64px: measured against the longest realistic
+     `.stat` string ("dispatch in flight", 19 chars monospace) on the fixed
+     248px desktop card — any bigger and that line wraps to two, which
+     would grow the card, the one thing this change is explicitly not
+     allowed to do. The desktop card has essentially no spare width to give
+     (confirmed on screen: at the OLD 64px tube, the text already used
+     nearly all the remaining room), so 80px is close to the ceiling there;
+     see the `@media` block below for the real gain, on a card with room to
+     give it. */
+  padding-right: 80px;
 }
-.mach-body--scope > :not(.mach-scope) {
-  grid-column: 1;
-}
+/* (#2881) The tube itself. `top`/`bottom: 0` give it a DEFINITE height —
+   its parent's own height, already resolved from the in-flow text per this
+   selector's own doc above — and `aspect-ratio: 1` turns that height into a
+   matching width, pinned to the card's right edge. This is what makes the
+   tube SIZE ITSELF from the available height rather than a fixed diameter,
+   for any card shorter than the `max-width`/`max-height` cap below (every
+   card with just 2-3 status rows, i.e. every idle-to-N=1 card and most
+   N=2+ cards) — the cap only engages for the tallest stacks, so it reads
+   as a ceiling, not the tube's usual size. This element is deliberately
+   unpadded — the padded element is the CHILD `.token-scope-bezel--card`
+   below, matching this file's own "never aspect-ratio + padding on the
+   SAME element" Safari rule (search `.token-scope-bezel`'s own comment) by
+   construction, not by remembering to keep them apart. */
 .mach-scope {
-  grid-column: 2;
-  grid-row: 1 / span 3;
-  align-self: center;
-  margin-top: 12px;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  aspect-ratio: 1;
+  /* Both axes clamp equally (not `max-width` alone) — `top`/`bottom: 0`
+     otherwise hands this box a definite height from the container
+     regardless of `max-width`, and `aspect-ratio` would then stretch the
+     WIDTH down to match that unclamped height's square, which is what an
+     oval bezel (found in an actual screenshot, not predicted) turns out to
+     mean in practice. Matches `padding-right` above — see its own comment. */
+  max-width: 80px;
+  max-height: 80px;
+}
+/* (Mobile fix pass, #2877; widened #2881) The SAME width fix this file's
+   `.mach { width: 100% }` rule already makes at this breakpoint turns a
+   fixed-diameter tube into real spare width with nothing using it — this
+   is the "use the empty space on the right" the issue names, genuinely
+   available only here, not on the fixed-width desktop card above. */
+@media (max-width: 560px) {
+  .mach-body--scope {
+    padding-right: 112px;
+  }
+  .mach-scope {
+    max-width: 112px;
+    max-height: 112px;
+  }
 }
 .mach-scope__rate {
   margin-top: 5px;
@@ -3516,6 +3581,39 @@ body {
    real number, just from an earlier turn, not this instant. */
 .mach-scope__rate[data-carried="true"] {
   opacity: 0.55;
+}
+/* (#2881) The pager: a small, FIXED-size row (never grows with the card),
+   under the rate line. Arrows are `role="button"` divs, matching
+   `.runs--live`'s own nested-tap-target shape (`FleetLens.tsx`'s doc next
+   to `selectPage`) — both need `stopPropagation` so a click doesn't ALSO
+   fire the card body's `machineDrillHash`. */
+.mach-scope__pager {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  color: var(--dim);
+}
+.mach-scope__pager-btn {
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  color: var(--dim);
+}
+.mach-scope__pager-btn:hover {
+  color: var(--fg);
+}
+.mach-scope__pager-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.mach-scope__pager-n {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.mach-scope__pager-role {
+  opacity: 0.8;
 }
 .mach .runs {
   margin-top: 5px;
@@ -8175,9 +8273,16 @@ body {
 .scope-lamp[data-state="tools"] { --lit: var(--lamp-tools); }
 .scope-lamp[data-state="rest"] { --lit: var(--lamp-rest); }
 .scope-lamp[data-state="stalled"] { --lit: var(--lamp-stall); }
+/* (#2881) `width`/`height: 100%`, not a fixed `--d` — this bezel now fills
+   `.mach-scope`, the SQUARE wrapper that sizes itself from the card body's
+   own height (see that selector's own comment). `--rim` stays a fixed px
+   value; `TokenScope.tsx`'s `ResizeObserver` redraws the canvas at
+   whatever size that resolves to, per this component's own "prefer the
+   container sizing the tube" doc. */
 .token-scope-bezel--card {
-  --d: 64px;
   --rim: 5px;
+  width: 100%;
+  height: 100%;
 }
 .token-scope-bezel--tile {
   --d: 68px;
