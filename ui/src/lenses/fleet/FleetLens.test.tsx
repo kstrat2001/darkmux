@@ -10,6 +10,28 @@ import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
 
+// (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes in this
+// file stayed green while broken in the actual render path: the DOM-text
+// assertions elsewhere in this file (`.mach-scope__rate`'s textContent) all
+// read from the SAME `selectedExec` the tube reads from, so a bug that hit
+// ONLY the tube's own props (not the neighboring text) had nothing here to
+// catch it. Mocking `TokenScope` and recording every prop it's called with
+// lets a test assert on what the operator's SCREEN actually receives —
+// `tokensPerSec`/`tone`/`stalled`/`resting` — not merely on `FleetCard`
+// fields that happen to agree with it today. `data-props` carries the
+// latest call's props as JSON; `latestTokenScopeProps()` below reads it
+// back typed.
+vi.mock("../../components/TokenScope", () => ({
+  TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
+}));
+
+function latestTokenScopeProps(): Record<string, unknown> {
+  const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
+  const last = nodes[nodes.length - 1];
+  if (!last) throw new Error("no TokenScope probe rendered");
+  return JSON.parse(last.getAttribute("data-props")!);
+}
+
 // (#1913) Every fixture below anchors its records at "T10:00" of `today`
 // (`todayUTC()`), and liveness (`flowLiveSessions`, `FLOW_LIVE_TTL_MS`) is
 // judged against REAL wall-clock now. Left alone, that means the suite's
@@ -186,7 +208,16 @@ describe("FleetLens", () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
-        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" },
+        // (#2886 pass 5) `source: "mission"` on the mission's own top-level
+        // session — a real mission bookend always carries it
+        // (`mission_launch.rs::mission_bookend_record`) and it's what
+        // `liveExecutions` reads to exclude this session from the pager's
+        // `card.executions` (see that function's own doc). Without it here,
+        // this fixture read as TWO genuine executions sharing one collapsed
+        // run — a real mismatch, correctly triggering #2881's "N run(s) · M
+        // executions" wording, not the bug this older test predates and was
+        // never about.
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start", source: "mission" },
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" },
       ],
     });
@@ -917,9 +948,49 @@ describe("FleetLens pager (#2881)", () => {
     // summed total (also 100 here, since only s1 is generating — see the
     // next assertion for where the total actually shows up).
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    // (#2886 pass 5, MUST — fresh-reviewer finding F5) Pin what the TUBE
+    // component itself receives, not just the neighboring text — a bug that
+    // hits only the tube's own props (e.g. still reading the machine
+    // aggregate) would leave every text assertion in this file green.
+    expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: 100, tone: "generating", stalled: false, resting: false });
     // (#2881) "the machine total moves to the count line" — no separate
     // "all" page.
     expect(document.querySelector(".runs--live")!.textContent).toBe("3 running · 100 tok/s");
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F2) A mission's seats all
+  // collapse to ONE top-level run (`topLevelRunSessionIds`), but the pager
+  // shows one page per seat — so `runsCount` (1) and `card.executions.length`
+  // (9) genuinely disagree here, unlike the plain-dispatches case above
+  // where they agree by construction.
+  it("names both counts when runs and executions disagree (a mission's seats collapse to one run)", async () => {
+    const missionId = "mission-1";
+    const seatRecords: FlowRecord[] = Array.from({ length: 8 }, (_, i) => ({
+      ts: at(0),
+      machine_uid: "u1",
+      machine_id: "MacBook-Pro",
+      session_id: `seat-${i + 2}`,
+      action: "dispatch.start",
+      mission_id: missionId,
+      handle: "darkmux/crawler",
+    })) as FlowRecord[];
+    const missionRecords: FlowRecord[] = [
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: missionId, action: "dispatch.start", source: "mission", mission_id: missionId },
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", action: "dispatch.start", mission_id: missionId, handle: "darkmux/crawler" },
+      { ts: at(0), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+      { ts: at(2), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+      ...seatRecords,
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={missionRecords} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    // 9 seat executions, 1 collapsed run.
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/9");
+    const countEl = document.querySelector(".runs--live, .runs")!;
+    expect(countEl.textContent).toBe("1 run · 9 executions · 100 tok/s");
   });
 
   it("no pager renders for exactly one running execution — same as before this issue", async () => {
@@ -973,6 +1044,30 @@ describe("FleetLens pager (#2881)", () => {
     await waitFor(() => expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/2"));
     expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F3) A lit GEN lamp with no
+  // reading yet (one heartbeat, no same-turn pair) must not print a
+  // confident "0 tok/s" — same "—" the run page's tile already shows for
+  // the identical case. The tube must not be driven by a fake 0 either —
+  // pinned via the mocked TokenScope so a future regression that only hits
+  // the tube (leaving the text correct) still goes red.
+  it("shows '—', not '0 tok/s', while generating with no reading yet — and never drives the tube with a fake 0", async () => {
+    // (mirrors `tokenRate.test.ts`'s own fixture note) `dispatch.start` sits
+    // 5s before the heartbeat so `deriveLiveState`'s same-second marker tie
+    // rule doesn't fire and read this as PROMPT instead of GENERATING.
+    const oneFreshHeartbeat: FlowRecord[] = [
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={oneFreshHeartbeat} tMax={D0} tMin={D0} playhead={D0} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("—");
+    expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: null, tone: "generating" });
   });
 });
 

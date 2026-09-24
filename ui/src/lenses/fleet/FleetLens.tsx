@@ -875,7 +875,16 @@ export function FleetLens({
               {card.liveTokRate !== null && selectedExec && (
                 <div className="mach-scope__rate" data-tone={selectedExec.state ?? "none"} data-carried={selectedExec.carried ? "true" : "false"}>
                   {selectedExec.state === "generating"
-                    ? `${fmtN(Math.round(selectedExec.tokensPerSec ?? 0))} tok/s`
+                    ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
+                      // lamp with no reading yet (fewer than two same-turn
+                      // heartbeats, or an untrusted opener pair) is "not yet
+                      // measured", not "measured zero" — same "—" the run
+                      // page's tile already shows for the identical case
+                      // (`SessionReplay.tsx`'s `centerLabel`). `Math.round(...
+                      // ?? 0)` used to print a confident "0 tok/s" here.
+                      selectedExec.tokensPerSec != null
+                      ? `${fmtN(Math.round(selectedExec.tokensPerSec))} tok/s`
+                      : "—"
                     : // (#2886 pass 3) `state: null` here (rather than the
                       // "no live execution" case, ruled out since
                       // `card.liveTokRate !== null` implies something IS
@@ -953,11 +962,28 @@ export function FleetLens({
                   "all" page; `card.liveTokRate` is still the machine-wide
                   aggregate this line always showed before, just no longer
                   the rate line's own number once there's more than one
-                  execution to attribute it to. */}
+                  execution to attribute it to.
+                  (#2886 pass 5, MUST — fresh-reviewer finding F2) `runsCount`
+                  and `execs.length` (`card.executions`) are DIFFERENT counts
+                  for a mission/crawl: `runsCount` is post-collapse
+                  (`topLevelRunSessionIds` folds every seat sharing one
+                  `mission_id` into its ONE top-level run — a mission with 9
+                  crawler seats reads "1 running"), while `execs` is the
+                  per-execution pager data, uncollapsed on purpose (each seat
+                  IS its own page). Showing "1 running · 200 tok/s" under a
+                  "‹ 5/9 crawler ›" pager reads as a bug (nine pages under
+                  one run?), so when the two counts disagree the line names
+                  BOTH: "1 run · 9 executions · 200 tok/s". They agree for a
+                  standalone card's several plain dispatches (no mission to
+                  collapse), which is the common case — that keeps the
+                  original "N running · X tok/s" wording unchanged. */}
               {(() => {
                 const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+                const rateText = `${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`;
                 const countText = pagerActive
-                  ? `${card.runsCount} ${card.runsLabel} · ${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`
+                  ? card.runsCount === execs.length
+                    ? `${card.runsCount} ${card.runsLabel} · ${rateText}`
+                    : `${card.runsCount} ${card.runsCount === 1 ? "run" : "runs"} · ${execs.length} ${execs.length === 1 ? "execution" : "executions"} · ${rateText}`
                   : `${card.runsCount} ${card.runsLabel}`;
                 if (!runsHash) {
                   return <div className="runs">{countText}</div>;
@@ -991,8 +1017,12 @@ export function FleetLens({
                     // the last generating stretch must not still drive the
                     // wave once the state has moved on (only `stalled` used
                     // to zero this). (#2881) The PAGE's own execution, not
-                    // the machine aggregate.
-                    tokensPerSec={selectedExec.state === "generating" ? (selectedExec.tokensPerSec ?? 0) : 0}
+                    // the machine aggregate. (#2886 pass 5, finding F3) The
+                    // RAW nullable reading, not `?? 0` — matches
+                    // `SessionReplay.tsx`'s identical prop exactly (a `null`
+                    // reading is "not yet measured", never coerced into a
+                    // confident zero before it reaches the component).
+                    tokensPerSec={selectedExec.state === "generating" ? selectedExec.tokensPerSec : 0}
                     stalled={selectedExec.state === "stalled"}
                     resting={selectedExec.state === "rest"}
                     tone={selectedExec.state ?? "none"}
