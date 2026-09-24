@@ -325,7 +325,14 @@ describe("SessionReplay", () => {
     expect(system?.textContent).toContain("WALL CLOCK");
   });
 
-  it("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry", async () => {
+  // Both producer lineages' bookend spellings. The space form is the one a
+  // mission's run-grain session really carries (darkmux-crew); a fixture that
+  // only used the dotted form passed while the live page never fetched the
+  // mission's records at all.
+  it.each([
+    ["space (darkmux-crew, what a mission emits)", " "],
+    ["dot (darkmux-lab and the runtime)", "."],
+  ])("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry: %s spelling", async (_label, sep) => {
     // The defect: a mission mints a run-grain session (`dispatch start` /
     // `dispatch complete` / `mission.grow` — bookends only) distinct from its
     // inner role-execution session, which carries the real turns/tokens/
@@ -343,7 +350,7 @@ describe("SessionReplay", () => {
       // only, exactly the shape #2759 measured on a real run.
       {
         ts: "2026-09-16T05:30:44Z",
-        action: "dispatch.start",
+        action: `dispatch${sep}start`,
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -353,7 +360,7 @@ describe("SessionReplay", () => {
       { ts: "2026-09-16T05:31:00Z", action: "mission.grow", session_id: missionId, mission_id: missionId, machine_id: "M", payload: {} },
       {
         ts: "2026-09-16T05:31:41Z",
-        action: "dispatch.complete",
+        action: `dispatch${sep}complete`,
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -363,7 +370,7 @@ describe("SessionReplay", () => {
       // dispatch, carrying the real telemetry.
       {
         ts: "2026-09-16T05:30:50Z",
-        action: "dispatch.start",
+        action: `dispatch${sep}start`,
         session_id: unitSid,
         mission_id: missionId,
         machine_id: "M",
@@ -402,7 +409,7 @@ describe("SessionReplay", () => {
         machine_id: "M",
         payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
       },
-      { ts: "2026-09-16T05:31:35Z", action: "dispatch.complete", session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+      { ts: "2026-09-16T05:31:35Z", action: `dispatch${sep}complete`, session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
     ];
     const fetchMock = vi.fn((url: string) => {
       if (url.startsWith("/fleet/sessions/live")) {

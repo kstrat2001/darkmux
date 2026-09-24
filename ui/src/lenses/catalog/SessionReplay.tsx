@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { T, flowToRenderModel } from "../../lib/flow";
+import { T, flowToRenderModel, isDispatchStart } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
 import { getSource } from "../../lib/source";
@@ -198,7 +198,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   const ownRaw = session?.ok ? session.data.records : null;
   const ownMissionId = useMemo(() => {
     if (!ownRaw) return null;
-    const start = ownRaw.find((r) => r.session_id === sessionId && r.action === "dispatch.start");
+    const start = ownRaw.find((r) => r.session_id === sessionId && isDispatchStart(r.action));
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId]);
   const ownHasTelemetry = useMemo(
