@@ -5197,10 +5197,11 @@ fn run_streaming_turn(
         let cumulative = accumulator.content_bytes();
         let delta_bytes = cumulative.saturating_sub(last_content_bytes);
         last_content_bytes = cumulative;
-        // (#2877) `generated_chars` includes the separate-field reasoning
-        // buffer alongside answer content, so the viewer's token-rate scope
-        // sees a nonzero rate while a model reasons before answering.
-        let generated_chars = cumulative.saturating_add(accumulator.reasoning_bytes());
+        // (#2877) `generated_chars` counts everything the model is emitting:
+        // answer content, the separate-field reasoning buffer, and streamed
+        // tool-call arguments, so the viewer's token-rate scope reads a real
+        // rate while a model reasons and while it writes a tool call.
+        let generated_chars = accumulator.generated_bytes();
         trajectory.append_model_partial(
             seq,
             partial_index,

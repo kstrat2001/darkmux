@@ -837,6 +837,24 @@ impl ChunkAccumulator {
         self.reasoning_content.len()
     }
 
+    /// (#2877) Cumulative bytes of streamed tool-call names and arguments.
+    /// A coder's generation is mostly tool-call arguments (a file's
+    /// contents), which neither `content_bytes` nor `reasoning_bytes` sees;
+    /// without this the rate scope reads ~0 while the model writes code.
+    pub fn tool_call_bytes(&self) -> usize {
+        self.tool_call_slots
+            .iter()
+            .map(|t| t.function.name.len() + t.function.arguments.len())
+            .sum()
+    }
+
+    /// (#2877) Everything the model has emitted this turn: answer content,
+    /// separate-field reasoning, and tool-call names and arguments. What the
+    /// heartbeat's `generated_chars` carries and the rate scope divides.
+    pub fn generated_bytes(&self) -> usize {
+        self.content_bytes() + self.reasoning_bytes() + self.tool_call_bytes()
+    }
+
     /// Number of chunks ingested so far.
     pub fn partial_count(&self) -> u32 {
         self.partial_count
@@ -1840,6 +1858,30 @@ mod tests {
         acc.ingest(&content_chunk("answer"));
         assert_eq!(acc.content_bytes(), 6);
         assert_eq!(acc.reasoning_bytes(), 8, "content must not leak into reasoning_bytes");
+    }
+
+    /// (#2877) A coder spends most of its generation writing tool-call
+    /// arguments (a file's contents). Measured live: a turn billed 1,757
+    /// completion tokens while content + reasoning grew by 117 bytes, so the
+    /// rate scope read ~0 while the model wrote code.
+    #[test]
+    fn accumulator_tool_call_bytes_counts_streamed_arguments_across_calls() {
+        let mut acc = ChunkAccumulator::new();
+        assert_eq!(acc.tool_call_bytes(), 0);
+        acc.ingest(&tool_call_fragment(0, Some("c1"), Some("write"), Some("{\"path\":")));
+        acc.ingest(&tool_call_fragment(0, None, None, Some("\"a.js\"}")));
+        acc.ingest(&tool_call_fragment(1, Some("c2"), Some("read"), Some("{}")));
+        assert_eq!(acc.tool_call_bytes(), "write".len() + "{\"path\":\"a.js\"}".len() + "read".len() + 2);
+        assert_eq!(acc.content_bytes(), 0, "tool-call text must not leak into content_bytes");
+    }
+
+    #[test]
+    fn accumulator_generated_bytes_sums_content_reasoning_and_tool_calls() {
+        let mut acc = ChunkAccumulator::new();
+        acc.ingest(&reasoning_chunk("thinking"));
+        acc.ingest(&content_chunk("ok"));
+        acc.ingest(&tool_call_fragment(0, Some("c1"), Some("write"), Some("{}")));
+        assert_eq!(acc.generated_bytes(), 8 + 2 + "write".len() + 2);
     }
 
     #[test]
