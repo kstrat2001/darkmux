@@ -403,9 +403,12 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
     ctxPeak = Math.max(ctxPeak, cCtxPeak);
     ctxNow = Math.max(ctxNow, cCtxNow);
     nctx = Math.max(nctx, cNctx);
+    // Every inner execution records each model resident when it started, so
+    // one model appears once per execution; list it once.
     for (const l of loads) {
       const f = l.fields as Record<string, unknown>;
-      loadLines.push(`${f.model} · ${f.gb ?? "?"}GB`);
+      const line = `${f.model} · ${f.gb ?? "?"}GB`;
+      if (!loadLines.includes(line)) loadLines.push(line);
     }
   }
   return { hasEvidence, turns, tokIn, tokOut, ctxPeak, ctxNow, nctx, loadLines };

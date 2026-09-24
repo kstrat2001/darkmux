@@ -211,12 +211,11 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     enabled: flowSrc === null && ownMissionId != null && !ownHasTelemetry,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
-  // `/flow-mission/<id>` is a SUPERSET of `/flow-session/<id>` — every record
-  // under a mission carries that mission's `mission_id`, including the run's
-  // own bookend records — so this REPLACES rather than merges. Merging the
-  // two raw arrays would double-count every record `ownRaw` and the mission
-  // fetch both return (this session's own dispatch.start/complete), which
-  // for a plain sum (TOKENS IN/OUT) is silently wrong, not just redundant.
+  // `/flow-mission/<id>` holds every record carrying this mission's id,
+  // including the run's own bookends, so it is not simply appended to
+  // `ownRaw`: that would double-count this session's dispatch records, which
+  // for a plain sum (TOKENS IN/OUT) is silently wrong. See `enrichedRaw`
+  // below for what is kept from `ownRaw`.
   //
   // Static builds get the same enrichment from the day's own committed file
   // (below, `staticMissionSlice`) rather than this query, which never runs
@@ -227,7 +226,15 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     const recs = day.raw.filter((r) => r.mission_id === ownMissionId);
     return recs.length ? recs : null;
   }, [flowSrc, day.raw, ownHasTelemetry, ownMissionId]);
-  const enrichedRaw = missionRaw ?? staticMissionSlice ?? ownRaw;
+  // The mission slice covers every record carrying this mission's id, but not
+  // what the daemon attaches to a SESSION by time window: the run's host
+  // samples (`machine.telemetry`, no mission_id). Keep those from `ownRaw`,
+  // and only those, so nothing is counted twice.
+  const missionSlice = missionRaw ?? staticMissionSlice;
+  const enrichedRaw = useMemo(
+    () => (missionSlice && ownRaw ? [...missionSlice, ...ownRaw.filter((r) => r.mission_id !== ownMissionId)] : missionSlice ?? ownRaw),
+    [missionSlice, ownRaw, ownMissionId],
+  );
 
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
   // hooks per render, so calling `useNowMs` after the loading/error/empty

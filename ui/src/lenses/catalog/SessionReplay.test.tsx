@@ -410,18 +410,43 @@ describe("SessionReplay", () => {
         payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
       },
       { ts: "2026-09-16T05:31:35Z", action: `dispatch${sep}complete`, session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+      // A SECOND inner execution (the crawl's coder) that saw the same model
+      // resident: its own load record must not list the model twice.
+      {
+        ts: "2026-09-16T05:31:36Z",
+        category: "telemetry",
+        source: "lms",
+        action: "telemetry.lms",
+        session_id: `${unitSid}-1`,
+        mission_id: missionId,
+        machine_id: "M",
+        payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
+      },
     ];
+    // Host samples as the daemon really serves them: `/flow-session` attaches
+    // the run window's `machine.telemetry` (no session_id, no mission_id);
+    // `/flow-mission` does not. Replacing the session's records with the
+    // mission's dropped these and blanked the SYSTEM host tiles.
+    const hostSamples = ["2026-09-16T05:30:50Z", "2026-09-16T05:31:20Z"].map((ts, i) => ({
+      ts,
+      category: "machinery",
+      source: "host",
+      action: "machine.telemetry",
+      machine_id: "M",
+      payload: { cpu_pct: 30 + i * 20, mem_pct: 70, gpu_pct: 50 },
+    }));
     const fetchMock = vi.fn((url: string) => {
       if (url.startsWith("/fleet/sessions/live")) {
         return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: {} }), { status: 200 }));
       }
+      const own = [...allRecords.filter((r) => r.session_id === missionId), ...hostSamples];
       const body = url.startsWith("/flow-mission/")
         ? { records: allRecords, count: allRecords.length, truncated: false, generated_at_ms: 0 }
         : {
-            // `/flow-session/<id>` — the run's OWN records ONLY, matching the
-            // real daemon's per-session scoping.
-            records: allRecords.filter((r) => r.session_id === missionId),
-            count: allRecords.filter((r) => r.session_id === missionId).length,
+            // `/flow-session/<id>` — the run's OWN records plus the run
+            // window's host samples, matching the real daemon.
+            records: own,
+            count: own.length,
             truncated: false,
             generated_at_ms: 0,
           };
@@ -450,6 +475,11 @@ describe("SessionReplay", () => {
     // The "loaded models" track: real data, not the own-session placeholder.
     expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();
     expect(document.querySelector(".session-run")?.textContent).toContain("qwen3.6-35b-a3b-turboquant-mlx · 20GB");
+    expect(document.querySelector(".session-run")?.textContent?.split("qwen3.6-35b-a3b-turboquant-mlx · 20GB").length).toBe(2);
+
+    // The run window's host samples survive the rollup.
+    expect(tileValue("CPU").value).toMatch(/^40%/);
+    expect(tileValue("HOST").tile).toBeUndefined();
   });
 
   it("(#2863) groups the page as MODEL (tiles, then which model), SYSTEM, SIGNALS", async () => {
