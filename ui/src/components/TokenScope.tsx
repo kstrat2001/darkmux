@@ -31,7 +31,7 @@ import { useEffect, useRef } from "react";
  *   without a window-level event to key off.
  */
 
-export type TokenScopeSize = "mini" | "tile";
+export type TokenScopeSize = "mini" | "card" | "tile";
 
 export interface TokenScopeProps {
   /** Current tok/s reading. Callers pass whatever `tokenRate.ts`'s

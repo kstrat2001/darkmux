@@ -786,71 +786,79 @@ export function FleetLens({
                 <span className="specdim">{specUnknownLabel(card.specUnknown ?? "not-reported")}</span>
               )}
             </div>
-            <div className="stat">
-              <span className="dot" />
-              {card.stat}
-            </div>
-            {/* (#2877) Live token-rate scope. Rendered ONLY when the card
-                computed a reading (`liveTokRate !== null` — live mode,
-                active, and at least one running session has produced two
-                heartbeats) — an idle machine mounts zero `TokenScope`
-                instances, never one sitting at 0, which is what makes "idle
-                machines keep plain text and never animate" true by
-                construction rather than by a prop the component has to
-                honor internally. */}
-            {card.liveTokRate !== null && (
-              <div className="mach-scope" data-testid="fleet-token-scope">
-                <TokenScope tokensPerSec={card.liveTokRate} stalled={card.liveTokStalled} size="mini" />
-                <span className="mach-scope__rate">{fmtN(Math.round(card.liveTokRate))} tok/s</span>
+            {/* (#2877) Status, rate and running count on the left; while the
+                machine generates, the scope sits to their right at the
+                concept's card size, spanning those rows, so the card does
+                not grow taller and an idle card reserves no empty slot. */}
+            <div className={card.liveTokRate !== null ? "mach-body mach-body--scope" : "mach-body"}>
+              <div className="stat">
+                <span className="dot" />
+                {card.stat}
               </div>
-            )}
-            {/* (#1903) The running count's own tap target — a SIBLING
-                affordance to the card body's `machineDrillHash` click
-                above, not a replacement for it. `runsHash` is `null`
-                (falls through to the old plain, non-interactive count)
-                whenever there's nothing running to open — see
-                `machineRunsHash`'s own doc. `stopPropagation` on both
-                handlers keeps a click/Enter on the count from ALSO firing
-                the card body's own handler underneath it (this is a
-                nested interactive control by necessity — the issue is
-                explicit that the card body's destination must stay
-                unchanged, which rules out restructuring the card to avoid
-                the nesting). `.runs--live`'s own CSS is what makes it LOOK
-                interactive, matching #1900's lesson in the other
-                direction: a clickable-but-inert-looking control is as
-                dishonest as an inert-looking one that's secretly a broken
-                link. */}
-            {(() => {
-              const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
-              if (!runsHash) {
+              {/* (#2877) Live token-rate scope. Rendered ONLY when the card
+                  computed a reading (`liveTokRate !== null` — live mode,
+                  active, and at least one running session has produced two
+                  heartbeats) — an idle machine mounts zero `TokenScope`
+                  instances, never one sitting at 0, which is what makes "idle
+                  machines keep plain text and never animate" true by
+                  construction rather than by a prop the component has to
+                  honor internally. */}
+              {card.liveTokRate !== null && (
+                <div className="mach-scope__rate">{fmtN(Math.round(card.liveTokRate))} tok/s</div>
+              )}
+              {/* (#1903) The running count's own tap target — a SIBLING
+                  affordance to the card body's `machineDrillHash` click
+                  above, not a replacement for it. `runsHash` is `null`
+                  (falls through to the old plain, non-interactive count)
+                  whenever there's nothing running to open — see
+                  `machineRunsHash`'s own doc. `stopPropagation` on both
+                  handlers keeps a click/Enter on the count from ALSO firing
+                  the card body's own handler underneath it (this is a
+                  nested interactive control by necessity — the issue is
+                  explicit that the card body's destination must stay
+                  unchanged, which rules out restructuring the card to avoid
+                  the nesting). `.runs--live`'s own CSS is what makes it LOOK
+                  interactive, matching #1900's lesson in the other
+                  direction: a clickable-but-inert-looking control is as
+                  dishonest as an inert-looking one that's secretly a broken
+                  link. */}
+              {(() => {
+                const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+                if (!runsHash) {
+                  return (
+                    <div className="runs">
+                      {card.runsCount} {card.runsLabel}
+                    </div>
+                  );
+                }
+                const activate = (e: { stopPropagation: () => void }) => {
+                  e.stopPropagation();
+                  location.hash = runsHash;
+                };
                 return (
-                  <div className="runs">
+                  <div
+                    className="runs runs--live"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
+                    onClick={activate}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        activate(e);
+                      }
+                    }}
+                  >
                     {card.runsCount} {card.runsLabel}
                   </div>
                 );
-              }
-              const activate = (e: { stopPropagation: () => void }) => {
-                e.stopPropagation();
-                location.hash = runsHash;
-              };
-              return (
-                <div
-                  className="runs runs--live"
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
-                  onClick={activate}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      activate(e);
-                    }
-                  }}
-                >
-                  {card.runsCount} {card.runsLabel}
+              })()}
+              {card.liveTokRate !== null && (
+                <div className="mach-scope" data-testid="fleet-token-scope">
+                  <TokenScope tokensPerSec={card.liveTokRate} stalled={card.liveTokStalled} size="card" />
                 </div>
-              );
-            })()}
+              )}
+            </div>
           </div>
         ))}
       </div>

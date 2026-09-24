@@ -3473,13 +3473,23 @@ body {
 }
 /* (#2877) Only present while the card computed a live tok/s reading — see
    `FleetLens.tsx`'s render note next to `.mach-scope`. */
-.mach-scope {
-  margin-top: 8px;
-  display: flex;
+.mach-body--scope {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
   align-items: center;
-  gap: 8px;
+}
+.mach-body--scope > :not(.mach-scope) {
+  grid-column: 1;
+}
+.mach-scope {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: center;
+  margin-top: 12px;
 }
 .mach-scope__rate {
+  margin-top: 5px;
   font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
   color: #7dffa0;
   font-variant-numeric: tabular-nums;
@@ -8074,6 +8084,10 @@ body {
 .token-scope-bezel--mini {
   --d: 40px;
   --rim: 4px;
+}
+.token-scope-bezel--card {
+  --d: 64px;
+  --rim: 5px;
 }
 .token-scope-bezel--tile {
   --d: 68px;
