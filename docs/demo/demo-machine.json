@@ -4,7 +4,7 @@
     "attribution_note": "4 worker(s) for 4 resident(s) \u2014 per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker <-> largest weights)",
     "cache_ttl_ms": 2000,
     "gather_ms": 303,
-    "generated_at_ms": 1790194838437,
+    "generated_at_ms": 1790235842528,
     "limit_bytes": 274877906944,
     "limit_source": "physical_pool",
     "load": {
@@ -40,7 +40,7 @@
           "gpu": 2516,
           "total": 4641
         },
-        "sampled_at_ms": 1790194096924,
+        "sampled_at_ms": 1790235819031,
         "sampler_cost_ms": 3,
         "thermal": {
           "cpu_speed_limit_pct": 100,
@@ -172,9 +172,9 @@
   },
   "specs": {
     "cpu_brand": "Apple M5 Ultra",
-    "darkmux_version": "3.10.0",
+    "darkmux_version": "3.12.0",
     "flow_schema_version": "1.20.0",
-    "generated_at_ms": 1790194838437,
+    "generated_at_ms": 1790235842527,
     "lms_unreachable": false,
     "loaded_models": [
       {

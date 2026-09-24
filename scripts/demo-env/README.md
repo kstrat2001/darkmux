@@ -62,10 +62,13 @@ nothing in it should be read as a benchmark result.**
 
 ## Where the records come from
 
-`sessions/crawl-error-discard.jsonl` is a REAL dispatch — a crawler run over
-darkmux's own `crates/darkmux-flow/src`, looking for discarded `Result`s —
+`sessions/coder-pepper-grinder.jsonl` is a REAL dispatch: a coder run on the
+open-source [pepper-grinder](https://github.com/kstrat2001/pepper-grinder)
+fixture (3.12.0, so its heartbeats carry `sampled_at_ms` and `generated_chars`
+and the token-rate scope animates through reasoning and tool calls). It was
 imported by `import_session.py`, which strips identity and rewrites timestamps
-to offsets from the session's own start.
+to offsets from the session's own start. The earlier crawler session,
+`sessions/crawl-error-discard.jsonl`, stays in the tree for reference.
 
 Records replayed from a real emitter are shape-correct by construction. A
 hand-written record can encode a shape the daemon could never produce, and the

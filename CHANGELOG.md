@@ -12,6 +12,62 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.12.0] - 2026-09-24
+
+### Added
+
+- **A live token-rate scope** (#2877, #2879). A small CRT oscilloscope shows
+  how fast the model is generating:
+  - **Fleet cards:** while a machine generates, the card shows a tube and its
+    rate beside the status line.
+  - **Run page:** a TOK/S tile (full width on a phone) holds the tube with the
+    rate in the middle. A finished run shows its average: billed output tokens
+    over generation time, not over the wall clock.
+  - **State lamps:** GEN, PROMPT, TOOLS, REST (with a countdown) and STALL sit
+    under the tube, grey when off, one lit. The trace takes the lit lamp's
+    color.
+  - **How the rate is measured:** characters generated between heartbeats,
+    including reasoning and tool-call arguments, converted with the run's own
+    characters per token from finished turns. It is labeled an estimate.
+- **Motion on live pages** (#2878). Arriving events slide in, meters ease
+  between readings, and numbers count up. The fleet total counts up only on
+  new work, not when old records leave its 24-hour window.
+- **Loading placeholders** (#2862). A page draws its real layout at once and
+  only the values still loading shimmer, instead of a bare "loading…" line.
+
+### Changed
+
+- **Playback defaults to real time** (1s/s), so a replay shows motion at the
+  pace a live viewer saw it. The speed button steps 1s/s, 5s/s, 30s/s, 1m/s,
+  10m/s, 1h/s.
+- **A replay renders what the live page showed at the same moment.** The run
+  page, fleet cards and activity timeline are derived from the records up to
+  the playhead, with one clock (the playhead, or now when live). The timeline
+  in a replay is the live rolling window anchored at the playhead. A scrub
+  never animates; playing forward does.
+- **A rest is recorded when it starts**, carrying its planned length, so a
+  live page can show the rest while it happens. The host's inactivity
+  deadline now includes the rest's own length.
+
+### Fixed
+
+- **Mission run pages** (#2759): the MODEL tiles never rolled up the mission's
+  inner executions on a real run (a spelling mismatch), host tiles vanished
+  once they did, and each loaded model was listed twice. A mission's page now
+  stays live while any of its executions or the mission itself is running,
+  and lands on COMPLETE when it ends.
+- **A live page judged "now" by the newest record** rather than the clock, so
+  a stall only showed once another record arrived.
+
+### Schema notes
+
+- **`FLOW_SCHEMA_VERSION` 1.54.0 → 1.55.0, additive:**
+  `dispatch.turn.heartbeat` gains `sampled_at_ms` and `generated_chars`
+  (content, reasoning and tool-call arguments).
+- **Session presence** beats gain an optional `mission_id`, omitted when
+  absent.
+- **Readers:** older readers ignore the new fields.
+
 ## [3.11.0] - 2026-09-24
 
 ### Added
@@ -152,6 +208,7 @@ darkmux release.
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[3.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.12.0
 [3.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.11.0
 [3.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.10.0
 
