@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useMemo, useRef, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -18,7 +18,7 @@ import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -443,14 +443,27 @@ export function FleetLens({
    * values the consumers below receive. */
   const livePolling = liveMode && getSource().kind === "daemon";
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
-  // (#2881) The pager's sticky pick, per machine uid — the session id the
+  // (#2881) The pager's sticky PICK, per machine uid — the session id the
   // operator last chose with an arrow, if any. `FleetCard.executions` no
-  // longer including it (that execution ended) falls back to
-  // `card.defaultExecutionSessionId` on the very next render below, which is
-  // the whole of "sticks until that execution ends, then moves to the next
-  // [busiest]" — there is no separate cleanup step, and no live/playback
-  // branch: the same fallback rule applies to a replayed instant too.
+  // longer including it (that execution ended) falls back to the AUTO
+  // default (`effectiveDefaultSid`, computed per card below) on the very
+  // next render, which is the whole of "sticks until that execution ends,
+  // then moves to the next [busiest]" — there is no separate cleanup step,
+  // and no live/playback branch: the same fallback rule applies to a
+  // replayed instant too.
   const [pinnedPageByUid, setPinnedPageByUid] = useState<Record<string, string>>({});
+  // (#2886 pass 5, MUST — fresh-reviewer finding F6) The pager's AUTO
+  // (unpicked) default, per machine uid — the session id currently shown as
+  // page 1 when the operator hasn't picked one. A `useRef`, not `useState`:
+  // it's read and written in the SAME render pass, purely to remember what
+  // was shown last render so `isStrictlyBusier` has something to compare
+  // against — it never itself needs to SCHEDULE a re-render (new flow data
+  // arriving already does that). Recomputing the default from scratch every
+  // tick (`busiestExecution` alone, with no memory) flapped a real fleet's
+  // page 46 times in 863s, because two executions' fluctuating rates kept
+  // trading the tie-break; see the `cards.map` callback below for the
+  // guarded update.
+  const stickyDefaultByUidRef = useRef<Record<string, string>>({});
 
   const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
@@ -744,17 +757,38 @@ export function FleetLens({
           // (#2881) Pager selection for this card. `execs` is already
           // sorted by session id (`cards.ts::buildFleetCard`'s own doc) —
           // that sort order IS the pager's page order, so page numbers stay
-          // put tick to tick. The sticky pick lives in `pinnedPageByUid`
+          // put tick to tick. The USER'S pick lives in `pinnedPageByUid`
           // (component state, above): it applies only while the picked
           // session is still among `execs`; the moment it isn't (the
-          // execution ended), this falls straight through to
-          // `card.defaultExecutionSessionId` (the busiest of what's left)
-          // with no separate cleanup step, and no live/playback branch —
-          // the same fallback rule for a replayed instant too.
+          // execution ended), this falls straight through to the AUTO
+          // default computed just below (`effectiveDefaultSid`) with no
+          // separate cleanup step, and no live/playback branch — the same
+          // fallback rule for a replayed instant too.
           const execs = card.executions;
           const pagerActive = execs.length >= 2;
+          // (#2886 pass 5, MUST — fresh-reviewer finding F6) The AUTO
+          // default is sticky against flapping: keep whatever was shown as
+          // the default last render (`stickyDefaultByUidRef`) unless that
+          // execution is gone (falls straight to the fresh busiest — same
+          // "no separate cleanup step" shape the user's OWN pin already
+          // uses below) or another execution is now STRICTLY busier by
+          // state class. `card.defaultExecutionSessionId` (the from-scratch
+          // busiest `cards.ts` computes) is deliberately NOT read directly
+          // here any more — it's what flapped, since it has no memory of
+          // what was on screen a moment ago.
+          const stickyDefaultSid = stickyDefaultByUidRef.current[card.uid];
+          const stickyDefaultExec = stickyDefaultSid != null ? execs.find((e) => e.sessionId === stickyDefaultSid) : undefined;
+          const freshBusiest = busiestExecution(execs);
+          const effectiveDefaultSid =
+            stickyDefaultExec && freshBusiest
+              ? isStrictlyBusier(freshBusiest, stickyDefaultExec)
+                ? freshBusiest.sessionId
+                : stickyDefaultExec.sessionId
+              : (freshBusiest?.sessionId ?? null);
+          if (effectiveDefaultSid != null) stickyDefaultByUidRef.current[card.uid] = effectiveDefaultSid;
+          else delete stickyDefaultByUidRef.current[card.uid];
           const pinnedSid = pinnedPageByUid[card.uid];
-          const selectedSid = pinnedSid != null && execs.some((e) => e.sessionId === pinnedSid) ? pinnedSid : card.defaultExecutionSessionId;
+          const selectedSid = pinnedSid != null && execs.some((e) => e.sessionId === pinnedSid) ? pinnedSid : effectiveDefaultSid;
           const selectedIdx = selectedSid != null ? execs.findIndex((e) => e.sessionId === selectedSid) : -1;
           const selectedExec = selectedIdx >= 0 ? execs[selectedIdx] : null;
           // `card.liveTokRate !== null` (the scope's mount gate below) only

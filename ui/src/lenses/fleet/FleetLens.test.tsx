@@ -1069,6 +1069,68 @@ describe("FleetLens pager (#2881)", () => {
     expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("—");
     expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: null, tone: "generating" });
   });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F6) The default page must
+  // not flap: recomputing "the busiest execution" from scratch every tick
+  // flipped a real fleet's default page 46 times in 863s, because two
+  // GENERATING executions' fluctuating rates kept trading the tie-break.
+  describe("the default page does not flap on a tie, only moves on a STRICT state-class win", () => {
+    // s1: CODER, generating at 100 tok/s (0 -> 800 chars over 2s).
+    // s2: REVIEWER, generating at 10 tok/s (0 -> 80 chars over 2s) at first.
+    const twoGenerating = (s2Chars: number): FlowRecord[] => [
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+      { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
+      { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+      { ts: at(2), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: s2Chars } },
+    ] as FlowRecord[];
+
+    it("keeps the SAME default page once s2's rate overtakes s1's — both still generating", async () => {
+      const { rerender } = render(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={twoGenerating(80)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+        </QueryClientProvider>,
+      );
+      // Initial pick: s1 is the faster of the two (100 vs 10 tok/s).
+      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder"));
+
+      // s2's rate now FAR exceeds s1's (2000 chars -> 250 tok/s vs s1's
+      // unchanged 100) — recomputing "busiest" from scratch would flip to
+      // s2. Both are still `generating`, a tie at the STATE-CLASS level, so
+      // the sticky default must not move.
+      rerender(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={twoGenerating(2_000)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+        </QueryClientProvider>,
+      );
+      expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+      expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    });
+
+    it("DOES move once the currently-shown execution becomes strictly worse (generating -> rest) while the other keeps generating", async () => {
+      // Same starting point as the no-flap test above: s1 is the faster of
+      // the two, so it's the initial default.
+      const { rerender } = render(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={twoGenerating(80)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder"));
+
+      // s1 now rests (a real state-class change); s2 keeps generating.
+      // s2 is STRICTLY busier now (generating beats rest) — this is a real
+      // switch, not a flap, and must happen.
+      const s1Rests: FlowRecord[] = [...twoGenerating(2_000), { ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.rest", payload: { ms: 15_000 } } as FlowRecord];
+      rerender(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={s1Rests} tMax={D0 + 6000} tMin={D0} playhead={D0 + 6000} historical />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer"));
+      expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("250 tok/s");
+    });
+  });
 });
 
 // ── (#1855) a rostered-but-silent machine must still render a card ──

@@ -423,6 +423,25 @@ export function busiestExecution(executions: ExecutionTokenReading[]): Execution
   return best;
 }
 
+/** (#2886 pass 5, MUST — fresh-reviewer finding F6) Whether `candidate`
+ *  should REPLACE `current` as the pager's STICKY default page. Only when
+ *  `candidate` is STRICTLY busier by STATE CLASS (the same
+ *  `liveStatePriority` ranking `busiestExecution` itself picks from — a
+ *  candidate that only ties `current`'s priority is not strictly busier,
+ *  by definition). Deliberately narrower than `busiestExecution`'s own
+ *  tie-break chain: that function picks a reasonable FIRST default from
+ *  nothing; this one guards against replacing an ALREADY-DISPLAYED page,
+ *  where a rate-based or session-id tie-break is exactly what flapped a
+ *  real fleet's default page 46 times in 863s — two generating executions
+ *  trading which one currently reads the higher tok/s is not a reason to
+ *  switch what the operator is looking at. `FleetLens.tsx` calls this every
+ *  render with the currently-displayed execution as `current`, and only
+ *  calls `busiestExecution` fresh when `current` itself is gone (its own
+ *  execution ended) — see that component's own doc. */
+export function isStrictlyBusier(candidate: ExecutionTokenReading, current: ExecutionTokenReading): boolean {
+  return liveStatePriority(candidate.state) < liveStatePriority(current.state);
+}
+
 export interface FleetCard {
   /** (#2802 regression fix) The operator's own roster name for this machine,
    * when they declared one AND it differs from what the machine calls

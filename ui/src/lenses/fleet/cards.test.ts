@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, busiestExecution, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 import type { ExecutionTokenReading } from "../../lib/tokenRate";
 import type { Run } from "../../types/generated/Run";
@@ -1031,6 +1031,46 @@ describe("busiestExecution", () => {
     const second = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
     expect(busiestExecution([first, second])?.sessionId).toBe("a");
     expect(busiestExecution([second, first])?.sessionId).toBe("a");
+  });
+});
+
+// (#2886 pass 5, MUST — fresh-reviewer finding F6) The pager's STICKY
+// default page guard — never flaps on a tie or on rate alone.
+describe("isStrictlyBusier", () => {
+  const exec = (overrides: Partial<ExecutionTokenReading> & Pick<ExecutionTokenReading, "sessionId" | "state">): ExecutionTokenReading => ({
+    role: "coder",
+    tokensPerSec: null,
+    carried: false,
+    ...overrides,
+  });
+
+  it("is false when both are the SAME state class, even if the rate differs (the flap this exists to stop)", () => {
+    const current = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
+    const candidate = exec({ sessionId: "b", state: "generating", tokensPerSec: 90 });
+    expect(isStrictlyBusier(candidate, current)).toBe(false);
+  });
+
+  it("is false when the candidate is the SAME execution as current (a tie with itself)", () => {
+    const current = exec({ sessionId: "a", state: "rest" });
+    expect(isStrictlyBusier(current, current)).toBe(false);
+  });
+
+  it("is false when the candidate is a WORSE state class than current", () => {
+    const current = exec({ sessionId: "a", state: "generating" });
+    const candidate = exec({ sessionId: "b", state: "stalled" });
+    expect(isStrictlyBusier(candidate, current)).toBe(false);
+  });
+
+  it("is true only when the candidate is a STRICTLY better state class than current", () => {
+    const current = exec({ sessionId: "a", state: "rest" });
+    const candidate = exec({ sessionId: "b", state: "generating" });
+    expect(isStrictlyBusier(candidate, current)).toBe(true);
+  });
+
+  it("is false for no-signal (null) vs no-signal — the worst class tied with itself", () => {
+    const current = exec({ sessionId: "a", state: null });
+    const candidate = exec({ sessionId: "b", state: null });
+    expect(isStrictlyBusier(candidate, current)).toBe(false);
   });
 });
 
