@@ -121,6 +121,11 @@ test('activity lane: drilling a session.end-only session does not throw', async 
   await page.goto('/index-lifecycle.html');
   await page.waitForSelector('.lane .sbar', { timeout: 15_000 });
 
+  // Playback draws the same rolling window as live, anchored at the playhead
+  // (playback parity). This fixture's whole day is ten minutes, so at the
+  // default 24h window its sessions share a sliver and the in-flight bar
+  // covers the ended one. Zoom to 10m, as a user would, before clicking.
+  await page.locator('.twinb', { hasText: /^10m$/ }).click();
   await page.locator('.sbar[title*="sess-ended-via-sessionend"]').click();
 
   await expect(page.locator('.session-run')).toBeVisible();

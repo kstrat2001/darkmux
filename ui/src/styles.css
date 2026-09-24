@@ -6,6 +6,24 @@
      round 2 shipped a 10px mismatch by editing one of two literals). */
   --phone-drawer-closed-h: 76px;
   color-scheme: dark;
+  /* (#2877) The token-rate scope is an instrument with ONE look in both
+     themes: a green phosphor CRT, not the app accent. Its colors, and the
+     state lamps under it, live here so the rules below name them. */
+  --scope-phosphor: #7dffa0;
+  --scope-phosphor-glow: rgba(125, 255, 160, 0.6);
+  --scope-bezel-hi: #1a221c;
+  --scope-bezel-lo: #111712;
+  --scope-bezel-rim: #1c261e;
+  --scope-bezel-shadow: rgba(0, 0, 0, 0.5);
+  --scope-screen-hi: #0b130d;
+  --scope-screen-lo: #050806;
+  --scope-screen-inset: rgba(0, 0, 0, 0.9);
+  --scope-scanline: rgba(0, 0, 0, 0.18);
+  --lamp-off: #3a4048;
+  --lamp-prompt: #5eead4;
+  --lamp-tools: #7aa2ff;
+  --lamp-rest: #fbbf24;
+  --lamp-stall: #f87171;
   /* ONE mono stack, because there were three and they disagreed (#2001).
      Measured with CDP on macOS Chrome, what each of the old ones actually
      rendered:
@@ -3491,7 +3509,7 @@ body {
 .mach-scope__rate {
   margin-top: 5px;
   font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
-  color: #7dffa0;
+  color: var(--scope-phosphor);
   font-variant-numeric: tabular-nums;
 }
 .mach .runs {
@@ -8096,10 +8114,10 @@ body {
   padding: var(--rim);
   box-sizing: border-box;
   flex: none;
-  background: radial-gradient(circle at 35% 30%, #1a221c, #111712 60%);
+  background: radial-gradient(circle at 35% 30%, var(--scope-bezel-hi), var(--scope-bezel-lo) 60%);
   box-shadow:
-    inset 0 0 0 2px #1c261e,
-    0 10px 26px rgba(0, 0, 0, 0.5);
+    inset 0 0 0 2px var(--scope-bezel-rim),
+    0 10px 26px var(--scope-bezel-shadow);
 }
 .token-scope-bezel--mini {
   --d: 40px;
@@ -8131,21 +8149,21 @@ body {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #3a4048;
+  background: var(--lamp-off);
 }
 .scope-lamp[data-on="true"] {
   opacity: 1;
-  color: var(--lamp);
+  color: var(--lit);
 }
 .scope-lamp[data-on="true"] .scope-lamp__dot {
-  background: var(--lamp);
-  box-shadow: 0 0 6px var(--lamp), 0 0 12px var(--lamp);
+  background: var(--lit);
+  box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
 }
-.scope-lamp[data-state="generating"] { --lamp: #7dffa0; }
-.scope-lamp[data-state="prompt"] { --lamp: #5eead4; }
-.scope-lamp[data-state="tools"] { --lamp: #7aa2ff; }
-.scope-lamp[data-state="rest"] { --lamp: #fbbf24; }
-.scope-lamp[data-state="stalled"] { --lamp: #f87171; }
+.scope-lamp[data-state="generating"] { --lit: var(--scope-phosphor); }
+.scope-lamp[data-state="prompt"] { --lit: var(--lamp-prompt); }
+.scope-lamp[data-state="tools"] { --lit: var(--lamp-tools); }
+.scope-lamp[data-state="rest"] { --lit: var(--lamp-rest); }
+.scope-lamp[data-state="stalled"] { --lit: var(--lamp-stall); }
 .token-scope-bezel--card {
   --d: 64px;
   --rim: 5px;
@@ -8160,8 +8178,8 @@ body {
   height: 100%;
   border-radius: 50%;
   overflow: hidden;
-  background: radial-gradient(circle, #0b130d 0%, #050806 70%);
-  box-shadow: inset 0 0 30px rgba(0, 0, 0, 0.9);
+  background: radial-gradient(circle, var(--scope-screen-hi) 0%, var(--scope-screen-lo) 70%);
+  box-shadow: inset 0 0 30px var(--scope-screen-inset);
 }
 .token-scope-screen canvas {
   width: 100%;
@@ -8176,7 +8194,7 @@ body {
   inset: 0;
   border-radius: 50%;
   pointer-events: none;
-  background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);
+  background: repeating-linear-gradient(to bottom, var(--scope-scanline) 0 1px, transparent 1px 3px);
 }
 .token-scope-center {
   position: absolute;
@@ -8188,10 +8206,10 @@ body {
   z-index: 1;
 }
 .token-scope-center .token-scope-n {
-  font: 400 16px/0.85 var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font: 400 16px/0.85 var(--font-mono);
   font-variant-numeric: tabular-nums;
-  color: #7dffa0;
-  text-shadow: 0 0 10px rgba(125, 255, 160, 0.6);
+  color: var(--scope-phosphor);
+  text-shadow: 0 0 10px var(--scope-phosphor-glow);
 }
 /* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
    frame and never animates again (see `TokenScope.tsx`), so nothing here
