@@ -3579,11 +3579,6 @@ body {
   color: var(--scope-phosphor);
   font-variant-numeric: tabular-nums;
 }
-/* (#2885) Same carried-reading dim as the run tile's `.token-scope-n` — a
-   real number, just from an earlier turn, not this instant. */
-.mach-scope__rate[data-carried="true"] {
-  opacity: 0.55;
-}
 /* (#2881) The pager: a small row under the rate line, sized by its own
    text/tap-targets rather than any fixed constant — see `.mach-scope`'s own
    doc for the ONE thing that must not grow the card (the tube), which this
@@ -8448,18 +8443,14 @@ body {
   color: var(--scope-phosphor);
   text-shadow: 0 0 10px var(--scope-phosphor-glow);
 }
-/* (#2885) A carried reading — the number is real but from an earlier turn,
-   not the current one's own two most recent heartbeats — reads dimmed and
-   without the phosphor glow, distinct from a fresh sample. */
+/* (#2885, #2890) A carried reading (the number is real, but from an earlier
+   turn) keeps the full glow: dimming it flickered at every turn's start.
+   `data-carried` is still stamped on the element, unstyled. */
 /* (#2890) REST's countdown in the center takes the rest lamp's amber. */
 .token-scope-bezel[data-state="rest"] .token-scope-n,
 .token-scope-bezel[data-state="rest"] .token-scope-u {
   color: var(--lamp-rest);
   text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
-}
-.token-scope-center .token-scope-n[data-carried="true"] {
-  opacity: 0.55;
-  text-shadow: none;
 }
 /* (#2890) The run page's hero: the rate (or the finished average) at the
    prototype's size, with its unit quietly under it. */

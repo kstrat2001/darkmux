@@ -86,10 +86,10 @@ export interface TokenScopeProps {
    *  page passes it; the fleet card does not. */
   centerUnit?: string | null;
   /** (#2885) `true` when `centerLabel` is a rate carried forward from an
-   *  earlier turn rather than freshly measured — dims the number
-   *  (`data-carried` on `.token-scope-n`, see `styles.css`) so it reads as
-   *  "last known", not a fresh sample. No effect when `centerLabel` is
-   *  unset. */
+   *  earlier turn rather than freshly measured. Stamped as `data-carried`
+   *  on `.token-scope-n` but NOT styled: the dim made every turn's opening
+   *  seconds flicker, and the operator preferred the steady glow (#2890).
+   *  No effect when `centerLabel` is unset. */
   centerCarried?: boolean;
   className?: string;
   /** The live state as a lamp tone (`lib/scopeTone.ts`). Used to pick the

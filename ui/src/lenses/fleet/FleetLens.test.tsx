@@ -1669,7 +1669,7 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
     const t1c = "2026-06-15T10:00:04.000Z";
     const t2 = "2026-06-15T10:01:58.000Z";
 
-    it("dims the rate line (data-carried=true) when the reading is carried forward from an earlier turn", async () => {
+    it("marks the rate line (data-carried=true) when the reading is carried forward from an earlier turn", async () => {
       mockFleetFetch({
         flowToday: [
           { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
