@@ -3564,15 +3564,28 @@ body {
    fixed-diameter tube into real spare width with nothing using it — this
    is the "use the empty space on the right" the issue names, genuinely
    available only here, not on the fixed-width desktop card above. */
+/* (#2881, operator on the phone 2026-09-25: "still small and not using a lot
+   of space") On a phone the cards STACK, so a taller active card no longer
+   stretches its neighbors the way it did in the desktop row: the status
+   block grows to the tube's size instead of the tube shrinking to the
+   status rows (about 88px on a phone before this). The tube stays beside
+   those rows, not beside the header: the hardware line is too long to share
+   a row with it (it already wraps at 309px on a 375px screen). The size
+   follows the screen: 100vw minus 248px leaves the status column 172px,
+   which keeps "dispatch in flight" on one line (measured at 375px and
+   390px), clamped to 104px..150px. */
 @media (max-width: 560px) {
   .mach-body--scope {
-    padding-right: 112px;
+    --tube: clamp(104px, calc(100vw - 248px), 150px);
+    padding-right: calc(var(--tube) + 12px);
+    min-height: var(--tube);
   }
   .mach-scope {
-    max-width: 112px;
-    max-height: 112px;
+    max-width: var(--tube);
+    max-height: var(--tube);
   }
 }
+
 .mach-scope__rate {
   margin-top: 5px;
   font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
