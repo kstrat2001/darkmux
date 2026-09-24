@@ -1248,6 +1248,19 @@ pub fn launch(
             serde_json::json!({ "runtime": "mission" }),
         ),
     );
+    // (#2877, pre-PR review) The mission's own run session beats presence for
+    // as long as the launch runs. Its executions beat only while a model call
+    // is live, so during the steps between them (a summary, a mod wait, a test
+    // gate, delivery) nothing was live, the run page stopped polling, and it
+    // could miss its own COMPLETE. Dropped at scope end, after the bookend has
+    // closed; the emitter's drop removes the key and suppresses the
+    // reconciler's abandoned edge, same as a dispatch's.
+    let _mission_presence = flow::session_presence::spawn_session_emitter(
+        mission_id.clone(),
+        None,
+        None,
+        Some(mission_id.clone()),
+    );
 
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only
