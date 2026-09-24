@@ -19,17 +19,17 @@ fleet
 
 === stage ===
 DARKMUX TOKENS
-999,248
+982,028
 ALL TOKENS · LAST 24H
-381.51k
+377.86k
 GENERATED
-32.77k
+19.52k
 FRESH INPUT
-320
+0
 RE-READ
 584.65k
 UNCLASSIFIED
-52
+42
 DISPATCHES
 Orchestrator note: First editor-embedded review shipped tonight — the crew reviewed a real ticket inside Zed, end to end on local models, and the report rendered beautifully. Four feature findings captured for the real integration. Great night. · 03:06:54 history →
 MacBook-Pro
@@ -47,7 +47,7 @@ RECENT ACTIVITY
 24H
 MacBook-Pro
 m1-max-32gb-studio
-14:28
-02:28
-14:28
+02:00
+14:00
+02:00
 
