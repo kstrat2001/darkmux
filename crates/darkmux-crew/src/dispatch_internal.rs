@@ -3399,6 +3399,7 @@ fn dispatch_remote(
         session_id.clone(),
         Some(opts.role_id.clone()),
         Some(pm.id.clone()),
+        mission_id.clone(),
     );
 
     let req_body = single_shot_body(
@@ -3769,6 +3770,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         session_id.clone(),
         Some(opts.role_id.clone()),
         Some(model_id.clone()),
+        mission_id.clone(),
     );
 
     let t0 = SystemTime::now();
@@ -5386,6 +5388,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         session_id.clone(),
         Some(opts.role_id.clone()),
         Some(model.clone()),
+        mission_id.clone(),
     );
 
     // 6. Spawn the docker container. Async via `spawn()` (vs the older

@@ -1,5 +1,5 @@
 import { WorkStatus } from "../../components/WorkStatus";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useCountUp } from "../../hooks/useCountUp";
 import { parseNumericLike } from "../../lib/numericLike";
 import { useQuery } from "@tanstack/react-query";
@@ -146,7 +146,12 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // counting. `useSessionLiveness` owns that window; it also owns the SAME
   // query key this component reads, so the event log and the stage cannot
   // disagree about when the run ended.
-  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId);
+  // The mission this run belongs to, learned from the run's own records
+  // below. It reaches the liveness hook one render after those records land:
+  // a mission's run-grain session never beats itself, so without it the page
+  // is never live, fetches once, and freezes on its first read.
+  const [livenessMissionId, setLivenessMissionId] = useState<string | null>(null);
+  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -201,6 +206,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     const start = ownRaw.find((r) => r.session_id === sessionId && isDispatchStart(r.action));
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId]);
+  useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === "telemetry") : false),
     [ownRaw, sessionId],
@@ -226,15 +232,18 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     const recs = day.raw.filter((r) => r.mission_id === ownMissionId);
     return recs.length ? recs : null;
   }, [flowSrc, day.raw, ownHasTelemetry, ownMissionId]);
-  // The mission slice covers every record carrying this mission's id, but not
-  // what the daemon attaches to a SESSION by time window: the run's host
-  // samples (`machine.telemetry`, no mission_id). Keep those from `ownRaw`,
-  // and only those, so nothing is counted twice.
+  // A union of the two, each record once. Neither side covers the other: the
+  // session fetch carries host samples the daemon attaches by time window
+  // (no mission_id), and the two queries refresh separately, so the run's
+  // terminal record can reach the session fetch before the mission fetch has
+  // it. Both are served from the same JSONL by the same daemon, so a record
+  // present in both serializes identically.
   const missionSlice = missionRaw ?? staticMissionSlice;
-  const enrichedRaw = useMemo(
-    () => (missionSlice && ownRaw ? [...missionSlice, ...ownRaw.filter((r) => r.mission_id !== ownMissionId)] : missionSlice ?? ownRaw),
-    [missionSlice, ownRaw, ownMissionId],
-  );
+  const enrichedRaw = useMemo(() => {
+    if (!missionSlice || !ownRaw) return missionSlice ?? ownRaw;
+    const seen = new Set(missionSlice.map((r) => JSON.stringify(r)));
+    return [...missionSlice, ...ownRaw.filter((r) => !seen.has(JSON.stringify(r)))];
+  }, [missionSlice, ownRaw]);
 
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
   // hooks per render, so calling `useNowMs` after the loading/error/empty

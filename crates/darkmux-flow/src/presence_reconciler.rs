@@ -593,6 +593,7 @@ mod tests {
             display_name: "laptop".to_string(),
             role: Some(role.to_string()),
             model: Some("qwen3.6-35b".to_string()),
+            mission_id: None,
             beat_ts_ms: 1,
         }
     }
