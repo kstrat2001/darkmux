@@ -602,7 +602,16 @@ describe("SessionReplay", () => {
     // "Now" is two full minutes after the run started — real time that has
     // NOTHING to do with the scrubbed playhead below. A clock reading real
     // time here reads "2:00 so far"; the correct, playhead-honoring reading
-    // is "0:20 so far" (the last record at-or-before the parked playhead).
+    // is "0:30 so far" — the PLAYHEAD's own elapsed (Playback parity, Change
+    // A: `clockNow = playhead ?? wallNow`, one derivation in both modes).
+    // This used to read "0:20" (the last record AT-OR-BEFORE the parked
+    // playhead, i.e. the heartbeat at t0+20s, ignoring the 10s gap up to the
+    // scrub itself) — correct for #2757's own narrow fix (stop real
+    // `Date.now()` from bleeding into a scrubbed view) but itself the
+    // parity defect the audit's finding #2 later named: a replay parked
+    // mid-generation must show the SAME "so far" a live viewer would have
+    // seen watching in real time to that same instant, gaps between
+    // records included — not freeze at the last one.
     vi.setSystemTime(t0 + 120_000);
     const records = [
       { ts: new Date(t0).toISOString(), action: "dispatch.start", session_id: "s-parked", machine_id: "M", payload: { role: "coder" } },
@@ -624,7 +633,7 @@ describe("SessionReplay", () => {
     // ── Position A: playhead BEFORE the run's own terminal record ──
     const parked = readWall();
     expect(parked).toContain("so far");
-    expect(parked).toContain("0:20"); // the scrubbed instant's own elapsed
+    expect(parked).toContain("0:30"); // the scrubbed instant's own elapsed
     expect(parked).not.toContain("2:00"); // NOT real Date.now() - start
 
     // Real time passes; the playhead does not move. Before the fix, this is

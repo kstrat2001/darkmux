@@ -156,14 +156,15 @@ function SavingsHero({
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   // (#2878) `null` while unsettled, so the first real total lands instantly;
   // a later change counts up, and only up (the 24h window slides past old
-  // records on every poll with nothing running). Off outside live mode: a
-  // scrub or replay is a seek, not a figure moving.
-  const heroTotal = useCountUp(
-    settled ? t.local + t.cloud + t.unknown : null,
-    (n) => (n === null ? "" : fmtN(n)),
-    liveMode ? undefined : 0,
-    { upOnly: true },
-  );
+  // records on every poll with nothing running). (Playback parity, Change
+  // B) NOT gated on `liveMode` any more — `useCountUp` itself reads the
+  // one shared seek signal and snaps only across an actual scrub/rewind;
+  // an ADVANCE (a play tick, or a live poll) tweens in both modes now,
+  // which is the parity fix (finding #5: a 30s advance tweened live and
+  // jumped in playback for the identical figure).
+  const heroTotal = useCountUp(settled ? t.local + t.cloud + t.unknown : null, (n) => (n === null ? "" : fmtN(n)), undefined, {
+    upOnly: true,
+  });
 
   return (
     // The silhouette is applied in CSS off this one attribute so the figures
@@ -395,7 +396,13 @@ export function FleetLens({
   playhead?: number;
   historical?: boolean;
 } = {}) {
-  const nowMs = Date.now();
+  // (Playback parity, Change A) `wallNow` feeds ONLY the live fetch window
+  // below (`useFlowWindow`) — "what is fetched" is the one thing liveMode
+  // is still allowed to decide. Every RENDER-TIME derivation reads
+  // `playheadT` instead (defined below as `playhead ?? wallNow` — a
+  // literal `Date.now()`, not this frozen value, so a replay's `wallNow` is
+  // never mistaken for its own clock).
+  const wallNow = Date.now();
   const liveMode = !historical;
   /** (U5-1) Whether a daemon exists to ASK — a different question from
    * `liveMode`, which is the caller's intent ("this mount is a replay").
@@ -418,14 +425,21 @@ export function FleetLens({
   const livePolling = liveMode && getSource().kind === "daemon";
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
 
-  const liveWindow = useFlowWindow(nowMs);
+  const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
     ? { data: records, tMax: tMax ?? 0, settled: true }
     : liveWindow;
-  // The playhead every bracketing derivation below reads — `flowWindow.tMax`
-  // when the caller didn't separate the two (live mode; any pre-#1869
-  // caller), or the real scrub position when it did.
-  const playheadT = playhead ?? flowWindow.tMax;
+  // (Playback parity, Change A — "one clock") The clock every bracketing
+  // derivation below reads: the playhead when scrubbed, the real wall
+  // clock at the live edge. This USED to be `playhead ?? flowWindow.tMax`
+  // — the newest RECORD's timestamp, not now — which is the Side finding
+  // in the parity spec: the live fleet card judged staleness against
+  // whenever a record last happened to arrive, so the stalled ring only
+  // appeared once another record showed up, sometimes long after the run
+  // actually went quiet. `flowWindow.tMax` is still used as the FIXED axis
+  // ceiling it always was (see `timeline.ts`'s own doc) — this is the
+  // separate, moving "now" value.
+  const playheadT = playhead ?? wallNow;
   // `enabled: false` stops the REQUEST, not just the result: an earlier draft
   // discarded the data while the hook kept polling `/fleet/machines/live`
   // every few seconds behind a replay.
@@ -568,8 +582,8 @@ export function FleetLens({
     // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
     // would route around the disabled presence hooks above and re-derive
     // "running" from the day's own records — presence-agnostic in name only.
-    () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs, liveMode),
-    [flowWindow.data, liveSessionIds, nowMs, liveMode],
+    () => liveSessionSet(flowWindow.data, liveSessionIds, playheadT, liveMode),
+    [flowWindow.data, liveSessionIds, playheadT, liveMode],
   );
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //
@@ -672,13 +686,13 @@ export function FleetLens({
         // doc + this component's `playhead` prop doc for why the two must
         // stay separate arguments once a replay can scrub.
         flowWindow.tMax,
-        nowMs,
+        playheadT,
         windowMinutes,
         liveMode,
         tMin ?? 0,
         playheadT,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes, liveMode, tMin, playheadT],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutes, liveMode, tMin, playheadT],
   );
 
   return (
@@ -688,7 +702,7 @@ export function FleetLens({
         note={note}
         liveMode={liveMode}
         data={scopedData}
-        nowMs={nowMs}
+        nowMs={playheadT}
         settled={flowWindow.settled}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
@@ -844,22 +858,24 @@ export function FleetLens({
         <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
           <div className="tlhdr">
             <span>{timeline.headerText}</span>
-            {/* `const winCtl=liveMode?...:''` (viewer.html:1764) — LIVE-ONLY.
-                A replay shows the full recorded day, so there is no window to
-                slide over and the control would be a dead knob. */}
-            {liveMode ? (
-              <span className="twin">
-                {ACTIVITY_WINDOW_PRESETS.map((p) => (
-                  <button
-                    key={p.minutes}
-                    className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
-                    onClick={() => setWindowMinutes(p.minutes)}
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </span>
-            ) : null}
+            {/* (Playback parity, Change A, finding #8) Shown in BOTH modes
+                now — a replay draws the same rolling window as live,
+                anchored at the playhead, so the window control is a live
+                knob there too, not a dead one. Used to be LIVE-ONLY
+                (`const winCtl=liveMode?...:''`, viewer.html:1764), back when
+                a replay drew the whole recorded day with nothing to slide
+                over. */}
+            <span className="twin">
+              {ACTIVITY_WINDOW_PRESETS.map((p) => (
+                <button
+                  key={p.minutes}
+                  className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
+                  onClick={() => setWindowMinutes(p.minutes)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </span>
           </div>
           {timeline.lanes.map((lane) => (
             <div className="lane" key={lane.uid}>

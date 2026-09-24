@@ -392,30 +392,46 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // counts. Note the counter can step BACKWARDS at that moment, from the
   // ticked value to the last record's own elapsed time; that is the point —
   // the run's last sign of life is a fact, and the seconds since are not.
-  const quietMs = base?.lastBeatMs != null ? Date.now() - base.lastBeatMs : Infinity;
+  // (Playback parity, Change A) `clockNow` — `playhead ?? wallNow` — is the
+  // ONE "now" every render-time derivation below reads, in both modes. This
+  // used to be `Date.now()` unconditionally (finding #1's `quietMs`, and
+  // the `ticking`/`base` split below): correct at the live edge, but a
+  // replay probed mid-scrub compared a RECORDED instant against the
+  // browser's real wall clock, which is what made a mid-generation replay
+  // read "stale"/"no recent activity" — the run had gone quiet relative to
+  // NOW, when the question is whether it was quiet as of the PLAYHEAD.
+  // `wallNow` is a plain per-render `Date.now()` read (not a hook) — it
+  // does not itself drive a re-render; see `ticking`/`useNowMs` below for
+  // what does, at the live edge only.
+  const wallNow = Date.now();
+  const clockNow = playhead ?? wallNow;
+  const quietMs = base?.lastBeatMs != null ? clockNow - base.lastBeatMs : Infinity;
   const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
-  // (#2757) `playhead === null` — added here, everything else on this line
-  // predates it. A non-null playhead means the operator has actively parked
-  // the shell's transport away from the live edge (`App.tsx`'s
+  // (#2757) `playhead === null` — a non-null playhead means the operator has
+  // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
-  // at the live edge `playhead` is `null`). Without this guard, `ticking`
-  // fed `nowMs` from `useNowMs` — the real `Date.now()` clock — into
-  // `runRegions` regardless of where the playhead sat, so WALL CLOCK climbed
-  // in real time even while every OTHER pane on the page (derived from
-  // `data`, itself cut to `playhead` above) stayed frozen at the scrubbed
-  // instant. Measured live (#2757): a run whose terminal record fell just
-  // after the parked playhead read "1:21 so far", then "2:25 so far" — the
-  // OPERATOR'S OWN wall-clock time elapsed while watching, not the run's.
-  //
-  // `playhead === null` is also what makes this correct at the live tip:
-  // unscrubbed, `playhead` is `null` and ticking behaves exactly as #1972
-  // designed it to (advance live so a stalled dispatch's clock doesn't
-  // freeze). Once the playhead reaches or passes the run's own terminal
-  // record, `data` already contains it, `base`'s own `done`/`runWallMs`
-  // computation (`sessionRun.ts`) takes over unticked, and the tile shows
-  // the run's fixed total instead of climbing past it.
+  // at the live edge `playhead` is `null`). This gate now decides ONLY
+  // whether the shared 1s clock subscribes (a pure perf/re-render concern —
+  // there is no reason to re-render every second while scrubbed, since the
+  // transport itself re-renders this component on every tick it advances).
+  // It no longer decides whether `runRegions` gets a moving "now" — that is
+  // `clockNow` above, unconditionally, in both modes (Change A). Before this
+  // split, the SAME boolean gated both, which is what made a scrubbed
+  // replay's "so far" clock freeze between records (finding #2): `view`
+  // below fell back to `base` — `runRegions` with NO override, i.e. the
+  // newest CUT record's own timestamp — instead of the playhead, so the
+  // reading only advanced when a new record happened to arrive.
   const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
   const nowMs = useNowMs(ticking);
+  // The override actually fed to `runRegions`: the playhead when scrubbed
+  // (unconditionally — a playhead means a replay, and a replay's clock is
+  // never "no override", full stop); otherwise the ticking clock's own
+  // snapshot while plausibly running, or `undefined` (record-time only) once
+  // the run is done/stale/static — `runRegions`'s own `Math.max(override,
+  // tMax)` clamp means passing nothing here is exactly equivalent to
+  // freezing at the newest record, which is what a finished/stale run
+  // should do either way.
+  const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : undefined);
 
   if (!session) {
     return <SessionPendingHeader sessionId={sessionId} />;
@@ -461,8 +477,18 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       </div>
     );
   }
-  const view = ticking ? runRegions(data, sessionId, nowMs) : base;
-  const liveness = livenessState({ done: !view.live, animate: ticking, lastBeatMs: view.lastBeatMs, nowMs });
+  // (Playback parity, Change A) Run ONCE, with `clockOverride`, in both
+  // modes — no more `ticking ? ... : base` branch selecting between a
+  // moving clock and a frozen one keyed on live/playback.
+  const view = runRegions(data, sessionId, clockOverride);
+  // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
+  // "should the shared clock subscribe" perf gate (see its own doc above)
+  // and is unconditionally `false` in playback (`playhead === null` fails
+  // whenever scrubbed), which is exactly finding #1: the pill read "stale"
+  // in playback regardless of whether the run was actually still going as
+  // of the playhead. `plausiblyRunning` is computed from `clockNow` above,
+  // so it answers the SAME question live and replayed.
+  const liveness = livenessState({ done: !view.live, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
 
   return (
     <div data-state="data" className="session-run">

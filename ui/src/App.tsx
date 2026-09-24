@@ -4,6 +4,7 @@ import { useHashRoute } from "./lib/useHashRoute";
 import { getSource } from "./lib/source";
 import { useDay } from "./hooks/useDay";
 import { usePlaybackTransport, type PlaybackFocus } from "./hooks/usePlaybackTransport";
+import { SeekSignalContext } from "./lib/seekSignal";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
@@ -611,6 +612,14 @@ export function App() {
   useSyncHash(route);
 
   return (
+    // (Playback parity, Change B) `transport.seekGen` bumps on a scrub/
+    // rewind/replay-restart and never on the 100ms play tick — see
+    // `usePlaybackTransport`'s own doc. `0` (unchanging) when no day is
+    // loaded, which is every live route: live mode never seeks, so nothing
+    // downstream ever reads a seek there. Provided once, at the root, for
+    // `useCountUp`/`useArrivalKeys` to read — see `SeekSignalContext`'s own
+    // doc for why this replaces a per-caller `liveMode` gate.
+    <SeekSignalContext.Provider value={transport.seekGen}>
     <div className="app-shell">
       {/* (Chrome packet) The masthead — brand, build chip, the catalog/
           liveness pill, refresh, topnav — moved out of this function into
@@ -864,6 +873,7 @@ export function App() {
         )}
       </div>
     </div>
+    </SeekSignalContext.Provider>
   );
 }
 

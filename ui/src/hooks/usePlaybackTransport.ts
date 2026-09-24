@@ -151,6 +151,15 @@ export interface PlaybackTransport {
   rewind: () => void;
   togglePlay: () => void;
   cycleSpeed: () => void;
+  /** (Playback parity, Change B) Increments exactly once per SEEK — a
+   * scrub, a rewind, or pressing play again after running off the end
+   * (which restarts `t` at `tMin`, the same discrete jump). The 100ms play
+   * tick that ADVANCES `t` during ordinary playback never touches this.
+   * `App.tsx` provides it through `SeekSignalContext`; `useCountUp` and
+   * `useArrivalKeys` are its consumers — see that context's own doc for
+   * why this is the ONE signal that suppresses animation, rather than a
+   * per-caller `liveMode` gate. */
+  seekGen: number;
 }
 
 export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: PlaybackFocus = DAY_FOCUS): PlaybackTransport {
@@ -297,8 +306,24 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
   // is a public part of the transport's API — a direct call (a test, a
   // future caller) must not be able to punch the playhead outside the
   // focus it belongs to.
-  const scrub = useCallback((next: number) => setT(Math.min(tMax, Math.max(tMin, next))), [tMin, tMax]);
-  const rewind = useCallback(() => setT(tMin), [tMin]);
+  // (Playback parity, Change B) `seekGen` bumps on every SEEK — see the
+  // interface field's own doc. A plain counter, not a boolean: a consumer
+  // needs to tell "a seek happened since MY last render" from its own ref,
+  // and a boolean would need resetting by someone, which just moves the
+  // bookkeeping rather than removing it.
+  const [seekGen, setSeekGen] = useState(0);
+  const bumpSeek = useCallback(() => setSeekGen((g) => g + 1), []);
+  const scrub = useCallback(
+    (next: number) => {
+      bumpSeek();
+      setT(Math.min(tMax, Math.max(tMin, next)));
+    },
+    [tMin, tMax, bumpSeek],
+  );
+  const rewind = useCallback(() => {
+    bumpSeek();
+    setT(tMin);
+  }, [tMin, bumpSeek]);
   const togglePlay = useCallback(() => {
     if (playing) {
       setPlaying(false);
@@ -306,10 +331,14 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     }
     // Pressing play at the end starts over, same as the lens did. Two plain
     // setters, not a setter inside another's updater (updaters must stay
-    // pure; React may invoke them twice).
-    if (playheadT >= tMax) setT(tMin);
+    // pure; React may invoke them twice). Restarting at `tMin` is the same
+    // discrete jump `rewind` makes, so it counts as a seek too.
+    if (playheadT >= tMax) {
+      bumpSeek();
+      setT(tMin);
+    }
     setPlaying(true);
-  }, [playing, playheadT, tMin, tMax]);
+  }, [playing, playheadT, tMin, tMax, bumpSeek]);
   const cycleSpeed = useCallback(() => setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]), []);
 
   const visibleCount = useMemo(() => (records ? records.filter((r) => !(T(r.ts) > playheadT)).length : 0), [records, playheadT]);
@@ -328,5 +357,6 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     rewind,
     togglePlay,
     cycleSpeed,
+    seekGen,
   };
 }

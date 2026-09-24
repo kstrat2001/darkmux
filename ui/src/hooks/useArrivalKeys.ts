@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useSeekGeneration } from "../lib/seekSignal";
 
 /** ~150ms slide + a ~1s highlight fade (`styles.css`'s `eventlog-arrive`/
  * `eventlog-arrive-highlight` keyframes) — held a little past the longer
@@ -26,14 +27,29 @@ const DEFAULT_HOLD_MS = 1100;
  * once. Pass the value that identifies the underlying data set
  * (`scopeLabel`, a session id, …); changing it drops the old `seen` set
  * and adopts the new snapshot with nothing marked as arriving.
- */
+ *
+ * (Playback parity, Change B, finding #12) A forward SEEK (a scrub that
+ * jumps the playhead ahead, or rewind) can bring many rows into view at
+ * once that were never individually "arriving" — they simply became
+ * visible because the playhead jumped past them. Marking every one of
+ * them as arriving painted the whole event log with arrival highlights on
+ * a single scrub. `useSeekGeneration()` is the same one signal
+ * `useCountUp` reads: when it has changed since this hook's own last
+ * render, this update is a seek, and the newly-visible keys are adopted
+ * into `seen` silently, with no highlight. An ADVANCE (the play tick,
+ * which never changes the seek generation) still marks genuinely new
+ * arrivals exactly as before. */
 export function useArrivalKeys(keys: readonly string[], resetKey: string, holdMs = DEFAULT_HOLD_MS): ReadonlySet<string> {
   const seen = useRef<Set<string> | null>(null);
   const lastResetKey = useRef<string | null>(null);
   const [arriving, setArriving] = useState<ReadonlySet<string>>(() => new Set());
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const seekGen = useSeekGeneration();
+  const lastSeekGen = useRef(seekGen);
 
   useEffect(() => {
+    const isSeek = seekGen !== lastSeekGen.current;
+    lastSeekGen.current = seekGen;
     if (lastResetKey.current !== resetKey) {
       // A different underlying data set (or the very first render): adopt
       // its keys as the baseline, mark nothing as arriving, and drop any
@@ -49,6 +65,7 @@ export function useArrivalKeys(keys: readonly string[], resetKey: string, holdMs
     const fresh = keys.filter((k) => !prev.has(k));
     seen.current = new Set(keys);
     if (fresh.length === 0) return;
+    if (isSeek) return; // adopt silently — a seek reveals rows, it doesn't age new ones in
     setArriving((old) => {
       const next = new Set(old);
       for (const k of fresh) next.add(k);
@@ -72,7 +89,7 @@ export function useArrivalKeys(keys: readonly string[], resetKey: string, holdMs
     // output, and including it would re-run the diff on every highlight
     // expiring rather than only when `keys`/`resetKey` change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keys, resetKey, holdMs]);
+  }, [keys, resetKey, holdMs, seekGen]);
 
   useEffect(() => {
     const map = timers.current;

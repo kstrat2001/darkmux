@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "./usePrefersReducedMotion";
+import { useSeekGeneration } from "../lib/seekSignal";
 
 const DEFAULT_DURATION_MS = 700;
 
@@ -46,7 +47,19 @@ function easeOutCubic(t: number): number {
  *   past old records. Tweening that made an idle fleet look busy.
  * - **A change mid-tween** continues from the number currently on screen,
  *   not from the previous target, so the figure never jumps.
- */
+ *
+ * (Playback parity, Change B) Whether a change tweens or snaps used to be
+ * decided per CALLER (`liveMode ? undefined : 0`), which meant a live
+ * page's advance and a playback page's advance ran different code paths —
+ * exactly the divergence the parity audit's finding #5 caught (a 30s
+ * advance tweened live, jumped in playback, for the identical figure). The
+ * ONLY thing that should suppress a tween is a SEEK — a scrub/rewind that
+ * jumps the playhead to an unrelated instant, where animating between two
+ * values that were never adjacent in time would show a number that was
+ * never true. `useSeekGeneration()` is that one signal, read here rather
+ * than threaded through every caller: it never changes in live mode (no
+ * transport, no seeks), so live behavior is unchanged — advance always
+ * animates, in both modes now, and only a genuine seek snaps. */
 export function useCountUp(
   target: number | null,
   format: (n: number | null) => string,
@@ -60,8 +73,12 @@ export function useCountUp(
   const upOnly = opts.upOnly === true;
   const rafRef = useRef<number | null>(null);
   const reduced = usePrefersReducedMotion();
+  const seekGen = useSeekGeneration();
+  const prevSeekGen = useRef(seekGen);
 
   useEffect(() => {
+    const isSeek = seekGen !== prevSeekGen.current;
+    prevSeekGen.current = seekGen;
     if (prevTarget.current === UNSET) {
       // First mount: render the true value immediately (never animate on
       // first paint — see this hook's own doc).
@@ -72,13 +89,12 @@ export function useCountUp(
     const from = prevTarget.current;
     prevTarget.current = target;
     if (from === target) return;
-    // `durationMs <= 0` is a caller opt-out — a scrubbed playhead or a
-    // replay jump is a discrete seek to a different already-happened
-    // instant, not a live value changing over time, and animating BETWEEN
-    // two unrelated instants would show a number that was never true at
-    // either point in time (the fleet hero's own `liveMode` gate is the
-    // first caller of this — see `FleetLens.tsx`).
-    if (from === null || target === null || reduced || durationMs <= 0 || (upOnly && target < from)) {
+    // A seek (not a caller opt-out any more — see this function's own doc
+    // above) is a discrete jump to a different already-happened instant,
+    // not a live value changing over time, and animating BETWEEN two
+    // unrelated instants would show a number that was never true at either
+    // point in time.
+    if (from === null || target === null || reduced || isSeek || durationMs <= 0 || (upOnly && target < from)) {
       setDisplay(target);
       return;
     }
@@ -97,7 +113,7 @@ export function useCountUp(
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [target, reduced, durationMs, upOnly]);
+  }, [target, reduced, durationMs, upOnly, seekGen]);
 
   // Absence renders on THIS render, not one effect later: `display` still
   // holds the old number until the effect runs, and a caller whose formatter

@@ -619,7 +619,17 @@ describe("App", () => {
    * port had collapsed to its live arm. `goldens/playback-date.txt` is the
    * byte-level spec; this is the fast guard beneath it.
    */
-  it("a replay renders the REPLAY arm of the fleet hero, not the live one", async () => {
+  // (Playback parity, Change A, finding #3/#4/#8 — 2026-09-24) This used to
+  // assert the OLD divergent "replay arm" behavior directly: the card
+  // counted the day's WHOLE session roster as "specialists" regardless of
+  // whether anything was running at the playhead, and the timeline drew a
+  // fixed day-span axis with no window control. Both are the parity defect
+  // the audit named (findings #3/#4/#8), not a feature — a replay now
+  // renders the SAME components a live viewer would have seen at the same
+  // instant. Only the hero eyebrow wording (dropping "· last 24h", since a
+  // replay is a specific day, not a rolling window) is still allowed to
+  // differ — that is header wording, which Change A leaves untouched.
+  it("a replay renders the SAME running-state components a live viewer would, at the playhead (parity)", async () => {
     window.location.hash = "#2026-08-07";
     vi.stubGlobal(
       "fetch",
@@ -658,17 +668,22 @@ describe("App", () => {
     expect(screen.getByText("darkmux tokens")).toBeInTheDocument();
     expect(screen.queryByText(/tokens · last/i)).not.toBeInTheDocument();
 
-    // The card counts the DAY's sessions and calls them specialists.
-    expect(document.querySelector(".mach .runs")?.textContent).toBe("2 specialists");
+    // Both sessions are CLOSED as of the playhead (the day's own end,
+    // unscrubbed) — "0 running", not "2 specialists": nothing is actually
+    // running at that instant, the same word and count a live viewer would
+    // have seen.
+    expect(document.querySelector(".mach .runs")?.textContent).toBe("0 running");
 
     // The `_type` header contributed no machine card.
     expect(document.querySelectorAll(".mach")).toHaveLength(1);
 
-    // The timeline spans the day and carries no window control.
-    expect(document.querySelector(".tlhdr span")?.textContent).toBe("activity");
-    expect(document.querySelector(".twin")).toBeNull();
-    // Both of the day's sessions drew a bar. The NOW-anchored live arm would
-    // have filtered every one of them out for ending before `now - 24h`.
+    // The timeline draws the SAME rolling window as live now, anchored at
+    // the playhead, with the SAME header and window control.
+    expect(document.querySelector(".tlhdr span")?.textContent).toBe("recent activity");
+    expect(document.querySelector(".twin")).not.toBeNull();
+    // Both of the day's sessions still drew a bar — the default 24h window
+    // ending at the playhead (the day's own end here) covers the whole
+    // recorded span, same as it would live probed at that instant.
     expect(document.querySelectorAll(".fleettl .lane")).toHaveLength(1);
     expect(document.querySelectorAll(".sbar")).toHaveLength(2);
   });
