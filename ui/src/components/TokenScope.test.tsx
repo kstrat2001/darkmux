@@ -32,6 +32,22 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(container.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("bash");
   });
 
+  it("PROMPT shows the brain until a prompt size arrives, then the count", () => {
+    const a = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel={null} />);
+    expect(a.container.querySelector("[data-scope-icon]")?.getAttribute("data-scope-icon")).toBe("brain");
+    expect(a.container.querySelector(".token-scope-n")).toBeNull();
+    const b = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel="36k" centerUnit="reading" />);
+    expect(b.container.querySelector("[data-scope-icon]")).toBeNull();
+    expect(b.container.querySelector(".token-scope-n")?.textContent).toBe("36k");
+  });
+
+  it("no brain outside PROMPT", () => {
+    for (const state of ["generating", "tools", "rest", "stalled", "finished"] as const) {
+      const { container } = render(<TokenScope tokensPerSec={0} size="tile" state={state} />);
+      expect(container.querySelector("[data-scope-icon]")).toBeNull();
+    }
+  });
+
   it("GEN shows the rate with its unit on the tile", () => {
     const { container } = render(<TokenScope tokensPerSec={180} size="tile" state="generating" centerLabel="180" centerUnit="tok/s" />);
     expect(container.querySelector(".token-scope-n")?.textContent).toBe("180");
@@ -51,8 +67,8 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-state")).toBe("finished");
   });
 
-  it("PROMPT, REST, STALL and NO SIGNAL have an empty center", () => {
-    for (const state of ["prompt", "rest", "stalled", "nosignal"] as const) {
+  it("REST, STALL and NO SIGNAL have an empty center with no label", () => {
+    for (const state of ["rest", "stalled", "nosignal"] as const) {
       const { container, unmount } = render(<TokenScope tokensPerSec={0} size="tile" state={state} />);
       expect(center(container)).toBeNull();
       unmount();

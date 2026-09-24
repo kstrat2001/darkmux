@@ -12,6 +12,7 @@ import {
 } from "../lib/scopeMorph";
 import { useCountUp } from "../hooks/useCountUp";
 import { ToolIcon } from "./ToolIcon";
+import { BrainGlyph } from "./ActivityIcon";
 
 /**
  * (#2877) Live token-rate scope — a CRT oscilloscope, ported from the
@@ -247,17 +248,17 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.fill();
     ctx.shadowBlur = 0;
   }
-  // PROMPT: rings expanding outward from the center.
+  // PROMPT: rings emitted outward from the base ring.
   if (p.inward > 0.01) {
+    const edge = R * 1.47; // the screen's radius
     for (let k = 0; k < 3; k++) {
       const q = (c.inwardT + k / 3) % 1;
-      // (#2890 operator review) Outward: each ring starts near the center
-      // (clear of the center label) and expands toward the rim, the context
-      // being worked through radiating out.
-      // It travels to the screen's edge (the screen radius is ~1.47R), fading
-      // in fast near the center and out slowly as it reaches the rim.
-      const r = R * (0.3 + q * 1.12);
-      const a = Math.min(1, q / 0.15) * Math.pow(1 - q, 0.7) * 0.9 * p.inward;
+      // (#2890 operator review) Each ring leaves the base ring and travels
+      // to the screen's edge, so the center stays clear for the glyph like
+      // every other state's. Born at the base ring's brightness, fading out
+      // as it reaches the rim.
+      const r = rBase + q * (edge - rBase);
+      const a = Math.pow(1 - q, 1.2) * 0.9 * p.inward;
       for (const [lw, al] of INWARD_PASSES) {
         ctx.beginPath();
         ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, 0, Math.PI * 2);
@@ -429,7 +430,10 @@ export function TokenScope({
   const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))));
   const shownLabel = whole !== null ? eased : centerLabel;
   const showIcon = state === "tools";
-  const showNumber = !showIcon && centerLabel != null;
+  // PROMPT shows a pulsing brain until the runtime reports the prompt size
+  // mid-turn (#2889); then the count takes the center like any other number.
+  const showBrain = state === "prompt" && centerLabel == null;
+  const showNumber = !showIcon && !showBrain && centerLabel != null;
 
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
@@ -439,6 +443,11 @@ export function TokenScope({
         {showIcon && (
           <div className="token-scope-center token-scope-center--icon">
             <ToolIcon kind={toolIconKind(toolName)} className="token-scope-ico" />
+          </div>
+        )}
+        {showBrain && (
+          <div className="token-scope-center token-scope-center--icon token-scope-center--brain">
+            <BrainGlyph className="token-scope-ico" />
           </div>
         )}
         {showNumber && (

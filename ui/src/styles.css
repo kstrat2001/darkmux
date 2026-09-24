@@ -8498,6 +8498,19 @@ body {
   color: var(--lamp-tools);
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-tools) 80%, transparent));
 }
+/* PROMPT: the brain takes the prompt lamp's color and breathes. */
+.token-scope-center--brain .token-scope-ico {
+  color: var(--lamp-prompt);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-prompt) 80%, transparent));
+  animation: token-scope-brain 2.4s ease-in-out infinite;
+}
+@keyframes token-scope-brain {
+  0%, 100% { opacity: 0.55; transform: scale(0.94); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-center--brain .token-scope-ico { animation: none; }
+}
 @media (max-width: 560px) {
   .token-scope-bezel--card {
     --ico: 36px;
