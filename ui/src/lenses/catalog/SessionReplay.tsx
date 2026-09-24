@@ -1,5 +1,7 @@
 import { WorkStatus } from "../../components/WorkStatus";
 import { useMemo } from "react";
+import { useCountUp } from "../../hooks/useCountUp";
+import { parseNumericLike } from "../../lib/numericLike";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -50,6 +52,24 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * `pillLabel` (pre-uppercased, golden-pinned). */
 function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
   return cls === "run" ? "running" : cls === "err" ? "error" : cls === "done" ? "complete" : "canceled";
+}
+
+/** (#2878) A MODEL/SYSTEM metric tile's value (`.mv`), counting up/down
+ * when it changes on a live run — TURNS, COMPACTIONS, a host CPU/RAM/GPU
+ * percentage. `sessionRun.ts` hands this component an already-FORMATTED
+ * string (comma grouping, `%`, rounding all baked in), so
+ * `parseNumericLike` is the bridge: it recognizes a plain number (with
+ * that same comma/`%` shape) and reproduces it exactly at every
+ * intermediate frame. A value that ISN'T one plain number — a duration
+ * like "10:15", a model name, "—" — renders exactly as it always did, no
+ * animation, because there is nothing here safe to interpolate. */
+function AnimatedMetricValue({ value }: { value: string }) {
+  const parsed = parseNumericLike(value);
+  // `useCountUp` is called unconditionally either way — only the target it
+  // tweens toward (a number, or `null` for "nothing to animate") depends
+  // on `parsed`, so this never violates the rules of hooks.
+  const tweened = useCountUp(parsed ? parsed.n : null, (n) => (n === null ? "" : parsed!.render(n)));
+  return <>{parsed ? tweened : value}</>;
 }
 
 /** (#2000) `.brief-grid`'s `repeat(auto-fit, minmax(240px, 1fr))` resolves
@@ -429,7 +449,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
             <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
               {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
-              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
+              <div className="mv"><AnimatedMetricValue value={m.value} />{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>
@@ -466,7 +486,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
             {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
-              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
+              <div className="mv"><AnimatedMetricValue value={m.value} />{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>

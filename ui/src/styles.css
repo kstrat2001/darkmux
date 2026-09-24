@@ -1944,6 +1944,64 @@ body {
 .eventlog__turndur--slow {
   color: var(--warn);
 }
+/* (#2878) The in-progress turn's own subtle live pulse — a synthesized
+   "in progress" header (`turnGroups.ts`'s own `why: "in progress"`), the
+   one whose events are still being written. A thin accent bar rather than
+   pulsing the whole row: the row's TEXT must stay easy to read while it
+   breathes, and reuses the SAME `--beat` keyframe every other liveness
+   indicator on this page uses (`styles.css`'s own "defined once" doc) —
+   `--beat: none` under reduced motion turns this off along with all of
+   them, no separate override needed here. */
+.eventlog__rec--turn.eventlog__rec--live {
+  position: relative;
+}
+.eventlog__rec--turn.eventlog__rec--live::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  animation: var(--beat);
+}
+/* (#2878) "A new event row slides in... with a brief highlight" — only for
+   a row that arrives while the pane is open (`useArrivalKeys.ts`'s own
+   doc draws the line: never the initial list, never a row a filter merely
+   reveals). Transform + opacity, not a literal height grow: this list's
+   rows vary a lot in height (a one-line record next to a multi-line turn
+   header), and animating `max-height` risks clipping a tall row's own
+   content mid-slide. A CSS keyframe animation plays ONCE, automatically,
+   the moment a class naming it is first applied to an element — no JS
+   loop needed to drive or stop it. */
+@keyframes eventlog-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes eventlog-arrive-highlight {
+  0% {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.eventlog__rec--arriving {
+  animation:
+    eventlog-arrive 150ms ease-out,
+    eventlog-arrive-highlight 1000ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .eventlog__rec--arriving {
+    animation: none;
+  }
+}
 .eventlog__turnctx {
   display: grid;
   /* (#2863 review, finding 4) A bare `1fr` middle track can be squeezed to
@@ -1989,6 +2047,16 @@ body {
   border-radius: 2px;
   background: var(--accent);
   opacity: 0.8;
+  /* (#2878) Eases to a new context reading rather than jumping — same
+     ~1-2s sampling-interval feel as the machine-lens dials. Never on
+     first mount: React sets `width` inline at whatever the turn's own
+     reading already is, so there is no prior width to transition from. */
+  transition: width 1.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .eventlog__ctxfill {
+    transition: none;
+  }
 }
 .eventlog__ctxtick {
   position: absolute;
@@ -4132,6 +4200,44 @@ body {
   fill: var(--dim);
   font-size: calc(8.5px * var(--fs-scale));
   letter-spacing: 0.12em;
+}
+/* (#2878) "Ease between samples" — every dial's fill and needle transition
+   toward a new reading rather than snapping to it, roughly the sampling
+   interval (~1-2s the host reports at). CSS transitions on the SVG
+   presentation attributes that already encode the value — `stroke-dasharray`
+   for a band's extent, `transform` for the needle's rotation — need no JS
+   tween loop: the browser interpolates the attribute change directly, same
+   mechanism this file already leans on for `width`/`transform` elsewhere.
+   Covers every `<Meter>` instance (the VRAM pressure dial AND every compact
+   CPU/GPU/MEM/cluster gauge) because they all share this one geometry
+   (`Meter.tsx`'s own doc) and these are its only value-bearing classes.
+   `.mm-gauge-growth`'s hatch extent is included too — its `alwaysRender`
+   band still moves when committed-but-unmaterialized growth changes.
+   Never on FIRST mount: an element with no prior value has nothing to
+   transition FROM, so it simply appears at its true reading, matching this
+   app's "never animate on load" rule. */
+.mm-gauge-val,
+.mm-gauge-other,
+.mm-gauge-growth,
+.mm-gauge-inner-val,
+.mm-gauge-commit,
+.mm-gauge-fill-compact,
+.mm-gauge-needle {
+  transition:
+    stroke-dasharray 1.4s ease-out,
+    stroke-dashoffset 1.4s ease-out,
+    transform 1.4s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mm-gauge-val,
+  .mm-gauge-other,
+  .mm-gauge-growth,
+  .mm-gauge-inner-val,
+  .mm-gauge-commit,
+  .mm-gauge-fill-compact,
+  .mm-gauge-needle {
+    transition: none;
+  }
 }
 .mm-gauge-tick {
   stroke: var(--dim);
@@ -7232,6 +7338,16 @@ body {
    of the source"), so a threshold on top would double up on the same
    fact. */
 .battery-bar-fill {
+  /* (#2878) Eases to a new charge reading rather than snapping — same
+     ~1-2s sampling-interval feel as every other dial on this page. Never
+     on first mount: the `width` attribute JSX sets is the rect's only
+     width ever, so there is nothing to transition from at appearance. */
+  transition: width 1.4s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .battery-bar-fill {
+    transition: none;
+  }
 }
 /* (operator, 2026-09-24: "seems like a lightning bolt icon works inside
    the battery or next to it") The charging/on-AC glyph, drawn centered

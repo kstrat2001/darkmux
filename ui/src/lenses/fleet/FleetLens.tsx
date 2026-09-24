@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
@@ -193,7 +194,21 @@ function SavingsHero({
             FROM — the tokens were dispatched by darkmux either way, which
             is the only claim being made. */}
         <div className="savlead">
-          <div className="savnum">{settled ? fmtN(t.local + t.cloud + t.unknown) : ""}</div>
+          {/* (#2878) `null` while unsettled — the FIRST real total lands
+              instantly (this is a reading arriving, not a change to
+              tween through, matching `useCountUp`'s absence rule); only a
+              LATER change to an already-settled total counts up/down.
+              Tweening is also OFF (`durationMs: 0`) outside `liveMode`: a
+              scrubbed playhead or a replayed day is a seek to a different
+              already-happened instant, not a live figure moving — see
+              `useCountUp`'s own doc on this exact distinction. */}
+          <div className="savnum">
+            {useCountUp(
+              settled ? t.local + t.cloud + t.unknown : null,
+              (n) => (n === null ? "" : fmtN(n)),
+              liveMode ? undefined : 0,
+            )}
+          </div>
           <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
         </div>
         <div className="savclasses">
