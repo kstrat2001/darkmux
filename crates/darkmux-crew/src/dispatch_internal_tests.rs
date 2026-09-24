@@ -10498,7 +10498,7 @@
         let verdict = "Tests: 2 failed, 86 passed, 88 total";
         let body = format!(
             "exit: 1\n--- stdout ---\n{}\n{verdict}\n",
-            "PASS tests/services/noise.test.ts\n".repeat(4000)
+            "PASS test/noise.test.js\n".repeat(4000)
         );
         assert!(body.len() > 4096, "fixture must actually exceed the cap");
 

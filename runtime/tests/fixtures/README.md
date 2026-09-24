@@ -32,8 +32,10 @@ The harvested traces came from the canonical-tests long-agentic workload
 (operator-confirmed-public). One internal-project ticket key
 appeared in the compactor's free-text output and was sanitized to
 `SAMPLE-1234` (preserves structural shape, drops the recognizable internal
-sentinel). Workspace paths use the `/workspace/src/services/refreshToken*`
-form which is generic enough — common across auth codebases worldwide.
+sentinel). Workspace paths were later re-sanitized to the `/workspace/src/`
+and `/workspace/test/tokenRotation*` form matching the public
+pepper-grinder fixture, replacing an earlier form that echoed a private
+employer codebase's real file names.
 
 If future harvests include engagement sentinels (the set listed in
 `tests/parity/lib/sanitize.mjs`),
