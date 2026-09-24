@@ -7096,6 +7096,47 @@ mod tests {
         assert_eq!(rest_events, 2, "one runtime.rest trajectory event per rest");
     }
 
+    /// (#2877, pre-PR review) The turn-delay rest, the most common one, had
+    /// no test that it is recorded BEFORE its sleep: moving `append_rest`
+    /// back after the sleep left the whole crate green. Same real loop as
+    /// the test above; at each sleep the matching rest event must already
+    /// be in the trajectory.
+    #[test]
+    #[serial_test::serial]
+    fn turn_delay_rest_is_recorded_before_each_sleep_not_after() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
+        let server = crate::test_support::GuardedMockServer::start();
+        register_three_turn_tool_then_stop_script(&server);
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-delay-order").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let sleeper = RestVisibleAtSleepSleeper {
+            traj_path: tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+            rests_seen_at_sleep: Default::default(),
+            flip_pause_off: None,
+        };
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+        )
+        .expect("3-turn scripted dispatch returns Ok");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+        assert_eq!(outcome.rests, 2);
+        assert_eq!(
+            sleeper.rests_seen_at_sleep.borrow().as_slice(),
+            &[1, 2],
+            "each turn-delay rest is on disk when its sleep begins"
+        );
+    }
+
     /// (#2114) A sleeper that, on its SECOND call, flips `pace.json` to
     /// `pause: false` — simulating a governor rewriting the file WHILE the
     /// loop is inside a poll increment's sleep. Records every call like
