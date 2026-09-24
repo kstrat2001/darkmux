@@ -99,7 +99,12 @@ export function useCountUp(
     };
   }, [target, reduced, durationMs, upOnly]);
 
-  return format(display);
+  // Absence renders on THIS render, not one effect later: `display` still
+  // holds the old number until the effect runs, and a caller whose formatter
+  // only exists while the value is numeric (SessionReplay's metric tiles)
+  // crashed on that one stale render. A reading that appears shows at once
+  // for the same reason, rather than one blank render.
+  return format(target === null ? null : (display ?? target));
 }
 
 // A dedicated sentinel rather than `undefined` — `target` is already

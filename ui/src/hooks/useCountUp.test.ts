@@ -95,6 +95,22 @@ describe("useCountUp (#2878)", () => {
     expect(Number(result.current)).toBeLessThan(100);
   });
 
+  it("a target going null never renders the stale number, not even for one render", () => {
+    // SessionReplay's metric tile formats through a parser that exists only
+    // while the value is numeric; handing it the old number on the render
+    // where the value turned "—" crashed the whole run page.
+    stubReducedMotion(false);
+    let live: number | null = 5;
+    const strict = (n: number | null) => {
+      if (live === null && n !== null) throw new Error(`stale number ${n} formatted after the target went null`);
+      return fmt(n);
+    };
+    const { result, rerender } = renderHook(({ v }) => useCountUp(v, strict), { initialProps: { v: 5 as number | null } });
+    live = null;
+    rerender({ v: null });
+    expect(result.current).toBe("—");
+  });
+
   it("applies the caller's own formatter, never its own", () => {
     stubReducedMotion(false);
     const asDollars = (n: number | null) => (n === null ? "" : `$${n}`);
