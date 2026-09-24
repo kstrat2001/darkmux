@@ -248,17 +248,18 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     ctx.fill();
     ctx.shadowBlur = 0;
   }
-  // PROMPT: rings emitted outward from the base ring.
+  // PROMPT: rings drawn in from the screen's edge toward the brain, the
+  // prompt being absorbed.
   if (p.inward > 0.01) {
     const edge = R * 1.47; // the screen's radius
+    const sink = rBase * 0.78; // where a ring is fully absorbed
     for (let k = 0; k < 3; k++) {
       const q = (c.inwardT + k / 3) % 1;
-      // (#2890 operator review) Each ring leaves the base ring and travels
-      // to the screen's edge, so the center stays clear for the glyph like
-      // every other state's. Born at the base ring's brightness, fading out
-      // as it reaches the rim.
-      const r = rBase + q * (edge - rBase);
-      const a = Math.pow(1 - q, 1.2) * 0.9 * p.inward;
+      // (#2890 operator review) Each ring enters at the edge, brightens as it
+      // closes on the base ring, and is absorbed just inside it, short of the
+      // brain, so the center stays clear like every other state's.
+      const r = edge - q * (edge - sink);
+      const a = Math.min(1, q / 0.2) * Math.pow(1 - q, 0.45) * 0.9 * p.inward;
       for (const [lw, al] of INWARD_PASSES) {
         ctx.beginPath();
         ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, 0, Math.PI * 2);
