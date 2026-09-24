@@ -249,7 +249,22 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     if (m && (!marker || m.atMs >= marker.atMs)) marker = m;
   }
 
-  if (marker && (lastBeatAt === null || marker.atMs >= lastBeatAt)) {
+  // A marker's `atMs` comes from a record's own `ts`, which on the real
+  // wire is WHOLE-SECOND (no `.SSS`); a heartbeat's `atMs` prefers the
+  // ms-precise `sampled_at_ms`. A marker genuinely emitted in the SAME
+  // second as the last heartbeat — a tool call dispatched right after the
+  // turn that produced it — then truncates to a timestamp a few hundred ms
+  // BELOW the heartbeat's precise one, reading as "older" even though it
+  // followed it. Found via screenshot verification against the real
+  // corpus: turn 12's `dispatch.tool` (ts truncates to :16.000) landed
+  // right after its own last heartbeat (sampled_at_ms :16.141) and read as
+  // "stalled" instead of "tools". Comparing against the heartbeat's OWN
+  // second floor (not its precise ms) is the fix: two records in the same
+  // second are treated as ties, and a tie goes to the marker, since a
+  // marker only exists because SOMETHING happened after generation
+  // stopped.
+  const lastBeatSecondFloor = lastBeatAt === null ? null : Math.floor(lastBeatAt / 1000) * 1000;
+  if (marker && (lastBeatSecondFloor === null || marker.atMs >= lastBeatSecondFloor)) {
     const found: StateMarker = marker;
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);

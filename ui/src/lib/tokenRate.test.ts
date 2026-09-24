@@ -227,6 +227,28 @@ describe("deriveLiveState", () => {
     expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools" });
   });
 
+  // (Found via screenshot verification against the real corpus — a
+  // dispatch.tool record whose own `ts` truncates to the SAME whole second
+  // as the heartbeat immediately preceding it, e.g. heartbeat
+  // sampled_at_ms=...636141 vs the tool record's ts="...:16Z" (=...636000).
+  // The marker's truncated 636000 < the heartbeat's precise 636141, so the
+  // naive `marker.atMs >= lastBeatAt` comparison read the tool call as
+  // OLDER than the heartbeat it actually followed, falling through to
+  // "stalled" instead of "tools".)
+  it("does not mistake a same-second marker for one older than the heartbeat it followed (real-record whole-second ts vs ms-precise sampled_at_ms)", () => {
+    const beatAtMs = 1_790_224_636_141;
+    // Record `ts` truncates to the whole second BELOW the heartbeat's own
+    // ms-precise sampled_at_ms — real wire behavior (`toISOString` would
+    // keep the ms; a real flow record's `ts` does not).
+    const toolTs = new Date(Math.floor(beatAtMs / 1000) * 1000).toISOString();
+    const recs: FlowRecord[] = [
+      beat(beatAtMs - 2_000, 4_483),
+      beat(beatAtMs, 5_623),
+      { ts: toolTs, action: "dispatch.tool", session_id: SID, payload: { tool_name: "edit" } } as unknown as FlowRecord,
+    ];
+    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
+  });
+
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
     const recs = [tool(0), rest(1_000, 15_000)];
     // 1s into the 15s window → 14s left (ceil).

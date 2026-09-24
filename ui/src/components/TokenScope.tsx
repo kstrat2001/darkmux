@@ -130,7 +130,15 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: Sc
   // alive rather than a dead flat ring — calmer than a busy one (the floor
   // does not grow with `active`), but never perfectly still.
   const breathe = 0.5 + 0.5 * Math.sin(anim.breath);
-  const amp = R * (0.03 + 0.012 * breathe + 0.16 * active);
+  // (#2877 pass 2, second look) `anim.bright` alone (0.22) measured only a
+  // ~13% average-brightness drop against tools/prompt on the real
+  // screenshots — additive "lighter" blending plus the glow's own bloom
+  // keeps a thin bright line looking nearly as present as a thicker dim
+  // one. Resting now also shrinks the ring itself (smaller amplitude, a
+  // measured ~30% fewer lit pixels), so the dim reads as "a smaller, calmer
+  // trace" and not just "the same trace, slightly faded".
+  const restDamp = resting ? 0.55 : 1;
+  const amp = R * (0.03 + 0.012 * breathe + 0.16 * active) * restDamp;
   const noise = stalled ? R * 0.004 : 0;
 
   ctx.globalCompositeOperation = "lighter";
