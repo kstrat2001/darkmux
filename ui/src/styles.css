@@ -8451,6 +8451,12 @@ body {
 /* (#2885) A carried reading — the number is real but from an earlier turn,
    not the current one's own two most recent heartbeats — reads dimmed and
    without the phosphor glow, distinct from a fresh sample. */
+/* (#2890) REST's countdown in the center takes the rest lamp's amber. */
+.token-scope-bezel[data-state="rest"] .token-scope-n,
+.token-scope-bezel[data-state="rest"] .token-scope-u {
+  color: var(--lamp-rest);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
+}
 .token-scope-center .token-scope-n[data-carried="true"] {
   opacity: 0.55;
   text-shadow: none;

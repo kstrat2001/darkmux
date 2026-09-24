@@ -165,7 +165,8 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   ctx.fillRect(0, 0, w, h);
 
   // Clocks: the wave's phase speed follows the rate; the rest are fixed tempos.
-  c.phase += (0.6 + tps * 0.09) * dt * 60;
+  // (#2890) `tempo` slows a finished run's echo; every live state runs at 1.
+  c.phase += (0.6 + tps * 0.09) * dt * 60 * p.tempo;
   c.breathT += dt * 1.1;
   c.sweep += dt * Math.PI * 1.6;
   c.inwardT = (c.inwardT + dt * 0.45) % 1;
@@ -199,13 +200,15 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     }
     ctx.shadowBlur = 0;
   }
-  // GEN's sweep dot fades in with the rate.
-  if (active > 0.05 && p.sx > 0.5) {
+  // GEN's sweep dot fades in with the rate, and out with tempo: a racing dot
+  // reads as live, so a finished run's slow echo has none (#2890).
+  const dotLive = Math.max(0, Math.min(1, (p.tempo - 0.3) / 0.7));
+  if (active > 0.05 && p.sx > 0.5 && dotLive > 0.02) {
     const ang = -c.phase * 0.5;
     const sr = rBase + amp * Math.sin(lobes * ang - c.phase);
     ctx.beginPath();
     ctx.arc(cx + Math.cos(ang) * sr * p.sx, cy + Math.sin(ang) * sr * p.sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
-    ctx.fillStyle = rgba(lift(cr, 0.55), lift(cg, 0.55), lift(cb, 0.55), (0.5 + 0.45 * active) * active);
+    ctx.fillStyle = rgba(lift(cr, 0.55), lift(cg, 0.55), lift(cb, 0.55), (0.5 + 0.45 * active) * active * dotLive);
     ctx.shadowColor = rgba(cr, cg, cb, 0.9);
     ctx.shadowBlur = 10;
     ctx.fill();
@@ -322,7 +325,8 @@ export function TokenScope({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const morphRef = useRef<ScopeMorph>(createMorph());
   const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random() });
-  const rate = state === "generating" ? Math.max(0, tokensPerSec ?? 0) : 0;
+  // GEN's live rate, or a finished run's average for its echo (#2890).
+  const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
   // The trace takes the state's color, read once per state change from the
   // same :root token its lamp uses (never per frame).
   const rgb = useMemo(() => toneRgb(stateTone(state)), [state]);

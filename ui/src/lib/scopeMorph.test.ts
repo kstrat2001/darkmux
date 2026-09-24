@@ -33,8 +33,8 @@ describe("scopeTargets: each state is a set of targets on ONE trace (#2890)", ()
     expect([t.r, t.g, t.b]).toEqual(GREEN);
   });
 
-  it("only GEN carries the rate; every other state's wave target is 0", () => {
-    for (const s of ["prompt", "tools", "rest", "stalled", "nosignal", "finished", "idle"] as const) {
+  it("only GEN (and FINISHED's average echo, tested below) carries a rate; every other state's wave target is 0", () => {
+    for (const s of ["prompt", "tools", "rest", "stalled", "nosignal", "idle"] as const) {
       expect(scopeTargets(s, 0, 180, GREEN).wave).toBe(0);
     }
   });
@@ -56,7 +56,7 @@ describe("scopeTargets: each state is a set of targets on ONE trace (#2890)", ()
   });
 
   it("FINISHED is a calm dimmed ring, no motion layers", () => {
-    expect(scopeTargets("finished", 0, 0, GREEN)).toMatchObject({ ring: 0.45, rscale: 0.96, comet: 0, inward: 0, breath: 0, fuzz: 0, ember: 0 });
+    expect(scopeTargets("finished", 0, 0, GREEN)).toMatchObject({ ring: 0.55, rscale: 0.96, comet: 0, inward: 0, breath: 0, fuzz: 0, ember: 0 });
   });
 
   it("STALL collapses in three phases: squash to a line, shrink to a dot, then an ember", () => {
@@ -208,5 +208,21 @@ describe("stateTone: the color each scope state draws in", () => {
     expect(stateTone("finished")).toBe("none");
     expect(stateTone("idle")).toBe("none");
     expect(stateTone("nosignal")).toBe("nosignal");
+  });
+});
+
+describe("the finished scope echoes its average (#2890 operator review)", () => {
+  it("draws the wave the average rate would draw, at a slow tempo", () => {
+    const t = scopeTargets("finished", 0, 192, GREEN);
+    expect(t.wave).toBe(192);
+    expect(t.tempo).toBeLessThan(0.5);
+  });
+  it("keeps every live state at full tempo", () => {
+    for (const s of ["generating", "prompt", "tools", "rest", "stalled", "nosignal"] as const) {
+      expect(scopeTargets(s, 0, 180, GREEN).tempo).toBe(1);
+    }
+  });
+  it("leaves an idle scope (no average) flat", () => {
+    expect(scopeTargets("idle", 0, 0, GREEN).wave).toBe(0);
   });
 });

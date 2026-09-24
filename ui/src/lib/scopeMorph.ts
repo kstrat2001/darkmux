@@ -35,6 +35,7 @@ export type ScopeState = LiveState | "nosignal" | "finished" | "idle";
  *  - `sx`/`sy`: horizontal and vertical scale (the CRT collapse and power-on)
  *  - `ember`: the STALL dot
  *  - `rscale`: ring radius scale
+ *  - `tempo`: how fast the wave turns (1 live; slow for a finished run's echo)
  *  - `r`/`g`/`b`: color */
 export interface ScopeParams {
   ring: number;
@@ -47,6 +48,7 @@ export interface ScopeParams {
   sy: number;
   ember: number;
   rscale: number;
+  tempo: number;
   r: number;
   g: number;
   b: number;
@@ -66,19 +68,21 @@ export const SCOPE_SPEED = {
   sy: 16,
   ember: 5,
   rscale: 5,
+  tempo: 4,
   rgb: 5,
 } as const;
 
 /** The morphing keys, in a fixed array so the per-frame loop does not call
  *  `Object.keys` (which allocates). Color is handled separately. */
-const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale"] as const;
+const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale", "tempo"] as const;
 
 function blankParams(): ScopeParams {
-  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, r: 0, g: 0, b: 0 };
+  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, r: 0, g: 0, b: 0 };
 }
 
 /** The targets for `state`, `sinceSec` seconds after entering it, written
- *  into `out` (a fresh object when omitted). `rate` only matters for GEN;
+ *  into `out` (a fresh object when omitted). `rate` only matters for GEN
+ *  and FINISHED (its average);
  *  `sinceSec` only for STALL, whose collapse runs in three phases: squash to
  *  a line, shrink the line to a dot, then leave an ember. */
 export function scopeTargets(state: ScopeState, sinceSec: number, rate: number, rgb: Rgb, out: ScopeParams = blankParams()): ScopeParams {
@@ -92,6 +96,7 @@ export function scopeTargets(state: ScopeState, sinceSec: number, rate: number, 
   out.sy = 1;
   out.ember = 0;
   out.rscale = 1;
+  out.tempo = 1;
   out.r = rgb[0];
   out.g = rgb[1];
   out.b = rgb[2];
@@ -117,7 +122,17 @@ export function scopeTargets(state: ScopeState, sinceSec: number, rate: number, 
       out.fuzz = 1;
       break;
     case "finished":
+      // (#2890 operator review) The ended run's echo: the wave its AVERAGE
+      // rate draws, so the shape matches the number in the center, turning
+      // slowly and dimmer than live GEN. A flat ring under "192 avg tok/s"
+      // read as a run that never generated.
+      out.ring = 0.55;
+      out.rscale = 0.96;
+      out.wave = Math.max(0, rate);
+      out.tempo = 0.12;
+      break;
     case "idle":
+      // No live execution and no average (a mission between model steps).
       out.ring = 0.45;
       out.rscale = 0.96;
       break;

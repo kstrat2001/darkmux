@@ -1333,9 +1333,9 @@ describe("modelScopeHero (#2890)", () => {
     });
   });
 
-  it("any other live state: no number, no unit, no rate driving the wave", () => {
-    const h = modelScopeHero({ liveTokScope: { ...live, state: "rest", restSecondsLeft: 9 }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "rest", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "rest", restSecondsLeft: 9 } });
+  it("a live state with nothing to count (PROMPT): no number, no unit, no rate driving the wave", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt" }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "prompt", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "prompt" } });
   });
 
   it("no signal is its own state with the words under the lamps", () => {
@@ -1346,6 +1346,16 @@ describe("modelScopeHero (#2890)", () => {
   it("finished: the average, 'avg tok/s', and the partial-average qualifier as the note", () => {
     const h = modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "64", sub: "avg · 3 of 4 turns" } });
     expect(h).toMatchObject({ state: "finished", centerLabel: "64", centerUnit: "avg tok/s", note: "avg · 3 of 4 turns", lamps: { state: null } });
+  });
+
+  it("rest: the countdown goes in the center (amber, by state), not on the lamp", () => {
+    const live = { tokensPerSec: 0, state: "rest", restSecondsLeft: 12, stalled: false, carried: false, noSignal: false } as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "rest", centerLabel: "12", centerUnit: "s rest" });
+  });
+
+  it("finished: the scope is driven by the average, so its wave matches the number", () => {
+    expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "192", sub: null } })?.tokensPerSec).toBe(192);
+    expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "—", sub: null } })?.tokensPerSec).toBe(0);
   });
 
   it("no model work: no hero", () => {

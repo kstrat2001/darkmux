@@ -117,7 +117,7 @@ function ScopeLamps({
                 stays in the DOM for the status role. */}
             <span className="scope-lamp__label">
               {label}
-              {on && state === "rest" && reading.restSecondsLeft != null ? ` ${reading.restSecondsLeft}s` : ""}
+
             </span>
           </span>
         );
@@ -150,8 +150,14 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       toolName: state === "tools" ? live.toolName : undefined,
       // Only the reading goes inside the tube while generating; a state is
       // said by the trace, the lamps and (TOOLS) the icon.
-      centerLabel: generating ? (live.tokensPerSec != null ? String(Math.round(live.tokensPerSec)) : "—") : null,
-      centerUnit: generating ? "tok/s" : null,
+      // (#2890 operator review) REST puts its countdown in the center, amber
+      // by state, instead of on the lit lamp.
+      centerLabel: generating
+        ? (live.tokensPerSec != null ? String(Math.round(live.tokensPerSec)) : "—")
+        : state === "rest" && live.restSecondsLeft != null
+          ? String(live.restSecondsLeft)
+          : null,
+      centerUnit: generating ? "tok/s" : state === "rest" && live.restSecondsLeft != null ? "s rest" : null,
       centerCarried: generating && live.carried,
       lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft },
       note: state === "nosignal" ? "no signal" : null,
@@ -161,7 +167,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   if (fin) {
     return {
       state: "finished",
-      tokensPerSec: 0,
+      // (#2890 operator review) The average drives the echo's wave, so the
+      // shape matches the number; "—" (no fully billed turn) stays flat.
+      tokensPerSec: Number.isFinite(Number(fin.average)) ? Number(fin.average) : 0,
       centerLabel: fin.average,
       centerUnit: "avg tok/s",
       centerCarried: false,
