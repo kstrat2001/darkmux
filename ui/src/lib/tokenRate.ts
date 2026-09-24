@@ -182,8 +182,15 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
  * flat ring" state. Set above the heartbeat cadence itself
  * (`HEARTBEAT_MIN_INTERVAL`, 2s, `crates/darkmux-crew/src/
  * dispatch_internal.rs`) with margin, so landing exactly on the rate-limit
- * boundary never misreads as a stall. */
-export const STALL_AFTER_MS = 5000;
+ * boundary never misreads as a stall.
+ *
+ * 30s, not the 5s it started at: a model writing a tool call can go 20+ s
+ * with no stream chunks at all, because LM Studio buffers the arguments
+ * rather than streaming them (measured: a turn that billed 2,105 tokens had
+ * a 23s gap between heartbeats). At 5s that lit STALL during ordinary file
+ * writing. A turn end, tool or rest is shown at once by its own record, so
+ * this threshold only governs genuine silence. */
+export const STALL_AFTER_MS = 30_000;
 
 /** Whether an execution's heartbeat stream has gone quiet — no sample
  * within `STALL_AFTER_MS` of `nowMs`. `false` (not stalled) when there are

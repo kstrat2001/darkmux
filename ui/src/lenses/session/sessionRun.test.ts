@@ -197,8 +197,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
       { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
     ];
-    // 30s after the last heartbeat, well past STALL_AFTER_MS.
-    const view = runRegions(flowToRenderModel(data), "s1", beat2Ms + 30_000);
+    // 60s after the last heartbeat, well past STALL_AFTER_MS (30s).
+    const view = runRegions(flowToRenderModel(data), "s1", beat2Ms + 60_000);
     expect(view.liveTokScope).not.toBeNull();
     expect(view.liveTokScope!.stalled).toBe(true);
   });
