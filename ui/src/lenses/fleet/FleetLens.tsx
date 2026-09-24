@@ -810,7 +810,7 @@ export function FleetLens({
                   word the run page's tile shows (`liveStateLabel`, one
                   derivation, no mode branch). */}
               {card.liveTokRate !== null && (
-                <div className="mach-scope__rate">
+                <div className="mach-scope__rate" data-tone={card.liveTokState ?? "none"}>
                   {card.liveTokState === "generating"
                     ? `${fmtN(Math.round(card.liveTokRate))} tok/s`
                     : liveStateLabel({ state: card.liveTokState ?? "stalled", restSecondsLeft: card.liveTokRestSecondsLeft })}
@@ -873,6 +873,7 @@ export function FleetLens({
                     tokensPerSec={card.liveTokState === "generating" ? card.liveTokRate : 0}
                     stalled={card.liveTokStalled}
                     resting={card.liveTokState === "rest"}
+                    tone={card.liveTokState ?? "none"}
                     size="card"
                   />
                 </div>

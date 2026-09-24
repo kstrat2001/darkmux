@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
+import { lighten, PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from "../lib/scopeTone";
 
 /**
  * (#2877) Live token-rate scope — a CRT oscilloscope, ported from the
@@ -58,6 +59,9 @@ export interface TokenScopeProps {
    *  page passes the tok/s readout here; the fleet card leaves it unset. */
   centerLabel?: string | null;
   className?: string;
+  /** The live state, which colors the trace to match its lit lamp
+   *  (`lib/scopeTone.ts`). `"none"`: no live execution, phosphor green. */
+  tone?: ScopeTone;
 }
 
 interface ScopeAnim {
@@ -104,7 +108,9 @@ function prefersReducedMotion(): boolean {
  *    at.
  * Busy still reads busier: phase velocity (rotation speed) and the sweep
  * dot's speed and brightness both still scale with the rate directly. */
-function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: ScopeAnim, stalled: boolean, resting: boolean) {
+function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: ScopeAnim, stalled: boolean, resting: boolean, rgb: Rgb) {
+  const [cr, cg, cb] = rgb;
+  const [hr, hg, hb] = lighten(rgb, 0.55);
   const cx = w / 2;
   const cy = h / 2;
   const R = Math.min(w, h) * 0.34;
@@ -158,9 +164,9 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: Sc
       else ctx.lineTo(x, y);
     }
     ctx.closePath();
-    ctx.strokeStyle = `rgba(125,255,160,${p.a * anim.bright})`;
+    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${p.a * anim.bright})`;
     ctx.lineWidth = p.w;
-    ctx.shadowColor = "rgba(125,255,160,0.8)";
+    ctx.shadowColor = `rgba(${cr},${cg},${cb},0.8)`;
     ctx.shadowBlur = p.w * 3 * anim.bright;
     ctx.stroke();
   }
@@ -176,23 +182,25 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: Sc
     const sy = cy + Math.sin(sweepAngle) * sweepR;
     ctx.beginPath();
     ctx.arc(sx, sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(205,255,215,${(0.5 + 0.45 * active) * anim.bright})`;
-    ctx.shadowColor = "rgba(180,255,200,0.9)";
+    ctx.fillStyle = `rgba(${hr},${hg},${hb},${(0.5 + 0.45 * active) * anim.bright})`;
+    ctx.shadowColor = `rgba(${cr},${cg},${cb},0.9)`;
     ctx.shadowBlur = 10 * anim.bright;
     ctx.fill();
   }
   ctx.shadowBlur = 0;
 }
 
-export function TokenScope({ tokensPerSec, stalled = false, resting = false, size, centerLabel, className }: TokenScopeProps) {
+export function TokenScope({ tokensPerSec, stalled = false, resting = false, size, centerLabel, className, tone = "generating" }: TokenScopeProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animRef = useRef<ScopeAnim>({ shown: 0, target: 0, phase: Math.random() * 6, bright: 1, breath: Math.random() * 6 });
-  const targetRef = useRef({ target: 0, stalled: false, resting: false });
+  const targetRef = useRef({ target: 0, stalled: false, resting: false, rgb: PHOSPHOR_FALLBACK as Rgb });
 
   // Live values the rAF loop reads without needing to restart the effect
   // below on every rate update (a heartbeat every ~2s would otherwise tear
   // down and rebuild the canvas/observer/listener on that same cadence).
-  targetRef.current = { target: stalled ? 0 : Math.max(0, tokensPerSec ?? 0), stalled, resting };
+  // The trace takes the lit lamp's color, read from the same :root token.
+  const rgb = useMemo(() => toneRgb(tone), [tone]);
+  targetRef.current = { target: stalled ? 0 : Math.max(0, tokensPerSec ?? 0), stalled, resting, rgb };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -232,7 +240,7 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
       // existing dim wasn't legible; lower still reads the sweep/wave (never
       // fully dark) while being unmistakably dimmer than an active tube.
       anim.bright += ((isResting ? 0.22 : 1) - anim.bright) * k;
-      if (w && h) drawFrame(ctx!, w, h, anim, targetRef.current.stalled, isResting);
+      if (w && h) drawFrame(ctx!, w, h, anim, targetRef.current.stalled, isResting, targetRef.current.rgb);
       rafId = requestAnimationFrame(frame);
     }
 
@@ -254,7 +262,7 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
       animRef.current.bright = targetRef.current.resting ? 0.22 : 1;
       const w = canvas.clientWidth;
       const h = canvas.clientHeight;
-      if (w && h) drawFrame(ctx, w, h, animRef.current, targetRef.current.stalled, targetRef.current.resting);
+      if (w && h) drawFrame(ctx, w, h, animRef.current, targetRef.current.stalled, targetRef.current.resting, targetRef.current.rgb);
     } else {
       const onVisibility = () => {
         if (document.hidden) stop();
@@ -280,7 +288,7 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
 
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
-    <div className={cls}>
+    <div className={cls} data-tone={tone}>
       <div className="token-scope-screen">
         <canvas ref={canvasRef} aria-hidden="true" />
         {centerLabel != null && (

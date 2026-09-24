@@ -646,6 +646,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
                     tokensPerSec={view.liveTokScope.state === "generating" ? view.liveTokScope.tokensPerSec : 0}
                     stalled={view.liveTokScope.stalled}
                     resting={view.liveTokScope.state === "rest"}
+                    tone={view.liveTokScope.state ?? "none"}
                     size="tile"
                     // Only the reading goes inside the tube. A state is a
                     // caption about the reading and sits under it: set at

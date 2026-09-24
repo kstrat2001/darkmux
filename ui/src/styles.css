@@ -8159,6 +8159,12 @@ body {
   background: var(--lit);
   box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
 }
+/* The fleet card's rate line takes its state's color, same tokens as the
+   lamps and the trace. */
+.mach-scope__rate[data-tone="prompt"] { color: var(--lamp-prompt); }
+.mach-scope__rate[data-tone="tools"] { color: var(--lamp-tools); }
+.mach-scope__rate[data-tone="rest"] { color: var(--lamp-rest); }
+.mach-scope__rate[data-tone="stalled"] { color: var(--lamp-stall); }
 .scope-lamp[data-state="generating"] { --lit: var(--scope-phosphor); }
 .scope-lamp[data-state="prompt"] { --lit: var(--lamp-prompt); }
 .scope-lamp[data-state="tools"] { --lit: var(--lamp-tools); }

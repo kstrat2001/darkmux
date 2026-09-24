@@ -146,6 +146,8 @@ describe("TOK/S tile: a state is a lit lamp under the tube, never text inside it
     expect(tile.querySelector(".token-scope-n")).toBeNull();
     // A lamp per state, exactly one lit: the operator's "is this resting?
     // can't tell" answered by seeing every state at once.
+    // The trace takes the lit lamp's color: the tube carries the state as its tone.
+    expect(tile.querySelector(".token-scope-bezel")?.getAttribute("data-tone")).toBe("prompt");
     const lamps = [...tile.querySelectorAll(".scope-lamp")].map((l) => [l.getAttribute("data-state"), l.getAttribute("data-on")]);
     expect(lamps).toEqual([
       ["generating", "false"],
