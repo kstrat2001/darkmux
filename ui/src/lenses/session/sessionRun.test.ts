@@ -1635,7 +1635,9 @@ describe("runRegions — MODEL section content (#2890)", () => {
 
   it("a live run's active time counts up, still in MODEL", () => {
     const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:08Z")), "s1", Date.parse("2026-01-01T00:00:08Z"));
-    expect(live.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("0:08 so far");
+    const active = live.metrics.find((m) => m.label === "ACTIVE TIME");
+    expect(active?.value).toBe("0:08");
+    expect(active?.sub).toContain("so far");
   });
 
   it("a unit with no model work keeps WALL CLOCK in SYSTEM", () => {

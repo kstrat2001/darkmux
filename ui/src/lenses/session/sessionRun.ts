@@ -678,7 +678,8 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
 
   // (U3-7/U5-2) `fmtElapsed`, not the retired `fmtDuration`: a dispatch
   // that runs past an hour used to read "75:23" here.
-  const wallBase = done ? fmtElapsed(runWallMs) : `${fmtElapsed(nowMs - startTs)} so far`;
+  const wallElapsed = done ? fmtElapsed(runWallMs) : fmtElapsed(nowMs - startTs);
+  const wallBase = done ? wallElapsed : `${wallElapsed} so far`;
   const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
   // (#2860) How the run ended goes on the tile's `sub` line, not appended to
   // the figure: the value is `nowrap` because it is contracted to be one
@@ -1073,8 +1074,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     // governor was armed for this dispatch or a rest actually occurred).
     const thermal = restByKind.get("thermal");
     const thermalShown = restConfiguredByKind.thermal === true || thermal != null;
-    const activeSub = [wallSub, thermalShown ? `${fmtElapsed(thermal?.totalMs ?? 0)} thermal rest` : undefined].filter(Boolean).join(" · ") || undefined;
-    push(modelIdx, wallBase, "ACTIVE TIME", undefined, WALL_HINT_TITLE, activeSub);
+    // (#2890) The grid cell is narrow: the value is the bare time, and a
+    // live run's "so far" moves to the sub line instead of clipping the value.
+    const activeSub = [done ? undefined : "so far", wallSub, thermalShown ? `${fmtElapsed(thermal?.totalMs ?? 0)} thermal rest` : undefined].filter(Boolean).join(" · ") || undefined;
+    push(modelIdx, wallElapsed, "ACTIVE TIME", undefined, WALL_HINT_TITLE, activeSub);
   }
   push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
   push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");

@@ -5721,7 +5721,9 @@ body {
   border-radius: 0;
   background: var(--panel-2);
   padding: 22px 24px;
-  justify-content: center;
+  /* (#2890) Top-aligned, not centered: a cell with a sub line would sit
+     higher than one without, so labels in a row stopped lining up. */
+  justify-content: flex-start;
   min-width: 0;
 }
 .session-run .modelbox__figs .ml {

@@ -43,6 +43,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+
+// (#2890) A live run's "so far" sits on the ACTIVE TIME cell's sub line, not
+// in its value (the value is the bare time so it fits the grid cell).
+const activeSub = () => {
+  const cell = [...document.querySelectorAll('.metrics[data-scope="model"] .met')].find(
+    (c) => c.querySelector(".ml")?.textContent === "ACTIVE TIME",
+  );
+  return cell?.querySelector(".msub")?.textContent ?? "";
+};
+
 describe("SessionReplay", () => {
   // ── (#1973 / #1978) rendered-DOM assertions ────────────────────────
   //
@@ -586,7 +596,7 @@ describe("SessionReplay", () => {
     const readWall = () =>
       [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
-    expect(before).toContain("so far");
+    expect(activeSub()).toContain("so far");
 
     // No new records — only time passing. This is the whole point.
     act(() => {
@@ -648,7 +658,7 @@ describe("SessionReplay", () => {
 
     // ── Position A: playhead BEFORE the run's own terminal record ──
     const parked = readWall();
-    expect(parked).toContain("so far");
+    expect(activeSub()).toContain("so far");
     expect(parked).toContain("0:30"); // the scrubbed instant's own elapsed
     expect(parked).not.toContain("2:00"); // NOT real Date.now() - start
 
@@ -667,7 +677,7 @@ describe("SessionReplay", () => {
     );
     await vi.waitFor(() => expect(readWall()).toContain("1:00"));
     const ended = readWall();
-    expect(ended).not.toContain("so far"); // a FIXED total, not still counting
+    expect(activeSub()).not.toContain("so far"); // a FIXED total, not still counting
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
