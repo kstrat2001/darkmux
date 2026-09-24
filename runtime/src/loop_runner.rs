@@ -2948,6 +2948,7 @@ fn run_with_sleeper(
                 Watch {
                     interval: per_call_cap,
                     carried: turn.carried(),
+                    tick: STREAM_TICK,
                 },
             )?;
             (outcome.response, outcome.cut)
@@ -5125,7 +5126,22 @@ struct Watch<'a> {
     /// The turn's accumulation from earlier continuations, so the in-stream
     /// verdict judges the same scope the post-hoc one does.
     carried: &'a str,
+    /// (#2889) How long the stream may go without a chunk before the loop
+    /// wakes to say the model is still writing a tool call. Production is
+    /// [`STREAM_TICK`]; a test passes milliseconds.
+    tick: std::time::Duration,
 }
+
+/// (#2889) Cadence of the "still writing a tool call" event while the
+/// endpoint is silent. LM Studio names a tool call immediately, then
+/// generates its arguments without sending a byte and delivers them in one
+/// chunk; without a tick nothing is written during that silence and the
+/// viewer reads it as a stall. One second, under the host's two-second
+/// heartbeat coalescing (`HEARTBEAT_MIN_INTERVAL` in
+/// `crates/darkmux-crew/src/dispatch_internal.rs`), so every host window
+/// has an event to forward and the cadence the viewer sees is the host's,
+/// unchanged.
+pub(crate) const STREAM_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
 /// `model.partial` trajectory event per chunk (stats only — no content
@@ -5170,7 +5186,9 @@ fn run_streaming_turn(
         crate::detection::degeneracy_policy().acts(),
     );
     let mut cut = CutSource::None;
-    let stream = client.chat_streaming(request)?;
+    // (#2889) Ticking, so the loop wakes during a silence and can say the
+    // model is still writing a tool call — see `TickingStream`'s doc.
+    let stream = crate::lmstudio::TickingStream::spawn(client.chat_streaming(request)?, watch.tick);
     for chunk_result in stream {
         // (#2836 stage 2) A SILENT stream ends the turn; it does not kill the
         // dispatch.
@@ -5185,7 +5203,28 @@ fn run_streaming_turn(
         // Genuine transport failures still propagate. The distinction is a
         // typed marker, not a string match.
         let chunk = match chunk_result {
-            Ok(c) => c,
+            Ok(crate::lmstudio::StreamEvent::Chunk(c)) => c,
+            // (#2889) No chunk this tick. Once a tool call is named, the
+            // silence IS the model writing its arguments: say so, with the
+            // counts unchanged. Before a name arrives a silence is prompt
+            // processing or a pause, and this names nothing.
+            //
+            // Deliberately NOT proof of work: `last_proof_of_work` and the
+            // soft warning are left alone, and the host does not reset its
+            // watchdog on this event. A tick proves only that the runtime is
+            // waiting, which a wedged endpoint would also produce.
+            Ok(crate::lmstudio::StreamEvent::Idle) => {
+                if let Some(name) = accumulator.writing_tool_name() {
+                    trajectory.append_tool_call_writing(
+                        seq,
+                        accumulator.partial_count(),
+                        accumulator.content_bytes(),
+                        accumulator.generated_bytes(),
+                        name,
+                    );
+                }
+                continue;
+            }
             Err(e) if e.downcast_ref::<crate::lmstudio::StreamWentSilent>().is_some() => {
                 eprintln!(
                     "darkmux-runtime: ⏹ the endpoint went silent — ending this call \
@@ -5213,6 +5252,7 @@ fn run_streaming_turn(
             cumulative,
             accumulator.has_tool_calls(),
             generated_chars,
+            accumulator.writing_tool_name(),
         );
         *last_proof_of_work = std::time::Instant::now();
         *inactivity_soft_warning_fired_in_window = false;
@@ -17042,3 +17082,7 @@ mod reasoning_feedback_probe {
 #[cfg(test)]
 #[path = "checkpoint_regression_tests.rs"]
 mod checkpoint_regression_tests;
+
+#[cfg(test)]
+#[path = "tool_writing_tests.rs"]
+mod tool_writing_tests;

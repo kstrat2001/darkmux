@@ -287,6 +287,61 @@ impl Drop for GuardedMockServer {
     }
 }
 
+/// (#2889) A raw SSE server that plays a SCRIPT: each entry waits its delay,
+/// then sends one `data:` payload. Built on a bare `TcpListener` rather than
+/// httpmock because the defect under test is a SILENCE inside one response
+/// (LM Studio names a tool call, then generates its arguments without sending
+/// anything), and httpmock can only delay a whole response.
+///
+/// Drains the request head and body before answering, for the same reason
+/// `lmstudio.rs`'s `sse_server_with_gaps` does: closing a socket with unread
+/// request bytes makes the kernel send RST, which the client reads as a
+/// transport failure rather than a clean end of stream.
+pub(crate) fn sse_server_scripted(script: Vec<(std::time::Duration, String)>) -> String {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            let _ = std::io::Read::read_exact(&mut head, &mut body);
+        }
+        let _ = sock.write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: text/event-stream\r\n\
+              Transfer-Encoding: chunked\r\n\r\n",
+        );
+        let _ = sock.flush();
+        for (delay, data) in script {
+            std::thread::sleep(delay);
+            let payload = format!("data: {data}\n\n");
+            if sock
+                .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .is_err()
+            {
+                return;
+            }
+            let _ = sock.flush();
+        }
+        let done = "data: [DONE]\n\n";
+        let _ = sock.write_all(format!("{:x}\r\n{done}\r\n0\r\n\r\n", done.len()).as_bytes());
+        let _ = sock.flush();
+    });
+    format!("http://{addr}/v1")
+}
+
 mod self_tests {
     use super::*;
 

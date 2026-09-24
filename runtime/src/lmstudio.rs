@@ -865,6 +865,19 @@ impl ChunkAccumulator {
         !self.tool_call_slots.is_empty()
     }
 
+    /// (#2889) The name of the tool call the model is writing right now: the
+    /// latest slot whose name has arrived. LM Studio sends the name at once
+    /// and the arguments only when they are complete, so a named slot is the
+    /// only evidence the model has moved from thinking to writing a call.
+    /// `None` until a name arrives.
+    pub fn writing_tool_name(&self) -> Option<&str> {
+        self.tool_call_slots
+            .iter()
+            .rev()
+            .map(|s| s.function.name.as_str())
+            .find(|n| !n.is_empty())
+    }
+
     /// Convert into the equivalent non-streaming `ChatResponse` so the
     /// rest of the agent loop treats the result identically. Synthesizes
     /// one `Choice` with index 0 (the only one we ever generate via
@@ -1107,6 +1120,75 @@ impl<R: BufRead> Iterator for ChunkStream<R> {
                     }
                     return Some(Err(anyhow!("SSE read failed: {e}")));
                 }
+            }
+        }
+    }
+}
+
+/// (#2889) One item from a [`TickingStream`]: a chunk, or the news that
+/// none arrived within one tick.
+pub enum StreamEvent {
+    Chunk(ChatChunk),
+    Idle,
+}
+
+/// (#2889) Wraps a chunk iterator so the caller wakes on a cadence even
+/// while the endpoint sends nothing.
+///
+/// LM Studio names a tool call immediately and then generates its arguments
+/// without sending a byte (measured: 7s of silence before 3,455 argument
+/// chars arrived in one chunk). A caller blocked on the next chunk cannot
+/// write anything during that silence, so the operator sees a stall where
+/// the model is working. The read happens on its own thread and hands chunks
+/// over a channel; the caller waits at most one `tick` for each and gets
+/// [`StreamEvent::Idle`] when none came.
+///
+/// Every transport bound is unchanged: the socket's read timeout still fires
+/// on the reader thread and arrives here as the same `StreamWentSilent`
+/// error, so an idle tick never extends how long a wedged endpoint is
+/// waited on.
+///
+/// Dropping this early (the gate cutting a stream) drops the receiver; the
+/// reader thread exits at its next send, which closes the connection one
+/// chunk later than dropping the stream directly used to. A cut only ever
+/// happens while chunks are flowing, so that is milliseconds.
+pub struct TickingStream {
+    rx: std::sync::mpsc::Receiver<Result<ChatChunk>>,
+    tick: Duration,
+    done: bool,
+}
+
+impl TickingStream {
+    pub fn spawn<I>(inner: I, tick: Duration) -> Self
+    where
+        I: Iterator<Item = Result<ChatChunk>> + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for item in inner {
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { rx, tick, done: false }
+    }
+}
+
+impl Iterator for TickingStream {
+    type Item = Result<StreamEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.rx.recv_timeout(self.tick) {
+            Ok(Ok(chunk)) => Some(Ok(StreamEvent::Chunk(chunk))),
+            Ok(Err(e)) => Some(Err(e)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Ok(StreamEvent::Idle)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.done = true;
+                None
             }
         }
     }
