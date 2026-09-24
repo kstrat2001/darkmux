@@ -65,7 +65,7 @@ test('pressing play on the static build actually advances the playhead', async (
   });
   // Playback defaults to real time (1s/s); pick 1h/s the way a user would.
   const speedBtn = page.locator('button[aria-label^="playback speed"]');
-  for (let i = 0; i < 4 && !(await speedBtn.getAttribute('aria-label')).endsWith('1h/s'); i++) await speedBtn.click();
+  for (let i = 0; i < 6 && !(await speedBtn.getAttribute('aria-label')).endsWith('1h/s'); i++) await speedBtn.click();
   await expect(speedBtn).toHaveAttribute('aria-label', 'playback speed, 1h/s');
   await playBtn.click();
 

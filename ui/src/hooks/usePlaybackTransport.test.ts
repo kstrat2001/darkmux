@@ -5,7 +5,7 @@ import { usePlaybackTransport, speedLabel, DEFAULT_SPEED } from "./usePlaybackTr
 /** Cycle to 1h/s. The default is real time, so a test that plays a
  *  recorded hour to its end picks the fast speed explicitly. */
 function toHourPerSecond(result: { current: { speed: number; cycleSpeed: () => void } }) {
-  for (let i = 0; i < 4 && result.current.speed !== 3600; i++) act(() => result.current.cycleSpeed());
+  for (let i = 0; i < 6 && result.current.speed !== 3600; i++) act(() => result.current.cycleSpeed());
   expect(result.current.speed).toBe(3600);
 }
 import type { FlowRecord } from "../types/handwritten";
@@ -87,15 +87,16 @@ describe("usePlaybackTransport", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(result.current.t - result.current.tMin).toBe(1000);
-    // The cycle steps UP from real time and wraps back to it.
-    act(() => result.current.cycleSpeed());
-    expect(result.current.speed).toBe(60);
-    act(() => result.current.cycleSpeed());
-    expect(result.current.speed).toBe(600);
-    act(() => result.current.cycleSpeed());
-    expect(result.current.speed).toBe(3600);
-    act(() => result.current.cycleSpeed());
-    expect(result.current.speed).toBe(1);
+    // The cycle steps UP from real time and wraps back to it. 5s/s and 30s/s
+    // sit between real time and 1m/s (operator: going straight from 1x to
+    // 60x "goes direct to hyper mode").
+    const seen: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      act(() => result.current.cycleSpeed());
+      seen.push(result.current.speed);
+    }
+    expect(seen).toEqual([5, 30, 60, 600, 3600, 1]);
+    expect([5, 30].map(speedLabel)).toEqual(["5s/s", "30s/s"]);
   });
 
   it("speed is a real multiplier: at 1h/s one real second replays one recorded hour, at 1m/s one minute", () => {
@@ -116,7 +117,9 @@ describe("usePlaybackTransport", () => {
     act(() => result.current.rewind());
     act(() => result.current.cycleSpeed()); // 1h/s -> wraps to 1s/s
     expect(result.current.speed).toBe(1);
-    act(() => result.current.cycleSpeed()); // 1s/s -> 1m/s
+    act(() => result.current.cycleSpeed()); // 1s/s -> 5s/s
+    act(() => result.current.cycleSpeed()); // 5s/s -> 30s/s
+    act(() => result.current.cycleSpeed()); // 30s/s -> 1m/s
     expect(result.current.speed).toBe(60);
     act(() => {
       vi.advanceTimersByTime(1000);
@@ -130,7 +133,7 @@ describe("usePlaybackTransport", () => {
       result.current.rewind();
       result.current.cycleSpeed();
     });
-    expect(result.current.speed).toBe(60);
+    expect(result.current.speed).toBe(5);
     const other = [{ ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start" }, { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete" }] as unknown as FlowRecord[];
     rerender({ d: other });
     expect(result.current.t).toBe(Date.parse("2026-08-09T02:00:00.000Z"));
@@ -229,7 +232,7 @@ describe("usePlaybackTransport", () => {
         result.current.rewind();
         result.current.cycleSpeed();
       });
-      expect(result.current.speed).toBe(60);
+      expect(result.current.speed).toBe(5);
       const otherDaySc = [
         { ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start", session_id: "sC" },
         { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete", session_id: "sC" },

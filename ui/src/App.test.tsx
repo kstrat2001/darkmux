@@ -92,7 +92,7 @@ const FLEET_OFF = (key: "machines" | "sessions") => ({
  *  to real time, so a test that plays a recorded day through picks the fast
  *  speed the way a user would. */
 function selectHourPerSecond() {
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 6; i++) {
     const btn = screen.getByRole("button", { name: /^playback speed/ });
     if (btn.getAttribute("aria-label")?.endsWith("1h/s")) return;
     fireEvent.click(btn);

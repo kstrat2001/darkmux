@@ -116,9 +116,10 @@ function focusRange(dayRecords: FlowRecord[], focus: PlaybackFocus): { tMin: num
  * multiplier is meaningless to a reader: `1h/s` is. The default is REAL
  * TIME (operator, 2026-09-24): a replay then plays every animation (the
  * token scope easing between 2s heartbeats, events arriving) at the pace a
- * live viewer saw it. The cycle steps UP from there (1s/s → 1m/s → 10m/s →
- * 1h/s) and wraps. */
-export const SPEEDS = [1, 60, 600, 3600] as const;
+ * live viewer saw it. The cycle steps UP from there (1s/s → 5s/s → 30s/s →
+ * 1m/s → 10m/s → 1h/s) and wraps; 5s/s and 30s/s sit between real time and
+ * 1m/s, which on its own "goes direct to hyper mode" (operator). */
+export const SPEEDS = [1, 5, 30, 60, 600, 3600] as const;
 export type Speed = (typeof SPEEDS)[number];
 export const DEFAULT_SPEED: Speed = 1;
 export const PLAY_TICK_MS = 100;
