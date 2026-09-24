@@ -335,6 +335,79 @@ describe("buildFleetCard", () => {
     expect(card.runsCount).toBe(2);
   });
 
+  // (#2877) Live token-rate scope input. `liveTokRate` is what
+  // `FleetLens.tsx` gates the mini scope's mount on — `null` means "render
+  // plain idle text, mount zero TokenScope instances".
+  describe("liveTokRate", () => {
+    it("is null while idle, even with completed heartbeat history", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 3000, generated_chars: 120 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
+      expect(card.stat).toBe("idle");
+      expect(card.liveTokRate).toBeNull();
+    });
+
+    it("is null for a running session with fewer than two heartbeats (not yet enough to derive a rate)", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1000, generated_chars: 40 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.stat).toBe("dispatch in flight");
+      expect(card.liveTokRate).toBeNull();
+    });
+
+    it("is a positive number once a running session has two heartbeats to derive Δchars/Δms from", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 3000, generated_chars: 120 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      // 80 chars / 2000ms = 40 chars/sec, DEFAULT_CHARS_PER_TOKEN (4) → 10 tok/s.
+      expect(card.liveTokRate).toBeCloseTo(10, 5);
+    });
+
+    it("sums across two concurrently running sessions on the same machine", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 3000, generated_chars: 120 } }),
+        rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 3000, generated_chars: 200 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", true, T_MAX);
+      // s1: 40 chars/sec / 4 = 10 tok/s. s2: 80 chars/sec / 4 = 20 tok/s.
+      expect(card.liveTokRate).toBeCloseTo(30, 5);
+    });
+
+    it("is always null in replay (liveMode=false), even with a running-shaped session", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 1000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: 3000, generated_chars: 120 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", false, T_MAX);
+      expect(card.liveTokRate).toBeNull();
+    });
+
+    it("still works from an OLDER runtime's heartbeat shape (no sampled_at_ms/generated_chars)", () => {
+      const data: FlowRecord[] = [
+        rec({ ts: "2026-08-08T00:00:00.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ ts: "2026-08-08T00:00:00.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
+        rec({ ts: "2026-08-08T00:00:02.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokRate).not.toBeNull();
+      expect(card.liveTokRate!).toBeGreaterThan(0);
+    });
+  });
+
   // (#1923) The gap flow presence genuinely cannot cover: a lab run's
   // NON-dispatch phases (COW sandbox clone, baseline hash, the verify
   // command, scoring — minutes of a long-agentic run), and the Redis-off

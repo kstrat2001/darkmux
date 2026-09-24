@@ -26,6 +26,7 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
+import { aggregateTokenRate } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -422,6 +423,14 @@ export interface FleetCard {
    * lens pinned to this machine otherwise — without re-deriving the
    * running session set from raw flow data a second time. */
   runningSessionIds: string[];
+  /** (#2877) This machine's total tok/s across whatever is running right
+   * now — `null` when there is nothing running (idle/absent, or a
+   * replay/liveMode=false card, where this is never computed at all: see
+   * `buildFleetCard`'s own note) OR when running sessions exist but none
+   * has produced two heartbeats yet to derive a rate from. The card must
+   * render plain "idle" text and never mount a scope when this is `null` —
+   * an idle machine has zero `TokenScope` instances, not one sitting at 0. */
+  liveTokRate: number | null;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -468,7 +477,8 @@ export function buildFleetCard(
   // Replay's `all` stays UNCOLLAPSED on purpose: it tallies the day's whole
   // specialist roster (`runsCount`'s own module doc), which is a different
   // question from "how many things are running right now."
-  const runningSessionIds = liveMode ? topLevelRunSessionIds(data, all.filter((sid) => liveSet.has(sid))) : [];
+  const liveSids = all.filter((sid) => liveSet.has(sid));
+  const runningSessionIds = liveMode ? topLevelRunSessionIds(data, liveSids) : [];
   // (#1923) The two sources OVERLAP — they are not disjoint, and summing
   // them double-counts. A lab run in its dispatch phase appears on BOTH:
   // once as its `/runs` lab row, once as the flow session its provider's
@@ -503,6 +513,19 @@ export function buildFleetCard(
   // above is unchanged for now; that collapse is a follow-up to this
   // card specifically, not a producer-side gap any more.
   const runsCount = liveMode ? Math.max(runningSessionIds.length, labRunning) : all.length;
+  // (#2877) Scoped by the RAW per-session live ids (`liveSids`), not the
+  // mission-collapsed `runningSessionIds` above: a mission's own top-level
+  // session never carries heartbeats (its inner role executions do — same
+  // fact `sessionRun.ts::rollUpMissionModelWork`'s doc names), and
+  // `topLevelRunSessionIds` picks EITHER representative depending on which
+  // happened to land in the live set. Reading every live session's own
+  // heartbeats sidesteps that ambiguity entirely: a session with no
+  // heartbeats (a mission's top-level session, or one between turns)
+  // contributes nothing, `aggregateTokenRate` sums what real generation IS
+  // producing right now. Never computed in replay (`liveMode` false) — a
+  // historical rate reads as a live instrument reading "something's
+  // generating right now", which a replayed day is not.
+  const liveTokRate = liveMode && active ? aggregateTokenRate(liveSids.map((sid) => data.filter((r) => r.session_id === sid))) : null;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -525,5 +548,6 @@ export function buildFleetCard(
     runsCount,
     runsLabel: liveMode ? "running" : `specialist${runsCount === 1 ? "" : "s"}`,
     runningSessionIds,
+    liveTokRate,
   };
 }

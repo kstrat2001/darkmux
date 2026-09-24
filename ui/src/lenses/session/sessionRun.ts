@@ -56,6 +56,7 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
+import { aggregateTokenRate, isStalled } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
 export type PillCls = "run" | "err" | "done" | "canceled";
@@ -170,6 +171,13 @@ export interface SessionRunView {
    * `model (lms)` mean, and are these numbers about the model or about
    * darkmux?" */
   metricScope: { model: number[]; system: number[] };
+  /** (#2877) The live token-rate scope's data for a run STILL IN PROGRESS.
+   * `null` whenever there is nothing to show it for: no model work at all
+   * (same gate as `metricScope.model`), OR the run already finished — a
+   * finished run's TOK/S tile is a plain `push()`'d metric instead (see
+   * the "TOK/S" push below), matching the issue's "when the run finishes,
+   * the scope goes and the tile shows the final measured tok/s". */
+  liveTokScope: { tokensPerSec: number | null; stalled: boolean } | null;
   /** (#2863) Whether the MODEL section shows its model card. False for an
    * endpoint-served run: the card could only repeat the model name the
    * brief's `model` row already shows. */
@@ -790,6 +798,30 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // session did model work.
   const effHasModelWork = hasModelWork || !!rollup?.hasEvidence;
 
+  // (#2877) Live token-rate scope. A mission's own top-level session never
+  // carries heartbeats — its INNER role executions do (same fact
+  // `rollUpMissionModelWork`'s doc above names) — so when this session has
+  // no telemetry of its own but rolled up a mission's, the heartbeats live
+  // on those same candidate sibling sessions `rollUpMissionModelWork`
+  // walked. Re-deriving that candidate set here (rather than threading it
+  // out of that function) keeps this additive and keeps the rollup
+  // function's contract — MissionModelRollup's four numbers — unchanged.
+  const tokRateSids: string[] =
+    ownHasTelemetryEvidence || !missionIdForRollup
+      ? [sid]
+      : (() => {
+          const set = new Set<string>();
+          for (const r of data) {
+            if (r.mission_id === missionIdForRollup && r.session_id) set.add(r.session_id);
+          }
+          return set.size ? [...set] : [sid];
+        })();
+  const tokRateRecordSets = tokRateSids.map((s) => data.filter((r) => r.session_id === s));
+  // ALL candidates must be stale — one active sibling among several
+  // (a mission with one seat still generating) must not read as stalled
+  // just because another candidate session has gone quiet.
+  const tokRateStalled = tokRateRecordSets.length > 0 && tokRateRecordSets.every((recs) => isStalled(recs, nowMs));
+
   // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
   // `const procs = ...` followed by `void procs` to silence the unused
   // warning, with a comment parking it for "a future packet". That is the
@@ -860,6 +892,20 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
   push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
   push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub);
+  // (#2877) The fifth MODEL tile, TOK/S. A FINISHED run gets a plain text
+  // tile like its four neighbors here — "the scope goes... the tile shows
+  // the final measured tok/s" (issue text). A run still in progress does
+  // NOT push here at all; `SessionReplay.tsx` renders `liveTokScope` (the
+  // live canvas + centered number) as the fifth tile instead, since a
+  // pushed string tile has no way to host a component. Final rate: total
+  // billed output tokens over the run's own wall clock — the same two
+  // numbers TOKENS OUT and WALL CLOCK already show, so this tile's number
+  // is reconcilable against its neighbors rather than a third, opaque
+  // measurement.
+  if (done) {
+    const finalTokPerSec = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
+    push(modelIdx, finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—", "TOK/S", undefined, undefined, "estimate");
+  }
   // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
   // the model's work, and the gate — while this tile is the dispatch's own
   // `wall_ms`, the runtime's measure of the execution alone. On a real
@@ -1292,6 +1338,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     disclosures,
     metrics,
     metricScope,
+    liveTokScope:
+      effHasModelWork && !done
+        ? { tokensPerSec: aggregateTokenRate(tokRateRecordSets), stalled: tokRateStalled }
+        : null,
     showModelCard,
     modelTrackLabel,
     modelTrackLines,

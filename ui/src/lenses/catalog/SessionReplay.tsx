@@ -21,6 +21,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
  *  asserting something the harness has already ruled out. */
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
+import { TokenScope } from "../../components/TokenScope";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
@@ -555,6 +556,26 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>
               ))}
+              {/* (#2877) The fifth MODEL tile, live only: a finished run's
+                  TOK/S is a plain pushed metric already inside the `.map`
+                  above (`sessionRun.ts`'s "TOK/S" push) — this renders ONLY
+                  while `view.liveTokScope` is non-null (model work, not yet
+                  done), and disappears the moment the run finishes, per the
+                  issue's "when the run finishes, the scope goes and the
+                  tile shows the final measured tok/s". */}
+              {view.liveTokScope && (
+                <div className="met scopetile" data-testid="run-token-scope">
+                  <div className="ml">TOK/S</div>
+                  <TokenScope
+                    tokensPerSec={view.liveTokScope.tokensPerSec}
+                    stalled={view.liveTokScope.stalled}
+                    size="tile"
+                    centerLabel={
+                      view.liveTokScope.tokensPerSec != null ? String(Math.round(view.liveTokScope.tokensPerSec)) : "—"
+                    }
+                  />
+                </div>
+              )}
             </div>
           )}
           {view.showModelCard && (

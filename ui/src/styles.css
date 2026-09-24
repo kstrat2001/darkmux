@@ -3471,6 +3471,19 @@ body {
   margin-top: 12px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
 }
+/* (#2877) Only present while the card computed a live tok/s reading — see
+   `FleetLens.tsx`'s render note next to `.mach-scope`. */
+.mach-scope {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mach-scope__rate {
+  font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
+  color: #7dffa0;
+  font-variant-numeric: tabular-nums;
+}
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
@@ -5508,6 +5521,17 @@ body {
   order: 1;
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
+}
+/* (#2877) The fifth MODEL tile, live only — see `SessionReplay.tsx`'s
+   render note next to `view.liveTokScope`. Centers the bezel under the
+   `TOK/S` label instead of the flex-start every other tile's short text
+   value uses. */
+.session-run .met.scopetile {
+  align-items: center;
+}
+.session-run .met.scopetile .token-scope-bezel {
+  order: 3;
+  margin-top: 4px;
 }
 /* (operator, 2026-09-05) The third slot — see `SessionRunView.metrics.sub`
    in `sessionRun.ts`. A qualifying fact (CTX's window ceiling, the peak
@@ -8018,3 +8042,82 @@ body {
   color: var(--dim);
   font-weight: 400;
 }
+/* (#2877) Live token-rate scope — a CRT oscilloscope, ported from the
+   operator-approved concept (token-scope-concept.html). Phosphor green
+   deliberately, not `--accent`: the concept's own reasoning is that it reads
+   as an instrument, not another meter. Colors are local constants, not
+   `:root` tokens — this is the one surface in the app that intentionally
+   does NOT follow the teal/dark palette, so tying it to shared tokens would
+   make future palette edits accidentally reshade an oscilloscope.
+
+   Sizing (component doc + issue #2877 constraint): an explicit square `--d`
+   diameter plus a fixed `--rim`, NEVER `aspect-ratio` + percentage padding —
+   Safari applies `aspect-ratio` to the content box when there is padding
+   (the bezel renders taller than wide), and percentage padding resolves
+   against the PARENT's width, so a small bezel in a wide tile squeezes its
+   own tube into an oval. Each placement below sets `--d`/`--rim`; nothing
+   here or in `TokenScope.tsx` ever reaches for `aspect-ratio`. */
+.token-scope-bezel {
+  --d: 100px;
+  --rim: 5px;
+  width: var(--d);
+  height: var(--d);
+  border-radius: 50%;
+  padding: var(--rim);
+  box-sizing: border-box;
+  flex: none;
+  background: radial-gradient(circle at 35% 30%, #1a221c, #111712 60%);
+  box-shadow:
+    inset 0 0 0 2px #1c261e,
+    0 10px 26px rgba(0, 0, 0, 0.5);
+}
+.token-scope-bezel--mini {
+  --d: 40px;
+  --rim: 4px;
+}
+.token-scope-bezel--tile {
+  --d: 68px;
+  --rim: 5px;
+}
+.token-scope-screen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle, #0b130d 0%, #050806 70%);
+  box-shadow: inset 0 0 30px rgba(0, 0, 0, 0.9);
+}
+.token-scope-screen canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+/* Scanlines. A pseudo-element rather than a canvas layer: static, so it
+   costs nothing per frame and never needs the ResizeObserver's redraw. */
+.token-scope-screen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);
+}
+.token-scope-center {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  pointer-events: none;
+  z-index: 1;
+}
+.token-scope-center .token-scope-n {
+  font: 400 16px/0.85 var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  color: #7dffa0;
+  text-shadow: 0 0 10px rgba(125, 255, 160, 0.6);
+}
+/* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
+   frame and never animates again (see `TokenScope.tsx`), so nothing here
+   needs a reduced-motion media query of its own. */

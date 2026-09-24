@@ -12,6 +12,7 @@ import type { FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
+import { TokenScope } from "../../components/TokenScope";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
@@ -775,6 +776,20 @@ export function FleetLens({
               <span className="dot" />
               {card.stat}
             </div>
+            {/* (#2877) Live token-rate scope. Rendered ONLY when the card
+                computed a reading (`liveTokRate !== null` — live mode,
+                active, and at least one running session has produced two
+                heartbeats) — an idle machine mounts zero `TokenScope`
+                instances, never one sitting at 0, which is what makes "idle
+                machines keep plain text and never animate" true by
+                construction rather than by a prop the component has to
+                honor internally. */}
+            {card.liveTokRate !== null && (
+              <div className="mach-scope" data-testid="fleet-token-scope">
+                <TokenScope tokensPerSec={card.liveTokRate} size="mini" />
+                <span className="mach-scope__rate">{fmtN(Math.round(card.liveTokRate))} tok/s</span>
+              </div>
+            )}
             {/* (#1903) The running count's own tap target — a SIBLING
                 affordance to the card body's `machineDrillHash` click
                 above, not a replacement for it. `runsHash` is `null`

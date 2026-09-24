@@ -169,6 +169,58 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:00");
   });
 
+  // (#2877) Live token-rate scope. `nowOverride` freezes the clock so
+  // `done`'s liveness math is a fixed parameter, not whatever `Date.now()`
+  // happens to be when the suite runs.
+  it("a run still in progress with two heartbeats gets a live scope reading, no TOK/S metric tile", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1", beat2Ms);
+    expect(view.liveTokScope).not.toBeNull();
+    // 80 chars / 2000ms = 40 chars/sec, DEFAULT_CHARS_PER_TOKEN (4) → 10 tok/s.
+    expect(view.liveTokScope!.tokensPerSec).toBeCloseTo(10, 5);
+    expect(view.liveTokScope!.stalled).toBe(false);
+    // The finished-run tile must NOT also be present while still running.
+    expect(view.metrics.find((m) => m.label === "TOK/S")).toBeUndefined();
+  });
+
+  it("a run with heartbeats but a long gap since the last one reads as stalled", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    // 30s after the last heartbeat, well past STALL_AFTER_MS.
+    const view = runRegions(flowToRenderModel(data), "s1", beat2Ms + 30_000);
+    expect(view.liveTokScope).not.toBeNull();
+    expect(view.liveTokScope!.stalled).toBe(true);
+  });
+
+  it("a FINISHED run gets a TOK/S metric tile (output tokens / wall clock) and no live scope", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:00:10Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "tokens",
+        payload: { prompt_tokens: 100, completion_tokens: 200 },
+      },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 200 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.liveTokScope).toBeNull();
+    // 200 completion tokens over a 10s wall clock = 20 tok/s.
+    expect(view.metrics.find((m) => m.label === "TOK/S")?.value).toBe("20");
+  });
+
   it("an errored (non-killed) dispatch names the exit code and reads red", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
