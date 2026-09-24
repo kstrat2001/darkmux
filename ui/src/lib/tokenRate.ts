@@ -34,7 +34,22 @@ export interface HeartbeatSample {
   /** The turn this sample belongs to, when the record says. `generated_chars`
    *  restarts every turn, so two samples from different turns never pair. */
   turn?: unknown;
+  /** (#2889) Present when the heartbeat says the model is writing a tool
+   *  call (`phase: "writing_tool_call"`): the tool's name, `""` when the
+   *  record names none. A writing sample never pairs into a rate — its
+   *  count is held while the endpoint is silent and then jumps when the
+   *  arguments land in one chunk, so any pair touching it reads 0 or a
+   *  spike, never generation speed. */
+  writingTool?: string;
+  /** (#2889) The request's size in chars, carried only by a turn's opening
+   *  heartbeat (flow schema 1.56.0). */
+  promptChars?: number;
 }
+
+/** (#2889) The `phase` value a heartbeat carries while the model writes a
+ *  tool call. Spelled once in the runtime (`WRITING_TOOL_CALL_PHASE`,
+ *  `runtime/src/trajectory.rs`) and matched literally here. */
+export const WRITING_TOOL_CALL_PHASE = "writing_tool_call";
 
 /** Every `dispatch.turn.heartbeat` in `records`, reduced to time-ordered
  * samples. Additive-field aware (#2877 flow-schema 1.55.0): prefers the new
@@ -53,7 +68,11 @@ export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
     if (chars === null) continue;
     const atMs = num(f.sampled_at_ms) ?? Date.parse(r.ts);
     if (!Number.isFinite(atMs)) continue;
-    out.push({ atMs, chars, turn: f.turn_seq });
+    const sample: HeartbeatSample = { atMs, chars, turn: f.turn_seq };
+    if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
+    const promptChars = num(f.prompt_chars);
+    if (promptChars !== null) sample.promptChars = promptChars;
+    out.push(sample);
   }
   out.sort((a, b) => a.atMs - b.atMs);
   return out;
@@ -276,6 +295,8 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
   // near-zero rate at full brightness where "not yet measured" (fall
   // through to the carry, or `null`) is the honest reading.
   if (!openerPairTrusted(prev, next)) return carriedTokenRate(records, samples);
+  // (#2889) A pair touching a writing sample is not generation speed.
+  if (prev.writingTool !== undefined || next.writingTool !== undefined) return carriedTokenRate(records, samples);
   const cps = charsPerSecond(prev, next);
   if (cps === null) return carriedTokenRate(records, samples);
   const charsPerToken = measuredCharsPerToken(records);
@@ -325,6 +346,8 @@ function carriedTokenRate(records: FlowRecord[], samples: HeartbeatSample[]): To
     const prev = samples[i - 1];
     if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) continue;
     if (!openerPairTrusted(prev, next)) continue;
+    // (#2889) Same rule as the direct path: writing samples never pair.
+    if (prev.writingTool !== undefined || next.writingTool !== undefined) continue;
     const cps = charsPerSecond(prev, next);
     if (cps === null) continue;
     const charsPerToken = measuredCharsPerToken(records);
@@ -383,6 +406,17 @@ export interface LiveStateReading {
    *  (the icon falls back to the gear). A previous turn's tool never carries
    *  over. */
   toolName?: string;
+  /** (#2889) Present (always `true`) only when `state === "tools"` because
+   *  the model is WRITING a tool call — the arguments are being generated
+   *  and nothing is streaming. Absent when darkmux is running the tool. */
+  writing?: true;
+  /** (#2889) Alongside `writing`: whole seconds since the first heartbeat of
+   *  this writing stretch, i.e. since the call's name arrived. */
+  writingSeconds?: number;
+  /** (#2889) Present only when `state === "prompt"` and the turn's opening
+   *  heartbeat said how large the request is, in chars. The caller converts
+   *  it to an estimated token count (`promptTokensLabel`). */
+  promptChars?: number;
 }
 
 /** A record whose action marks a state transition, reduced to its ordering
@@ -444,19 +478,29 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // (#2890) The latest completed tool of the current turn, reset at each turn
   // boundary so an earlier turn's tool never names this one.
   let turnToolName: string | null = null;
+  // (#2889) The tool the model most recently WROTE (a writing heartbeat's
+  // `tool_name`). At the turn's end it seeds `turnToolName`, so the tool
+  // darkmux is about to run keeps its icon instead of dropping to the gear
+  // until its completion names it.
+  let writtenTool: string | null = null;
   const ordered = [...cut].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   for (const r of ordered) {
     const atMs = Date.parse(r.ts);
     if (!Number.isFinite(atMs)) continue;
     let m: StateMarker | null = null;
-    if (r.action === "dispatch.start") {
+    if (r.action === "dispatch.turn.heartbeat") {
+      const f = fields(r);
+      if (f.phase === WRITING_TOOL_CALL_PHASE && typeof f.tool_name === "string" && f.tool_name) writtenTool = f.tool_name;
+    } else if (r.action === "dispatch.start") {
       pendingTools = null;
       turnToolName = null;
+      writtenTool = null;
       m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.turn") {
       const calls = num(fields(r).tool_calls_count);
       pendingTools = calls;
-      turnToolName = null;
+      turnToolName = writtenTool;
+      writtenTool = null;
       m = { atMs, kind: calls !== null && calls > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.tool") {
       if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
@@ -511,7 +555,25 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // prompt / thinking, not generating yet. Lighting GEN here would drive
   // the wave over a stretch that hasn't produced anything.
   if (lastBeatAt !== null && !isStalled(cut, nowMs)) {
-    return beats[beats.length - 1].chars === 0 ? { state: "prompt" } : { state: "generating" };
+    const last = beats[beats.length - 1];
+    // (#2889) The model is writing a tool call: TOOLS, never GEN (there is
+    // no rate while the arguments are generated off the wire), and never
+    // STALL or PROMPT — the runtime's ticks keep this fresh however long
+    // the silence runs. The stretch counts from the first writing sample of
+    // the current unbroken run of them in this turn.
+    if (last.writingTool !== undefined) {
+      let since = last.atMs;
+      for (let i = beats.length - 1; i >= 0; i--) {
+        const b = beats[i];
+        if (b.writingTool === undefined || b.turn !== last.turn) break;
+        since = b.atMs;
+      }
+      const reading: LiveStateReading = { state: "tools", writing: true, writingSeconds: Math.max(0, Math.floor((nowMs - since) / 1000)) };
+      if (last.writingTool) reading.toolName = last.writingTool;
+      return reading;
+    }
+    if (last.chars === 0) return last.promptChars !== undefined ? { state: "prompt", promptChars: last.promptChars } : { state: "prompt" };
+    return { state: "generating" };
   }
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
 }
@@ -591,7 +653,8 @@ export function liveStateLabel(reading: LiveStateReading): string {
       // disclosure just above the tile.
       return "reading prompt";
     case "tools":
-      return "tools";
+      // (#2889) Elapsed since the call's name arrived, while it is written.
+      return reading.writing ? `writing · ${reading.writingSeconds ?? 0} s` : "tools";
     case "stalled":
       return "stalled";
     case "generating":
@@ -765,6 +828,10 @@ export interface ExecutionTokenReading {
   /** (#2890) Present only when `state === "tools"` — see
    *  `LiveStateReading.toolName`. */
   toolName?: string;
+  /** (#2889) Present only while the model writes a tool call — see
+   *  `LiveStateReading.writing` / `writingSeconds`. */
+  writing?: true;
+  writingSeconds?: number;
 }
 
 export function executionTokenReading(
@@ -796,7 +863,37 @@ export function executionTokenReading(
     tokensPerSec: reading?.tokensPerSec ?? null,
     carried: reading?.carried ?? false,
     toolName: state === "tools" ? liveState?.toolName : undefined,
+    ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
   };
+}
+
+/** (#2889) The PROMPT center's size estimate for a reading aggregated over
+ *  several executions: the first live execution whose own reading is a
+ *  PROMPT with a size, converted with THAT execution's calibration (turn
+ *  numbers are per execution, so records of different executions never
+ *  share one ratio). `null` when no live execution is reading a sized
+ *  prompt. */
+export function promptEstimate(perExecutionRecords: FlowRecord[][], nowMs: number): string | null {
+  for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
+    const reading = deriveLiveState(recs, nowMs);
+    if (reading.state !== "prompt" || reading.promptChars === undefined) continue;
+    const cut = recs.filter((r) => !(Date.parse(r.ts) > nowMs));
+    const label = promptTokensLabel(reading.promptChars, measuredCharsPerToken(cut));
+    if (label !== null) return label;
+  }
+  return null;
+}
+
+/** (#2889) A request's size in chars as an estimated token count for the
+ *  PROMPT center ("~36k"), converted with the session's own chars-per-token
+ *  (`measuredCharsPerToken`, which already leaves out checkpointed turns).
+ *  `~` because both the size and the ratio are estimates. `null` for a
+ *  size that rounds to nothing, so the caller keeps its sizeless display. */
+export function promptTokensLabel(promptChars: number, charsPerToken: number): string | null {
+  if (!(promptChars > 0) || !(charsPerToken > 0)) return null;
+  const tokens = promptChars / charsPerToken;
+  if (tokens < 1) return null;
+  return tokens >= 1000 ? `~${Math.round(tokens / 1000)}k` : `~${Math.round(tokens)}`;
 }
 
 /** Accessor for `STATE_PRIORITY` — the pager's default-page pick

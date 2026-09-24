@@ -56,7 +56,7 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected, promptEstimate } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
@@ -221,6 +221,14 @@ export interface SessionRunView {
         /** (#2890) Present only when `state === "tools"`: the tool the scope's
          *  center draws as an icon. See `LiveStateReading.toolName`. */
         toolName?: string;
+        /** (#2889) Present only while the model WRITES a tool call — see
+         *  `LiveStateReading.writing` / `writingSeconds`. */
+        writing?: true;
+        writingSeconds?: number;
+        /** (#2889) Present only in PROMPT when the turn's opening heartbeat
+         *  said how big the request is: the estimate the scope's center shows
+         *  ("~36k"). `null`/absent keeps the brain. */
+        promptLabel?: string | null;
       }
     | null;
   /** (#2890) A FINISHED run's average generation rate, shown in the MODEL
@@ -1543,6 +1551,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
             noSignal: tokRateNoSignal,
             toolName: tokRateLiveState?.state === "tools" ? tokRateLiveState.toolName : undefined,
+            ...(tokRateLiveState?.state === "tools" && tokRateLiveState.writing
+              ? { writing: true as const, writingSeconds: tokRateLiveState.writingSeconds }
+              : {}),
+            promptLabel: tokRateLiveState?.state === "prompt" ? promptEstimate(tokRateRecordSets, nowMs) : null,
           }
         : null,
     finishedTokRate,

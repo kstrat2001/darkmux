@@ -69,6 +69,13 @@ export interface TokenScopeProps {
    *  completed call's `tool_name`), drawn as an icon in the center. Unknown
    *  or absent reads as the gear. */
   toolName?: string | null;
+  /** (#2889) While `state` is `"tools"`: the model is WRITING the call (its
+   *  arguments are being generated and nothing is streaming), not darkmux
+   *  running it. Same color and icon; the comet stretches and its head
+   *  scribbles, eased like every other morph parameter so the switch to
+   *  running never pops. `centerUnit`, when given, is captioned under the
+   *  icon ("writing · 23 s"). */
+  toolWriting?: boolean;
   /** No fresh heartbeat recently. Used only when `state` is omitted. */
   stalled?: boolean;
   /** A rest/pause (e.g. thermal). Used only when `state` is omitted. */
@@ -223,7 +230,10 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   // reads the same at a fraction of the cost (#2890).
   if (p.comet > 0.01) {
     const head = c.sweep;
-    const len = Math.PI * 0.55;
+    // (#2889) Writing: the tail stretches (the call being laid down) and the
+    // head scribbles in and out along the radius, like a pen. Both scale by
+    // the eased `scribe`, so the switch to running glides.
+    const len = Math.PI * 0.55 * (1 + 0.5 * p.scribe);
     const n = 36;
     ctx.beginPath();
     ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * 0.5, head);
@@ -241,8 +251,9 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       ctx.lineWidth = 1.4 + 2.2 * f;
       ctx.stroke();
     }
+    const hr = rBase * (1 + 0.05 * p.scribe * Math.sin(c.sweep * 7));
     ctx.beginPath();
-    ctx.arc(cx + Math.cos(head) * rBase * p.sx, cy + Math.sin(head) * rBase * p.sy, Math.max(1.6, R * 0.045), 0, Math.PI * 2);
+    ctx.arc(cx + Math.cos(head) * hr * p.sx, cy + Math.sin(head) * hr * p.sy, Math.max(1.6, R * 0.045), 0, Math.PI * 2);
     ctx.fillStyle = rgba(lift(cr, 0.6), lift(cg, 0.6), lift(cb, 0.6), 0.95 * p.comet);
     ctx.shadowBlur = 12 * p.comet;
     ctx.fill();
@@ -327,6 +338,7 @@ export function TokenScope({
   tokensPerSec,
   state: stateProp,
   toolName,
+  toolWriting = false,
   stalled = false,
   resting = false,
   size,
@@ -348,8 +360,9 @@ export function TokenScope({
   // Live values the rAF loop reads without restarting the effect below on
   // every update (a heartbeat every ~2s would otherwise tear down and
   // rebuild the canvas/observer/listener on that same cadence).
-  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb }>({ state, rate, rgb: PHOSPHOR_FALLBACK });
-  targetRef.current = { state, rate, rgb };
+  const writing = state === "tools" && toolWriting;
+  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing });
+  targetRef.current = { state, rate, rgb, writing };
   // Set by the effect: redraws one settled frame when motion is reduced.
   const staticRedrawRef = useRef<(() => void) | null>(null);
 
@@ -364,7 +377,7 @@ export function TokenScope({
       const w = canvas!.clientWidth;
       const h = canvas!.clientHeight;
       const t = targetRef.current;
-      const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb);
+      const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing);
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0);
     }
 
@@ -400,7 +413,7 @@ export function TokenScope({
       const dt = Math.min(0.1, Math.max(0, (now - last) / 1000)) || 0;
       last = now;
       const t = targetRef.current;
-      const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt);
+      const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt, t.writing);
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt);
       rafId = requestAnimationFrame(frame);
     }
@@ -433,12 +446,16 @@ export function TokenScope({
 
   useEffect(() => {
     staticRedrawRef.current?.();
-  }, [state, rate, rgb]);
+  }, [state, rate, rgb, writing]);
 
   const whole = parseWhole(centerLabel);
   const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))));
   const shownLabel = whole !== null ? eased : centerLabel;
   const showIcon = state === "tools";
+  // (#2889) The writing caption is HELD after writing ends so it can fade
+  // out by CSS rather than vanish; the center's key does not change between
+  // writing and running, so the icon never crossfades.
+  const toolCaption = useLatched(showIcon && writing ? (centerUnit ?? null) : null);
   // PROMPT shows a pulsing brain until the runtime reports the prompt size
   // mid-turn (#2889); then the count takes the center like any other number.
   const showBrain = state === "prompt" && centerLabel == null;
@@ -454,6 +471,11 @@ export function TokenScope({
     centerNode = (
       <div className="token-scope-center token-scope-center--icon" data-state={state}>
         <ToolIcon kind={kind} className="token-scope-ico" />
+        {toolCaption !== null ? (
+          <span className="token-scope-u token-scope-u--tools" data-on={writing ? "true" : "false"} aria-hidden={writing ? undefined : "true"}>
+            {toolCaption}
+          </span>
+        ) : null}
       </div>
     );
   } else if (showBrain) {
@@ -478,7 +500,7 @@ export function TokenScope({
 
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
-    <div className={cls} data-tone={stateTone(state)} data-state={state}>
+    <div className={cls} data-tone={stateTone(state)} data-state={state} data-writing={writing ? "true" : "false"}>
       <div className="token-scope-screen">
         <canvas ref={canvasRef} aria-hidden="true" />
         {ghost && (
@@ -494,6 +516,14 @@ export function TokenScope({
       </div>
     </div>
   );
+}
+
+/** (#2889) The last non-null `value`, held after it goes `null` so a caption
+ *  can fade out with its text still in place. Reset only by a new value. */
+function useLatched(value: string | null): string | null {
+  const held = useRef<string | null>(null);
+  if (value !== null) held.current = value;
+  return held.current;
 }
 
 /** Length of the center's crossfade, in ms; matches `token-scope-fade-*` in

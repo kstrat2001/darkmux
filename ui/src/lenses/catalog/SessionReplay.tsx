@@ -83,7 +83,7 @@ function ScopeLamps({
   noSignal = false,
   finished = false,
 }: {
-  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number };
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
@@ -103,7 +103,12 @@ function ScopeLamps({
           : "no model working"
       : reading.state === "generating"
         ? "generating"
-        : liveStateLabel({ state: reading.state, restSecondsLeft: reading.restSecondsLeft } as LiveStateReading);
+        : liveStateLabel({
+            state: reading.state,
+            restSecondsLeft: reading.restSecondsLeft,
+            writing: reading.writing,
+            writingSeconds: reading.writingSeconds,
+          } as LiveStateReading);
   return (
     <div className="scope-lamps" role="status" aria-label={`run state: ${aria}`}>
       {SCOPE_LAMPS.map(({ state, label }) => {
@@ -134,20 +139,29 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   state: ScopeState;
   tokensPerSec: number | null;
   toolName?: string;
+  /** (#2889) TOOLS while the model writes the call — see `TokenScope`'s
+   *  `toolWriting`. */
+  toolWriting?: boolean;
   centerLabel: string | null;
   centerUnit: string | null;
   centerCarried: boolean;
-  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number };
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number };
   note: string | null;
 } | null {
   const live = view.liveTokScope;
   if (live) {
     const state = scopeStateOf({ state: live.state, noSignal: live.noSignal });
     const generating = state === "generating";
+    // (#2889) The model writing a tool call: the tool's icon with the elapsed
+    // time under it. PROMPT with the opening heartbeat's size: the estimate
+    // over "reading", in the prompt color; without one, the brain.
+    const writing = state === "tools" && live.writing === true;
+    const promptLabel = state === "prompt" ? (live.promptLabel ?? null) : null;
     return {
       state,
       tokensPerSec: generating ? live.tokensPerSec : 0,
       toolName: state === "tools" ? live.toolName : undefined,
+      toolWriting: state === "tools" ? writing : undefined,
       // Only the reading goes inside the tube while generating; a state is
       // said by the trace, the lamps and (TOOLS) the icon.
       // (#2890 operator review) REST puts its countdown in the center, amber
@@ -156,10 +170,18 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         ? (live.tokensPerSec != null ? String(Math.round(live.tokensPerSec)) : "—")
         : state === "rest" && live.restSecondsLeft != null
           ? `${live.restSecondsLeft}s`
-          : null,
-      centerUnit: generating ? "tok/s" : state === "rest" && live.restSecondsLeft != null ? "resting" : null,
+          : promptLabel,
+      centerUnit: generating
+        ? "tok/s"
+        : state === "rest" && live.restSecondsLeft != null
+          ? "resting"
+          : writing
+            ? `writing · ${live.writingSeconds ?? 0} s`
+            : promptLabel !== null
+              ? "reading"
+              : null,
       centerCarried: generating && live.carried,
-      lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft },
+      lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft, writing: live.writing, writingSeconds: live.writingSeconds },
       note: state === "nosignal" ? "no signal" : null,
     };
   }
@@ -749,6 +771,7 @@ export function SessionReplay({
                       // not still drive the wave once the state has moved on.
                       tokensPerSec={scopeHero.tokensPerSec}
                       toolName={scopeHero.toolName}
+                      toolWriting={scopeHero.toolWriting}
                       size="tile"
                       centerLabel={scopeHero.centerLabel}
                       centerUnit={scopeHero.centerUnit}

@@ -226,3 +226,32 @@ describe("the finished scope echoes its average (#2890 operator review)", () => 
     expect(scopeTargets("idle", 0, 0, GREEN).wave).toBe(0);
   });
 });
+
+describe("(#2889) TOOLS while the model WRITES the call", () => {
+  it("is the same TOOLS look (color, comet, ring) plus a writing cue", () => {
+    const running = scopeTargets("tools", 0, 0, BLUE);
+    const writing = scopeTargets("tools", 0, 0, BLUE, undefined, true);
+    expect(writing).toMatchObject({ ring: running.ring, comet: running.comet, r: running.r, g: running.g, b: running.b, scribe: 1 });
+    expect(running.scribe).toBe(0);
+  });
+
+  it("the cue is TOOLS-only: no other state lights it, even if asked", () => {
+    for (const s of ["generating", "prompt", "rest", "stalled", "nosignal", "finished", "idle"] as const) {
+      expect(scopeTargets(s, 0, 0, GREEN, undefined, true).scribe).toBe(0);
+    }
+  });
+
+  it("writing to running glides the cue out rather than dropping it", () => {
+    const m = createMorph();
+    const dt = 1 / 60;
+    for (let t = 0; t < 1; t += dt) advanceMorph(m, "tools", 0, BLUE, dt, true);
+    expect(m.p!.scribe).toBeGreaterThan(0.95);
+    const p = advanceMorph(m, "tools", 0, BLUE, dt, false);
+    expect(p.scribe).toBeGreaterThan(0.5);
+    expect(p.scribe).toBeLessThan(1);
+  });
+
+  it("the reduced-motion frame settles on the cue too", () => {
+    expect(settleMorph(createMorph(), "tools", 0, BLUE, true).scribe).toBe(1);
+  });
+});

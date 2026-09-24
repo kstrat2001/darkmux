@@ -8489,6 +8489,31 @@ body {
   color: var(--lamp-tools);
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-tools) 80%, transparent));
 }
+/* (#2889) TOOLS while the model WRITES the call: "writing · 23 s" under the
+   icon, in the tools color. Positioned off the icon (not in the grid flow)
+   so the icon never moves when it appears or goes, and faded by opacity:
+   the text is held after writing ends so the fade has something to fade. */
+.token-scope-center--icon .token-scope-u--tools {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% + var(--ico) / 2 + 4px);
+  margin-top: 0;
+  color: var(--lamp-tools);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--lamp-tools) 60%, transparent);
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+.token-scope-center--icon .token-scope-u--tools[data-on="true"] {
+  opacity: 0.85;
+}
+/* (#2889) PROMPT's size estimate ("~36k" over "reading") takes the prompt
+   lamp's color, the way REST's countdown takes amber. */
+.token-scope-center[data-state="prompt"] .token-scope-n,
+.token-scope-center[data-state="prompt"] .token-scope-u {
+  color: var(--lamp-prompt);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-prompt) 60%, transparent);
+}
 /* (#2890) The center crossfades at a change of kind. Each layer fills the
    screen like `.token-scope-center`, so the two overlap during the fade.
    The rest color rides the LAYER's own data-state, so a fading-out
@@ -8515,6 +8540,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .token-scope-fade--in { animation: none; }
   .token-scope-fade--out { display: none; }
+  .token-scope-center--icon .token-scope-u--tools { transition: none; }
 }
 /* PROMPT: the brain takes the prompt lamp's color and breathes. */
 .token-scope-center--brain .token-scope-ico {
