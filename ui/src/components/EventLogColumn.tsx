@@ -1324,7 +1324,10 @@ export function EventLogColumn({
                   return (
                     <div key={key} className={`eventlog__rec eventlog__rec--rest${isSel ? " sel" : ""}${arriveCls}`} {...common}>
                       <span className="eventlog__ractivity">
-                        rested {Math.round(ms / 1000)} s
+                        {/* Present tense: the runtime records a rest as it
+                            starts (#2877), so this row appears at the start
+                            of the rest it describes. */}
+                        rest {Math.round(ms / 1000)} s
                         {typeof f.state === "string" ? ` · thermal: ${f.state}` : ""}
                       </span>
                     </div>
