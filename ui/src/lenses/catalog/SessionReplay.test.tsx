@@ -1350,7 +1350,7 @@ describe("modelScopeHero (#2890)", () => {
 
   it("rest: the countdown goes in the center (amber, by state), not on the lamp", () => {
     const live = { tokensPerSec: 0, state: "rest", restSecondsLeft: 12, stalled: false, carried: false, noSignal: false } as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
-    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "rest", centerLabel: "12", centerUnit: "s rest" });
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "rest", centerLabel: "12s", centerUnit: "resting" });
   });
 
   it("finished: the scope is driven by the average, so its wave matches the number", () => {

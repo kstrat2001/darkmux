@@ -155,9 +155,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       centerLabel: generating
         ? (live.tokensPerSec != null ? String(Math.round(live.tokensPerSec)) : "—")
         : state === "rest" && live.restSecondsLeft != null
-          ? String(live.restSecondsLeft)
+          ? `${live.restSecondsLeft}s`
           : null,
-      centerUnit: generating ? "tok/s" : state === "rest" && live.restSecondsLeft != null ? "s rest" : null,
+      centerUnit: generating ? "tok/s" : state === "rest" && live.restSecondsLeft != null ? "resting" : null,
       centerCarried: generating && live.carried,
       lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft },
       note: state === "nosignal" ? "no signal" : null,
