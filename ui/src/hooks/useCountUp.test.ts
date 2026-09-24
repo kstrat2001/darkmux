@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
 import { useCountUp } from "./useCountUp";
+import { SeekSignalContext } from "../lib/seekSignal";
 
 function stubReducedMotion(matches: boolean) {
   Object.defineProperty(window, "matchMedia", {
@@ -142,5 +144,59 @@ describe("useCountUp (#2878)", () => {
     expect(result.current).toBe("—");
     rerender({ v: 80 });
     expect(result.current).toBe("80"); // a first real reading after absence, not a tween from 50
+  });
+
+  // (Playback parity, Change B) The seek signal is the ONLY thing that
+  // suppresses a tween now — not a per-caller `durationMs` gate keyed on
+  // `liveMode`. An ADVANCE (the target changes, `seekGen` does not) still
+  // tweens; a SEEK (the target changes AND `seekGen` bumps in the same
+  // update) snaps instantly, in both modes.
+  describe("seek signal (Change B)", () => {
+    function withSeekGen(initialGen: number) {
+      let gen = initialGen;
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(SeekSignalContext.Provider, { value: gen }, children);
+      return { wrapper, bump: () => { gen += 1; } };
+    }
+
+    it("an ADVANCE (seekGen unchanged) still tweens — mid-flight value is neither the old nor the new target", () => {
+      stubReducedMotion(false);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+      const { wrapper } = withSeekGen(0);
+      const { result, rerender } = renderHook(({ v }) => useCountUp(v, fmt), { initialProps: { v: 0 }, wrapper });
+      rerender({ v: 100 });
+      act(() => { vi.advanceTimersByTime(350); }); // mid-tween (DEFAULT_DURATION_MS=700)
+      const mid = Number(result.current);
+      expect(mid).toBeGreaterThan(0);
+      expect(mid).toBeLessThan(100);
+      act(() => { vi.advanceTimersByTime(400); });
+      expect(result.current).toBe("100");
+    });
+
+    it("a SEEK (seekGen bumps on the same update the target changes) snaps instantly — no intermediate frame", () => {
+      stubReducedMotion(false);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+      const { wrapper, bump } = withSeekGen(0);
+      const { result, rerender } = renderHook(({ v }) => useCountUp(v, fmt), { initialProps: { v: 0 }, wrapper });
+      bump();
+      rerender({ v: 100 });
+      // No rAF/timer advance at all — a seek must land on the first render,
+      // exactly like the `durationMs: 0` caller opt-out above.
+      expect(result.current).toBe("100");
+    });
+
+    it("live mode's context default (seekGen never provided, always 0) never counts as a seek — advance keeps animating", () => {
+      // No wrapper at all: `useSeekGeneration()` reads the context's
+      // default value (0), which never changes across renders — this is
+      // what makes live mode's behavior exactly what it always was.
+      stubReducedMotion(false);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+      const { result, rerender } = renderHook(({ v }) => useCountUp(v, fmt), { initialProps: { v: 0 } });
+      rerender({ v: 100 });
+      act(() => { vi.advanceTimersByTime(350); });
+      const mid = Number(result.current);
+      expect(mid).toBeGreaterThan(0);
+      expect(mid).toBeLessThan(100);
+    });
   });
 });

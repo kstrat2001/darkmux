@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
 import { useArrivalKeys } from "./useArrivalKeys";
+import { SeekSignalContext } from "../lib/seekSignal";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -61,5 +63,48 @@ describe("useArrivalKeys (#2878)", () => {
     });
     rerender({ keys: ["x", "y", "z"], scope: "run-2" });
     expect(result.current.size).toBe(0);
+  });
+
+  // (Playback parity, Change B, finding #12) A forward SEEK (a scrub that
+  // jumps the playhead past several rows at once) must adopt the newly-
+  // visible keys silently — not mark every one of them as "arriving", the
+  // way a genuine ADVANCE (one row landing at a time) does.
+  describe("seek signal (Change B)", () => {
+    function withSeekGen(initialGen: number) {
+      let gen = initialGen;
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(SeekSignalContext.Provider, { value: gen }, children);
+      return { wrapper, bump: () => { gen += 1; } };
+    }
+
+    it("an ADVANCE (seekGen unchanged) still marks the new key as arriving", () => {
+      vi.useFakeTimers();
+      const { wrapper } = withSeekGen(0);
+      const { result, rerender } = renderHook(({ keys }) => useArrivalKeys(keys, "scope-a"), {
+        initialProps: { keys: ["a"] },
+        wrapper,
+      });
+      rerender({ keys: ["a", "b"] });
+      expect(result.current.has("b")).toBe(true);
+    });
+
+    it("a SEEK (seekGen bumps on the same update several keys appear) adopts them silently — none marked arriving", () => {
+      vi.useFakeTimers();
+      const { wrapper, bump } = withSeekGen(0);
+      const { result, rerender } = renderHook(({ keys }) => useArrivalKeys(keys, "scope-a"), {
+        initialProps: { keys: ["a"] },
+        wrapper,
+      });
+      bump();
+      rerender({ keys: ["a", "b", "c", "d"] }); // a forward scrub jumped past b, c, d at once
+      expect(result.current.size).toBe(0);
+      // The seeked-past keys are still adopted as SEEN — a later genuine
+      // advance only marks what's new AFTER this seek, not b/c/d again.
+      rerender({ keys: ["a", "b", "c", "d", "e"] });
+      expect(result.current.has("e")).toBe(true);
+      expect(result.current.has("b")).toBe(false);
+      expect(result.current.has("c")).toBe(false);
+      expect(result.current.has("d")).toBe(false);
+    });
   });
 });
