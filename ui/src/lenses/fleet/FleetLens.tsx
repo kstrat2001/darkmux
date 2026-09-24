@@ -207,6 +207,9 @@ function SavingsHero({
               settled ? t.local + t.cloud + t.unknown : null,
               (n) => (n === null ? "" : fmtN(n)),
               liveMode ? undefined : 0,
+              // The window slides past old records on every poll, so the total
+              // falls with nothing running; only new work counts up.
+              { upOnly: true },
             )}
           </div>
           <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>

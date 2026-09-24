@@ -39,14 +39,25 @@ function easeOutCubic(t: number): number {
  * this hook only ever hands it a number (or `null`), never touches digit
  * grouping, rounding or units itself, so a number's printed shape is
  * exactly what it always was.
+ *
+ * - **`upOnly`**: only an increase tweens; a decrease lands instantly. For a
+ *   figure that falls by bookkeeping rather than by activity, e.g. the fleet
+ *   hero's "last 24h" total, which shrinks on every poll as the window slides
+ *   past old records. Tweening that made an idle fleet look busy.
+ * - **A change mid-tween** continues from the number currently on screen,
+ *   not from the previous target, so the figure never jumps.
  */
 export function useCountUp(
   target: number | null,
   format: (n: number | null) => string,
   durationMs: number = DEFAULT_DURATION_MS,
+  opts: { upOnly?: boolean } = {},
 ): string {
   const prevTarget = useRef<number | null | typeof UNSET>(UNSET);
   const [display, setDisplay] = useState<number | null>(target);
+  const shown = useRef<number | null>(target);
+  shown.current = display;
+  const upOnly = opts.upOnly === true;
   const rafRef = useRef<number | null>(null);
   const reduced = usePrefersReducedMotion();
 
@@ -67,11 +78,13 @@ export function useCountUp(
     // two unrelated instants would show a number that was never true at
     // either point in time (the fleet hero's own `liveMode` gate is the
     // first caller of this — see `FleetLens.tsx`).
-    if (from === null || target === null || reduced || durationMs <= 0) {
+    if (from === null || target === null || reduced || durationMs <= 0 || (upOnly && target < from)) {
       setDisplay(target);
       return;
     }
-    const startVal = from;
+    // From what is on screen: a tween interrupted by a new target continues
+    // from where it was, rather than restarting at the previous target.
+    const startVal = shown.current ?? from;
     const endVal = target;
     const start = performance.now();
     const tick = (now: number) => {
@@ -84,7 +97,7 @@ export function useCountUp(
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [target, reduced, durationMs]);
+  }, [target, reduced, durationMs, upOnly]);
 
   return format(display);
 }

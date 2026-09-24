@@ -52,6 +52,49 @@ describe("useCountUp (#2878)", () => {
     expect(result.current).toBe("100"); // exact end state, not an approximation
   });
 
+  it("upOnly: a decrease snaps with no intermediate frames; an increase still tweens", () => {
+    // The fleet hero's "last 24h" total SHRINKS on every poll as the window
+    // slides past old records, with nothing running. Tweening that read as
+    // live activity on an idle fleet; only new work (an increase) animates.
+    stubReducedMotion(false);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+    const { result, rerender } = renderHook(({ v }) => useCountUp(v, fmt, undefined, { upOnly: true }), {
+      initialProps: { v: 1000 },
+    });
+    rerender({ v: 900 });
+    expect(result.current).toBe("900"); // landed on the render itself, no frame advanced
+    rerender({ v: 1000 });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    const mid = Number(result.current);
+    expect(mid).toBeGreaterThan(900);
+    expect(mid).toBeLessThan(1000);
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(result.current).toBe("1000");
+  });
+
+  it("a change mid-tween continues from the number on screen, never jumps back to the old target", () => {
+    stubReducedMotion(false);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame", "cancelAnimationFrame", "performance"] });
+    const { result, rerender } = renderHook(({ v }) => useCountUp(v, fmt), { initialProps: { v: 0 } });
+    rerender({ v: 100 });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    const shown = Number(result.current);
+    rerender({ v: 200 });
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+    // Restarting from the previous TARGET (100) would jump forward past what
+    // was shown; the next frame must stay near the displayed value.
+    expect(Number(result.current)).toBeGreaterThanOrEqual(shown);
+    expect(Number(result.current)).toBeLessThan(100);
+  });
+
   it("applies the caller's own formatter, never its own", () => {
     stubReducedMotion(false);
     const asDollars = (n: number | null) => (n === null ? "" : `$${n}`);
