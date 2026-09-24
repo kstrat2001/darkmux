@@ -625,7 +625,7 @@ def main():
     by_id = {m["id"]: m for m in world["machines"]}
     hero = by_id[world["hero_machine"]]
 
-    src = [json.loads(l) for l in (HERE / "sessions" / "crawl-error-discard.jsonl")
+    src = [json.loads(l) for l in (HERE / "sessions" / "coder-pepper-grinder.jsonl")
            .read_text().splitlines() if l.strip()]
 
     out = pathlib.Path(a.out)
