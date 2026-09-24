@@ -611,14 +611,20 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
                     stalled={view.liveTokScope.stalled}
                     resting={view.liveTokScope.state === "rest"}
                     size="tile"
+                    // Only the reading goes inside the tube. A state is a
+                    // caption about the reading and sits under it: set at
+                    // the number's size, "prompt" ran through the ring.
                     centerLabel={
                       view.liveTokScope.state === "generating"
                         ? view.liveTokScope.tokensPerSec != null
                           ? String(Math.round(view.liveTokScope.tokensPerSec))
                           : "—"
-                        : liveStateLabel(view.liveTokScope)
+                        : null
                     }
                   />
+                  {view.liveTokScope.state !== "generating" && (
+                    <div className="scopetile__state">{liveStateLabel(view.liveTokScope)}</div>
+                  )}
                 </div>
               )}
             </div>

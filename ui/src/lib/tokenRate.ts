@@ -342,7 +342,9 @@ export function liveStateLabel(reading: LiveStateReading): string {
     case "rest":
       return `rest ${reading.restSecondsLeft ?? 0}s`;
     case "prompt":
-      return "prompt";
+      // Not the bare word: the run page shows a "prompt · N chars"
+      // disclosure just above the tile.
+      return "reading prompt";
     case "tools":
       return "tools";
     case "stalled":

@@ -117,3 +117,33 @@ describe("parity: fleet card, live vs playback at the same recorded instant", ()
     expect(pick(play)).toEqual(pick(live));
   });
 });
+
+describe("TOK/S tile: a state is a caption under the tube, never text inside it", () => {
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  // Operator, on a phone: "prompt" set at the number's size ran straight
+  // through the ring. The number is the reading and sits inside; a state is
+  // a caption about the reading and sits under the tube.
+  it("waiting for the first token: empty tube center, 'reading prompt' caption", async () => {
+    const start = T((ALL.find((r) => r.session_id === SID && /dispatch.start|dispatch start/.test(String(r.action))) as { ts: string }).ts);
+    const at = start + 1_000;
+    vi.useFakeTimers();
+    vi.setSystemTime(at);
+    const records = upTo(at);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SessionReplay sessionId={SID} playhead={null} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    const tile = document.querySelector('[data-testid="run-token-scope"]')!;
+    expect(tile.querySelector(".token-scope-n")).toBeNull();
+    expect(tile.querySelector(".scopetile__state")?.textContent).toBe("reading prompt");
+  });
+});

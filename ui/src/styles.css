@@ -8105,6 +8105,16 @@ body {
   --d: 40px;
   --rim: 4px;
 }
+/* The TOK/S tile's state caption: under the tube, never inside it. */
+.scopetile__state {
+  margin-top: 8px;
+  text-align: center;
+  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
 .token-scope-bezel--card {
   --d: 64px;
   --rim: 5px;

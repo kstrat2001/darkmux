@@ -12,6 +12,7 @@ import {
   isStalled,
   measuredCharsPerToken,
   averageGenerationRate,
+  liveStateLabel,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -342,5 +343,11 @@ describe("averageGenerationRate", () => {
   it("skips a turn with no generation_ms, and is null when no turn has one", () => {
     expect(averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 500), turn("a", 2, undefined), tok("a", 2, 900)]])).toBeCloseTo(100, 5);
     expect(averageGenerationRate([[turn("a", 1, undefined), tok("a", 1, 500)]])).toBeNull();
+  });
+});
+
+describe("liveStateLabel", () => {
+  it("names the prompt wait as 'reading prompt', not the bare word the page's prompt disclosure also uses", () => {
+    expect(liveStateLabel({ state: "prompt" } as never)).toBe("reading prompt");
   });
 });
