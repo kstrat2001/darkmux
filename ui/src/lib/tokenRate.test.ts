@@ -268,6 +268,48 @@ describe("currentTokenRate", () => {
     expect(currentTokenRate(records)).toBeNull();
   });
 
+  // (#2886 pass 5, MUST — fresh-reviewer finding F1) A pair whose earlier
+  // sample is 0 chars is not ALWAYS untrustworthy — a FAST one (about one
+  // heartbeat interval) is real signal: the model produced its first chars
+  // almost immediately. This is the DIRECT path (the pair IS the current
+  // turn's own last two samples), so a trusted fast opener must read fresh
+  // (not carried).
+  it("trusts a FAST opener pair (<= ~one heartbeat interval) as a fresh, non-carried reading", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // 40 chars over 2s = 20 chars/s / 4 default = 5 tok/s.
+    const reading = currentTokenRate([hbT(0, 0, 5), hbT(2_000, 40, 5)]);
+    expect(reading).not.toBeNull();
+    expect(reading!.tokensPerSec).toBeCloseTo(5, 5);
+    expect(reading!.carried).toBeUndefined();
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F1, "the naive skip made
+  // nulls jump 41->148") A SLOW opener as the CURRENT pair must not be
+  // trusted directly (it would read ~0.1 tok/s at full brightness — real
+  // data: 0 -> 4 chars over 13s) — but the fallback search must still find
+  // an EARLIER pair that IS a fast, trustworthy opener, rather than
+  // rejecting every 0-chars pair outright (the over-correction this finding
+  // also warns against). Turn 4's own opening pair (0 -> 800 over 2s) is
+  // exactly that: a fast opener, one turn back.
+  it("rejects a SLOW opener as the current reading but still finds an earlier FAST opener to carry", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [
+      // Turn 4: a FAST opener — 800 chars over 2s = 400 chars/s -> 100 tok/s.
+      hbT(0, 0, 4),
+      hbT(2_000, 800, 4),
+      // Turn 5 (current): a SLOW opener — 4 chars over 13s, not trustworthy
+      // as a direct reading.
+      hbT(10_000, 0, 5),
+      hbT(23_000, 4, 5),
+    ];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+  });
+
   // (#2886 pass 4, MUST — fresh-reviewer finding 3) After a checkpoint,
   // `generated_chars` restarts within the SAME turn_seq (real shapes:
   // 119,547 -> 1; 74,617 -> 3), so the current turn's own last two

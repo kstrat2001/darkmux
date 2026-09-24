@@ -268,10 +268,38 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
   // `generated_chars` restarts every turn: a new turn's first sample paired
   // with the previous turn's last spans the tool gap and read near 0.
   if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) return carriedTokenRate(records, samples);
+  // (#2886 pass 5, MUST — fresh-reviewer finding F1) A SLOW opener pair
+  // (the turn's first heartbeat, still at 0 chars, paired with a second one
+  // far later) is not generation speed — see `openerPairTrusted`'s own doc.
+  // Treating it as a live, full-brightness reading here (this function's
+  // DIRECT path, not the historical carry scan) is exactly the bug: a
+  // near-zero rate at full brightness where "not yet measured" (fall
+  // through to the carry, or `null`) is the honest reading.
+  if (!openerPairTrusted(prev, next)) return carriedTokenRate(records, samples);
   const cps = charsPerSecond(prev, next);
   if (cps === null) return carriedTokenRate(records, samples);
   const charsPerToken = measuredCharsPerToken(records);
   return { tokensPerSec: cps / charsPerToken, atMs: next.atMs, estimate: true };
+}
+
+/** (#2886 pass 5, MUST — fresh-reviewer finding F1) Whether an "opener" pair
+ *  — one whose EARLIER sample reads `generated_chars: 0`, which every turn's
+ *  very first heartbeat does — is trustworthy as a rate measurement, fresh
+ *  or carried. A FAST opener (within about one heartbeat interval,
+ *  `OPENER_TRUST_WINDOW_MS`) is real signal: the model produced its first
+ *  chars almost immediately, and the pair genuinely measures generation. A
+ *  SLOW one mostly measures "still thinking" time (prompt reading, or
+ *  reasoning before the first visible token) — real data: 0 -> 4 chars over
+ *  13s reads as ~0.1 tok/s if trusted blindly, shown at FULL brightness
+ *  under a lit GEN lamp (the naive "skip every 0-chars opener unconditionally"
+ *  fix tried first made an unrelated regression instead — carried readings
+ *  jumping 41 -> 148 tok/s once nothing at all was left to carry from — so
+ *  the fix is a TRUST WINDOW, not a blanket skip). Non-opener pairs
+ *  (`prev.chars !== 0`) are always trusted here; this only narrows the
+ *  opener case. */
+const OPENER_TRUST_WINDOW_MS = 2_500;
+function openerPairTrusted(prev: HeartbeatSample, next: HeartbeatSample): boolean {
+  return prev.chars !== 0 || next.atMs - prev.atMs <= OPENER_TRUST_WINDOW_MS;
 }
 
 /** (#2885) Scans backward from the end of `samples` for the most recent
@@ -283,20 +311,20 @@ export function currentTokenRate(records: FlowRecord[]): TokenRateReading | null
  *  execution, or every pair so far spans only prompt reading), matching
  *  `currentTokenRate`'s pre-#2885 behavior for that case.
  *
- *  (#2886 pass 4, MUST — fresh-reviewer finding 2) A pair whose EARLIER
- *  sample reads `generated_chars: 0` is skipped, not carried. Every turn
- *  opens with a heartbeat at 0 chars sent before the first token, so that
- *  pair's span covers prompt reading (and whatever "still thinking" gap
- *  precedes the first token), not generation — carrying it read as a
- *  dimmed near-zero rate under a lit GEN lamp on the very next turn (real
- *  shape: turn 3 went 0 -> 4 chars over 13s). The scan keeps going past it
- *  for the most recent pair with real progress. */
+ *  (#2886 pass 4, MUST — fresh-reviewer finding 2; pass 5 finding F1
+ *  narrowed "skip" to "skip unless fast") A pair whose EARLIER sample reads
+ *  `generated_chars: 0` is skipped UNLESS it is a fast opener — see
+ *  `openerPairTrusted`'s own doc, the SAME rule `currentTokenRate`'s direct
+ *  path applies, so a fast opener pair found here and a fast opener pair
+ *  found there can't disagree about which one gets to count. The scan keeps
+ *  going past an untrusted one for the most recent pair with real
+ *  progress. */
 function carriedTokenRate(records: FlowRecord[], samples: HeartbeatSample[]): TokenRateReading | null {
   for (let i = samples.length - 1; i > 0; i--) {
     const next = samples[i];
     const prev = samples[i - 1];
     if (prev.turn !== undefined && next.turn !== undefined && prev.turn !== next.turn) continue;
-    if (prev.chars === 0) continue;
+    if (!openerPairTrusted(prev, next)) continue;
     const cps = charsPerSecond(prev, next);
     if (cps === null) continue;
     const charsPerToken = measuredCharsPerToken(records);
