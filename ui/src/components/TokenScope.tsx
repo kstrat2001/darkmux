@@ -254,8 +254,10 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       // (#2890 operator review) Outward: each ring starts near the center
       // (clear of the center label) and expands toward the rim, the context
       // being worked through radiating out.
-      const r = R * (0.3 + q * 0.78);
-      const a = Math.sin(q * Math.PI) * 0.9 * p.inward;
+      // It travels to the screen's edge (the screen radius is ~1.47R), fading
+      // in fast near the center and out slowly as it reaches the rim.
+      const r = R * (0.3 + q * 1.12);
+      const a = Math.min(1, q / 0.15) * Math.pow(1 - q, 0.7) * 0.9 * p.inward;
       for (const [lw, al] of INWARD_PASSES) {
         ctx.beginPath();
         ctx.ellipse(cx, cy, r * p.sx, r * p.sy, 0, 0, Math.PI * 2);
