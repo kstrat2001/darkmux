@@ -6,6 +6,31 @@ import { clkhm } from "./lib/format";
 import { fmtElapsed } from "./lib/format";
 import { ACT_ORDER } from "./lib/eventFilters";
 
+// (#2886 pass 5, MUST — fresh-reviewer finding F5, "App rendering FleetLens
+// without connected/lastContactMs") A mutation dropping those two props off
+// App.tsx's `<FleetLens connected={...} lastContactMs={...} />` call site
+// stayed green — `lib/route.test.ts` proves `tokRateConnectionEvidence`
+// COMPUTES the right values, never that the JSX call site forwards them.
+// `fleetLensProbe.enabled` gates a probe wrapper so every OTHER test in this
+// file keeps rendering the REAL `FleetLens` (unmocked) — only the one test
+// below that flips it on inspects the received props. `vi.hoisted` (not a
+// bare module-level `let`) because `vi.mock` factories are hoisted above
+// every import, including this file's own — a plain `let` referenced from
+// inside the factory would be read before its own initializer ran.
+const fleetLensProbe = vi.hoisted(() => ({ enabled: false }));
+vi.mock("./lenses/fleet/FleetLens", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lenses/fleet/FleetLens")>();
+  return {
+    FleetLens: (props: Record<string, unknown>) =>
+      fleetLensProbe.enabled ? (
+        <div data-testid="fleet-lens-probe" data-props={JSON.stringify(props)} />
+      ) : (
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        <actual.FleetLens {...(props as any)} />
+      ),
+  };
+});
+
 /**
  * (#2416) This file's fixtures use real dispatch-lifecycle actions
  * (`dispatch.start`/`dispatch.complete`, etc.) because they're testing
@@ -54,6 +79,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   window.location.hash = "";
+  fleetLensProbe.enabled = false;
 });
 
 /**
@@ -118,6 +144,34 @@ describe("App", () => {
     // timeline falls to its empty-fleet branch.
     await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
     expect(screen.getByText(/waiting for the first flow record/i)).toBeInTheDocument();
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F5) Pins that the fleet
+  // route's `<FleetLens>` call site actually FORWARDS `connected`/
+  // `lastContactMs`, not App's own default route rendering it bare (which
+  // would silently fall back to `FleetLens`'s own defaults, `true`/`null`).
+  // jsdom has no `EventSource` and this test injects no test factory, so
+  // `useLiveTail` never opens a stream and stays at its pessimistic starting
+  // status ("reconnecting") for the test's whole life — `connected` on the
+  // (live) fleet route is exactly `liveStatus === "live"`
+  // (`tokRateConnectionEvidence`), so the wired-through value is `false`,
+  // distinguishable from the component's own `true` default. `lastContactMs`
+  // is a real `Date.now()`-seeded ref (`App.tsx`'s `lastContactRef`), a
+  // number either way, so this asserts its TYPE (present, not the `null`
+  // default) rather than a specific value.
+  it("wires connected and lastContactMs through to FleetLens on the default fleet route", async () => {
+    fleetLensProbe.enabled = true;
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector('[data-testid="fleet-lens-probe"]')).toBeInTheDocument());
+    const props = JSON.parse(document.querySelector('[data-testid="fleet-lens-probe"]')!.getAttribute("data-props")!);
+    expect(props.connected).toBe(false);
+    expect(typeof props.lastContactMs).toBe("number");
   });
 
   it("renders the real console lens (not a placeholder) for #lens=console", async () => {

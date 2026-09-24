@@ -11,6 +11,22 @@ import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
 
+// (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
+// green while broken in the actual render path — `effectiveConnected`/
+// `effectiveLastContactMs`'s scrub overrides, and the TOK/S tile's
+// `centerLabel`/`centerCarried` — because nothing asserted on what
+// `TokenScope` itself receives. Same mock + reader `FleetLens.test.tsx` uses.
+vi.mock("../../components/TokenScope", () => ({
+  TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
+}));
+
+function latestTokenScopeProps(): Record<string, unknown> {
+  const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
+  const last = nodes[nodes.length - 1];
+  if (!last) throw new Error("no TokenScope probe rendered");
+  return JSON.parse(last.getAttribute("data-props")!);
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
 
@@ -1071,5 +1087,105 @@ describe("SessionReplay — the pending state draws the page, not a bare line (#
         expect(tile.querySelector(".mv .ph-shimmer"), "tile value should shimmer").toBeTruthy();
       }
     }
+  });
+});
+
+// (#2886 pass 5, MUST — fresh-reviewer finding F5) `effectiveConnected`/
+// `effectiveLastContactMs`'s scrub overrides and the TOK/S tile's
+// `centerLabel`/`centerCarried` — pinned at the rendered surface via the
+// mocked `TokenScope`, not just at `runRegions`'s own `sessionRun.test.ts`
+// coverage (which proves the DERIVATION is right, never that it reaches the
+// screen).
+describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A session whose heartbeat stream went stale 38s before "now" —
+  // STALL_AFTER_MS is 30s, so this genuinely reads STALLED live, with
+  // nothing scrubbed and nothing disconnected.
+  function staleRunningSession(t0: number) {
+    return [
+      { ts: new Date(t0 - 60_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 40_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-stale", machine_id: "M", payload: { sampled_at_ms: t0 - 40_000, generated_chars: 40 } },
+      { ts: new Date(t0 - 38_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-stale", machine_id: "M", payload: { sampled_at_ms: t0 - 38_000, generated_chars: 120 } },
+    ];
+  }
+
+  it("shows 'no signal' (not blank) for a genuinely disconnected LIVE view, not the run being idle", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: staleRunningSession(t0) }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-stale" connected={false} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: "no signal", stalled: false, tone: "none" });
+  });
+
+  // (finding F5, "effectiveConnected = connected") A SCRUBBED playhead must
+  // read as connected REGARDLESS of the live `connected` prop — history is
+  // not affected by whether the live page happens to be connected right
+  // now. Same stale fixture, `connected={false}`, but now WITH a playhead —
+  // the genuine historical stall must show, not a false "no signal".
+  it("a scrubbed playhead ignores the live connected=false and shows the REAL historical stall", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: staleRunningSession(t0) }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-stale" playhead={t0 - 5_000} connected={false} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, stalled: true, tone: "stalled" });
+  });
+
+  // (finding F5, "effectiveLastContactMs = lastContactMs") A SCRUBBED
+  // playhead must WITHHOLD the live `lastContactMs` — it's a fact about the
+  // live connection right now, not about the history being viewed.
+  // `lastContactMs` here sits BEFORE the stalled execution's own deadline
+  // (t0-38_000 + 30_000 = t0-8_000), which — if NOT withheld — would
+  // downgrade a genuine historical stall to "no signal".
+  it("a scrubbed playhead withholds lastContactMs too, so a stale half-open value can't downgrade real history", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: staleRunningSession(t0) }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-stale" playhead={t0 - 5_000} connected lastContactMs={t0 - 39_000} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, stalled: true, tone: "stalled" });
+  });
+
+  // (finding F5, "centerCarried={false}") The generating + carried case,
+  // pinned at the rendered surface — a carried reading dims the number.
+  it("centerCarried is true exactly for a generating, carried reading", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 22_000).toISOString(), action: "dispatch.start", session_id: "s-carry", machine_id: "M", payload: { role: "coder" } },
+      // Turn 1: real progress to carry from (0 -> 800 chars over 2s).
+      { ts: new Date(t0 - 22_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-carry", machine_id: "M", payload: { sampled_at_ms: t0 - 22_000, generated_chars: 0, turn_seq: 1 } },
+      { ts: new Date(t0 - 20_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-carry", machine_id: "M", payload: { sampled_at_ms: t0 - 20_000, generated_chars: 800, turn_seq: 1 } },
+      // Turn 2: lone first heartbeat — nothing of its own yet, carries turn 1's rate.
+      { ts: new Date(t0).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-carry", machine_id: "M", payload: { sampled_at_ms: t0, generated_chars: 50, turn_seq: 2 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-carry" />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ tone: "generating", centerCarried: true });
   });
 });

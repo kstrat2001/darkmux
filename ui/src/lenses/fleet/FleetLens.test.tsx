@@ -1020,6 +1020,20 @@ describe("FleetLens pager (#2881)", () => {
     expect(window.location.hash).toBe("");
   });
 
+  // (#2886 pass 5, MUST — fresh-reviewer finding F5) No test clicked the
+  // PREVIOUS arrow specifically — a mutation wiring it to the SAME `+1` the
+  // next arrow uses stayed green. Wrap-around from page 1 is the
+  // distinguishing case: `+1` would land on page 2 (indistinguishable from
+  // clicking "next"); a correct `-1` wraps to the LAST page.
+  it("the previous arrow moves BACKWARD (wraps to the last page from page 1), not the same direction as next", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/3");
+    fireEvent.click(screen.getByLabelText("previous execution"));
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("3/3");
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("fetch-render");
+  });
+
   it("the picked page sticks until that execution ends, then falls forward to the new busiest among what's left", async () => {
     const { rerender } = renderThree(5);
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
