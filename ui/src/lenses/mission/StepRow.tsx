@@ -29,7 +29,7 @@ type MeterLike = Omit<StepMeter, "tools" | "wallMs"> & { tools?: number; wallMs?
  * already establish the CSS-generated form as this project's answer to
  * "a label that should be seen but not enter the golden". */
 const STEP_TIME_HINT = "step";
-const STEP_TIME_TITLE = "step time — the whole step span: setup, model work and gate. The session drill-in's WALL CLOCK is the model's own run, and reads shorter.";
+const STEP_TIME_TITLE = "step time — the whole step span: setup, model work and gate. The run page's ACTIVE TIME (WALL CLOCK for a step with no model) is the dispatch's own run, and reads shorter.";
 
 export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
   if (!meter || !meter.show) return null;

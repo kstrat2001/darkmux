@@ -23,8 +23,9 @@ export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
+import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
-import type { BriefEntry } from "../session/sessionRun";
+import type { BriefEntry, SessionRunView } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
 
 /**
@@ -66,8 +67,8 @@ function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
  * intermediate frame. A value that ISN'T one plain number — a duration
  * like "10:15", a model name, "—" — renders exactly as it always did, no
  * animation, because there is nothing here safe to interpolate. */
-/** The TOK/S tile's state lamps: one per state, grey when off, exactly one
- *  lit in its state's color. Seeing every state at once is what makes the
+/** The MODEL hero's state lamps (#2890; the TOK/S tile's before it): one
+ *  per state, grey when off, exactly one lit in its state's color. Seeing every state at once is what makes the
  *  current one legible (operator: "is this resting? can't tell"). The rest
  *  lamp carries its countdown while lit. */
 const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = [
@@ -80,20 +81,26 @@ const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = 
 function ScopeLamps({
   reading,
   noSignal = false,
+  finished = false,
 }: {
   reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
   noSignal?: boolean;
+  /** (#2890) A finished run keeps its lamp row (every lamp off) under the
+   *  calm scope; the status text says it finished. */
+  finished?: boolean;
 }) {
   // `state: null` is no live execution (a mission between model steps):
   // every lamp is off.
   const aria =
     reading.state === null
-      ? noSignal
-        ? "no signal — page disconnected from the daemon"
-        : "no model working"
+      ? finished
+        ? "finished"
+        : noSignal
+          ? "no signal — page disconnected from the daemon"
+          : "no model working"
       : reading.state === "generating"
         ? "generating"
         : liveStateLabel({ state: reading.state, restSecondsLeft: reading.restSecondsLeft } as LiveStateReading);
@@ -117,6 +124,52 @@ function ScopeLamps({
       })}
     </div>
   );
+}
+
+/** (#2890) What the MODEL hero's scope shows, from the one view derivation:
+ *  the live reading while the run is going, the calm finished state with its
+ *  average once it has ended, or nothing when the unit did no model work.
+ *  Exported for its tests; the same function serves live and playback. */
+export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "finishedTokRate">): {
+  state: ScopeState;
+  tokensPerSec: number | null;
+  toolName?: string;
+  centerLabel: string | null;
+  centerUnit: string | null;
+  centerCarried: boolean;
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number };
+  note: string | null;
+} | null {
+  const live = view.liveTokScope;
+  if (live) {
+    const state = scopeStateOf({ state: live.state, noSignal: live.noSignal });
+    const generating = state === "generating";
+    return {
+      state,
+      tokensPerSec: generating ? live.tokensPerSec : 0,
+      toolName: state === "tools" ? live.toolName : undefined,
+      // Only the reading goes inside the tube while generating; a state is
+      // said by the trace, the lamps and (TOOLS) the icon.
+      centerLabel: generating ? (live.tokensPerSec != null ? String(Math.round(live.tokensPerSec)) : "—") : null,
+      centerUnit: generating ? "tok/s" : null,
+      centerCarried: generating && live.carried,
+      lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft },
+      note: state === "nosignal" ? "no signal" : null,
+    };
+  }
+  const fin = view.finishedTokRate;
+  if (fin) {
+    return {
+      state: "finished",
+      tokensPerSec: 0,
+      centerLabel: fin.average,
+      centerUnit: "avg tok/s",
+      centerCarried: false,
+      lamps: { state: null },
+      note: fin.sub,
+    };
+  }
+  return null;
 }
 
 function AnimatedMetricValue({ value }: { value: string }) {
@@ -584,6 +637,7 @@ export function SessionReplay({
   // of the playhead. `plausiblyRunning` is computed from `clockNow` above,
   // so it answers the SAME question live and replayed.
   const liveness = livenessState({ done: !view.live, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
+  const scopeHero = modelScopeHero(view);
 
   return (
     <div data-state="data" className="session-run">
@@ -668,103 +722,87 @@ export function SessionReplay({
           `.metrics[data-scope]` grids keep their scope attribute as a hook. */}
       {(view.metricScope.model.length > 0 || view.hasModelWork) && (
         <section className="runsec" data-head="model">
-          {view.metricScope.model.length > 0 && (
-            <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
-              {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
-            <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
-              <div className="mv"><AnimatedMetricValue value={m.value} />{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
-              <div className="ml" data-hint={m.hint}>{m.label}</div>
-              {m.sub && <div className="msub">{m.sub}</div>}
-            </div>
-              ))}
-              {/* (#2877) The fifth MODEL tile, live only: a finished run's
-                  TOK/S is a plain pushed metric already inside the `.map`
-                  above (`sessionRun.ts`'s "TOK/S" push) — this renders ONLY
-                  while `view.liveTokScope` is non-null (model work, not yet
-                  done), and disappears the moment the run finishes, per the
-                  issue's "when the run finishes, the scope goes and the
-                  tile shows the final measured tok/s". */}
-              {/* (#2877 pass 2, "is this resting? can't tell") While
-                  generating, the center stays the tok/s number — unchanged.
-                  Otherwise it names the state a flat ring used to hide:
-                  `rest 12s` (counting down), `prompt` (a turn has started, no
-                  heartbeat for it yet), `tools` (waiting on a dispatched
-                  tool), or `stalled` (the existing stall rule). One
-                  derivation (`lib/tokenRate.ts::deriveLiveState`), read here
-                  and by `FleetLens.tsx`'s rate line — no branch on mode. */}
-              {view.liveTokScope && (
-                <div className="met scopetile" data-testid="run-token-scope">
-                  <div className="ml">TOK/S</div>
-                  <TokenScope
-                    // A stale reading from the LAST generating stretch must
-                    // not still drive the wave once the state has moved on
-                    // to rest/tools/prompt (only `stalled` used to zero it) —
-                    // otherwise the tube looks busy while the label says
-                    // "tools".
-                    tokensPerSec={view.liveTokScope.state === "generating" ? view.liveTokScope.tokensPerSec : 0}
-                    stalled={view.liveTokScope.stalled}
-                    resting={view.liveTokScope.state === "rest"}
-                    tone={view.liveTokScope.state ?? "none"}
-                    size="tile"
-                    // Only the reading goes inside the tube. A state is a
-                    // caption about the reading and sits under it: set at
-                    // the number's size, "prompt" ran through the ring.
-                    //
-                    // (#2886 pass 4, do-it — fresh-reviewer finding 7) A
-                    // `noSignal` reading (the connection was lost, not the
-                    // run) gets its own visible word, the SAME "no signal"
-                    // the fleet card's rate line already shows — distinct
-                    // from the bare blank a genuine "no live execution"
-                    // reading leaves (that case has nothing wrong to name).
-                    centerLabel={
-                      view.liveTokScope.state === "generating"
-                        ? view.liveTokScope.tokensPerSec != null
-                          ? String(Math.round(view.liveTokScope.tokensPerSec))
-                          : "—"
-                        : view.liveTokScope.noSignal
-                          ? "no signal"
-                          : null
-                    }
-                    // (#2885) Dims the number when it's carried forward from
-                    // an earlier turn rather than the current one's own two
-                    // most recent heartbeats.
-                    centerCarried={view.liveTokScope.state === "generating" && view.liveTokScope.carried}
-                  />
-                  {/* (#2886 pass 4, finding 7) `noSignal` is the PRECISE flag
-                      `sessionRun.ts` computes from whether a downgrade
-                      actually fired, not the raw `!connected` this used to
-                      read — that mislabeled a genuinely idle run (no live
-                      execution at all, e.g. a mission between model steps)
-                      as "no signal" whenever the page happened to be
-                      disconnected at the same time, even though THAT null
-                      had nothing to do with the connection. */}
-                  <ScopeLamps reading={view.liveTokScope} noSignal={view.liveTokScope.noSignal} />
-                </div>
-              )}
-            </div>
-          )}
-          {view.showModelCard && (
-            <div className="track">
-              <div className="lbl">{view.modelTrackLabel}</div>
-              {/* (#2863) One row per model, the one that ran first and marked:
-                  the name, its size, and what it was here for. The text lines
-                  remain for the cases with no per-model structure (an
-                  endpoint, no telemetry yet). */}
-              {view.modelEntries
-            ? view.modelEntries.map((m, i) => (
-                <div className={`modelrow${m.ran ? " modelrow--ran" : ""}`} key={i}>
-                  <span className="modelrow__name">{m.name}</span>
-                  <span className="modelrow__size">{m.gb != null ? `${m.gb} GB` : "?"}</span>
-                  {m.ran != null && (
-                    <span className={`modelrow__tag${m.ran ? " modelrow__tag--ran" : ""}`}>
-                      {m.ran ? "ran this run" : "also loaded"}
-                    </span>
-                  )}
-                </div>
-              ))
-            : view.modelTrackLines.map((line, i) => <div key={i}>{line}</div>)}
-            </div>
-          )}
+          {/* (#2890) ONE container for the whole MODEL section (hairline
+              dividers, no per-metric cards): the scope is the hero on the
+              left with its lamp row under it, the figures fill a collection
+              grid on the right, and the loaded models sit below a hairline.
+              Phone: scope on top, grid, models last (`styles.css`). A
+              FINISHED run keeps the scope as the hero, calm and dimmed, with
+              its average in the center, rather than a TOK/S tile. One
+              derivation (`runRegions`), no live/playback branch. */}
+          <div className="modelbox">
+            {(view.metricScope.model.length > 0 || scopeHero) && (
+              <div className="modelbox__main">
+                {scopeHero && (
+                  <div className="modelbox__hero" data-testid="run-token-scope">
+                    <TokenScope
+                      state={scopeHero.state}
+                      // A stale reading from the LAST generating stretch must
+                      // not still drive the wave once the state has moved on.
+                      tokensPerSec={scopeHero.tokensPerSec}
+                      toolName={scopeHero.toolName}
+                      size="tile"
+                      centerLabel={scopeHero.centerLabel}
+                      centerUnit={scopeHero.centerUnit}
+                      // (#2885) Dims the number when it's carried forward from
+                      // an earlier turn rather than the current one's own two
+                      // most recent heartbeats.
+                      centerCarried={scopeHero.centerCarried}
+                    />
+                    <ScopeLamps
+                      reading={scopeHero.lamps}
+                      noSignal={scopeHero.state === "nosignal"}
+                      finished={scopeHero.state === "finished"}
+                    />
+                    {/* A quiet line under the lamps: "no signal" when the page
+                        lost its connection (distinct from a genuinely idle
+                        run, which has nothing wrong to name), or the finished
+                        average's qualifier when it is partial or a fallback. */}
+                    {scopeHero.note && <div className="modelbox__note">{scopeHero.note}</div>}
+                  </div>
+                )}
+                {view.metricScope.model.length > 0 && (
+                  <div className="metrics modelbox__figs" data-scope="model" role="group" aria-label="model metrics">
+                    {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
+                      <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
+                        <div className="mv"><AnimatedMetricValue value={m.value} />{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
+                        <div className="ml" data-hint={m.hint}>{m.label}</div>
+                        {m.bar && (
+                          <div className="mbar" aria-hidden="true">
+                            <i className="mbar__peak" style={{ width: `${m.bar.peakPct}%` }} />
+                            <i className="mbar__now" style={{ width: `${m.bar.nowPct}%` }} />
+                          </div>
+                        )}
+                        {m.sub && <div className="msub">{m.sub}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {view.showModelCard && (
+              <div className="track modelbox__models">
+                <div className="lbl">{view.modelTrackLabel}</div>
+                {/* (#2863) One row per model, the one that ran first and marked:
+                    the name, its size, and what it was here for. The text lines
+                    remain for the cases with no per-model structure (an
+                    endpoint, no telemetry yet). */}
+                {view.modelEntries
+                  ? view.modelEntries.map((m, i) => (
+                      <div className={`modelrow${m.ran ? " modelrow--ran" : ""}`} key={i}>
+                        <span className="modelrow__name">{m.name}</span>
+                        <span className="modelrow__size">{m.gb != null ? `${m.gb} GB` : "?"}</span>
+                        {m.ran != null && (
+                          <span className={`modelrow__tag${m.ran ? " modelrow__tag--ran" : ""}`}>
+                            {m.ran ? "ran this run" : "also loaded"}
+                          </span>
+                        )}
+                      </div>
+                    ))
+                  : view.modelTrackLines.map((line, i) => <div key={i}>{line}</div>)}
+              </div>
+            )}
+          </div>
         </section>
       )}
 

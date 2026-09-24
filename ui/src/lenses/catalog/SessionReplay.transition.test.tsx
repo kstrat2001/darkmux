@@ -65,7 +65,8 @@ function renderReplay() {
 
 const pillText = () => document.querySelector(".session-run__header .pill")?.textContent ?? "";
 const wallText = () =>
-  [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+  // (#2890) A dispatch's run time is the MODEL section's ACTIVE TIME cell.
+  [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -188,11 +189,10 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // drop is applied (see `SessionReplay.tsx`'s comment on `endedByPresence`)
     // — read the settled value, then assert nothing moves it after that.
     const frozen = wallText();
-    // (#2413 M4) The trailing "—" is the explicit HOST tile's value — this
-    // fixture has model work but no host telemetry, so the pane now says so
-    // instead of silently omitting the tile (see sessionRun.ts's own test
-    // for the same behavior in isolation).
-    expect(frozen).toBe("9:57 so far0—");
+    // (#2890) Read from the MODEL grid now: TURNS "—", TOOL CALLS "0",
+    // ACTIVE TIME, then TOKENS IN/OUT and CONTEXT "—" (no telemetry in this
+    // fixture). The frozen run time is the figure that matters here.
+    expect(frozen).toBe("—09:57 so far———");
     act(() => {
       vi.advanceTimersByTime(30_000);
     });

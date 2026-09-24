@@ -13,6 +13,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { TokenScope } from "../../components/TokenScope";
+import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
@@ -1057,9 +1058,13 @@ export function FleetLens({
                     // reading is "not yet measured", never coerced into a
                     // confident zero before it reaches the component).
                     tokensPerSec={selectedExec.state === "generating" ? selectedExec.tokensPerSec : 0}
-                    stalled={selectedExec.state === "stalled"}
-                    resting={selectedExec.state === "rest"}
-                    tone={selectedExec.state ?? "none"}
+                    // (#2890) The same morphing states as the run page's hero,
+                    // sized for the card. `state: null` here is the per-
+                    // execution disconnection downgrade (a running machine is
+                    // guaranteed by the gate above), the same "no signal" the
+                    // rate line prints, so the tube shows static.
+                    state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
+                    toolName={selectedExec.toolName}
                     size="card"
                   />
                 </div>

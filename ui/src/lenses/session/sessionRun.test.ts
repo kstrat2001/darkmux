@@ -166,7 +166,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // `fmtC(tokIn)` on the metric tile (NOT `fmtN`'s comma-grouped form).
     expect(view.metrics.find((m) => m.label === "TOKENS IN")?.value).toBe("1.00k");
     expect(view.metrics.find((m) => m.label === "TOKENS OUT")?.value).toBe("200");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:00");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("10:00");
   });
 
   // (#2877) Live token-rate scope. `nowOverride` freezes the clock so
@@ -203,7 +203,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.liveTokScope!.stalled).toBe(true);
   });
 
-  it("a FINISHED run gets a TOK/S metric tile (output tokens / wall clock) and no live scope", () => {
+  // (#2890) The finished average lives in the MODEL hero scope's center now,
+  // not in a TOK/S tile; the labeling rules are unchanged.
+  it("a FINISHED run gets its average rate (output tokens / wall clock) and no live scope", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -219,9 +221,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.liveTokScope).toBeNull();
     // No `generation_ms` (a pre-1.53 runtime): 200 completion tokens over a
     // 10s wall clock = 20 tok/s, and the tile says which average it is.
-    const tile = view.metrics.find((m) => m.label === "TOK/S");
-    expect(tile?.value).toBe("20");
-    expect(tile?.sub).toBe("avg · wall clock");
+    expect(view.metrics.find((m) => m.label === "TOK/S")).toBeUndefined();
+    expect(view.finishedTokRate).toEqual({ average: "20", sub: "avg · wall clock" });
   });
 
   it("a FINISHED run's TOK/S averages over GENERATION time when turns carry generation_ms, labeled avg", () => {
@@ -240,9 +241,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     // 200 tokens over 2.5s of generation = 80, not 200 over the 10s wall clock.
-    const tile = view.metrics.find((m) => m.label === "TOK/S");
-    expect(tile?.value).toBe("80");
-    expect(tile?.sub).toBe("avg");
+    // The ordinary average needs no sub line: the center's unit already says "avg tok/s".
+    expect(view.finishedTokRate).toEqual({ average: "80", sub: null });
   });
 
   // (#2886) A checkpointed turn is excluded from the finished-run average,
@@ -261,9 +261,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 111 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const tile = view.metrics.find((m) => m.label === "TOK/S");
-    expect(tile?.value).toBe("100");
-    expect(tile?.sub).toBe("avg · 1 of 2 turns");
+    expect(view.finishedTokRate).toEqual({ average: "100", sub: "avg · 1 of 2 turns" });
   });
 
   it("a FINISHED run's TOK/S shows '—' (not a wrong number) when EVERY paired turn is checkpointed", () => {
@@ -275,8 +273,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 91 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const tile = view.metrics.find((m) => m.label === "TOK/S");
-    expect(tile?.value).toBe("—");
+    expect(view.finishedTokRate?.average).toBe("—");
   });
 
   // (#2885) A short turn's own first heartbeat carries the previous turn's
@@ -383,7 +380,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // tile value is `nowrap` because it is contracted to be one short figure
     // (`styles.css`, `.session-run .mv`), and "3:38 · errored (exit 1)" ran
     // straight through the COMPACTIONS tile beside it on a phone.
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("1:00");
     expect(wall?.sub).toBe("errored (exit 1)");
   });
@@ -395,7 +392,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.pillLabel).toBe("KILLED");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("1:00");
     expect(wall?.sub).toBe("killed (timeout)");
   });
@@ -416,7 +413,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T02:00:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 615920 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:15");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("10:15");
     // The brief's timing line reports the SAME duration. Two derivations of
     // one quantity on one page is how they drift apart.
     expect(view.briefLines.map((e) => e.text).some((t) => t.includes("(10:15)"))).toBe(true);
@@ -432,7 +429,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "session.end" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("2:00");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("2:00");
   });
 
   // (#2863 review, finding 1) `wall_ms` INCLUDES rest time
@@ -472,13 +469,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    // (#2890) The run time is the MODEL section's ACTIVE TIME cell now, and
+    // the thermal rest it includes rides under it instead of a SYSTEM tile.
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("4:03");
-    expect(wall?.hint).toBe("run time");
-    expect(wall?.sub).toBeUndefined();
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
-    expect(thermal?.value).toBe("1:30");
-    expect(thermal?.sub).toBe("6 rests");
+    expect(wall?.sub).toBe("1:30 thermal rest");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
   it("(rest-reason cards) mixed rest causes each get their own card", () => {
@@ -489,10 +485,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 60000 } },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
+    // (#2890) Thermal under ACTIVE TIME; every other kind keeps its card.
     const delay = view.metrics.find((m) => m.label === "TURN DELAY");
-    expect(thermal?.value).toBe("1:00");
-    expect(thermal?.sub).toBe("1 rest");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("1:00 thermal rest");
     expect(delay?.value).toBe("0:30");
     expect(delay?.sub).toBe("1 rest · 30 s each");
   });
@@ -530,11 +525,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 6 } },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBeUndefined();
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
-    expect(thermal?.value).toBe("0:15");
-    expect(thermal?.sub).toBe("1 rest");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
+    expect(wall?.sub).toBe("0:15 thermal rest");
   });
 
   it("(rest-reason cards) rest with no per-rest records shows no card at all", () => {
@@ -548,7 +540,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBeUndefined();
     expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
     expect(view.metrics.find((m) => m.label === "TURN DELAY")).toBeUndefined();
@@ -560,9 +552,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBeUndefined();
-    expect(wall?.hint).toBe("run time");
+    expect(wall?.hintTitle).toContain("INCLUDING any thermal rest");
   });
 
   it("(rest-reason cards) an errored run's WALL CLOCK sub names only the outcome, not rest", () => {
@@ -576,7 +568,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBe("errored (exit 1)");
   });
 
@@ -592,9 +584,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
-    expect(thermal?.value).toBe("0:00");
-    expect(thermal?.sub).toBe("0 rests");
+    // (#2890) Armed and quiet reads under ACTIVE TIME now.
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("0:00 thermal rest");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
   it("(rest-reason cards) thermal NOT configured and no rests shows no card", () => {
@@ -1018,7 +1010,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const labels = view.metricScope.system.map((i) => view.metrics[i].label);
     // COMPACTIONS is present because this fixture DID dispatch (it just had
     // no host sampler); the no-model case is covered separately below.
-    expect(labels).toEqual(["WALL CLOCK", "COMPACTIONS", "HOST"]);
+    // (#2890) Run time is the MODEL section's ACTIVE TIME for a dispatch.
+    expect(labels).toEqual(["COMPACTIONS", "HOST"]);
     const hostIdx = view.metricScope.system[labels.indexOf("HOST")];
     expect(view.metrics[hostIdx].sub).toBe("no host samples for this run");
   });
@@ -1106,8 +1099,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.hasModelWork).toBe(true);
     const modelLabels = view.metricScope.model.map((i) => view.metrics[i].label);
-    expect(modelLabels.slice(0, 3)).toEqual(["TURNS", "TOKENS IN", "TOKENS OUT"]);
-    expect(modelLabels).toHaveLength(4);
+    // (#2890) Tool calls and active time sit between turns and tokens.
+    expect(modelLabels).toEqual(["TURNS", "TOOL CALLS", "ACTIVE TIME", "TOKENS IN", "TOKENS OUT", "CONTEXT"]);
     expect(modelLabels).not.toContain("COMPACTIONS");
   });
 
@@ -1488,7 +1481,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // A real assertion, not a vacuous loop: fail loudly if the fixture
     // didn't actually populate the tiles this test exists to check.
     expect(view.metrics.map((m) => m.label)).toEqual(
-      expect.arrayContaining(["TURNS", "TOKENS IN", "TOKENS OUT", "CTX PEAK", "WALL CLOCK"]),
+      expect.arrayContaining(["TURNS", "TOOL CALLS", "TOKENS IN", "TOKENS OUT", "CTX PEAK", "ACTIVE TIME"]),
     );
     for (const m of view.metrics) {
       if (m.value === "—" || m.value === "") continue; // a placeholder can't "restate" anything
@@ -1538,4 +1531,121 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.briefLines.some((e) => e.href?.startsWith("#mission="))).toBe(false);
   });
 
+});
+
+// (#2890) The MODEL section is one container: the scope as hero, then a
+// collection grid of turns, tool calls, active time, tokens in, tokens out and
+// context. Tool calls and active time come up from SYSTEM (no duplicates),
+// thermal rest rides under active time, and a finished run's rate lives in the
+// scope, not in a TOK/S tile.
+describe("runRegions — MODEL section content (#2890)", () => {
+  const BASE_TS = "2026-01-01T00:00:00Z";
+  const labelsOf = (view: ReturnType<typeof runRegions>, scope: "model" | "system") =>
+    view.metricScope[scope].map((i) => view.metrics[i].label);
+  const tool = (ts: string, name: string, extra: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts, session_id: "s1", action: "dispatch.tool", payload: { tool_name: name, ok: true, outcome: "ok", ...extra } }) as unknown as FlowRecord;
+
+  const finishedRun = (): FlowRecord[] =>
+    [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", payload: { bounds: { thermal_pacing_enabled: { value: true } } } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 3, generation_ms: 2_500 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", payload: { turn_seq: 1, prompt_tokens: 1000, completion_tokens: 200 } },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "context", payload: { used: 30000, max: 100000 } },
+      tool("2026-01-01T00:00:05Z", "read"),
+      // Ran and exited non-zero: the tool WORKING (#2008), not a failure.
+      tool("2026-01-01T00:00:06Z", "bash", { ok: false, outcome: "reported", exit_code: 1 }),
+      tool("2026-01-01T00:00:07Z", "edit", { ok: false, outcome: "failed" }),
+      { ts: "2026-01-01T00:00:20Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "thermal-duty-cycle" } },
+      { ts: "2026-01-01T00:01:10Z", session_id: "s1", category: "telemetry", source: "context", payload: { used: 12000, max: 100000 } },
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000, prompt_tokens: 1000, completion_tokens: 200 } },
+    ] as FlowRecord[];
+
+  /** The run as of `iso`: records after it are not in the page's data yet
+   *  (the caller cuts to its clock, live or playback). */
+  const asOf = (iso: string) => finishedRun().filter((r) => Date.parse(r.ts) <= Date.parse(iso));
+
+  it("orders the model cells turns, tool calls, active time, tokens in, tokens out, context", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    expect(labelsOf(view, "model")).toEqual(["TURNS", "TOOL CALLS", "ACTIVE TIME", "TOKENS IN", "TOKENS OUT", "CTX PEAK"]);
+  });
+
+  it("counts every tool call, and only the ones that could not run as failed", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const cell = view.metrics.find((m) => m.label === "TOOL CALLS");
+    expect(cell?.value).toBe("3");
+    expect(cell?.sub).toBe("1 failed");
+  });
+
+  it("active time is the run's own wall clock, with thermal rest under it", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const cell = view.metrics.find((m) => m.label === "ACTIVE TIME");
+    expect(cell?.value).toBe("10:00");
+    expect(cell?.sub).toBe("0:45 thermal rest");
+  });
+
+  it("an armed thermal governor that never fired still says so under active time", () => {
+    const data = finishedRun().filter((r) => r.action !== "dispatch.rest");
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("0:00 thermal rest");
+  });
+
+  it("moves wall clock and thermal rest out of SYSTEM: nothing on the page twice", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const system = labelsOf(view, "system");
+    expect(system).not.toContain("WALL CLOCK");
+    expect(system).not.toContain("THERMAL REST");
+    expect(view.metrics.filter((m) => m.label === "ACTIVE TIME")).toHaveLength(1);
+  });
+
+  it("other rest kinds stay SYSTEM tiles", () => {
+    const data = [
+      ...finishedRun(),
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } } as unknown as FlowRecord,
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(labelsOf(view, "system")).toContain("TURN DELAY");
+  });
+
+  it("the context cell carries a bar: now and peak against the window", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const cell = view.metrics.find((m) => m.label === "CTX PEAK");
+    expect(cell?.value).toBe("30.00k");
+    expect(cell?.bar).toEqual({ nowPct: 12, peakPct: 30 });
+  });
+
+  it("a finished run has no TOK/S tile; the average goes to the scope instead", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    expect(view.metrics.find((m) => m.label === "TOK/S")).toBeUndefined();
+    // 200 tokens over 2.5s of generation.
+    expect(view.finishedTokRate).toEqual({ average: "80", sub: null });
+  });
+
+  it("a live run has no finished average, and a finished one has no live reading", () => {
+    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:08Z")), "s1", Date.parse("2026-01-01T00:00:08Z"));
+    expect(live.finishedTokRate).toBeNull();
+    expect(live.liveTokScope).not.toBeNull();
+    const done = runRegions(flowToRenderModel(finishedRun()), "s1");
+    expect(done.liveTokScope).toBeNull();
+  });
+
+  it("a live run in TOOLS names the tool for the scope's icon", () => {
+    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:06Z")), "s1", Date.parse("2026-01-01T00:00:06Z"));
+    expect(live.liveTokScope).toMatchObject({ state: "tools", toolName: "bash" });
+  });
+
+  it("a live run's active time counts up, still in MODEL", () => {
+    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:08Z")), "s1", Date.parse("2026-01-01T00:00:08Z"));
+    expect(live.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("0:08 so far");
+  });
+
+  it("a unit with no model work keeps WALL CLOCK in SYSTEM", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "p1", action: "step.start" },
+      { ts: "2026-01-01T00:00:30Z", session_id: "p1", action: "session.end" },
+    ] as FlowRecord[];
+    const view = runRegions(flowToRenderModel(data), "p1");
+    expect(view.metricScope.model).toEqual([]);
+    expect(labelsOf(view, "system")).toContain("WALL CLOCK");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")).toBeUndefined();
+  });
 });

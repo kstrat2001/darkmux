@@ -11,6 +11,8 @@
      state lamps under it, live here so the rules below name them. */
   --scope-phosphor: #7dffa0;
   --scope-phosphor-glow: rgba(125, 255, 160, 0.6);
+  /* (#2890) The no-signal static's gray. */
+  --scope-nosignal: #96a0aa;
   --scope-bezel-hi: #1a221c;
   --scope-bezel-lo: #111712;
   --scope-bezel-rim: #1c261e;
@@ -5619,26 +5621,6 @@ body {
   .session-run .metrics {
     grid-template-columns: repeat(2, 1fr);
   }
-  /* (#2877 pass 2, "grow it so the effect is large") The TOK/S scope tile
-     spans the full 2-column row at phone width, and its bezel grows to
-     match — the whole reason to give it the row. `--d`/`--rim` are
-     overridden here, not `aspect-ratio` + percentage padding — see the
-     token-scope block's own doc for why that renders as an oval in Safari;
-     this keeps the SAME explicit-square mechanism, just with bigger
-     numbers. Diameter sits in the 180-220px band the report asked for;
-     the center label scales up with it (below) so the number stays
-     legible at the new size instead of looking lost in the middle of a
-     much bigger tube. */
-  .session-run .met.scopetile {
-    grid-column: 1 / -1;
-  }
-  .session-run .met.scopetile .token-scope-bezel--tile {
-    --d: 200px;
-    --rim: 8px;
-  }
-  .session-run .met.scopetile .token-scope-center .token-scope-n {
-    font-size: 40px;
-  }
 }
 /* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
    width, via `order` rather than DOM position. The DOM keeps `.mv` before
@@ -5686,16 +5668,129 @@ body {
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
 }
-/* (#2877) The fifth MODEL tile, live only — see `SessionReplay.tsx`'s
-   render note next to `view.liveTokScope`. Centers the bezel under the
-   `TOK/S` label instead of the flex-start every other tile's short text
-   value uses. */
-.session-run .met.scopetile {
-  align-items: center;
+/* (#2890) The MODEL section: ONE container, ported from the approved
+   prototype (`model-section-prototype.html`). The scope is the hero on the
+   left with its lamp row under it; the figures fill a collection grid on the
+   right (3x2, cells stretching to the full height) divided by hairlines, not
+   per-metric cards; the loaded models sit below a hairline. The hairlines are
+   the grid's 1px gap showing the container's rule color between opaque
+   cells. Phone: the scope goes full width on top, a 2x3 grid, models last. */
+.session-run .modelbox {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
 }
-.session-run .met.scopetile .token-scope-bezel {
+.session-run .modelbox__main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+.session-run .modelbox__hero {
+  padding: 24px 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  border-right: 1px solid var(--border);
+}
+.session-run .modelbox__hero .token-scope-bezel--tile {
+  --d: 240px;
+  --rim: 9px;
+}
+/* In DOM order here (scope, lamps, note), not the old tile's `order: 4`. */
+.session-run .modelbox__hero .scope-lamps {
+  order: 0;
+  margin-top: 0;
+}
+/* The "no signal" words, or a finished average's qualifier, under the lamps. */
+.session-run .modelbox__note {
+  font-size: calc(11px * var(--fs-scale));
+  letter-spacing: 0.1em;
+  color: var(--dim);
+}
+.session-run .metrics.modelbox__figs {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
+  gap: 1px;
+  margin: 0;
+  background: var(--border);
+}
+.session-run .modelbox__figs .met {
+  border: 0;
+  border-radius: 0;
+  background: var(--panel-2);
+  padding: 22px 24px;
+  justify-content: center;
+  min-width: 0;
+}
+.session-run .modelbox__figs .ml {
+  font-size: calc(11px * var(--fs-scale));
+  letter-spacing: 0.1em;
+}
+.session-run .modelbox__figs .mv {
+  font-size: calc(28px * var(--fs-scale));
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.session-run .modelbox__figs .msub {
+  font-size: calc(11px * var(--fs-scale));
+  margin-top: 6px;
+}
+/* The context cell's thin bar: the peak as a faint fill, the context in use
+   now as the solid one on top. Between the value and the sub line, by the
+   same `order` mechanism the rest of the cell uses. */
+.session-run .mbar {
   order: 3;
-  margin-top: 4px;
+  position: relative;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--dim) 22%, transparent);
+}
+.session-run .mbar i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+.session-run .mbar__peak {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.session-run .mbar__now {
+  background: var(--accent);
+}
+.session-run .modelbox__models {
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  margin: 0;
+  padding: 14px 18px;
+}
+@media (max-width: 720px) {
+  .session-run .modelbox__main {
+    grid-template-columns: 1fr;
+  }
+  .session-run .modelbox__hero {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 24px 16px;
+  }
+  .session-run .modelbox__hero .token-scope-bezel--tile {
+    --d: min(78vw, 300px);
+  }
+  .session-run .metrics.modelbox__figs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .session-run .modelbox__figs .met {
+    padding: 18px 16px;
+  }
+  .session-run .modelbox__figs .mv {
+    font-size: calc(22px * var(--fs-scale));
+  }
 }
 /* (operator, 2026-09-05) The third slot — see `SessionRunView.metrics.sub`
    in `sessionRun.ts`. A qualifying fact (CTX's window ceiling, the peak
@@ -8358,6 +8453,48 @@ body {
   opacity: 0.55;
   text-shadow: none;
 }
+/* (#2890) The run page's hero: the rate (or the finished average) at the
+   prototype's size, with its unit quietly under it. */
+.session-run .modelbox__hero .token-scope-center .token-scope-n {
+  font-size: 40px;
+  line-height: 0.9;
+}
+.token-scope-center .token-scope-u {
+  margin-top: 6px;
+  font: 11px var(--font-mono);
+  letter-spacing: 0.1em;
+  color: var(--scope-phosphor);
+  opacity: 0.7;
+}
+/* A finished run's center is calm, like its dimmed ring. */
+.token-scope-bezel[data-state="finished"] .token-scope-center {
+  opacity: 0.8;
+}
+/* (#2890) TOOLS: a glowing line icon for the tool, sized per placement. */
+.token-scope-bezel {
+  --ico: 16px;
+}
+.token-scope-bezel--card {
+  --ico: 28px;
+}
+.token-scope-bezel--tile {
+  --ico: 26px;
+}
+.session-run .modelbox__hero .token-scope-bezel--tile {
+  --ico: 64px;
+}
+.token-scope-center--icon .token-scope-ico {
+  display: block;
+  width: var(--ico);
+  height: var(--ico);
+  color: var(--lamp-tools);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-tools) 80%, transparent));
+}
+@media (max-width: 560px) {
+  .token-scope-bezel--card {
+    --ico: 36px;
+  }
+}
 /* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
-   frame and never animates again (see `TokenScope.tsx`), so nothing here
-   needs a reduced-motion media query of its own. */
+   settled frame per state change and never loops (see `TokenScope.tsx`), so
+   nothing here needs a reduced-motion media query of its own. */

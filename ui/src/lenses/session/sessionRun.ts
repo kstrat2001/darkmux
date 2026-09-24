@@ -59,6 +59,12 @@ import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
+import { toolOutcome } from "../../lib/recordDetail";
+
+/** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
+ *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
+const WALL_HINT_TITLE =
+  "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
 
 export type PillCls = "run" | "err" | "done" | "canceled";
 
@@ -155,7 +161,17 @@ export interface SessionRunView {
    * instead. Every tile renders its `sub` slot, empty or not, so the grid
    * doesn't go ragged the moment one tile has more to say than its
    * neighbors — see `.session-run .msub` in `styles.css`. */
-  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }>;
+  metrics: Array<{
+    value: string;
+    label: string;
+    hint?: string;
+    hintTitle?: string;
+    sub?: string;
+    unit?: string;
+    /** (#2890) The context cell's thin bar: the context in use now and its
+     *  peak, each as a percentage (0..100) of the window. */
+    bar?: { nowPct: number; peakPct: number };
+  }>;
   /** (#1973) Which metrics describe the MODEL's work and which describe the
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
@@ -202,8 +218,18 @@ export interface SessionRunView {
          *  "no signal" word rather than reusing the ambiguous "no model
          *  working" wording both cases would otherwise share. */
         noSignal: boolean;
+        /** (#2890) Present only when `state === "tools"`: the tool the scope's
+         *  center draws as an icon. See `LiveStateReading.toolName`. */
+        toolName?: string;
       }
     | null;
+  /** (#2890) A FINISHED run's average generation rate, shown in the MODEL
+   *  hero scope's center ("avg tok/s") rather than as a TOK/S tile. `sub` is
+   *  the qualifier `averageGenerationRate`'s labeling rules produce when the
+   *  average is partial or a fallback ("avg · 1 of 2 turns", "avg · wall
+   *  clock", "avg · unbilled"), `null` for the ordinary average. `null`
+   *  while the run is live or when it did no model work. */
+  finishedTokRate: { average: string; sub: string | null } | null;
   /** (#2863) Whether the MODEL section shows its model card. False for an
    * endpoint-served run: the card could only repeat the model name the
    * brief's `model` row already shows. */
@@ -959,88 +985,17 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // conditional (host tiles only exist when host telemetry does), and an
   // audit already flagged the hardcoded form as a positional contract nothing
   // enforced — this makes the two unable to drift because there is only one.
-  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }> = [];
+  const metrics: SessionRunView["metrics"] = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string) => {
+  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string, bar?: { nowPct: number; peakPct: number }) => {
     into.push(metrics.length);
-    metrics.push({ value, label, hint, hintTitle, sub, unit });
+    metrics.push(bar ? { value, label, hint, hintTitle, sub, unit, bar } : { value, label, hint, hintTitle, sub, unit });
   };
-  push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
-  push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
-  push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
-  push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub);
-  // (#2877) The fifth MODEL tile, TOK/S. A FINISHED run gets a plain text
-  // tile like its four neighbors here — "the scope goes... the tile shows
-  // the final measured tok/s" (issue text). A run still in progress does
-  // NOT push here at all; `SessionReplay.tsx` renders `liveTokScope` (the
-  // live canvas + centered number) as the fifth tile instead, since a
-  // pushed string tile has no way to host a component. Final rate: total
-  // billed output tokens over the run's own wall clock — the same two
-  // numbers TOKENS OUT and WALL CLOCK already show, so this tile's number
-  // is reconcilable against its neighbors rather than a third, opaque
-  // measurement.
-  if (done) {
-    // The model's generation rate: billed tokens over generation time, an
-    // exact average, not an estimate. Wall clock is only the fallback for a
-    // runtime that predates `generation_ms`, and the label says so.
-    //
-    // (#2886) `genRate` now also says how many of the turns that PAIRED a
-    // `generation_ms` with billed tokens actually went into the average —
-    // a checkpointed turn is excluded (see `averageGenerationRate`'s own
-    // doc). Three outcomes, per the issue's acceptance:
-    // 1. Every paired turn billed: the ordinary "avg" label, unchanged.
-    // 2. Some excluded, at least one remains: "avg · M of N turns" so the
-    //    reader knows the average is partial, not silently wrong.
-    // 3. Turns existed but ALL were checkpointed (`tokensPerSec: null`):
-    //    show "—", never the wall-clock fallback — that fallback is for
-    //    when there is NO generation_ms data at all (an older runtime),
-    //    not for "every measured turn turned out to be unbillable".
-    const genRate = averageGenerationRate(tokRateRecordSets);
-    const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
-    let finalTokPerSec: number | null;
-    let tokSub: string;
-    if (genRate == null) {
-      finalTokPerSec = wallRate;
-      tokSub = "avg · wall clock";
-    } else if (genRate.tokensPerSec == null) {
-      finalTokPerSec = null;
-      tokSub = "avg · unbilled";
-    } else {
-      finalTokPerSec = genRate.tokensPerSec;
-      tokSub = genRate.billedTurns === genRate.totalTurns ? "avg" : `avg · ${genRate.billedTurns} of ${genRate.totalTurns} turns`;
-    }
-    push(modelIdx, finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—", "TOK/S", undefined, undefined, tokSub);
-  }
-  // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
-  // the model's work, and the gate — while this tile is the dispatch's own
-  // `wall_ms`, the runtime's measure of the execution alone. On a real
-  // mission the same step read 10:36 there and 10:07 here with nothing on
-  // either screen saying why. The flow record carries no step span (see
-  // `DispatchCompletePayload`: no step start/end field exists), so this side
-  // cannot show BOTH numbers — it can only stop being anonymous, which is
-  // what the label does. `StepRow.tsx` carries the matching half.
-  push(
-    systemIdx,
-    wallBase,
-    "WALL CLOCK",
-    "run time",
-    "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
-    wallSub,
-  );
-  // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
-  // and it is the reading contract 8 supports: the harness DECIDES to compact
-  // and performs it through a UTILITY role's sub-execution. The specialist
-  // neither chooses it nor does it; it only experiences the result.
-  // An earlier comment here argued the opposite — that an operator reads it
-  // as "what happened to this model's context" — which describes the EFFECT
-  // rather than the actor, and is exactly the blending the sub-execution rule
-  // exists to stop.
-  // Gated on model work for the same reason the model pane is: a
-  // `procedural.shell` step has no context to compact, so `0 COMPACTIONS`
-  // would assert "the harness compacted nothing" where the truth is "there
-  // was nothing here that could be compacted".
-  if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
+  // (#2890) Whether run time is shown as the MODEL section's ACTIVE TIME cell
+  // (any unit with a model section) or as SYSTEM's WALL CLOCK (a unit with
+  // none, such as a `procedural.shell` step).
+  const activeInModel = effHasModelWork;
   // (rest-reason cards) One SYSTEM tile per rest KIND — THERMAL REST / TURN
   // DELAY / BATTERY PAUSE / OPERATOR HOLD, plus a generic label for a
   // reason string this file doesn't recognize — replacing the single
@@ -1092,7 +1047,135 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const extraKinds = [...restByKind.keys()]
     .filter((k) => !restKindOrder.includes(k))
     .sort((a, b) => (restByKind.get(b)?.totalMs ?? 0) - (restByKind.get(a)?.totalMs ?? 0));
+  // (#2890) The MODEL section's cells, in the order the operator reads them:
+  // turns, tool calls, active time, tokens in, tokens out, context. TOOL
+  // CALLS and ACTIVE TIME came up from the machine's section; each figure is
+  // on the page once.
+  push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
+  if (activeInModel) {
+    // Every `dispatch.tool` record of the same executions the turn and token
+    // counts describe (this session, or the mission's inner executions when
+    // those numbers rolled up). "Failed" is `toolOutcome`'s rule, the one the
+    // event log row uses: a command that ran and exited non-zero is the tool
+    // working, not a failure (#2008).
+    const toolSids = new Set(tokRateSids);
+    let toolCalls = 0;
+    let toolFailed = 0;
+    for (const r of toolSids.size === 1 && toolSids.has(sid) ? attemptRecs : visible) {
+      if (r.action !== "dispatch.tool" || !toolSids.has(r.session_id ?? "")) continue;
+      toolCalls += 1;
+      if (toolOutcome((r.fields || r.payload || {}) as Record<string, unknown>) === "failed") toolFailed += 1;
+    }
+    push(modelIdx, String(toolCalls), "TOOL CALLS", undefined, undefined, `${toolFailed} failed`);
+    // The same run time WALL CLOCK shows, with the thermal rest it includes
+    // named under it in the approved prototype's words ("1:00 thermal
+    // rest"; the hover title says the figure INCLUDES it) (the THERMAL REST tile's own rule: shown when the
+    // governor was armed for this dispatch or a rest actually occurred).
+    const thermal = restByKind.get("thermal");
+    const thermalShown = restConfiguredByKind.thermal === true || thermal != null;
+    const activeSub = [wallSub, thermalShown ? `${fmtElapsed(thermal?.totalMs ?? 0)} thermal rest` : undefined].filter(Boolean).join(" · ") || undefined;
+    push(modelIdx, wallBase, "ACTIVE TIME", undefined, WALL_HINT_TITLE, activeSub);
+  }
+  push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
+  push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
+  // (#2890) A thin bar under the context figure: now and peak against the
+  // window, as percentages of it.
+  const ctxBar =
+    effNctx > 0
+      ? {
+          nowPct: Math.min(100, Math.max(0, (effCtxNow / effNctx) * 100)),
+          peakPct: Math.min(100, Math.max(0, (effCtxPeak / effNctx) * 100)),
+        }
+      : undefined;
+  push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub, undefined, ctxBar);
+  // (#2877) The fifth MODEL tile, TOK/S. A FINISHED run gets a plain text
+  // tile like its four neighbors here — "the scope goes... the tile shows
+  // the final measured tok/s" (issue text). A run still in progress does
+  // NOT push here at all; `SessionReplay.tsx` renders `liveTokScope` (the
+  // live canvas + centered number) as the fifth tile instead, since a
+  // pushed string tile has no way to host a component. Final rate: total
+  // billed output tokens over the run's own wall clock — the same two
+  // numbers TOKENS OUT and WALL CLOCK already show, so this tile's number
+  // is reconcilable against its neighbors rather than a third, opaque
+  // measurement.
+  let finishedTokRate: SessionRunView["finishedTokRate"] = null;
+  if (done && effHasModelWork) {
+    // The model's generation rate: billed tokens over generation time, an
+    // exact average, not an estimate. Wall clock is only the fallback for a
+    // runtime that predates `generation_ms`, and the label says so.
+    //
+    // (#2886) `genRate` now also says how many of the turns that PAIRED a
+    // `generation_ms` with billed tokens actually went into the average —
+    // a checkpointed turn is excluded (see `averageGenerationRate`'s own
+    // doc). Three outcomes, per the issue's acceptance:
+    // 1. Every paired turn billed: the ordinary "avg" label, unchanged.
+    // 2. Some excluded, at least one remains: "avg · M of N turns" so the
+    //    reader knows the average is partial, not silently wrong.
+    // 3. Turns existed but ALL were checkpointed (`tokensPerSec: null`):
+    //    show "—", never the wall-clock fallback — that fallback is for
+    //    when there is NO generation_ms data at all (an older runtime),
+    //    not for "every measured turn turned out to be unbillable".
+    const genRate = averageGenerationRate(tokRateRecordSets);
+    const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
+    let finalTokPerSec: number | null;
+    let tokSub: string;
+    if (genRate == null) {
+      finalTokPerSec = wallRate;
+      tokSub = "avg · wall clock";
+    } else if (genRate.tokensPerSec == null) {
+      finalTokPerSec = null;
+      tokSub = "avg · unbilled";
+    } else {
+      finalTokPerSec = genRate.tokensPerSec;
+      tokSub = genRate.billedTurns === genRate.totalTurns ? "avg" : `avg · ${genRate.billedTurns} of ${genRate.totalTurns} turns`;
+    }
+    // (#2890) No TOK/S tile any more: a finished run keeps the scope as the
+    // MODEL hero with this average in its center ("avg tok/s" is the unit
+    // there). The sub line appears only when it says more than "avg".
+    finishedTokRate = {
+      average: finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—",
+      sub: tokSub === "avg" ? null : tokSub,
+    };
+  }
+  // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
+  // the model's work, and the gate — while this tile is the dispatch's own
+  // `wall_ms`, the runtime's measure of the execution alone. On a real
+  // mission the same step read 10:36 there and 10:07 here with nothing on
+  // either screen saying why. The flow record carries no step span (see
+  // `DispatchCompletePayload`: no step start/end field exists), so this side
+  // cannot show BOTH numbers — it can only stop being anonymous, which is
+  // what the label does. `StepRow.tsx` carries the matching half.
+  //
+  // (#2890) When this unit did model work, the same figure is the MODEL
+  // section's ACTIVE TIME cell (pushed above, with thermal rest under it);
+  // SYSTEM keeps WALL CLOCK only for a unit with no model section.
+  if (!activeInModel) {
+    push(
+      systemIdx,
+      wallBase,
+      "WALL CLOCK",
+      "run time",
+      WALL_HINT_TITLE,
+      wallSub,
+    );
+  }
+  // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
+  // and it is the reading contract 8 supports: the harness DECIDES to compact
+  // and performs it through a UTILITY role's sub-execution. The specialist
+  // neither chooses it nor does it; it only experiences the result.
+  // An earlier comment here argued the opposite — that an operator reads it
+  // as "what happened to this model's context" — which describes the EFFECT
+  // rather than the actor, and is exactly the blending the sub-execution rule
+  // exists to stop.
+  // Gated on model work for the same reason the model pane is: a
+  // `procedural.shell` step has no context to compact, so `0 COMPACTIONS`
+  // would assert "the harness compacted nothing" where the truth is "there
+  // was nothing here that could be compacted".
+  if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
   for (const key of [...restKindOrder, ...extraKinds]) {
+    // (#2890) Thermal rest rides under ACTIVE TIME in MODEL when that cell
+    // exists, so it is not shown twice.
+    if (key === "thermal" && activeInModel) continue;
     const occurred = restByKind.get(key);
     const configured = restConfiguredByKind[key] === true;
     if (!configured && !occurred) continue;
@@ -1456,8 +1539,10 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
             state: tokRateLiveState?.state ?? null,
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
             noSignal: tokRateNoSignal,
+            toolName: tokRateLiveState?.state === "tools" ? tokRateLiveState.toolName : undefined,
           }
         : null,
+    finishedTokRate,
     showModelCard,
     modelTrackLabel,
     modelTrackLines,

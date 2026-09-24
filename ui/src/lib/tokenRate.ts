@@ -376,6 +376,13 @@ export interface LiveStateReading {
    * (`Math.ceil` of the ms remaining) — present only when `state ===
    * "rest"`. */
   restSecondsLeft?: number;
+  /** (#2890) Present only when `state === "tools"` and a tool of the CURRENT
+   *  turn has completed: the latest completed call's `tool_name`, which the
+   *  scope's TOOLS center draws as an icon. `dispatch.tool` is emitted on
+   *  completion, so before a turn's first completion there is no name yet
+   *  (the icon falls back to the gear). A previous turn's tool never carries
+   *  over. */
+  toolName?: string;
 }
 
 /** A record whose action marks a state transition, reduced to its ordering
@@ -434,6 +441,9 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   // when the turn record does not say how many calls it made (older
   // records), and then a completion reads as TOOLS, the old behavior.
   let pendingTools: number | null = null;
+  // (#2890) The latest completed tool of the current turn, reset at each turn
+  // boundary so an earlier turn's tool never names this one.
+  let turnToolName: string | null = null;
   const ordered = [...cut].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   for (const r of ordered) {
     const atMs = Date.parse(r.ts);
@@ -441,13 +451,17 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
     let m: StateMarker | null = null;
     if (r.action === "dispatch.start") {
       pendingTools = null;
+      turnToolName = null;
       m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.turn") {
       const calls = num(fields(r).tool_calls_count);
       pendingTools = calls;
+      turnToolName = null;
       m = { atMs, kind: calls !== null && calls > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.tool") {
       if (pendingTools !== null && pendingTools > 0) pendingTools -= 1;
+      const name = fields(r).tool_name;
+      if (typeof name === "string" && name) turnToolName = name;
       m = { atMs, kind: pendingTools === null || pendingTools > 0 ? "tools" : "prompt" };
     } else if (r.action === "dispatch.rest") {
       // Only the completed-rest shape (`ms` present) counts — the
@@ -482,6 +496,7 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       if (remaining > 0) return { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
       return { state: "prompt" };
     }
+    if (found.kind === "tools" && turnToolName !== null) return { state: "tools", toolName: turnToolName };
     return { state: found.kind };
   }
 
@@ -747,6 +762,9 @@ export interface ExecutionTokenReading {
   /** Meaningful only alongside a non-null `tokensPerSec` — see
    *  `TokenRateReading.carried`'s own doc. */
   carried: boolean;
+  /** (#2890) Present only when `state === "tools"` — see
+   *  `LiveStateReading.toolName`. */
+  toolName?: string;
 }
 
 export function executionTokenReading(
@@ -777,6 +795,7 @@ export function executionTokenReading(
     restSecondsLeft: state === "rest" ? liveState?.restSecondsLeft : undefined,
     tokensPerSec: reading?.tokensPerSec ?? null,
     carried: reading?.carried ?? false,
+    toolName: state === "tools" ? liveState?.toolName : undefined,
   };
 }
 

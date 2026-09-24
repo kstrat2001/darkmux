@@ -10,6 +10,7 @@ describe("scope tone: the trace takes the lit lamp's color", () => {
       rest: "--lamp-rest",
       stalled: "--lamp-stall",
       none: "--scope-phosphor",
+      nosignal: "--scope-nosignal",
     });
   });
 

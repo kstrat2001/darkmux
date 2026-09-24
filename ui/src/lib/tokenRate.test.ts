@@ -444,7 +444,8 @@ describe("deriveLiveState", () => {
   it("is tools while a dispatch.tool is the latest thing and no heartbeat has followed it", () => {
     const toolAt = 1_000 + STALL_AFTER_MS + 200;
     const recs = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];
-    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools" });
+    // (#2890) The completed tool's name rides along for the TOOLS icon.
+    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   // (Found via screenshot verification against the real corpus — a
@@ -466,7 +467,7 @@ describe("deriveLiveState", () => {
       beat(beatAtMs, 5_623),
       { ts: toolTs, action: "dispatch.tool", session_id: SID, payload: { tool_name: "edit" } } as unknown as FlowRecord,
     ];
-    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools", toolName: "edit" });
   });
 
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
@@ -481,7 +482,7 @@ describe("deriveLiveState", () => {
 
   it("ignores the announce-only rest record (no ms) — a pacing nudge, not a rest", () => {
     const recs = [tool(0), restAnnounceOnly(1_000)];
-    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   it("is stalled once a heartbeat has gone stale with nothing after it to explain the gap", () => {
@@ -491,14 +492,14 @@ describe("deriveLiveState", () => {
 
   it("prefers a marker newer than the last stale heartbeat over calling it stalled", () => {
     const recs = [beat(0, 10), beat(1_000, 200), tool(1_000 + STALL_AFTER_MS + 500)];
-    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   it("ignores records after the given clock — never reads the future", () => {
     // The rest record technically exists in the array, but its ts is after
     // `nowMs`; the state must read as if it had not happened yet.
     const recs = [tool(0), rest(5_000, 15_000)];
-    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   it("mutation self-check: without the rest branch this would read prompt/tools instead", () => {
@@ -778,6 +779,46 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
   it("is PROMPT once every tool the turn called has completed", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000), tool(6_000)];
     expect(deriveLiveState(recs, 7_000).state).toBe("prompt");
+  });
+  // (#2890) The TOOLS center shows an icon for the tool. The runtime emits
+  // `dispatch.tool` on COMPLETION, so the name the viewer has is the latest
+  // completed call of THIS turn; a previous turn's tool must never leak in.
+  const namedTool = (atMs: number, name: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name } }) as unknown as FlowRecord;
+
+  it("names the latest completed tool of this turn while TOOLS", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(6_000, "edit")];
+    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "edit" });
+  });
+
+  it("names no tool before this turn's first completion", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2)];
+    expect(deriveLiveState(recs, 5_000)).toEqual({ state: "tools" });
+  });
+
+  it("never carries the previous turn's tool into this one", () => {
+    const recs = [
+      start(0),
+      beat(1_000, 0),
+      beat(3_000, 800),
+      turn(4_000, 1, 1),
+      namedTool(5_000, "bash"),
+      beat(6_000, 0),
+      beat(8_000, 900),
+      turn(9_000, 2, 2),
+    ];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools" });
+  });
+
+  it("ignores a tool completion from after the clock (playback cut)", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(9_000, "edit")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  });
+
+  it("carries the name through executionTokenReading and aggregateLiveState", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "search")];
+    expect(executionTokenReading(recs, 6_000).toolName).toBe("search");
+    expect(aggregateLiveState([recs], 6_000)).toEqual({ state: "tools", toolName: "search" });
   });
 });
 

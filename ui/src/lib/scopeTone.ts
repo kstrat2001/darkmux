@@ -10,6 +10,9 @@ export const SCOPE_TONE_TOKEN = {
   rest: "--lamp-rest",
   stalled: "--lamp-stall",
   none: "--scope-phosphor",
+  // (#2890) A stall the page could not trust (connection lost): the static
+  // draws in a neutral gray, not a lamp's color, since no lamp is lit.
+  nosignal: "--scope-nosignal",
 } as const;
 
 export type ScopeTone = keyof typeof SCOPE_TONE_TOKEN;

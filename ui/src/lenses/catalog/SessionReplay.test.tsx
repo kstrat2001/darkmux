@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { SessionReplay } from "./SessionReplay";
+import { SessionReplay, modelScopeHero } from "./SessionReplay";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
 // green while broken in the actual render path — `effectiveConnected`/
@@ -226,20 +226,19 @@ describe("SessionReplay", () => {
     renderReplay("s-disc");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
-    const tiles = [...document.querySelectorAll('.metrics[data-scope="system"] .met')];
-    const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "WALL CLOCK");
-    expect(wall, "the WALL CLOCK tile").toBeTruthy();
-    expect(wall?.querySelector(".ml")?.getAttribute("data-hint")).toBe("run time");
-    // (#2863) Drawn under the value, not appended to the label, so the label
-    // stays one line in a narrow tile.
-    expect(wall?.getAttribute("data-subhint")).toBe("run time");
+    // (#2890) A dispatch's run time is the MODEL section's ACTIVE TIME cell
+    // now. Its label already names it, so the short "run time" hint under the
+    // value is gone; the hover title still spells the span out.
+    const tiles = [...document.querySelectorAll('.metrics[data-scope="model"] .met')];
+    const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "ACTIVE TIME");
+    expect(wall, "the ACTIVE TIME cell").toBeTruthy();
     const title = wall?.getAttribute("title") ?? "";
     expect(title).toContain("run time");
     // It has to name what it EXCLUDES, or the label is just another word.
     expect(title).toContain("step");
 
-    // No other tile borrowed the hint — this is a distinction, not decoration.
-    expect(tiles.filter((t) => t.querySelector(".ml")?.hasAttribute("data-hint")).length).toBe(1);
+    // No cell carries a short hint any more: each label names its figure.
+    expect(tiles.filter((t) => t.querySelector(".ml")?.hasAttribute("data-hint")).length).toBe(0);
 
     // And the golden's text is untouched.
     expect(wall?.textContent).not.toContain("run time");
@@ -336,9 +335,10 @@ describe("SessionReplay", () => {
     // performs it via a utility role. The specialist only experiences it.
     expect(model?.textContent).not.toContain("COMPACTIONS");
     expect(system?.textContent).toContain("COMPACTIONS");
-    // WALL CLOCK is the harness's measure of the run, not the model's work.
-    expect(model?.textContent).not.toContain("WALL CLOCK");
-    expect(system?.textContent).toContain("WALL CLOCK");
+    // (#2890) The run's time came up into MODEL as ACTIVE TIME, once.
+    expect(model?.textContent).toContain("ACTIVE TIME");
+    expect(system?.textContent).not.toContain("WALL CLOCK");
+    expect(system?.textContent).not.toContain("ACTIVE TIME");
   });
 
   // Both producer lineages' bookend spellings. The space form is the one a
@@ -509,14 +509,14 @@ describe("SessionReplay", () => {
 
     const secs = [...document.querySelectorAll(".session-run .runsec")];
     expect(secs.map((e) => e.getAttribute("data-head"))).toEqual(["model", "system", "signals"]);
-    // The model card sits inside the MODEL section, after its tiles.
+    // The model card sits inside the MODEL section, after its figures, in the
+    // same container (#2890).
     const model = secs[0];
-    expect(model.querySelector('.metrics[data-scope="model"]')?.nextElementSibling?.querySelector(".lbl")?.textContent).toBe(
-      "loaded models",
-    );
+    expect(model.querySelector(".modelbox__main")?.nextElementSibling?.querySelector(".lbl")?.textContent).toBe("loaded models");
+    expect(model.querySelector(".modelbox > .modelbox__models")).toBeInTheDocument();
     const txt = document.querySelector(".session-run")?.textContent ?? "";
     expect(txt.indexOf("TOKENS OUT")).toBeLessThan(txt.indexOf("loaded models"));
-    expect(txt.indexOf("loaded models")).toBeLessThan(txt.indexOf("WALL CLOCK"));
+    expect(txt.indexOf("loaded models")).toBeLessThan(txt.indexOf("COMPACTIONS"));
   });
 
   it("(#1973) renders a signal group with its severity, count badge and run-relative time", async () => {
@@ -584,7 +584,7 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
     expect(before).toContain("so far");
 
@@ -636,7 +636,7 @@ describe("SessionReplay", () => {
     ];
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const { rerender } = render(
@@ -693,7 +693,7 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
     act(() => {
       vi.advanceTimersByTime(10_000);
@@ -1123,7 +1123,10 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
       </QueryClientProvider>,
     );
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
-    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: "no signal", stalled: false, tone: "none" });
+    // (#2890) The tube shows static (the `nosignal` state) with an empty
+    // center, and the words sit under the lamps.
+    expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
+    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("no signal");
   });
 
   // (finding F5, "effectiveConnected = connected") A SCRUBBED playhead must
@@ -1142,7 +1145,7 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
       </QueryClientProvider>,
     );
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
-    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, stalled: true, tone: "stalled" });
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, state: "stalled" });
   });
 
   // (finding F5, "effectiveLastContactMs = lastContactMs") A SCRUBBED
@@ -1162,7 +1165,7 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
       </QueryClientProvider>,
     );
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
-    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, stalled: true, tone: "stalled" });
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, state: "stalled" });
   });
 
   // (finding F5, "centerCarried={false}") The generating + carried case,
@@ -1186,6 +1189,156 @@ describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)",
       </QueryClientProvider>,
     );
     await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
-    expect(latestTokenScopeProps()).toMatchObject({ tone: "generating", centerCarried: true });
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", centerCarried: true, centerUnit: "tok/s" });
+  });
+});
+
+// (#2890) The MODEL section as the operator sees it: one container, the scope
+// as the hero with one line of lamps, a collection grid of six figures, the
+// loaded models below. Rendered through the real component with the mocked
+// scope, so the assertions are on what reaches the screen and on the props the
+// scope receives.
+describe("SessionReplay MODEL section (#2890)", () => {
+  const SID = "s-model";
+  const at = (sec: number) => new Date(Date.UTC(2026, 8, 24, 1, 0, 0) + sec * 1000).toISOString();
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => ({
+    ts: at(sec),
+    action,
+    session_id: SID,
+    machine_id: "MacBook-Pro",
+    payload,
+    ...extra,
+  });
+  function finishedRun() {
+    return [
+      rec(0, "dispatch.start", { role: "coder", bounds: { thermal_pacing_enabled: { value: true } } }, { handle: "darkmux/coder", model: "darkmux:qwen3.6-35b" }),
+      rec(1, "telemetry.lms", {}, { category: "telemetry", source: "lms", fields: { event: "load", model: "qwen3.6-35b", gb: 18 } }),
+      rec(4, "dispatch.turn", { turn_seq: 1, tool_calls_count: 2, generation_ms: 2_500 }),
+      rec(4, "telemetry.tokens", { turn_seq: 1, prompt_tokens: 1000, completion_tokens: 200 }, { category: "telemetry", source: "tokens" }),
+      rec(5, "telemetry.context", { used: 30000, max: 100000 }, { category: "telemetry", source: "context" }),
+      rec(5, "dispatch.tool", { tool_name: "read", ok: true, outcome: "ok" }),
+      rec(6, "dispatch.tool", { tool_name: "edit", ok: false, outcome: "failed" }),
+      rec(20, "dispatch.rest", { ms: 45000, reason: "thermal-duty-cycle" }),
+      rec(70, "telemetry.context", { used: 12000, max: 100000 }, { category: "telemetry", source: "context" }),
+      rec(600, "dispatch.complete", { wall_ms: 600000, prompt_tokens: 1000, completion_tokens: 200 }),
+    ];
+  }
+  async function renderRun(records: unknown[]) {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay(SID);
+    // `vi.waitFor`, which also works under fake timers.
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+  }
+  const cells = () =>
+    [...document.querySelectorAll('.modelbox .metrics[data-scope="model"] .met')].map((c) => ({
+      label: c.querySelector(".ml")?.textContent,
+      value: c.querySelector(".mv")?.textContent,
+      sub: c.querySelector(".msub")?.textContent ?? null,
+      bar: c.querySelector(".mbar") !== null,
+    }));
+
+  it("lays the figures out as six cells in reading order, with their sub lines", async () => {
+    await renderRun(finishedRun());
+    expect(cells()).toEqual([
+      { label: "TURNS", value: "1", sub: null, bar: false },
+      { label: "TOOL CALLS", value: "2", sub: "1 failed", bar: false },
+      { label: "ACTIVE TIME", value: "10:00", sub: "0:45 thermal rest", bar: false },
+      { label: "TOKENS IN", value: "1.00k", sub: null, bar: false },
+      { label: "TOKENS OUT", value: "200", sub: null, bar: false },
+      { label: "CTX PEAK", value: "30.00k", sub: "of 100.00k", bar: true },
+    ]);
+  });
+
+  it("draws the context bar as now and peak against the window", async () => {
+    await renderRun(finishedRun());
+    const bar = document.querySelector(".mbar");
+    expect((bar?.querySelector(".mbar__now") as HTMLElement | null)?.style.width).toBe("12%");
+    expect((bar?.querySelector(".mbar__peak") as HTMLElement | null)?.style.width).toBe("30%");
+  });
+
+  it("a finished run keeps the scope as the hero with its average, and no TOK/S title anywhere", async () => {
+    await renderRun(finishedRun());
+    expect(latestTokenScopeProps()).toMatchObject({ state: "finished", centerLabel: "80", centerUnit: "avg tok/s", size: "tile" });
+    const section = document.querySelector('.runsec[data-head="model"]');
+    expect(section?.textContent).not.toContain("TOK/S");
+    // The ordinary average needs no note under the lamps.
+    expect(document.querySelector(".modelbox__note")).toBeNull();
+  });
+
+  it("the lamp row is one line of five dots with none lit when the run has finished", async () => {
+    await renderRun(finishedRun());
+    const lamps = [...document.querySelectorAll('[data-testid="run-token-scope"] .scope-lamps .scope-lamp')];
+    expect(lamps.map((l) => l.getAttribute("data-state"))).toEqual(["generating", "prompt", "tools", "rest", "stalled"]);
+    expect(lamps.filter((l) => l.getAttribute("data-on") === "true")).toHaveLength(0);
+    expect(document.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: finished");
+  });
+
+  it("everything sits in ONE container: hero and grid side by side, loaded models below", async () => {
+    await renderRun(finishedRun());
+    const box = document.querySelector('.runsec[data-head="model"] > .modelbox');
+    expect(box).toBeInTheDocument();
+    const main = box!.querySelector(":scope > .modelbox__main");
+    expect([...main!.children].map((c) => c.className)).toEqual(["modelbox__hero", "metrics modelbox__figs"]);
+    expect(box!.lastElementChild?.classList.contains("modelbox__models")).toBe(true);
+    expect(box!.lastElementChild?.textContent).toContain("loaded models");
+  });
+
+  it("the machine section no longer repeats wall clock or thermal rest", async () => {
+    await renderRun(finishedRun());
+    const system = document.querySelector('.metrics[data-scope="system"]')?.textContent ?? "";
+    expect(system).not.toContain("WALL CLOCK");
+    expect(system).not.toContain("THERMAL REST");
+  });
+
+  it("a live run in TOOLS hands the scope the tool for its icon, and no number", async () => {
+    // One of the turn's two calls has completed: still TOOLS, named by it.
+    const t0 = Date.parse(at(5)) + 500;
+    vi.useFakeTimers();
+    vi.setSystemTime(t0);
+    try {
+      await renderRun(finishedRun().filter((r) => Date.parse(r.ts) <= t0));
+      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", centerLabel: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("modelScopeHero (#2890)", () => {
+  const live = {
+    tokensPerSec: 142.4,
+    carried: false,
+    stalled: false,
+    state: "generating" as const,
+    noSignal: false,
+  };
+
+  it("GEN: the rounded rate with its unit", () => {
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({
+      state: "generating",
+      tokensPerSec: 142.4,
+      centerLabel: "142",
+      centerUnit: "tok/s",
+      note: null,
+    });
+  });
+
+  it("any other live state: no number, no unit, no rate driving the wave", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "rest", restSecondsLeft: 9 }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "rest", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "rest", restSecondsLeft: 9 } });
+  });
+
+  it("no signal is its own state with the words under the lamps", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: null, noSignal: true }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "no signal" });
+  });
+
+  it("finished: the average, 'avg tok/s', and the partial-average qualifier as the note", () => {
+    const h = modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "64", sub: "avg · 3 of 4 turns" } });
+    expect(h).toMatchObject({ state: "finished", centerLabel: "64", centerUnit: "avg tok/s", note: "avg · 3 of 4 turns", lamps: { state: null } });
+  });
+
+  it("no model work: no hero", () => {
+    expect(modelScopeHero({ liveTokScope: null, finishedTokRate: null })).toBeNull();
   });
 });
