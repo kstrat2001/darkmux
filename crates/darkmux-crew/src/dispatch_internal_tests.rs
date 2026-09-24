@@ -6612,6 +6612,39 @@
         );
     }
 
+    /// (#2877) The runtime records a rest as it STARTS (so a live viewer can
+    /// show it). The deadline reset must then cover the rest itself: a rest
+    /// longer than `inactivity_secs` would otherwise let the watchdog kill a
+    /// dispatch that is resting by design.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(), same as its neighbors
+    fn tailer_rest_event_extends_the_deadline_past_the_rest_it_starts() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let inactivity_secs = 10u64;
+        let shared = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(f, r#"{{"type":"runtime.rest","seq":3,"ts":1,"ms":60000,"reason":"thermal-duty-cycle"}}"#).unwrap();
+        drop(f);
+        let before = Instant::now();
+        state.poll_and_emit();
+        let new_deadline = *shared.lock().unwrap();
+        assert!(
+            new_deadline >= before + Duration::from_secs(inactivity_secs + 60) - Duration::from_millis(50),
+            "a 60s rest must not leave the watchdog only {inactivity_secs}s of margin"
+        );
+    }
+
     /// (#457 → #464) Counter-test: events that don't indicate
     /// observable progress (model turn completions, reasoning,
     /// streaming markers) must NOT reset the inactivity deadline.

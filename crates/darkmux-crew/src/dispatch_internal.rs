@@ -9781,9 +9781,14 @@ impl TailerState {
                 if reason != "turn_delay" {
                     self.summary.paced_rest_ms = self.summary.paced_rest_ms.saturating_add(ms);
                 }
+                // (#2877) The runtime records a rest as it STARTS, so the
+                // margin must cover the rest itself as well as the usual
+                // inactivity window; a rest longer than the window would
+                // otherwise be killed while resting by design.
                 if let Some(deadline) = &self.inactivity_deadline {
-                    let new_deadline =
-                        Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    let new_deadline = Instant::now()
+                        + Duration::from_secs(self.inactivity_secs)
+                        + Duration::from_millis(ms);
                     *lock_deadline(deadline) = new_deadline;
                 }
                 let payload = runtime_rest_payload(
