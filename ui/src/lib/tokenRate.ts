@@ -431,8 +431,9 @@ export interface LiveStateReading {
    *  this writing stretch, i.e. since the call's name arrived. */
   writingSeconds?: number;
   /** (#2889) Present only when `state === "prompt"` and the turn's opening
-   *  heartbeat said how large the request is, in chars. Recorded, not
-   *  displayed: the scope shows the brain for all of PROMPT (#2890). */
+   *  heartbeat said how large the request is, in chars. The fleet card's
+   *  status line shows it as an estimate (`promptTokensLabel`); the scope
+   *  shows the brain for all of PROMPT (#2890). */
   promptChars?: number;
 }
 
@@ -896,6 +897,10 @@ export interface ExecutionTokenReading {
    *  reasoning rather than writing visible text. See
    *  `LiveStateReading.thinking`. */
   thinking?: true;
+  /** (#2890) In PROMPT, the prompt's estimated size ("~18k") when the turn's
+   *  opening heartbeat reported it. For the fleet card's status line only:
+   *  the scope's center shows the brain for all of PROMPT. */
+  promptLabel?: string;
 }
 
 export function executionTokenReading(
@@ -929,7 +934,25 @@ export function executionTokenReading(
     toolName: state === "tools" ? liveState?.toolName : undefined,
     ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
     ...(state === "generating" && liveState?.thinking ? { thinking: true as const } : {}),
+    ...(state === "prompt" && liveState?.promptChars !== undefined
+      ? (() => {
+          const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(records.filter((r) => !(Date.parse(r.ts) > nowMs))));
+          return label !== null ? { promptLabel: label } : {};
+        })()
+      : {}),
   };
+}
+
+/** (#2889) A request's size in chars as an estimated token count ("~36k"),
+ *  converted with the session's own chars-per-token
+ *  (`measuredCharsPerToken`, which already leaves out checkpointed turns).
+ *  `~` because both the size and the ratio are estimates. `null` for a
+ *  size that rounds to nothing. */
+export function promptTokensLabel(promptChars: number, charsPerToken: number): string | null {
+  if (!(promptChars > 0) || !(charsPerToken > 0)) return null;
+  const tokens = promptChars / charsPerToken;
+  if (tokens < 1) return null;
+  return tokens >= 1000 ? `~${Math.round(tokens / 1000)}k` : `~${Math.round(tokens)}`;
 }
 
 /** Accessor for `STATE_PRIORITY` — the pager's default-page pick

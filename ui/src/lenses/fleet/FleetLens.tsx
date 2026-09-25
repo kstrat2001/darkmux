@@ -949,6 +949,7 @@ export function FleetLens({
                   data-tone={selectedExec.state ?? "none"}
                   data-carried={selectedExec.carried ? "true" : "false"}
                   data-thinking={selectedExec.state === "generating" && selectedExec.thinking === true ? "true" : undefined}
+                  title={selectedExec.state === "prompt" && selectedExec.promptLabel ? `estimated prompt size: ${selectedExec.promptLabel} tokens` : undefined}
                 >
                   {selectedExec.state === "generating"
                     ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
@@ -974,7 +975,11 @@ export function FleetLens({
                           restSecondsLeft: selectedExec.restSecondsLeft,
                           writing: selectedExec.writing,
                           writingSeconds: selectedExec.writingSeconds,
-                        })}
+                        }) +
+                        // (#2890, operator) The prompt's estimated size lives
+                        // here, not in the tube (whose center is the brain for
+                        // all of PROMPT): "processing prompt · ~36k".
+                        (selectedExec.state === "prompt" && selectedExec.promptLabel ? ` · ${selectedExec.promptLabel}` : "")}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —

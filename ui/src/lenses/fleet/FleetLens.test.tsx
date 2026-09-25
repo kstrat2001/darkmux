@@ -1020,6 +1020,38 @@ describe("FleetLens pager (#2881)", () => {
     expect(countEl.textContent).toBe("1 run · 9 executions · 100 tok/s");
   });
 
+  it("(#2890) PROMPT: the status line carries the estimated size; the tube is handed no center", async () => {
+    const scopeProps = () =>
+      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+    // One execution whose turn opener reported a 144,000-char prompt; no
+    // billed turn yet, so the default 4 chars/token -> ~36k.
+    const sized: FlowRecord[] = [
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "p1", action: "dispatch.start", handle: "coder" },
+      { ts: at(1), machine_uid: "u1", session_id: "p1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 1000, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={sized} tMax={D0 + 3000} tMin={D0} playhead={D0 + 3000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    const line = document.querySelector(".mach-scope__rate")!;
+    expect(line.textContent).toBe("processing prompt · ~36k");
+    expect(line.getAttribute("title")).toBe("estimated prompt size: ~36k tokens");
+    expect(scopeProps()).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null });
+  });
+
+  it("(#2890) PROMPT from an older host (no size): the plain words, no tooltip", async () => {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={threeExecutionRecords.filter((r) => r.session_id === "s3")} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("processing prompt");
+    expect(document.querySelector(".mach-scope__rate")!.getAttribute("title")).toBeNull();
+  });
+
   it("no pager renders for exactly one running execution — same as before this issue", async () => {
     const oneExecution = threeExecutionRecords.filter((r) => r.session_id === "s1");
     render(

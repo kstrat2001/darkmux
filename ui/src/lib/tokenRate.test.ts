@@ -10,6 +10,7 @@ import {
   deriveLiveState,
   executionRole,
   executionTokenReading,
+  promptTokensLabel,
   heartbeatSamples,
   isStalled,
   liveStatePriority,
@@ -1046,6 +1047,22 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
   it("an opener from an older host (no prompt_chars) reads PROMPT with no size", () => {
     const records = [rec(-5, "dispatch.start"), hb(0, 0)];
     expect(deriveLiveState(records, Date.parse(atSec(3)))).toEqual({ state: "prompt" });
+  });
+
+  it("(#2890) executionTokenReading estimates the prompt's size with the execution's own calibration", () => {
+    const tokens = rec(-8, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
+    const turn1 = [hb(-12, 0), hb(-10, 3_000)].map((r) => ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, turn_seq: 1 } }) as unknown as FlowRecord);
+    const records = [rec(-15, "dispatch.start"), ...turn1, tokens, hb(0, 0, { prompt_chars: 144_000 })];
+    // 3,000 chars over 1,000 billed tokens = 3 chars/token -> 48k, not the default 4's 36k.
+    expect(executionTokenReading(records, Date.parse(atSec(3))).promptLabel).toBe("~48k");
+    expect(executionTokenReading([rec(-5, "dispatch.start"), hb(0, 0)], Date.parse(atSec(3))).promptLabel).toBeUndefined();
+  });
+
+  it("(#2890) the size converts to an estimated token count", () => {
+    expect(promptTokensLabel(144_000, 4)).toBe("~36k");
+    expect(promptTokensLabel(144_000, 3)).toBe("~48k");
+    expect(promptTokensLabel(3_200, 4)).toBe("~800");
+    expect(promptTokensLabel(0, 4)).toBeNull();
   });
 
   // (#2889 review, M3) The wire as it really lands: record `ts` is
