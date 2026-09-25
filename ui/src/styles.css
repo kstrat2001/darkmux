@@ -4037,17 +4037,28 @@ body {
   margin-top: 8px;
   border-top: 1px solid var(--border);
 }
+/* (#2890, operator: "the big borders on buttons look noisy") Borderless:
+   plain icons and a text speed chip, a quiet background on hover and press.
+   Frees the width the boxes' padding spent. Tap targets keep their 44px
+   hit region (the phone `::after` rule) and focus keeps its outline. */
 .scrub button {
-  background: var(--bg);
-  border: 1px solid var(--accent-dim);
+  background: transparent;
+  border: 0;
   color: var(--fg);
-  padding: 7px 14px;
-  border-radius: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
   cursor: pointer;
   font: 600 calc(12px * var(--fs-scale)) var(--font-mono);
 }
 .scrub button:hover {
-  border-color: var(--accent);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+.scrub button:active {
+  background: color-mix(in srgb, var(--fg) 14%, transparent);
+}
+/* Play/pause anchors the row in the accent color. */
+.scrub button.primary {
+  color: var(--accent);
 }
 .scrub button:focus-visible,
 .scrub input[type="range"]:focus-visible {
@@ -4065,7 +4076,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
+  width: 34px;
   height: 34px;
   padding: 0;
   line-height: 0;
