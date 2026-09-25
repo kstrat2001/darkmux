@@ -1036,7 +1036,7 @@ describe("FleetLens pager (#2881)", () => {
     );
     await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
     const line = document.querySelector(".mach-scope__rate")!;
-    expect(line.textContent).toBe("processing prompt · ~36k");
+    expect(line.textContent).toBe("processing ~36k");
     expect(line.getAttribute("title")).toBe("estimated prompt size: ~36k tokens");
     expect(scopeProps()).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null });
   });

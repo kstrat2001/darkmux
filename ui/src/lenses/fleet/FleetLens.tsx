@@ -970,16 +970,19 @@ export function FleetLens({
                       // so, not "stalled".
                       selectedExec.state === null
                       ? "no signal"
-                      : liveStateLabel({
-                          state: selectedExec.state,
-                          restSecondsLeft: selectedExec.restSecondsLeft,
-                          writing: selectedExec.writing,
-                          writingSeconds: selectedExec.writingSeconds,
-                        }) +
-                        // (#2890, operator) The prompt's estimated size lives
+                      : // (#2890, operator) The prompt's estimated size lives
                         // here, not in the tube (whose center is the brain for
-                        // all of PROMPT): "processing prompt · ~36k".
-                        (selectedExec.state === "prompt" && selectedExec.promptLabel ? ` · ${selectedExec.promptLabel}` : "")}
+                        // all of PROMPT). "processing ~36k", not "processing
+                        // prompt · ~36k": measured, the long form ellipsized
+                        // the size away on a phone and a 1000px desktop.
+                        selectedExec.state === "prompt" && selectedExec.promptLabel
+                        ? `processing ${selectedExec.promptLabel}`
+                        : liveStateLabel({
+                            state: selectedExec.state,
+                            restSecondsLeft: selectedExec.restSecondsLeft,
+                            writing: selectedExec.writing,
+                            writingSeconds: selectedExec.writingSeconds,
+                          })}
                 </div>
               )}
               {/* (#2881) The pager: shown only with 2+ running executions —
