@@ -17,14 +17,14 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v3.12.0 — a live token-rate scope (a CRT oscilloscope
-  # with GEN/PROMPT/TOOLS/REST/STALL lamps) on fleet cards and run pages,
-  # motion and loading placeholders on live pages, playback that defaults to
-  # real time and renders what the live page showed, and mission run pages
-  # that roll up their executions and stay live. Rests are recorded when
-  # they start.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.12.0.tar.gz"
-  sha256 "62254fcf78dc4857ffd25ccaf5fe82edea0ed03774b601faa93dc0f155090583"
+  # Stable release: v3.13.0: the tok/s scope gets one look per state (a
+  # wave for GEN with a violet shimmer while the model thinks, a brain for
+  # PROMPT, a wrench over "tool gen" while a tool call is generated, a
+  # breathing ring for REST and idle), the degeneracy gate's findings on the
+  # run page, fleet cards that page through concurrent runs, and the
+  # pepper-grinder built-in workload.
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.13.0.tar.gz"
+  sha256 "a286a913ed44300f3ec1898777e5d6bd8fdf4564d7268b4660733b5749c930b0"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
