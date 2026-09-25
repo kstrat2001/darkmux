@@ -12,6 +12,101 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.13.0] - 2026-09-25
+
+### Added
+
+- **The tok/s scope has one look per state** (#2890). One trace morphs
+  between states instead of popping:
+  - **GEN:** a wave whose speed follows the rate, with the rate in the tube's
+    center.
+  - **Thinking:** while the model reasons rather than writes visible text,
+    the ring takes a rotating violet and pink shimmer, the rate's characters
+    flow through the same colors, the card's rate line reads "think tok/s",
+    and the run page's lit GEN lamp reads "think". Worked out from the
+    heartbeat's two counters (all characters, visible characters), so it
+    needs no runtime change and works on older recordings that carry both.
+  - **PROMPT:** rings peel off the ring and sink toward a brain in the
+    center.
+  - **TOOLS:** a comet with the tool's icon in the center.
+  - **REST:** a breathing ring with the countdown in the center.
+  - **STALL** collapses like a CRT switching off; **no signal** shows static.
+  - **Finished:** a slow echo of the run's average rate.
+  - **Idle:** every online machine's card shows its tube breathing calmly,
+    with "idle" in the center, until work starts; a machine that is off
+    shows none.
+  - The center crossfades between kinds of content, and reads the same on
+    the fleet card and the run page.
+- **"tool gen" instead of a false STALL** (#2889). LM Studio sends a tool
+  call's name at once and its arguments only when complete; for a large edit
+  that was seconds to minutes of silence, read as PROMPT or STALL. The runtime
+  now keeps sending heartbeats while the call is generated, and the scope
+  shows a wrench over "tool gen", with the seconds in the status line
+  ("tool gen · 12 s"); when the tool runs, its own icon takes over. Each
+  turn's opening heartbeat also records the request's size, which the fleet
+  card's status line shows as an estimate ("processing ~36k"). A
+  degenerate-output cut now closes the connection at once.
+- **The gate's findings reach the run page** (#2887). The in-stream
+  degeneracy gate's observations and aborts are now forwarded to the flow
+  stream, so SIGNALS shows REPETITION where it used to read CLEAN, with the
+  policy in force and whether the gate acted. Each dispatch start records the
+  flow schema its host wrote.
+- **Fleet cards page through concurrent runs** (#2881). A machine running two
+  or more executions shows a `‹ 1/N ›` pager; the arrows never move and the
+  card never grows.
+- **pepper-grinder is a built-in workload.** `darkmux lab run pepper-grinder`
+  runs the refresh-token QA review from the Genesis series against the
+  published fixture (github.com/kstrat2001/pepper-grinder): clone it,
+  `darkmux lab fixture register <path>`, then run.
+
+### Changed
+
+- **Fleet cards fill the row three across** on desktop, with the tube
+  stacked between the card's header and its status, sized from the card's
+  width; on a phone it sits beside the text. The tube's text and icons scale
+  with it. Long machine names and hardware lines truncate with the full text
+  as a tooltip.
+- **Replays open on the whole recording.** RECENT ACTIVITY offers "all",
+  the recording's own span, and uses it by default in a replay; a preset
+  still rolls with the playhead.
+- **The playback clock shows seconds** and stays on the transport's row on a
+  phone; the transport controls are borderless.
+- **The run page's MODEL section** leads with the scope, the metrics beside
+  it in a grid.
+
+### Removed
+
+- **The `long-agentic` built-in workload.** Its fixture contract was one only
+  a private codebase satisfied, so no one could run it; use
+  `pepper-grinder`.
+
+### Fixed
+
+- **Tok/s on turns with a reasoning check-in** (#2886): the live rate and the
+  finished average no longer read far too low; a short turn carries the last
+  rate instead of showing a flat GEN (#2885); a lost connection reads "no
+  signal", not STALL.
+- **The fleet pager counts executions only**: a review run recorded before
+  3.7 no longer shows its whole-run record as an extra execution.
+- **The event pane no longer sticks at "0 events · N hidden"**: when a
+  second batch of records arrived before the restored filters rendered, the
+  restored picks were overwritten and never came back.
+- **`darkmux lab doctor` no longer suggests `rm -rf` on a fixture's `.git`**
+  (#2888); a published fixture is a git clone.
+- **Mutation testing no longer fails a test-only change** in files with
+  brace or quote character literals (#2892).
+- **A private codebase's source paths are gone** from docs, tests and
+  fixtures (#2883).
+
+### Schema notes
+
+- **`FLOW_SCHEMA_VERSION` 1.55.0 → 1.56.0, additive:**
+  `dispatch.turn.heartbeat` gains `phase`, `tool_name` and `prompt_chars`;
+  `telemetry.detector` gains `kind: "repetition"` records with `policy` /
+  `acted`; `dispatch.checkpoint` gains `policy` / `would_conclude`;
+  `dispatch start` gains `flow_schema`.
+- **Readers:** older readers ignore the new fields.
+
 ## [3.12.0] - 2026-09-24
 
 ### Added
@@ -208,6 +303,7 @@ darkmux release.
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[3.13.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.13.0
 [3.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.12.0
 [3.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.11.0
 [3.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.10.0
