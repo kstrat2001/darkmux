@@ -301,8 +301,11 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       const q = (c.inwardT + k / 3) % 1;
       // (#2890 operator review) Each ring is born ON the base ring, wave and
       // all, then shrinks toward the brain, its wave flattening as it goes,
-      // and fades out at half the base radius so the center stays clear.
-      const shrink = 1 - 0.5 * q;
+      // and fades out near 72% of the base radius so the center stays clear.
+      // (#2890, operator: "prompt would also benefit from a larger radius")
+      // They sink to about 72% of the base ring, not half, so they stay
+      // near the glass and clear of the "~18k reading" label.
+      const shrink = 1 - 0.28 * q;
       const waveAmp = amp * (1 - q);
       const a = Math.min(1, q / 0.12) * Math.pow(1 - q, 1.1) * 0.9 * p.inward;
       for (const [lw, al] of INWARD_PASSES) {

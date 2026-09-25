@@ -143,7 +143,8 @@ export function scopeTargets(
       out.ring = 0.8;
       out.breath = 1;
       out.drift = 1;
-      out.rscale = 0.92;
+      // (#2890, operator) Full radius like TOOLS; the breath pulses around it.
+      out.rscale = 1;
       break;
     case "nosignal":
       out.ring = 0;

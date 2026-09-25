@@ -8592,8 +8592,11 @@ body {
   pointer-events: none;
   z-index: 1;
 }
+.token-scope-center {
+  --scope-num: 16px;
+}
 .token-scope-center .token-scope-n {
-  font: 400 16px/0.85 var(--font-mono);
+  font: 400 var(--scope-num)/0.85 var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--scope-phosphor);
   text-shadow: 0 0 10px var(--scope-phosphor-glow);
@@ -8638,8 +8641,8 @@ body {
 }
 /* (#2890) The fleet card's tube (96px desktop, up to 150px on a phone)
    carries the live rate in its center, sized to the tube. */
-.token-scope-bezel--card .token-scope-center .token-scope-n {
-  font-size: 22px;
+.token-scope-bezel--card .token-scope-center {
+  --scope-num: 22px;
 }
 /* The card's tube shows the number alone: its ring passes through the
    unit's line (measured: "think tok/s" crossed the trace and lost its ends),
@@ -8648,17 +8651,28 @@ body {
   display: none;
 }
 @media (max-width: 560px) {
-  .token-scope-bezel--card .token-scope-center .token-scope-n {
-    font-size: 30px;
+  .token-scope-bezel--card .token-scope-center {
+    --scope-num: 30px;
   }
 
 }
+.session-run .modelbox__hero .token-scope-center {
+  --scope-num: 40px;
+}
 .session-run .modelbox__hero .token-scope-center .token-scope-n {
-  font-size: 40px;
   line-height: 0.9;
 }
 .token-scope-center .token-scope-u {
-  margin-top: 6px;
+  /* (#2890, operator: "centering of the number inside the circle with the
+     'resting' being lower") The unit hangs below the number instead of
+     sharing its box, so the NUMBER is what sits at the circle's center.
+     Offset by half the number's height (`--scope-num`, set per tube size)
+     plus a small gap. */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% + var(--scope-num) * 0.5 + 4px);
+  text-align: center;
   font: 11px var(--font-mono);
   letter-spacing: 0.1em;
   color: var(--scope-phosphor);

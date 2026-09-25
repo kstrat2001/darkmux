@@ -48,7 +48,7 @@ describe("scopeTargets: each state is a set of targets on ONE trace (#2890)", ()
   });
 
   it("REST breathes on a slightly smaller ring", () => {
-    expect(scopeTargets("rest", 0, 0, GREEN)).toMatchObject({ ring: 0.8, breath: 1, rscale: 0.92 });
+    expect(scopeTargets("rest", 0, 0, GREEN)).toMatchObject({ ring: 0.8, breath: 1, rscale: 1 });
   });
 
   it("NO SIGNAL turns the ring off and the static on", () => {
