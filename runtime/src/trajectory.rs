@@ -735,6 +735,7 @@ impl Trajectory {
     /// `Observed` branch (which by construction never aborts, degenerate or
     /// not), `true` for the `Degenerate` branch's own observation (the one
     /// immediately followed by `append_gate_abort` for the same moment).
+    #[allow(clippy::too_many_arguments)]
     pub fn append_gate_observation(
         &mut self,
         seq: u32,
@@ -777,6 +778,7 @@ impl Trajectory {
     /// across four continuations from one that started looping inside this
     /// call, which is the difference between the gate working and the gate
     /// over-firing.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_gate_abort(
         &mut self,
         seq: u32,
