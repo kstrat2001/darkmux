@@ -475,7 +475,7 @@ interface StateMarker {
  * (#2889) A fresh WRITING heartbeat (the model is writing a named tool call)
  * reads `"tools"` with `writing`, never `"stalled"`: the runtime ticks for as
  * long as it waits on that call. So an endpoint that hangs after naming a
- * tool reads "writing · N s" until the host's inactivity watchdog ends the
+ * tool reads "tool gen · N s" until the host's inactivity watchdog ends the
  * dispatch (600 s by default), never STALL. */
 export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveStateReading {
   // Cut ONCE, up front — every downstream read (`heartbeatSamples`,
@@ -711,8 +711,10 @@ export function liveStateLabel(reading: LiveStateReading): string {
       // (#2890, operator) "processing", not "reading": too close to the read tool.
       return "processing prompt";
     case "tools":
-      // (#2889) Elapsed since the call's name arrived, while it is written.
-      return reading.writing ? `writing · ${reading.writingSeconds ?? 0} s` : "tools";
+      // (#2889) Elapsed since the call's name arrived, while the model
+      // generates its arguments. (#2890, operator) "tool gen", LM Studio's
+      // "tool call generation": "writing" read as the edit/write tools.
+      return reading.writing ? `tool gen · ${reading.writingSeconds ?? 0} s` : "tools";
     case "stalled":
       return "stalled";
     case "generating":

@@ -1443,9 +1443,9 @@ describe("modelScopeHero (#2890)", () => {
     expect(text).toMatchObject({ centerUnit: "tok/s", thinking: false });
   });
 
-  it("(#2889) TOOLS while writing: the tool icon, the writing cue, and 'writing' under it", () => {
+  it("(#2889) TOOLS while writing: the tool icon, the writing cue, and 'tool gen' under it", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: "tools", toolName: "edit", writing: true, writingSeconds: 70 }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: true, centerUnit: "writing", tokensPerSec: 0 });
+    expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: true, centerUnit: "tool gen", tokensPerSec: 0 });
   });
 
   it("(#2889) TOOLS while darkmux runs the tool: no writing cue, no caption", () => {

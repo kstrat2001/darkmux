@@ -12,8 +12,8 @@ describe("scopeCenter", () => {
   it("REST: the countdown over resting", () => {
     expect(scopeCenter({ state: "rest", tokensPerSec: 0, restSecondsLeft: 8 })).toEqual({ centerLabel: "8s", centerUnit: "resting", centerCarried: false });
   });
-  it("TOOLS: \"writing\", without the seconds, only while writing", () => {
-    expect(scopeCenter({ state: "tools", tokensPerSec: 0, writing: true, writingSeconds: 10 })).toMatchObject({ centerLabel: null, centerUnit: "writing" });
+  it("TOOLS: \"tool gen\", without the seconds, only while the call is generated", () => {
+    expect(scopeCenter({ state: "tools", tokensPerSec: 0, writing: true, writingSeconds: 10 })).toMatchObject({ centerLabel: null, centerUnit: "tool gen" });
     expect(scopeCenter({ state: "tools", tokensPerSec: 0 })).toMatchObject({ centerLabel: null, centerUnit: null });
   });
   it("PROMPT: the size over reading when known; nothing otherwise (the brain)", () => {

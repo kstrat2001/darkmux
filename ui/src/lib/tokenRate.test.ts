@@ -1024,7 +1024,7 @@ describe("(#2889) writing a tool call", () => {
   });
 
   it("labels the writing stretch with its elapsed seconds; running a tool keeps the old word", () => {
-    expect(liveStateLabel({ state: "tools", toolName: "edit", writing: true, writingSeconds: 70 })).toBe("writing · 70 s");
+    expect(liveStateLabel({ state: "tools", toolName: "edit", writing: true, writingSeconds: 70 })).toBe("tool gen · 70 s");
     expect(liveStateLabel({ state: "tools", toolName: "edit" })).toBe("tools");
   });
 

@@ -1117,7 +1117,7 @@ export function FleetLens({
                     state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
                     toolName={selectedExec.toolName}
                     // (#2889) The writing cue; the status line under the
-                    // tube carries the live "writing · N s".
+                    // tube carries the live "tool gen · N s".
                     toolWriting={selectedExec.writing === true}
                     // (#2890) Thinking tints the ring and shimmers the rate;
                     // the words and number stay as they are.
@@ -1128,7 +1128,7 @@ export function FleetLens({
                     // center's own content (tool icon, brain) or none.
                     // (#2890) The same center as every scope in the app
                     // (`lib/scopeCenter.ts`): rate over "tok/s", the REST
-                    // countdown, "writing" (no seconds), the prompt size.
+                    // countdown, "tool gen" (no seconds), the prompt size.
                     {...scopeCenter({
                       state: scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null }),
                       tokensPerSec: selectedExec.tokensPerSec,
