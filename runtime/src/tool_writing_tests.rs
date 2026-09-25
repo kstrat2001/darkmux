@@ -167,3 +167,51 @@ fn a_silence_without_a_named_tool_call_writes_no_writing_events() {
         "a partial with no tool call in flight names no phase"
     );
 }
+
+/// (#2889 review, C3) Once a named call's arguments have arrived, the call is
+/// written. A silence after that (a delayed finish chunk, or a pause before a
+/// second call) must not tick "writing" for the finished call, and the chunks
+/// that follow must not be stamped with the writing phase.
+#[test]
+#[serial_test::serial]
+fn a_silence_after_the_arguments_arrived_writes_no_writing_events() {
+    let ws = tempfile::Builder::new().prefix("tool-writing-done").tempdir().unwrap();
+    let args = r#"{"path":"a.txt","content":"hello"}"#;
+    let script = vec![
+        (
+            Duration::ZERO,
+            chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "write", "arguments": ""}
+                }]}),
+                None,
+            ),
+        ),
+        (
+            Duration::from_millis(20),
+            chunk(serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": args}}]}), None),
+        ),
+        // The finish chunk is late: several ticks of silence with the call done.
+        (TICK * 5, chunk(serde_json::json!({}), Some("tool_calls"))),
+    ];
+    run(sse_server_scripted(script), ws.path());
+    let evs = events(ws.path());
+    let args_idx = evs
+        .iter()
+        .position(|e| {
+            e["type"] == "model.partial"
+                && e["generated_chars"].as_u64().unwrap_or(0) >= (args.len() + "write".len()) as u64
+        })
+        .expect("the arguments chunk produced a model.partial");
+    let after = &evs[args_idx + 1..];
+    let ticks = after.iter().filter(|e| e["type"] == "model.tool_call.writing").count();
+    assert_eq!(ticks, 0, "the call's arguments arrived; no writing tick may follow for it");
+    assert!(
+        after
+            .iter()
+            .filter(|e| e["type"] == "model.partial")
+            .all(|e| e.get("phase").is_none()),
+        "a partial after the arguments landed names no writing phase"
+    );
+}

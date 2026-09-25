@@ -890,12 +890,19 @@ impl ChunkAccumulator {
     /// and the arguments only when they are complete, so a named slot is the
     /// only evidence the model has moved from thinking to writing a call.
     /// `None` until a name arrives.
+    ///
+    /// (#2889 review) And `None` again once that call's arguments are
+    /// complete — a whole JSON value. A silence after that (a late finish
+    /// chunk, or a pause before a second call is named) is not the model
+    /// writing this call. Arguments that stream in pieces do not parse until
+    /// the last piece lands, so a pause mid-arguments still reads as writing.
     pub fn writing_tool_name(&self) -> Option<&str> {
-        self.tool_call_slots
-            .iter()
-            .rev()
-            .map(|s| s.function.name.as_str())
-            .find(|n| !n.is_empty())
+        let slot = self.tool_call_slots.iter().rev().find(|s| !s.function.name.is_empty())?;
+        let args = slot.function.arguments.trim();
+        if serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok() {
+            return None;
+        }
+        Some(slot.function.name.as_str())
     }
 
     /// Convert into the equivalent non-streaming `ChatResponse` so the
@@ -2464,6 +2471,32 @@ mod tests {
             1,
             "the second call reuses the first call's pooled connection"
         );
+    }
+
+    /// (#2889 review, C3) A call is "being written" from its name until its
+    /// arguments form a whole JSON value — including a pause between pieces
+    /// of arguments that stream in parts.
+    #[test]
+    fn writing_tool_name_holds_until_the_arguments_are_whole() {
+        let tc = |name: Option<&str>, args: &str| -> ChatChunk {
+            let mut f = serde_json::json!({"arguments": args});
+            if let Some(n) = name {
+                f["name"] = serde_json::json!(n);
+            }
+            serde_json::from_value(serde_json::json!({
+                "id": "c",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": f}]}}]
+            }))
+            .unwrap()
+        };
+        let mut acc = ChunkAccumulator::new();
+        assert_eq!(acc.writing_tool_name(), None, "nothing named yet");
+        acc.ingest(&tc(Some("write"), ""));
+        assert_eq!(acc.writing_tool_name(), Some("write"), "named, no arguments yet");
+        acc.ingest(&tc(None, r#"{"path":"a.txt","#));
+        assert_eq!(acc.writing_tool_name(), Some("write"), "arguments still arriving");
+        acc.ingest(&tc(None, r#""content":"hi"}"#));
+        assert_eq!(acc.writing_tool_name(), None, "arguments complete: the call is written");
     }
 
     /// (#2889 review) A reader thread that panics is a failed stream, not a
