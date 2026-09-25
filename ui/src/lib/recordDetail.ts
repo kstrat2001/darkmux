@@ -333,6 +333,22 @@ function unquote(s: string): string {
   return t.startsWith('"') ? t.replace(/^"+|"+$/g, "") : t;
 }
 
+/** (#2008) A `dispatch.tool` payload's three-way outcome: `reported` is a
+ *  command that ran and exited non-zero (the tool working), `failed` is a
+ *  tool that could not run. `outcome` is absent on pre-1.22 records, where
+ *  `ok === false` still carried the old conflated meaning and reads as
+ *  `failed`. `undefined` when the record says neither. (#2890) Exported so
+ *  the run page's TOOL CALLS failed count reads the same rule as the event
+ *  log's row, not a second copy of it. */
+export function toolOutcome(f: Record<string, unknown>): RecordObject["outcome"] {
+  if (typeof f.outcome === "string") {
+    return f.outcome === "reported" ? "reported" : f.outcome === "failed" ? "failed" : "ok";
+  }
+  if (f.ok === false) return "failed";
+  if (f.ok === true) return "ok";
+  return undefined;
+}
+
 export function recordObject(r: FlowRecord): RecordObject {
   const f = (r.fields || r.payload) as Record<string, unknown> | undefined;
   const a = r.action || "";
@@ -379,14 +395,7 @@ export function recordObject(r: FlowRecord): RecordObject {
         mono = true;
       }
     }
-    let outcome: RecordObject["outcome"];
-    if (typeof f.outcome === "string") {
-      outcome = f.outcome === "reported" ? "reported" : f.outcome === "failed" ? "failed" : "ok";
-    } else if (f.ok === false) {
-      outcome = "failed";
-    } else if (f.ok === true) {
-      outcome = "ok";
-    }
+    const outcome = toolOutcome(f);
     // (#2863 review, finding 7) `text` above came from a model-controlled
     // command/pattern/path — the one place bidi/zero-width control
     // characters can reach this row.

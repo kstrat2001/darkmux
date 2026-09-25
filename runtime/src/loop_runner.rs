@@ -2948,6 +2948,7 @@ fn run_with_sleeper(
                 Watch {
                     interval: per_call_cap,
                     carried: turn.carried(),
+                    tick: STREAM_TICK,
                 },
             )?;
             (outcome.response, outcome.cut)
@@ -5125,7 +5126,22 @@ struct Watch<'a> {
     /// The turn's accumulation from earlier continuations, so the in-stream
     /// verdict judges the same scope the post-hoc one does.
     carried: &'a str,
+    /// (#2889) How long the stream may go without a chunk before the loop
+    /// wakes to say the model is still writing a tool call. Production is
+    /// [`STREAM_TICK`]; a test passes milliseconds.
+    tick: std::time::Duration,
 }
+
+/// (#2889) Cadence of the "still writing a tool call" event while the
+/// endpoint is silent. LM Studio names a tool call immediately, then
+/// generates its arguments without sending a byte and delivers them in one
+/// chunk; without a tick nothing is written during that silence and the
+/// viewer reads it as a stall. One second, under the host's two-second
+/// heartbeat coalescing (`HEARTBEAT_MIN_INTERVAL` in
+/// `crates/darkmux-crew/src/dispatch_internal.rs`), so every host window
+/// has an event to forward and the cadence the viewer sees is the host's,
+/// unchanged.
+pub(crate) const STREAM_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
 /// `model.partial` trajectory event per chunk (stats only — no content
@@ -5159,6 +5175,12 @@ fn run_streaming_turn(
     trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
     let mut accumulator = ChunkAccumulator::new();
     let mut last_content_bytes: usize = 0;
+    // (#2887 F3) Resolved ONCE and reused for the gate's own bounds AND for
+    // stamping every trajectory event it writes below — two separate calls
+    // to `degeneracy_policy()` (as this used to read) can only ever agree
+    // by chance, since each is a fresh env read; a single value read once is
+    // the one true source for both.
+    let policy = crate::detection::degeneracy_policy();
     let mut gate = StreamGate::new(
         crate::stream_gate::GateBounds { interval_tokens: watch.interval },
         crate::reasoning_loop::measure_and_judge,
@@ -5166,11 +5188,13 @@ fn run_streaming_turn(
         // (#2846) The stream gate is the FIRST of two gates; suppressing only
         // the checkpoint gate would still let this one cut generation short,
         // which is a second variable.
-        crate::detection::degeneracy_policy().measures(),
-        crate::detection::degeneracy_policy().acts(),
+        policy.measures(),
+        policy.acts(),
     );
     let mut cut = CutSource::None;
-    let stream = client.chat_streaming(request)?;
+    // (#2889) Ticking, so the loop wakes during a silence and can say the
+    // model is still writing a tool call — see `TickingStream`'s doc.
+    let stream = client.chat_streaming_ticking(request, watch.tick)?;
     for chunk_result in stream {
         // (#2836 stage 2) A SILENT stream ends the turn; it does not kill the
         // dispatch.
@@ -5185,7 +5209,28 @@ fn run_streaming_turn(
         // Genuine transport failures still propagate. The distinction is a
         // typed marker, not a string match.
         let chunk = match chunk_result {
-            Ok(c) => c,
+            Ok(crate::lmstudio::StreamEvent::Chunk(c)) => c,
+            // (#2889) No chunk this tick. Once a tool call is named, the
+            // silence IS the model writing its arguments: say so, with the
+            // counts unchanged. Before a name arrives a silence is prompt
+            // processing or a pause, and this names nothing.
+            //
+            // Deliberately NOT proof of work: `last_proof_of_work` and the
+            // soft warning are left alone, and the host does not reset its
+            // watchdog on this event. A tick proves only that the runtime is
+            // waiting, which a wedged endpoint would also produce.
+            Ok(crate::lmstudio::StreamEvent::Idle) => {
+                if let Some(name) = accumulator.writing_tool_name() {
+                    trajectory.append_tool_call_writing(
+                        seq,
+                        accumulator.partial_count(),
+                        accumulator.content_bytes(),
+                        accumulator.generated_bytes(),
+                        name,
+                    );
+                }
+                continue;
+            }
             Err(e) if e.downcast_ref::<crate::lmstudio::StreamWentSilent>().is_some() => {
                 eprintln!(
                     "darkmux-runtime: ⏹ the endpoint went silent — ending this call \
@@ -5213,6 +5258,7 @@ fn run_streaming_turn(
             cumulative,
             accumulator.has_tool_calls(),
             generated_chars,
+            accumulator.writing_tool_name(),
         );
         *last_proof_of_work = std::time::Instant::now();
         *inactivity_soft_warning_fired_in_window = false;
@@ -5250,6 +5296,12 @@ fn run_streaming_turn(
                     ratio,
                     watch.interval,
                     would_abort,
+                    policy.as_str(),
+                    // (#2887 F3) `Observed` never itself ends the call — that
+                    // is the branch's whole definition (see `GateAction`'s
+                    // own doc) — so this observation never acted, degenerate
+                    // or not.
+                    false,
                 );
             }
             crate::stream_gate::GateAction::Degenerate { slice_chars, ratio, generated_chars } => {
@@ -5259,6 +5311,11 @@ fn run_streaming_turn(
                     slice_chars,
                     ratio,
                     watch.interval,
+                    true,
+                    policy.as_str(),
+                    // (#2887 F3) This observation's own verdict is what
+                    // ends the call — the `append_gate_abort` call just
+                    // below is for this SAME moment.
                     true,
                 );
                 eprintln!(
@@ -5282,12 +5339,15 @@ fn run_streaming_turn(
                     generated_chars,
                     watch.interval,
                     gate.tool_call_in_flight(),
+                    policy.as_str(),
                 );
                 cut = CutSource::RuntimeAbort(AbortReason::Degenerate);
-                // Dropping the stream drops ureq's pooled reader, so the
-                // socket closes rather than returning to the pool
-                // half-read. LMStudio logs `Client disconnected. Stopping
-                // generation...` about a second later.
+                // Leaving the loop drops the `TickingStream`, whose drop
+                // shuts the socket down at once (#2889 review) — its reader
+                // thread may be blocked in a read that would otherwise hold
+                // the connection open for the whole read timeout. The half-
+                // read connection never returns to ureq's pool. LMStudio
+                // logs `Client disconnected. Stopping generation...`.
                 break;
             }
         }
@@ -8972,6 +9032,37 @@ mod tests {
             !traj_text.contains("dispatch.tool_call.discarded"),
             "and it must not have destroyed anything doing it"
         );
+        // (#2887 F3) The gate stamps its own policy + outcome now, rather
+        // than leaving a downstream host to reconstruct them from its own
+        // (possibly stale, possibly absent) environment. Under the default
+        // (enforce) policy this test runs with, the degenerate observation
+        // and the abort it produced both say `acted:true` — this IS the
+        // call that ended the stream. Parsed per-record (not a raw
+        // substring match) so the assertion pins the FIELD ON THE RIGHT
+        // RECORD, not merely somewhere in the file — `"acted":true` is
+        // also unconditionally present on every `dispatch.gate.abort`
+        // record, so a substring check alone cannot tell a correctly-
+        // stamped observation from a wrongly-stamped one sharing a file
+        // with a correctly-stamped abort.
+        let observation = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
+            .expect("a degenerate observation record must exist");
+        assert_eq!(observation["policy"], "enforce", "got {observation}");
+        assert_eq!(
+            observation["acted"], true,
+            "the degenerate observation that led to the abort must say it \
+             acted — under enforce it is the SAME moment as the abort \
+             below; got {observation}"
+        );
+        let abort = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.abort")
+            .expect("the stream gate itself must have aborted the call");
+        assert_eq!(abort["policy"], "enforce", "got {abort}");
+        assert_eq!(abort["acted"], true, "got {abort}");
     }
 
     /// (#2846) `observe` measures and records without acting.
@@ -9053,6 +9144,23 @@ mod tests {
             "observe must not let the STREAM gate abort either; the claim is \
              that only the verdict's EFFECT changes, and an aborted stream is \
              an effect; got:\n{traj_text}"
+        );
+        // (#2887 F3) Same policy/acted stamping this issue adds to the
+        // enforce path above — under observe the degenerate observation
+        // must say `policy:"observe"` and `acted:false`: the judge found it
+        // repeating, but nothing ended the call because of it. Parsed
+        // per-record, same discipline as the enforce test's own version of
+        // this assertion.
+        let observation = traj_text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["type"] == "dispatch.gate.observation" && v["degenerate"] == true)
+            .expect("a degenerate observation record must exist");
+        assert_eq!(observation["policy"], "observe", "got {observation}");
+        assert_eq!(
+            observation["acted"], false,
+            "a degenerate observation under observe must say it did NOT \
+             act — that is the entire point of the policy; got {observation}"
         );
     }
 
@@ -17042,3 +17150,7 @@ mod reasoning_feedback_probe {
 #[cfg(test)]
 #[path = "checkpoint_regression_tests.rs"]
 mod checkpoint_regression_tests;
+
+#[cfg(test)]
+#[path = "tool_writing_tests.rs"]
+mod tool_writing_tests;

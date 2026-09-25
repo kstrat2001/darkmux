@@ -26,12 +26,13 @@ import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
+import type { LiveTailStatus } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { T, asRecordArray, displayNameOf, earliestRecordDate, firstRecordDate, isDispatchTerminal, localMachineUid, missionReplayDate, todayUTC } from "./lib/flow";
-import { isLiveRoute, showsEventLog } from "./lib/route";
+import { isLiveRoute, showsEventLog, tokRateConnectionEvidence } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
@@ -150,13 +151,27 @@ export function App() {
   // for why that's the right call, not a shared subscription).
   const isMobile = useIsMobile();
 
+  // (#2886 pass 4, finding 5, "half-open connection race") The last moment
+  // `useLiveTail` recorded actual contact with the daemon — written into a
+  // REF, not `useState`, because contact happens on every SSE message
+  // (~every 2s while a dispatch streams): a `useState` here would force a
+  // re-render on that cadence for a value nothing paints directly, exactly
+  // the kind of self-perturbing observer CLAUDE.md's "the observer must not
+  // join the observed" warns against. It's read at render time by whatever
+  // ALREADY re-renders periodically for its own reasons (the shared 1s
+  // clock a live run page subscribes to, a presence poll) — see
+  // `renderRoute`'s own doc for where it's consumed.
+  const lastContactRef = useRef<number>(Date.now());
+  const onLiveTailContact = useCallback((ms: number) => {
+    lastContactRef.current = ms;
+  }, []);
   // (Packet 5) The SSE tail + reconcile backstop + date-rollover handler —
   // gated by `isLiveRoute` (see that function's own doc) so a genuinely
   // historical route (`playback`/`session`) doesn't run
   // a live tail behind it, matching legacy's own `wantsPlayback` gate on
   // `startLiveTail`. Feeds `flowWindow` below via the Query cache
   // (`useFlowWindow`'s own doc), not a direct return-value dependency here.
-  const liveStatus = useLiveTail(isLiveRoute(route));
+  const liveStatus = useLiveTail(isLiveRoute(route), useMemo(() => ({ onContact: onLiveTailContact }), [onLiveTailContact]));
 
   const flowWindow = useFlowWindow(nowMs);
   // (#1800 P1) The event log follows the ROUTE, not the clock. On a
@@ -856,7 +871,7 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader)}
+            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader, liveStatus, lastContactRef.current)}
           </LensErrorBoundary>
         </main>
         {!isMobile && (
@@ -1013,10 +1028,30 @@ function renderRoute(
   onMissionEvents: (events: FlowRecord[], srvTruncated: boolean) => void,
   onSelectStep: (stepId: string | null) => void,
   onStepHeader: (fields: StepHeaderField[] | null) => void,
+  /** (#2886 pass 3, "STALL while disconnected") The SAME `useLiveTail`
+   *  status the header already renders — used to derive `connected` below
+   *  so the fleet card and the run tile's TOK/S scope can tell "the run
+   *  stalled" apart from "the page lost its connection". Every route other
+   *  than `fleet`/`dispatch` ignores it; those two are the only lenses that
+   *  render the TOK/S scope (see the dispatch brief's file list). */
+  liveStatus: LiveTailStatus,
+  /** (#2886 pass 4, finding 5, "half-open connection race") The last moment
+   *  `useLiveTail` recorded contact with the daemon — `App.tsx`'s
+   *  `lastContactRef.current`, read fresh on every render this function
+   *  runs on. `null` here (below) whenever this route was never
+   *  live-tail-backed, same fold as `connected` — a static build's ref
+   *  value is a stale mount-time `Date.now()` that means nothing, and must
+   *  never feed the half-open check. */
+  lastContactMs: number | null,
 ) {
+  // (#2886 pass 4) The fold itself is `lib/route.ts::tokRateConnectionEvidence`
+  // — extracted there so it has its own unit tests independent of this
+  // module's `reactflow` dependency chain; see that function's own doc for
+  // why `isLiveRoute(route)` (not merely `liveStatus === "live"`) governs.
+  const { connected, lastContactMs: routeLastContactMs } = tokRateConnectionEvidence(route, liveStatus, lastContactMs);
   switch (route.kind) {
     case "fleet":
-      return <FleetLens />;
+      return <FleetLens connected={connected} lastContactMs={routeLastContactMs} />;
     case "runs":
       return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
     case "machine":
@@ -1031,7 +1066,7 @@ function renderRoute(
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
-      return <SessionReplay sessionId={route.dispatchId} playhead={playhead} />;
+      return <SessionReplay sessionId={route.dispatchId} playhead={playhead} connected={connected} lastContactMs={routeLastContactMs} />;
     case "mission":
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this

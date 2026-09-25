@@ -29,8 +29,8 @@ darkmux lab run list $ARGUMENTS
 ```
 RUN ID                              WORKLOAD       PROFILE       WALL    OK
 quick-q-deep-1730000123-1           quick-q        deep             12s    ✓
-long-task-deep-1729998888-1         long-agentic   deep            198s    ✓
-long-task-balanced-1729990000-1     long-agentic   balanced        291s    ✓
+pepper-grinder-deep-1729998888-1    pepper-grinder deep            198s    ✓
+pepper-grinder-balanced-1729990000-1 pepper-grinder balanced       291s    ✓
 ...
 ```
 

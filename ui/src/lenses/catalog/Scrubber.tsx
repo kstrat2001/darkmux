@@ -1,5 +1,5 @@
 import { speedLabel } from "../../hooks/usePlaybackTransport";
-import { clkhm, clkrange } from "../../lib/format";
+import { clk, clkhm, clkrange } from "../../lib/format";
 import { fmtElapsed } from "../../lib/format";
 
 /**
@@ -143,8 +143,12 @@ export function Scrubber({
         {speedLabel(speed)}
       </button>
       <span className="clock" data-testid="scrubber-clock">
-        {elapsedMs != null ? `${fmtElapsed(elapsedMs)} · ` : ""}
-        {clkhm(t)}
+        {/* On a phone the run's length is hidden here (the run page shows it
+            as ACTIVE TIME) so the range keeps room to scrub (#2890). */}
+        {elapsedMs != null ? <span className="clock__elapsed">{`${fmtElapsed(elapsedMs)} · `}</span> : null}
+        {/* (#2890, operator) With seconds: at 5s/s an HH:MM clock changed once
+            every 12 seconds and read as a fixed total, not the playhead. */}
+        {clk(t)}
         {label ? ` · ${label}` : ""}
       </span>
     </div>

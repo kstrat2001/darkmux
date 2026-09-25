@@ -23,8 +23,16 @@
  */
 
 import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
-import { aggregateLiveState, aggregateTokenRate, liveExecutions } from "../../lib/tokenRate";
-import type { LiveState } from "../../lib/tokenRate";
+import {
+  aggregateLiveState,
+  aggregateTokenRate,
+  executionTokenReading,
+  lastHeartbeatMs,
+  liveExecutions,
+  liveStatePriority,
+  liveStateWhileConnected,
+} from "../../lib/tokenRate";
+import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
 // (#2814) `isSelfMachine`/`displayNameOf` live in `lib/flow.ts` beside
 // `nameOf`/`machineNames`/`localMachineUid` rather than here, because the
@@ -382,6 +390,58 @@ export function specUnknownLabel(reason: SpecUnknownReason): string {
   return reason === "not-seen" ? "hardware unknown — nothing received" : "hardware not reported";
 }
 
+/** (#2881) The pager's default page when the operator hasn't picked one:
+ *  the busiest running execution — generating first, then the lamps' own
+ *  priority (`liveStatePriority`, the same ranking `aggregateLiveState`
+ *  already uses to pick the card's single aggregate state). A tie within a
+ *  priority band goes to the higher current rate (meaningful only among
+ *  generating executions, where a real tie is otherwise plausible — two
+ *  coders that both started producing at once), and a final tie goes to the
+ *  lower session id so the pick is deterministic rather than depending on
+ *  array order. `null` for an empty list. */
+export function busiestExecution(executions: ExecutionTokenReading[]): ExecutionTokenReading | null {
+  let best: ExecutionTokenReading | null = null;
+  for (const e of executions) {
+    if (!best) {
+      best = e;
+      continue;
+    }
+    const bestPriority = liveStatePriority(best.state);
+    const ePriority = liveStatePriority(e.state);
+    if (ePriority !== bestPriority) {
+      if (ePriority < bestPriority) best = e;
+      continue;
+    }
+    const bestRate = best.tokensPerSec ?? -1;
+    const eRate = e.tokensPerSec ?? -1;
+    if (eRate !== bestRate) {
+      if (eRate > bestRate) best = e;
+      continue;
+    }
+    if (e.sessionId < best.sessionId) best = e;
+  }
+  return best;
+}
+
+/** (#2886 pass 5, MUST — fresh-reviewer finding F6) Whether `candidate`
+ *  should REPLACE `current` as the pager's STICKY default page. Only when
+ *  `candidate` is STRICTLY busier by STATE CLASS (the same
+ *  `liveStatePriority` ranking `busiestExecution` itself picks from — a
+ *  candidate that only ties `current`'s priority is not strictly busier,
+ *  by definition). Deliberately narrower than `busiestExecution`'s own
+ *  tie-break chain: that function picks a reasonable FIRST default from
+ *  nothing; this one guards against replacing an ALREADY-DISPLAYED page,
+ *  where a rate-based or session-id tie-break is exactly what flapped a
+ *  real fleet's default page 46 times in 863s — two generating executions
+ *  trading which one currently reads the higher tok/s is not a reason to
+ *  switch what the operator is looking at. `FleetLens.tsx` calls this every
+ *  render with the currently-displayed execution as `current`, and only
+ *  calls `busiestExecution` fresh when `current` itself is gone (its own
+ *  execution ended) — see that component's own doc. */
+export function isStrictlyBusier(candidate: ExecutionTokenReading, current: ExecutionTokenReading): boolean {
+  return liveStatePriority(candidate.state) < liveStatePriority(current.state);
+}
+
 export interface FleetCard {
   /** (#2802 regression fix) The operator's own roster name for this machine,
    * when they declared one AND it differs from what the machine calls
@@ -435,6 +495,31 @@ export interface FleetCard {
    * never mount a scope when this is `null` — an idle machine has zero
    * `TokenScope` instances, not one sitting at 0. */
   liveTokRate: number | null;
+  /** (#2886 pass 5, MUST — fresh-reviewer finding F4) `liveTokStalled`,
+   *  `liveTokState`, `liveTokRestSecondsLeft`, `liveTokCarried` below, and
+   *  `defaultExecutionSessionId` further down, are NOT read by
+   *  `FleetLens.tsx` any more — the pager reads the equivalent per-PAGE data
+   *  off `executions` instead (one entry per execution) once #2881 landed,
+   *  including for a single running execution (verified:
+   *  `card.executions[0]` matches these aggregate fields exactly in that
+   *  case, so no separate rendering path was ever needed for it).
+   *
+   *  Kept anyway, deliberately, rather than deleted:
+   *  1. They are still a genuine part of `buildFleetCard`'s PURE snapshot —
+   *     the machine-wide stall/state/carry answer, independent of which
+   *     execution a pager happens to be showing, which is a reasonable
+   *     thing for a card snapshot to expose even to a consumer that never
+   *     renders a pager (a future export, a different summary view).
+   *  2. The render-level gap the finding actually named — the per-page
+   *     half-open evidence and per-page `lastHeartbeatMs` were asserted
+   *     only on `card.executions[i]` fields, never on what reaches the
+   *     screen — is closed by NEW tests in `FleetLens.test.tsx` that pin
+   *     the rendered rate-line text and the mocked `TokenScope`'s own
+   *     props, not by these fields regaining a consumer.
+   *  3. Deleting five fields with a decade of pre-existing #2877/#2885/
+   *     #2886 unit coverage (stall detection, the half-open race, carried
+   *     detection) to chase a render-path gap that's already closed here
+   *     would be churn for its own sake, not a fix. */
   /** (#2877) No fresh heartbeat from anything running on this machine —
    * the scope should decay to its flat-ring stall state. `liveTokRate` is
    * already forced to `0` in this case (see `buildFleetCard`), so this is
@@ -451,6 +536,24 @@ export interface FleetCard {
   liveTokState: LiveState | null;
   /** Present only when `liveTokState === "rest"`. */
   liveTokRestSecondsLeft?: number;
+  /** (#2885) `true` when `liveTokRate` is carried forward from an earlier
+   *  turn on at least one contributing session rather than freshly measured
+   *  — the card dims the rate line. See
+   *  `lib/tokenRate.ts::AggregatedTokenRate`. */
+  liveTokCarried: boolean;
+  /** (#2881) One entry per currently-running execution on this machine, as
+   *  of `t` — the pager's per-page data. Sorted by session id, a STABLE
+   *  order independent of state/rate, so a pager's page numbers do not
+   *  reshuffle tick to tick while the operator is looking at one page (see
+   *  `FleetLens.tsx`'s sticky-pick doc). Empty when nothing is running,
+   *  same condition as `liveTokRate === null`. The single machine-wide
+   *  `liveTokRate` above is unchanged — it is still the card's TOTAL (moved
+   *  to the count line once there are 2+ executions, #2881); this is each
+   *  execution's OWN reading. */
+  executions: ExecutionTokenReading[];
+  /** (#2881) The pager's default page's session id — the busiest of
+   *  `executions` (`busiestExecution`). `null` when `executions` is empty. */
+  defaultExecutionSessionId: string | null;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -487,6 +590,23 @@ export function buildFleetCard(
    * there too — nothing here branches on mode; the data simply isn't
    * fetched (the one thing mode is still allowed to decide). */
   machineRuns: Run[] = [],
+  /** (#2886 pass 3, "STALL while disconnected") Whether the PAGE has a
+   * working connection to the daemon right now — read by the caller from
+   * the same liveness source the header renders (`hooks/useLiveTail.ts`'s
+   * `LiveTailStatus`). Defaults to `true` so every existing call site
+   * (tests, and a replay call — see `liveStateWhileConnected`'s own doc for
+   * why disconnection is meaningless there) keeps behaving exactly as
+   * before; `FleetLens.tsx`'s live-mode render is the one caller that
+   * passes the real value. */
+  connected = true,
+  /** (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+   * race") The last moment the page confirmed contact with the daemon
+   * (`App.tsx`'s `lastContactRef`, sourced from `useLiveTail`'s
+   * `onContact`) — `null` when unknown (tests, a replay call, or a
+   * genuinely never-live route), in which case the half-open check inside
+   * `liveStateWhileConnected` is skipped and only `connected` governs, same
+   * as before this parameter existed. */
+  lastContactMs: number | null = null,
 ): FleetCard {
   const flowActive = machActive(data, liveSet, m, t);
   const labRunning = runningLabRunCount(machineRuns);
@@ -581,7 +701,28 @@ export function buildFleetCard(
   // deriveLiveState`'s own doc. `liveTokStalled` is now DERIVED from it
   // (`=== "stalled"`) rather than a second, separately-computed "every
   // running session's heartbeats are stale" check.
-  const liveTokLiveState = liveTokRecordSets.length > 0 ? aggregateLiveState(liveTokRecordSets, t) : null;
+  // (#2886 pass 3, "STALL while disconnected"; pass 4 finding 5, "half-open
+  // connection race") Downgraded the same way the run page's
+  // `sessionRun.ts` downgrades it — see
+  // `lib/tokenRate.ts::liveStateWhileConnected`'s own doc. `connected`
+  // defaults to `true`, so this is a no-op for every caller that doesn't
+  // pass it (tests, and a replay call, where disconnection is meaningless).
+  // `lastHeartbeatMs` is this MACHINE's most recent heartbeat across its
+  // running sessions — the deadline the half-open check compares
+  // `lastContactMs` against; `null` when unknown skips that check too.
+  const liveTokLiveState =
+    liveTokRecordSets.length > 0
+      ? liveStateWhileConnected(
+          aggregateLiveState(liveTokRecordSets, t),
+          connected,
+          // Only construct the half-open evidence when this caller actually
+          // HAS it — `lastContactMs === null` means "not wired for this
+          // route" (App.tsx's own fold), not "confirmed no contact ever",
+          // and must skip the check entirely rather than distrust every
+          // stall on principle.
+          lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs(liveTokRecordSets) } : undefined,
+        )
+      : null;
   const liveTokStalled = liveTokLiveState?.state === "stalled";
   // While the machine has a running execution the scope stays mounted: at 0
   // with its state word when nothing is generating (resting, tools, reading
@@ -590,10 +731,45 @@ export function buildFleetCard(
   // Only when a live EXECUTION exists: a mission between model steps (only
   // its run session beating) has no model working, so no scope and no state.
   const hasLiveExecution = liveExecutions(liveTokRecordSets, t).length > 0;
-  const rawLiveTokRate = active && hasLiveExecution ? (aggregateTokenRate(liveTokRecordSets, t) ?? 0) : null;
+  // (#2885) `aggregateTokenRate` now returns `{tokensPerSec, carried}` —
+  // `rawTokReading` is `null` exactly when there is nothing running or no
+  // execution has a reading yet, same as before.
+  const rawTokReading = active && hasLiveExecution ? aggregateTokenRate(liveTokRecordSets, t) : null;
+  const rawLiveTokRate = active && hasLiveExecution ? (rawTokReading?.tokensPerSec ?? 0) : null;
   const liveTokRate = rawLiveTokRate != null && liveTokStalled ? 0 : rawLiveTokRate;
   const liveTokState = liveTokRate !== null ? (liveTokLiveState?.state ?? null) : null;
   const liveTokRestSecondsLeft = liveTokState === "rest" ? liveTokLiveState?.restSecondsLeft : undefined;
+  // Only meaningful while `liveTokState === "generating"` — that's the one
+  // state whose rate line shows the NUMBER (`FleetLens.tsx`'s rate line
+  // shows a state word otherwise), so a carried reading during rest/tools/
+  // prompt/stalled would dim text that isn't the rate at all.
+  const liveTokCarried = liveTokState === "generating" ? (rawTokReading?.carried ?? false) : false;
+  // (#2881) Per-execution readings for the pager — ONE derivation, live or
+  // replay, over the SAME `liveTokRecordSets` the aggregate reading above
+  // already narrowed to this machine's running sessions as of `t` and
+  // `liveExecutions` already filtered down to genuine execution evidence
+  // (see that function's own doc). Sorted by session id — see `executions`'
+  // own field doc on `FleetCard` for why the order must be stable rather
+  // than resorted by business every tick.
+  // (#2886 pass 4 parity) Same half-open-connection evidence the aggregate
+  // reading above threads into `liveStateWhileConnected` — but per
+  // EXECUTION, `lastHeartbeatMs` is THIS execution's own last heartbeat
+  // (`lastHeartbeatMs([recs])`), not the machine-wide max the aggregate
+  // uses. Sharing the machine-wide max here would let one execution's
+  // fresher heartbeat wrongly excuse another, quieter execution's own
+  // genuine stall — the whole point of per-page state is that each page
+  // answers for its OWN run, not the busiest one on the card.
+  const executions: ExecutionTokenReading[] = liveExecutions(liveTokRecordSets, t)
+    .map((recs) =>
+      executionTokenReading(
+        recs,
+        t,
+        connected,
+        lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs([recs]) } : undefined,
+      ),
+    )
+    .sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
+  const defaultExecutionSessionId = busiestExecution(executions)?.sessionId ?? null;
   const spec = specOf(data, liveMachines, specs, m, specBeats);
   // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
   // machine's hardware line, so "was there anything to read" is exactly
@@ -624,5 +800,8 @@ export function buildFleetCard(
     liveTokStalled,
     liveTokState,
     liveTokRestSecondsLeft,
+    liveTokCarried,
+    executions,
+    defaultExecutionSessionId,
   };
 }

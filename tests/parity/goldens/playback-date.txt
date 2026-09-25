@@ -34,13 +34,15 @@ MacBook-Pro
 hardware unknown — nothing received
 idle
 0 running
+idle
 RECENT ACTIVITY
+ALL
 10M
 1H
 4H
 24H
 MacBook-Pro
-18:28
-06:28
+02:09
+10:18
 18:28
 

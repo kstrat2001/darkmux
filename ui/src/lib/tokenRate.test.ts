@@ -8,11 +8,17 @@ import {
   charsPerSecond,
   currentTokenRate,
   deriveLiveState,
+  executionRole,
+  executionTokenReading,
+  promptTokensLabel,
   heartbeatSamples,
   isStalled,
+  liveStatePriority,
   measuredCharsPerToken,
   averageGenerationRate,
   liveStateLabel,
+  liveStateWhileConnected,
+  lastHeartbeatMs,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -52,8 +58,10 @@ describe("heartbeatSamples", () => {
   it("reads new-shape sampled_at_ms + generated_chars", () => {
     const samples = heartbeatSamples([beat(1_000, 40), beat(3_000, 120)]);
     expect(samples).toEqual([
-      { atMs: 1_000, chars: 40 },
-      { atMs: 3_000, chars: 120 },
+      // (#2890) `visible` (cumulative_chars) rides along when the record
+      // also has generated_chars; the old-runtime case below has none.
+      { atMs: 1_000, chars: 40, visible: 40 },
+      { atMs: 3_000, chars: 120, visible: 120 },
     ]);
   });
 
@@ -129,6 +137,61 @@ describe("measuredCharsPerToken", () => {
     const ratio = measuredCharsPerToken([turnBeat(1, 1_000, 566), turnTokens(1, 391)]);
     expect(ratio).toBe(DEFAULT_CHARS_PER_TOKEN);
   });
+
+  // (#2886/#2885, real recorded shape — Splash bake-off run
+  // `darkmux-coding-refresh-rotation-1790242191590`) Turn 2 was cut by a
+  // reasoning checkpoint: 74,617 generated chars, only 91 billed tokens
+  // (≈820 chars/token). Turn 3 was ordinary: 7,227 chars, 1,943 tokens
+  // (≈3.72 chars/token, close to the real measured ratio). Blended together
+  // the pair calibrates to ≈40 chars/token — this must calibrate from turn
+  // 3 ALONE.
+  const checkpoint = (turn: number): FlowRecord =>
+    ({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "conclude" } }) as unknown as FlowRecord;
+
+  it("excludes a checkpointed turn from calibration, keyed on the dispatch.checkpoint record (#2886)", () => {
+    const ratio = measuredCharsPerToken([
+      turnBeat(2, 1_000, 74_617),
+      turnTokens(2, 91),
+      checkpoint(2),
+      turnBeat(3, 5_000, 7_227),
+      turnTokens(3, 1_943),
+    ]);
+    expect(ratio).toBeCloseTo(7_227 / 1_943, 5);
+  });
+
+  it("falls back to DEFAULT_CHARS_PER_TOKEN when the ONLY turn with usage is checkpointed", () => {
+    const ratio = measuredCharsPerToken([turnBeat(2, 1_000, 74_617), turnTokens(2, 91), checkpoint(2)]);
+    expect(ratio).toBe(DEFAULT_CHARS_PER_TOKEN);
+  });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 1) A `continue` checkpoint
+  // did NOT cut the stream — the harness judged the turn mid-thought and let
+  // it keep going, so its telemetry.tokens bills the WHOLE turn normally.
+  // Only `verdict: "conclude"` (the harness forcing a hand-off) actually
+  // truncates. Real shape, session
+  // `darkmux-coding-refresh-rotation-1790243027020` turn 2: checkpointed
+  // with `verdict: "continue"`, still billed normally.
+  const continueCheckpoint = (turn: number): FlowRecord =>
+    ({ ts: atSec(0), action: "dispatch.checkpoint", session_id: SID, payload: { turn_seq: turn, checkpoint: 1, verdict: "continue" } }) as unknown as FlowRecord;
+
+  it("does NOT exclude a turn whose checkpoint verdict is 'continue' — it billed normally", () => {
+    const ratio = measuredCharsPerToken([turnBeat(2, 1_000, 8_050), continueCheckpoint(2), turnTokens(2, 2_300)]);
+    // 8,050 / 2,300 ≈ 3.5 chars/token, the real measured ratio — must NOT
+    // fall back to DEFAULT_CHARS_PER_TOKEN as if this turn were excluded.
+    expect(ratio).toBeCloseTo(8_050 / 2_300, 5);
+  });
+
+  it("a turn with BOTH a continue and a later conclude checkpoint is still excluded (the conclude cut it)", () => {
+    const ratio = measuredCharsPerToken([
+      turnBeat(2, 1_000, 74_617),
+      continueCheckpoint(2),
+      turnTokens(2, 91),
+      checkpoint(2),
+      turnBeat(3, 5_000, 7_227),
+      turnTokens(3, 1_943),
+    ]);
+    expect(ratio).toBeCloseTo(7_227 / 1_943, 5);
+  });
 });
 
 describe("currentTokenRate", () => {
@@ -151,6 +214,129 @@ describe("currentTokenRate", () => {
     // Last pair: 80 chars over 2000ms = 40 chars/sec / 4 default = 10 tok/s.
     expect(a!.tokensPerSec).toBeCloseTo(10, 5);
   });
+
+  // (#2885, acceptance criterion) "previous turn measured, new turn with
+  // one heartbeat gives a carried reading, not null."
+  it("carries the last measured rate into a new turn's lone first heartbeat, marked carried", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // Turn 1: opens at 0 (every turn does — finding 2), then 800 chars over
+    // 2s, then another 800 over 2s = 400 chars/s -> 100 tok/s at the
+    // default 4 chars/token. The carry must read the (800, 1600) pair, not
+    // the opening (0, 800) one (finding 2). Turn 2's own first (and only)
+    // sample follows 18s later.
+    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(5_000, 1_600, 1), hbT(23_000, 50, 2)]);
+    expect(reading).not.toBeNull();
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading!.carried).toBe(true);
+  });
+
+  it("is null, not carried, with only ONE heartbeat ever (nothing to carry from)", () => {
+    expect(currentTokenRate([beat(1_000, 40)])).toBeNull();
+  });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 2) Every turn opens with a
+  // heartbeat at `generated_chars: 0`, sent before the first token — a pair
+  // whose EARLIER sample is 0 chars spans prompt reading, not generation,
+  // and reads near-zero. Real shape, session
+  // `darkmux-coding-refresh-rotation-1790243027020`: turn 3 went 0 -> 4
+  // chars over 13s; turn 4 then showed a dimmed "0" on a flat ring. The
+  // carry must skip that near-zero pair and reach further back for the
+  // most recent pair with real progress.
+  it("never carries a pair whose earlier sample is 0 chars — reaches further back for real progress", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [
+      // Turn 2: opens at 0 (every turn does), then real progress: 800 chars
+      // over 2s, then another 800 over 2s = 400 chars/s -> 100 tok/s.
+      hbT(0, 0, 2),
+      hbT(2_000, 800, 2),
+      hbT(4_000, 1_600, 2),
+      // Turn 3: near-zero — its earlier sample (0) must be skipped, not carried.
+      hbT(10_000, 0, 3),
+      hbT(23_000, 4, 3),
+      // Turn 4: lone first heartbeat — nothing of its own to read from yet.
+      hbT(30_000, 1, 4),
+    ];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+  });
+
+  it("returns null (not a near-zero carry) when the ONLY prior pair has a 0-chars earlier sample", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [hbT(0, 0, 3), hbT(13_000, 4, 3), hbT(30_000, 1, 4)];
+    expect(currentTokenRate(records)).toBeNull();
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F1) A pair whose earlier
+  // sample is 0 chars is not ALWAYS untrustworthy — a FAST one (about one
+  // heartbeat interval) is real signal: the model produced its first chars
+  // almost immediately. This is the DIRECT path (the pair IS the current
+  // turn's own last two samples), so a trusted fast opener must read fresh
+  // (not carried).
+  it("trusts a FAST opener pair (<= ~one heartbeat interval) as a fresh, non-carried reading", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // 40 chars over 2s = 20 chars/s / 4 default = 5 tok/s.
+    const reading = currentTokenRate([hbT(0, 0, 5), hbT(2_000, 40, 5)]);
+    expect(reading).not.toBeNull();
+    expect(reading!.tokensPerSec).toBeCloseTo(5, 5);
+    expect(reading!.carried).toBeUndefined();
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F1, "the naive skip made
+  // nulls jump 41->148") A SLOW opener as the CURRENT pair must not be
+  // trusted directly (it would read ~0.1 tok/s at full brightness — real
+  // data: 0 -> 4 chars over 13s) — but the fallback search must still find
+  // an EARLIER pair that IS a fast, trustworthy opener, rather than
+  // rejecting every 0-chars pair outright (the over-correction this finding
+  // also warns against). Turn 4's own opening pair (0 -> 800 over 2s) is
+  // exactly that: a fast opener, one turn back.
+  it("rejects a SLOW opener as the current reading but still finds an earlier FAST opener to carry", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [
+      // Turn 4: a FAST opener — 800 chars over 2s = 400 chars/s -> 100 tok/s.
+      hbT(0, 0, 4),
+      hbT(2_000, 800, 4),
+      // Turn 5 (current): a SLOW opener — 4 chars over 13s, not trustworthy
+      // as a direct reading.
+      hbT(10_000, 0, 5),
+      hbT(23_000, 4, 5),
+    ];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+  });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 3) After a checkpoint,
+  // `generated_chars` restarts within the SAME turn_seq (real shapes:
+  // 119,547 -> 1; 74,617 -> 3), so the current turn's own last two
+  // heartbeats read a NEGATIVE Δchars and `charsPerSecond` returns null.
+  // Before this fix `currentTokenRate` returned null right there without
+  // ever trying the carried rate — must fall back instead.
+  it("falls back to the carried rate when the current turn's own last pair has restarted (post-checkpoint) chars", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    const records = [
+      // Turn 4: real progress to carry from. 800 chars/2s = 400 chars/s.
+      hbT(0, 0, 4),
+      hbT(2_000, 800, 4),
+      hbT(4_000, 1_600, 4),
+      // Turn 5 (current): a checkpoint reset the counter mid-turn — the
+      // SAME turn_seq's own last pair goes backward (119,547 -> 1).
+      hbT(6_000, 119_547, 5),
+      hbT(8_000, 1, 5),
+    ];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+  });
 });
 
 describe("isStalled", () => {
@@ -169,17 +355,36 @@ describe("aggregateTokenRate", () => {
   it("sums current readings across running executions", () => {
     const exec1 = [beat(1_000, 40), beat(3_000, 120)]; // 40 chars/sec / 4 = 10 tok/s
     const exec2 = [beat(1_000, 40), beat(3_000, 200)]; // 80 chars/sec / 4 = 20 tok/s
-    expect(aggregateTokenRate([exec1, exec2], 3_500)).toBeCloseTo(30, 5);
+    const reading = aggregateTokenRate([exec1, exec2], 3_500);
+    expect(reading?.tokensPerSec).toBeCloseTo(30, 5);
+    expect(reading?.carried).toBe(false);
   });
 
   it("treats a stalled/fresh execution as contributing 0, not dropping the machine's total", () => {
     const generating = [beat(1_000, 40), beat(3_000, 120)];
     const fresh: FlowRecord[] = [beat(5_000, 0)];
-    expect(aggregateTokenRate([generating, fresh], 5_500)).toBeCloseTo(10, 5);
+    expect(aggregateTokenRate([generating, fresh], 5_500)?.tokensPerSec).toBeCloseTo(10, 5);
   });
 
   it("is null only when NO execution has a reading at all", () => {
     expect(aggregateTokenRate([[beat(1_000, 0)], []], 1_500)).toBeNull();
+  });
+
+  // (#2885) A carried reading from any ONE contributing execution marks the
+  // whole aggregate carried — the caller renders a single number, dimmed or
+  // not, never a per-execution split.
+  it("marks the aggregate carried when any contributing execution's own reading is carried", () => {
+    const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
+      ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
+    // exec1: turn 1 opens at 0, then two real-progress intervals, then
+    // turn 2's lone first sample — carried (from turn 1's second interval,
+    // not its 0-opening one — finding 2).
+    const exec1 = [hbT(0, 0, 1), hbT(2_000, 400, 1), hbT(4_000, 800, 1), hbT(23_000, 50, 2)];
+    // exec2: an ordinary fresh same-turn pair — not carried.
+    const exec2 = [beat(23_000, 0), beat(25_000, 200)];
+    const reading = aggregateTokenRate([exec1, exec2], 25_500);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
   });
 });
 
@@ -211,6 +416,22 @@ describe("deriveLiveState", () => {
     expect(deriveLiveState(recs, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "generating" });
   });
 
+  // (#2886 pass 4, CONSIDER-do-it — fresh-reviewer finding 4) A turn whose
+  // only heartbeat(s) read `generated_chars: 0` is still reading the prompt
+  // / thinking before its first token — GENERATING would light the lamp and
+  // drive the wave over a stretch that hasn't produced anything yet.
+  it("is prompt, not generating, while the only fresh heartbeat(s) read 0 chars", () => {
+    const oneZero = [beat(1_000, 0)];
+    expect(deriveLiveState(oneZero, 1_000 + STALL_AFTER_MS - 1)).toEqual({ state: "prompt" });
+    const twoZero = [beat(1_000, 0), beat(3_000, 0)];
+    expect(deriveLiveState(twoZero, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "prompt" });
+  });
+
+  it("is generating once the fresh heartbeat shows real progress, even right after a 0-chars opener", () => {
+    const recs = [beat(1_000, 0), beat(3_000, 40)];
+    expect(deriveLiveState(recs, 3_000 + STALL_AFTER_MS - 1)).toEqual({ state: "generating" });
+  });
+
   it("is prompt right after dispatch.start, before the first heartbeat", () => {
     expect(deriveLiveState([start(0)], 500)).toEqual({ state: "prompt" });
   });
@@ -226,7 +447,8 @@ describe("deriveLiveState", () => {
   it("is tools while a dispatch.tool is the latest thing and no heartbeat has followed it", () => {
     const toolAt = 1_000 + STALL_AFTER_MS + 200;
     const recs = [beat(0, 10), beat(1_000, 200), turnEnd(toolAt, 1), tool(toolAt)];
-    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools" });
+    // (#2890) The completed tool's name rides along for the TOOLS icon.
+    expect(deriveLiveState(recs, toolAt + 2_000)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   // (Found via screenshot verification against the real corpus — a
@@ -248,7 +470,7 @@ describe("deriveLiveState", () => {
       beat(beatAtMs, 5_623),
       { ts: toolTs, action: "dispatch.tool", session_id: SID, payload: { tool_name: "edit" } } as unknown as FlowRecord,
     ];
-    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, beatAtMs + STALL_AFTER_MS + 1_000)).toEqual({ state: "tools", toolName: "edit" });
   });
 
   it("is rest with a countdown while inside a reported rest's ms window, then falls to prompt once it elapses", () => {
@@ -263,7 +485,7 @@ describe("deriveLiveState", () => {
 
   it("ignores the announce-only rest record (no ms) — a pacing nudge, not a rest", () => {
     const recs = [tool(0), restAnnounceOnly(1_000)];
-    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 2_000)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   it("is stalled once a heartbeat has gone stale with nothing after it to explain the gap", () => {
@@ -273,14 +495,14 @@ describe("deriveLiveState", () => {
 
   it("prefers a marker newer than the last stale heartbeat over calling it stalled", () => {
     const recs = [beat(0, 10), beat(1_000, 200), tool(1_000 + STALL_AFTER_MS + 500)];
-    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 1_000 + STALL_AFTER_MS + 600)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   it("ignores records after the given clock — never reads the future", () => {
     // The rest record technically exists in the array, but its ts is after
     // `nowMs`; the state must read as if it had not happened yet.
     const recs = [tool(0), rest(5_000, 15_000)];
-    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools" });
+    expect(deriveLiveState(recs, 1_000)).toEqual({ state: "tools", toolName: "bash" });
   });
 
   it("mutation self-check: without the rest branch this would read prompt/tools instead", () => {
@@ -328,27 +550,167 @@ describe("averageGenerationRate", () => {
     ({ ts: atSec(seq), action: "telemetry.tokens", session_id: sid, payload: { turn_seq: seq, completion_tokens: completion } }) as unknown as FlowRecord;
 
   it("sums billed tokens over summed generation time, paired per turn", () => {
-    const rate = averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 400), turn("a", 2, 5_000), tok("a", 2, 600)]]);
-    expect(rate).toBeCloseTo(100, 5);
+    const reading = averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 400), turn("a", 2, 5_000), tok("a", 2, 600)]]);
+    expect(reading?.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading?.billedTurns).toBe(2);
+    expect(reading?.totalTurns).toBe(2);
   });
 
   it("pairs by session as well as turn, across a mission's executions", () => {
-    const rate = averageGenerationRate([
+    const reading = averageGenerationRate([
       [turn("a", 1, 4_000), tok("a", 1, 400)],
       [turn("b", 1, 6_000), tok("b", 1, 200)],
     ]);
-    expect(rate).toBeCloseTo(60, 5);
+    expect(reading?.tokensPerSec).toBeCloseTo(60, 5);
   });
 
   it("skips a turn with no generation_ms, and is null when no turn has one", () => {
-    expect(averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 500), turn("a", 2, undefined), tok("a", 2, 900)]])).toBeCloseTo(100, 5);
+    expect(averageGenerationRate([[turn("a", 1, 5_000), tok("a", 1, 500), turn("a", 2, undefined), tok("a", 2, 900)]])?.tokensPerSec).toBeCloseTo(
+      100,
+      5,
+    );
     expect(averageGenerationRate([[turn("a", 1, undefined), tok("a", 1, 500)]])).toBeNull();
+  });
+
+  // (#2886) Real recorded shape: a checkpointed turn's billed tokens cover
+  // only its final continuation while `generation_ms` spans the whole
+  // chain — including it drags a real ~150 tok/s down to ~34.
+  const checkpoint = (sid: string, seq: number): FlowRecord =>
+    ({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "conclude" } }) as unknown as FlowRecord;
+
+  it("excludes a checkpointed turn from the average, labeling how many of the paired turns were billed", () => {
+    const reading = averageGenerationRate([
+      [
+        turn("a", 1, 200), // billed, ordinary
+        tok("a", 1, 20), // 100 tok/s
+        turn("a", 2, 220_000), // checkpointed: huge generation_ms, tiny billed tokens
+        tok("a", 2, 91),
+        checkpoint("a", 2),
+      ],
+    ]);
+    expect(reading).not.toBeNull();
+    // Only turn 1 is billed: 20 tokens / 0.2s = 100 tok/s, not the ~0.5
+    // tok/s a naive (20+91)/(200+220000)ms average would read.
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading!.billedTurns).toBe(1);
+    expect(reading!.totalTurns).toBe(2);
+  });
+
+  it("returns a null rate (not a fallback average) when EVERY paired turn is checkpointed", () => {
+    const reading = averageGenerationRate([[turn("a", 1, 220_000), tok("a", 1, 91), checkpoint("a", 1)]]);
+    expect(reading).toEqual({ tokensPerSec: null, billedTurns: 0, totalTurns: 1 });
+  });
+
+  // (#2886 pass 4, MUST — fresh-reviewer finding 1) Real shape, session
+  // `darkmux-coding-refresh-rotation-1790243027020` turn 2: checkpointed
+  // with `verdict: "continue"` — NOT cut, billed 32,000 + 1,803 = 33,803
+  // completion tokens over 127,348 ms of generation (~265 tok/s). Excluding
+  // it (treating `continue` the same as `conclude`) is the bug that made
+  // this run read 102 tok/s "avg · 5 of 6 turns" instead of ~210.
+  const continueCheckpoint = (sid: string, seq: number): FlowRecord =>
+    ({ ts: atSec(seq), action: "dispatch.checkpoint", session_id: sid, payload: { turn_seq: seq, checkpoint: 1, verdict: "continue" } }) as unknown as FlowRecord;
+
+  it("does NOT exclude a turn whose checkpoint verdict is 'continue' from the average", () => {
+    const reading = averageGenerationRate([[turn("a", 2, 127_348), tok("a", 2, 33_803), continueCheckpoint("a", 2)]]);
+    expect(reading).not.toBeNull();
+    expect(reading!.billedTurns).toBe(1);
+    expect(reading!.totalTurns).toBe(1);
+    expect(reading!.tokensPerSec).toBeCloseTo(33_803 / (127_348 / 1000), 5);
   });
 });
 
 describe("liveStateLabel", () => {
-  it("names the prompt wait as 'reading prompt', not the bare word the page's prompt disclosure also uses", () => {
-    expect(liveStateLabel({ state: "prompt" } as never)).toBe("reading prompt");
+  it("names the prompt wait as 'processing prompt', not the bare word the page's prompt disclosure also uses", () => {
+    expect(liveStateLabel({ state: "prompt" } as never)).toBe("processing prompt");
+  });
+});
+
+// (#2886 pass 3, "STALL while disconnected") A lost daemon connection must
+// not let a false STALL claim through.
+describe("liveStateWhileConnected", () => {
+  it("downgrades a stalled reading to null (the shared 'no live execution' rendering) when disconnected", () => {
+    expect(liveStateWhileConnected({ state: "stalled" }, false)).toBeNull();
+  });
+
+  it("leaves a stalled reading alone while connected", () => {
+    expect(liveStateWhileConnected({ state: "stalled" }, true)).toEqual({ state: "stalled" });
+  });
+
+  it("leaves every non-stalled state alone even while disconnected — only STALL is a false claim", () => {
+    expect(liveStateWhileConnected({ state: "generating" }, false)).toEqual({ state: "generating" });
+    expect(liveStateWhileConnected({ state: "rest", restSecondsLeft: 5 }, false)).toEqual({ state: "rest", restSecondsLeft: 5 });
+    expect(liveStateWhileConnected({ state: "tools" }, false)).toEqual({ state: "tools" });
+    expect(liveStateWhileConnected({ state: "prompt" }, false)).toEqual({ state: "prompt" });
+  });
+
+  it("passes a null reading through unchanged regardless of connection", () => {
+    expect(liveStateWhileConnected(null, false)).toBeNull();
+    expect(liveStateWhileConnected(null, true)).toBeNull();
+  });
+
+  // (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+  // race") STALL_AFTER_MS (30s) can fire before the header's own watchdog
+  // notices a half-open connection (LIVE_CONTACT_TIMEOUT_MS, ~40s) — a
+  // half-open connection delivers no visible `error` event, so `connected`
+  // stays `true` while heartbeats have already gone silent. A stall claim
+  // is trusted only when the daemon has answered (`lastContactMs`) AFTER
+  // the point the stalled execution's own last heartbeat
+  // (`lastHeartbeatMs`) plus STALL_AFTER_MS — i.e. after the deadline that
+  // heartbeat missed.
+  describe("the half-open connection race (finding 5)", () => {
+    const lastBeat = 1_000_000;
+
+    it("trusts a stalled reading when contact is confirmed AFTER the stall deadline", () => {
+      const halfOpen = { lastContactMs: lastBeat + STALL_AFTER_MS + 1, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toEqual({ state: "stalled" });
+    });
+
+    it("downgrades to no-signal when the last confirmed contact predates the stall deadline", () => {
+      // Contact was confirmed, but BEFORE the point a stall claim needs one.
+      const halfOpen = { lastContactMs: lastBeat + STALL_AFTER_MS - 1, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toBeNull();
+    });
+
+    it("downgrades to no-signal when there is no contact evidence at all", () => {
+      const halfOpen = { lastContactMs: null, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toBeNull();
+    });
+
+    it("skips the half-open check entirely when omitted — old 2-arg behavior unchanged", () => {
+      expect(liveStateWhileConnected({ state: "stalled" }, true)).toEqual({ state: "stalled" });
+    });
+
+    it("skips the half-open check when there is no heartbeat to compare against", () => {
+      const halfOpen = { lastContactMs: null, lastHeartbeatMs: null };
+      expect(liveStateWhileConnected({ state: "stalled" }, true, halfOpen)).toEqual({ state: "stalled" });
+    });
+
+    it("the plain disconnected check still wins outright, before the half-open check ever runs", () => {
+      const halfOpen = { lastContactMs: lastBeat + STALL_AFTER_MS + 1, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "stalled" }, false, halfOpen)).toBeNull();
+    });
+
+    it("never touches a non-stalled reading, even with failing half-open evidence", () => {
+      const halfOpen = { lastContactMs: null, lastHeartbeatMs: lastBeat };
+      expect(liveStateWhileConnected({ state: "generating" }, true, halfOpen)).toEqual({ state: "generating" });
+    });
+  });
+});
+
+describe("lastHeartbeatMs", () => {
+  it("is null when no execution has ever produced a heartbeat", () => {
+    expect(lastHeartbeatMs([[], []])).toBeNull();
+  });
+
+  it("is the MOST RECENT heartbeat across several executions", () => {
+    const execA = [beat(1_000, 40), beat(3_000, 120)];
+    const execB = [beat(2_000, 10), beat(5_000, 90)];
+    expect(lastHeartbeatMs([execA, execB])).toBe(5_000);
+  });
+
+  it("ignores an execution with no heartbeats without throwing", () => {
+    const execA = [beat(1_000, 40)];
+    expect(lastHeartbeatMs([execA, []])).toBe(1_000);
   });
 });
 
@@ -364,13 +726,13 @@ describe("which executions count: live ones only", () => {
     const finished = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), hb("a", 3_000, 800), rec("a", 3_500, "dispatch.complete")];
     const live = [rec("b", 10_000, "dispatch.start"), hb("b", 11_000, 0), hb("b", 13_000, 800)];
     // Both measured 400 chars/s -> 100 tok/s at the default 4 chars/token.
-    expect(aggregateTokenRate([finished, live], 13_500)).toBeCloseTo(100, 5);
+    expect(aggregateTokenRate([finished, live], 13_500)?.tokensPerSec).toBeCloseTo(100, 5);
   });
 
   it("a resting or tool-running execution adds nothing while another generates", () => {
     const resting = [rec("a", 0, "dispatch.start"), hb("a", 1_000, 0), hb("a", 3_000, 800), rec("a", 3_500, "dispatch.rest", { ms: 15_000 })];
     const live = [rec("b", 0, "dispatch.start"), hb("b", 3_000, 0), hb("b", 5_000, 800)];
-    expect(aggregateTokenRate([resting, live], 5_500)).toBeCloseTo(100, 5);
+    expect(aggregateTokenRate([resting, live], 5_500)?.tokensPerSec).toBeCloseTo(100, 5);
   });
 
   it("the mission's own run-grain session (a mission-sourced start) never reads as PROMPT over a stalled execution", () => {
@@ -421,13 +783,366 @@ describe("tools vs reading prompt, from the tool COMPLETION records", () => {
     const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2), tool(5_000), tool(6_000)];
     expect(deriveLiveState(recs, 7_000).state).toBe("prompt");
   });
+  // (#2890) The TOOLS center shows an icon for the tool. The runtime emits
+  // `dispatch.tool` on COMPLETION, so the name the viewer has is the latest
+  // completed call of THIS turn; a previous turn's tool must never leak in.
+  const namedTool = (atMs: number, name: string): FlowRecord =>
+    ({ ts: new Date(atMs).toISOString(), action: "dispatch.tool", session_id: SID, payload: { tool_name: name } }) as unknown as FlowRecord;
+
+  it("names the latest completed tool of this turn while TOOLS", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(6_000, "edit")];
+    expect(deriveLiveState(recs, 7_000)).toEqual({ state: "tools", toolName: "edit" });
+  });
+
+  it("names no tool before this turn's first completion", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 2)];
+    expect(deriveLiveState(recs, 5_000)).toEqual({ state: "tools" });
+  });
+
+  it("never carries the previous turn's tool into this one", () => {
+    const recs = [
+      start(0),
+      beat(1_000, 0),
+      beat(3_000, 800),
+      turn(4_000, 1, 1),
+      namedTool(5_000, "bash"),
+      beat(6_000, 0),
+      beat(8_000, 900),
+      turn(9_000, 2, 2),
+    ];
+    expect(deriveLiveState(recs, 10_000)).toEqual({ state: "tools" });
+  });
+
+  it("ignores a tool completion from after the clock (playback cut)", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "read"), namedTool(9_000, "edit")];
+    expect(deriveLiveState(recs, 6_000)).toEqual({ state: "tools", toolName: "read" });
+  });
+
+  it("carries the name through executionTokenReading and aggregateLiveState", () => {
+    const recs = [start(0), beat(1_000, 0), beat(3_000, 800), turn(4_000, 1, 3), namedTool(5_000, "search")];
+    expect(executionTokenReading(recs, 6_000).toolName).toBe("search");
+    expect(aggregateLiveState([recs], 6_000)).toEqual({ state: "tools", toolName: "search" });
+  });
 });
 
 describe("a turn's first reading never pairs with the previous turn", () => {
-  it("returns no reading for a new turn's first sample instead of a near-zero rate across the tool gap", () => {
+  // (#2885) Pre-#2885 this returned `null` outright — "no reading yet" for
+  // several seconds every short turn, the exact tile-reads-dead defect the
+  // issue reports. It now falls back to the CARRIED reading instead (see
+  // `currentTokenRate` describe above): still never a near-zero rate spanning
+  // the tool gap between turn 1's last sample and turn 2's first, but also
+  // never a bare "—" while the run is plainly still generating.
+  it("never pairs a new turn's first sample with the previous turn's last (no near-zero rate across the tool gap)", () => {
     const hbT = (atMs: number, chars: number, turnSeq: number): FlowRecord =>
       ({ ts: new Date(atMs).toISOString(), action: "dispatch.turn.heartbeat", session_id: SID, payload: { sampled_at_ms: atMs, generated_chars: chars, turn_seq: turnSeq } }) as unknown as FlowRecord;
-    // Turn 1 ended at 800 chars; turn 2's first sample is 900 chars 20s later.
-    expect(currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(23_000, 900, 2)])).toBeNull();
+    // Turn 1: opens at 0, then 800 chars over 2s, then another 800 over 2s
+    // = 400 chars/s throughout. Turn 2's first sample is 18s later — if
+    // this paired turn 1's last (1,600) against turn 2's first across that
+    // 18s gap it would read a near-zero rate; instead it carries turn 1's
+    // own (800, 1,600) interval — its 0-opening interval is skipped
+    // (finding 2) even though it would have given the same number here.
+    const reading = currentTokenRate([hbT(1_000, 0, 1), hbT(3_000, 800, 1), hbT(5_000, 1_600, 1), hbT(23_000, 900, 2)]);
+    expect(reading).not.toBeNull();
+    expect(reading!.carried).toBe(true);
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
   });
 });
+
+// (#2881) The fleet card pager's per-execution data.
+describe("executionRole", () => {
+  const rec = (action: string, handle?: string): FlowRecord =>
+    ({ ts: atSec(0), action, session_id: SID, ...(handle ? { handle } : {}), payload: {} }) as unknown as FlowRecord;
+
+  it("strips the darkmux/ prefix and lowercases", () => {
+    expect(executionRole([rec("dispatch.start", "darkmux/coder")])).toBe("coder");
+  });
+
+  it("lowercases a bare handle with no prefix", () => {
+    expect(executionRole([rec("dispatch.start", "CODER")])).toBe("coder");
+  });
+
+  it("is empty when nothing in the set carries a handle", () => {
+    expect(executionRole([rec("dispatch.turn.heartbeat")])).toBe("");
+  });
+
+  it("falls back to any record's handle when no dispatch.start carries one", () => {
+    expect(executionRole([rec("dispatch.turn.heartbeat", "darkmux/reviewer")])).toBe("reviewer");
+  });
+
+  it("prefers the LATEST dispatch.start's handle over an earlier one", () => {
+    const early = { ts: atSec(0), action: "dispatch.start", session_id: SID, handle: "darkmux/coder", payload: {} } as unknown as FlowRecord;
+    const later = { ts: atSec(10), action: "dispatch.start", session_id: SID, handle: "darkmux/reviewer", payload: {} } as unknown as FlowRecord;
+    expect(executionRole([early, later])).toBe("reviewer");
+  });
+});
+
+describe("executionTokenReading", () => {
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, handle?: string): FlowRecord =>
+    ({ ts: atSec(sec), action, session_id: SID, ...(handle ? { handle } : {}), payload }) as unknown as FlowRecord;
+  const hb = (sec: number, chars: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 1 });
+
+  it("carries the session id, role, generating state and rate", () => {
+    const records = [rec(0, "dispatch.start", {}, "darkmux/coder"), hb(0, 0), hb(2, 400)];
+    const reading = executionTokenReading(records, Date.parse(atSec(2)));
+    expect(reading.sessionId).toBe(SID);
+    expect(reading.role).toBe("coder");
+    expect(reading.state).toBe("generating");
+    // 400 chars / 2s = 200 chars/s -> 50 tok/s at the default 4 chars/token.
+    expect(reading.tokensPerSec).toBeCloseTo(50, 5);
+    expect(reading.carried).toBe(false);
+  });
+
+  it("reports null tokensPerSec while generating with no same-turn pair yet — never 0", () => {
+    // The start marker sits 5s before the heartbeat so its second-floor tie
+    // rule (`deriveLiveState`'s own doc: a marker in the SAME second as the
+    // last heartbeat wins) doesn't fire — this fixture is testing the fresh
+    // "one heartbeat, no pair" case, not that tie.
+    const records = [rec(-5, "dispatch.start", {}, "darkmux/coder"), hb(0, 40)];
+    const reading = executionTokenReading(records, Date.parse(atSec(0)));
+    expect(reading.state).toBe("generating");
+    expect(reading.tokensPerSec).toBeNull();
+  });
+
+  it("reports the rest state with restSecondsLeft, and no rate", () => {
+    const records = [
+      rec(0, "dispatch.start", {}, "darkmux/coder"),
+      hb(0, 0),
+      hb(2, 400),
+      rec(3, "dispatch.rest", { ms: 15_000 }),
+    ];
+    const reading = executionTokenReading(records, Date.parse(atSec(3)) + 5_000);
+    expect(reading.state).toBe("rest");
+    expect(reading.restSecondsLeft).toBe(10);
+    expect(reading.tokensPerSec).toBeNull();
+  });
+
+  it("marks a carried reading — the previous turn's rate, into a fresh turn's lone first heartbeat", () => {
+    // (rebase onto fix/2886-tokrate-checkpoints) `carriedTokenRate` now
+    // skips a pair whose EARLIER sample has 0 chars, so turn 1's first
+    // heartbeat starts at a nonzero count here — the 400-char delta over
+    // the same 2s window is unchanged, so the expected 50 tok/s below still
+    // holds.
+    const records = [
+      rec(0, "dispatch.start", {}, "darkmux/coder"),
+      hb(0, 40),
+      hb(2, 440),
+      rec(20, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(20)), generated_chars: 50, turn_seq: 2 }),
+    ];
+    const reading = executionTokenReading(records, Date.parse(atSec(20)));
+    expect(reading.state).toBe("generating");
+    expect(reading.carried).toBe(true);
+    expect(reading.tokensPerSec).toBeCloseTo(50, 5);
+  });
+
+  // (#2886 pass 3 downgrade, applied per execution) A false STALL claim from
+  // a lost connection must not survive at the PAGE grain either.
+  it("downgrades a stalled reading to null (no signal) when disconnected, same rule as the aggregate", () => {
+    const records = [rec(0, "dispatch.start", {}, "darkmux/coder"), hb(0, 0), hb(2, 400)];
+    const nowMs = Date.parse(atSec(2)) + STALL_AFTER_MS + 5_000;
+    const connected = executionTokenReading(records, nowMs, true);
+    expect(connected.state).toBe("stalled");
+    const disconnected = executionTokenReading(records, nowMs, false);
+    expect(disconnected.state).toBeNull();
+    expect(disconnected.restSecondsLeft).toBeUndefined();
+  });
+});
+
+describe("liveStatePriority", () => {
+  it("ranks generating best and stalled worst among real states", () => {
+    expect(liveStatePriority("generating")).toBeLessThan(liveStatePriority("rest"));
+    expect(liveStatePriority("rest")).toBeLessThan(liveStatePriority("tools"));
+    expect(liveStatePriority("tools")).toBeLessThan(liveStatePriority("prompt"));
+    expect(liveStatePriority("prompt")).toBeLessThan(liveStatePriority("stalled"));
+  });
+
+  it("ranks null (no signal) worse than every real state, including stalled", () => {
+    expect(liveStatePriority(null)).toBeGreaterThan(liveStatePriority("stalled"));
+  });
+});
+
+// (#2889) The model writing a tool call. LM Studio names the call at once,
+// then generates its arguments without sending anything; the runtime ticks
+// through that silence and the host forwards each tick as a heartbeat with
+// `phase: "writing_tool_call"`, `tool_name`, and `generated_chars` UNCHANGED.
+describe("(#2889) writing a tool call", () => {
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts: atSec(sec), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const hb = (sec: number, chars: number, extra: Record<string, unknown> = {}) =>
+    rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 1, ...extra });
+  const writing = (sec: number, chars: number, tool = "write") => hb(sec, chars, { phase: "writing_tool_call", tool_name: tool });
+
+  /** The probe's shape, stretched: 2s of reasoning, then the name at 4s,
+   *  then 36s of ticks at the same count, well past `STALL_AFTER_MS`. */
+  const probe = (): FlowRecord[] => {
+    const out = [rec(-5, "dispatch.start"), hb(0, 0, { prompt_chars: 144_000 }), hb(1, 400), hb(2, 800), writing(4, 812)];
+    for (let s = 6; s <= 40; s += 2) out.push(writing(s, 812));
+    return out;
+  };
+
+  it("derives TOOLS, writing, with the tool name — never STALL, PROMPT or GEN — through a gap longer than the stall threshold", () => {
+    const nowMs = Date.parse(atSec(41));
+    expect(nowMs - Date.parse(atSec(4))).toBeGreaterThan(STALL_AFTER_MS);
+    expect(deriveLiveState(probe(), nowMs)).toEqual({ state: "tools", toolName: "write", writing: true, writingSeconds: 37 });
+  });
+
+  it("the writing stretch counts from the first writing heartbeat of the current run of them", () => {
+    expect(deriveLiveState(probe(), Date.parse(atSec(10)))).toMatchObject({ state: "tools", writing: true, writingSeconds: 6 });
+  });
+
+  it("a writing heartbeat gone stale is still a stall — the tick stopped, so nothing is writing", () => {
+    expect(deriveLiveState(probe(), Date.parse(atSec(40)) + STALL_AFTER_MS + 1).state).toBe("stalled");
+  });
+
+  it("once the turn ends, the TOOLS reading names the written tool until a completion names one", () => {
+    const records = [...probe(), writing(41, 4_267), rec(42, "dispatch.turn", { turn_seq: 1, tool_calls_count: 1 })];
+    expect(deriveLiveState(records, Date.parse(atSec(43)))).toEqual({ state: "tools", toolName: "write" });
+  });
+
+  it("a writing sample never pairs into a rate: no zero dragging the live rate, no spike when the arguments land", () => {
+    // After the arguments land (812 -> 4,267 chars in 1s), the reading must
+    // be the last GENUINE pair (1s -> 2s: 400 chars/s = 100 tok/s), carried.
+    const records = [...probe(), writing(41, 4_267)];
+    const reading = currentTokenRate(records);
+    expect(reading).not.toBeNull();
+    expect(reading!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(reading!.carried).toBe(true);
+  });
+
+  it("writing ticks do not move the chars-per-token calibration", () => {
+    const tokens = rec(43, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
+    const withTicks = [...probe(), writing(41, 4_267), tokens];
+    const withoutTicks = [hb(0, 0), hb(2, 800), writing(41, 4_267), tokens];
+    expect(measuredCharsPerToken(withTicks)).toBeCloseTo(measuredCharsPerToken(withoutTicks), 10);
+  });
+
+  it("the stretch never reaches back into an earlier turn's writing (an older host sends no opener between them)", () => {
+    const t1 = (sec: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: 500, turn_seq: 1, phase: "writing_tool_call", tool_name: "read" });
+    const t2 = (sec: number) => rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: 90, turn_seq: 2, phase: "writing_tool_call", tool_name: "edit" });
+    const records = [rec(-5, "dispatch.start"), t1(0), t1(2), t2(20), t2(22)];
+    expect(deriveLiveState(records, Date.parse(atSec(25)))).toMatchObject({ state: "tools", toolName: "edit", writingSeconds: 5 });
+  });
+
+  it("labels the writing stretch with its elapsed seconds; running a tool keeps the old word", () => {
+    expect(liveStateLabel({ state: "tools", toolName: "edit", writing: true, writingSeconds: 70 })).toBe("tool gen · 70 s");
+    expect(liveStateLabel({ state: "tools", toolName: "edit" })).toBe("tools");
+  });
+
+  it("executionTokenReading carries the writing flag and seconds for the fleet card", () => {
+    const reading = executionTokenReading(probe(), Date.parse(atSec(41)));
+    expect(reading).toMatchObject({ state: "tools", toolName: "write", writing: true, writingSeconds: 37, tokensPerSec: null });
+  });
+});
+
+describe("(#2889) the prompt size on the opening heartbeat", () => {
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts: atSec(sec), action, session_id: SID, payload }) as unknown as FlowRecord;
+  const hb = (sec: number, chars: number, extra: Record<string, unknown> = {}) =>
+    rec(sec, "dispatch.turn.heartbeat", { sampled_at_ms: Date.parse(atSec(sec)), generated_chars: chars, turn_seq: 2, ...extra });
+
+  it("a fresh opener carrying prompt_chars reads PROMPT with that size", () => {
+    const records = [rec(-5, "dispatch.start"), hb(0, 0, { prompt_chars: 144_000 })];
+    expect(deriveLiveState(records, Date.parse(atSec(3)))).toEqual({ state: "prompt", promptChars: 144_000 });
+  });
+
+  it("an opener from an older host (no prompt_chars) reads PROMPT with no size", () => {
+    const records = [rec(-5, "dispatch.start"), hb(0, 0)];
+    expect(deriveLiveState(records, Date.parse(atSec(3)))).toEqual({ state: "prompt" });
+  });
+
+  it("(#2890) executionTokenReading estimates the prompt's size with the execution's own calibration", () => {
+    const tokens = rec(-8, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
+    const turn1 = [hb(-12, 0), hb(-10, 3_000)].map((r) => ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, turn_seq: 1 } }) as unknown as FlowRecord);
+    const records = [rec(-15, "dispatch.start"), ...turn1, tokens, hb(0, 0, { prompt_chars: 144_000 })];
+    // 3,000 chars over 1,000 billed tokens = 3 chars/token -> 48k, not the default 4's 36k.
+    expect(executionTokenReading(records, Date.parse(atSec(3))).promptLabel).toBe("~48k");
+    expect(executionTokenReading([rec(-5, "dispatch.start"), hb(0, 0)], Date.parse(atSec(3))).promptLabel).toBeUndefined();
+  });
+
+  it("(#2890) the size converts to an estimated token count", () => {
+    expect(promptTokensLabel(144_000, 4)).toBe("~36k");
+    expect(promptTokensLabel(144_000, 3)).toBe("~48k");
+    expect(promptTokensLabel(3_200, 4)).toBe("~800");
+    expect(promptTokensLabel(0, 4)).toBeNull();
+  });
+
+  // (#2889 review, M3) The wire as it really lands: record `ts` is
+  // WHOLE-SECOND, and the heartbeat's own `sampled_at_ms` is ms-precise. In
+  // 9 of 12 real openers the marker (`dispatch.start`, or the turn's last
+  // `dispatch.tool`) shares a second with the 0-char opener, so the marker
+  // wins the tie. The size must still ride along for the whole PROMPT phase.
+  const wholeSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+  const base = Date.parse(atSec(0));
+  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts: wholeSec(atMs), action, session_id: SID, payload }) as unknown as FlowRecord;
+
+  it("a dispatch.start in the same second as the opener still reads PROMPT with the opener's size", () => {
+    const records = [
+      wire(base + 100, "dispatch.start"),
+      wire(base + 300, "dispatch.turn.heartbeat", { sampled_at_ms: base + 300, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 }),
+    ];
+    expect(deriveLiveState(records, base + 1_500)).toEqual({ state: "prompt", promptChars: 144_000 });
+    // ...and for the whole prompt phase, past the stall threshold.
+    expect(deriveLiveState(records, base + 40_000)).toEqual({ state: "prompt", promptChars: 144_000 });
+  });
+
+  it("the turn's last dispatch.tool in the same second as the next opener still carries the size", () => {
+    const records = [
+      wire(base, "dispatch.start"),
+      wire(base + 200, "dispatch.turn.heartbeat", { sampled_at_ms: base + 200, generated_chars: 0, turn_seq: 1, prompt_chars: 90_000 }),
+      wire(base + 2_000, "dispatch.turn.heartbeat", { sampled_at_ms: base + 2_000, generated_chars: 400, turn_seq: 1 }),
+      wire(base + 3_000, "dispatch.turn", { turn_seq: 1, tool_calls_count: 1 }),
+      wire(base + 6_100, "dispatch.tool", { tool_name: "read" }),
+      wire(base + 6_400, "dispatch.turn.heartbeat", { sampled_at_ms: base + 6_400, generated_chars: 0, turn_seq: 2, prompt_chars: 96_000 }),
+    ];
+    expect(deriveLiveState(records, base + 7_000)).toEqual({ state: "prompt", promptChars: 96_000 });
+  });
+
+  it("an opener from BEFORE the winning marker's second never lends its size to a later PROMPT", () => {
+    // Turn 1's opener at :00.3, then its turn record at :03 says no tools:
+    // PROMPT, but the size belonged to a request already answered.
+    const records = [
+      wire(base + 100, "dispatch.start"),
+      wire(base + 300, "dispatch.turn.heartbeat", { sampled_at_ms: base + 300, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 }),
+      wire(base + 3_000, "dispatch.turn", { turn_seq: 1, tool_calls_count: 0 }),
+    ];
+    expect(deriveLiveState(records, base + 3_500)).toEqual({ state: "prompt" });
+  });
+
+  it("an elapsed rest in the same second as the next opener reads PROMPT with its size", () => {
+    const records = [
+      wire(base + 100, "dispatch.rest", { ms: 400 }),
+      wire(base + 700, "dispatch.turn.heartbeat", { sampled_at_ms: base + 700, generated_chars: 0, turn_seq: 2, prompt_chars: 60_000 }),
+    ];
+    expect(deriveLiveState(records, base + 1_500)).toEqual({ state: "prompt", promptChars: 60_000 });
+  });
+
+});
+
+describe("(#2890) thinking vs visible text while generating", () => {
+  it("only reasoning grew since the last sample: generating, thinking", () => {
+    const recs = [beat(1_000, 400, 0), beat(3_000, 1_200, 0)];
+    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "generating", thinking: true });
+  });
+  it("visible text grew: generating, not thinking", () => {
+    const recs = [beat(1_000, 1_200, 0), beat(3_000, 1_900, 700)];
+    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "generating" });
+  });
+  it("a turn's first chunk with no visible text yet reads as thinking", () => {
+    expect(deriveLiveState([beat(1_000, 300, 0)], 1_500)).toEqual({ state: "generating", thinking: true });
+  });
+  it("an old runtime (no generated_chars) never claims thinking", () => {
+    const recs = [oldBeat(1, 100), oldBeat(3, 500)];
+    expect(deriveLiveState(recs, Date.parse(atSec(3)) + 500)).toEqual({ state: "generating" });
+  });
+});
+
+describe("(#2890) executionTokenReading carries thinking", () => {
+  it("present only while generating and thinking", () => {
+    const thinking = executionTokenReading([beat(1_000, 400, 0), beat(3_000, 1_200, 0)], 3_500, true);
+    expect(thinking.state).toBe("generating");
+    expect(thinking.thinking).toBe(true);
+    const text = executionTokenReading([beat(1_000, 400, 0), beat(3_000, 1_200, 800)], 3_500, true);
+    expect(text.thinking).toBeUndefined();
+  });
+});
+

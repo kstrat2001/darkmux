@@ -178,10 +178,16 @@ export function buildActivityTimeline(
    * `FleetLens.tsx`'s own doc on the Side finding this fixes), and under
    * scrub it is the playhead. */
   playheadT = tMax,
+  /** (#2890) A replay's "all" window: the axis is the recording's own
+   *  [start, end], fixed, instead of a window rolling back from the
+   *  playhead. Bars still stop at the playhead, so the lanes fill in as it
+   *  plays. Absent (every live call, and a replay with a preset picked)
+   *  keeps the rolling window. */
+  fixedRange?: [number, number],
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
-  const tlMax = playheadT;
-  const tlMin = tlMax - winMs;
+  const tlMax = fixedRange ? fixedRange[1] : playheadT;
+  const tlMin = fixedRange ? fixedRange[0] : tlMax - winMs;
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 

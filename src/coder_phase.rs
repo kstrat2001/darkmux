@@ -2380,6 +2380,19 @@ fn mission_cautions(
                 continue;
             }
             let kind = pstr("kind").unwrap_or("caution");
+            // (#2887 F5) `repetition` (the degeneracy gate + reasoning
+            // checkpoint) is darkmux-internal vocabulary an operator reads
+            // on the run page, not a finding about the CODE the next
+            // dispatch should be cautioned about — unlike `cycle`/
+            // `tool-failure`/`reasoning-loop`, it says nothing about a file
+            // or a pattern in the diff. Forwarding it here would add up to
+            // one bullet per flagged turn (observation + abort + checkpoint,
+            // before the #2887 F4 turn-grouping this brief-inject path does
+            // not do) to every future dispatch's brief on a mission that
+            // merely ran under a gate that fired — noise, not a caution.
+            if kind == "repetition" {
+                continue;
+            }
             let severity = pstr("severity").unwrap_or("warn");
             let area = payload.and_then(|p| p.get("area"));
             let file = area

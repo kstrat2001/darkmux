@@ -1,4 +1,6 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { fitTubes } from "./tubeFit";
+import { scopeCenter } from "../../lib/scopeCenter";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -13,12 +15,13 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { TokenScope } from "../../components/TokenScope";
+import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
 import { NotesDialog } from "../../components/NotesDialog";
 import { openModalEl } from "../../lib/dialogManager";
-import { buildFleetCard, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
 import { runsForMachine } from "../runs/format";
@@ -381,6 +384,8 @@ export function FleetLens({
   tMin,
   playhead,
   historical = false,
+  connected = true,
+  lastContactMs = null,
 }: {
   records?: FlowRecord[];
   tMax?: number;
@@ -396,6 +401,22 @@ export function FleetLens({
    * fixed while a marker sweeps across it. */
   playhead?: number;
   historical?: boolean;
+  /** (#2886 pass 3, "STALL while disconnected") Whether the PAGE has a
+   * working connection to the daemon right now — `App.tsx`'s live render
+   * passes `useLiveTail`'s status. Defaults to `true`, so a `historical`
+   * (playback) render — which never passes this — always reads as
+   * connected: disconnection is meaningless there, since `useLiveTail`
+   * never even runs on a playback route (`isLiveRoute` excludes it) and
+   * would otherwise report a permanent, misleading "reconnecting". See
+   * `lib/tokenRate.ts::liveStateWhileConnected`'s own doc. */
+  connected?: boolean;
+  /** (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+   * race") `App.tsx`'s `lastContactRef.current` — the last moment
+   * `useLiveTail` confirmed contact with the daemon. `null` (the default)
+   * on every call that doesn't pass it (a `historical` render, or a test),
+   * which skips the half-open check in `buildFleetCard` entirely and falls
+   * back to the plain `connected` boolean — see that function's own doc. */
+  lastContactMs?: number | null;
 } = {}) {
   // (Playback parity, Change A) `wallNow` feeds ONLY the live fetch window
   // below (`useFlowWindow`) — "what is fetched" is the one thing liveMode
@@ -424,8 +445,54 @@ export function FleetLens({
    * a static build today, so their gated-off results were already the empty
    * values the consumers below receive. */
   const livePolling = liveMode && getSource().kind === "daemon";
-  const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
+  // (#2890) A replay's timeline defaults to "all": the recording's own span,
+  // edge to edge, so a short recording (the demo is about half an hour)
+  // fills the lanes instead of sitting as a sliver at the right edge of a
+  // preset. "all" is offered only in a replay; a preset the operator picks
+  // replaces it. Live keeps the 24h default and has no "all".
+  const recordingRange: [number, number] | null =
+    historical && tMin != null && tMax != null && tMax > tMin ? [tMin, tMax] : null;
+  const [windowMinutes, setWindowMinutes] = useState<number | "all">(() =>
+    recordingRange ? "all" : DEFAULT_ACTIVITY_WINDOW_MIN,
+  );
+  const fixedRange = windowMinutes === "all" ? (recordingRange ?? undefined) : undefined;
+  const windowMinutesNum = windowMinutes === "all" ? DEFAULT_ACTIVITY_WINDOW_MIN : windowMinutes;
+  // (#2881) The pager's sticky PICK, per machine uid — the session id the
+  // operator last chose with an arrow, if any. `FleetCard.executions` no
+  // longer including it (that execution ended) falls back to the AUTO
+  // default (`effectiveDefaultSid`, computed per card below) on the very
+  // next render, which is the whole of "sticks until that execution ends,
+  // then moves to the next [busiest]" — there is no separate cleanup step,
+  // and no live/playback branch: the same fallback rule applies to a
+  // replayed instant too.
+  const [pinnedPageByUid, setPinnedPageByUid] = useState<Record<string, string>>({});
+  // (#2886 pass 5, MUST — fresh-reviewer finding F6) The pager's AUTO
+  // (unpicked) default, per machine uid — the session id currently shown as
+  // page 1 when the operator hasn't picked one. A `useRef`, not `useState`:
+  // it's read and written in the SAME render pass, purely to remember what
+  // was shown last render so `isStrictlyBusier` has something to compare
+  // against — it never itself needs to SCHEDULE a re-render (new flow data
+  // arriving already does that). Recomputing the default from scratch every
+  // tick (`busiestExecution` alone, with no memory) flapped a real fleet's
+  // page 46 times in 863s, because two executions' fluctuating rates kept
+  // trading the tie-break; see the `cards.map` callback below for the
+  // guarded update.
+  const stickyDefaultByUidRef = useRef<Record<string, string>>({});
 
+  // (#2890) Size each card's tube to the room it has (see `tubeFit.ts`):
+  // after every render, since a rate or a pager changes the text, and on
+  // every resize of the card grid.
+  const fleetRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    fitTubes(fleetRef.current);
+  });
+  useEffect(() => {
+    const el = fleetRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(() => fitTubes(el));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
     ? { data: records, tMax: tMax ?? 0, settled: true }
@@ -637,6 +704,8 @@ export function FleetLens({
           // carries only a display NAME (`runsForMachine`'s own doc), same
           // alias-set lookup `specOf`/`nameOf` already use for this uid.
           runsForMachine(runs, machineNames(flowWindow.data, liveMachines, m)),
+          connected,
+          lastContactMs,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -670,10 +739,13 @@ export function FleetLens({
           liveMode,
           playheadT,
           specBeats,
+          undefined,
+          connected,
+          lastContactMs,
         ),
       ),
     ],
-    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster],
+    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs],
   );
 
   const timeline = useMemo(
@@ -688,12 +760,13 @@ export function FleetLens({
         // stay separate arguments once a replay can scrub.
         flowWindow.tMax,
         playheadT,
-        windowMinutes,
+        windowMinutesNum,
         liveMode,
         tMin ?? 0,
         playheadT,
+        fixedRange,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutes, liveMode, tMin, playheadT],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1]],
   );
 
   return (
@@ -708,8 +781,58 @@ export function FleetLens({
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
-      <div className="fleet">
-        {cards.map((card) => (
+      <div className="fleet" ref={fleetRef}>
+        {cards.map((card) => {
+          // (#2881) Pager selection for this card. `execs` is already
+          // sorted by session id (`cards.ts::buildFleetCard`'s own doc) —
+          // that sort order IS the pager's page order, so page numbers stay
+          // put tick to tick. The USER'S pick lives in `pinnedPageByUid`
+          // (component state, above): it applies only while the picked
+          // session is still among `execs`; the moment it isn't (the
+          // execution ended), this falls straight through to the AUTO
+          // default computed just below (`effectiveDefaultSid`) with no
+          // separate cleanup step, and no live/playback branch — the same
+          // fallback rule for a replayed instant too.
+          const execs = card.executions;
+          const pagerActive = execs.length >= 2;
+          // (#2886 pass 5, MUST — fresh-reviewer finding F6) The AUTO
+          // default is sticky against flapping: keep whatever was shown as
+          // the default last render (`stickyDefaultByUidRef`) unless that
+          // execution is gone (falls straight to the fresh busiest — same
+          // "no separate cleanup step" shape the user's OWN pin already
+          // uses below) or another execution is now STRICTLY busier by
+          // state class. `card.defaultExecutionSessionId` (the from-scratch
+          // busiest `cards.ts` computes) is deliberately NOT read directly
+          // here any more — it's what flapped, since it has no memory of
+          // what was on screen a moment ago.
+          const stickyDefaultSid = stickyDefaultByUidRef.current[card.uid];
+          const stickyDefaultExec = stickyDefaultSid != null ? execs.find((e) => e.sessionId === stickyDefaultSid) : undefined;
+          const freshBusiest = busiestExecution(execs);
+          const effectiveDefaultSid =
+            stickyDefaultExec && freshBusiest
+              ? isStrictlyBusier(freshBusiest, stickyDefaultExec)
+                ? freshBusiest.sessionId
+                : stickyDefaultExec.sessionId
+              : (freshBusiest?.sessionId ?? null);
+          if (effectiveDefaultSid != null) stickyDefaultByUidRef.current[card.uid] = effectiveDefaultSid;
+          else delete stickyDefaultByUidRef.current[card.uid];
+          const pinnedSid = pinnedPageByUid[card.uid];
+          const selectedSid = pinnedSid != null && execs.some((e) => e.sessionId === pinnedSid) ? pinnedSid : effectiveDefaultSid;
+          const selectedIdx = selectedSid != null ? execs.findIndex((e) => e.sessionId === selectedSid) : -1;
+          const selectedExec = selectedIdx >= 0 ? execs[selectedIdx] : null;
+          // `card.liveTokRate !== null` (the scope's mount gate below) only
+          // ever holds when at least one execution is running, so
+          // `selectedExec` is non-null everywhere it's read below — this is
+          // the ONE per-execution reading that N=1 and N=2+ both render
+          // from; there is no separate "aggregate" rendering path left for
+          // N=1 to keep in sync with this one.
+          const selectPage = (e: { stopPropagation: () => void }, dir: 1 | -1) => {
+            e.stopPropagation();
+            if (execs.length < 2 || selectedIdx < 0) return;
+            const next = execs[(selectedIdx + dir + execs.length) % execs.length];
+            setPinnedPageByUid((m) => ({ ...m, [card.uid]: next.sessionId }));
+          };
+          return (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`
           // (viewer.html:1711) — the fleet-card drill-in: `ACTIONS.machine`
           // (viewer.html:2991) calls `drillMachine(uid)` for an explicit
@@ -772,7 +895,12 @@ export function FleetLens({
               <span className="mico">
                 <MachineIcon />
               </span>
-              {card.name}
+              {/* (#2890) Its own box, so a long name ellipsizes beside the
+                  tube (a flex row's bare text cannot); the full name is the
+                  tooltip. */}
+              <span className="mach-name" title={card.name}>
+                {card.name}
+              </span>
             </div>
             {/* (#1855) The dim fallback says WHICH kind of unknown this is —
                 a machine that beat and carried no hardware, vs one nothing
@@ -780,7 +908,7 @@ export function FleetLens({
                 cards this issue made visible in the first place). The
                 wording lives in `cards.ts::specUnknownLabel` so the card and
                 its tests read the same string. */}
-            <div className="spec">
+            <div className="spec" title={card.spec || undefined}>
               {card.spec ? (
                 card.spec
               ) : (
@@ -791,7 +919,10 @@ export function FleetLens({
                 machine generates, the scope sits to their right at the
                 concept's card size, spanning those rows, so the card does
                 not grow taller and an idle card reserves no empty slot. */}
-            <div className={card.liveTokRate !== null ? "mach-body mach-body--scope" : "mach-body"}>
+            {/* (#2890) Every ONLINE card carries the tube: running work
+                drives it; a machine with nothing running shows it idle
+                (breathing, like rest). A machine that is off shows none. */}
+            <div className={(card.liveTokRate !== null && selectedExec) || !card.absent ? "mach-body mach-body--scope" : "mach-body"}>
               <div className="stat">
                 <span className="dot" />
                 {card.stat}
@@ -808,12 +939,100 @@ export function FleetLens({
                   label exists on this card, so the rate line itself carries
                   the word: `N tok/s` while generating, else the same state
                   word the run page's tile shows (`liveStateLabel`, one
-                  derivation, no mode branch). */}
-              {card.liveTokRate !== null && (
-                <div className="mach-scope__rate" data-tone={card.liveTokState ?? "none"}>
-                  {card.liveTokState === "generating"
-                    ? `${fmtN(Math.round(card.liveTokRate))} tok/s`
-                    : liveStateLabel({ state: card.liveTokState ?? "stalled", restSecondsLeft: card.liveTokRestSecondsLeft })}
+                  derivation, no mode branch). (#2881) Reads the PAGE's own
+                  execution now (`selectedExec` — the sole one when there's
+                  only one running), not a machine-wide aggregate: the tube,
+                  its color and this word all belong to one run. */}
+              {card.liveTokRate !== null && selectedExec && (
+                <div
+                  className="mach-scope__rate"
+                  data-tone={selectedExec.state ?? "none"}
+                  data-carried={selectedExec.carried ? "true" : "false"}
+                  data-thinking={selectedExec.state === "generating" && selectedExec.thinking === true ? "true" : undefined}
+                  title={selectedExec.state === "prompt" && selectedExec.promptLabel ? `estimated prompt size: ${selectedExec.promptLabel} tokens` : undefined}
+                >
+                  {selectedExec.state === "generating"
+                    ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
+                      // lamp with no reading yet (fewer than two same-turn
+                      // heartbeats, or an untrusted opener pair) is "not yet
+                      // measured", not "measured zero" — same "—" the run
+                      // page's tile already shows for the identical case
+                      // (`SessionReplay.tsx`'s `centerLabel`). `Math.round(...
+                      // ?? 0)` used to print a confident "0 tok/s" here.
+                      selectedExec.tokensPerSec != null
+                      ? `${fmtN(Math.round(selectedExec.tokensPerSec))} ${selectedExec.thinking ? "think tok/s" : "tok/s"}`
+                      : "—"
+                    : // (#2886 pass 3) `state: null` here (rather than the
+                      // "no live execution" case, ruled out since
+                      // `card.liveTokRate !== null` implies something IS
+                      // running) is `liveStateWhileConnected`'s
+                      // disconnection downgrade, applied per execution — say
+                      // so, not "stalled".
+                      selectedExec.state === null
+                      ? "no signal"
+                      : // (#2890, operator) The prompt's estimated size lives
+                        // here, not in the tube (whose center is the brain for
+                        // all of PROMPT). "processing ~36k", not "processing
+                        // prompt · ~36k": measured, the long form ellipsized
+                        // the size away on a phone and a 1000px desktop.
+                        selectedExec.state === "prompt" && selectedExec.promptLabel
+                        ? `processing ${selectedExec.promptLabel}`
+                        : liveStateLabel({
+                            state: selectedExec.state,
+                            restSecondsLeft: selectedExec.restSecondsLeft,
+                            writing: selectedExec.writing,
+                            writingSeconds: selectedExec.writingSeconds,
+                          })}
+                </div>
+              )}
+              {/* (#2881) The pager: shown only with 2+ running executions —
+                  "no pager with one execution" is `pagerActive`'s own
+                  `execs.length >= 2` gate. The arrows are their own tap
+                  targets, matching the running-count control directly below
+                  (`.runs--live`, #1903) — same nested-interactive-control
+                  shape, same reason: a click here must not ALSO fire the
+                  card body's `machineDrillHash` handler underneath it. */}
+              {pagerActive && selectedExec && (
+                <div className="mach-scope__pager" data-testid="fleet-pager">
+                  <div
+                    className="mach-scope__pager-btn"
+                    role="button"
+                    tabIndex={0}
+                    aria-label="previous execution"
+                    onClick={(e) => selectPage(e, -1)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        selectPage(e, -1);
+                      }
+                    }}
+                  >
+                    ‹
+                  </div>
+                  <span className="mach-scope__pager-n">
+                    {selectedIdx + 1}/{execs.length}
+                  </span>
+                  {/* (#2881) Always rendered, even empty, so the right arrow's
+                      column never moves between pages; one line, ellipsized,
+                      with the full label in the tooltip. */}
+                  <span className="mach-scope__pager-role" title={selectedExec.role ?? undefined}>
+                    {selectedExec.role ?? ""}
+                  </span>
+                  <div
+                    className="mach-scope__pager-btn"
+                    role="button"
+                    tabIndex={0}
+                    aria-label="next execution"
+                    onClick={(e) => selectPage(e, 1)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        selectPage(e, 1);
+                      }
+                    }}
+                  >
+                    ›
+                  </div>
                 </div>
               )}
               {/* (#1903) The running count's own tap target — a SIBLING
@@ -831,15 +1050,37 @@ export function FleetLens({
                   interactive, matching #1900's lesson in the other
                   direction: a clickable-but-inert-looking control is as
                   dishonest as an inert-looking one that's secretly a broken
-                  link. */}
+                  link.
+                  (#2881) With the pager active, the machine TOTAL moves
+                  here ("3 running · 180 tok/s") — there is no separate
+                  "all" page; `card.liveTokRate` is still the machine-wide
+                  aggregate this line always showed before, just no longer
+                  the rate line's own number once there's more than one
+                  execution to attribute it to.
+                  (#2886 pass 5, MUST — fresh-reviewer finding F2) `runsCount`
+                  and `execs.length` (`card.executions`) are DIFFERENT counts
+                  for a mission/crawl: `runsCount` is post-collapse
+                  (`topLevelRunSessionIds` folds every seat sharing one
+                  `mission_id` into its ONE top-level run — a mission with 9
+                  crawler seats reads "1 running"), while `execs` is the
+                  per-execution pager data, uncollapsed on purpose (each seat
+                  IS its own page). Showing "1 running · 200 tok/s" under a
+                  "‹ 5/9 crawler ›" pager reads as a bug (nine pages under
+                  one run?), so when the two counts disagree the line names
+                  BOTH: "1 run · 9 executions · 200 tok/s". They agree for a
+                  standalone card's several plain dispatches (no mission to
+                  collapse), which is the common case — that keeps the
+                  original "N running · X tok/s" wording unchanged. */}
               {(() => {
                 const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+                const rateText = `${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`;
+                const countText = pagerActive
+                  ? card.runsCount === execs.length
+                    ? `${card.runsCount} ${card.runsLabel} · ${rateText}`
+                    : `${card.runsCount} ${card.runsCount === 1 ? "run" : "runs"} · ${execs.length} ${execs.length === 1 ? "execution" : "executions"} · ${rateText}`
+                  : `${card.runsCount} ${card.runsLabel}`;
                 if (!runsHash) {
-                  return (
-                    <div className="runs">
-                      {card.runsCount} {card.runsLabel}
-                    </div>
-                  );
+                  return <div className="runs">{countText}</div>;
                 }
                 const activate = (e: { stopPropagation: () => void }) => {
                   e.stopPropagation();
@@ -859,28 +1100,65 @@ export function FleetLens({
                       }
                     }}
                   >
-                    {card.runsCount} {card.runsLabel}
+                    {countText}
                   </div>
                 );
               })()}
-              {card.liveTokRate !== null && (
+              {card.liveTokRate !== null && selectedExec && (
                 <div className="mach-scope" data-testid="fleet-token-scope">
                   <TokenScope
                     // Same rule as the run page's tile — a stale rate from
                     // the last generating stretch must not still drive the
                     // wave once the state has moved on (only `stalled` used
-                    // to zero this).
-                    tokensPerSec={card.liveTokState === "generating" ? card.liveTokRate : 0}
-                    stalled={card.liveTokStalled}
-                    resting={card.liveTokState === "rest"}
-                    tone={card.liveTokState ?? "none"}
+                    // to zero this). (#2881) The PAGE's own execution, not
+                    // the machine aggregate. (#2886 pass 5, finding F3) The
+                    // RAW nullable reading, not `?? 0` — matches
+                    // `SessionReplay.tsx`'s identical prop exactly (a `null`
+                    // reading is "not yet measured", never coerced into a
+                    // confident zero before it reaches the component).
+                    tokensPerSec={selectedExec.state === "generating" ? selectedExec.tokensPerSec : 0}
+                    // (#2890) The same morphing states as the run page's hero,
+                    // sized for the card. `state: null` here is the per-
+                    // execution disconnection downgrade (a running machine is
+                    // guaranteed by the gate above), the same "no signal" the
+                    // rate line prints, so the tube shows static.
+                    state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
+                    toolName={selectedExec.toolName}
+                    // (#2889) The writing cue; the status line under the
+                    // tube carries the live "tool gen · N s".
+                    toolWriting={selectedExec.writing === true}
+                    // (#2890) Thinking tints the ring and shimmers the rate;
+                    // the words and number stay as they are.
+                    thinking={selectedExec.state === "generating" && selectedExec.thinking === true}
+                    // (#2890, operator 2026-09-25) With the tube now sized to
+                    // the card, the live rate sits in its center while
+                    // generating, as on the run page. Other states keep the
+                    // center's own content (tool icon, brain) or none.
+                    // (#2890) The same center as every scope in the app
+                    // (`lib/scopeCenter.ts`): rate over "tok/s", the REST
+                    // countdown, "tool gen" (no seconds), the prompt size.
+                    {...scopeCenter({
+                      state: scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null }),
+                      tokensPerSec: selectedExec.tokensPerSec,
+                      carried: selectedExec.carried,
+                      restSecondsLeft: selectedExec.restSecondsLeft,
+                      writing: selectedExec.writing === true,
+                      writingSeconds: selectedExec.writingSeconds,
+                      thinking: selectedExec.thinking === true,
+                    })}
                     size="card"
                   />
                 </div>
               )}
+              {!(card.liveTokRate !== null && selectedExec) && !card.absent && (
+                <div className="mach-scope" data-testid="fleet-token-scope">
+                  <TokenScope tokensPerSec={0} state="idle" size="card" {...scopeCenter({ state: "idle", tokensPerSec: 0 })} />
+                </div>
+              )}
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
       {uids.length ? (
         <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
@@ -894,6 +1172,11 @@ export function FleetLens({
                 a replay drew the whole recorded day with nothing to slide
                 over. */}
             <span className="twin">
+              {recordingRange && (
+                <button className={`twinb${windowMinutes === "all" ? " on" : ""}`} onClick={() => setWindowMinutes("all")}>
+                  all
+                </button>
+              )}
               {ACTIVITY_WINDOW_PRESETS.map((p) => (
                 <button
                   key={p.minutes}

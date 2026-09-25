@@ -84,11 +84,23 @@
 
 <section>
   <div class="wrap">
+    <h2>The long-agentic workload: pepper-grinder</h2>
+    <p><code>pepper-grinder</code> is the workload darkmux's own development runs on: a real multi-turn coding task. The model reads a refresh-token rotation module and its tests, decides what isn't covered, writes those tests, runs the suite, reads the failures and fixes them until it goes green. It exercises tool calls across several files, iteration against a real signal, and a test suite as the ground truth.</p>
+    <p>The fixture is open source (MIT) and has no dependencies, so the suite runs in well under a second. Clone it once and register it:</p>
+    <pre><code>git clone https://github.com/kstrat2001/pepper-grinder
+darkmux lab fixture register ./pepper-grinder
+darkmux lab run pepper-grinder</code></pre>
+    <p>The untouched suite already passes (14 tests), so a green result on its own is a weak bar. The useful signal is how many tests the run added, which <code>lab run stats</code> reports.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>Inspect a run</h2>
     <pre><code>darkmux lab run inspect quick-q-deep-1778302418-1</code></pre>
     <p>Shows: total wall-clock, turn count, compaction events, mode (fast vs slow), notes from the trajectory.</p>
 
-    <p>The mode classification reflects the bimodal wall-clock distribution observed in empirical testing: wall-clock per turn splits into two clusters based on whether the prompt happened to hit a state that triggers heavy compaction or not. Inspect tells you which cluster a given run landed in. The output is a small report, best seen by running it on your own machine after a <code>quick-q</code> or <code>long-agentic</code> run. The methodology behind this is documented in <a href="https://darklyenergized.substack.com/p/part-2-charting-the-wake">Part 2 of the lab series</a> if you want the full empirical grounding.</p>
+    <p>The mode classification reflects the bimodal wall-clock distribution observed in empirical testing: wall-clock per turn splits into two clusters based on whether the prompt happened to hit a state that triggers heavy compaction or not. Inspect tells you which cluster a given run landed in. The output is a small report, best seen by running it on your own machine after a <code>quick-q</code> or <code>pepper-grinder</code> run. The methodology behind this is documented in <a href="https://darklyenergized.substack.com/p/part-2-charting-the-wake">Part 2 of the lab series</a> if you want the full empirical grounding.</p>
   </div>
 </section>
 
@@ -110,7 +122,7 @@
   <div class="wrap">
     <h2>Tune: detect bimodal variance</h2>
     <p>Single runs lie about local-AI behavior. Wall-clock varies enough that one run isn't a reliable signal. <code>lab tune</code> dispatches N runs against the same workload and clusters the results, surfacing the bimodal "fast" vs "slow" mode shape if it's there.</p>
-    <pre><code>darkmux lab tune long-agentic --runs 6</code></pre>
+    <pre><code>darkmux lab tune pepper-grinder --runs 6</code></pre>
     <p>Output: a per-run table + a cluster verdict ("looks bimodal at fast=&lt;mean&gt;s, slow=&lt;mean&gt;s" or "single-mode").</p>
     <p>Use this after changing a profile setting (context length, compaction mode, compactor model) to see whether the change actually shifted the distribution rather than just luck on a single run.</p>
   </div>
@@ -130,7 +142,7 @@
   <div class="wrap">
     <h2>Derived metrics: <code>lab run stats</code></h2>
     <p><code>darkmux lab run stats &lt;run&gt;</code> derives the numbers a run's raw artifacts don't hand you directly &mdash; tok/s, active time (wall minus rest), energy per token, which gate cut which turn &mdash; and runs a set of reconciliation checks before printing any of it. A figure that fails a check still prints (dropping it would be choosing the answer), but the run's checks are listed underneath, unconditionally, so you never copy a number without the reason it may not be quotable.</p>
-    <pre><code>darkmux lab run stats long-agentic-balanced-1780396995-1</code></pre>
+    <pre><code>darkmux lab run stats pepper-grinder-deep-1790239929-1</code></pre>
     <p>One run prints wall/rest/active time, turns, throughput, both detection gates (the streaming gate and the per-call checkpoint gate &mdash; they judge different things and are never collapsed into one line), and host power/energy when telemetry covers the run. Pass <code>--json</code> for the full <code>RunStats</code> record instead of the text.</p>
     <h3>Comparing a set of runs</h3>
     <p>Name more than one run, or add <code>--baseline</code>, to get the set view: a table with one row per run, ranges (median with min&ndash;max, never a bare mean) across the set, and <strong>cost per successful run</strong> &mdash; every run's cost divided by only the runs that passed verify, because a failed run still consumed the GPU.</p>

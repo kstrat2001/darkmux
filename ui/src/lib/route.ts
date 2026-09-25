@@ -252,6 +252,37 @@ export function isLiveRoute(route: Route): boolean {
   return route.kind !== "playback";
 }
 
+/** (#2886 pass 4, do-it — fresh-reviewer finding 5+7) The `connected`/
+ * `lastContactMs` evidence `App.tsx`'s `renderRoute` hands to `FleetLens`/
+ * `SessionReplay` for the tok/s scope's STALL-vs-no-signal read — extracted
+ * out of `renderRoute` (which lives in `App.tsx`, a module this file's own
+ * test cannot import without dragging in `MissionGraphLens`'s `reactflow`
+ * dependency) so the derivation itself is unit-testable on its own.
+ *
+ * `isLiveRoute(route)` — NOT merely `liveStatus === "live"` — is the load-
+ * bearing check: a static/demo build's `useLiveTail` never runs at all
+ * (`isLiveRoute` returns `false` for `getSource().kind === "static"`,
+ * checked FIRST in that function), so `liveStatus` sits at its pessimistic
+ * default, `"reconnecting"`, forever. That is not the same fact as a real
+ * daemon connection dropping mid-session, and a static build must never
+ * read as "no signal" — there is no signal to have lost. `connected` is
+ * therefore `true` whenever this route was never live-tail-backed in the
+ * first place (a static build, OR a `playback` route), and otherwise
+ * follows the real status. `lastContactMs` follows the same fold: a stale
+ * mount-time `Date.now()` from a ref that was never fed real contact events
+ * must never feed the half-open check either. */
+export function tokRateConnectionEvidence(
+  route: Route,
+  liveStatus: "live" | "reconnecting",
+  lastContactMs: number | null,
+): { connected: boolean; lastContactMs: number | null } {
+  const routeIsLive = isLiveRoute(route);
+  return {
+    connected: !routeIsLive || liveStatus === "live",
+    lastContactMs: routeIsLive ? lastContactMs : null,
+  };
+}
+
 /** Should the event-log column (`components/EventLogColumn.tsx` — the
  * per-record stream + its search/filter/follow chrome and the `#detail`
  * selected-event panel) render for this route?

@@ -10,6 +10,28 @@ import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
 
+// (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes in this
+// file stayed green while broken in the actual render path: the DOM-text
+// assertions elsewhere in this file (`.mach-scope__rate`'s textContent) all
+// read from the SAME `selectedExec` the tube reads from, so a bug that hit
+// ONLY the tube's own props (not the neighboring text) had nothing here to
+// catch it. Mocking `TokenScope` and recording every prop it's called with
+// lets a test assert on what the operator's SCREEN actually receives —
+// `tokensPerSec`/`tone`/`stalled`/`resting` — not merely on `FleetCard`
+// fields that happen to agree with it today. `data-props` carries the
+// latest call's props as JSON; `latestTokenScopeProps()` below reads it
+// back typed.
+vi.mock("../../components/TokenScope", () => ({
+  TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
+}));
+
+function latestTokenScopeProps(): Record<string, unknown> {
+  const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
+  const last = nodes[nodes.length - 1];
+  if (!last) throw new Error("no TokenScope probe rendered");
+  return JSON.parse(last.getAttribute("data-props")!);
+}
+
 // (#1913) Every fixture below anchors its records at "T10:00" of `today`
 // (`todayUTC()`), and liveness (`flowLiveSessions`, `FLOW_LIVE_TTL_MS`) is
 // judged against REAL wall-clock now. Left alone, that means the suite's
@@ -186,7 +208,16 @@ describe("FleetLens", () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
-        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start" },
+        // (#2886 pass 5) `source: "mission"` on the mission's own top-level
+        // session — a real mission bookend always carries it
+        // (`mission_launch.rs::mission_bookend_record`) and it's what
+        // `liveExecutions` reads to exclude this session from the pager's
+        // `card.executions` (see that function's own doc). Without it here,
+        // this fixture read as TWO genuine executions sharing one collapsed
+        // run — a real mismatch, correctly triggering #2881's "N run(s) · M
+        // executions" wording, not the bug this older test predates and was
+        // never about.
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "mission-1", mission_id: "mission-1", action: "dispatch.start", source: "mission" },
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", mission_id: "mission-1", action: "dispatch.start" },
       ],
     });
@@ -488,6 +519,30 @@ describe("FleetLens", () => {
     } finally {
       document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
     }
+  });
+
+  it("(#2890) a replay's activity window defaults to \"all\", the recording's own span", async () => {
+    // A 34-minute recording under the 24h default was a sliver at the right
+    // edge of the timeline (operator, 2026-09-25: "I'm spending most of my
+    // time watching nothing happen").
+    const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    const records = [mk("2026-08-26T10:00:00.000Z", "dispatch.start"), mk("2026-08-26T10:34:00.000Z", "dispatch.complete")];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T10:00:00.000Z"), tMax: Date.parse("2026-08-26T10:34:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("all"));
+  });
+
+  it("(#2890) a picked preset replaces \"all\"; live has no \"all\" and keeps 24h", async () => {
+    const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+    const records = [mk("2026-08-26T01:00:00.000Z", "dispatch.start"), mk("2026-08-26T09:00:00.000Z", "dispatch.complete")];
+    const r = renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("all"));
+    fireEvent.click(screen.getByRole("button", { name: "1h" }));
+    expect(document.querySelector(".twinb.on")?.textContent).toBe("1h");
+    r.unmount();
+    // Same records, not a replay: no "all", and the live 24h default.
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z") });
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("24h"));
+    expect([...document.querySelectorAll(".twinb")].map((b) => b.textContent)).not.toContain("all");
   });
 
   it("(#2834) a session whose endpoint is unknown still counts: darkmux dispatched those tokens either way", async () => {
@@ -855,6 +910,9 @@ describe("FleetLens", () => {
     // (rather than asserting a literal — `clkhm` renders in the runner's
     // local timezone), which is what actually moves with the playhead.
     expect(document.querySelector(".tlhdr span")!.textContent).toBe("recent activity");
+    // (#2890) A replay now opens on "all" (the recording's fixed span); the
+    // rolling window this test pins is what any picked preset does.
+    fireEvent.click(screen.getByRole("button", { name: "24h" }));
     const axisBefore = [...document.querySelectorAll(".tlaxis span")].map((e) => e.textContent);
     expect(axisBefore.every(Boolean)).toBe(true);
     // The playhead marker sits at the window's own right edge at rest.
@@ -880,6 +938,360 @@ describe("FleetLens", () => {
   });
 });
 
+// (#2881) The fleet card pager. Uses the `records`/`historical` render path
+// directly (same as the scrubbed-playhead test above), not `mockFleetFetch`
+// — the pager reads only `buildFleetCard`'s output, which this path drives
+// with no separate live/playback branch to mock around.
+describe("FleetLens pager (#2881)", () => {
+  const D0 = Date.parse("2026-08-26T10:00:00.000Z");
+  const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
+
+  // s1: CODER, generating (~100 tok/s, the two heartbeats 2s apart).
+  // s2: REVIEWER, resting (a dispatch.rest 15s window opened at 3s).
+  // s3: FETCH-RENDER, prompt (a bare dispatch.start, no heartbeat yet).
+  const threeExecutionRecords: FlowRecord[] = [
+    { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+    { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+    { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+    { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "reviewer" },
+    { ts: at(3), machine_uid: "u1", session_id: "s2", action: "dispatch.rest", payload: { ms: 15_000 } },
+    { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s3", action: "dispatch.start", handle: "fetch-render" },
+  ] as FlowRecord[];
+
+  function renderThree(playheadSec: number) {
+    return render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={threeExecutionRecords} tMax={D0 + playheadSec * 1000} tMin={D0} playhead={D0 + playheadSec * 1000} historical />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("defaults to the busiest (generating) execution's own tube, role and rate — not the machine aggregate", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/3");
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    // The rate line shows s1's OWN reading (100 tok/s), not the machine's
+    // summed total (also 100 here, since only s1 is generating — see the
+    // next assertion for where the total actually shows up).
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    // (#2886 pass 5, MUST — fresh-reviewer finding F5) Pin what the TUBE
+    // component itself receives, not just the neighboring text — a bug that
+    // hits only the tube's own props (e.g. still reading the machine
+    // aggregate) would leave every text assertion in this file green.
+    expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: 100, state: "generating" });
+    // (#2881) "the machine total moves to the count line" — no separate
+    // "all" page.
+    expect(document.querySelector(".runs--live")!.textContent).toBe("3 running · 100 tok/s");
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F2) A mission's seats all
+  // collapse to ONE top-level run (`topLevelRunSessionIds`), but the pager
+  // shows one page per seat — so `runsCount` (1) and `card.executions.length`
+  // (9) genuinely disagree here, unlike the plain-dispatches case above
+  // where they agree by construction.
+  it("names both counts when runs and executions disagree (a mission's seats collapse to one run)", async () => {
+    const missionId = "mission-1";
+    const seatRecords: FlowRecord[] = Array.from({ length: 8 }, (_, i) => ({
+      ts: at(0),
+      machine_uid: "u1",
+      machine_id: "MacBook-Pro",
+      session_id: `seat-${i + 2}`,
+      action: "dispatch.start",
+      mission_id: missionId,
+      handle: "darkmux/crawler",
+    })) as FlowRecord[];
+    const missionRecords: FlowRecord[] = [
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: missionId, action: "dispatch.start", source: "mission", mission_id: missionId },
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "seat-1", action: "dispatch.start", mission_id: missionId, handle: "darkmux/crawler" },
+      { ts: at(0), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+      { ts: at(2), machine_uid: "u1", session_id: "seat-1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+      ...seatRecords,
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={missionRecords} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    // 9 seat executions, 1 collapsed run.
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/9");
+    const countEl = document.querySelector(".runs--live, .runs")!;
+    expect(countEl.textContent).toBe("1 run · 9 executions · 100 tok/s");
+  });
+
+  it("(#2890) PROMPT: the status line carries the estimated size; the tube is handed no center", async () => {
+    const scopeProps = () =>
+      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+    // One execution whose turn opener reported a 144,000-char prompt; no
+    // billed turn yet, so the default 4 chars/token -> ~36k.
+    const sized: FlowRecord[] = [
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "p1", action: "dispatch.start", handle: "coder" },
+      { ts: at(1), machine_uid: "u1", session_id: "p1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 1000, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={sized} tMax={D0 + 3000} tMin={D0} playhead={D0 + 3000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    const line = document.querySelector(".mach-scope__rate")!;
+    expect(line.textContent).toBe("processing ~36k");
+    expect(line.getAttribute("title")).toBe("estimated prompt size: ~36k tokens");
+    expect(scopeProps()).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null });
+  });
+
+  it("(#2890) PROMPT from an older host (no size): the plain words, no tooltip", async () => {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={threeExecutionRecords.filter((r) => r.session_id === "s3")} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("processing prompt");
+    expect(document.querySelector(".mach-scope__rate")!.getAttribute("title")).toBeNull();
+  });
+
+  it("no pager renders for exactly one running execution — same as before this issue", async () => {
+    const oneExecution = threeExecutionRecords.filter((r) => r.session_id === "s1");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={oneExecution} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__pager")).toBeNull();
+    // The count line has NO tok/s suffix at N=1 — that's still the rate
+    // line's job, as before.
+    expect(document.querySelector(".runs--live")!.textContent).toBe("1 running");
+  });
+
+  it("(#2890) the card's tube center matches the run page's: the rate while generating, the countdown while resting", async () => {
+    // `TokenScope` is mocked in this file (a probe that records its props),
+    // so this reads what the card HANDS the tube; TokenScope.test.tsx pins
+    // how the tube renders a center label.
+    const scopeProps = () =>
+      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    expect(scopeProps()).toMatchObject({ state: "generating", centerLabel: "100", centerUnit: "tok/s", centerCarried: false });
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 13s");
+    // (#2890) The same center as the run page's: the countdown over "resting".
+    expect(scopeProps()).toMatchObject({ centerLabel: "13s", centerUnit: "resting" });
+  });
+
+  it("an arrow click changes the page and does not fire the card's machine drill-in", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(window.location.hash).toBe("");
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("2/3");
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 13s");
+    // (#1903-shaped) The arrow is its own tap target — stopPropagation kept
+    // it from ALSO firing the outer card's `machineDrillHash` click.
+    expect(window.location.hash).toBe("");
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F5) No test clicked the
+  // PREVIOUS arrow specifically — a mutation wiring it to the SAME `+1` the
+  // next arrow uses stayed green. Wrap-around from page 1 is the
+  // distinguishing case: `+1` would land on page 2 (indistinguishable from
+  // clicking "next"); a correct `-1` wraps to the LAST page.
+  it("the previous arrow moves BACKWARD (wraps to the last page from page 1), not the same direction as next", async () => {
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/3");
+    fireEvent.click(screen.getByLabelText("previous execution"));
+    expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("3/3");
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("fetch-render");
+  });
+
+  it("the picked page sticks until that execution ends, then falls forward to the new busiest among what's left", async () => {
+    const { rerender } = renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    // Pick s2 (reviewer, resting) — one click forward from the default s1.
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+
+    // s2 ends; s1 (generating) and s3 (prompt) are still running.
+    const afterS2Ends: FlowRecord[] = [
+      ...threeExecutionRecords,
+      { ts: at(4), machine_uid: "u1", session_id: "s2", action: "dispatch.complete" } as FlowRecord,
+    ];
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={afterS2Ends} tMax={D0 + 6000} tMin={D0} playhead={D0 + 6000} historical />
+      </QueryClientProvider>,
+    );
+
+    // Still a pager (2 executions left), but the sticky pick (s2) is gone —
+    // falls forward to the new busiest (s1, generating), not to whichever
+    // index s2 used to occupy.
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager-n")!.textContent).toBe("1/2"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F3) A lit GEN lamp with no
+  // reading yet (one heartbeat, no same-turn pair) must not print a
+  // confident "0 tok/s" — same "—" the run page's tile already shows for
+  // the identical case. The tube must not be driven by a fake 0 either —
+  // pinned via the mocked TokenScope so a future regression that only hits
+  // the tube (leaving the text correct) still goes red.
+  it("shows '—', not '0 tok/s', while generating with no reading yet — and never drives the tube with a fake 0", async () => {
+    // (mirrors `tokenRate.test.ts`'s own fixture note) `dispatch.start` sits
+    // 5s before the heartbeat so `deriveLiveState`'s same-second marker tie
+    // rule doesn't fire and read this as PROMPT instead of GENERATING.
+    const oneFreshHeartbeat: FlowRecord[] = [
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={oneFreshHeartbeat} tMax={D0} tMin={D0} playhead={D0} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("—");
+    expect(latestTokenScopeProps()).toMatchObject({ tokensPerSec: null, state: "generating" });
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F6) The default page must
+  // not flap: recomputing "the busiest execution" from scratch every tick
+  // flipped a real fleet's default page 46 times in 863s, because two
+  // GENERATING executions' fluctuating rates kept trading the tie-break.
+  describe("the default page does not flap on a tie, only moves on a STRICT state-class win", () => {
+    // s1: CODER, generating at 100 tok/s (0 -> 800 chars over 2s).
+    // s2: REVIEWER, generating at 10 tok/s (0 -> 80 chars over 2s) at first.
+    const twoGenerating = (s2Chars: number): FlowRecord[] => [
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(0), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+      { ts: at(2), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: 800 } },
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
+      { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 0 } },
+      { ts: at(2), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 2000, generated_chars: s2Chars } },
+    ] as FlowRecord[];
+
+    it("keeps the SAME default page once s2's rate overtakes s1's — both still generating", async () => {
+      const { rerender } = render(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={twoGenerating(80)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+        </QueryClientProvider>,
+      );
+      // Initial pick: s1 is the faster of the two (100 vs 10 tok/s).
+      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder"));
+
+      // s2's rate now FAR exceeds s1's (2000 chars -> 250 tok/s vs s1's
+      // unchanged 100) — recomputing "busiest" from scratch would flip to
+      // s2. Both are still `generating`, a tie at the STATE-CLASS level, so
+      // the sticky default must not move.
+      rerender(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={twoGenerating(2_000)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+        </QueryClientProvider>,
+      );
+      expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+      expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    });
+
+    it("DOES move once the currently-shown execution becomes strictly worse (generating -> rest) while the other keeps generating", async () => {
+      // Same starting point as the no-flap test above: s1 is the faster of
+      // the two, so it's the initial default.
+      const { rerender } = render(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={twoGenerating(80)} tMax={D0 + 5000} tMin={D0} playhead={D0 + 5000} historical />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder"));
+
+      // s1 now rests (a real state-class change); s2 keeps generating.
+      // s2 is STRICTLY busier now (generating beats rest) — this is a real
+      // switch, not a flap, and must happen.
+      const s1Rests: FlowRecord[] = [...twoGenerating(2_000), { ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.rest", payload: { ms: 15_000 } } as FlowRecord];
+      rerender(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FleetLens records={s1Rests} tMax={D0 + 6000} tMin={D0} playhead={D0 + 6000} historical />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer"));
+      expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("250 tok/s");
+    });
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F4) The half-open evidence
+  // threaded into each execution's OWN reading (`cards.ts`'s
+  // `executionTokenReading` call — `lastHeartbeatMs([recs])`, not the
+  // machine-wide `lastHeartbeatMs(liveTokRecordSets)` the AGGREGATE uses)
+  // was previously only asserted on `card.executions[i].state` directly —
+  // nothing rendered proved it reached the screen. This pins it at the
+  // rendered surface: s1 (fresh, generating) and s2 (stale, would read
+  // STALLED on its own) share one card. `lastContactMs` sits AFTER s2's own
+  // deadline (so a CORRECT per-execution check trusts s2's stall) but
+  // BEFORE s1's much-later deadline (so a WRONG machine-wide check — using
+  // s1's fresher heartbeat as the deadline for BOTH executions — would
+  // wrongly downgrade s2 to "no signal" instead).
+  it("downgrades a stalled execution using ITS OWN last heartbeat as the half-open deadline, not the machine-wide one", async () => {
+    const records: FlowRecord[] = [
+      // s1: CODER, fresh — generating, last heartbeat at 95s.
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
+      { ts: at(95), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 95_000, generated_chars: 800 } },
+      // s2: REVIEWER, stale — one heartbeat at 0s, long past STALL_AFTER_MS
+      // (30s) by the t=100s playhead. Its OWN deadline is 0 + 30 = 30s.
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
+      { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        {/* lastContactMs = 40s: past s2's own 30s deadline (trust s2's
+            stall) but nowhere near s1's 95+30=125s deadline (a machine-wide
+            check would NOT trust it). */}
+        <FleetLens records={records} tMax={D0 + 100_000} tMin={D0} playhead={D0 + 100_000} historical connected lastContactMs={D0 + 40_000} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    // Default page is s1 (generating beats stalled/no-signal either way).
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("coder");
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("stalled");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "stalled" });
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F4, second half) The test
+  // above alone does not prove the half-open evidence is CONSULTED at all —
+  // `lastContactMs=40s` trusts s2's stall either way: with the correct
+  // per-execution deadline (30s) OR with no check running at all (passing
+  // `undefined`, which trusts every stall unconditionally while connected).
+  // This one moves `lastContactMs` BEFORE s2's own deadline, so the CORRECT
+  // behavior downgrades to "no signal" — a result "no check ran" cannot
+  // produce (it would still read "stalled").
+  it("downgrades to 'no signal' when contact came BEFORE the stalled execution's own deadline", async () => {
+    const records: FlowRecord[] = [
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(93), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 93_000, generated_chars: 0 } },
+      { ts: at(95), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 95_000, generated_chars: 800 } },
+      // s2's own deadline is 0 + 30 = 30s.
+      { ts: at(-5), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" },
+      { ts: at(0), machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0, generated_chars: 40 } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        {/* lastContactMs = 20s: BEFORE s2's own 30s deadline. */}
+        <FleetLens records={records} tMax={D0 + 100_000} tMin={D0} playhead={D0 + 100_000} historical connected lastContactMs={D0 + 20_000} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__pager-role")!.textContent).toBe("reviewer");
+    expect(document.querySelector(".mach-scope__rate")!.textContent?.toLowerCase()).toBe("no signal");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal" });
+  });
+});
+
 // ── (#1855) a rostered-but-silent machine must still render a card ──
 //
 // Before this fix, the fleet card list was `machineUids(flowData,
@@ -902,6 +1314,29 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     // vocabulary invented for this case (the project's "no snowflakes,
     // shared indicators" rule).
     expect(card.className).toContain("absent");
+    // (#2890) A machine that is off shows no tube at all.
+    expect(card.querySelector('[data-testid="fleet-token-scope"]')).toBeNull();
+  });
+
+  it("(#2890) the machine name and hardware line carry their full text as a tooltip", async () => {
+    const records = [
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence-reconciler" },
+    ] as unknown as FlowRecord[];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".mach-name")).not.toBeNull());
+    expect(document.querySelector(".mach-name")!.getAttribute("title")).toBe("m1-max-32gb-studio");
+  });
+
+  it("(#2890) an online machine with nothing running shows its tube idle", async () => {
+    const records = [
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+    ] as unknown as FlowRecord[];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.className).not.toContain("absent");
+    const probe = card.querySelector('[data-testid="token-scope-probe"]');
+    expect(probe && JSON.parse(probe.getAttribute("data-props")!)).toMatchObject({ state: "idle", size: "card", centerUnit: "idle" });
   });
 
   // (#1855) The card's HARDWARE line, on the same card. Rendering the
@@ -1309,5 +1744,94 @@ describe("savings hero: nothing leaks while loading (#2830)", () => {
       .filter((el) => (el.textContent ?? "").trim() !== "")
       .map((el) => `${el.className}="${el.textContent}"`);
     expect(leaked, "no figure text may render while unsettled").toEqual([]);
+  });
+
+  // (#2886 pass 4, do-it — fresh-reviewer finding 7, "add tests for... both
+  // dimmed renders") The DOM-level counterparts to `cards.test.ts`'s
+  // data-layer coverage of `liveTokCarried`/the half-open no-signal read —
+  // this proves the JSX actually stamps `data-carried`/"no signal" from
+  // those fields, not just that the underlying derivation is correct.
+  describe("the TOK/S rate line's carried and no-signal renders", () => {
+    // Hardcoded to FROZEN_NOW's own date rather than `todayUTC()` — this
+    // `describe` body runs at COLLECTION time, before `beforeEach`'s fake
+    // timers are installed, so `todayUTC()` here would read the REAL
+    // wall-clock date and build timestamps chronologically AFTER
+    // FROZEN_NOW, which fails every `T(ts) <= t` liveness check silently
+    // (found live: `machActive` read false, `sessionRunning` still read
+    // true via a different path, so the card rendered "idle" with a
+    // contradictory "1 running" tap target).
+    // Anchored so the LAST heartbeat sits 2s before FROZEN_NOW (10:02:00) —
+    // fresh under STALL_AFTER_MS (30s).
+    const t1a = "2026-06-15T10:00:00.000Z";
+    const t1b = "2026-06-15T10:00:02.000Z";
+    const t1c = "2026-06-15T10:00:04.000Z";
+    const t2 = "2026-06-15T10:01:58.000Z";
+
+    it("marks the rate line (data-carried=true) when the reading is carried forward from an earlier turn", async () => {
+      mockFleetFetch({
+        flowToday: [
+          { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+          // Turn 1 opens at 0 (every turn does — finding 2), then two
+          // real-progress intervals (400 chars/s each).
+          { ts: t1a, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1a), generated_chars: 0, turn_seq: 1 } },
+          { ts: t1b, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1b), generated_chars: 800, turn_seq: 1 } },
+          { ts: t1c, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1c), generated_chars: 1_600, turn_seq: 1 } },
+          // Turn 2: lone first heartbeat — nothing of its own to read from yet.
+          { ts: t2, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t2), generated_chars: 50, turn_seq: 2 } },
+        ],
+      });
+      renderFleetLens({ connected: true });
+
+      const rate = await waitFor(() => {
+        const el = document.querySelector(".mach-scope__rate");
+        expect(el, "the rate line should be mounted").toBeTruthy();
+        return el as HTMLElement;
+      });
+      // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
+      expect(rate.textContent).toContain("100");
+      expect(rate.getAttribute("data-carried")).toBe("true");
+    });
+
+    it("shows literal 'no signal' text, not 'stalled', when the page is disconnected over an otherwise-stale heartbeat", async () => {
+      mockFleetFetch({
+        flowToday: [
+          { ts: t1a, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+          { ts: t1a, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1a), generated_chars: 40 } },
+          { ts: t1b, machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: Date.parse(t1b), generated_chars: 120 } },
+        ],
+      });
+      renderFleetLens({ connected: false });
+
+      const rate = await waitFor(() => {
+        const el = document.querySelector(".mach-scope__rate");
+        expect(el, "the rate line should be mounted").toBeTruthy();
+        return el as HTMLElement;
+      });
+      expect(rate.textContent?.toLowerCase()).toContain("no signal");
+      expect(rate.textContent?.toLowerCase()).not.toContain("stalled");
+    });
+  });
+});
+
+// (#2890) The fleet card's tube morphs through the same states as the run
+// page's hero, and in TOOLS it gets the tool for its icon.
+describe("FleetLens card scope: the tool icon (#2890)", () => {
+  const D0 = Date.UTC(2026, 8, 24, 1, 0, 0);
+  const at = (sec: number) => new Date(D0 + sec * 1000).toISOString();
+  it("hands the card's scope the running execution's tool while it is in TOOLS", async () => {
+    const records: FlowRecord[] = [
+      { ts: at(0), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" },
+      { ts: at(1), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 1_000, generated_chars: 0 } },
+      { ts: at(3), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: D0 + 3_000, generated_chars: 800 } },
+      { ts: at(4), machine_uid: "u1", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 2 } },
+      { ts: at(5), machine_uid: "u1", session_id: "s1", action: "dispatch.tool", payload: { tool_name: "search" } },
+    ] as FlowRecord[];
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={D0 + 6_000} tMin={D0} playhead={D0 + 6_000} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector('[data-testid="fleet-token-scope"]')).not.toBeNull());
+    expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "search", size: "card" });
   });
 });

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { Scrubber } from "./Scrubber";
-import { clkhm, clkrange } from "../../lib/format";
+import { clk, clkhm, clkrange } from "../../lib/format";
 import { fmtElapsed } from "../../lib/format";
 
 const TMIN = Date.parse("2026-08-07T00:00:00.000Z");
@@ -117,12 +117,12 @@ describe("Scrubber", () => {
   // `playbackMissionLabel` doc).
   it("the clock readout names only the playhead time when no label is given", () => {
     renderScrubber({ t: TMIN });
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(TMIN));
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(clk(TMIN));
   });
 
   it("appends the label after the clock, separated by a middot, when one is given", () => {
     renderScrubber({ t: TMIN, label: "Review · nameof recency" });
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${clkhm(TMIN)} · Review · nameof recency`);
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${clk(TMIN)} · Review · nameof recency`);
   });
 
   // (#2346) A dispatch/mission focus reports its own elapsed time — the
@@ -133,18 +133,18 @@ describe("Scrubber", () => {
   it("shows the focus's elapsed time before the time of day when elapsedMs is given", () => {
     const t = TMIN + 6_888_000; // 1:54:48
     renderScrubber({ t, elapsedMs: 6_888_000 });
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_000)} · ${clkhm(t)}`);
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_000)} · ${clk(t)}`);
   });
 
   it("still appends a label after the clock when both elapsedMs and label are given", () => {
     const t = TMIN + 6_888_000;
     renderScrubber({ t, elapsedMs: 6_888_000, label: "coder" });
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_000)} · ${clkhm(t)} · coder`);
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_000)} · ${clk(t)} · coder`);
   });
 
   it("omits the elapsed segment entirely when elapsedMs is null (day focus)", () => {
     renderScrubber({ t: TMIN, elapsedMs: null });
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(TMIN));
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(clk(TMIN));
   });
 
   // (#1869 code review) A zero-span day pins the thumb at the RIGHT edge

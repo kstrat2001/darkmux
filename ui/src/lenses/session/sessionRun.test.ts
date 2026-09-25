@@ -87,7 +87,20 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   if (view.signalGroups.length === 0) {
     // (#2863) The shared chip renders its label upper-cased, as it does
     // COMPLETE; the detector cells read from the one list the card uses.
-    lines.push("CLEAN", "no detector flagged this run", ...CLEAN_DETECTORS);
+    // (#2887 N2/F1) `repetition`'s cell text varies with `repetitionOff`/
+    // `repetitionRecorded` the same way `SessionReplay.tsx`'s own render
+    // does — kept in sync here so THIS golden-compared mirror can catch a
+    // wording drift too, not just `SessionReplay.test.tsx`'s DOM assertions.
+    lines.push(
+      "CLEAN",
+      "no detector flagged this run",
+      ...CLEAN_DETECTORS.map((d) => {
+        if (d !== "repetition") return d;
+        if (view.repetitionOff) return `${d} (off)`;
+        if (!view.repetitionRecorded) return `${d} (not recorded)`;
+        return d;
+      }),
+    );
   } else {
     for (const g of view.signalGroups) {
       lines.push(`${g.severity === "warn" ? "⚠" : "✓"}${g.kind}${g.count > 1 ? `×${g.count}` : ""}`);
@@ -166,7 +179,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // `fmtC(tokIn)` on the metric tile (NOT `fmtN`'s comma-grouped form).
     expect(view.metrics.find((m) => m.label === "TOKENS IN")?.value).toBe("1.00k");
     expect(view.metrics.find((m) => m.label === "TOKENS OUT")?.value).toBe("200");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:00");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("10:00");
   });
 
   // (#2877) Live token-rate scope. `nowOverride` freezes the clock so
@@ -203,7 +216,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.liveTokScope!.stalled).toBe(true);
   });
 
-  it("a FINISHED run gets a TOK/S metric tile (output tokens / wall clock) and no live scope", () => {
+  // (#2890) The finished average lives in the MODEL hero scope's center now,
+  // not in a TOK/S tile; the labeling rules are unchanged.
+  it("a FINISHED run gets its average rate (output tokens / wall clock) and no live scope", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -219,9 +234,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.liveTokScope).toBeNull();
     // No `generation_ms` (a pre-1.53 runtime): 200 completion tokens over a
     // 10s wall clock = 20 tok/s, and the tile says which average it is.
-    const tile = view.metrics.find((m) => m.label === "TOK/S");
-    expect(tile?.value).toBe("20");
-    expect(tile?.sub).toBe("avg · wall clock");
+    expect(view.metrics.find((m) => m.label === "TOK/S")).toBeUndefined();
+    expect(view.finishedTokRate).toEqual({ average: "20", sub: "avg · wall clock" });
   });
 
   it("a FINISHED run's TOK/S averages over GENERATION time when turns carry generation_ms, labeled avg", () => {
@@ -240,9 +254,131 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     // 200 tokens over 2.5s of generation = 80, not 200 over the 10s wall clock.
-    const tile = view.metrics.find((m) => m.label === "TOK/S");
-    expect(tile?.value).toBe("80");
-    expect(tile?.sub).toBe("avg");
+    // The ordinary average needs no sub line: the center's unit already says "avg tok/s".
+    expect(view.finishedTokRate).toEqual({ average: "80", sub: null });
+  });
+
+  // (#2886) A checkpointed turn is excluded from the finished-run average,
+  // and the tile says how many of the paired turns were billed.
+  it("a FINISHED run's TOK/S excludes a checkpointed turn and labels 'avg · N of M turns'", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // Turn 1: ordinary, billed. 20 tokens / 0.2s = 100 tok/s.
+      { ts: "2026-01-01T00:00:00.200Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 200 } },
+      { ts: "2026-01-01T00:00:00.200Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 1, completion_tokens: 20 } },
+      // Turn 2: checkpointed. Huge generation_ms, tiny billed tokens — must
+      // not drag the average down.
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 2, generation_ms: 220_000 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 2, completion_tokens: 91 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.checkpoint", payload: { turn_seq: 2, checkpoint: 1, verdict: "conclude" } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 111 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.finishedTokRate).toEqual({ average: "100", sub: "avg · 1 of 2 turns" });
+  });
+
+  it("a FINISHED run's TOK/S shows '—' (not a wrong number) when EVERY paired turn is checkpointed", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, generation_ms: 220_000 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "telemetry.tokens", payload: { turn_seq: 1, completion_tokens: 91 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.checkpoint", payload: { turn_seq: 1, checkpoint: 1, verdict: "conclude" } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", action: "dispatch.complete", payload: { prompt_tokens: 100, completion_tokens: 91 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.finishedTokRate?.average).toBe("—");
+  });
+
+  // (#2885) A short turn's own first heartbeat carries the previous turn's
+  // measured rate rather than reading "no reading yet".
+  it("a live run's scope carries the last measured rate into a new turn's lone first heartbeat", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:00Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:02Z");
+    const beat3Ms = Date.parse("2026-01-01T00:00:04Z");
+    const beat4Ms = Date.parse("2026-01-01T00:00:22Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // Turn 1 opens at 0 (every turn does — #2886 pass 4 finding 2), then
+      // two real-progress intervals (400 chars/s each) before turn 2's lone
+      // first heartbeat. The carry must read the SECOND interval, not the
+      // 0-opening one.
+      { ts: "2026-01-01T00:00:00Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 0, turn_seq: 1 } },
+      { ts: "2026-01-01T00:00:02Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 800, turn_seq: 1 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat3Ms, generated_chars: 1_600, turn_seq: 1 } },
+      { ts: "2026-01-01T00:00:22Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat4Ms, generated_chars: 50, turn_seq: 2 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1", beat4Ms);
+    expect(view.liveTokScope).not.toBeNull();
+    // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
+    expect(view.liveTokScope!.tokensPerSec).toBeCloseTo(100, 5);
+    expect(view.liveTokScope!.carried).toBe(true);
+  });
+
+  // (#2886 pass 3, "STALL while disconnected") A page that has lost its own
+  // connection to the daemon must not claim the run stalled from the same
+  // silence a healthy connection just hasn't reported yet.
+  it("reads no live state (not stalled) when disconnected, even past STALL_AFTER_MS", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    const nowMs = beat2Ms + 60_000; // well past STALL_AFTER_MS (30s)
+    // Connected (the default): reads stalled, as before.
+    const connectedView = runRegions(flowToRenderModel(data), "s1", nowMs, true);
+    expect(connectedView.liveTokScope!.stalled).toBe(true);
+    expect(connectedView.liveTokScope!.state).toBe("stalled");
+    // Disconnected: the SAME records and clock must not read stalled.
+    const disconnectedView = runRegions(flowToRenderModel(data), "s1", nowMs, false);
+    expect(disconnectedView.liveTokScope!.stalled).toBe(false);
+    expect(disconnectedView.liveTokScope!.state).toBeNull();
+    // (#2886 pass 4, finding 7) This IS the connection-downgrade case, so
+    // it must read noSignal — distinct from the "genuinely no live
+    // execution" case covered below.
+    expect(disconnectedView.liveTokScope!.noSignal).toBe(true);
+    expect(connectedView.liveTokScope!.noSignal).toBe(false);
+  });
+
+  // (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+  // race") Same fixture as above — connected=true, but the last confirmed
+  // daemon contact predates the deadline (last heartbeat + STALL_AFTER_MS,
+  // 3,000 + 30,000 = 33,000ms).
+  it("downgrades a stall to no-signal via the half-open check even while connected=true", () => {
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    const nowMs = beat2Ms + 60_000;
+    // Contact confirmed BEFORE the 33,000ms-from-epoch deadline.
+    const staleContact = runRegions(flowToRenderModel(data), "s1", nowMs, true, beat2Ms + 29_999);
+    expect(staleContact.liveTokScope!.stalled).toBe(false);
+    expect(staleContact.liveTokScope!.state).toBeNull();
+    expect(staleContact.liveTokScope!.noSignal).toBe(true);
+    // Contact confirmed AFTER the deadline — a genuine, trustworthy stall.
+    const freshContact = runRegions(flowToRenderModel(data), "s1", nowMs, true, beat2Ms + 30_001);
+    expect(freshContact.liveTokScope!.stalled).toBe(true);
+    expect(freshContact.liveTokScope!.state).toBe("stalled");
+    expect(freshContact.liveTokScope!.noSignal).toBe(false);
+  });
+
+  it("never reads noSignal for a genuinely idle run (no live execution) even though state is also null", () => {
+    // A mission's own run-grain session never generates — its own
+    // `dispatch.start` is mission-sourced, so `liveExecutions` excludes it:
+    // there is model work (this session DID start), but no live EXECUTION
+    // to derive a state from. `state` reads null the same as the
+    // disconnected case above, for a wholly unrelated reason — and even
+    // while `connected` is explicitly `false` here, `noSignal` must stay
+    // `false`, since nothing about THIS null came from a connection problem.
+    const data: FlowRecord[] = [{ ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", source: "mission" }];
+    const view = runRegions(flowToRenderModel(data), "s1", Date.parse(BASE_TS) + 1_000, false);
+    expect(view.liveTokScope).not.toBeNull();
+    expect(view.liveTokScope!.state).toBeNull();
+    expect(view.liveTokScope!.noSignal).toBe(false);
   });
 
   it("an errored (non-killed) dispatch names the exit code and reads red", () => {
@@ -257,7 +393,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // tile value is `nowrap` because it is contracted to be one short figure
     // (`styles.css`, `.session-run .mv`), and "3:38 · errored (exit 1)" ran
     // straight through the COMPACTIONS tile beside it on a phone.
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("1:00");
     expect(wall?.sub).toBe("errored (exit 1)");
   });
@@ -269,7 +405,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.header.pillLabel).toBe("KILLED");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("1:00");
     expect(wall?.sub).toBe("killed (timeout)");
   });
@@ -290,7 +426,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T02:00:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 615920 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:15");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("10:15");
     // The brief's timing line reports the SAME duration. Two derivations of
     // one quantity on one page is how they drift apart.
     expect(view.briefLines.map((e) => e.text).some((t) => t.includes("(10:15)"))).toBe(true);
@@ -306,7 +442,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "session.end" },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("2:00");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.value).toBe("2:00");
   });
 
   // (#2863 review, finding 1) `wall_ms` INCLUDES rest time
@@ -346,13 +482,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    // (#2890) The run time is the MODEL section's ACTIVE TIME cell now, and
+    // the thermal rest it includes rides under it instead of a SYSTEM tile.
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.value).toBe("4:03");
-    expect(wall?.hint).toBe("run time");
-    expect(wall?.sub).toBeUndefined();
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
-    expect(thermal?.value).toBe("1:30");
-    expect(thermal?.sub).toBe("6 rests");
+    expect(wall?.sub).toBe("1:30 thermal rest");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
   it("(rest-reason cards) mixed rest causes each get their own card", () => {
@@ -363,10 +498,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 2, paced_rest_ms: 60000 } },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
+    // (#2890) Thermal under ACTIVE TIME; every other kind keeps its card.
     const delay = view.metrics.find((m) => m.label === "TURN DELAY");
-    expect(thermal?.value).toBe("1:00");
-    expect(thermal?.sub).toBe("1 rest");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("1:00 thermal rest");
     expect(delay?.value).toBe("0:30");
     expect(delay?.sub).toBe("1 rest · 30 s each");
   });
@@ -404,11 +538,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:04:03Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 243000, rest_ms: 90000, rests: 6 } },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
-    expect(wall?.sub).toBeUndefined();
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
-    expect(thermal?.value).toBe("0:15");
-    expect(thermal?.sub).toBe("1 rest");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
+    expect(wall?.sub).toBe("0:15 thermal rest");
   });
 
   it("(rest-reason cards) rest with no per-rest records shows no card at all", () => {
@@ -422,7 +553,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBeUndefined();
     expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
     expect(view.metrics.find((m) => m.label === "TURN DELAY")).toBeUndefined();
@@ -434,9 +565,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBeUndefined();
-    expect(wall?.hint).toBe("run time");
+    expect(wall?.hintTitle).toContain("INCLUDING any thermal rest");
   });
 
   it("(rest-reason cards) an errored run's WALL CLOCK sub names only the outcome, not rest", () => {
@@ -450,7 +581,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const wall = view.metrics.find((m) => m.label === "WALL CLOCK");
+    const wall = view.metrics.find((m) => m.label === "ACTIVE TIME");
     expect(wall?.sub).toBe("errored (exit 1)");
   });
 
@@ -466,9 +597,9 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000 } },
     ] as FlowRecord[];
     const view = runRegions(flowToRenderModel(data), "s1");
-    const thermal = view.metrics.find((m) => m.label === "THERMAL REST");
-    expect(thermal?.value).toBe("0:00");
-    expect(thermal?.sub).toBe("0 rests");
+    // (#2890) Armed and quiet reads under ACTIVE TIME now.
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("0:00 thermal rest");
+    expect(view.metrics.find((m) => m.label === "THERMAL REST")).toBeUndefined();
   });
 
   it("(rest-reason cards) thermal NOT configured and no rests shows no card", () => {
@@ -892,7 +1023,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const labels = view.metricScope.system.map((i) => view.metrics[i].label);
     // COMPACTIONS is present because this fixture DID dispatch (it just had
     // no host sampler); the no-model case is covered separately below.
-    expect(labels).toEqual(["WALL CLOCK", "COMPACTIONS", "HOST"]);
+    // (#2890) Run time is the MODEL section's ACTIVE TIME for a dispatch.
+    expect(labels).toEqual(["COMPACTIONS", "HOST"]);
     const hostIdx = view.metricScope.system[labels.indexOf("HOST")];
     expect(view.metrics[hostIdx].sub).toBe("no host samples for this run");
   });
@@ -980,8 +1112,8 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.hasModelWork).toBe(true);
     const modelLabels = view.metricScope.model.map((i) => view.metrics[i].label);
-    expect(modelLabels.slice(0, 3)).toEqual(["TURNS", "TOKENS IN", "TOKENS OUT"]);
-    expect(modelLabels).toHaveLength(4);
+    // (#2890) Tool calls and active time sit between turns and tokens.
+    expect(modelLabels).toEqual(["TURNS", "TOOL CALLS", "ACTIVE TIME", "TOKENS IN", "TOKENS OUT", "CONTEXT"]);
     expect(modelLabels).not.toContain("COMPACTIONS");
   });
 
@@ -1362,7 +1494,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     // A real assertion, not a vacuous loop: fail loudly if the fixture
     // didn't actually populate the tiles this test exists to check.
     expect(view.metrics.map((m) => m.label)).toEqual(
-      expect.arrayContaining(["TURNS", "TOKENS IN", "TOKENS OUT", "CTX PEAK", "WALL CLOCK"]),
+      expect.arrayContaining(["TURNS", "TOOL CALLS", "TOKENS IN", "TOKENS OUT", "CTX PEAK", "ACTIVE TIME"]),
     );
     for (const m of view.metrics) {
       if (m.value === "—" || m.value === "") continue; // a placeholder can't "restate" anything
@@ -1412,4 +1544,711 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.briefLines.some((e) => e.href?.startsWith("#mission="))).toBe(false);
   });
 
+  // (#2887) The central defect this packet fixes: a run the degeneracy gate
+  // flagged must never read CLEAN. Fixture mirrors the forwarder's real
+  // output shape (`category=telemetry, source=detector, action=telemetry.
+  // detector, fields.kind="repetition"`).
+  it("(#2887) a degenerate gate observation forwarded to flow makes the run NOT read CLEAN", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition",
+          severity: "warn",
+          detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836) and ended the call",
+          turn_seq: 14,
+          observation: 17,
+          tail_ratio: 0.242,
+          slice_chars: 68000,
+          policy: "enforce",
+          acted: true,
+        },
+      },
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.length).toBeGreaterThan(0);
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeDefined();
+    expect(view.signalGroups.find((g) => g.kind === "repetition")?.severity).toBe("warn");
+  });
+
+  // (#2887) Companion to the above: under `observe` policy the record still
+  // flags (never CLEAN) but its wording says so was NOT enforced — the
+  // operator-visible distinction the issue asks for.
+  it("(#2887) an observe-policy gate finding reads 'observed, not enforced', never CLEAN", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition",
+          severity: "warn",
+          detail: "observation 17: tail_ratio=0.242 over 68000 characters — the degeneracy gate judged this repeating (#2836) — flagged (observed), not enforced",
+          turn_seq: 14,
+          observation: 17,
+          tail_ratio: 0.242,
+          slice_chars: 68000,
+          policy: "observe",
+          acted: false,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeDefined();
+    const sig = view.signalGroups.find((g) => g.kind === "repetition")!.signals[0];
+    expect(sig.detail).toMatch(/observed/);
+    expect(sig.detail).toMatch(/not enforced/);
+  });
+
+  // (#2887) A reasoning checkpoint that WOULD have concluded under an
+  // observe policy — `verdict:"continue"`, `would_conclude:true` — must
+  // also flag, worded as observed, even though the harness let the turn
+  // keep going. `dispatch.checkpoint` DOES reach the flow stream already
+  // (unlike the gate above); the defect here was that nothing counted it.
+  it("(#2887) a would-conclude checkpoint under observe policy flags as repetition (observed)", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.2026,
+          verdict: "continue",
+          policy: "observe",
+          would_conclude: true,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/observed/);
+    expect(group!.signals[0].detail).toMatch(/not enforced/);
+  });
+
+  // (#2887) The paired case: a checkpoint that actually CONCLUDED
+  // (`verdict:"conclude"`, `enforce` policy) flags too, worded as acted —
+  // exercising the `acted` branch of the checkpoint wording, not just the
+  // observe branch above.
+  it("(#2887) a concluded checkpoint under enforce policy flags as repetition, worded as acted (not observed)", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.05,
+          verdict: "conclude",
+          policy: "enforce",
+          would_conclude: true,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/ended it/);
+    expect(group!.signals[0].detail).not.toMatch(/observed/);
+  });
+
+  // (#2887) A checkpoint that never judged the turn repetitive at all
+  // (`would_conclude:false`) must NOT flag — otherwise every ordinary
+  // checkpoint on a healthy run would light up the SIGNALS card.
+  it("(#2887) a checkpoint with would_conclude:false does not flag", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.9,
+          verdict: "continue",
+          policy: "enforce",
+          would_conclude: false,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeUndefined();
+  });
+
+  // (#2887 F1, fix-pass) A HISTORICAL checkpoint from before #2846 shipped
+  // `would_conclude` at all — only `verdict` exists. 85 real sessions on
+  // this machine have this exact shape, 53 with no detector record at all,
+  // so `verdict==="conclude"` alone must still flag; the old
+  // `would_conclude !== true` filter read every one of them as CLEAN with
+  // "repetition" ticked.
+  it("(#2887 F1) a historical checkpoint with verdict:conclude and NO would_conclude key still flags", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        action: "dispatch.checkpoint",
+        fields: {
+          turn_seq: 2,
+          checkpoint: 1,
+          slice_tokens: 32000,
+          tail_ratio: 0.05,
+          verdict: "conclude",
+          // no `would_conclude`, no `policy` — the pre-#2846 shape.
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/ended it/);
+  });
+
+  // (#2887 F2) Under a run-level policy of `off` (read from `dispatch.
+  // start`'s `payload.bounds.detection_degeneracy_policy.value`), the gate
+  // never ran — `repetitionOff` must be true, and even a STRAY
+  // repetition-shaped record in the window (a policy flipped mid-
+  // investigation, a malformed fixture) must not manufacture a finding for
+  // a detector that measured nothing.
+  it("(#2887 F2) run-level policy 'off' suppresses repetition entirely and sets repetitionOff", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        fields: { bounds: { detection_degeneracy_policy: { value: "off", source: "config" } } },
+      },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition", severity: "warn", detail: "stray record",
+          turn_seq: 5, policy: "enforce", acted: true,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionOff).toBe(true);
+    expect(view.signalGroups.find((g) => g.kind === "repetition")).toBeUndefined();
+  });
+
+  // (#2887 F2) A run-level policy that IS armed (`enforce`/`observe`) must
+  // read `repetitionOff:false` — the false case covers BOTH "ran and found
+  // nothing" and "unknown", so a run with real findings under enforce must
+  // not read as off.
+  it("(#2887 F2) run-level policy 'enforce' does not set repetitionOff", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        fields: { bounds: { detection_degeneracy_policy: { value: "enforce", source: "config" } } },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionOff).toBe(false);
+  });
+
+  // (#2887 F2) The run-level policy is PREFERRED for the observed/enforced
+  // wording over a record's own (possibly absent) `policy` field — here the
+  // gate observation carries no `policy` of its own (an older-runtime
+  // shape), but the run's `dispatch.start` says `observe`, so the wording
+  // must still read as observed-not-enforced rather than falling through to
+  // the bare "judged repeating" sentence.
+  it("(#2887 F2) run-level policy fills in wording when the record's own policy is absent", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS,
+        session_id: "s1",
+        action: "dispatch.start",
+        handle: "coder",
+        fields: { bounds: { detection_degeneracy_policy: { value: "observe", source: "config" } } },
+      },
+      {
+        ts: "2026-01-01T00:01:00Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        action: "telemetry.detector",
+        fields: {
+          kind: "repetition", severity: "warn", detail: "no policy on the record itself",
+          turn_seq: 5, acted: false,
+        },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/observed/);
+    expect(group!.signals[0].detail).toMatch(/not enforced/);
+  });
+
+  // (#2887 F4, fixed per a fresh reviewer's N1, gate fields fixed per F2)
+  // Built from the REAL enforce-policy trajectory
+  // (`~/.darkmux/runs/refresh-rotation-splash-qwen36-1790241677-1/
+  // trajectory.jsonl`, 2026-09-24 bake-off, read-only — never modified):
+  // 3 cuts total — turn_seq 2 cut once (one degenerate observation, one
+  // abort, one concluding checkpoint), turn_seq 3 cut TWICE (a
+  // continuation after the first cut, so two of each). That is 9 raw
+  // signal-bearing records across only 2 DISTINCT turns. Grouped by turn,
+  // the SIGNALS card must show exactly ONE "repetition" group with count
+  // 2 — not 9, not 3.
+  //
+  // N1: the FIRST version of this test built `ts` as
+  // `` `2026-01-01T00:0${observation}:00Z` ``, and observation numbers 14
+  // and 17 produced the literal string `"2026-01-01T00:014:00Z"` — an
+  // invalid minute component. `Date.parse` on that returns `NaN`, and
+  // `runRegions`'s `visible = data.filter((r) => T(r.ts) <= nowMs)` drops
+  // any record whose `ts` doesn't parse (`NaN <= nowMs` is always false),
+  // so 4 of the 6 gate records never reached `mergeTurn` at all — the
+  // three checkpoint records (a FIXED, always-valid `"...:05:00Z"`
+  // literal) were carrying the whole assertion. Proven vacuous: keying
+  // `mergeTurn` on `f.observation` instead of `f.turn_seq` left every one
+  // of the 105 UI tests green, because the gate records that would have
+  // exposed the wrong key were silently absent from `visible`.
+  //
+  // The fix uses the trajectory's OWN epoch-ms timestamps (`ts` fields on
+  // the real `dispatch.gate.observation`/`dispatch.gate.abort`/
+  // `dispatch.checkpoint` lines), converted to ISO — real values, not a
+  // template that can silently overflow a field again.
+  //
+  // F2 (second review pass): this trajectory was recorded BEFORE the
+  // runtime was changed to stamp `policy`/`acted` on the gate's own
+  // events (verified against the raw file: its `dispatch.gate.observation`
+  // / `dispatch.gate.abort` lines carry neither key at all — only
+  // `observation`, `slice_chars`, `tail_ratio`/`degenerate` or
+  // `generated_chars`/`tool_call_in_flight`). The CURRENT host forwarder
+  // passes `policy`/`acted` through VERBATIM from the trajectory event, so
+  // fed this real (pre-stamp) trajectory it forwards them as explicit
+  // `null` — the gate fixtures below carry NEITHER field, matching that
+  // real shape. (The checkpoint fields `policy`/`would_conclude` DO stay,
+  // correctly — those predate this run by #2846, well before #2887, and
+  // the real trajectory's checkpoint lines carry them.) A companion test
+  // right after this one covers the OPPOSITE case: a run recorded by the
+  // runtime AFTER it started stamping the gate's own `policy`/`acted`.
+  it("(#2887 F4) real enforce trajectory shape: 3 cuts across 2 turns collapse to one group, count 2", () => {
+    const gateRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      handle: "coder",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: judged repeating`,
+        turn_seq: turnSeq, observation,
+        // No `policy`/`acted` — this trajectory predates the runtime
+        // stamping either on a gate event (see the test's own doc above).
+      },
+    });
+    const abortRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      // The real trajectory's abort record shares the observation's
+      // millisecond exactly (`ts` is whole-second-truncated on the wire in
+      // practice, but this fixture keeps the source file's own values).
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      handle: "coder",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: ended the call`,
+        turn_seq: turnSeq, observation,
+        // (#2887 N4/F2) Only a real `dispatch.gate.abort` ever carries
+        // this — it is the signal `mergeTurn` uses to count DISTINCT cuts
+        // without double-counting the degenerate OBSERVATION for the same
+        // moment, and (F2) the ONLY signal it relies on: an abort's own
+        // existence is the acted outcome, whether or not `acted` itself is
+        // present on the record.
+        generated_chars: 8000,
+      },
+    });
+    const checkpointRecord = (turnSeq: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      action: "dispatch.checkpoint",
+      handle: "coder",
+      fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
+    });
+    const data: FlowRecord[] = [
+      { ts: new Date(1790241677181).toISOString(), session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // turn_seq 2: one cut. Real ts from the trajectory's own lines.
+      gateRecord(2, 14, 1790241731958),
+      abortRecord(2, 14, 1790241731958),
+      checkpointRecord(2, 1790241731962),
+      // turn_seq 3: two cuts (a continuation after the first).
+      gateRecord(3, 17, 1790241807319),
+      abortRecord(3, 17, 1790241807319),
+      checkpointRecord(3, 1790241807323),
+      gateRecord(3, 3, 1790241856862),
+      abortRecord(3, 3, 1790241856862),
+      checkpointRecord(3, 1790241856867),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.signals).toHaveLength(2);
+    const turnsNamed = group!.signals.map((s) => s.detail).sort();
+    expect(turnsNamed[0]).toMatch(/turn 2/);
+    expect(turnsNamed[1]).toMatch(/turn 3/);
+    // (#2887 N4) turn_seq 2 was cut ONCE — no "N×" clause; turn_seq 3 was
+    // cut TWICE (a continuation after the first abort) — "2×".
+    const turn2 = group!.signals.find((s) => s.detail.includes("turn 2"))!;
+    const turn3 = group!.signals.find((s) => s.detail.includes("turn 3"))!;
+    expect(turn2.detail).not.toMatch(/×/);
+    expect(turn3.detail).toMatch(/2×/);
+    // Both were ended by the GATE (an abort record contributed), so both
+    // cite #2836, not the checkpoint's #1221.
+    expect(turn2.detail).toMatch(/#2836/);
+    expect(turn3.detail).toMatch(/#2836/);
+  });
+
+  // (#2887 F2, second review pass) The OTHER case: a run recorded by a
+  // runtime AFTER it started stamping `policy`/`acted` on the gate's own
+  // trajectory events. Same shape as the real-trajectory test above (one
+  // cut on turn 2, two cuts on turn 3), but the gate records carry the
+  // stamped fields explicitly — confirms the counting/acted logic gives
+  // the SAME answer whether or not the fields are present, since it must
+  // never depend on `acted` being there (that was the exact bug: an
+  // abort's own existence — `generated_chars != null` — is what proves the
+  // call ended, not the newer `acted` field, which older runtimes and
+  // hosts alike may still forward as `null`).
+  it("(#2887 F2) a run with the runtime's stamped policy/acted fields counts and cites the same as the historical shape", () => {
+    const gateRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      handle: "coder",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: judged repeating`,
+        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+      },
+    });
+    const abortRecord = (turnSeq: number, observation: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector" as const,
+      action: "telemetry.detector",
+      handle: "coder",
+      fields: {
+        kind: "repetition", severity: "warn",
+        detail: `observation ${observation}: ended the call`,
+        turn_seq: turnSeq, observation, policy: "enforce", acted: true,
+        generated_chars: 8000,
+      },
+    });
+    const checkpointRecord = (turnSeq: number, tsMs: number) => ({
+      ts: new Date(tsMs).toISOString(),
+      session_id: "s1",
+      action: "dispatch.checkpoint",
+      handle: "coder",
+      fields: { turn_seq: turnSeq, verdict: "conclude", would_conclude: true, policy: "enforce" },
+    });
+    const data: FlowRecord[] = [
+      { ts: new Date(1790241677181).toISOString(), session_id: "s1", action: "dispatch.start", handle: "coder" },
+      gateRecord(2, 14, 1790241731958),
+      abortRecord(2, 14, 1790241731958),
+      checkpointRecord(2, 1790241731962),
+      gateRecord(3, 17, 1790241807319),
+      abortRecord(3, 17, 1790241807319),
+      checkpointRecord(3, 1790241807323),
+      gateRecord(3, 3, 1790241856862),
+      abortRecord(3, 3, 1790241856862),
+      checkpointRecord(3, 1790241856867),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    const turn2 = group!.signals.find((s) => s.detail.includes("turn 2"))!;
+    const turn3 = group!.signals.find((s) => s.detail.includes("turn 3"))!;
+    expect(turn2.detail).not.toMatch(/×/);
+    expect(turn3.detail).toMatch(/2×/);
+    expect(turn2.detail).toMatch(/#2836/);
+    expect(turn3.detail).toMatch(/#2836/);
+  });
+
+  // (#2887 N3) A dispatch session id is TASK-scoped — sibling seats fanned
+  // out within one task can share ONE session_id, so two DIFFERENT seats
+  // can each be on their own "turn 2" concurrently. Keying only on
+  // turn_seq would collapse them into one finding, hiding that TWO
+  // distinct executions were flagged. `handle` + `payload.step_id`
+  // distinguish the seats even though `session_id` cannot.
+  it("(#2887 N3) two sibling seats sharing a session each flag their own turn 2 as SEPARATE findings", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "reviewer",
+        fields: { kind: "repetition", severity: "warn", detail: "seat A", turn_seq: 2, step_id: "step-a", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+      {
+        ts: "2026-01-01T00:01:05Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "reviewer",
+        fields: { kind: "repetition", severity: "warn", detail: "seat B", turn_seq: 2, step_id: "step-b", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.signals).toHaveLength(2);
+  });
+
+  // (#2887 N3) Records with NO turn_seq at all must not collapse into one
+  // shared "turn ?" bucket — a malformed/older record naming no turn is
+  // still real evidence, and merging two unrelated ones would either lose
+  // one entirely or falsely combine their gate-abort counts.
+  it("(#2887 N3) records with no turn_seq stay as separate findings, not one shared 'turn ?' group", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "coder",
+        fields: { kind: "repetition", severity: "warn", detail: "no turn_seq A", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+      {
+        ts: "2026-01-01T00:02:00Z", session_id: "s1", category: "telemetry", source: "detector",
+        action: "telemetry.detector", handle: "coder",
+        fields: { kind: "repetition", severity: "warn", detail: "no turn_seq B", policy: "enforce", acted: true, generated_chars: 100 },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.count).toBe(2);
+    expect(group!.signals).toHaveLength(2);
+  });
+
+  // (#2887 N4) A turn flagged ONLY by the reasoning check-in's own
+  // post-hoc judge (no gate-sourced record at all for that turn) must cite
+  // #1221, not #2836 — the two are independent detectors.
+  it("(#2887 N4) a checkpoint-only flag cites #1221, not the gate's #2836", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.checkpoint", handle: "coder",
+        fields: { turn_seq: 9, checkpoint: 1, tail_ratio: 0.05, verdict: "conclude", would_conclude: true, policy: "enforce" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const group = view.signalGroups.find((g) => g.kind === "repetition");
+    expect(group).toBeDefined();
+    expect(group!.signals[0].detail).toMatch(/#1221/);
+    expect(group!.signals[0].detail).not.toMatch(/#2836/);
+  });
+
+  // (#2887 N2) A pre-1.56 session shape: `dispatch.start` carries no
+  // `flow_schema` key at all (every run before this field existed). The
+  // card must NOT claim the gate looked and found nothing.
+  it("(#2887 N2) a run with no flow_schema on dispatch.start reads repetitionRecorded:false", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionRecorded).toBe(false);
+    expect(view.repetitionOff).toBe(false);
+  });
+
+  // (#2887 N2) An explicit pre-1.56.0 flow_schema (not just absent) must
+  // read the same way — "too old" and "absent" are the same case.
+  it("(#2887 N2) a run with flow_schema below 1.56.0 reads repetitionRecorded:false", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.55.0" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionRecorded).toBe(false);
+  });
+
+  // (#2887 N2) A run recorded at 1.56.0 or later — the checklist may
+  // legitimately claim the gate looked and found nothing.
+  it("(#2887 N2) a run with flow_schema 1.56.0 or later reads repetitionRecorded:true", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.56.0" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.repetitionRecorded).toBe(true);
+
+    const later: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.60.2" },
+      },
+    ];
+    expect(runRegions(flowToRenderModel(later), "s1").repetitionRecorded).toBe(true);
+  });
+
+  // (#2887 N2) `"1.9.0"` must read as GREATER than `"1.56.0"` — a plain
+  // string compare gets this backwards (`'9' < '5'`... no, `'9' > '5'` as
+  // characters, but `"1.56.0" < "1.9.0"` lexicographically is still WRONG
+  // because it compares the second component as strings "56" vs "9", and
+  // "5" < "9" puts 1.56.0 after 1.9.0 alphabetically despite 56 > 9
+  // numerically) unless components are compared as numbers.
+  it("(#2887 N2) version comparison is numeric per component, not lexicographic", () => {
+    const data: FlowRecord[] = [
+      {
+        ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder",
+        fields: { flow_schema: "1.9.0" },
+      },
+    ];
+    // 1.9.0 < 1.56.0 numerically (minor 9 < minor 56) — must read as NOT
+    // recorded, even though "1.9.0" > "1.56.0" as a bare string compare.
+    expect(runRegions(flowToRenderModel(data), "s1").repetitionRecorded).toBe(false);
+  });
+
+});
+
+// (#2890) The MODEL section is one container: the scope as hero, then a
+// collection grid of turns, tool calls, active time, tokens in, tokens out and
+// context. Tool calls and active time come up from SYSTEM (no duplicates),
+// thermal rest rides under active time, and a finished run's rate lives in the
+// scope, not in a TOK/S tile.
+describe("runRegions — MODEL section content (#2890)", () => {
+  const BASE_TS = "2026-01-01T00:00:00Z";
+  const labelsOf = (view: ReturnType<typeof runRegions>, scope: "model" | "system") =>
+    view.metricScope[scope].map((i) => view.metrics[i].label);
+  const tool = (ts: string, name: string, extra: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts, session_id: "s1", action: "dispatch.tool", payload: { tool_name: name, ok: true, outcome: "ok", ...extra } }) as unknown as FlowRecord;
+
+  const finishedRun = (): FlowRecord[] =>
+    [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", payload: { bounds: { thermal_pacing_enabled: { value: true } } } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "dispatch.turn", payload: { turn_seq: 1, tool_calls_count: 3, generation_ms: 2_500 } },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", payload: { turn_seq: 1, prompt_tokens: 1000, completion_tokens: 200 } },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "context", payload: { used: 30000, max: 100000 } },
+      tool("2026-01-01T00:00:05Z", "read"),
+      // Ran and exited non-zero: the tool WORKING (#2008), not a failure.
+      tool("2026-01-01T00:00:06Z", "bash", { ok: false, outcome: "reported", exit_code: 1 }),
+      tool("2026-01-01T00:00:07Z", "edit", { ok: false, outcome: "failed" }),
+      { ts: "2026-01-01T00:00:20Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 45000, reason: "thermal-duty-cycle" } },
+      { ts: "2026-01-01T00:01:10Z", session_id: "s1", category: "telemetry", source: "context", payload: { used: 12000, max: 100000 } },
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 600000, prompt_tokens: 1000, completion_tokens: 200 } },
+    ] as FlowRecord[];
+
+  /** The run as of `iso`: records after it are not in the page's data yet
+   *  (the caller cuts to its clock, live or playback). */
+  const asOf = (iso: string) => finishedRun().filter((r) => Date.parse(r.ts) <= Date.parse(iso));
+
+  it("orders the model cells turns, tool calls, active time, tokens in, tokens out, context", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    expect(labelsOf(view, "model")).toEqual(["TURNS", "TOOL CALLS", "ACTIVE TIME", "TOKENS IN", "TOKENS OUT", "CTX PEAK"]);
+  });
+
+  it("counts every tool call, and only the ones that could not run as failed", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const cell = view.metrics.find((m) => m.label === "TOOL CALLS");
+    expect(cell?.value).toBe("3");
+    expect(cell?.sub).toBe("1 failed");
+  });
+
+  it("active time is the run's own wall clock, with thermal rest under it", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const cell = view.metrics.find((m) => m.label === "ACTIVE TIME");
+    expect(cell?.value).toBe("10:00");
+    expect(cell?.sub).toBe("0:45 thermal rest");
+  });
+
+  it("an armed thermal governor that never fired still says so under active time", () => {
+    const data = finishedRun().filter((r) => r.action !== "dispatch.rest");
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")?.sub).toBe("0:00 thermal rest");
+  });
+
+  it("moves wall clock and thermal rest out of SYSTEM: nothing on the page twice", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const system = labelsOf(view, "system");
+    expect(system).not.toContain("WALL CLOCK");
+    expect(system).not.toContain("THERMAL REST");
+    expect(view.metrics.filter((m) => m.label === "ACTIVE TIME")).toHaveLength(1);
+  });
+
+  it("other rest kinds stay SYSTEM tiles", () => {
+    const data = [
+      ...finishedRun(),
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "dispatch.rest", payload: { ms: 30000, reason: "turn_delay" } } as unknown as FlowRecord,
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(labelsOf(view, "system")).toContain("TURN DELAY");
+  });
+
+  it("the context cell carries a bar: now and peak against the window", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    const cell = view.metrics.find((m) => m.label === "CTX PEAK");
+    expect(cell?.value).toBe("30.00k");
+    expect(cell?.bar).toEqual({ nowPct: 12, peakPct: 30 });
+  });
+
+  it("a finished run has no TOK/S tile; the average goes to the scope instead", () => {
+    const view = runRegions(flowToRenderModel(finishedRun()), "s1");
+    expect(view.metrics.find((m) => m.label === "TOK/S")).toBeUndefined();
+    // 200 tokens over 2.5s of generation.
+    expect(view.finishedTokRate).toEqual({ average: "80", sub: null });
+  });
+
+  it("a live run has no finished average, and a finished one has no live reading", () => {
+    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:08Z")), "s1", Date.parse("2026-01-01T00:00:08Z"));
+    expect(live.finishedTokRate).toBeNull();
+    expect(live.liveTokScope).not.toBeNull();
+    const done = runRegions(flowToRenderModel(finishedRun()), "s1");
+    expect(done.liveTokScope).toBeNull();
+  });
+
+  it("a live run in TOOLS names the tool for the scope's icon", () => {
+    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:06Z")), "s1", Date.parse("2026-01-01T00:00:06Z"));
+    expect(live.liveTokScope).toMatchObject({ state: "tools", toolName: "bash" });
+  });
+
+  it("a live run's active time counts up, still in MODEL", () => {
+    const live = runRegions(flowToRenderModel(asOf("2026-01-01T00:00:08Z")), "s1", Date.parse("2026-01-01T00:00:08Z"));
+    const active = live.metrics.find((m) => m.label === "ACTIVE TIME");
+    expect(active?.value).toBe("0:08");
+    expect(active?.sub).toContain("so far");
+  });
+
+  it("a unit with no model work keeps WALL CLOCK in SYSTEM", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "p1", action: "step.start" },
+      { ts: "2026-01-01T00:00:30Z", session_id: "p1", action: "session.end" },
+    ] as FlowRecord[];
+    const view = runRegions(flowToRenderModel(data), "p1");
+    expect(view.metricScope.model).toEqual([]);
+    expect(labelsOf(view, "system")).toContain("WALL CLOCK");
+    expect(view.metrics.find((m) => m.label === "ACTIVE TIME")).toBeUndefined();
+  });
 });

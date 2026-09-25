@@ -56,9 +56,15 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateLiveState, aggregateTokenRate, averageGenerationRate } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
+import { toolOutcome } from "../../lib/recordDetail";
+
+/** The run-time figure's long hover text, shared by SYSTEM's WALL CLOCK and
+ *  (#2890) the MODEL section's ACTIVE TIME, which show the same number. */
+const WALL_HINT_TITLE =
+  "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.";
 
 export type PillCls = "run" | "err" | "done" | "canceled";
 
@@ -75,8 +81,18 @@ function pillClsFor(label: string): PillCls {
 /** (#2863) The detectors a clean run passed, in the order the old sentence
  * named them (`cycle, tool-failure, reasoning-loop, edit-drift`). One list,
  * read by the signals card and by the text mirror its tests compare against
- * the parity golden, so the two cannot drift apart. */
-export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift"] as const;
+ * the parity golden, so the two cannot drift apart.
+ *
+ * (#2887) `repetition` covers TWO producers under one name: the in-stream
+ * degeneracy gate (`dispatch.gate.observation`/`dispatch.gate.abort`,
+ * forwarded as `telemetry.detector` records with `kind:"repetition"`) and
+ * the reasoning check-in's own judgment (`dispatch.checkpoint` with
+ * `would_conclude:true`, read directly below — it is not a detector
+ * telemetry record, so it cannot ride the `kind` field the same way, but it
+ * is pushed into `finds` under the SAME `"repetition"` kind). Before this,
+ * neither producer had ANY entry here, which is the defect the issue names:
+ * a run the gate flagged 14 times still read CLEAN. */
+export const CLEAN_DETECTORS = ["cycle", "tool failure", "reasoning loop", "edit drift", "repetition"] as const;
 
 export interface SessionHeader {
   /** Pre-uppercased (`.sub h2{text-transform:uppercase}` in legacy CSS —
@@ -155,7 +171,17 @@ export interface SessionRunView {
    * instead. Every tile renders its `sub` slot, empty or not, so the grid
    * doesn't go ragged the moment one tile has more to say than its
    * neighbors — see `.session-run .msub` in `styles.css`. */
-  metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }>;
+  metrics: Array<{
+    value: string;
+    label: string;
+    hint?: string;
+    hintTitle?: string;
+    sub?: string;
+    unit?: string;
+    /** (#2890) The context cell's thin bar: the context in use now and its
+     *  peak, each as a percentage (0..100) of the window. */
+    bar?: { nowPct: number; peakPct: number };
+  }>;
   /** (#1973) Which metrics describe the MODEL's work and which describe the
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
@@ -181,6 +207,11 @@ export interface SessionRunView {
   liveTokScope:
     | {
         tokensPerSec: number | null;
+        /** (#2885) `true` when `tokensPerSec` is carried forward from an
+         *  earlier turn rather than freshly measured from the current
+         *  turn's own two most recent heartbeats — the caller renders the
+         *  number dimmed. See `lib/tokenRate.ts::AggregatedTokenRate`. */
+        carried: boolean;
         stalled: boolean;
         /** (#2877 pass 2) The legible between-heartbeats state — see
          *  `lib/tokenRate.ts::deriveLiveState`'s own doc. `stalled` above is
@@ -190,8 +221,32 @@ export interface SessionRunView {
         /** Present only when `state === "rest"` — whole seconds left in the
          *  reported rest window. */
         restSecondsLeft?: number;
+        /** (#2886 pass 4, finding 7) `true` exactly when `state === null`
+         *  because the connection was lost/half-open, NOT because there is
+         *  genuinely no live execution to have a state for (a mission
+         *  between model steps). The caller uses this to render a DISTINCT
+         *  "no signal" word rather than reusing the ambiguous "no model
+         *  working" wording both cases would otherwise share. */
+        noSignal: boolean;
+        /** (#2890) Present only when `state === "tools"`: the tool the scope's
+         *  center draws as an icon. See `LiveStateReading.toolName`. */
+        toolName?: string;
+        /** (#2889) Present only while the model WRITES a tool call — see
+         *  `LiveStateReading.writing` / `writingSeconds`. */
+        writing?: true;
+        writingSeconds?: number;
+        /** (#2890) Present only while generating and the model is reasoning
+         *  rather than writing visible text. See `LiveStateReading.thinking`. */
+        thinking?: true;
       }
     | null;
+  /** (#2890) A FINISHED run's average generation rate, shown in the MODEL
+   *  hero scope's center ("avg tok/s") rather than as a TOK/S tile. `sub` is
+   *  the qualifier `averageGenerationRate`'s labeling rules produce when the
+   *  average is partial or a fallback ("avg · 1 of 2 turns", "avg · wall
+   *  clock", "avg · unbilled"), `null` for the ordinary average. `null`
+   *  while the run is live or when it did no model work. */
+  finishedTokRate: { average: string; sub: string | null } | null;
   /** (#2863) Whether the MODEL section shows its model card. False for an
    * endpoint-served run: the card could only repeat the model name the
    * brief's `model` row already shows. */
@@ -219,6 +274,29 @@ export interface SessionRunView {
    *  a flat list of grey strings. */
   signalsLabel: string;
   signalGroups: SignalGroup[];
+  /** (#2887 F2) The run-level `detection_degeneracy_policy.value` the
+   * dispatch actually ran under (`payload.bounds.detection_degeneracy_
+   * policy` on the `dispatch.start` record — the SAME resolved value the
+   * host stamps for the container, distinct from any per-record `policy`
+   * field an individual gate/checkpoint record may or may not carry).
+   * `true` only when that value is literally `"off"` — the gate never ran
+   * at all, so the SIGNALS card must not claim "repetition: clean" (which
+   * asserts the detector looked and found nothing); it renders the
+   * checklist cell as "off" instead. `false` covers both "ran, found
+   * nothing" (enforce/observe with no findings) and "unknown" (no
+   * `dispatch.start`, or an older record predating this field) — an
+   * unknown run-level policy must NOT render as off, since that would be
+   * claiming something the data doesn't say either. */
+  repetitionOff: boolean;
+  /** (#2887 N2) Whether this run's `dispatch.start` names a `flow_schema`
+   * of 1.56.0 or later — the version the degeneracy gate's own findings
+   * started reaching the flow stream at. `false` (never `true` by
+   * default) for any run recorded before that field existed, or with no
+   * `dispatch.start` in the window at all. The CLEAN checklist's
+   * "repetition" cell renders a checkmark only when this is `true` AND
+   * `repetitionOff` is `false` — otherwise "(not recorded)", so the card
+   * never claims a check the record can't support. */
+  repetitionRecorded: boolean;
 }
 
 /** (#1989) Render a detector's `detail` without destroying it.
@@ -436,6 +514,23 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
   return { hasEvidence, turns, tokIn, tokOut, ctxPeak, ctxNow, nctx, loadLines };
 }
 
+/** (#2887 N2) `version >= min`, comparing dotted numeric components
+ * (`"1.56.0"` vs `"1.9.0"` — a plain string compare would read `"1.56.0" <
+ * "1.9.0"` since `'5' < '9'` lexicographically, which is wrong). `null`
+ * (no `flow_schema` on the record at all — every run before this field
+ * itself) reads as `false`, never as "assume current". */
+function flowSchemaAtLeast(version: string | null, min: string): boolean {
+  if (!version) return false;
+  const va = version.split(".").map((n) => parseInt(n, 10) || 0);
+  const vb = min.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
+    const a = va[i] ?? 0;
+    const b = vb[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
 /** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
  * (see this module's own top doc). `data` should already be scoped to ONE
  * session (the `/flow-session/<id>` response, through `flowToRenderModel`
@@ -455,8 +550,24 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
  * Passing a real clock here fixes that. It is never allowed to run BACKWARDS
  * of the records, though: `max(nowOverride, tMax)` keeps a machine whose
  * clock lags a peer's from rendering a negative elapsed time.
+ *
+ * @param connected (#2886 pass 3, "STALL while disconnected") Whether the
+ * PAGE currently has a working connection to the daemon — read by the
+ * caller from the same liveness source the header renders
+ * (`hooks/useLiveTail.ts`'s `LiveTailStatus`). Defaults to `true` (assume
+ * connected) so every existing caller/test that doesn't pass it keeps
+ * behaving exactly as before; `SessionReplay.tsx` is the one caller that
+ * passes the real value. See `lib/tokenRate.ts::liveStateWhileConnected`'s
+ * own doc for why only a `"stalled"` reading is affected.
+ *
+ * @param lastContactMs (#2886 pass 4, do-it — fresh-reviewer finding 5,
+ * "half-open connection race") The last moment the page confirmed contact
+ * with the daemon — `App.tsx`'s `lastContactRef.current`, sourced from
+ * `useLiveTail`'s `onContact`. `null` (the default) skips the half-open
+ * check inside `liveStateWhileConnected` and falls back to the plain
+ * `connected` boolean, same as omitting it there.
  */
-export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number): SessionRunView {
+export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number, connected = true, lastContactMs: number | null = null): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
@@ -624,7 +735,8 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
 
   // (U3-7/U5-2) `fmtElapsed`, not the retired `fmtDuration`: a dispatch
   // that runs past an hour used to read "75:23" here.
-  const wallBase = done ? fmtElapsed(runWallMs) : `${fmtElapsed(nowMs - startTs)} so far`;
+  const wallElapsed = done ? fmtElapsed(runWallMs) : fmtElapsed(nowMs - startTs);
+  const wallBase = done ? wallElapsed : `${wallElapsed} so far`;
   const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
   // (#2860) How the run ended goes on the tile's `sub` line, not appended to
   // the figure: the value is `nowrap` because it is contracted to be one
@@ -839,8 +951,38 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // used to be able to disagree (a marker explaining the gap on every
   // candidate would still read "stalled" under the old rule); they can't
   // any more, because there is only one rule now.
-  const tokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
+  // (#2886 pass 3, "STALL while disconnected"; pass 4 finding 5, "half-open
+  // connection race") Downgrades a "stalled" reading to `null` (no live
+  // execution — every lamp off, no rate) when the page itself has lost its
+  // connection to the daemon: no new record could have arrived either way,
+  // so a false STALL claim is worse than saying nothing. `connected`
+  // defaults to `true` for every caller that doesn't pass it, so this is a
+  // no-op everywhere except the real `SessionReplay.tsx` render.
+  // `lastContactMs` (also defaulted, also a no-op when absent) additionally
+  // closes the half-open gap: a stall is trusted only once the daemon has
+  // answered AFTER this session's own last heartbeat's deadline — see
+  // `lib/tokenRate.ts::liveStateWhileConnected`'s own doc.
+  const rawTokRateLiveState = aggregateLiveState(tokRateRecordSets, nowMs);
+  const tokRateLiveState = liveStateWhileConnected(
+    rawTokRateLiveState,
+    connected,
+    lastContactMs != null ? { lastContactMs, lastHeartbeatMs: lastHeartbeatMs(tokRateRecordSets) } : undefined,
+  );
+  // `tokRateStalled` reads the ADJUSTED state, so it can never disagree
+  // with what `liveTokScope.state` below shows.
   const tokRateStalled = tokRateLiveState?.state === "stalled";
+  // (#2886 pass 4, do-it — fresh-reviewer finding 7, "fix the aria
+  // relabeling a real idle state as no signal") `state === null` is ALSO
+  // what a genuine "no live execution" reading looks like (a mission
+  // between model steps, or nothing running) — that is NOT a connectivity
+  // problem and must not read "no signal". This is `true` ONLY when the
+  // downgrade above is what produced the `null` — i.e. the raw reading
+  // (before any connection knowledge) WAS a stall, and connection evidence
+  // is what erased it.
+  const tokRateNoSignal = rawTokRateLiveState?.state === "stalled" && tokRateLiveState === null;
+  // Computed once, here, and read both by `liveTokScope` below and nowhere
+  // else — a single call, not one per read site.
+  const liveTokRate = aggregateTokenRate(tokRateRecordSets, nowMs);
 
   // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
   // `const procs = ...` followed by `void procs` to silence the unused
@@ -901,72 +1043,17 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // conditional (host tiles only exist when host telemetry does), and an
   // audit already flagged the hardcoded form as a positional contract nothing
   // enforced — this makes the two unable to drift because there is only one.
-  const metrics: Array<{ value: string; label: string; hint?: string; hintTitle?: string; sub?: string; unit?: string }> = [];
+  const metrics: SessionRunView["metrics"] = [];
   const modelIdx: number[] = [];
   const systemIdx: number[] = [];
-  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string) => {
+  const push = (into: number[], value: string, label: string, hint?: string, hintTitle?: string, sub?: string, unit?: string, bar?: { nowPct: number; peakPct: number }) => {
     into.push(metrics.length);
-    metrics.push({ value, label, hint, hintTitle, sub, unit });
+    metrics.push(bar ? { value, label, hint, hintTitle, sub, unit, bar } : { value, label, hint, hintTitle, sub, unit });
   };
-  push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
-  push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
-  push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
-  push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub);
-  // (#2877) The fifth MODEL tile, TOK/S. A FINISHED run gets a plain text
-  // tile like its four neighbors here — "the scope goes... the tile shows
-  // the final measured tok/s" (issue text). A run still in progress does
-  // NOT push here at all; `SessionReplay.tsx` renders `liveTokScope` (the
-  // live canvas + centered number) as the fifth tile instead, since a
-  // pushed string tile has no way to host a component. Final rate: total
-  // billed output tokens over the run's own wall clock — the same two
-  // numbers TOKENS OUT and WALL CLOCK already show, so this tile's number
-  // is reconcilable against its neighbors rather than a third, opaque
-  // measurement.
-  if (done) {
-    // The model's generation rate: billed tokens over generation time, an
-    // exact average, not an estimate. Wall clock is only the fallback for a
-    // runtime that predates `generation_ms`, and the label says so.
-    const genRate = averageGenerationRate(tokRateRecordSets);
-    const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
-    const finalTokPerSec = genRate ?? wallRate;
-    push(
-      modelIdx,
-      finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—",
-      "TOK/S",
-      undefined,
-      undefined,
-      genRate != null ? "avg" : "avg · wall clock",
-    );
-  }
-  // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
-  // the model's work, and the gate — while this tile is the dispatch's own
-  // `wall_ms`, the runtime's measure of the execution alone. On a real
-  // mission the same step read 10:36 there and 10:07 here with nothing on
-  // either screen saying why. The flow record carries no step span (see
-  // `DispatchCompletePayload`: no step start/end field exists), so this side
-  // cannot show BOTH numbers — it can only stop being anonymous, which is
-  // what the label does. `StepRow.tsx` carries the matching half.
-  push(
-    systemIdx,
-    wallBase,
-    "WALL CLOCK",
-    "run time",
-    "run time — the runtime's own measure of this execution, INCLUDING any thermal rest. A mission step's badge covers a WIDER span (setup and gate included) and reads longer.",
-    wallSub,
-  );
-  // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
-  // and it is the reading contract 8 supports: the harness DECIDES to compact
-  // and performs it through a UTILITY role's sub-execution. The specialist
-  // neither chooses it nor does it; it only experiences the result.
-  // An earlier comment here argued the opposite — that an operator reads it
-  // as "what happened to this model's context" — which describes the EFFECT
-  // rather than the actor, and is exactly the blending the sub-execution rule
-  // exists to stop.
-  // Gated on model work for the same reason the model pane is: a
-  // `procedural.shell` step has no context to compact, so `0 COMPACTIONS`
-  // would assert "the harness compacted nothing" where the truth is "there
-  // was nothing here that could be compacted".
-  if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
+  // (#2890) Whether run time is shown as the MODEL section's ACTIVE TIME cell
+  // (any unit with a model section) or as SYSTEM's WALL CLOCK (a unit with
+  // none, such as a `procedural.shell` step).
+  const activeInModel = effHasModelWork;
   // (rest-reason cards) One SYSTEM tile per rest KIND — THERMAL REST / TURN
   // DELAY / BATTERY PAUSE / OPERATOR HOLD, plus a generic label for a
   // reason string this file doesn't recognize — replacing the single
@@ -1018,7 +1105,137 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const extraKinds = [...restByKind.keys()]
     .filter((k) => !restKindOrder.includes(k))
     .sort((a, b) => (restByKind.get(b)?.totalMs ?? 0) - (restByKind.get(a)?.totalMs ?? 0));
+  // (#2890) The MODEL section's cells, in the order the operator reads them:
+  // turns, tool calls, active time, tokens in, tokens out, context. TOOL
+  // CALLS and ACTIVE TIME came up from the machine's section; each figure is
+  // on the page once.
+  push(modelIdx, effTurnsValue != null ? String(effTurnsValue) : "—", "TURNS");
+  if (activeInModel) {
+    // Every `dispatch.tool` record of the same executions the turn and token
+    // counts describe (this session, or the mission's inner executions when
+    // those numbers rolled up). "Failed" is `toolOutcome`'s rule, the one the
+    // event log row uses: a command that ran and exited non-zero is the tool
+    // working, not a failure (#2008).
+    const toolSids = new Set(tokRateSids);
+    let toolCalls = 0;
+    let toolFailed = 0;
+    for (const r of toolSids.size === 1 && toolSids.has(sid) ? attemptRecs : visible) {
+      if (r.action !== "dispatch.tool" || !toolSids.has(r.session_id ?? "")) continue;
+      toolCalls += 1;
+      if (toolOutcome((r.fields || r.payload || {}) as Record<string, unknown>) === "failed") toolFailed += 1;
+    }
+    push(modelIdx, String(toolCalls), "TOOL CALLS", undefined, undefined, `${toolFailed} failed`);
+    // The same run time WALL CLOCK shows, with the thermal rest it includes
+    // named under it in the approved prototype's words ("1:00 thermal
+    // rest"; the hover title says the figure INCLUDES it) (the THERMAL REST tile's own rule: shown when the
+    // governor was armed for this dispatch or a rest actually occurred).
+    const thermal = restByKind.get("thermal");
+    const thermalShown = restConfiguredByKind.thermal === true || thermal != null;
+    // (#2890) The grid cell is narrow: the value is the bare time, and a
+    // live run's "so far" moves to the sub line instead of clipping the value.
+    const activeSub = [done ? undefined : "so far", wallSub, thermalShown ? `${fmtElapsed(thermal?.totalMs ?? 0)} thermal rest` : undefined].filter(Boolean).join(" · ") || undefined;
+    push(modelIdx, wallElapsed, "ACTIVE TIME", undefined, WALL_HINT_TITLE, activeSub);
+  }
+  push(modelIdx, effTokIn != null ? fmtC(effTokIn) : "—", "TOKENS IN");
+  push(modelIdx, effTokOut != null ? fmtC(effTokOut) : "—", "TOKENS OUT");
+  // (#2890) A thin bar under the context figure: now and peak against the
+  // window, as percentages of it.
+  const ctxBar =
+    effNctx > 0
+      ? {
+          nowPct: Math.min(100, Math.max(0, (effCtxNow / effNctx) * 100)),
+          peakPct: Math.min(100, Math.max(0, (effCtxPeak / effNctx) * 100)),
+        }
+      : undefined;
+  push(modelIdx, effNctx ? fmtC(ctxHeadline) : "—", ctxLabel, undefined, undefined, ctxSub, undefined, ctxBar);
+  // (#2877) The fifth MODEL tile, TOK/S. A FINISHED run gets a plain text
+  // tile like its four neighbors here — "the scope goes... the tile shows
+  // the final measured tok/s" (issue text). A run still in progress does
+  // NOT push here at all; `SessionReplay.tsx` renders `liveTokScope` (the
+  // live canvas + centered number) as the fifth tile instead, since a
+  // pushed string tile has no way to host a component. Final rate: total
+  // billed output tokens over the run's own wall clock — the same two
+  // numbers TOKENS OUT and WALL CLOCK already show, so this tile's number
+  // is reconcilable against its neighbors rather than a third, opaque
+  // measurement.
+  let finishedTokRate: SessionRunView["finishedTokRate"] = null;
+  if (done && effHasModelWork) {
+    // The model's generation rate: billed tokens over generation time, an
+    // exact average, not an estimate. Wall clock is only the fallback for a
+    // runtime that predates `generation_ms`, and the label says so.
+    //
+    // (#2886) `genRate` now also says how many of the turns that PAIRED a
+    // `generation_ms` with billed tokens actually went into the average —
+    // a checkpointed turn is excluded (see `averageGenerationRate`'s own
+    // doc). Three outcomes, per the issue's acceptance:
+    // 1. Every paired turn billed: the ordinary "avg" label, unchanged.
+    // 2. Some excluded, at least one remains: "avg · M of N turns" so the
+    //    reader knows the average is partial, not silently wrong.
+    // 3. Turns existed but ALL were checkpointed (`tokensPerSec: null`):
+    //    show "—", never the wall-clock fallback — that fallback is for
+    //    when there is NO generation_ms data at all (an older runtime),
+    //    not for "every measured turn turned out to be unbillable".
+    const genRate = averageGenerationRate(tokRateRecordSets);
+    const wallRate = effTokOut != null && runWallMs > 0 ? effTokOut / (runWallMs / 1000) : null;
+    let finalTokPerSec: number | null;
+    let tokSub: string;
+    if (genRate == null) {
+      finalTokPerSec = wallRate;
+      tokSub = "avg · wall clock";
+    } else if (genRate.tokensPerSec == null) {
+      finalTokPerSec = null;
+      tokSub = "avg · unbilled";
+    } else {
+      finalTokPerSec = genRate.tokensPerSec;
+      tokSub = genRate.billedTurns === genRate.totalTurns ? "avg" : `avg · ${genRate.billedTurns} of ${genRate.totalTurns} turns`;
+    }
+    // (#2890) No TOK/S tile any more: a finished run keeps the scope as the
+    // MODEL hero with this average in its center ("avg tok/s" is the unit
+    // there). The sub line appears only when it says more than "avg".
+    finishedTokRate = {
+      average: finalTokPerSec != null ? String(Math.round(finalTokPerSec)) : "—",
+      sub: tokSub === "avg" ? null : tokSub,
+    };
+  }
+  // (U3-6) The mission graph's per-step badge shows the STEP SPAN — setup,
+  // the model's work, and the gate — while this tile is the dispatch's own
+  // `wall_ms`, the runtime's measure of the execution alone. On a real
+  // mission the same step read 10:36 there and 10:07 here with nothing on
+  // either screen saying why. The flow record carries no step span (see
+  // `DispatchCompletePayload`: no step start/end field exists), so this side
+  // cannot show BOTH numbers — it can only stop being anonymous, which is
+  // what the label does. `StepRow.tsx` carries the matching half.
+  //
+  // (#2890) When this unit did model work, the same figure is the MODEL
+  // section's ACTIVE TIME cell (pushed above, with thermal rest under it);
+  // SYSTEM keeps WALL CLOCK only for a unit with no model section.
+  if (!activeInModel) {
+    push(
+      systemIdx,
+      wallBase,
+      "WALL CLOCK",
+      "run time",
+      WALL_HINT_TITLE,
+      wallSub,
+    );
+  }
+  // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
+  // and it is the reading contract 8 supports: the harness DECIDES to compact
+  // and performs it through a UTILITY role's sub-execution. The specialist
+  // neither chooses it nor does it; it only experiences the result.
+  // An earlier comment here argued the opposite — that an operator reads it
+  // as "what happened to this model's context" — which describes the EFFECT
+  // rather than the actor, and is exactly the blending the sub-execution rule
+  // exists to stop.
+  // Gated on model work for the same reason the model pane is: a
+  // `procedural.shell` step has no context to compact, so `0 COMPACTIONS`
+  // would assert "the harness compacted nothing" where the truth is "there
+  // was nothing here that could be compacted".
+  if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
   for (const key of [...restKindOrder, ...extraKinds]) {
+    // (#2890) Thermal rest rides under ACTIVE TIME in MODEL when that cell
+    // exists, so it is not shown twice.
+    if (key === "thermal" && activeInModel) continue;
     const occurred = restByKind.get(key);
     const configured = restConfiguredByKind[key] === true;
     if (!configured && !occurred) continue;
@@ -1293,8 +1510,50 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     }
   }
   const runStartMs = d?.ts ? T(d.ts) : null;
+  // (#2887 F2) The run-level policy the dispatch actually ran under, read
+  // from `dispatch.start`'s own `payload.bounds.detection_degeneracy_
+  // policy.value` — the SAME resolved value the host stamps into the
+  // container's env for this run, so it is the one true "what was this run
+  // configured to do" answer, independent of whether any individual
+  // gate/checkpoint record happens to carry its own `policy` field (an
+  // older runtime image may not). `null` when unknown (no dispatch.start in
+  // the window, or a record predating this field) — unknown is never
+  // treated as "off".
+  const runDegeneracyPolicy = (() => {
+    const sf = d?.fields as Record<string, unknown> | undefined;
+    const bounds = sf?.bounds as Record<string, unknown> | undefined;
+    const block = bounds?.detection_degeneracy_policy as Record<string, unknown> | undefined;
+    return typeof block?.value === "string" ? block.value : null;
+  })();
+  const repetitionOff = runDegeneracyPolicy === "off";
+  // (#2887 N2) A run recorded before FLOW_SCHEMA_VERSION 1.56.0 has no way
+  // to tell "the gate genuinely never flagged anything" from "the forwarder
+  // that reports flags didn't exist yet for this run" — the degeneracy
+  // gate's own findings only started reaching the flow stream at 1.56.0
+  // (see `schema.rs`'s own history entry, which also names this stamp's
+  // real scope: it proves the HOST forwarder's version, not that the
+  // runtime IMAGE the container ran actually executed the gate — that
+  // narrower gap is `darkmux doctor`'s job, not this field's). `dispatch.
+  // start`'s `payload.flow_schema` (the SAME `FLOW_SCHEMA_VERSION` constant
+  // the host stamped this run's records against) is the one place that can
+  // say which case applies. Absent entirely on any run older than this
+  // field itself, which reads the same as "too old" — both must render as
+  // unmeasured, never as a checked-and-clean tick.
+  const runFlowSchema = (() => {
+    const sf = d?.fields as Record<string, unknown> | undefined;
+    return typeof sf?.flow_schema === "string" ? sf.flow_schema : null;
+  })();
+  const repetitionRecorded = flowSchemaAtLeast(runFlowSchema, "1.56.0");
+
   for (const r of dets) {
     const f = r.fields as Record<string, unknown>;
+    // (#2887 F4) `repetition`-kind detector records are handled below,
+    // grouped by turn — NOT pushed one-per-record here. Under enforce a
+    // single cut produces a degenerate observation AND an abort AND
+    // (usually) a concluding checkpoint for the SAME turn; pushed through
+    // this generic per-record loop that reads as three-to-six findings for
+    // one operator-visible event.
+    if (f.kind === "repetition") continue;
     const atMs = r.ts ? T(r.ts) : null;
     finds.push({
       // (#1989) `String(f.kind)` turned a missing field into the literal
@@ -1315,6 +1574,183 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       detail: signalDetail(f.detail),
       atMs,
       offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
+    });
+  }
+
+  // (#2887 F4) One flagged TURN, not one raw record. Under enforce the
+  // runtime writes a degenerate `dispatch.gate.observation`, a
+  // `dispatch.gate.abort` for the SAME moment, and a concluding
+  // `dispatch.checkpoint` for the same turn — three (or, across a turn's
+  // several continuations, more) records for what the operator experiences
+  // as ONE cut. Every one of those record kinds names the turn it belongs
+  // to (`turn_seq`, forwarded from the runtime's own `seq`), so they
+  // collapse here into a single Signal per distinct turn.
+  //
+  // `dispatch.checkpoint` is NOT a detector telemetry record (`category=
+  // work`, `source` unset — it rides `self.emit`, not `self.emit_
+  // telemetry`), so it never reached `dets`/`tel` above; read it straight
+  // off `visible` instead, scoped to this session's attempt window the same
+  // way every other region here is.
+  const checkpoints = visible.filter((r) => inAttempt(r) && r.action === "dispatch.checkpoint");
+
+  // (#2887 N3) `turn_seq` alone is not a safe key. A dispatch session id is
+  // TASK-scoped (`darkmux_types::session_id::task` — see this project's own
+  // "task-scoped session id trap" note): sibling seats fanned out within one
+  // task can share ONE session_id, so two concurrent seats can each be on
+  // their own "turn 2" at the same time. What DOES individually attribute a
+  // record even when its session id is a shared grouping key is the pair
+  // `dispatch.internal`'s own doc names for exactly this reason:
+  // `payload.step_id` (present only inside a mission graph step — absent
+  // for a standalone `darkmux dispatch`) and `handle` (the role). Combined
+  // with `turn_seq` this is the merge key below.
+  const seatKeyFor = (r: FlowRecord, f: Record<string, unknown>): string =>
+    `${r.handle ?? ""}::${typeof f.step_id === "string" ? f.step_id : ""}`;
+
+  type TurnFlag = {
+    turnSeq: number | string;
+    acted: boolean;
+    // (#2887 N4) How many DISTINCT calls the gate itself ended for this
+    // turn — counted off `dispatch.gate.abort`-sourced records specifically
+    // (identified by `generated_chars`, a field only an abort ever
+    // populates — see the loop below), never off the DEGENERATE
+    // OBSERVATION that names the SAME cut, which would double the count.
+    gateAbortCount: number;
+    // Whether a gate-sourced record (observation or abort) contributed at
+    // all, vs. the flag coming ONLY from the checkpoint's own post-hoc
+    // judge — the two are independent detectors (#2836 the in-stream gate,
+    // #1221 the reasoning check-in) that usually but not always co-occur:
+    // the checkpoint's judge can conclude a turn the stream gate's
+    // per-observation-boundary sampling never crossed.
+    sawGate: boolean;
+    policy: string | null;
+    atMs: number | null;
+    ratio: string | null;
+  };
+  const byTurn = new Map<string, TurnFlag>();
+  const mergeTurn = (
+    turnSeqRaw: unknown,
+    seatKey: string,
+    acted: boolean,
+    isGateAbort: boolean,
+    isGateSourced: boolean,
+    policy: string | null,
+    atMs: number | null,
+    ratio: string | null,
+  ) => {
+    const turnSeq = typeof turnSeqRaw === "number" ? turnSeqRaw : "?";
+    // (#2887 N3) A record with no numeric `turn_seq` must never collapse
+    // with ANOTHER such record just because both read "?" — a fresh
+    // per-record suffix keeps every unknown-turn record its own group
+    // rather than silently merging unrelated findings.
+    const key =
+      turnSeq === "?" ? `${seatKey}::?::${byTurn.size}` : `${seatKey}::${turnSeq}`;
+    const existing = byTurn.get(key);
+    if (!existing) {
+      byTurn.set(key, {
+        turnSeq,
+        acted,
+        gateAbortCount: isGateAbort ? 1 : 0,
+        sawGate: isGateSourced,
+        policy,
+        atMs,
+        ratio,
+      });
+      return;
+    }
+    if (acted) existing.acted = true;
+    if (isGateAbort) existing.gateAbortCount += 1;
+    if (isGateSourced) existing.sawGate = true;
+    if (policy && !existing.policy) existing.policy = policy;
+    if (atMs != null && (existing.atMs == null || atMs < existing.atMs)) existing.atMs = atMs;
+    if (ratio && !existing.ratio) existing.ratio = ratio;
+  };
+
+  // (#2887 F2) `off` means the gate never ran — there is nothing to flag,
+  // and any stray repetition-shaped record in the window (a policy change
+  // mid-investigation, a malformed fixture) must not manufacture a finding
+  // for a detector this run's own bounds say was not measuring anything.
+  if (!repetitionOff) {
+    for (const r of dets) {
+      const f = r.fields as Record<string, unknown>;
+      if (f.kind !== "repetition") continue;
+      const atMs = r.ts ? T(r.ts) : null;
+      const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
+      // Only `dispatch.gate.abort` ever populates `generated_chars` (the
+      // runtime's own trajectory shape — `append_gate_observation` never
+      // writes it); a degenerate OBSERVATION for the SAME cut carries
+      // `acted:true` too, and must not be double-counted as a second abort.
+      const isGateAbort = f.generated_chars != null;
+      // (#2887 F2 second pass) `f.acted === true` alone is NOT a safe
+      // "did this end the call" test — a run recorded by a host predating
+      // the runtime-stamped `acted` field forwards it as an explicit
+      // `null` (see `detector_telemetry_payload`'s `.unwrap_or(Value::
+      // Null)`), so `f.acted === true` reads `false` for a REAL abort. An
+      // abort record's own existence IS the acted outcome regardless of
+      // whether the field is present (same fact `append_gate_abort`'s own
+      // doc states server-side: `"acted": true` is written unconditionally
+      // there) — `isGateAbort` alone already proves it.
+      const acted = f.acted === true || isGateAbort;
+      mergeTurn(
+        f.turn_seq,
+        seatKeyFor(r, f),
+        acted,
+        isGateAbort,
+        true,
+        typeof f.policy === "string" ? f.policy : null,
+        atMs,
+        ratio,
+      );
+    }
+    // A checkpoint counts as a flag when `would_conclude` is `true` (the
+    // judge found the turn repetitive under a runtime that measures) OR
+    // `verdict === "conclude"` (F1: a HISTORICAL checkpoint from before
+    // #2846 shipped `would_conclude` at all carries only `verdict` — a
+    // conclude with no `would_conclude` key must still flag, or every
+    // pre-#2846 enforced conclusion on record reads CLEAN).
+    for (const r of checkpoints) {
+      const f = r.fields as Record<string, unknown>;
+      const acted = f.verdict === "conclude";
+      const flagged = f.would_conclude === true || acted;
+      if (!flagged) continue;
+      const atMs = r.ts ? T(r.ts) : null;
+      const ratio = typeof f.tail_ratio === "number" ? f.tail_ratio.toFixed(3) : null;
+      mergeTurn(
+        f.turn_seq,
+        seatKeyFor(r, f),
+        acted,
+        false,
+        false,
+        typeof f.policy === "string" ? f.policy : null,
+        atMs,
+        ratio,
+      );
+    }
+  }
+
+  for (const acc of byTurn.values()) {
+    // (#2887 F2) Prefer the RUN-LEVEL policy for the observed/enforced
+    // wording — it is the one resolved value every record in this run
+    // shares, where an individual record's own `policy` field may be
+    // absent (an older runtime image) or, in principle, stale.
+    const effectivePolicy = runDegeneracyPolicy ?? acc.policy;
+    const ratioClause = acc.ratio ? ` (tail_ratio=${acc.ratio})` : "";
+    // (#2887 N4) Cite the detector that actually produced this finding:
+    // #2836 (the in-stream degeneracy gate) whenever a gate-sourced record
+    // contributed, #1221 (the reasoning check-in) for a checkpoint-only
+    // flag the stream gate never saw.
+    const citation = acc.sawGate ? "#2836" : "#1221";
+    const timesClause = acc.gateAbortCount > 1 ? ` ${acc.gateAbortCount}×` : "";
+    const detail = acc.acted
+      ? `turn ${acc.turnSeq}: judged repeating${ratioClause} and ended it${timesClause} (${citation})`
+      : effectivePolicy === "observe"
+        ? `turn ${acc.turnSeq}: judged repeating${ratioClause} — flagged (observed), not enforced (#2846)`
+        : `turn ${acc.turnSeq}: judged repeating${ratioClause} (${citation})`;
+    finds.push({
+      kind: "repetition",
+      severity: "warn",
+      detail,
+      atMs: acc.atMs,
+      offsetLabel: acc.atMs != null && runStartMs != null ? runOffset(acc.atMs - runStartMs) : "",
     });
   }
 
@@ -1373,14 +1809,23 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     liveTokScope:
       effHasModelWork && !done
         ? {
-            tokensPerSec: aggregateTokenRate(tokRateRecordSets, nowMs),
+            tokensPerSec: liveTokRate?.tokensPerSec ?? null,
+            carried: liveTokRate?.carried ?? false,
             stalled: tokRateStalled,
             // null: no live execution right now (a mission between model
-            // steps). Every lamp is off; nothing claims a state.
+            // steps), OR downgraded by `liveStateWhileConnected` above.
+            // Every lamp is off; nothing claims a state.
             state: tokRateLiveState?.state ?? null,
             restSecondsLeft: tokRateLiveState?.restSecondsLeft,
+            noSignal: tokRateNoSignal,
+            toolName: tokRateLiveState?.state === "tools" ? tokRateLiveState.toolName : undefined,
+            ...(tokRateLiveState?.state === "tools" && tokRateLiveState.writing
+              ? { writing: true as const, writingSeconds: tokRateLiveState.writingSeconds }
+              : {}),
+            ...(tokRateLiveState?.state === "generating" && tokRateLiveState.thinking ? { thinking: true as const } : {}),
           }
         : null,
+    finishedTokRate,
     showModelCard,
     modelTrackLabel,
     modelTrackLines,
@@ -1395,5 +1840,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     lastBeatMs,
     signalsLabel,
     signalGroups,
+    repetitionOff,
+    repetitionRecorded,
   };
 }

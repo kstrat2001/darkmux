@@ -9,7 +9,23 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { SessionReplay } from "./SessionReplay";
+import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
+
+// (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
+// green while broken in the actual render path — `effectiveConnected`/
+// `effectiveLastContactMs`'s scrub overrides, and the TOK/S tile's
+// `centerLabel`/`centerCarried` — because nothing asserted on what
+// `TokenScope` itself receives. Same mock + reader `FleetLens.test.tsx` uses.
+vi.mock("../../components/TokenScope", () => ({
+  TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
+}));
+
+function latestTokenScopeProps(): Record<string, unknown> {
+  const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
+  const last = nodes[nodes.length - 1];
+  if (!last) throw new Error("no TokenScope probe rendered");
+  return JSON.parse(last.getAttribute("data-props")!);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../../../..");
@@ -26,6 +42,16 @@ function renderReplay(sessionId: string) {
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+
+// (#2890) A live run's "so far" sits on the ACTIVE TIME cell's sub line, not
+// in its value (the value is the bare time so it fits the grid cell).
+const activeSub = () => {
+  const cell = [...document.querySelectorAll('.metrics[data-scope="model"] .met')].find(
+    (c) => c.querySelector(".ml")?.textContent === "ACTIVE TIME",
+  );
+  return cell?.querySelector(".msub")?.textContent ?? "";
+};
 
 describe("SessionReplay", () => {
   // ── (#1973 / #1978) rendered-DOM assertions ────────────────────────
@@ -210,20 +236,19 @@ describe("SessionReplay", () => {
     renderReplay("s-disc");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
-    const tiles = [...document.querySelectorAll('.metrics[data-scope="system"] .met')];
-    const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "WALL CLOCK");
-    expect(wall, "the WALL CLOCK tile").toBeTruthy();
-    expect(wall?.querySelector(".ml")?.getAttribute("data-hint")).toBe("run time");
-    // (#2863) Drawn under the value, not appended to the label, so the label
-    // stays one line in a narrow tile.
-    expect(wall?.getAttribute("data-subhint")).toBe("run time");
+    // (#2890) A dispatch's run time is the MODEL section's ACTIVE TIME cell
+    // now. Its label already names it, so the short "run time" hint under the
+    // value is gone; the hover title still spells the span out.
+    const tiles = [...document.querySelectorAll('.metrics[data-scope="model"] .met')];
+    const wall = tiles.find((t) => t.querySelector(".ml")?.textContent === "ACTIVE TIME");
+    expect(wall, "the ACTIVE TIME cell").toBeTruthy();
     const title = wall?.getAttribute("title") ?? "";
     expect(title).toContain("run time");
     // It has to name what it EXCLUDES, or the label is just another word.
     expect(title).toContain("step");
 
-    // No other tile borrowed the hint — this is a distinction, not decoration.
-    expect(tiles.filter((t) => t.querySelector(".ml")?.hasAttribute("data-hint")).length).toBe(1);
+    // No cell carries a short hint any more: each label names its figure.
+    expect(tiles.filter((t) => t.querySelector(".ml")?.hasAttribute("data-hint")).length).toBe(0);
 
     // And the golden's text is untouched.
     expect(wall?.textContent).not.toContain("run time");
@@ -320,9 +345,10 @@ describe("SessionReplay", () => {
     // performs it via a utility role. The specialist only experiences it.
     expect(model?.textContent).not.toContain("COMPACTIONS");
     expect(system?.textContent).toContain("COMPACTIONS");
-    // WALL CLOCK is the harness's measure of the run, not the model's work.
-    expect(model?.textContent).not.toContain("WALL CLOCK");
-    expect(system?.textContent).toContain("WALL CLOCK");
+    // (#2890) The run's time came up into MODEL as ACTIVE TIME, once.
+    expect(model?.textContent).toContain("ACTIVE TIME");
+    expect(system?.textContent).not.toContain("WALL CLOCK");
+    expect(system?.textContent).not.toContain("ACTIVE TIME");
   });
 
   // Both producer lineages' bookend spellings. The space form is the one a
@@ -493,14 +519,14 @@ describe("SessionReplay", () => {
 
     const secs = [...document.querySelectorAll(".session-run .runsec")];
     expect(secs.map((e) => e.getAttribute("data-head"))).toEqual(["model", "system", "signals"]);
-    // The model card sits inside the MODEL section, after its tiles.
+    // The model card sits inside the MODEL section, after its figures, in the
+    // same container (#2890).
     const model = secs[0];
-    expect(model.querySelector('.metrics[data-scope="model"]')?.nextElementSibling?.querySelector(".lbl")?.textContent).toBe(
-      "loaded models",
-    );
+    expect(model.querySelector(".modelbox__main")?.nextElementSibling?.querySelector(".lbl")?.textContent).toBe("loaded models");
+    expect(model.querySelector(".modelbox > .modelbox__models")).toBeInTheDocument();
     const txt = document.querySelector(".session-run")?.textContent ?? "";
     expect(txt.indexOf("TOKENS OUT")).toBeLessThan(txt.indexOf("loaded models"));
-    expect(txt.indexOf("loaded models")).toBeLessThan(txt.indexOf("WALL CLOCK"));
+    expect(txt.indexOf("loaded models")).toBeLessThan(txt.indexOf("COMPACTIONS"));
   });
 
   it("(#1973) renders a signal group with its severity, count badge and run-relative time", async () => {
@@ -568,9 +594,9 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
-    expect(before).toContain("so far");
+    expect(activeSub()).toContain("so far");
 
     // No new records — only time passing. This is the whole point.
     act(() => {
@@ -620,7 +646,7 @@ describe("SessionReplay", () => {
     ];
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const { rerender } = render(
@@ -632,7 +658,7 @@ describe("SessionReplay", () => {
 
     // ── Position A: playhead BEFORE the run's own terminal record ──
     const parked = readWall();
-    expect(parked).toContain("so far");
+    expect(activeSub()).toContain("so far");
     expect(parked).toContain("0:30"); // the scrubbed instant's own elapsed
     expect(parked).not.toContain("2:00"); // NOT real Date.now() - start
 
@@ -651,7 +677,7 @@ describe("SessionReplay", () => {
     );
     await vi.waitFor(() => expect(readWall()).toContain("1:00"));
     const ended = readWall();
-    expect(ended).not.toContain("so far"); // a FIXED total, not still counting
+    expect(activeSub()).not.toContain("so far"); // a FIXED total, not still counting
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
@@ -677,7 +703,7 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
     act(() => {
       vi.advanceTimersByTime(10_000);
@@ -893,7 +919,95 @@ describe("SessionReplay", () => {
       "tool failure",
       "reasoning loop",
       "edit drift",
+      // (#2887 N2) This corpus's `dispatch.start` predates `flow_schema`
+      // entirely — the run page cannot claim the gate looked and found
+      // nothing, so it reads "(not recorded)", not a plain checkmark.
+      "repetition (not recorded)",
     ]);
+  });
+
+  // (#2887 F2) A clean run whose degeneracy policy was `off` (read from
+  // `dispatch.start`'s own `payload.bounds.detection_degeneracy_policy.
+  // value`) must render the "repetition" checklist cell distinctly from
+  // the other four, which genuinely ran and found nothing — a plain
+  // checkmark there would claim the detector looked, which it did not.
+  it("(#2887 F2) renders the repetition checklist cell as 'off' when the run's policy was off", async () => {
+    const records = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        action: "dispatch.start",
+        session_id: "s-off",
+        machine_id: "M",
+        payload: { role: "coder", bounds: { detection_degeneracy_policy: { value: "off", source: "config" } } },
+      },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-off", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-off");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    const cells = [...document.querySelectorAll(".sigcheck")];
+    const repetitionCell = cells.find((c) => c.textContent?.startsWith("repetition"));
+    expect(repetitionCell).toBeDefined();
+    expect(repetitionCell!.textContent).toBe("repetition (off)");
+    expect(repetitionCell!.className).toContain("sigcheck--off");
+    // The other four DID run and found nothing — plain cells, no "(off)".
+    expect(cells.find((c) => c.textContent === "cycle")).toBeDefined();
+  });
+
+  // (#2887 N2) A clean run with NO `flow_schema` on `dispatch.start` at
+  // all (every run before the field existed) must NOT claim the gate
+  // looked and found nothing — a plain checkmark there would be exactly
+  // the false claim the SESSIONS N2 finding names.
+  it("(#2887 N2) renders the repetition checklist cell as 'not recorded' when dispatch.start carries no flow_schema", async () => {
+    const records = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        action: "dispatch.start",
+        session_id: "s-old",
+        machine_id: "M",
+        payload: { role: "coder", bounds: { detection_degeneracy_policy: { value: "enforce", source: "config" } } },
+      },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-old", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-old");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    const cells = [...document.querySelectorAll(".sigcheck")];
+    const repetitionCell = cells.find((c) => c.textContent?.startsWith("repetition"));
+    expect(repetitionCell).toBeDefined();
+    expect(repetitionCell!.textContent).toBe("repetition (not recorded)");
+    expect(repetitionCell!.className).toContain("sigcheck--off");
+  });
+
+  // (#2887 N2) A clean run with a CURRENT `flow_schema` on `dispatch.start`
+  // — the gate genuinely ran (enforce, not off) and found nothing, so the
+  // plain checkmark is an honest claim.
+  it("(#2887 N2) renders the repetition checklist cell as a plain checkmark when flow_schema is current", async () => {
+    const records = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        action: "dispatch.start",
+        session_id: "s-new",
+        machine_id: "M",
+        payload: {
+          role: "coder",
+          bounds: { detection_degeneracy_policy: { value: "enforce", source: "config" } },
+          flow_schema: "1.56.0",
+        },
+      },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-new", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-new");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(screen.getByText("clean")).toBeInTheDocument();
+    const cells = [...document.querySelectorAll(".sigcheck")];
+    const repetitionCell = cells.find((c) => c.textContent?.startsWith("repetition"));
+    expect(repetitionCell).toBeDefined();
+    expect(repetitionCell!.textContent).toBe("repetition");
+    expect(repetitionCell!.className).not.toContain("sigcheck--off");
   });
 
   it("URL-encodes the session id in the fetch path", async () => {
@@ -1071,5 +1185,299 @@ describe("SessionReplay — the pending state draws the page, not a bare line (#
         expect(tile.querySelector(".mv .ph-shimmer"), "tile value should shimmer").toBeTruthy();
       }
     }
+  });
+});
+
+// (#2886 pass 5, MUST — fresh-reviewer finding F5) `effectiveConnected`/
+// `effectiveLastContactMs`'s scrub overrides and the TOK/S tile's
+// `centerLabel`/`centerCarried` — pinned at the rendered surface via the
+// mocked `TokenScope`, not just at `runRegions`'s own `sessionRun.test.ts`
+// coverage (which proves the DERIVATION is right, never that it reaches the
+// screen).
+describe("SessionReplay TOK/S tile — rendered-surface pinning (#2886 pass 5)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // A session whose heartbeat stream went stale 38s before "now" —
+  // STALL_AFTER_MS is 30s, so this genuinely reads STALLED live, with
+  // nothing scrubbed and nothing disconnected.
+  function staleRunningSession(t0: number) {
+    return [
+      { ts: new Date(t0 - 60_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 40_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-stale", machine_id: "M", payload: { sampled_at_ms: t0 - 40_000, generated_chars: 40 } },
+      { ts: new Date(t0 - 38_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-stale", machine_id: "M", payload: { sampled_at_ms: t0 - 38_000, generated_chars: 120 } },
+    ];
+  }
+
+  it("shows 'no signal' (not blank) for a genuinely disconnected LIVE view, not the run being idle", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: staleRunningSession(t0) }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-stale" connected={false} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    // (#2890) The tube shows static (the `nosignal` state) with an empty
+    // center, and the words sit under the lamps.
+    expect(latestTokenScopeProps()).toMatchObject({ state: "nosignal", centerLabel: null });
+    expect(document.querySelector('[data-testid="run-token-scope"] .modelbox__note')?.textContent).toBe("no signal");
+  });
+
+  // (finding F5, "effectiveConnected = connected") A SCRUBBED playhead must
+  // read as connected REGARDLESS of the live `connected` prop — history is
+  // not affected by whether the live page happens to be connected right
+  // now. Same stale fixture, `connected={false}`, but now WITH a playhead —
+  // the genuine historical stall must show, not a false "no signal".
+  it("a scrubbed playhead ignores the live connected=false and shows the REAL historical stall", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: staleRunningSession(t0) }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-stale" playhead={t0 - 5_000} connected={false} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, state: "stalled" });
+  });
+
+  // (finding F5, "effectiveLastContactMs = lastContactMs") A SCRUBBED
+  // playhead must WITHHOLD the live `lastContactMs` — it's a fact about the
+  // live connection right now, not about the history being viewed.
+  // `lastContactMs` here sits BEFORE the stalled execution's own deadline
+  // (t0-38_000 + 30_000 = t0-8_000), which — if NOT withheld — would
+  // downgrade a genuine historical stall to "no signal".
+  it("a scrubbed playhead withholds lastContactMs too, so a stale half-open value can't downgrade real history", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records: staleRunningSession(t0) }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-stale" playhead={t0 - 5_000} connected lastContactMs={t0 - 39_000} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ centerLabel: null, state: "stalled" });
+  });
+
+  // (finding F5, "centerCarried={false}") The generating + carried case,
+  // pinned at the rendered surface — a carried reading dims the number.
+  it("centerCarried is true exactly for a generating, carried reading", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 22_000).toISOString(), action: "dispatch.start", session_id: "s-carry", machine_id: "M", payload: { role: "coder" } },
+      // Turn 1: real progress to carry from (0 -> 800 chars over 2s).
+      { ts: new Date(t0 - 22_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-carry", machine_id: "M", payload: { sampled_at_ms: t0 - 22_000, generated_chars: 0, turn_seq: 1 } },
+      { ts: new Date(t0 - 20_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-carry", machine_id: "M", payload: { sampled_at_ms: t0 - 20_000, generated_chars: 800, turn_seq: 1 } },
+      // Turn 2: lone first heartbeat — nothing of its own yet, carries turn 1's rate.
+      { ts: new Date(t0).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-carry", machine_id: "M", payload: { sampled_at_ms: t0, generated_chars: 50, turn_seq: 2 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <SessionReplay sessionId="s-carry" />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(latestTokenScopeProps()).toMatchObject({ state: "generating", centerCarried: true, centerUnit: "tok/s" });
+  });
+});
+
+// (#2890) The MODEL section as the operator sees it: one container, the scope
+// as the hero with one line of lamps, a collection grid of six figures, the
+// loaded models below. Rendered through the real component with the mocked
+// scope, so the assertions are on what reaches the screen and on the props the
+// scope receives.
+describe("SessionReplay MODEL section (#2890)", () => {
+  const SID = "s-model";
+  const at = (sec: number) => new Date(Date.UTC(2026, 8, 24, 1, 0, 0) + sec * 1000).toISOString();
+  const rec = (sec: number, action: string, payload: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => ({
+    ts: at(sec),
+    action,
+    session_id: SID,
+    machine_id: "MacBook-Pro",
+    payload,
+    ...extra,
+  });
+  function finishedRun() {
+    return [
+      rec(0, "dispatch.start", { role: "coder", bounds: { thermal_pacing_enabled: { value: true } } }, { handle: "darkmux/coder", model: "darkmux:qwen3.6-35b" }),
+      rec(1, "telemetry.lms", {}, { category: "telemetry", source: "lms", fields: { event: "load", model: "qwen3.6-35b", gb: 18 } }),
+      rec(4, "dispatch.turn", { turn_seq: 1, tool_calls_count: 2, generation_ms: 2_500 }),
+      rec(4, "telemetry.tokens", { turn_seq: 1, prompt_tokens: 1000, completion_tokens: 200 }, { category: "telemetry", source: "tokens" }),
+      rec(5, "telemetry.context", { used: 30000, max: 100000 }, { category: "telemetry", source: "context" }),
+      rec(5, "dispatch.tool", { tool_name: "read", ok: true, outcome: "ok" }),
+      rec(6, "dispatch.tool", { tool_name: "edit", ok: false, outcome: "failed" }),
+      rec(20, "dispatch.rest", { ms: 45000, reason: "thermal-duty-cycle" }),
+      rec(70, "telemetry.context", { used: 12000, max: 100000 }, { category: "telemetry", source: "context" }),
+      rec(600, "dispatch.complete", { wall_ms: 600000, prompt_tokens: 1000, completion_tokens: 200 }),
+    ];
+  }
+  async function renderRun(records: unknown[]) {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay(SID);
+    // `vi.waitFor`, which also works under fake timers.
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+  }
+  const cells = () =>
+    [...document.querySelectorAll('.modelbox .metrics[data-scope="model"] .met')].map((c) => ({
+      label: c.querySelector(".ml")?.textContent,
+      value: c.querySelector(".mv")?.textContent,
+      sub: c.querySelector(".msub")?.textContent ?? null,
+      bar: c.querySelector(".mbar") !== null,
+    }));
+
+  it("lays the figures out as six cells in reading order, with their sub lines", async () => {
+    await renderRun(finishedRun());
+    expect(cells()).toEqual([
+      { label: "TURNS", value: "1", sub: null, bar: false },
+      { label: "TOOL CALLS", value: "2", sub: "1 failed", bar: false },
+      { label: "ACTIVE TIME", value: "10:00", sub: "0:45 thermal rest", bar: false },
+      { label: "TOKENS IN", value: "1.00k", sub: null, bar: false },
+      { label: "TOKENS OUT", value: "200", sub: null, bar: false },
+      { label: "CTX PEAK", value: "30.00k", sub: "of 100.00k", bar: true },
+    ]);
+  });
+
+  it("draws the context bar as now and peak against the window", async () => {
+    await renderRun(finishedRun());
+    const bar = document.querySelector(".mbar");
+    expect((bar?.querySelector(".mbar__now") as HTMLElement | null)?.style.width).toBe("12%");
+    expect((bar?.querySelector(".mbar__peak") as HTMLElement | null)?.style.width).toBe("30%");
+  });
+
+  it("a finished run keeps the scope as the hero with its average, and no TOK/S title anywhere", async () => {
+    await renderRun(finishedRun());
+    expect(latestTokenScopeProps()).toMatchObject({ state: "finished", centerLabel: "80", centerUnit: "avg tok/s", size: "tile" });
+    const section = document.querySelector('.runsec[data-head="model"]');
+    expect(section?.textContent).not.toContain("TOK/S");
+    // The ordinary average needs no note under the lamps.
+    expect(document.querySelector(".modelbox__note")).toBeNull();
+  });
+
+  it("the lamp row is one line of five dots with none lit when the run has finished", async () => {
+    await renderRun(finishedRun());
+    const lamps = [...document.querySelectorAll('[data-testid="run-token-scope"] .scope-lamps .scope-lamp')];
+    expect(lamps.map((l) => l.getAttribute("data-state"))).toEqual(["generating", "prompt", "tools", "rest", "stalled"]);
+    expect(lamps.filter((l) => l.getAttribute("data-on") === "true")).toHaveLength(0);
+    expect(document.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: finished");
+  });
+
+  it("everything sits in ONE container: hero and grid side by side, loaded models below", async () => {
+    await renderRun(finishedRun());
+    const box = document.querySelector('.runsec[data-head="model"] > .modelbox');
+    expect(box).toBeInTheDocument();
+    const main = box!.querySelector(":scope > .modelbox__main");
+    expect([...main!.children].map((c) => c.className)).toEqual(["modelbox__hero", "metrics modelbox__figs"]);
+    expect(box!.lastElementChild?.classList.contains("modelbox__models")).toBe(true);
+    expect(box!.lastElementChild?.textContent).toContain("loaded models");
+  });
+
+  it("the machine section no longer repeats wall clock or thermal rest", async () => {
+    await renderRun(finishedRun());
+    const system = document.querySelector('.metrics[data-scope="system"]')?.textContent ?? "";
+    expect(system).not.toContain("WALL CLOCK");
+    expect(system).not.toContain("THERMAL REST");
+  });
+
+  it("a live run in TOOLS hands the scope the tool for its icon, and no number", async () => {
+    // One of the turn's two calls has completed: still TOOLS, named by it.
+    const t0 = Date.parse(at(5)) + 500;
+    vi.useFakeTimers();
+    vi.setSystemTime(t0);
+    try {
+      await renderRun(finishedRun().filter((r) => Date.parse(r.ts) <= t0));
+      expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "read", centerLabel: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("modelScopeHero (#2890)", () => {
+  const live = {
+    tokensPerSec: 142.4,
+    carried: false,
+    stalled: false,
+    state: "generating" as const,
+    noSignal: false,
+  };
+
+  it("GEN: the rounded rate with its unit", () => {
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({
+      state: "generating",
+      tokensPerSec: 142.4,
+      centerLabel: "142",
+      centerUnit: "tok/s",
+      note: null,
+    });
+  });
+
+  it("a live state with nothing to count (PROMPT): no number, no unit, no rate driving the wave", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt" }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "prompt", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "prompt" } });
+  });
+
+  it("(#2890) GEN while thinking: the same number and unit, with the thinking look", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96, thinking: true }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "generating", centerLabel: "96", centerUnit: "tok/s", thinking: true, lamps: { state: "generating", thinking: true } });
+    const text = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96 }, finishedTokRate: null });
+    expect(text).toMatchObject({ centerUnit: "tok/s", thinking: false, lamps: { thinking: false } });
+  });
+
+  it("(#2890) the lit GEN lamp reads 'think' in the shimmer while thinking; one lamp, relabeled, not a sixth", () => {
+    const lit = () => document.querySelector('.scope-lamp[data-on="true"]');
+    const a = render(<ScopeLamps reading={{ state: "generating", thinking: true }} />);
+    expect(a.container.querySelectorAll(".scope-lamp")).toHaveLength(5);
+    expect(lit()?.getAttribute("data-state")).toBe("generating");
+    expect(lit()?.getAttribute("data-thinking")).toBe("true");
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("think");
+    expect(a.container.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: generating, thinking");
+    a.unmount();
+    render(<ScopeLamps reading={{ state: "generating" }} />);
+    expect(lit()?.getAttribute("data-thinking")).toBeNull();
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("gen");
+  });
+
+  it("(#2889) TOOLS while writing: the tool icon, the writing cue, and 'tool gen' under it", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "tools", toolName: "edit", writing: true, writingSeconds: 70 }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: true, centerUnit: "tool gen", tokensPerSec: 0 });
+  });
+
+  it("(#2889) TOOLS while darkmux runs the tool: no writing cue, no caption", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "tools", toolName: "edit" }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: false, centerUnit: null });
+  });
+
+  it("no signal is its own state with the words under the lamps", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: null, noSignal: true }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "nosignal", centerLabel: null, note: "no signal" });
+  });
+
+  it("finished: the average, 'avg tok/s', and the partial-average qualifier as the note", () => {
+    const h = modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "64", sub: "avg · 3 of 4 turns" } });
+    expect(h).toMatchObject({ state: "finished", centerLabel: "64", centerUnit: "avg tok/s", note: "avg · 3 of 4 turns", lamps: { state: null } });
+  });
+
+  it("rest: the countdown goes in the center (amber, by state), not on the lamp", () => {
+    const live = { tokensPerSec: 0, state: "rest", restSecondsLeft: 12, stalled: false, carried: false, noSignal: false } as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "rest", centerLabel: "12s", centerUnit: "resting" });
+  });
+
+  it("finished: the scope is driven by the average, so its wave matches the number", () => {
+    expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "192", sub: null } })?.tokensPerSec).toBe(192);
+    expect(modelScopeHero({ liveTokScope: null, finishedTokRate: { average: "—", sub: null } })?.tokensPerSec).toBe(0);
+  });
+
+  it("no model work: no hero", () => {
+    expect(modelScopeHero({ liveTokScope: null, finishedTokRate: null })).toBeNull();
   });
 });

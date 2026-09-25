@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { machActive, specOf, buildFleetCard, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
+import { machActive, specOf, buildFleetCard, busiestExecution, isStrictlyBusier, rosterOnlyEntries, rosterAliasFor, specUnknownLabel } from "./cards";
 import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from "../../types/handwritten";
+import type { ExecutionTokenReading } from "../../lib/tokenRate";
 import type { Run } from "../../types/generated/Run";
 
 function run(overrides: Partial<Run> & Pick<Run, "id" | "kind" | "status">): Run {
@@ -396,6 +397,47 @@ describe("buildFleetCard", () => {
       expect(card.liveTokStalled).toBe(false);
     });
 
+    // (#2885) A short turn's lone first heartbeat carries the previous
+    // turn's rate forward — marked `liveTokCarried` so the card can dim it.
+    it("carries the last measured rate (marked liveTokCarried) into a new turn's lone first heartbeat", () => {
+      const t1a = T_MAX - 22_000;
+      const t1b = T_MAX - 20_000;
+      const t1c = T_MAX - 18_000;
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        // Turn 1 opens at 0 (every turn does — #2886 pass 4 finding 2), then
+        // two real-progress intervals before turn 2's lone first heartbeat.
+        // The carry must read the SECOND interval, not the 0-opening one.
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1a, generated_chars: 0, turn_seq: 1 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1b, generated_chars: 800, turn_seq: 1 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: t1c, generated_chars: 1_600, turn_seq: 1 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: T_MAX, generated_chars: 50, turn_seq: 2 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokState).toBe("generating");
+      // Turn 1: 800 chars / 2s = 400 chars/s -> 100 tok/s at the default.
+      expect(card.liveTokRate).toBeCloseTo(100, 5);
+      expect(card.liveTokCarried).toBe(true);
+    });
+
+    it("is NOT carried once a turn has produced its own two fresh heartbeats", () => {
+      const card = buildFleetCard(
+        [
+          rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+          rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+          rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+        ],
+        new Map(),
+        null,
+        new Set(["s1"]),
+        false,
+        "u1",
+        true,
+        T_MAX,
+      );
+      expect(card.liveTokCarried).toBe(false);
+    });
+
     it("sums across two concurrently running sessions on the same machine", () => {
       const data: FlowRecord[] = [
         rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
@@ -461,10 +503,50 @@ describe("buildFleetCard", () => {
       expect(card.liveTokRate).toBe(0);
     });
 
+    // (#2886 pass 3, "STALL while disconnected") Same records, same stale
+    // gap — the ONLY thing that changed is the page's own connection to the
+    // daemon. A false STALL claim from a disconnection must not survive.
+    it("reads no state (not stalled) for the SAME stale gap when the page is disconnected", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
+      ];
+      const connectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true);
+      expect(connectedCard.liveTokStalled).toBe(true);
+      expect(connectedCard.liveTokState).toBe("stalled");
+      const disconnectedCard = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, false);
+      expect(disconnectedCard.liveTokStalled).toBe(false);
+      expect(disconnectedCard.liveTokState).toBeNull();
+      // Still mounted (a running session exists) — just no state to claim.
+      expect(disconnectedCard.liveTokRate).not.toBeNull();
+    });
+
+    // (#2886 pass 4, do-it — fresh-reviewer finding 5, "half-open connection
+    // race") Even while `connected` (the header's own status) says `true`,
+    // a stall claim needs the daemon to have answered SINCE the point the
+    // last heartbeat's own deadline passed. Same fixture as above (last
+    // heartbeat at 3,000ms) — `STALL_AFTER_MS` past it is 33,000ms.
+    it("downgrades a stall to no-signal via the half-open check even while connected=true", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
+      ];
+      // Contact confirmed BEFORE the 33,000ms deadline — the half-open gap.
+      const staleContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true, 32_999);
+      expect(staleContact.liveTokStalled).toBe(false);
+      expect(staleContact.liveTokState).toBeNull();
+      // Contact confirmed AFTER the deadline — a genuine, trustworthy stall.
+      const freshContact = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX, undefined, undefined, true, 33_001);
+      expect(freshContact.liveTokStalled).toBe(true);
+      expect(freshContact.liveTokState).toBe("stalled");
+    });
+
     it("a mission between model steps (only its run session beating) mounts no scope and claims no state", () => {
       // The launcher beats presence for the mission's run session during a
       // mod wait, a test gate, delivery: no model is involved, so the card
-      // must not say "reading prompt" or run a scope at 0.
+      // must not say "processing prompt" or run a scope at 0.
       const data: FlowRecord[] = [
         rec({ machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "mission", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
@@ -473,6 +555,22 @@ describe("buildFleetCard", () => {
       const card = buildFleetCard(data, new Map(), null, new Set(["m1"]), false, "u1", true, T_MAX);
       expect(card.liveTokRate).toBeNull();
       expect(card.liveTokState ?? null).toBeNull();
+    });
+
+    it("(#2881) a pre-#2310 review run's bookend (source \"review\") is a run, not a pager execution", () => {
+      // Archives are append-only (contract 8): the retired review launcher
+      // bookended the WHOLE run with `source: "review"` and a crew-summary
+      // handle, and it never bookended a seat, so that record is run-grain
+      // exactly like today's `source: "mission"`. Paging it read as a second
+      // execution labeled `deep+diff-review+probe-4b+probe-qwen38`.
+      const data: FlowRecord[] = [
+        rec({ ts: "2026-08-08T23:59:50.000Z", machine_uid: "u1", session_id: "m1", action: "dispatch start", source: "review", handle: "deep+diff-review+probe-4b", mission_id: "m1" }),
+        rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.start", handle: "reviewer", mission_id: "m1" }),
+        rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
+        rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "e1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
+      expect(card.executions.map((e) => e.sessionId)).toEqual(["e1"]);
     });
 
     it("still works from an OLDER runtime's heartbeat shape (no sampled_at_ms/generated_chars)", () => {
@@ -894,5 +992,143 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
 
   it("the two labels are different sentences — a regression that collapsed them would be invisible otherwise", () => {
     expect(specUnknownLabel("not-seen")).not.toBe(specUnknownLabel("not-reported"));
+  });
+});
+
+// (#2881) The pager's default-page pick.
+describe("busiestExecution", () => {
+  const exec = (overrides: Partial<ExecutionTokenReading> & Pick<ExecutionTokenReading, "sessionId" | "state">): ExecutionTokenReading => ({
+    role: "coder",
+    tokensPerSec: null,
+    carried: false,
+    ...overrides,
+  });
+
+  it("is null for an empty list", () => {
+    expect(busiestExecution([])).toBeNull();
+  });
+
+  it("picks the sole entry when there is only one", () => {
+    const e = exec({ sessionId: "a", state: "rest" });
+    expect(busiestExecution([e])).toBe(e);
+  });
+
+  it("picks generating over every quieter state, regardless of array order", () => {
+    const resting = exec({ sessionId: "a", state: "rest" });
+    const generating = exec({ sessionId: "b", state: "generating", tokensPerSec: 10 });
+    const stalled = exec({ sessionId: "c", state: "stalled" });
+    expect(busiestExecution([resting, generating, stalled])?.sessionId).toBe("b");
+    expect(busiestExecution([stalled, generating, resting])?.sessionId).toBe("b");
+  });
+
+  it("ranks the quiet states by the lamps' own priority: rest, then tools, then prompt, then stalled", () => {
+    const tools = exec({ sessionId: "a", state: "tools" });
+    const rest = exec({ sessionId: "b", state: "rest" });
+    const prompt = exec({ sessionId: "c", state: "prompt" });
+    const stalled = exec({ sessionId: "d", state: "stalled" });
+    expect(busiestExecution([tools, prompt, stalled, rest])?.sessionId).toBe("b");
+    expect(busiestExecution([prompt, stalled, tools])?.sessionId).toBe("a");
+  });
+
+  it("ranks a real state over no-signal (null), even a quiet one over a stalled no-signal", () => {
+    const noSignal = exec({ sessionId: "a", state: null });
+    const stalled = exec({ sessionId: "b", state: "stalled" });
+    expect(busiestExecution([noSignal, stalled])?.sessionId).toBe("b");
+  });
+
+  it("ties within generating go to the HIGHER current rate", () => {
+    const slower = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
+    const faster = exec({ sessionId: "b", state: "generating", tokensPerSec: 40 });
+    expect(busiestExecution([slower, faster])?.sessionId).toBe("b");
+  });
+
+  it("a final tie (same state, same rate) goes to the LOWER session id — deterministic, not array order", () => {
+    const first = exec({ sessionId: "b", state: "generating", tokensPerSec: 10 });
+    const second = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
+    expect(busiestExecution([first, second])?.sessionId).toBe("a");
+    expect(busiestExecution([second, first])?.sessionId).toBe("a");
+  });
+});
+
+// (#2886 pass 5, MUST — fresh-reviewer finding F6) The pager's STICKY
+// default page guard — never flaps on a tie or on rate alone.
+describe("isStrictlyBusier", () => {
+  const exec = (overrides: Partial<ExecutionTokenReading> & Pick<ExecutionTokenReading, "sessionId" | "state">): ExecutionTokenReading => ({
+    role: "coder",
+    tokensPerSec: null,
+    carried: false,
+    ...overrides,
+  });
+
+  it("is false when both are the SAME state class, even if the rate differs (the flap this exists to stop)", () => {
+    const current = exec({ sessionId: "a", state: "generating", tokensPerSec: 10 });
+    const candidate = exec({ sessionId: "b", state: "generating", tokensPerSec: 90 });
+    expect(isStrictlyBusier(candidate, current)).toBe(false);
+  });
+
+  it("is false when the candidate is the SAME execution as current (a tie with itself)", () => {
+    const current = exec({ sessionId: "a", state: "rest" });
+    expect(isStrictlyBusier(current, current)).toBe(false);
+  });
+
+  it("is false when the candidate is a WORSE state class than current", () => {
+    const current = exec({ sessionId: "a", state: "generating" });
+    const candidate = exec({ sessionId: "b", state: "stalled" });
+    expect(isStrictlyBusier(candidate, current)).toBe(false);
+  });
+
+  it("is true only when the candidate is a STRICTLY better state class than current", () => {
+    const current = exec({ sessionId: "a", state: "rest" });
+    const candidate = exec({ sessionId: "b", state: "generating" });
+    expect(isStrictlyBusier(candidate, current)).toBe(true);
+  });
+
+  it("is false for no-signal (null) vs no-signal — the worst class tied with itself", () => {
+    const current = exec({ sessionId: "a", state: null });
+    const candidate = exec({ sessionId: "b", state: null });
+    expect(isStrictlyBusier(candidate, current)).toBe(false);
+  });
+});
+
+describe("buildFleetCard: executions and defaultExecutionSessionId (#2881)", () => {
+  const BEAT1 = T_MAX - 2000;
+  const BEAT2 = T_MAX;
+
+  it("is empty while idle", () => {
+    const card = buildFleetCard([], new Map(), null, new Set(), false, "u1", true, T_MAX);
+    expect(card.executions).toEqual([]);
+    expect(card.defaultExecutionSessionId).toBeNull();
+  });
+
+  it("has exactly one entry for a single running execution, matching the aggregate fields", () => {
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+    expect(card.executions).toHaveLength(1);
+    expect(card.executions[0].sessionId).toBe("s1");
+    expect(card.executions[0].role).toBe("coder");
+    expect(card.executions[0].tokensPerSec).toBeCloseTo(card.liveTokRate!, 5);
+    expect(card.defaultExecutionSessionId).toBe("s1");
+  });
+
+  it("sorts by session id (a stable order independent of state) and defaults to the busiest", () => {
+    const data: FlowRecord[] = [
+      // s2 is RESTING.
+      rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start", handle: "darkmux/reviewer" }),
+      rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.rest", ts: new Date(BEAT2).toISOString(), payload: { ms: 15_000 } }),
+      // s1 is GENERATING.
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", handle: "darkmux/coder" }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+    ];
+    const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", true, T_MAX);
+    expect(card.executions.map((e) => e.sessionId)).toEqual(["s1", "s2"]);
+    expect(card.executions.find((e) => e.sessionId === "s2")?.state).toBe("rest");
+    // Busiest = generating, not array/session-id order.
+    expect(card.defaultExecutionSessionId).toBe("s1");
   });
 });

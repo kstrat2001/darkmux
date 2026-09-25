@@ -94,6 +94,16 @@ export const ACT_ICON: Record<string, IconKey> = {
   telemetry: "pulse",
 };
 
+/** (#2890) The same brain glyph, bare, for the scope's PROMPT center: one
+ *  icon vocabulary across the viewer rather than a second brain drawing. */
+export function BrainGlyph({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" strokeWidth={1.7} {...S} className={className} data-scope-icon="brain" aria-hidden="true">
+      {GLYPH.brain}
+    </svg>
+  );
+}
+
 /** Renders the glyph for one activity label, or nothing when unmapped.
  * `data-act-icon` carries the glyph key so tests can assert on it — see the
  * module doc for why asserting on text cannot work here. */

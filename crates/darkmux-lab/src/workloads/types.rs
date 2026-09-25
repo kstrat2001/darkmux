@@ -24,7 +24,7 @@ pub(crate) struct VerifySpec {
     /// (#2833) Minimum LINE coverage percentage the run's verify command
     /// must report, evaluated only for fixtures that also declare
     /// `baseline.test_count` (see `crate::lab::verify_gate`). `None` (the
-    /// default — pepper-grinder's `refresh-rotation` workload does NOT set
+    /// default — the built-in `pepper-grinder` workload does NOT set
     /// this) means no coverage rule is applied at all, matching today's
     /// behavior exactly.
     ///

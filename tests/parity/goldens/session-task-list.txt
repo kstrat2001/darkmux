@@ -31,4 +31,5 @@ cycle
 tool failure
 reasoning loop
 edit drift
+repetition (not recorded)
 

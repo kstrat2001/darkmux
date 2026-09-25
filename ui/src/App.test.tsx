@@ -2,9 +2,34 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
-import { clkhm } from "./lib/format";
+import { clk, clkhm } from "./lib/format";
 import { fmtElapsed } from "./lib/format";
 import { ACT_ORDER } from "./lib/eventFilters";
+
+// (#2886 pass 5, MUST — fresh-reviewer finding F5, "App rendering FleetLens
+// without connected/lastContactMs") A mutation dropping those two props off
+// App.tsx's `<FleetLens connected={...} lastContactMs={...} />` call site
+// stayed green — `lib/route.test.ts` proves `tokRateConnectionEvidence`
+// COMPUTES the right values, never that the JSX call site forwards them.
+// `fleetLensProbe.enabled` gates a probe wrapper so every OTHER test in this
+// file keeps rendering the REAL `FleetLens` (unmocked) — only the one test
+// below that flips it on inspects the received props. `vi.hoisted` (not a
+// bare module-level `let`) because `vi.mock` factories are hoisted above
+// every import, including this file's own — a plain `let` referenced from
+// inside the factory would be read before its own initializer ran.
+const fleetLensProbe = vi.hoisted(() => ({ enabled: false }));
+vi.mock("./lenses/fleet/FleetLens", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lenses/fleet/FleetLens")>();
+  return {
+    FleetLens: (props: Record<string, unknown>) =>
+      fleetLensProbe.enabled ? (
+        <div data-testid="fleet-lens-probe" data-props={JSON.stringify(props)} />
+      ) : (
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        <actual.FleetLens {...(props as any)} />
+      ),
+  };
+});
 
 /**
  * (#2416) This file's fixtures use real dispatch-lifecycle actions
@@ -54,6 +79,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   window.location.hash = "";
+  fleetLensProbe.enabled = false;
 });
 
 /**
@@ -118,6 +144,34 @@ describe("App", () => {
     // timeline falls to its empty-fleet branch.
     await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
     expect(screen.getByText(/waiting for the first flow record/i)).toBeInTheDocument();
+  });
+
+  // (#2886 pass 5, MUST — fresh-reviewer finding F5) Pins that the fleet
+  // route's `<FleetLens>` call site actually FORWARDS `connected`/
+  // `lastContactMs`, not App's own default route rendering it bare (which
+  // would silently fall back to `FleetLens`'s own defaults, `true`/`null`).
+  // jsdom has no `EventSource` and this test injects no test factory, so
+  // `useLiveTail` never opens a stream and stays at its pessimistic starting
+  // status ("reconnecting") for the test's whole life — `connected` on the
+  // (live) fleet route is exactly `liveStatus === "live"`
+  // (`tokRateConnectionEvidence`), so the wired-through value is `false`,
+  // distinguishable from the component's own `true` default. `lastContactMs`
+  // is a real `Date.now()`-seeded ref (`App.tsx`'s `lastContactRef`), a
+  // number either way, so this asserts its TYPE (present, not the `null`
+  // default) rather than a specific value.
+  it("wires connected and lastContactMs through to FleetLens on the default fleet route", async () => {
+    fleetLensProbe.enabled = true;
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector('[data-testid="fleet-lens-probe"]')).toBeInTheDocument());
+    const props = JSON.parse(document.querySelector('[data-testid="fleet-lens-probe"]')!.getAttribute("data-props")!);
+    expect(props.connected).toBe(false);
+    expect(typeof props.lastContactMs).toBe("number");
   });
 
   it("renders the real console lens (not a placeholder) for #lens=console", async () => {
@@ -761,7 +815,8 @@ describe("App", () => {
     // clock is bare and the mission's title lives only in the Machine info
     // playback row. The demo speaks for itself as it runs.
     const clock = document.querySelector('[data-testid="scrubber-clock"]');
-    expect(clock?.textContent).toMatch(/^\d\d:\d\d$/);
+    // (#2890) With seconds, so it visibly moves while playing.
+    expect(clock?.textContent).toMatch(/^\d\d:\d\d:\d\d$/);
   });
 
   /**
@@ -1458,7 +1513,7 @@ describe("App", () => {
       // The clock readout carries the run's own elapsed time beside the
       // time of day — 08:11:48 to 10:06:37 — the SAME quantity the run
       // detail's own WALL CLOCK tile shows (`fmtElapsed`, one producer).
-      expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(runEndMs - runStartMs)} · ${clkhm(runEndMs)}`);
+      expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(runEndMs - runStartMs)} · ${clk(runEndMs)}`);
     } finally {
       meta.remove();
     }
@@ -1471,7 +1526,7 @@ describe("App", () => {
       renderApp();
       await screen.findByRole("group", { name: "playback transport" });
       const dayEndMs = Date.parse("2026-08-07T20:43:00.000Z");
-      expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(dayEndMs));
+      expect(screen.getByTestId("scrubber-clock").textContent).toBe(clk(dayEndMs));
     } finally {
       meta.remove();
     }
@@ -1552,7 +1607,7 @@ describe("App", () => {
     // the run detail's own WALL CLOCK tile exactly, rather than merely
     // closely.
     expect(fmtElapsed(6_888_067)).not.toBe(fmtElapsed(runEndMs - runStartMs));
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_067)} · ${clkhm(runEndMs)}`);
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_067)} · ${clk(runEndMs)}`);
   });
 
   // (#2347 review, MUST FIX (b)) Leaving an AT-REST dispatch view for the
@@ -1584,7 +1639,7 @@ describe("App", () => {
       // (much earlier) end — both the clock text and the slider's own
       // position (100, the same "pinned at end" the day view starts at)
       // prove it, not just one or the other.
-      await waitFor(() => expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(dayEndMs)));
+      await waitFor(() => expect(screen.getByTestId("scrubber-clock").textContent).toBe(clk(dayEndMs)));
       expect(screen.getByRole("slider")).toHaveValue("100");
     } finally {
       meta.remove();

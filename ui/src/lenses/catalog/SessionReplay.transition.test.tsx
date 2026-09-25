@@ -65,7 +65,18 @@ function renderReplay() {
 
 const pillText = () => document.querySelector(".session-run__header .pill")?.textContent ?? "";
 const wallText = () =>
-  [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
+  // (#2890) A dispatch's run time is the MODEL section's ACTIVE TIME cell.
+  [...document.querySelectorAll('.metrics[data-scope="model"] .mv')].map((e) => e.textContent).join("");
+
+
+// (#2890) A live run's "so far" sits on the ACTIVE TIME cell's sub line, not
+// in its value (the value is the bare time so it fits the grid cell).
+const activeSub = () => {
+  const cell = [...document.querySelectorAll('.metrics[data-scope="model"] .met')].find(
+    (c) => c.querySelector(".ml")?.textContent === "ACTIVE TIME",
+  );
+  return cell?.querySelector(".msub")?.textContent ?? "";
+};
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -94,7 +105,7 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     const { again } = renderReplay();
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     expect(pillText()).toContain("running");
-    expect(wallText()).toContain("so far");
+    expect(activeSub()).toContain("so far");
 
     // The dispatch ends and the reconciler drops it from presence.
     h.liveIds = new Set<string>();
@@ -107,7 +118,7 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // 615920ms, from the record — NOT 10:00, which is what subtracting the two
     // record timestamps gives.
     expect(wallText()).toContain("10:15");
-    expect(wallText()).not.toContain("so far");
+    expect(activeSub()).not.toContain("so far");
   });
 
   it("a mission run: live while an execution under its mission beats, then snaps to COMPLETE when it drops", async () => {
@@ -188,11 +199,11 @@ describe("SessionReplay — the run finishing while the page is open (#2011)", (
     // drop is applied (see `SessionReplay.tsx`'s comment on `endedByPresence`)
     // — read the settled value, then assert nothing moves it after that.
     const frozen = wallText();
-    // (#2413 M4) The trailing "—" is the explicit HOST tile's value — this
-    // fixture has model work but no host telemetry, so the pane now says so
-    // instead of silently omitting the tile (see sessionRun.ts's own test
-    // for the same behavior in isolation).
-    expect(frozen).toBe("9:57 so far0—");
+    // (#2890) Read from the MODEL grid now: TURNS "—", TOOL CALLS "0",
+    // ACTIVE TIME, then TOKENS IN/OUT and CONTEXT "—" (no telemetry in this
+    // fixture). The frozen run time is the figure that matters here.
+    expect(frozen).toBe("—09:57———");
+    expect(activeSub()).toContain("so far");
     act(() => {
       vi.advanceTimersByTime(30_000);
     });

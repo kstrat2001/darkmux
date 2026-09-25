@@ -1,5 +1,18 @@
-import { useEffect, useMemo, useRef } from "react";
-import { lighten, PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from "../lib/scopeTone";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from "../lib/scopeTone";
+import {
+  advanceMorph,
+  createMorph,
+  settleMorph,
+  stateTone,
+  toolIconKind,
+  type ScopeMorph,
+  type ScopeParams,
+  type ScopeState,
+} from "../lib/scopeMorph";
+import { useCountUp } from "../hooks/useCountUp";
+import { ToolIcon } from "./ToolIcon";
+import { BrainGlyph } from "./ActivityIcon";
 
 /**
  * (#2877) Live token-rate scope — a CRT oscilloscope, ported from the
@@ -30,50 +43,94 @@ import { lighten, PHOSPHOR_FALLBACK, toneRgb, type Rgb, type ScopeTone } from ".
  * - Sized from its own box via `ResizeObserver`, not `window resize` alone
  *   — a hidden card becoming visible (grid reflow) resizes correctly
  *   without a window-level event to key off.
+ *
+ * (#2890) **One trace, morphing.** The per-state drawing is gone: every
+ * state is a set of targets on ONE trace (`lib/scopeMorph.ts`), and a state
+ * change glides the parameters toward them, so GEN, PROMPT, TOOLS, REST,
+ * STALL, no signal and finished morph into each other and never pop. The
+ * drawing below is the operator-approved prototype's
+ * (`scope-states-prototype.html`) ported as-is. The center shows the rate
+ * (easing between values) while generating, the average when finished, a
+ * glowing icon for the tool while in TOOLS, and nothing otherwise.
  */
 
 export type TokenScopeSize = "mini" | "card" | "tile";
 
 export interface TokenScopeProps {
   /** Current tok/s reading. Callers pass whatever `tokenRate.ts`'s
-   *  `currentTokenRate`/`aggregateTokenRate` last produced. This prop is
-   *  READ, never treated as authoritative "is it running" — that's
-   *  `stalled` below, kept separate because a stall's target rate is 0 but
-   *  the DECAY behavior (ring flattening) differs from "genuinely producing
-   *  0 tok/s" (which doesn't really happen, but the two are conceptually
-   *  distinct states per the issue). */
+   *  `currentTokenRate`/`aggregateTokenRate` last produced. Drives the GEN
+   *  wave only; it is never read as "is it running" (that is `state`). */
   tokensPerSec: number | null;
-  /** No fresh heartbeat recently — decays the wave toward a flat ring with
-   *  a little noise jitter, per the issue's "a stall decays toward a flat
-   *  ring". */
+  /** (#2890) The scope's state, which picks the trace's targets. When
+   *  omitted it is derived from the older props below (`stalled`,
+   *  `resting`, `tone`), so an existing caller keeps working. */
+  state?: ScopeState;
+  /** (#2890) While `state` is `"tools"`: the tool being run (the latest
+   *  completed call's `tool_name`), drawn as an icon in the center. Unknown
+   *  or absent reads as the gear. */
+  toolName?: string | null;
+  /** (#2889) While `state` is `"tools"`: the model is WRITING the call (its
+   *  arguments are being generated and nothing is streaming), not darkmux
+   *  running it. Same color and icon; the comet stretches and its head
+   *  scribbles, eased like every other morph parameter so the switch to
+   *  running never pops. `centerUnit`, when given, is captioned under the
+   *  icon ("tool gen"). */
+  toolWriting?: boolean;
+  /** (#2890) GEN while the model is reasoning rather than writing visible
+   *  text: the trace takes a slowly rotating violet-to-pink shimmer blended
+   *  into its GEN color, and the center's number shimmers the same way. The
+   *  words and number are unchanged. Ignored outside GEN. */
+  thinking?: boolean;
+  /** No fresh heartbeat recently. Used only when `state` is omitted. */
   stalled?: boolean;
-  /** A rest/pause (e.g. thermal) — dims the tube per the issue's "a rest or
-   *  pause dims the tube", independent of `stalled`. */
+  /** A rest/pause (e.g. thermal). Used only when `state` is omitted. */
   resting?: boolean;
-  /** `"mini"` = fleet machine card, `"tile"` = the run page's TOK/S MODEL
-   *  tile. Each maps to a fixed `--d`/`--rim` pair in `styles.css` — see
-   *  that file's own comment on why this is never `aspect-ratio` +
-   *  percentage padding. */
+  /** `"mini"`, `"card"` = the fleet machine card, `"tile"` = the run page's
+   *  MODEL hero. Each maps to a sizing rule in `styles.css`; see that
+   *  file's own comment on why this is never `aspect-ratio` + percentage
+   *  padding. */
   size: TokenScopeSize;
-  /** Placement 2's "only the number centered inside the tube" — the run
-   *  page passes the tok/s readout here; the fleet card leaves it unset. */
+  /** The number centered inside the tube: the live rate while generating,
+   *  the average once finished. Ignored in TOOLS (the icon is the whole
+   *  message). A plain integer eases between values. */
   centerLabel?: string | null;
+  /** (#2890) A quiet unit under the number (`tok/s`, `avg tok/s`). The run
+   *  page passes it; the fleet card does not. */
+  centerUnit?: string | null;
+  /** (#2885) `true` when `centerLabel` is a rate carried forward from an
+   *  earlier turn rather than freshly measured. Stamped as `data-carried`
+   *  on `.token-scope-n` but NOT styled: the dim made every turn's opening
+   *  seconds flicker, and the operator preferred the steady glow (#2890).
+   *  No effect when `centerLabel` is unset. */
+  centerCarried?: boolean;
   className?: string;
-  /** The live state, which colors the trace to match its lit lamp
-   *  (`lib/scopeTone.ts`). `"none"`: no live execution, phosphor green. */
+  /** The live state as a lamp tone (`lib/scopeTone.ts`). Used to pick the
+   *  state when `state` is omitted; the trace's color always follows the
+   *  state (`stateTone`). */
   tone?: ScopeTone;
 }
 
-interface ScopeAnim {
-  shown: number;
-  target: number;
+/** The older props to a state, for a caller that does not pass `state`. */
+function legacyState(stalled: boolean, resting: boolean, tone: ScopeTone): ScopeState {
+  if (stalled) return "stalled";
+  if (resting) return "rest";
+  if (tone === "none") return "idle";
+  return tone;
+}
+
+/** Free-running clocks that are not morph parameters: the wave's phase
+ *  (speed follows the rate), the breath, the comet sweep and the inward
+ *  rings (fixed tempos). */
+interface ScopeClocks {
   phase: number;
-  bright: number;
-  /** (#2877 pass 2) A slow accumulator that advances regardless of rate —
-   *  the "minimum ripple that breathes" a quiet-but-alive tube needs so it
-   *  never reads as a dead flat ring, distinct from `stalled`'s jittery
-   *  decay (see `drawFrame`'s own doc). */
-  breath: number;
+  breathT: number;
+  sweep: number;
+  inwardT: number;
+  /** (#2890) The wave's WHOLE lobe count now, the one it is leaving, and how
+   *  far the crossfade between them has run (0..1, 1 = settled). */
+  lobeCur: number;
+  lobePrev: number;
+  lobeMix: number;
 }
 
 function prefersReducedMotion(): boolean {
@@ -85,122 +142,305 @@ function prefersReducedMotion(): boolean {
   }
 }
 
-/** One frame of the phosphor trace, at the given radius fraction of
- * `min(w, h)`. Ported from the concept's `drawScope` — two passes (a soft
- * wide glow pass + a bright thin core pass), additive blending
- * ("lighter"), plus a phosphor sweep dot on top.
- *
- * (#2877 pass 2, operator phone screenshot at 88 tok/s) The original lobe
- * count (`3 + round(min(tps,200)/12)`, ~10 lobes at 88 tok/s) PLUS a
- * same-strength second harmonic (`lobes*2+1` peaks at 0.35 amplitude) PLUS
- * the afterglow trail together read as "a fuzzy glowing donut, not a
- * waveform" — too much density smeared together for the eye to resolve
- * individual peaks. Three changes, all in the direction of "speed and
- * brightness carry the busier signal, not density":
- * 1. Lobes are CAPPED (8) and grow more slowly (`tps / 22`, not `/12`) —
- *    individually countable at speed, at both the card and the grown mobile
- *    tile size.
- * 2. The second harmonic drops from an equal-weight second wave (0.35) to a
- *    faint texture (0.12) — it no longer doubles the perceived peak count.
- * 3. The afterglow trail itself fades FASTER as the rate climbs
- *    (`trailAlpha` rises with `active`), so a faster-moving trace does not
- *    smear into a longer, denser streak than a slow one already read fine
- *    at.
- * Busy still reads busier: phase velocity (rotation speed) and the sweep
- * dot's speed and brightness both still scale with the rate directly. */
-function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, anim: ScopeAnim, stalled: boolean, resting: boolean, rgb: Rgb) {
-  const [cr, cg, cb] = rgb;
-  const [hr, hg, hb] = lighten(rgb, 0.55);
-  const cx = w / 2;
-  const cy = h / 2;
-  const R = Math.min(w, h) * 0.34;
-  ctx.globalCompositeOperation = "source-over";
-
-  const tps = anim.shown;
-  const active = stalled ? 0 : Math.min(1, tps / 25);
-  // Low-alpha fill (not a hard clear) is the afterglow trail: the previous
-  // frame's trace fades rather than vanishing outright. Faster at higher
-  // rates — see this function's own doc, point 3.
-  const trailAlpha = 0.22 + 0.14 * active;
-  ctx.fillStyle = `rgba(5,8,6,${trailAlpha})`;
-  ctx.fillRect(0, 0, w, h);
-
-  // Rest and stall both slow the rotation — a rest is a deliberate pause,
-  // not merely "zero rate", so it reads calmer than an ordinary quiet tube.
-  const rate = resting ? 0.4 : 1;
-  anim.phase += (0.6 + tps * 0.09) * rate;
-  anim.breath += (resting ? 0.012 : 0.028) * rate;
-  const lobes = Math.min(8, 3 + Math.floor(tps / 22));
-  // The minimum-ripple floor breathes slowly on its own clock (`anim.breath`,
-  // independent of `tps`) so a quiet-but-not-stalled tube stays visibly
-  // alive rather than a dead flat ring — calmer than a busy one (the floor
-  // does not grow with `active`), but never perfectly still.
-  const breathe = 0.5 + 0.5 * Math.sin(anim.breath);
-  // (#2877 pass 2, second look) `anim.bright` alone (0.22) measured only a
-  // ~13% average-brightness drop against tools/prompt on the real
-  // screenshots — additive "lighter" blending plus the glow's own bloom
-  // keeps a thin bright line looking nearly as present as a thicker dim
-  // one. Resting now also shrinks the ring itself (smaller amplitude, a
-  // measured ~30% fewer lit pixels), so the dim reads as "a smaller, calmer
-  // trace" and not just "the same trace, slightly faded".
-  const restDamp = resting ? 0.55 : 1;
-  const amp = R * (0.03 + 0.012 * breathe + 0.16 * active) * restDamp;
-  const noise = stalled ? R * 0.004 : 0;
-
-  ctx.globalCompositeOperation = "lighter";
-  const passes: Array<{ w: number; a: number }> = [
-    { w: 3, a: 0.22 },
-    { w: 1.2, a: 0.88 },
-  ];
-  for (const p of passes) {
-    ctx.beginPath();
-    for (let i = 0; i <= 240; i++) {
-      const t = (i / 240) * Math.PI * 2;
-      const wave = Math.sin(lobes * t - anim.phase) + 0.12 * Math.sin((lobes * 2 + 1) * t + anim.phase * 1.7);
-      const r = R + amp * wave + noise * (Math.random() - 0.5);
-      const x = cx + Math.cos(t) * r;
-      const y = cy + Math.sin(t) * r;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${p.a * anim.bright})`;
-    ctx.lineWidth = p.w;
-    ctx.shadowColor = `rgba(${cr},${cg},${cb},0.8)`;
-    ctx.shadowBlur = p.w * 3 * anim.bright;
-    ctx.stroke();
-  }
-
-  // Phosphor sweep — a bright leading dot travelling the ring, radar-trace
-  // style. Its angular speed and brightness both follow the rate directly,
-  // the clearest "busier" signal at a glance since it doesn't depend on
-  // resolving individual wave peaks the way lobe density did.
-  if (!stalled) {
-    const sweepAngle = -anim.phase * 0.5;
-    const sweepR = R + amp * Math.sin(lobes * sweepAngle - anim.phase);
-    const sx = cx + Math.cos(sweepAngle) * sweepR;
-    const sy = cy + Math.sin(sweepAngle) * sweepR;
-    ctx.beginPath();
-    ctx.arc(sx, sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${hr},${hg},${hb},${(0.5 + 0.45 * active) * anim.bright})`;
-    ctx.shadowColor = `rgba(${cr},${cg},${cb},0.9)`;
-    ctx.shadowBlur = 10 * anim.bright;
-    ctx.fill();
-  }
-  ctx.shadowBlur = 0;
+/** Mix a channel toward white by `k`, the hot core of a dot. */
+function lift(c: number, k: number): number {
+  return Math.round(c + (255 - c) * k);
 }
 
-export function TokenScope({ tokensPerSec, stalled = false, resting = false, size, centerLabel, className, tone = "generating" }: TokenScopeProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const animRef = useRef<ScopeAnim>({ shown: 0, target: 0, phase: Math.random() * 6, bright: 1, breath: Math.random() * 6 });
-  const targetRef = useRef({ target: 0, stalled: false, resting: false, rgb: PHOSPHOR_FALLBACK as Rgb });
+function rgba(r: number, g: number, b: number, a: number): string {
+  return `rgba(${Math.round(r)},${Math.round(g)},${Math.round(b)},${a > 0 ? a : 0})`;
+}
 
-  // Live values the rAF loop reads without needing to restart the effect
-  // below on every rate update (a heartbeat every ~2s would otherwise tear
-  // down and rebuild the canvas/observer/listener on that same cadence).
-  // The trace takes the lit lamp's color, read from the same :root token.
-  const rgb = useMemo(() => toneRgb(tone), [tone]);
-  targetRef.current = { target: stalled ? 0 : Math.max(0, tokensPerSec ?? 0), stalled, resting, rgb };
+/** Two passes (a soft wide glow and a bright thin core), hoisted so the
+ *  per-frame loop does not rebuild them. */
+const TRACE_PASSES: ReadonlyArray<readonly [number, number]> = [
+  [3, 0.22],
+  [1.2, 0.88],
+];
+const INWARD_PASSES: ReadonlyArray<readonly [number, number]> = [
+  [2.4, 0.25],
+  [1, 0.8],
+];
+
+/** (#2890) The thinking palette: violet and pink, blended into the GEN
+ *  color by the eased `iris` parameter. */
+const THINK_VIOLET: Rgb = [192, 132, 252];
+const THINK_PINK: Rgb = [244, 114, 182];
+
+/** (#2890) The main trace's stroke while the model is thinking: a conic
+ *  gradient around the ring that alternates the GEN color with violet and
+ *  pink, rotating slowly with the wave's phase, mixed in by `iris` so it
+ *  eases in and out like every other state change. Falls back to the plain
+ *  GEN color where conic gradients are unavailable. */
+function thinkingStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, phase: number, p: ScopeParams, alpha: number): string | CanvasGradient {
+  const base: Rgb = [p.r, p.g, p.b];
+  if (typeof ctx.createConicGradient !== "function") return rgba(p.r, p.g, p.b, alpha);
+  const g = ctx.createConicGradient(phase * 0.12, cx, cy);
+  const mix = (to: Rgb) => base.map((v, i) => Math.round(v + (to[i] - v) * p.iris)) as unknown as Rgb;
+  // Violet and pink carry most of the ring; the GEN color keeps two narrow
+  // bands so it still reads as generating. Additive blending washes a
+  // partial mix out to near white, so the stops are the full colors.
+  const stops: Rgb[] = [mix(THINK_VIOLET), base, mix(THINK_PINK), mix(THINK_VIOLET), base, mix(THINK_PINK), mix(THINK_VIOLET)];
+  stops.forEach((col, i) => g.addColorStop(i / (stops.length - 1), rgba(col[0], col[1], col[2], alpha)));
+  return g;
+}
+
+/** (#2890) The trace's radial offset at angle `t`, for a crossfade from
+ *  `from` to `to` WHOLE lobes (`mix` 0..1).
+ *
+ *  Whole counts matter twice over. A fractional count (the rate maps to
+ *  one smoothly) does not meet itself after a full turn, so closing the
+ *  path drew a straight seam that spun with the wave (operator: "the
+ *  straight cut"). And blending two neighboring counts to fake the fraction
+ *  made them line up on one side and cancel on the other, so the left side
+ *  waved differently from the right (operator). Whole counts close exactly
+ *  and are rotationally symmetric; the count only changes by a short
+ *  crossfade when the rate moves enough (see `drawFrame`). `harmonic` adds
+ *  the small second term the main trace carries. */
+export function waveAt(t: number, from: number, to: number, mix: number, phase: number, harmonic = true): number {
+  const one = (k: number) => Math.sin(k * t - phase) + (harmonic ? 0.12 * Math.sin((k * 2 + 1) * t + phase * 1.7) : 0);
+  if (mix >= 1 || from === to) return one(to);
+  if (mix <= 0) return one(from);
+  return (1 - mix) * one(from) + mix * one(to);
+}
+
+/** One frame of the scope, from the current morph parameters `p`. Ported
+ *  from the prototype's `draw()`: an afterglow fill (a low-alpha fill rather
+ *  than a hard clear, so the previous frame bleeds through), then, each
+ *  faded in by its own parameter, the main trace (the GEN wave rides on
+ *  it), GEN's sweep dot, the TOOLS comet, the PROMPT inward rings, REST's
+ *  drifting dot, the STALL ember and the no-signal static. `sx`/`sy` scale
+ *  every layer, which is what squashes the tube to a line and a dot when it
+ *  stalls. `clock` is the scope's own running time (seconds), for the
+ *  ember's pulse. Additive blending ("lighter") for the glow. */
+function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: ScopeParams, c: ScopeClocks, clock: number, dt: number) {
+  const cx = w / 2;
+  const cy = h / 2;
+  // (#2890, operator: "nowhere near the edge") 40% of the screen, not 34%:
+  // the ring sits nearer the glass and farther from the center text; the
+  // GEN wave's peaks (R * 1.19) still clear the edge.
+  const R = Math.min(w, h) * 0.4;
+  const { r: cr, g: cg, b: cb } = p;
+  const tps = p.wave;
+  const active = Math.min(1, tps / 25);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = `rgba(5,8,6,${0.24 + 0.14 * active + 0.25 * p.fuzz})`;
+  ctx.fillRect(0, 0, w, h);
+
+  // Clocks: the wave's phase speed follows the rate; the rest are fixed tempos.
+  // (#2890) `tempo` slows a finished run's echo; every live state runs at 1.
+  c.phase += (0.6 + tps * 0.09) * dt * 60 * p.tempo;
+  c.breathT += dt * 1.1;
+  c.sweep += dt * Math.PI * 1.6;
+  c.inwardT = (c.inwardT + dt * 0.45) % 1;
+
+  ctx.globalCompositeOperation = "lighter";
+  // The rate sets a lobe count; the wave draws a WHOLE count and glides to a
+  // new one over ~0.6 s when the rate has moved more than 0.6 of a lobe away
+  // (the hysteresis keeps it from flickering at a boundary). A static frame
+  // (dt 0, reduced motion) settles at once.
+  const lobeTarget = Math.min(8, 3 + tps / 22);
+  if (Math.abs(lobeTarget - c.lobeCur) > 0.6) {
+    c.lobePrev = c.lobeCur;
+    c.lobeCur = Math.round(lobeTarget);
+    c.lobeMix = 0;
+  }
+  c.lobeMix = dt > 0 ? Math.min(1, c.lobeMix + dt / 0.6) : 1;
+  const lobeEase = c.lobeMix * c.lobeMix * (3 - 2 * c.lobeMix);
+  const breathe = 0.5 + 0.5 * Math.sin(c.breathT);
+  const rBase = R * p.rscale * (1 + 0.06 * p.breath * (breathe - 0.5));
+  const amp = R * (0.03 + 0.16 * active) * (1 - 0.8 * p.breath);
+
+  // The main trace.
+  if (p.ring > 0.01) {
+    const bright = Math.min(1, p.ring * (1 - 0.3 * p.breath * (1 - breathe)));
+    for (const [lw, a] of TRACE_PASSES) {
+      ctx.beginPath();
+      for (let i = 0; i <= 240; i++) {
+        const t = (i / 240) * Math.PI * 2;
+        const wave = waveAt(t, c.lobePrev, c.lobeCur, lobeEase, c.phase);
+        const r = rBase + amp * wave;
+        const x = cx + Math.cos(t) * r * p.sx;
+        const y = cy + Math.sin(t) * r * p.sy;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = p.iris > 0.01 ? thinkingStroke(ctx, cx, cy, c.phase, p, a * bright) : rgba(cr, cg, cb, a * bright);
+      ctx.lineWidth = lw;
+      // (#2890) Thinking shifts the glow toward violet with the trace, or the
+      // green halo around the thin line would dominate the tint.
+      ctx.shadowColor = p.iris > 0.01
+        ? rgba(cr + (THINK_VIOLET[0] - cr) * p.iris, cg + (THINK_VIOLET[1] - cg) * p.iris, cb + (THINK_VIOLET[2] - cb) * p.iris, 0.8)
+        : rgba(cr, cg, cb, 0.8);
+      ctx.shadowBlur = lw * 3 * bright;
+      ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+  }
+  // GEN's sweep dot fades in with the rate, and out with tempo: a racing dot
+  // reads as live, so a finished run's slow echo has none (#2890).
+  const dotLive = Math.max(0, Math.min(1, (p.tempo - 0.3) / 0.7));
+  if (active > 0.05 && p.sx > 0.5 && dotLive > 0.02) {
+    const ang = -c.phase * 0.5;
+    const sr = rBase + amp * waveAt(ang, c.lobePrev, c.lobeCur, lobeEase, c.phase, false);
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(ang) * sr * p.sx, cy + Math.sin(ang) * sr * p.sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
+    ctx.fillStyle = rgba(lift(cr, 0.55), lift(cg, 0.55), lift(cb, 0.55), (0.5 + 0.45 * active) * active * dotLive);
+    ctx.shadowColor = rgba(cr, cg, cb, 0.9);
+    ctx.shadowBlur = 10;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  // TOOLS: a comet sweeping at a constant tempo. The prototype blurred each
+  // of the 36 tail segments; measured in a headless render that cost ~16 ms
+  // per frame (5x any other state) because canvas shadow blur is paid per
+  // stroke. The glow is now ONE blurred stroke under the leading half of the
+  // tail, and the segments that taper it are drawn unblurred on top, which
+  // reads the same at a fraction of the cost (#2890).
+  if (p.comet > 0.01) {
+    const head = c.sweep;
+    // (#2889) Writing: the tail stretches (the call being laid down) and the
+    // head scribbles in and out along the radius, like a pen. Both scale by
+    // the eased `scribe`, so the switch to running glides.
+    const len = Math.PI * 0.55 * (1 + 0.5 * p.scribe);
+    const n = 36;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * 0.5, head);
+    ctx.strokeStyle = rgba(cr, cg, cb, 0.45 * p.comet);
+    ctx.lineWidth = 3;
+    ctx.shadowColor = rgba(cr, cg, cb, 0.8);
+    ctx.shadowBlur = 8 * p.comet;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (let i = 0; i < n; i++) {
+      const f = 1 - i / n;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rBase * p.sx, rBase * p.sy, 0, head - len * ((i + 1) / n), head - len * (i / n));
+      ctx.strokeStyle = rgba(cr, cg, cb, 0.9 * f * p.comet);
+      ctx.lineWidth = 1.4 + 2.2 * f;
+      ctx.stroke();
+    }
+    const hr = rBase * (1 + 0.05 * p.scribe * Math.sin(c.sweep * 7));
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(head) * hr * p.sx, cy + Math.sin(head) * hr * p.sy, Math.max(1.6, R * 0.045), 0, Math.PI * 2);
+    ctx.fillStyle = rgba(lift(cr, 0.6), lift(cg, 0.6), lift(cb, 0.6), 0.95 * p.comet);
+    ctx.shadowBlur = 12 * p.comet;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  // PROMPT: rings peel off the base ring and sink toward the brain, the
+  // prompt being absorbed.
+  if (p.inward > 0.01) {
+    for (let k = 0; k < 3; k++) {
+      const q = (c.inwardT + k / 3) % 1;
+      // (#2890 operator review) Each ring is born ON the base ring, wave and
+      // all, then shrinks toward the brain, its wave flattening as it goes,
+      // and fades out near 72% of the base radius so the center stays clear.
+      // (#2890, operator: "prompt would also benefit from a larger radius")
+      // They sink to about 72% of the base ring, not half, so they stay
+      // near the glass, well clear of the brain.
+      const shrink = 1 - 0.28 * q;
+      const waveAmp = amp * (1 - q);
+      const a = Math.min(1, q / 0.12) * Math.pow(1 - q, 1.1) * 0.9 * p.inward;
+      for (const [lw, al] of INWARD_PASSES) {
+        ctx.beginPath();
+        for (let i = 0; i <= 120; i++) {
+          const t = (i / 120) * Math.PI * 2;
+          const wave = waveAt(t, c.lobePrev, c.lobeCur, lobeEase, c.phase);
+          const r = (rBase + waveAmp * wave) * shrink;
+          const x = cx + Math.cos(t) * r * p.sx;
+          const y = cy + Math.sin(t) * r * p.sy;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.strokeStyle = rgba(cr, cg, cb, al * a);
+        ctx.lineWidth = lw;
+        ctx.shadowColor = rgba(cr, cg, cb, 0.8);
+        ctx.shadowBlur = lw * 3 * a;
+        ctx.stroke();
+      }
+    }
+    ctx.shadowBlur = 0;
+  }
+  // REST: a slow drifting dot on the breathing circle (idle breathes without
+  // it, #2890).
+  if (p.breath > 0.05 && p.drift > 0.05) {
+    const a = c.breathT * 0.32;
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(a) * rBase * p.sx, cy + Math.sin(a) * rBase * p.sy, Math.max(1.2, R * 0.03), 0, Math.PI * 2);
+    ctx.fillStyle = rgba(lift(cr, 0.5), lift(cg, 0.5), lift(cb, 0.5), 0.55 * p.breath * Math.min(1, p.drift));
+    ctx.fill();
+  }
+  // STALL: the ember left after the collapse, pulsing slowly.
+  if (p.ember > 0.01) {
+    const pulse = 0.5 + 0.5 * Math.sin(clock * 2);
+    const a = (0.35 + 0.25 * pulse) * p.ember;
+    const r = R * (0.055 + 0.01 * pulse);
+    ctx.beginPath();
+    ctx.arc(cx, cy, Math.max(1.2, r), 0, Math.PI * 2);
+    ctx.fillStyle = rgba(lift(cr, 0.6), lift(cg, 0.6), lift(cb, 0.6), a);
+    ctx.shadowColor = rgba(cr, cg, cb, a);
+    ctx.shadowBlur = 16 * a + 4;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  // NO SIGNAL: static fading in.
+  if (p.fuzz > 0.02) {
+    const rr = Math.min(w, h) / 2;
+    const n = Math.round(((w * h) / 18) * p.fuzz);
+    ctx.globalCompositeOperation = "source-over";
+    for (let i = 0; i < n; i++) {
+      const x = Math.random() * w;
+      const y = Math.random() * h;
+      if ((x - cx) ** 2 + (y - cy) ** 2 > rr * rr) continue;
+      const v = 90 + Math.random() * 120;
+      ctx.fillStyle = rgba(v, v, v + 8, (0.18 + Math.random() * 0.3) * p.fuzz);
+      ctx.fillRect(x, y, 1.3, 1.3);
+    }
+  }
+}
+
+/** A plain whole number eases between values; anything else ("—") is shown
+ *  as-is. */
+function parseWhole(label: string | null | undefined): number | null {
+  return label != null && /^\d+$/.test(label) ? Number(label) : null;
+}
+
+export function TokenScope({
+  tokensPerSec,
+  state: stateProp,
+  toolName,
+  toolWriting = false,
+  thinking: thinkingProp = false,
+  stalled = false,
+  resting = false,
+  size,
+  centerLabel,
+  centerUnit,
+  centerCarried = false,
+  className,
+  tone = "generating",
+}: TokenScopeProps) {
+  const state: ScopeState = stateProp ?? legacyState(stalled, resting, tone);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const morphRef = useRef<ScopeMorph>(createMorph());
+  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobeCur: 3, lobePrev: 3, lobeMix: 1 });
+  // GEN's live rate, or a finished run's average for its echo (#2890).
+  const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
+  // The trace takes the state's color, read once per state change from the
+  // same :root token its lamp uses (never per frame).
+  const rgb = useMemo(() => toneRgb(stateTone(state)), [state]);
+  // Live values the rAF loop reads without restarting the effect below on
+  // every update (a heartbeat every ~2s would otherwise tear down and
+  // rebuild the canvas/observer/listener on that same cadence).
+  const writing = state === "tools" && toolWriting;
+  const thinking = state === "generating" && thinkingProp;
+  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking });
+  targetRef.current = { state, rate, rgb, writing, thinking };
+  // Set by the effect: redraws one settled frame when motion is reduced.
+  const staticRedrawRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -208,42 +448,51 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
     const ctx = canvas.getContext("2d");
     if (!ctx) return undefined;
 
+    const reduce = prefersReducedMotion();
+    function drawStatic() {
+      const w = canvas!.clientWidth;
+      const h = canvas!.clientHeight;
+      const t = targetRef.current;
+      const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing, t.thinking);
+      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0);
+    }
+
     function size2() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const rect = canvas!.getBoundingClientRect();
       canvas!.width = Math.max(1, Math.round(rect.width * dpr));
       canvas!.height = Math.max(1, Math.round(rect.height * dpr));
       ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (reduce) drawStatic();
     }
     size2();
 
     const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(size2) : null;
     ro?.observe(canvas);
 
-    const reduce = prefersReducedMotion();
+    if (reduce) {
+      // Static readout: one settled frame, redrawn only when the state or
+      // rate changes (the effect below), never a loop.
+      staticRedrawRef.current = drawStatic;
+      drawStatic();
+      return () => {
+        staticRedrawRef.current = null;
+        ro?.disconnect();
+      };
+    }
+
     let rafId: number | null = null;
     let last = 0;
-
     function frame(now: number) {
       const w = canvas!.clientWidth;
       const h = canvas!.clientHeight;
-      const dtSec = Math.min(0.05, Math.max(0, (now - last) / 1000)) || 0;
+      const dt = Math.min(0.1, Math.max(0, (now - last) / 1000)) || 0;
       last = now;
-      const anim = animRef.current;
-      const { target, resting: isResting } = targetRef.current;
-      // Easing tuned so the ~2s heartbeat cadence reads as continuous
-      // motion rather than a visible step every beat (ported verbatim from
-      // the concept: k = 1 - e^(-dt*2.2)).
-      const k = 1 - Math.exp(-dtSec * 2.2);
-      anim.shown += (target - anim.shown) * k;
-      // (#2877 pass 2) 0.22, not 0.35 — the operator's note was that the
-      // existing dim wasn't legible; lower still reads the sweep/wave (never
-      // fully dark) while being unmistakably dimmer than an active tube.
-      anim.bright += ((isResting ? 0.22 : 1) - anim.bright) * k;
-      if (w && h) drawFrame(ctx!, w, h, anim, targetRef.current.stalled, isResting, targetRef.current.rgb);
+      const t = targetRef.current;
+      const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt, t.writing, t.thinking);
+      if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt);
       rafId = requestAnimationFrame(frame);
     }
-
     function start() {
       if (rafId !== null) return;
       last = performance.now();
@@ -255,48 +504,127 @@ export function TokenScope({ tokensPerSec, stalled = false, resting = false, siz
         rafId = null;
       }
     }
-
-    if (reduce) {
-      // Static readout: draw once at the target value, never loop.
-      animRef.current.shown = targetRef.current.target;
-      animRef.current.bright = targetRef.current.resting ? 0.22 : 1;
-      const w = canvas.clientWidth;
-      const h = canvas.clientHeight;
-      if (w && h) drawFrame(ctx, w, h, animRef.current, targetRef.current.stalled, targetRef.current.resting, targetRef.current.rgb);
-    } else {
-      const onVisibility = () => {
-        if (document.hidden) stop();
-        else start();
-      };
-      document.addEventListener("visibilitychange", onVisibility);
-      if (!document.hidden) start();
-      return () => {
-        stop();
-        document.removeEventListener("visibilitychange", onVisibility);
-        ro?.disconnect();
-      };
-    }
-
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    if (!document.hidden) start();
     return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
       ro?.disconnect();
     };
-    // Intentionally NOT depending on tokensPerSec/stalled/resting — those
-    // ride `targetRef` so a heartbeat's rate update never tears down and
-    // re-creates the canvas/observer/listener.
+    // Intentionally NOT depending on the state/rate — those ride
+    // `targetRef` so a heartbeat never re-creates the canvas/observer/listener.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    staticRedrawRef.current?.();
+  }, [state, rate, rgb, writing, thinking]);
+
+  const whole = parseWhole(centerLabel);
+  const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))));
+  const shownLabel = whole !== null ? eased : centerLabel;
+  const showIcon = state === "tools";
+  // (#2889, #2890) While the model generates the call: a wrench over the
+  // "tool gen" caption. When darkmux runs the tool the icon becomes the
+  // tool's own, a change of kind, so the whole center crossfades and the
+  // caption leaves with the wrench.
+  const toolCaption = showIcon && writing ? (centerUnit ?? null) : null;
+  // PROMPT shows a pulsing brain for the whole phase, whatever center it is
+  // handed (#2890, operator: a size estimate in the center made one phase
+  // look like two; the size is in the event detail and on the run page).
+  const showBrain = state === "prompt";
+  // A number with its unit under it, or (#2890, idle) a unit on its own.
+  const showNumber = !showIcon && !showBrain && (centerLabel != null || !!centerUnit);
+
+  // One center layer, keyed by WHAT it shows (not its value), so a number
+  // ticking within a state never fades, only a change of kind does.
+  let centerKey = "none";
+  let centerNode: ReactNode = null;
+  if (showIcon) {
+    const kind = writing ? "toolgen" : toolIconKind(toolName);
+    centerKey = `tools:${kind}`;
+    centerNode = (
+      <div className="token-scope-center token-scope-center--icon" data-state={state}>
+        <ToolIcon kind={kind} className="token-scope-ico" />
+        {toolCaption !== null ? (
+          <span className="token-scope-u token-scope-u--tools" data-on="true">
+            {toolCaption}
+          </span>
+        ) : null}
+      </div>
+    );
+  } else if (showBrain) {
+    centerKey = "brain";
+    centerNode = (
+      <div className="token-scope-center token-scope-center--icon token-scope-center--brain" data-state={state}>
+        <BrainGlyph className="token-scope-ico" />
+      </div>
+    );
+  } else if (showNumber) {
+    centerKey = `num:${state}`;
+    centerNode = (
+      <div className="token-scope-center" data-state={state}>
+        {centerLabel != null ? (
+          <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
+            {shownLabel}
+          </span>
+        ) : null}
+        {centerUnit ? <span className="token-scope-u">{centerUnit}</span> : null}
+      </div>
+    );
+  }
+  const ghost = useCrossfade(centerKey, centerNode);
+
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
-    <div className={cls} data-tone={tone}>
+    <div className={cls} data-tone={stateTone(state)} data-state={state} data-writing={writing ? "true" : "false"} data-thinking={thinking ? "true" : "false"}>
       <div className="token-scope-screen">
         <canvas ref={canvasRef} aria-hidden="true" />
-        {centerLabel != null && (
-          <div className="token-scope-center">
-            <span className="token-scope-n">{centerLabel}</span>
+        {ghost && (
+          <div key={`ghost-${ghost.id}`} className="token-scope-fade token-scope-fade--out" aria-hidden="true">
+            {ghost.node}
+          </div>
+        )}
+        {centerNode && (
+          <div key={centerKey} className="token-scope-fade token-scope-fade--in">
+            {centerNode}
           </div>
         )}
       </div>
     </div>
   );
+}
+
+/** Length of the center's crossfade, in ms; matches `token-scope-fade-*` in
+ *  `styles.css`. */
+const CENTER_FADE_MS = 180;
+
+/** (#2890 operator review) The center's content changes kind at a state
+ *  switch (rate, tool icon, brain, countdown) while the trace MORPHS, so a
+ *  hard swap read as a pop. This keeps the previous content on screen,
+ *  fading out, for one short crossfade while the new one fades in. The
+ *  ghost is captured in a layout effect so it lands in the same frame as
+ *  the switch, before paint. */
+function useCrossfade(key: string, node: ReactNode): { id: number; node: ReactNode } | null {
+  const last = useRef<{ key: string; node: ReactNode } | null>(null);
+  const seq = useRef(0);
+  const [ghost, setGhost] = useState<{ id: number; node: ReactNode } | null>(null);
+  useLayoutEffect(() => {
+    const prev = last.current;
+    if (prev && prev.key !== key && prev.node) {
+      seq.current += 1;
+      setGhost({ id: seq.current, node: prev.node });
+    }
+    last.current = { key, node };
+  });
+  useEffect(() => {
+    if (!ghost) return;
+    const t = setTimeout(() => setGhost(null), CENTER_FADE_MS);
+    return () => clearTimeout(t);
+  }, [ghost]);
+  return ghost;
 }

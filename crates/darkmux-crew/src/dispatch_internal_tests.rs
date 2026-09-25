@@ -1154,6 +1154,17 @@
         assert_eq!(payload["image"], serde_json::json!("darkmux-runtime:latest"));
         assert_eq!(payload["prompt_chars"], serde_json::json!("read x.txt".chars().count()));
         assert_eq!(payload["workspace"], serde_json::json!("/tmp/ws"));
+        // (#2887 N2) `flow_schema` names the schema version this run's
+        // records were written against, from the ONE shared constant — so
+        // a viewer reading an older run can tell "genuinely predates a
+        // forwarder fix" from "ran clean" instead of guessing. Asserted
+        // against the constant itself, not a literal, so this test can't
+        // silently go stale on the next bump.
+        assert_eq!(
+            payload["flow_schema"],
+            serde_json::json!(darkmux_flow::FLOW_SCHEMA_VERSION),
+            "dispatch.start must stamp the flow schema version: {payload}"
+        );
 
         unsafe {
             match prev {
@@ -8510,6 +8521,76 @@
         );
     }
 
+    /// (#2887) A CLEAN `dispatch.gate.observation` (`degenerate:false`) must
+    /// NOT map to a flow record — forwarding all of them would flood the
+    /// stream with ~30 clean looks per real finding (#2844's own doc: 34
+    /// observations, 14 degenerate, on the run that surfaced this gap).
+    #[test]
+    fn detector_telemetry_payload_drops_clean_gate_observation() {
+        let event = serde_json::json!({
+            "type": "dispatch.gate.observation",
+            "seq": 2,
+            "observation": 1,
+            "slice_chars": 4000,
+            "tail_ratio": 1.0,
+            "interval_tokens": 1000,
+            "degenerate": false,
+        });
+        assert!(
+            detector_telemetry_payload("dispatch.gate.observation", &event).is_none(),
+            "a clean observation must not become a flow record"
+        );
+    }
+
+    /// (#2887) A DEGENERATE `dispatch.gate.observation` maps to
+    /// `{kind:"repetition", severity:"warn"}` — this is the central defect
+    /// the issue names: this event previously had NO forwarder arm at all,
+    /// so a run the gate flagged 14 times could still read CLEAN.
+    #[test]
+    fn detector_telemetry_payload_maps_degenerate_gate_observation() {
+        let event = serde_json::json!({
+            "type": "dispatch.gate.observation",
+            "seq": 2,
+            "observation": 17,
+            "slice_chars": 68000,
+            "tail_ratio": 0.242_333_2,
+            "interval_tokens": 1000,
+            "degenerate": true,
+        });
+        let payload = detector_telemetry_payload("dispatch.gate.observation", &event)
+            .expect("a degenerate observation must map to a record");
+        assert_eq!(payload["kind"], "repetition");
+        assert_eq!(payload["severity"], "warn");
+        assert_eq!(payload["observation"], 17);
+        assert_eq!(payload["slice_chars"], 68000);
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(!detail.is_empty());
+        assert!(detail.contains("17") && detail.contains("68000"), "got {detail:?}");
+    }
+
+    /// (#2887) `dispatch.gate.abort` always maps — it only ever fires when
+    /// the gate's policy allowed it to act, so there is no clean/noisy case
+    /// to filter the way there is for the observation above.
+    #[test]
+    fn detector_telemetry_payload_maps_gate_abort() {
+        let event = serde_json::json!({
+            "type": "dispatch.gate.abort",
+            "seq": 3,
+            "observation": 6,
+            "slice_chars": 24000,
+            "generated_chars": 8000,
+            "interval_tokens": 1000,
+            "tool_call_in_flight": false,
+        });
+        let payload = detector_telemetry_payload("dispatch.gate.abort", &event)
+            .expect("an abort must always map to a record");
+        assert_eq!(payload["kind"], "repetition");
+        assert_eq!(payload["severity"], "warn");
+        assert_eq!(payload["observation"], 6);
+        assert_eq!(payload["slice_chars"], 24000);
+        assert_eq!(payload["generated_chars"], 8000);
+    }
+
     /// `intra_turn_stall.recovered` with a null `completion_tokens`
     /// (upstream omitted `usage`) renders "unknown", not a misleading 0.
     #[test]
@@ -9183,6 +9264,264 @@
         );
     }
 
+    /// (#2887) `dispatch.checkpoint`'s payload must carry `policy` and
+    /// `would_conclude` through — both already ride the runtime's own
+    /// trajectory event but were dropped by the forwarder, so an
+    /// observe-policy checkpoint that WOULD have concluded read
+    /// indistinguishably from one that never judged the turn repetitive at
+    /// all.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_dispatch_checkpoint_forwards_policy_and_would_conclude() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-checkpoint-policy".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.checkpoint","seq":1,"ts":1,"checkpoint":1,"slice_tokens":900,
+                "tail_ratio":0.17,"verdict":"continue","judged_chars":121276,"policy":"observe",
+                "would_conclude":true,
+                "bound":{"kind":"reasoning_checkpoint_interval","value":1000,"source":"built-in"}}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-checkpoint-policy" && v["action"] == "dispatch.checkpoint")
+            .expect("dispatch.checkpoint record must exist");
+        assert_eq!(record["payload"]["policy"], "observe");
+        assert_eq!(record["payload"]["would_conclude"], true);
+    }
+
+    /// (#2887 F3/F4) The central defect: a trajectory holding one DEGENERATE
+    /// `dispatch.gate.observation` must reach the flow stream as a
+    /// `telemetry.detector` record with `kind:"repetition"` — before this
+    /// fix there was no forwarder arm at all, so the SIGNALS card read
+    /// CLEAN no matter how many times the gate fired.
+    ///
+    /// The fixture carries `policy`/`acted` on the RAW event, the shape the
+    /// runtime now emits (`trajectory::append_gate_observation`) — the host
+    /// no longer resolves policy from its own env (a fresh reviewer found
+    /// that reading stale or ambient host state, not what the runtime
+    /// actually ran under). Asserts the forward is a verbatim passthrough:
+    /// under `observe`/`acted:false`, the record's own `policy` and `acted`
+    /// survive, and the detail sentence reads as observed-not-enforced.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_degenerate_gate_observation_forwards_repetition_stamped_observe() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-observe".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.gate.observation","seq":2,"ts":1,"observation":17,
+                "slice_chars":68000,"tail_ratio":0.2423332,"interval_tokens":1000,
+                "degenerate":true,"policy":"observe","acted":false}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-observe" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the degenerate observation");
+        assert_eq!(record["payload"]["kind"], "repetition");
+        assert_eq!(record["payload"]["turn_seq"], 2);
+        assert_eq!(record["payload"]["policy"], "observe");
+        assert_eq!(record["payload"]["acted"], false);
+        let detail = record["payload"]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("observed") && detail.contains("not enforced"),
+            "got {detail:?}"
+        );
+    }
+
+    /// (#2887 F3/F4) `dispatch.gate.abort` forwards `policy`/`acted`
+    /// verbatim from the runtime-stamped event, same passthrough discipline
+    /// as the observe-mode test above, exercising the enforce/acted:true
+    /// shape.
+    #[test]
+    #[serial]
+    fn handle_event_gate_abort_forwards_repetition_stamped_enforce() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-abort".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.gate.abort","seq":2,"ts":1,"observation":6,
+                "slice_chars":24000,"generated_chars":8000,"interval_tokens":1000,
+                "tool_call_in_flight":false,"policy":"enforce","acted":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-abort" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the abort");
+        assert_eq!(record["payload"]["kind"], "repetition");
+        assert_eq!(record["payload"]["turn_seq"], 2);
+        assert_eq!(record["payload"]["policy"], "enforce");
+        assert_eq!(record["payload"]["acted"], true);
+    }
+
+    /// (#2887 F3) An older runtime image that predates policy stamping on
+    /// gate events sends neither `policy` nor `acted` at all. The host must
+    /// NOT fill in a guessed value from its own environment — the whole
+    /// point of moving the stamp into the runtime was that the host's env
+    /// can disagree with (or postdate) what the runtime actually ran under.
+    /// Missing means null, not "assume enforce" or "assume the current env".
+    #[test]
+    #[serial]
+    fn handle_event_gate_observation_from_a_pre_policy_runtime_forwards_policy_as_null() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-gate-legacy".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // No `policy`/`acted` keys — the pre-#2887-F3 runtime shape.
+        state.handle_event(
+            r#"{"type":"dispatch.gate.observation","seq":2,"ts":1,"observation":17,
+                "slice_chars":68000,"tail_ratio":0.2423332,"interval_tokens":1000,
+                "degenerate":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-gate-legacy" && v["action"] == "telemetry.detector")
+            .expect("a telemetry.detector record must exist for the degenerate observation");
+        assert!(record["payload"]["policy"].is_null(), "got {}", record["payload"]);
+        assert!(record["payload"]["acted"].is_null(), "got {}", record["payload"]);
+        // Neither acted (unknown) nor definitely-observe, so the wording
+        // must fall back to the base sentence, no "flagged (observed)"
+        // clause and no "and ended the call" clause.
+        let detail = record["payload"]["detail"].as_str().unwrap();
+        assert!(!detail.contains("observed"), "got {detail:?}");
+        assert!(!detail.contains("ended the call"), "got {detail:?}");
+    }
+
     /// (#795) A `model.completed` event with a full `usage` object maps
     /// to the per-turn `telemetry.tokens` payload: turn_seq carried
     /// through, total derived as prompt + completion.
@@ -9563,6 +9902,233 @@
         assert_eq!(payload["cumulative_chars"], 10);
         assert!(payload["generated_chars"].is_null());
         assert!(payload["sampled_at_ms"].is_null());
+    }
+
+    /// (#2889) A partial that names the tool call being written forwards the
+    /// phase and the tool name, so the viewer can read "writing" rather than
+    /// a rate. A partial without them forwards neither key (absent, not
+    /// null): the keys MEAN writing, so their absence is the other reading.
+    #[test]
+    fn heartbeat_payload_forwards_the_writing_phase_only_when_present() {
+        let writing = serde_json::json!({
+            "type": "model.partial", "seq": 2, "partial_index": 7,
+            "cumulative_chars": 0, "generated_chars": 812, "ts": 5_000u64,
+            "phase": "writing_tool_call", "tool_name": "edit",
+        });
+        let payload = heartbeat_payload(&writing);
+        assert_eq!(payload["phase"], "writing_tool_call");
+        assert_eq!(payload["tool_name"], "edit");
+        assert_eq!(payload["generated_chars"], 812);
+
+        let plain = serde_json::json!({
+            "type": "model.partial", "seq": 2, "partial_index": 3,
+            "cumulative_chars": 10, "generated_chars": 40, "ts": 4_000u64,
+        });
+        let payload = heartbeat_payload(&plain);
+        assert!(payload.get("phase").is_none(), "no phase key without a named call: {payload}");
+        assert!(payload.get("tool_name").is_none(), "no tool_name key without a named call: {payload}");
+    }
+
+    /// (#2889) Every `dispatch.turn.heartbeat` the tailer wrote into the
+    /// isolated flows dir, in order.
+    fn heartbeats_in(flows: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(flows) {
+            for e in entries.flatten() {
+                for line in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    if v.get("action").and_then(|a| a.as_str()) == Some("dispatch.turn.heartbeat") {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// (#2889) The opening heartbeat. A stream start becomes a heartbeat at
+    /// `generated_chars: 0` carrying the request's size in chars (system +
+    /// everything else, the runtime's `model.streaming.start` split summed),
+    /// so the viewer can say how much the model is reading WHILE it reads.
+    /// Before this the only context size arrived at turn end.
+    #[test]
+    #[serial]
+    fn tailer_stream_start_emits_an_opening_heartbeat_with_the_prompt_size() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":140000}}"#
+        )
+        .unwrap();
+        drop(f);
+        state.poll_and_emit();
+
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 1, "a stream start must emit exactly one opening heartbeat: {beats:?}");
+        let p = &beats[0]["payload"];
+        assert_eq!(p["turn_seq"], 3);
+        assert_eq!(p["generated_chars"], 0);
+        assert_eq!(p["sampled_at_ms"], 1_758_700_000_000u64);
+        assert_eq!(p["prompt_chars"], 144_000, "system + prompt chars: {p}");
+        // A stream start is not a chunk: it proves nothing about the model
+        // producing, so it must not reset the watchdog.
+        assert_eq!(*shared.lock().unwrap(), original_deadline);
+    }
+
+    /// (#2889) A silent tick while the model writes a tool call becomes a
+    /// heartbeat naming the phase and tool, with its counts unchanged — and
+    /// it is NOT proof of work. A tick shows only that the runtime is
+    /// waiting, which a wedged endpoint produces too, so the deadline stays
+    /// where the last real chunk put it.
+    #[test]
+    #[serial]
+    fn tailer_tool_call_writing_tick_emits_a_writing_heartbeat_without_resetting_the_deadline() {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"model.tool_call.writing","seq":2,"partial_index":9,"cumulative_chars":0,"generated_chars":1500,"phase":"writing_tool_call","tool_name":"write","ts":1758700070000}}"#
+        )
+        .unwrap();
+        drop(f);
+        state.poll_and_emit();
+
+        let beats = heartbeats_in(&isolated.path().join("flows"));
+        assert_eq!(beats.len(), 1, "a writing tick must forward as a heartbeat: {beats:?}");
+        let p = &beats[0]["payload"];
+        assert_eq!(p["phase"], "writing_tool_call");
+        assert_eq!(p["tool_name"], "write");
+        assert_eq!(p["generated_chars"], 1500);
+        assert_eq!(p["sampled_at_ms"], 1_758_700_070_000u64);
+        assert_eq!(
+            *shared.lock().unwrap(),
+            original_deadline,
+            "a writing tick must not reset the inactivity deadline"
+        );
+    }
+
+    /// (#2889 review, M2) Two-event helper: write `lines` as one trajectory
+    /// chunk, poll ONCE, and return (heartbeats, deadline) so a test can see
+    /// how one event's gate bookkeeping affects the next.
+    fn two_event_poll(lines: &[&str]) -> (Vec<serde_json::Value>, Instant, Instant) {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        drop(f);
+        state.poll_and_emit();
+        // Payloads only: a full record carries the host's `machine_uid`,
+        // which must not reach a failing assertion's output.
+        let beats = heartbeats_in(&isolated.path().join("flows"))
+            .into_iter()
+            .map(|r| serde_json::json!({ "payload": r["payload"].clone() }))
+            .collect();
+        let deadline = *shared.lock().unwrap();
+        (beats, deadline, original_deadline)
+    }
+
+    /// (#2889 review, M2) The opening heartbeat must not consume the chunk
+    /// rate gate. Before the fix the opener stamped `last_heartbeat_at`, so
+    /// the turn's first real chunk (300 ms later on the runtime's clock, one
+    /// poll here) failed the 2 s gate: no heartbeat, and no deadline reset.
+    /// A turn shorter than 2 s never showed generation at all.
+    #[test]
+    #[serial]
+    fn tailer_first_chunk_after_the_opener_emits_and_resets_the_deadline() {
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":140000}"#,
+            r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":0,"generated_chars":12,"ts":1758700000300}"#,
+        ]);
+        assert_eq!(beats.len(), 2, "opener AND first chunk must both emit: {beats:?}");
+        assert_eq!(beats[0]["payload"]["generated_chars"], 0);
+        assert_eq!(beats[1]["payload"]["generated_chars"], 12);
+        assert!(deadline > original, "the first real chunk must reset the inactivity deadline");
+
+        // The previous turn's last chunk emitted moments before this turn's
+        // opener, so the 2 s window is shut: the new turn's first chunk
+        // still emits, because the opener left it owed.
+        let (beats, _, _) = two_event_poll(&[
+            r#"{"type":"model.partial","seq":2,"partial_index":40,"cumulative_chars":0,"generated_chars":900}"#,
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":140000}"#,
+            r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":0,"generated_chars":12,"ts":1758700000300}"#,
+        ]);
+        assert_eq!(beats.len(), 3, "prev chunk, opener, and the new turn's first chunk all emit: {beats:?}");
+    }
+
+    /// (#2889 review, M2) A writing tick must not swallow the real chunk
+    /// that follows it: the tick emits (no deadline reset), then the args
+    /// chunk emits AND resets the deadline even inside the 2 s window.
+    #[test]
+    #[serial]
+    fn tailer_real_chunk_after_a_writing_tick_emits_and_resets_the_deadline() {
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.tool_call.writing","seq":2,"partial_index":9,"cumulative_chars":0,"generated_chars":1500,"phase":"writing_tool_call","tool_name":"write","ts":1758700070000}"#,
+            r#"{"type":"model.partial","seq":2,"partial_index":10,"cumulative_chars":0,"generated_chars":1620,"ts":1758700070300}"#,
+        ]);
+        assert_eq!(beats.len(), 2, "tick AND the chunk after it must both emit: {beats:?}");
+        assert_eq!(beats[0]["payload"]["phase"], "writing_tool_call");
+        assert_eq!(beats[1]["payload"]["generated_chars"], 1620);
+        assert!(deadline > original, "the real chunk after a tick must reset the inactivity deadline");
+    }
+
+    /// (#2889 review, M2) The coalescing still holds for chunks: two real
+    /// chunks inside the window emit one heartbeat, and back-to-back ticks
+    /// emit one — the fix must not turn the gate into a pass-through.
+    #[test]
+    #[serial]
+    fn tailer_chunks_and_ticks_still_coalesce_inside_the_window() {
+        let (beats, _, _) = two_event_poll(&[
+            r#"{"type":"model.partial","seq":2,"partial_index":1,"cumulative_chars":0,"generated_chars":10}"#,
+            r#"{"type":"model.partial","seq":2,"partial_index":2,"cumulative_chars":0,"generated_chars":20}"#,
+        ]);
+        assert_eq!(beats.len(), 1, "two chunks in one window coalesce: {beats:?}");
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.tool_call.writing","seq":2,"partial_index":1,"cumulative_chars":0,"generated_chars":10,"phase":"writing_tool_call","tool_name":"write"}"#,
+            r#"{"type":"model.tool_call.writing","seq":2,"partial_index":1,"cumulative_chars":0,"generated_chars":10,"phase":"writing_tool_call","tool_name":"write"}"#,
+        ]);
+        assert_eq!(beats.len(), 1, "two ticks in one window coalesce: {beats:?}");
+        assert_eq!(deadline, original, "ticks never reset the deadline");
     }
 
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory

@@ -11,6 +11,8 @@
      state lamps under it, live here so the rules below name them. */
   --scope-phosphor: #7dffa0;
   --scope-phosphor-glow: rgba(125, 255, 160, 0.6);
+  /* (#2890) The no-signal static's gray. */
+  --scope-nosignal: #96a0aa;
   --scope-bezel-hi: #1a221c;
   --scope-bezel-lo: #111712;
   --scope-bezel-rim: #1c261e;
@@ -1176,6 +1178,10 @@ body {
   }
   .app-shell__sticky .scrub {
     flex-basis: 100%;
+    /* (#2890) Without this a flex item's minimum is its content, so the
+       run page's longer clock ("5:26 · 08:03:57") widened the page past a
+       375px phone instead of shrinking the range. */
+    min-width: 0;
   }
   /* (#2071) Tap targets: the transport's buttons keep their painted size
      and extend an invisible 44px hit region, the `.catalog-toggle::after`
@@ -2237,6 +2243,17 @@ body {
   content: "✓";
   color: var(--good);
   font-weight: 700;
+}
+/* (#2887 F2) A detector this run's own bounds say never ran (policy "off")
+   is neither a pass nor a struggle — a dash, not a checkmark, and dimmed
+   text so it reads as "not measured" rather than "measured, clean". */
+.sigcheck--off {
+  color: var(--dim);
+}
+.sigcheck--off::before {
+  content: "–";
+  color: var(--dim);
+  font-weight: 400;
 }
 /* (#2863) The panel's own scope, said once: which session, then who ran it
    where. */
@@ -3431,14 +3448,22 @@ body {
   outline-offset: 1px;
 }
 
+/* (#2881, operator 2026-09-25: "plenty of room to make these cards bigger so
+   that 3 fit across") A grid, not a wrapping row of fixed 248px cards: each
+   track is at least a third of the row (so never more than three across)
+   and at least 260px (so a narrow window drops to two, then one). The cards
+   fill the row instead of leaving most of it empty. */
 .fleet {
-  display: flex;
+  display: grid;
+  /* (#2890, operator on a large screen) A card is a third of the row, but
+     never under 260px or over 460px: past that a wide screen gets more
+     columns, not ever-longer, thinner cards. */
+  grid-template-columns: repeat(auto-fill, clamp(260px, calc((100% - 32px) / 3), 460px));
   gap: 16px;
-  flex-wrap: wrap;
   align-items: stretch;
 }
 .mach {
-  width: 248px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background: var(--panel-2);
@@ -3467,6 +3492,11 @@ body {
   align-items: center;
   gap: 8px;
 }
+/* (#2890) The name's text box: it can shrink below its content so a long
+   name ellipsizes (see `.mach-scope`'s gutter rules). */
+.mach-name {
+  min-width: 0;
+}
 .mico {
   display: inline-flex;
   color: var(--accent);
@@ -3490,32 +3520,258 @@ body {
   font: calc(12px * var(--fs-scale)) var(--font-mono);
 }
 /* (#2877) Only present while the card computed a live tok/s reading — see
-   `FleetLens.tsx`'s render note next to `.mach-scope`. */
+   `FleetLens.tsx`'s render note next to `.mach-scope`. (#2881, "bigger
+   scope: sized from the available height rather than a fixed 64px") A CSS
+   Grid two-column layout was tried first here and reverted: giving
+   `.mach-scope` `align-self: stretch` + `aspect-ratio: 1` so it fills the
+   row's own cross size measures correctly ONLY after the row's height is
+   already resolved, but browsers resolve an AUTO row's height by asking
+   every item in it for an intrinsic contribution FIRST — including this
+   one, whose `aspect-ratio` then fed back a large contribution and blew the
+   row itself out past its old fixed-scope height, growing the card (the
+   thing this issue explicitly rules out) and overlapping the tube onto the
+   status text (found by looking at the actual screenshot, not by reasoning
+   about the algorithm).
+   `position: relative`/`absolute` sidesteps that circularity entirely: a
+   spec-guaranteed rule, not a browser quirk, is that an absolutely
+   positioned child contributes NOTHING to its container's own size — so
+   this container's height is set ONLY by its in-flow text children
+   (`.stat`/`.mach-scope__rate`/`.mach-scope__pager`/`.runs`, however many of
+   those a given card has), before the tube's size is computed at all. */
 .mach-body--scope {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  column-gap: 12px;
-  align-items: center;
+  position: relative;
+  /* Reserves the tube's own gutter so the text never renders under it,
+     matched below by `.mach-scope`'s `max-width`/`max-height` (same pixel
+     value — a percentage was tried first and reverted: percentage
+     `max-height` on an absolutely positioned box resolves against the
+     containing block's HEIGHT, not its width, so sharing one percentage
+     between `padding-right` — meant as a fraction of WIDTH — and
+     `max-height` produced a squashed, undersized tube instead of the
+     shared clamp intended; found in an actual screenshot, not predicted).
+     80px, not the old fixed 64px: measured against the longest realistic
+     `.stat` string ("dispatch in flight", 19 chars monospace) on the fixed
+     248px desktop card — any bigger and that line wraps to two, which
+     would grow the card, the one thing this change is explicitly not
+     allowed to do. The desktop card has essentially no spare width to give
+     (confirmed on screen: at the OLD 64px tube, the text already used
+     nearly all the remaining room), so 80px is close to the ceiling there;
+     see the `@media` block below for the real gain, on a card with room to
+     give it. */
+  padding-right: 80px;
+  /* (#2881) With the cards now a third of the row, the status text fits on
+     one line and the block got SHORTER than the tube it used to size, so
+     the tube is a fixed size the block grows to, the same rule the phone
+     layout uses below. */
+  padding-right: calc(var(--tube) + 12px);
 }
-.mach-body--scope > :not(.mach-scope) {
-  grid-column: 1;
-}
+/* (#2881) The tube itself. `top`/`bottom: 0` give it a DEFINITE height —
+   its parent's own height, already resolved from the in-flow text per this
+   selector's own doc above — and `aspect-ratio: 1` turns that height into a
+   matching width, pinned to the card's right edge. This is what makes the
+   tube SIZE ITSELF from the available height rather than a fixed diameter,
+   for any card shorter than the `max-width`/`max-height` cap below (every
+   card with just 2-3 status rows, i.e. every idle-to-N=1 card and most
+   N=2+ cards) — the cap only engages for the tallest stacks, so it reads
+   as a ceiling, not the tube's usual size. This element is deliberately
+   unpadded — the padded element is the CHILD `.token-scope-bezel--card`
+   below, matching this file's own "never aspect-ratio + padding on the
+   SAME element" Safari rule (search `.token-scope-bezel`'s own comment) by
+   construction, not by remembering to keep them apart. */
 .mach-scope {
-  grid-column: 2;
-  grid-row: 1 / span 3;
-  align-self: center;
-  margin-top: 12px;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  aspect-ratio: 1;
+  /* Both axes clamp equally (not `max-width` alone) — `top`/`bottom: 0`
+     otherwise hands this box a definite height from the container
+     regardless of `max-width`, and `aspect-ratio` would then stretch the
+     WIDTH down to match that unclamped height's square, which is what an
+     oval bezel (found in an actual screenshot, not predicted) turns out to
+     mean in practice. Matches `padding-right` above — see its own comment. */
+  max-width: var(--tube);
+  max-height: var(--tube);
 }
+/* (Mobile fix pass, #2877; widened #2881) The SAME width fix this file's
+   `.mach { width: 100% }` rule already makes at this breakpoint turns a
+   fixed-diameter tube into real spare width with nothing using it — this
+   is the "use the empty space on the right" the issue names, genuinely
+   available only here, not on the fixed-width desktop card above. */
+/* (#2881, operator on the phone 2026-09-25: "still small and not using a lot
+   of space") On a phone the cards STACK, so a taller active card no longer
+   stretches its neighbors the way it did in the desktop row: the status
+   block grows to the tube's size instead of the tube shrinking to the
+   status rows (about 88px on a phone before this). The tube stays beside
+   those rows, not beside the header: the hardware line is too long to share
+   a row with it (it already wraps at 309px on a 375px screen). The size
+   follows the screen: 100vw minus 248px leaves the status column 172px,
+   which keeps "dispatch in flight" on one line (measured at 375px and
+   390px), clamped to 104px..150px. */
+/* (#2890, operator 2026-09-25: "circle centered with same distance to top and
+   bottom") The tube is centered in the WHOLE card, not in the status block
+   under the name and hardware lines, which left it sitting low. The card is
+   the positioning context and owns the tube's size; every row (name,
+   hardware, status) keeps the same right gutter so no text runs under it;
+   and the card is at least the tube plus its padding tall, so the tube never
+   overflows a short card. Still absolutely positioned, so it adds no height
+   of its own. */
+.mach:has(> .mach-body--scope) {
+  position: relative;
+  --tube: 96px;
+  min-height: calc(var(--tube) + 34px);
+}
+/* A MARGIN, not padding: `overflow: hidden` clips at the padding edge, so a
+   padded gutter let a long name or hardware line run under the tube before
+   it was cut (operator screenshot, "m1-max-32gb-studio"). */
+.mach:has(> .mach-body--scope) > .name,
+.mach:has(> .mach-body--scope) > .spec {
+  margin-right: calc(var(--tube) + 12px);
+}
+/* (#2890) The rows beside the tube stay on one line (ellipsized if they
+   ever must), so `tubeFit.ts` can measure their natural width and a
+   wrapped line never changes the card's height under it. */
+.mach-name,
+.mach:has(> .mach-body--scope) > .spec,
+.mach:has(> .mach-body--scope) .stat,
+.mach:has(> .mach-body--scope) .mach-scope__rate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mach:has(> .mach-body--scope) > .mach-body--scope {
+  position: static;
+}
+.mach:has(> .mach-body--scope) .mach-scope {
+  /* Decorative: a tap on the tube reaches the card itself (#2890). */
+  pointer-events: none;
+  top: 0;
+  bottom: 0;
+  right: 16px;
+  width: var(--tube);
+  height: var(--tube);
+  max-width: none;
+  max-height: none;
+  margin: auto 0;
+}
+@media (max-width: 560px) {
+  .mach:has(> .mach-body--scope) {
+    --tube: clamp(104px, calc(100vw - 262px), 150px);
+  }
+}
+/* (#2890, operator: "if it's 3 across there's plenty of room down to make
+   these taller") On a desktop the tube is a centered block between the
+   header and the status lines, so it is sized by the card's width (see
+   `tubeFit.ts`) and the card grows downward, instead of being squeezed
+   beside the text. The phone keeps the tube beside the text above. */
+@media (min-width: 561px) {
+  /* (#2890, operator: "the text is also small to read at 100% zoom") The
+     desktop card has room now: status lines one step up. */
+  .mach .stat,
+  .mach .runs {
+    font-size: calc(13px * var(--fs-scale));
+  }
+  .mach-scope__rate {
+    font-size: calc(14px * var(--fs-scale));
+  }
+  .mach:has(> .mach-body--scope) {
+    --tube: 150px;
+    min-height: 0;
+  }
+  .mach:has(> .mach-body--scope) > .name,
+  .mach:has(> .mach-body--scope) > .spec {
+    margin-right: 0;
+  }
+  .mach:has(> .mach-body--scope) > .mach-body--scope {
+    display: flex;
+    flex-direction: column;
+    padding-right: 0;
+  }
+  .mach:has(> .mach-body--scope) .mach-scope {
+    position: static;
+    order: -1;
+    align-self: center;
+    width: var(--tube);
+    height: var(--tube);
+    margin: 12px 0 14px;
+  }
+}
+
 .mach-scope__rate {
   margin-top: 5px;
   font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
   color: var(--scope-phosphor);
   font-variant-numeric: tabular-nums;
 }
+/* (#2881) The pager: a small row under the rate line, sized by its own
+   text/tap-targets rather than any fixed constant — see `.mach-scope`'s own
+   doc for the ONE thing that must not grow the card (the tube), which this
+   row is not. Arrows are `role="button"` divs, matching `.runs--live`'s own
+   nested-tap-target shape (`FleetLens.tsx`'s doc next to `selectPage`) —
+   both need `stopPropagation` so a click doesn't ALSO fire the card body's
+   `machineDrillHash`. */
+/* (#2881, UI review 2026-09-25) A grid, not flex: both arrows sit in fixed
+   32px tracks and the label takes `minmax(0, 1fr)`, so a long label
+   ellipsizes on one line instead of wrapping (a flex item's automatic
+   minimum size forced the wrap) and paging never moves a tap target. One
+   line matters beyond looks: every extra row grows the text block the
+   tube is sized from. */
+.mach-scope__pager {
+  margin-top: 4px;
+  display: grid;
+  grid-template-columns: 32px auto minmax(0, 1fr) 32px;
+  align-items: center;
+  column-gap: 5px;
+  min-width: 0;
+  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  color: var(--dim);
+}
+/* (#2886 pass 5, MUST — fresh-reviewer finding F8) The GLYPH is ~11px, but
+   the TAP TARGET is >= 32px square (`min-width`/`min-height`, real layout
+   space, centered via `inline-flex` — not an invisible pseudo-element
+   expansion, which would silently overlap the rate line above or
+   `.runs--live` below and intercept taps meant for them). This is the only
+   place the pager row's height grows beyond its text — a real, visible
+   accommodation for the tap target, not the tube's own concern (that stays
+   governed entirely by the surrounding TEXT rows, unchanged by this rule). */
+.mach-scope__pager-btn {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  color: var(--dim);
+}
+.mach-scope__pager-btn:hover {
+  color: var(--fg);
+}
+.mach-scope__pager-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.mach-scope__pager-n {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  min-width: 3ch;
+  text-align: right;
+}
+.mach-scope__pager-role {
+  opacity: 0.8;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
   color: var(--fg);
+  /* (#2881) One line, ellipsized: a wrapped count grows the text block the
+     tube is sized from, and the card with it. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* (#1903) The running-count's own tap target — see `FleetLens.tsx`'s
    `machineRunsHash` doc for why it exists distinct from `.mach` itself.
@@ -3530,6 +3786,9 @@ body {
   text-decoration: underline;
   text-underline-offset: 2px;
   width: fit-content;
+  /* (#2881) `fit-content` alone let a long count run past the text column
+     to the card's edge; capped, it ellipsizes like `.mach .runs`. */
+  max-width: 100%;
 }
 .mach .runs--live:hover {
   color: var(--fg);
@@ -3565,6 +3824,11 @@ body {
 @media (max-width: 560px) {
   .mach {
     width: 100%;
+  }
+  /* A phone stacks full-width cards; the desktop track's 260-460px clamp
+     would leave one narrow column. */
+  .fleet {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -3820,17 +4084,28 @@ body {
   margin-top: 8px;
   border-top: 1px solid var(--border);
 }
+/* (#2890, operator: "the big borders on buttons look noisy") Borderless:
+   plain icons and a text speed chip, a quiet background on hover and press.
+   Frees the width the boxes' padding spent. Tap targets keep their 44px
+   hit region (the phone `::after` rule) and focus keeps its outline. */
 .scrub button {
-  background: var(--bg);
-  border: 1px solid var(--accent-dim);
+  background: transparent;
+  border: 0;
   color: var(--fg);
-  padding: 7px 14px;
-  border-radius: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
   cursor: pointer;
   font: 600 calc(12px * var(--fs-scale)) var(--font-mono);
 }
 .scrub button:hover {
-  border-color: var(--accent);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+.scrub button:active {
+  background: color-mix(in srgb, var(--fg) 14%, transparent);
+}
+/* Play/pause anchors the row in the accent color. */
+.scrub button.primary {
+  color: var(--accent);
 }
 .scrub button:focus-visible,
 .scrub input[type="range"]:focus-visible {
@@ -3848,7 +4123,7 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
+  width: 34px;
   height: 34px;
   padding: 0;
   line-height: 0;
@@ -3867,13 +4142,15 @@ body {
   color: var(--dim);
   white-space: nowrap;
 }
+/* (#2890, operator on the phone) The clock stays on the controls' row: on
+   its own wrapped row it spent a full line of vertical space. Tighter gaps,
+   and the range takes whatever width is left. */
 @media (max-width: 560px) {
   .scrub {
-    flex-wrap: wrap;
+    gap: 8px;
   }
-  .scrub .clock {
-    flex: 1 1 100%;
-    text-align: right;
+  .scrub .clock__elapsed {
+    display: none;
   }
 }
 
@@ -5503,26 +5780,6 @@ body {
   .session-run .metrics {
     grid-template-columns: repeat(2, 1fr);
   }
-  /* (#2877 pass 2, "grow it so the effect is large") The TOK/S scope tile
-     spans the full 2-column row at phone width, and its bezel grows to
-     match — the whole reason to give it the row. `--d`/`--rim` are
-     overridden here, not `aspect-ratio` + percentage padding — see the
-     token-scope block's own doc for why that renders as an oval in Safari;
-     this keeps the SAME explicit-square mechanism, just with bigger
-     numbers. Diameter sits in the 180-220px band the report asked for;
-     the center label scales up with it (below) so the number stays
-     legible at the new size instead of looking lost in the middle of a
-     much bigger tube. */
-  .session-run .met.scopetile {
-    grid-column: 1 / -1;
-  }
-  .session-run .met.scopetile .token-scope-bezel--tile {
-    --d: 200px;
-    --rim: 8px;
-  }
-  .session-run .met.scopetile .token-scope-center .token-scope-n {
-    font-size: 40px;
-  }
 }
 /* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
    width, via `order` rather than DOM position. The DOM keeps `.mv` before
@@ -5570,16 +5827,131 @@ body {
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
 }
-/* (#2877) The fifth MODEL tile, live only — see `SessionReplay.tsx`'s
-   render note next to `view.liveTokScope`. Centers the bezel under the
-   `TOK/S` label instead of the flex-start every other tile's short text
-   value uses. */
-.session-run .met.scopetile {
-  align-items: center;
+/* (#2890) The MODEL section: ONE container, ported from the approved
+   prototype (`model-section-prototype.html`). The scope is the hero on the
+   left with its lamp row under it; the figures fill a collection grid on the
+   right (3x2, cells stretching to the full height) divided by hairlines, not
+   per-metric cards; the loaded models sit below a hairline. The hairlines are
+   the grid's 1px gap showing the container's rule color between opaque
+   cells. Phone: the scope goes full width on top, a 2x3 grid, models last. */
+.session-run .modelbox {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
 }
-.session-run .met.scopetile .token-scope-bezel {
+.session-run .modelbox__main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+.session-run .modelbox__hero {
+  padding: 24px 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  border-right: 1px solid var(--border);
+}
+.session-run .modelbox__hero .token-scope-bezel--tile {
+  --d: 240px;
+  --rim: 9px;
+}
+/* In DOM order here (scope, lamps, note), not the old tile's `order: 4`. */
+.session-run .modelbox__hero .scope-lamps {
+  order: 0;
+  margin-top: 0;
+}
+/* The "no signal" words, or a finished average's qualifier, under the lamps. */
+.session-run .modelbox__note {
+  font-size: calc(11px * var(--fs-scale));
+  letter-spacing: 0.1em;
+  color: var(--dim);
+}
+.session-run .metrics.modelbox__figs {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
+  gap: 1px;
+  margin: 0;
+  background: var(--border);
+}
+.session-run .modelbox__figs .met {
+  border: 0;
+  border-radius: 0;
+  background: var(--panel-2);
+  padding: 22px 24px;
+  /* (#2890) Top-aligned, not centered: a cell with a sub line would sit
+     higher than one without, so labels in a row stopped lining up. */
+  justify-content: flex-start;
+  min-width: 0;
+}
+.session-run .modelbox__figs .ml {
+  font-size: calc(11px * var(--fs-scale));
+  letter-spacing: 0.1em;
+}
+.session-run .modelbox__figs .mv {
+  font-size: calc(28px * var(--fs-scale));
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.session-run .modelbox__figs .msub {
+  font-size: calc(11px * var(--fs-scale));
+  margin-top: 6px;
+}
+/* The context cell's thin bar: the peak as a faint fill, the context in use
+   now as the solid one on top. Between the value and the sub line, by the
+   same `order` mechanism the rest of the cell uses. */
+.session-run .mbar {
   order: 3;
-  margin-top: 4px;
+  position: relative;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--dim) 22%, transparent);
+}
+.session-run .mbar i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+.session-run .mbar__peak {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.session-run .mbar__now {
+  background: var(--accent);
+}
+.session-run .modelbox__models {
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  margin: 0;
+  padding: 14px 18px;
+}
+@media (max-width: 720px) {
+  .session-run .modelbox__main {
+    grid-template-columns: 1fr;
+  }
+  .session-run .modelbox__hero {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 24px 16px;
+  }
+  .session-run .modelbox__hero .token-scope-bezel--tile {
+    --d: min(78vw, 300px);
+  }
+  .session-run .metrics.modelbox__figs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .session-run .modelbox__figs .met {
+    padding: 18px 16px;
+  }
+  .session-run .modelbox__figs .mv {
+    font-size: calc(22px * var(--fs-scale));
+  }
 }
 /* (operator, 2026-09-05) The third slot — see `SessionRunView.metrics.sub`
    in `sessionRun.ts`. A qualifying fact (CTX's window ceiling, the peak
@@ -8130,9 +8502,20 @@ body {
   order: 4;
   margin-top: 10px;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: center;
-  gap: 6px 12px;
+  align-items: center;
+  gap: 8px;
+}
+/* Unlit lamps are dots only; the lit one carries its word. Visually hidden,
+   not removed, so the status text stays readable to assistive tech. */
+.scope-lamp[data-on="false"] .scope-lamp__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 .scope-lamp {
   display: inline-flex;
@@ -8159,6 +8542,11 @@ body {
   background: var(--lit);
   box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
 }
+/* (#2890) The lit GEN lamp reads "gen" or "think": its label keeps the
+   longer word's width, so flipping between them never shifts the row. */
+.scope-lamp[data-state="generating"][data-on="true"] .scope-lamp__label {
+  min-width: calc(5ch + 5 * 0.08em);
+}
 /* The fleet card's rate line takes its state's color, same tokens as the
    lamps and the trace. */
 .mach-scope__rate[data-tone="prompt"] { color: var(--lamp-prompt); }
@@ -8170,9 +8558,16 @@ body {
 .scope-lamp[data-state="tools"] { --lit: var(--lamp-tools); }
 .scope-lamp[data-state="rest"] { --lit: var(--lamp-rest); }
 .scope-lamp[data-state="stalled"] { --lit: var(--lamp-stall); }
+/* (#2881) `width`/`height: 100%`, not a fixed `--d` — this bezel now fills
+   `.mach-scope`, the SQUARE wrapper that sizes itself from the card body's
+   own height (see that selector's own comment). `--rim` stays a fixed px
+   value; `TokenScope.tsx`'s `ResizeObserver` redraws the canvas at
+   whatever size that resolves to, per this component's own "prefer the
+   container sizing the tube" doc. */
 .token-scope-bezel--card {
-  --d: 64px;
   --rim: 5px;
+  width: 100%;
+  height: 100%;
 }
 .token-scope-bezel--tile {
   --d: 68px;
@@ -8211,12 +8606,188 @@ body {
   pointer-events: none;
   z-index: 1;
 }
+.token-scope-center {
+  --scope-num: 16px;
+}
 .token-scope-center .token-scope-n {
-  font: 400 16px/0.85 var(--font-mono);
+  font: 400 var(--scope-num)/0.85 var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--scope-phosphor);
   text-shadow: 0 0 10px var(--scope-phosphor-glow);
 }
+/* (#2885, #2890) A carried reading (the number is real, but from an earlier
+   turn) keeps the full glow: dimming it flickered at every turn's start.
+   `data-carried` is still stamped on the element, unstyled. */
+/* (#2890) REST's countdown in the center takes the rest lamp's amber. */
+.token-scope-center[data-state="rest"] .token-scope-n,
+.token-scope-center[data-state="rest"] .token-scope-u {
+  color: var(--lamp-rest);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
+}
+/* (#2890) The run page's hero: the rate (or the finished average) at the
+   prototype's size, with its unit quietly under it. */
+/* (#2890) Thinking: the model is reasoning rather than writing visible
+   text. The words and number stay as they are; the characters' colors
+   flow through the GEN green, violet and pink, the same palette the ring
+   takes. Reduced motion keeps the gradient still. */
+.token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-n,
+.token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-u,
+.mach-scope__rate[data-thinking="true"],
+.scope-lamp[data-thinking="true"] .scope-lamp__label {
+  background-image: linear-gradient(90deg, var(--scope-phosphor), #c084fc, #f472b6, #c084fc, var(--scope-phosphor));
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-shadow: none;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, #c084fc 45%, transparent));
+  animation: token-scope-think 3.2s linear infinite;
+}
+@keyframes token-scope-think {
+  from { background-position: 0% 50%; }
+  to { background-position: 300% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-n,
+  .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-u,
+  .mach-scope__rate[data-thinking="true"],
+  .scope-lamp[data-thinking="true"] .scope-lamp__label {
+    animation: none;
+  }
+}
+/* (#2890, operator: "with the extra space the glyphs are too small") The
+   fleet card's center scales with its tube (`--tube`, set per card by
+   `tubeFit.ts`: ~163-180px on a desktop, ~128px on a phone): the number is
+   20% of the tube, the unit about 7% (never under 9px), the tool/brain
+   glyph 27% (`--ico` below). */
+.token-scope-bezel--card .token-scope-center {
+  --scope-num: calc(var(--tube) * 0.2);
+}
+/* (#2890) A unit with no number above it (idle) sits at the center itself.
+   Not an icon center: TOOLS has no number either, and its "tool gen" caption
+   hangs below the glyph (`.token-scope-u--tools`). */
+.token-scope-center:not(.token-scope-center--icon):not(:has(.token-scope-n)) .token-scope-u {
+  top: 50%;
+  transform: translateY(-50%);
+}
+/* (#2890) The card's tube shows the same center as the run page's, unit
+   included; the larger tube and ring leave the unit clear of the trace. */
+.token-scope-bezel--card .token-scope-center .token-scope-u {
+  font-size: max(9px, calc(var(--tube) * 0.068));
+}
+@media (max-width: 560px) {
+  /* A phone card's tube is ~128px: a tighter unit keeps "think tok/s"
+     inside the GEN wave's inner troughs. */
+  .token-scope-bezel--card .token-scope-center .token-scope-u {
+    letter-spacing: 0.02em;
+  }
+}
+.session-run .modelbox__hero .token-scope-center {
+  --scope-num: 40px;
+}
+.session-run .modelbox__hero .token-scope-center .token-scope-n {
+  line-height: 0.9;
+}
+.token-scope-center .token-scope-u {
+  /* (#2890, operator: "centering of the number inside the circle with the
+     'resting' being lower") The unit hangs below the number instead of
+     sharing its box, so the NUMBER is what sits at the circle's center.
+     Offset by half the number's height (`--scope-num`, set per tube size)
+     plus a small gap. */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% + var(--scope-num) * 0.5 + 4px);
+  text-align: center;
+  font: 11px var(--font-mono);
+  letter-spacing: 0.1em;
+  color: var(--scope-phosphor);
+  opacity: 0.7;
+}
+/* A finished run's center is calm, like its dimmed ring. */
+.token-scope-bezel[data-state="finished"] .token-scope-center {
+  opacity: 0.8;
+}
+/* (#2890) TOOLS: a glowing line icon for the tool, sized per placement. */
+.token-scope-bezel {
+  --ico: 16px;
+}
+.token-scope-bezel--card {
+  --ico: calc(var(--tube) * 0.27);
+}
+.token-scope-bezel--tile {
+  --ico: 26px;
+}
+.session-run .modelbox__hero .token-scope-bezel--tile {
+  --ico: 64px;
+}
+.token-scope-center--icon .token-scope-ico {
+  display: block;
+  width: var(--ico);
+  height: var(--ico);
+  color: var(--lamp-tools);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-tools) 80%, transparent));
+}
+/* (#2889) TOOLS while the model GENERATES the call: "tool gen" under the
+   icon, in the tools color. Positioned off the icon (not in the grid flow)
+   so the icon never moves when it appears or goes, and faded by opacity:
+   the text is held after writing ends so the fade has something to fade. */
+.token-scope-center--icon .token-scope-u--tools {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% + var(--ico) / 2 + 4px);
+  margin-top: 0;
+  color: var(--lamp-tools);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--lamp-tools) 60%, transparent);
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+.token-scope-center--icon .token-scope-u--tools[data-on="true"] {
+  opacity: 0.85;
+}
+/* (#2890) The center crossfades at a change of kind. Each layer fills the
+   screen like `.token-scope-center`, so the two overlap during the fade.
+   The rest color rides the LAYER's own data-state, so a fading-out
+   countdown keeps its amber. */
+.token-scope-fade {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.token-scope-fade--in {
+  animation: token-scope-fade-in 180ms ease-out both;
+}
+.token-scope-fade--out {
+  animation: token-scope-fade-out 180ms ease-in both;
+}
+@keyframes token-scope-fade-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes token-scope-fade-out {
+  from { opacity: 1; transform: none; }
+  to { opacity: 0; transform: scale(1.06); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-fade--in { animation: none; }
+  .token-scope-fade--out { display: none; }
+  .token-scope-center--icon .token-scope-u--tools { transition: none; }
+}
+/* PROMPT: the brain takes the prompt lamp's color and breathes. */
+.token-scope-center--brain .token-scope-ico {
+  color: var(--lamp-prompt);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-prompt) 80%, transparent));
+  animation: token-scope-brain 2.4s ease-in-out infinite;
+}
+@keyframes token-scope-brain {
+  0%, 100% { opacity: 0.55; transform: scale(0.94); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-center--brain .token-scope-ico { animation: none; }
+}
+
 /* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
-   frame and never animates again (see `TokenScope.tsx`), so nothing here
-   needs a reduced-motion media query of its own. */
+   settled frame per state change and never loops (see `TokenScope.tsx`), so
+   nothing here needs a reduced-motion media query of its own. */

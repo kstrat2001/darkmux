@@ -36,10 +36,12 @@ MacBook-Pro
 Apple M5 Max · 128 GB
 idle
 0 running
+idle
 m1-max-32gb-studio
 hardware not reported
 idle
 0 running
+idle
 RECENT ACTIVITY
 10M
 1H
