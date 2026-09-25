@@ -58,11 +58,17 @@ on:
     branches: [main]
     # (#2896) `labeled` so adding `full-ci` to an open PR runs what it
     # unlocks here: the PR-diff mutation jobs and coverage.
+    # The cost: ANY label added to an open PR restarts its run (the PR
+    # concurrency group cancels the one in flight). Filtering the label per
+    # job would be worse: the cancelled run would be replaced by a skipped
+    # one. Labels are rare here, and usually set when the PR is opened.
     types: [opened, synchronize, reopened, labeled]
   # (#1792) Coverage also runs on main so the README badge reflects MAIN,
-  # not whichever PR happened to publish last. The PR-diff mutation jobs
-  # run only on PRs labeled `full-ci` (#2896); the nightly sweep covers the
-  # whole workspace. Each job is gated on its own `if:` below.
+  # not whichever PR happened to publish last. The root PR-diff mutation
+  # shards run only on PRs labeled `full-ci` (#2896), the nightly sweep
+  # covering the workspace crates; runtime/ and the bundler keep their
+  # PR-diff job on every PR, since the nightly sweep excludes them. Each job
+  # is gated on its own `if:` below.
   push:
     branches: [main]
   schedule:
@@ -97,10 +103,15 @@ env:
 #
 # `cancel-in-progress` is deliberately PR-ONLY. A push to main gates releases
 # and the nightly sweep is the full-workspace mutation run — neither may be
-# killed by a later one, so both queue instead. The event name is in the group
+# killed by a later one. (#2896) Each main push now gets its own group (keyed by
+# commit, below), so they run rather than queue. The event name is in the group
 # key so a schedule and a main push do not serialize against each other either.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # (#2896) A push to main is keyed by its COMMIT, not the branch: GitHub
+  # keeps only one pending run per group and cancels an older pending one,
+  # so a burst of merges used to lose a middle commit's run. Main pushes now
+  # run the leak check that unlabeled PRs skip, so every merge gets its own.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -198,8 +209,9 @@ jobs:
     name: "mutation — tests that cannot fail (PR diff only, root, shard ${{ matrix.shard }}/6)"
     runs-on: macos-latest
     # (#2896) Only on a PR labeled `full-ci`. An ordinary PR is the light
-    # gate; merged code is mutated by the nightly whole-workspace sweep
-    # below. Every PR queued up to 7 of these macOS jobs against a ~5-job
+    # gate; merged code in the workspace crates is mutated by the nightly
+    # sweep below (which does NOT cover runtime/ or the bundler: those keep
+    # their PR-diff job on every PR). Every PR queued up to 7 of these macOS jobs against a ~5-job
     # macOS concurrency limit, measured at up to 13 minutes of queueing.
     if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
     timeout-minutes: 45
@@ -477,8 +489,12 @@ jobs:
     # for exactly the scope #2602 already showed could fill it.
     name: mutation — tests that cannot fail (PR diff only, runtime/ + bundler/)
     runs-on: macos-latest
-    # (#2896) Only on a PR labeled `full-ci`, like the root shards.
-    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
+    # (#2896) Deliberately on EVERY PR, unlike the root shards: the nightly
+    # sweep excludes `runtime/` and `plugins/darkmux-bundler-rust/` (see
+    # `mutants-full`'s SCOPE note), so this job is their ONLY mutation
+    # coverage, and for the bundler the only place its tests run at all.
+    # It is one macOS job and its steps skip when the diff touches neither.
+    if: github.event_name == 'pull_request'
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

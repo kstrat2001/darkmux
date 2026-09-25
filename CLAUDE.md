@@ -51,13 +51,15 @@ nothing — the area you actually touched tests in **seconds**, and the merge ga
 is CI's conclusion, not a local green.
 
 **Two CI tiers (#2896).** An ordinary PR gets the LIGHT gate: build, the full
-nextest suite, clippy, the runtime crate, fleet e2e, the viewer XSS gate, audit
-and docs drift. The heavy checks (the isolation leak check, PR-diff mutation
-testing and coverage) run on every push to main, and the nightly sweep mutates
-the whole workspace. **Label a PR `full-ci`** to run the heavy checks before
-merge: do it for release candidates and for anything risky (test isolation,
-state paths, new test infrastructure). Without the label, a leak or a test that
-cannot fail is caught on main after merge, not at the PR.
+nextest suite plus doc tests, clippy, the runtime crate, runtime/ + bundler
+mutation, fleet e2e, the viewer XSS gate, audit and docs drift. The isolation
+leak check and coverage run on every push to main; the root PR-diff mutation
+shards do not run on main at all, and the workspace crates are mutated by the
+nightly sweep instead. **Label a PR `full-ci`** to run the leak check, the root
+mutation shards and coverage before merge: do it for release candidates and for
+anything risky (test isolation, state paths, new test infrastructure). Without
+the label, a leak is caught on main after merge, and a test that cannot fail by
+the next nightly sweep.
 
 Everything below wraps **`cargo nextest`**, which is CONTRIBUTING.md's documented
 loop. Install it: `cargo install cargo-nextest --locked`.

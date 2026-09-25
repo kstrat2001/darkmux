@@ -50,6 +50,10 @@ on:
     # (#2896) `labeled` so adding the `full-ci` label to an open PR runs the
     # heavy checks it unlocks (the isolation leak check below) without a
     # re-push.
+    # The cost: ANY label added to an open PR restarts its run (the PR
+    # concurrency group cancels the one in flight). Filtering the label per
+    # job would be worse: the cancelled run would be replaced by a skipped
+    # one. Labels are rare here, and usually set when the PR is opened.
     types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
@@ -72,10 +76,15 @@ env:
 #
 # `cancel-in-progress` is deliberately PR-ONLY. A push to main gates releases
 # and the nightly sweep is the full-workspace mutation run — neither may be
-# killed by a later one, so both queue instead. The event name is in the group
+# killed by a later one. (#2896) Each main push now gets its own group (keyed by
+# commit, below), so they run rather than queue. The event name is in the group
 # key so a schedule and a main push do not serialize against each other either.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # (#2896) A push to main is keyed by its COMMIT, not the branch: GitHub
+  # keeps only one pending run per group and cancels an older pending one,
+  # so a burst of merges used to lose a middle commit's run. Main pushes now
+  # run the leak check that unlabeled PRs skip, so every merge gets its own.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
