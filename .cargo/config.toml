@@ -19,8 +19,10 @@
 #      accepted and never answered), turning a 6s suite into 10+ minutes of
 #      silence. A hang that reports nothing is the worst kind of green.
 #
-# The repo has ZERO doctests (verified), which nextest does not run — so
-# nothing is lost by routing everything through it.
+# nextest does not run doctests. The repo has ONE: a `compile_fail` check that
+# `darkmux_crew::workspace_spec::WorkspaceLock` stays `!Send` (#2399). CI runs
+# it in its own `cargo test --workspace --doc` step; locally, run that command
+# when you touch that type.
 #
 # Needs: cargo install cargo-nextest --locked
 #
@@ -67,9 +69,10 @@ t-cli = "nextest run -p darkmux"
 #     shells out to `lms`. Do not read this as "no side effects". ---
 t-fast = "nextest run -p darkmux-types -p darkmux-profiles -p darkmux-eureka"
 
-# --- the same SCOPE CI gates on. Note CI runs it as `cargo test --workspace`,
-#     not nextest — so CI has no terminate-after, and a flake that passes on
-#     retry reports FLAKY here but FAILS there. Local is the permissive one. ---
+# --- the same SCOPE CI gates on. CI runs it as `cargo nextest run --workspace
+#     --profile ci` (#2896): the same terminate-after, but NO retries, so a
+#     flake that passes on retry reports FLAKY here but FAILS there. Local is
+#     the permissive one. ---
 # Reach for it when a change crosses crate boundaries in a way no single area
 # covers, or when tagging a release — not "to be safe".
 t-all = "nextest run --workspace"

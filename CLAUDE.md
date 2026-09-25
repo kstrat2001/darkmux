@@ -50,6 +50,17 @@ free, on a public repo. Running it locally before every commit buys almost
 nothing — the area you actually touched tests in **seconds**, and the merge gate
 is CI's conclusion, not a local green.
 
+**Two CI tiers (#2896).** An ordinary PR gets the LIGHT gate: build, the full
+nextest suite plus doc tests, clippy, the runtime crate, runtime/ + bundler
+mutation, fleet e2e, the viewer XSS gate, audit and docs drift. The isolation
+leak check and coverage run on every push to main; the root PR-diff mutation
+shards do not run on main at all, and the workspace crates are mutated by the
+nightly sweep instead. **Label a PR `full-ci`** to run the leak check, the root
+mutation shards and coverage before merge: do it for release candidates and for
+anything risky (test isolation, state paths, new test infrastructure). Without
+the label, a leak is caught on main after merge, and a test that cannot fail by
+the next nightly sweep.
+
 Everything below wraps **`cargo nextest`**, which is CONTRIBUTING.md's documented
 loop. Install it: `cargo install cargo-nextest --locked`.
 
@@ -64,7 +75,7 @@ loop. Install it: `cargo install cargo-nextest --locked`.
 | `cargo t-fleet` | roster + cross-machine routing | |
 | `cargo t-gestalt` | residency arbiter, hardware/heuristics providers | |
 | `cargo t-runtime` | the agent runtime — **not a workspace member, so `t-all` misses it** | ~418 |
-| `cargo t-all` | the same scope CI gates on (CI runs it as `cargo test --workspace`) | ~75s |
+| `cargo t-all` | the same scope CI gates on (CI runs it as `cargo nextest run --workspace --profile ci`) | ~75s |
 
 Narrower still is better when you know the name: `cargo nextest run -p
 darkmux-flow integrity_exit_code` runs one function's tests in under a second.
@@ -76,8 +87,9 @@ on `--workspace` (~75s vs ~10min), which you rarely run. The real reason is
 `.config/nextest.toml`'s per-test `terminate-after`: a test that **hangs** fails
 loudly instead of wedging the run. That has happened twice here, turning a 6s
 suite into 10+ minutes of silence. A hang that reports nothing is the worst kind
-of green. (The repo has zero doctests, which nextest does not run — so routing
-everything through it loses nothing.)
+of green. (nextest does not run doctests. The repo has one, a `compile_fail`
+check that `WorkspaceLock` stays `!Send`; CI runs it in its own `cargo test
+--workspace --doc` step.)
 
 **Reach for `t-all` only when there is a reason you can state**: a change that
 crosses crate boundaries in a way no single area covers, or a release tag. "To
