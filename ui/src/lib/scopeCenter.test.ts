@@ -3,9 +3,9 @@ import { scopeCenter } from "./scopeCenter";
 
 // (#2890) One center for every scope in the app (run page and fleet card).
 describe("scopeCenter", () => {
-  it("GEN: the rounded rate over tok/s, or think tok/s while thinking", () => {
+  it("GEN: the rounded rate over tok/s, thinking or not", () => {
     expect(scopeCenter({ state: "generating", tokensPerSec: 61.6 })).toEqual({ centerLabel: "62", centerUnit: "tok/s", centerCarried: false });
-    expect(scopeCenter({ state: "generating", tokensPerSec: 61.6, thinking: true }).centerUnit).toBe("think tok/s");
+    expect(scopeCenter({ state: "generating", tokensPerSec: 61.6, thinking: true }).centerUnit).toBe("tok/s");
     expect(scopeCenter({ state: "generating", tokensPerSec: null }).centerLabel).toBe("—");
     expect(scopeCenter({ state: "generating", tokensPerSec: 50, carried: true }).centerCarried).toBe(true);
   });

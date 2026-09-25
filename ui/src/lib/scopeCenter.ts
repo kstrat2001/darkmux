@@ -5,8 +5,8 @@ import type { ScopeState } from "./scopeMorph";
  *  operator, "make the effect consistent across the app to avoid
  *  confusion"). One function, so the two can never drift apart again:
  *
- *  - GEN: the rounded rate ("—" when not yet measured) over "tok/s", or
- *    "think tok/s" while the model reasons;
+ *  - GEN: the rounded rate ("—" when not yet measured) over "tok/s"
+ *    (also while thinking; the shimmer and the rate line say that);
  *  - REST: the countdown ("12s") over "resting";
  *  - TOOLS: the tool's icon (drawn by `TokenScope`), with "writing · N s"
  *    under it while the model writes the call;
@@ -45,10 +45,11 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
       : resting
         ? `${r.restSecondsLeft}s`
         : promptLabel,
+    // (#2890, operator) "tok/s" while thinking too: "think tok/s" did not
+    // fit inside the wave, and the violet shimmer plus the card's rate line
+    // ("76 think tok/s") already say it is thinking.
     centerUnit: generating
-      ? r.thinking
-        ? "think tok/s"
-        : "tok/s"
+      ? "tok/s"
       : resting
         ? "resting"
         : writing
