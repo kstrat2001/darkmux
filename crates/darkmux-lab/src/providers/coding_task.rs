@@ -1142,7 +1142,7 @@ fn augment_qa_reply_with_mismatch(
 ///   ...,
 ///   "workspace_delta": {
 ///     "added":   ["tests/foo.test.ts"],
-///     "modified": ["src/services/refreshTokenService.ts"],
+///     "modified": ["src/tokenRotation.js"],
 ///     "removed": [],
 ///     "total_bytes_changed": 1240
 ///   }

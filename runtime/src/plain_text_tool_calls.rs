@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn xml_format_multiline_bash_command() {
-        let text = "<tool_call><function=bash><parameter=command>cd /workspace && npm test -- tests/services/refreshTokenService.test.ts 2>&amp;1 | grep -A 30 \"FAIL\\|●\"</parameter><parameter=timeout>60</parameter></function></tool_call>";
+        let text = "<tool_call><function=bash><parameter=command>cd /workspace && npm test -- test/tokenRotation.test.js 2>&amp;1 | grep -A 30 \"FAIL\\|●\"</parameter><parameter=timeout>60</parameter></function></tool_call>";
         let blocks = blocks_only(parse_plain_text_tool_call_blocks(text, &allowed(&["bash"]), DEFAULT_MAX_PAYLOAD_BYTES)).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].name, "bash");
@@ -1110,7 +1110,7 @@ mod tests {
             <tool_call>\n\
             <function=bash>\n\
             <parameter=command>\n\
-            cd /workspace && npm test -- tests/services/refreshTokenService.test.ts 2>&1 | grep -A 30 \"FAIL\\|●\"\n\
+            cd /workspace && npm test -- test/tokenRotation.test.js 2>&1 | grep -A 30 \"FAIL\\|●\"\n\
             </parameter>\n\
             <parameter=timeout>\n\
             60\n\
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(blocks[0].name, "bash");
         let cmd = blocks[0].arguments.get("command").unwrap().as_str().unwrap();
         assert!(cmd.contains("npm test"));
-        assert!(cmd.contains("refreshTokenService.test.ts"));
+        assert!(cmd.contains("tokenRotation.test.js"));
         let timeout = blocks[0].arguments.get("timeout").unwrap();
         assert_eq!(timeout.as_i64().unwrap_or(-1), 60);
     }

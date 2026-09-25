@@ -12,12 +12,12 @@
 //! {
 //!   "name": "pepper-grinder",
 //!   "version": "1.0",
-//!   "satisfies": "node-refresh-token-rotation@1.0",
+//!   "satisfies": "node-pepper-grinder-js@2.0",
 //!   "language": "nodejs",
 //!   "verify_command": "npm test -- {test_files}",
-//!   "baseline": { "test_count": 77 },
+//!   "baseline": { "test_count": 14 },
 //!   "required_files": [
-//!     "src/services/refreshTokenService.ts"
+//!     "src/tokenRotation.js"
 //!   ]
 //! }
 //! ```
@@ -169,19 +169,19 @@ mod tests {
             r#"{
                 "name": "pepper-grinder",
                 "version": "1.0",
-                "satisfies": "node-refresh-token-rotation@1.0",
+                "satisfies": "node-pepper-grinder-js@2.0",
                 "language": "nodejs",
                 "verify_command": "npm test -- {test_files}",
-                "baseline": {"test_count": 77},
-                "required_files": ["src/services/refreshTokenService.ts"]
+                "baseline": {"test_count": 14},
+                "required_files": ["src/tokenRotation.js"]
             }"#,
         );
         let m = FixtureManifest::load_from_dir(tmp.path()).unwrap();
         assert_eq!(m.name, "pepper-grinder");
-        assert_eq!(m.satisfies.as_deref(), Some("node-refresh-token-rotation@1.0"));
+        assert_eq!(m.satisfies.as_deref(), Some("node-pepper-grinder-js@2.0"));
         assert_eq!(m.language.as_deref(), Some("nodejs"));
         assert_eq!(m.required_files.len(), 1);
-        assert_eq!(m.baseline["test_count"], 77);
+        assert_eq!(m.baseline["test_count"], 14);
     }
 
     #[test]
