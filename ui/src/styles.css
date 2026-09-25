@@ -1178,6 +1178,10 @@ body {
   }
   .app-shell__sticky .scrub {
     flex-basis: 100%;
+    /* (#2890) Without this a flex item's minimum is its content, so the
+       run page's longer clock ("5:26 · 08:03:57") widened the page past a
+       375px phone instead of shrinking the range. */
+    min-width: 0;
   }
   /* (#2071) Tap targets: the transport's buttons keep their painted size
      and extend an invisible 44px hit region, the `.catalog-toggle::after`
@@ -4080,13 +4084,15 @@ body {
   color: var(--dim);
   white-space: nowrap;
 }
+/* (#2890, operator on the phone) The clock stays on the controls' row: on
+   its own wrapped row it spent a full line of vertical space. Tighter gaps,
+   and the range takes whatever width is left. */
 @media (max-width: 560px) {
   .scrub {
-    flex-wrap: wrap;
+    gap: 8px;
   }
-  .scrub .clock {
-    flex: 1 1 100%;
-    text-align: right;
+  .scrub .clock__elapsed {
+    display: none;
   }
 }
 

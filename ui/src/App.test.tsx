@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
-import { clkhm } from "./lib/format";
+import { clk, clkhm } from "./lib/format";
 import { fmtElapsed } from "./lib/format";
 import { ACT_ORDER } from "./lib/eventFilters";
 
@@ -815,7 +815,8 @@ describe("App", () => {
     // clock is bare and the mission's title lives only in the Machine info
     // playback row. The demo speaks for itself as it runs.
     const clock = document.querySelector('[data-testid="scrubber-clock"]');
-    expect(clock?.textContent).toMatch(/^\d\d:\d\d$/);
+    // (#2890) With seconds, so it visibly moves while playing.
+    expect(clock?.textContent).toMatch(/^\d\d:\d\d:\d\d$/);
   });
 
   /**
@@ -1512,7 +1513,7 @@ describe("App", () => {
       // The clock readout carries the run's own elapsed time beside the
       // time of day — 08:11:48 to 10:06:37 — the SAME quantity the run
       // detail's own WALL CLOCK tile shows (`fmtElapsed`, one producer).
-      expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(runEndMs - runStartMs)} · ${clkhm(runEndMs)}`);
+      expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(runEndMs - runStartMs)} · ${clk(runEndMs)}`);
     } finally {
       meta.remove();
     }
@@ -1525,7 +1526,7 @@ describe("App", () => {
       renderApp();
       await screen.findByRole("group", { name: "playback transport" });
       const dayEndMs = Date.parse("2026-08-07T20:43:00.000Z");
-      expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(dayEndMs));
+      expect(screen.getByTestId("scrubber-clock").textContent).toBe(clk(dayEndMs));
     } finally {
       meta.remove();
     }
@@ -1606,7 +1607,7 @@ describe("App", () => {
     // the run detail's own WALL CLOCK tile exactly, rather than merely
     // closely.
     expect(fmtElapsed(6_888_067)).not.toBe(fmtElapsed(runEndMs - runStartMs));
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_067)} · ${clkhm(runEndMs)}`);
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${fmtElapsed(6_888_067)} · ${clk(runEndMs)}`);
   });
 
   // (#2347 review, MUST FIX (b)) Leaving an AT-REST dispatch view for the
@@ -1638,7 +1639,7 @@ describe("App", () => {
       // (much earlier) end — both the clock text and the slider's own
       // position (100, the same "pinned at end" the day view starts at)
       // prove it, not just one or the other.
-      await waitFor(() => expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(dayEndMs)));
+      await waitFor(() => expect(screen.getByTestId("scrubber-clock").textContent).toBe(clk(dayEndMs)));
       expect(screen.getByRole("slider")).toHaveValue("100");
     } finally {
       meta.remove();
