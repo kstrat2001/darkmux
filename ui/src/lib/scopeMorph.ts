@@ -128,6 +128,11 @@ export function scopeTargets(
   switch (state) {
     case "generating":
       out.wave = Math.max(0, rate);
+      // (#2890, operator: "nudged ... but not very far out or it risks the
+      // waves touching the bezel, want a buffer") The wave's peaks reach
+      // rBase + 0.19R; at 93% they top out near 45% of the screen, leaving
+      // a visible gap before the glass edge at 50%.
+      out.rscale = 0.93;
       if (thinking) out.iris = 1;
       break;
     case "prompt":

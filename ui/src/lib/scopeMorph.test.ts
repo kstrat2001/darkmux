@@ -29,7 +29,8 @@ function run(m: ReturnType<typeof createMorph>, state: Parameters<typeof advance
 describe("scopeTargets: each state is a set of targets on ONE trace (#2890)", () => {
   it("GEN drives the wave from the rate, full-bright ring, nothing else lit", () => {
     const t = scopeTargets("generating", 0, 180, GREEN);
-    expect(t).toMatchObject({ ring: 1, wave: 180, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1 });
+    // (#2890) 93%: the wave's peaks keep a buffer from the bezel.
+    expect(t).toMatchObject({ ring: 1, wave: 180, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 0.93 });
     expect([t.r, t.g, t.b]).toEqual(GREEN);
   });
 

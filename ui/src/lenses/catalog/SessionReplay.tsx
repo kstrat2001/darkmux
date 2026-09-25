@@ -1,3 +1,4 @@
+import { scopeCenter } from "../../lib/scopeCenter";
 import { WorkStatus } from "../../components/WorkStatus";
 import { Shimmer } from "../../components/Placeholder";
 import { useEffect, useMemo, useState } from "react";
@@ -166,27 +167,18 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       toolName: state === "tools" ? live.toolName : undefined,
       toolWriting: state === "tools" ? writing : undefined,
       thinking: generating && live.thinking === true,
-      // Only the reading goes inside the tube while generating; a state is
-      // said by the trace, the lamps and (TOOLS) the icon.
-      // (#2890 operator review) REST puts its countdown in the center, amber
-      // by state, instead of on the lit lamp.
-      centerLabel: generating
-        ? (live.tokensPerSec != null ? String(Math.round(live.tokensPerSec)) : "—")
-        : state === "rest" && live.restSecondsLeft != null
-          ? `${live.restSecondsLeft}s`
-          : promptLabel,
-      centerUnit: generating
-        ? live.thinking
-          ? "think tok/s"
-          : "tok/s"
-        : state === "rest" && live.restSecondsLeft != null
-          ? "resting"
-          : writing
-            ? `writing · ${live.writingSeconds ?? 0} s`
-            : promptLabel !== null
-              ? "reading"
-              : null,
-      centerCarried: generating && live.carried,
+      // (#2890) The center is the SAME for every scope in the app: see
+      // `lib/scopeCenter.ts`.
+      ...scopeCenter({
+        state,
+        tokensPerSec: live.tokensPerSec,
+        carried: live.carried,
+        restSecondsLeft: live.restSecondsLeft,
+        writing,
+        writingSeconds: live.writingSeconds,
+        thinking: live.thinking === true,
+        promptLabel,
+      }),
       lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft, writing: live.writing, writingSeconds: live.writingSeconds },
       note: state === "nosignal" ? "no signal" : null,
     };

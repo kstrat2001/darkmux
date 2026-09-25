@@ -893,6 +893,9 @@ export interface ExecutionTokenReading {
    *  reasoning rather than writing visible text. See
    *  `LiveStateReading.thinking`. */
   thinking?: true;
+  /** (#2890) In PROMPT, the prompt's size estimate ("~18k") when the turn's
+   *  opening heartbeat reported it, the same label the run page shows. */
+  promptLabel?: string;
 }
 
 export function executionTokenReading(
@@ -926,6 +929,12 @@ export function executionTokenReading(
     toolName: state === "tools" ? liveState?.toolName : undefined,
     ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
     ...(state === "generating" && liveState?.thinking ? { thinking: true as const } : {}),
+    ...(state === "prompt" && liveState?.promptChars !== undefined
+      ? (() => {
+          const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(records.filter((r) => !(Date.parse(r.ts) > nowMs))));
+          return label !== null ? { promptLabel: label } : {};
+        })()
+      : {}),
   };
 }
 

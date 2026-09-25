@@ -8644,15 +8644,20 @@ body {
 .token-scope-bezel--card .token-scope-center {
   --scope-num: 22px;
 }
-/* The card's tube shows the number alone: its ring passes through the
-   unit's line (measured: "think tok/s" crossed the trace and lost its ends),
-   and the rate line beside it already carries the unit. */
+/* (#2890) The card's tube shows the same center as the run page's, unit
+   included; the larger tube and ring leave the unit clear of the trace. */
 .token-scope-bezel--card .token-scope-center .token-scope-u {
-  display: none;
+  font-size: 9px;
 }
 @media (max-width: 560px) {
+  /* A phone card's tube is ~128px: a smaller number and a tighter unit keep
+     "think tok/s" inside the GEN wave's inner troughs. */
   .token-scope-bezel--card .token-scope-center {
-    --scope-num: 30px;
+    --scope-num: 26px;
+  }
+  .token-scope-bezel--card .token-scope-center .token-scope-u {
+    font-size: 8px;
+    letter-spacing: 0.02em;
   }
 
 }

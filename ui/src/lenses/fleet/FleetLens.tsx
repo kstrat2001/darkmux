@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { fitTubes } from "./tubeFit";
+import { scopeCenter } from "../../lib/scopeCenter";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -1125,15 +1126,19 @@ export function FleetLens({
                     // the card, the live rate sits in its center while
                     // generating, as on the run page. Other states keep the
                     // center's own content (tool icon, brain) or none.
-                    centerLabel={
-                      selectedExec.state === "generating"
-                        ? selectedExec.tokensPerSec != null
-                          ? String(Math.round(selectedExec.tokensPerSec))
-                          : "—"
-                        : null
-                    }
-                    centerUnit={selectedExec.state === "generating" ? (selectedExec.thinking ? "think tok/s" : "tok/s") : null}
-                    centerCarried={selectedExec.state === "generating" && selectedExec.carried === true}
+                    // (#2890) The same center as every scope in the app
+                    // (`lib/scopeCenter.ts`): rate and unit, "think tok/s",
+                    // the REST countdown, "writing · N s", the prompt size.
+                    {...scopeCenter({
+                      state: scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null }),
+                      tokensPerSec: selectedExec.tokensPerSec,
+                      carried: selectedExec.carried,
+                      restSecondsLeft: selectedExec.restSecondsLeft,
+                      writing: selectedExec.writing === true,
+                      writingSeconds: selectedExec.writingSeconds,
+                      thinking: selectedExec.thinking === true,
+                      promptLabel: selectedExec.promptLabel ?? null,
+                    })}
                     size="card"
                   />
                 </div>
