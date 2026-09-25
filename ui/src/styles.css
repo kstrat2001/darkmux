@@ -8644,6 +8644,11 @@ body {
 .token-scope-bezel--card .token-scope-center {
   --scope-num: 22px;
 }
+/* (#2890) A unit with no number above it (idle) sits at the center itself. */
+.token-scope-center:not(:has(.token-scope-n)) .token-scope-u {
+  top: 50%;
+  transform: translateY(-50%);
+}
 /* (#2890) The card's tube shows the same center as the run page's, unit
    included; the larger tube and ring leave the unit clear of the trace. */
 .token-scope-bezel--card .token-scope-center .token-scope-u {

@@ -20,7 +20,11 @@ describe("scopeCenter", () => {
     expect(scopeCenter({ state: "prompt", tokensPerSec: 0, promptLabel: "~18k" })).toMatchObject({ centerLabel: "~18k", centerUnit: "reading" });
     expect(scopeCenter({ state: "prompt", tokensPerSec: 0 })).toMatchObject({ centerLabel: null, centerUnit: null });
   });
+  it("IDLE says idle, on its own", () => {
+    expect(scopeCenter({ state: "idle", tokensPerSec: 0 })).toEqual({ centerLabel: null, centerUnit: "idle", centerCarried: false });
+  });
   it("a state's extras never leak into another state", () => {
-    expect(scopeCenter({ state: "idle", tokensPerSec: 0, restSecondsLeft: 5, promptLabel: "~9k", writing: true })).toEqual({ centerLabel: null, centerUnit: null, centerCarried: false });
+    expect(scopeCenter({ state: "idle", tokensPerSec: 0, restSecondsLeft: 5, promptLabel: "~9k", writing: true })).toEqual({ centerLabel: null, centerUnit: "idle", centerCarried: false });
+    expect(scopeCenter({ state: "stalled", tokensPerSec: 0, restSecondsLeft: 5, promptLabel: "~9k", writing: true })).toEqual({ centerLabel: null, centerUnit: null, centerCarried: false });
   });
 });

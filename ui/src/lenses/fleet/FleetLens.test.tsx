@@ -1304,7 +1304,7 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     const card = document.querySelector(".mach")!;
     expect(card.className).not.toContain("absent");
     const probe = card.querySelector('[data-testid="token-scope-probe"]');
-    expect(probe && JSON.parse(probe.getAttribute("data-props")!)).toMatchObject({ state: "idle", size: "card" });
+    expect(probe && JSON.parse(probe.getAttribute("data-props")!)).toMatchObject({ state: "idle", size: "card", centerUnit: "idle" });
   });
 
   // (#1855) The card's HARDWARE line, on the same card. Rendering the

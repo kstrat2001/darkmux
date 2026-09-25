@@ -12,6 +12,7 @@ import type { ScopeState } from "./scopeMorph";
  *    under it while the model writes the call;
  *  - PROMPT: the prompt's size ("~18k") over "reading" when the turn's
  *    opening heartbeat reported it; otherwise `TokenScope` draws the brain;
+ *  - IDLE: the word "idle" on its own, centered;
  *  - everything else: nothing. */
 export interface ScopeCenterInput {
   state: ScopeState;
@@ -53,7 +54,9 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
           ? `writing · ${r.writingSeconds ?? 0} s`
           : promptLabel !== null
             ? "reading"
-            : null,
+            : r.state === "idle"
+              ? "idle"
+              : null,
     centerCarried: generating && r.carried === true,
   };
 }

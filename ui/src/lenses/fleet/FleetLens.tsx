@@ -1145,7 +1145,7 @@ export function FleetLens({
               )}
               {!(card.liveTokRate !== null && selectedExec) && !card.absent && (
                 <div className="mach-scope" data-testid="fleet-token-scope">
-                  <TokenScope tokensPerSec={0} state="idle" size="card" />
+                  <TokenScope tokensPerSec={0} state="idle" size="card" {...scopeCenter({ state: "idle", tokensPerSec: 0 })} />
                 </div>
               )}
             </div>

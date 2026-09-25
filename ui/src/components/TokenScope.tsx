@@ -180,6 +180,21 @@ function thinkingStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, p
   return g;
 }
 
+/** (#2890, operator: "the straight cut on the wave") The trace's radial
+ *  offset at angle `t`. `lobes` follows the rate smoothly, so it is
+ *  usually fractional, and `sin(lobes * t)` then does not meet itself after
+ *  a full turn: closing the path drew a straight seam that spun with the
+ *  wave. This blends the two neighboring WHOLE lobe counts by the fraction,
+ *  each of which closes exactly, so the shape still changes smoothly with
+ *  the rate and the curve is continuous all the way round. `harmonic`
+ *  adds the small second term the main trace carries. */
+export function waveAt(t: number, lobes: number, phase: number, harmonic = true): number {
+  const n = Math.floor(lobes);
+  const f = lobes - n;
+  const one = (k: number) => Math.sin(k * t - phase) + (harmonic ? 0.12 * Math.sin((k * 2 + 1) * t + phase * 1.7) : 0);
+  return f === 0 ? one(n) : (1 - f) * one(n) + f * one(n + 1);
+}
+
 /** One frame of the scope, from the current morph parameters `p`. Ported
  *  from the prototype's `draw()`: an afterglow fill (a low-alpha fill rather
  *  than a hard clear, so the previous frame bleeds through), then, each
@@ -223,7 +238,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       ctx.beginPath();
       for (let i = 0; i <= 240; i++) {
         const t = (i / 240) * Math.PI * 2;
-        const wave = Math.sin(lobes * t - c.phase) + 0.12 * Math.sin((lobes * 2 + 1) * t + c.phase * 1.7);
+        const wave = waveAt(t, lobes, c.phase);
         const r = rBase + amp * wave;
         const x = cx + Math.cos(t) * r * p.sx;
         const y = cy + Math.sin(t) * r * p.sy;
@@ -248,7 +263,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   const dotLive = Math.max(0, Math.min(1, (p.tempo - 0.3) / 0.7));
   if (active > 0.05 && p.sx > 0.5 && dotLive > 0.02) {
     const ang = -c.phase * 0.5;
-    const sr = rBase + amp * Math.sin(lobes * ang - c.phase);
+    const sr = rBase + amp * waveAt(ang, lobes, c.phase, false);
     ctx.beginPath();
     ctx.arc(cx + Math.cos(ang) * sr * p.sx, cy + Math.sin(ang) * sr * p.sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
     ctx.fillStyle = rgba(lift(cr, 0.55), lift(cg, 0.55), lift(cb, 0.55), (0.5 + 0.45 * active) * active * dotLive);
@@ -312,7 +327,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
         ctx.beginPath();
         for (let i = 0; i <= 120; i++) {
           const t = (i / 120) * Math.PI * 2;
-          const wave = Math.sin(lobes * t - c.phase) + 0.12 * Math.sin((lobes * 2 + 1) * t + c.phase * 1.7);
+          const wave = waveAt(t, lobes, c.phase);
           const r = (rBase + waveAmp * wave) * shrink;
           const x = cx + Math.cos(t) * r * p.sx;
           const y = cy + Math.sin(t) * r * p.sy;
@@ -500,7 +515,8 @@ export function TokenScope({
   // PROMPT shows a pulsing brain until the runtime reports the prompt size
   // mid-turn (#2889); then the count takes the center like any other number.
   const showBrain = state === "prompt" && centerLabel == null;
-  const showNumber = !showIcon && !showBrain && centerLabel != null;
+  // A number with its unit under it, or (#2890, idle) a unit on its own.
+  const showNumber = !showIcon && !showBrain && (centerLabel != null || !!centerUnit);
 
   // One center layer, keyed by WHAT it shows (not its value), so a number
   // ticking within a state never fades, only a change of kind does.
@@ -530,9 +546,11 @@ export function TokenScope({
     centerKey = `num:${state}`;
     centerNode = (
       <div className="token-scope-center" data-state={state}>
-        <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
-          {shownLabel}
-        </span>
+        {centerLabel != null ? (
+          <span className="token-scope-n" data-carried={centerCarried ? "true" : "false"}>
+            {shownLabel}
+          </span>
+        ) : null}
         {centerUnit ? <span className="token-scope-u">{centerUnit}</span> : null}
       </div>
     );

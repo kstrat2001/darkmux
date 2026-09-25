@@ -243,3 +243,20 @@ describe("(#2890) thinking", () => {
   });
 });
 
+
+describe("(#2890) waveAt closes the trace", () => {
+  it("meets itself after a full turn at a fractional lobe count (no seam)", async () => {
+    const { waveAt } = await import("./TokenScope");
+    for (const lobes of [3.4, 5.73, 7.99]) {
+      expect(waveAt(0, lobes, 1.3)).toBeCloseTo(waveAt(Math.PI * 2, lobes, 1.3), 9);
+    }
+  });
+});
+
+describe("(#2890) a unit on its own", () => {
+  it("renders the unit with no number (idle)", () => {
+    const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="idle" centerUnit="idle" />);
+    expect(container.querySelector(".token-scope-n")).toBeNull();
+    expect(container.querySelector(".token-scope-u")?.textContent).toBe("idle");
+  });
+});
