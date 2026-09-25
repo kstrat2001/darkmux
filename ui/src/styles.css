@@ -3639,6 +3639,8 @@ body {
   position: static;
 }
 .mach:has(> .mach-body--scope) .mach-scope {
+  /* Decorative: a tap on the tube reaches the card itself (#2890). */
+  pointer-events: none;
   top: 0;
   bottom: 0;
   right: 16px;

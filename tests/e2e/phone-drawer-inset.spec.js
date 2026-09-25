@@ -110,8 +110,13 @@ async function pinnedControls(page) {
     if (!stage) return [];
     return [...stage.querySelectorAll('*')]
       .filter((el) => {
-        const p = getComputedStyle(el).position;
+        const cs = getComputedStyle(el);
+        const p = cs.position;
         if (p !== 'absolute' && p !== 'fixed') return false;
+        // (#2890) `pointer-events: none` cannot be a control: nothing under
+        // the drawer bar is lost by it (the fleet card's scope tube and its
+        // center overlays are decorative and can reach the fold at rest).
+        if (cs.pointerEvents === 'none') return false;
         const b = el.getBoundingClientRect();
         return b.width > 0 && b.height > 0;
       })
