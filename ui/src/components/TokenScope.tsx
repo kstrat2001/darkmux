@@ -126,6 +126,11 @@ interface ScopeClocks {
   breathT: number;
   sweep: number;
   inwardT: number;
+  /** (#2890) The wave's WHOLE lobe count now, the one it is leaving, and how
+   *  far the crossfade between them has run (0..1, 1 = settled). */
+  lobeCur: number;
+  lobePrev: number;
+  lobeMix: number;
 }
 
 function prefersReducedMotion(): boolean {
@@ -180,19 +185,23 @@ function thinkingStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, p
   return g;
 }
 
-/** (#2890, operator: "the straight cut on the wave") The trace's radial
- *  offset at angle `t`. `lobes` follows the rate smoothly, so it is
- *  usually fractional, and `sin(lobes * t)` then does not meet itself after
- *  a full turn: closing the path drew a straight seam that spun with the
- *  wave. This blends the two neighboring WHOLE lobe counts by the fraction,
- *  each of which closes exactly, so the shape still changes smoothly with
- *  the rate and the curve is continuous all the way round. `harmonic`
- *  adds the small second term the main trace carries. */
-export function waveAt(t: number, lobes: number, phase: number, harmonic = true): number {
-  const n = Math.floor(lobes);
-  const f = lobes - n;
+/** (#2890) The trace's radial offset at angle `t`, for a crossfade from
+ *  `from` to `to` WHOLE lobes (`mix` 0..1).
+ *
+ *  Whole counts matter twice over. A fractional count (the rate maps to
+ *  one smoothly) does not meet itself after a full turn, so closing the
+ *  path drew a straight seam that spun with the wave (operator: "the
+ *  straight cut"). And blending two neighboring counts to fake the fraction
+ *  made them line up on one side and cancel on the other, so the left side
+ *  waved differently from the right (operator). Whole counts close exactly
+ *  and are rotationally symmetric; the count only changes by a short
+ *  crossfade when the rate moves enough (see `drawFrame`). `harmonic` adds
+ *  the small second term the main trace carries. */
+export function waveAt(t: number, from: number, to: number, mix: number, phase: number, harmonic = true): number {
   const one = (k: number) => Math.sin(k * t - phase) + (harmonic ? 0.12 * Math.sin((k * 2 + 1) * t + phase * 1.7) : 0);
-  return f === 0 ? one(n) : (1 - f) * one(n) + f * one(n + 1);
+  if (mix >= 1 || from === to) return one(to);
+  if (mix <= 0) return one(from);
+  return (1 - mix) * one(from) + mix * one(to);
 }
 
 /** One frame of the scope, from the current morph parameters `p`. Ported
@@ -226,7 +235,18 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   c.inwardT = (c.inwardT + dt * 0.45) % 1;
 
   ctx.globalCompositeOperation = "lighter";
-  const lobes = Math.min(8, 3 + tps / 22);
+  // The rate sets a lobe count; the wave draws a WHOLE count and glides to a
+  // new one over ~0.6 s when the rate has moved more than 0.6 of a lobe away
+  // (the hysteresis keeps it from flickering at a boundary). A static frame
+  // (dt 0, reduced motion) settles at once.
+  const lobeTarget = Math.min(8, 3 + tps / 22);
+  if (Math.abs(lobeTarget - c.lobeCur) > 0.6) {
+    c.lobePrev = c.lobeCur;
+    c.lobeCur = Math.round(lobeTarget);
+    c.lobeMix = 0;
+  }
+  c.lobeMix = dt > 0 ? Math.min(1, c.lobeMix + dt / 0.6) : 1;
+  const lobeEase = c.lobeMix * c.lobeMix * (3 - 2 * c.lobeMix);
   const breathe = 0.5 + 0.5 * Math.sin(c.breathT);
   const rBase = R * p.rscale * (1 + 0.06 * p.breath * (breathe - 0.5));
   const amp = R * (0.03 + 0.16 * active) * (1 - 0.8 * p.breath);
@@ -238,7 +258,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       ctx.beginPath();
       for (let i = 0; i <= 240; i++) {
         const t = (i / 240) * Math.PI * 2;
-        const wave = waveAt(t, lobes, c.phase);
+        const wave = waveAt(t, c.lobePrev, c.lobeCur, lobeEase, c.phase);
         const r = rBase + amp * wave;
         const x = cx + Math.cos(t) * r * p.sx;
         const y = cy + Math.sin(t) * r * p.sy;
@@ -263,7 +283,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
   const dotLive = Math.max(0, Math.min(1, (p.tempo - 0.3) / 0.7));
   if (active > 0.05 && p.sx > 0.5 && dotLive > 0.02) {
     const ang = -c.phase * 0.5;
-    const sr = rBase + amp * waveAt(ang, lobes, c.phase, false);
+    const sr = rBase + amp * waveAt(ang, c.lobePrev, c.lobeCur, lobeEase, c.phase, false);
     ctx.beginPath();
     ctx.arc(cx + Math.cos(ang) * sr * p.sx, cy + Math.sin(ang) * sr * p.sy, Math.max(1.4, R * 0.035), 0, Math.PI * 2);
     ctx.fillStyle = rgba(lift(cr, 0.55), lift(cg, 0.55), lift(cb, 0.55), (0.5 + 0.45 * active) * active * dotLive);
@@ -327,7 +347,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
         ctx.beginPath();
         for (let i = 0; i <= 120; i++) {
           const t = (i / 120) * Math.PI * 2;
-          const wave = waveAt(t, lobes, c.phase);
+          const wave = waveAt(t, c.lobePrev, c.lobeCur, lobeEase, c.phase);
           const r = (rBase + waveAmp * wave) * shrink;
           const x = cx + Math.cos(t) * r * p.sx;
           const y = cy + Math.sin(t) * r * p.sy;
@@ -406,7 +426,7 @@ export function TokenScope({
   const state: ScopeState = stateProp ?? legacyState(stalled, resting, tone);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const morphRef = useRef<ScopeMorph>(createMorph());
-  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random() });
+  const clocksRef = useRef<ScopeClocks>({ phase: Math.random() * 6, breathT: Math.random() * 6, sweep: Math.random() * 6, inwardT: Math.random(), lobeCur: 3, lobePrev: 3, lobeMix: 1 });
   // GEN's live rate, or a finished run's average for its echo (#2890).
   const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
   // The trace takes the state's color, read once per state change from the

@@ -244,11 +244,18 @@ describe("(#2890) thinking", () => {
 });
 
 
-describe("(#2890) waveAt closes the trace", () => {
-  it("meets itself after a full turn at a fractional lobe count (no seam)", async () => {
+describe("(#2890) waveAt: whole lobes, no seam, the same all the way round", () => {
+  it("closes after a full turn, settled or mid-crossfade", async () => {
     const { waveAt } = await import("./TokenScope");
-    for (const lobes of [3.4, 5.73, 7.99]) {
-      expect(waveAt(0, lobes, 1.3)).toBeCloseTo(waveAt(Math.PI * 2, lobes, 1.3), 9);
+    for (const [from, to, mix] of [[5, 5, 1], [5, 6, 0.4], [3, 8, 0.9]] as const) {
+      expect(waveAt(0, from, to, mix, 1.3)).toBeCloseTo(waveAt(Math.PI * 2, from, to, mix, 1.3), 9);
+    }
+  });
+  it("a settled wave looks the same on every side (rotational symmetry)", async () => {
+    const { waveAt } = await import("./TokenScope");
+    const n = 5;
+    for (const t of [0.2, 1.1, 2.7]) {
+      expect(waveAt(t, n, n, 1, 0.7, false)).toBeCloseTo(waveAt(t + (2 * Math.PI) / n, n, n, 1, 0.7, false), 9);
     }
   });
 });
