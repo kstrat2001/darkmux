@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, act } from "@testing-library/react";
 import { TokenScope } from "./TokenScope";
 
@@ -62,7 +62,7 @@ describe("TokenScope center, per state (#2890)", () => {
   });
 
   it("no brain outside PROMPT", () => {
-    for (const state of ["generating", "tools", "rest", "stalled", "finished"] as const) {
+    for (const state of ["generating", "tools", "rest", "stalled", "finished", "idle", "nosignal"] as const) {
       const { container } = render(<TokenScope tokensPerSec={0} size="tile" state={state} />);
       expect(container.querySelector("[data-scope-icon]")).toBeNull();
     }
@@ -130,5 +130,103 @@ describe("TokenScope center crossfade (#2890)", () => {
     const { container, rerender } = render(<TokenScope tokensPerSec={100} size="tile" state="generating" centerLabel="100" centerUnit="tok/s" />);
     rerender(<TokenScope tokensPerSec={140} size="tile" state="generating" centerLabel="140" centerUnit="tok/s" />);
     expect(container.querySelector(".token-scope-fade--out")).toBeNull();
+  });
+});
+
+// (#2890 review) The canvas lifecycle. jsdom returns null from
+// `getContext("2d")`, so without a stub the whole effect returns early and
+// none of the loop / observer / listener wiring runs in a test at all.
+describe("TokenScope canvas lifecycle (#2890)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    delete (document as unknown as { hidden?: boolean }).hidden;
+  });
+
+  function harness() {
+    // A 2D context whose every method is a chainable no-op (a gradient's
+    // `addColorStop` included); property writes are kept.
+    const store: Record<string | symbol, unknown> = {};
+    const ctx: unknown = new Proxy(store, {
+      get: (t, k) => (k in t ? t[k] : () => ctx),
+      set: (t, k, v) => {
+        t[k] = v;
+        return true;
+      },
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(ctx as CanvasRenderingContext2D);
+    // Motion allowed: the loop only runs when reduced motion is off.
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (q: string) => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {} }) as unknown as MediaQueryList,
+    );
+    let nextId = 0;
+    const frames = new Map<number, FrameRequestCallback>();
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
+      nextId += 1;
+      frames.set(nextId, cb);
+      return nextId;
+    });
+    const caf = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe = observe;
+        disconnect = disconnect;
+        unobserve() {}
+      },
+    );
+    let hidden = false;
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+    const add = vi.spyOn(document, "addEventListener");
+    const remove = vi.spyOn(document, "removeEventListener");
+    const setHidden = (h: boolean) => {
+      hidden = h;
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+    };
+    const visibilityHandler = () => add.mock.calls.find((c) => c[0] === "visibilitychange")?.[1];
+    return { raf, caf, frames, observe, disconnect, add, remove, setHidden, visibilityHandler };
+  }
+
+  it("starts the loop and observes its box on mount", () => {
+    const h = harness();
+    const { container } = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    expect(h.raf).toHaveBeenCalledTimes(1);
+    expect(h.observe).toHaveBeenCalledWith(container.querySelector("canvas"));
+    expect(h.visibilityHandler()).toBeTypeOf("function");
+    // A frame schedules the next one: it is a loop, not a single draw.
+    const [[id, cb]] = [...h.frames];
+    h.frames.delete(id); // the browser consumes a frame when it fires it
+    act(() => cb(16));
+    expect(h.raf).toHaveBeenCalledTimes(2);
+    expect(h.frames.size).toBe(1);
+  });
+
+  it("hiding the document stops the loop; showing it again restarts it", () => {
+    const h = harness();
+    render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    h.frames.clear();
+    const firstId = h.raf.mock.results[0].value as number;
+    h.setHidden(true);
+    expect(h.caf).toHaveBeenCalledWith(firstId);
+    h.setHidden(false);
+    expect(h.raf).toHaveBeenCalledTimes(2);
+  });
+
+  it("unmounting cancels the pending frame, disconnects the observer, and removes the listener", () => {
+    const h = harness();
+    const { unmount } = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+    const handler = h.visibilityHandler();
+    const pending = h.raf.mock.results[0].value as number;
+    unmount();
+    expect(h.caf).toHaveBeenCalledWith(pending);
+    expect(h.frames.size).toBe(0);
+    expect(h.disconnect).toHaveBeenCalled();
+    expect(h.remove).toHaveBeenCalledWith("visibilitychange", handler);
   });
 });
