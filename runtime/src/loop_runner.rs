@@ -5194,7 +5194,7 @@ fn run_streaming_turn(
     let mut cut = CutSource::None;
     // (#2889) Ticking, so the loop wakes during a silence and can say the
     // model is still writing a tool call — see `TickingStream`'s doc.
-    let stream = crate::lmstudio::TickingStream::spawn(client.chat_streaming(request)?, watch.tick);
+    let stream = client.chat_streaming_ticking(request, watch.tick)?;
     for chunk_result in stream {
         // (#2836 stage 2) A SILENT stream ends the turn; it does not kill the
         // dispatch.
@@ -5342,10 +5342,12 @@ fn run_streaming_turn(
                     policy.as_str(),
                 );
                 cut = CutSource::RuntimeAbort(AbortReason::Degenerate);
-                // Dropping the stream drops ureq's pooled reader, so the
-                // socket closes rather than returning to the pool
-                // half-read. LMStudio logs `Client disconnected. Stopping
-                // generation...` about a second later.
+                // Leaving the loop drops the `TickingStream`, whose drop
+                // shuts the socket down at once (#2889 review) — its reader
+                // thread may be blocked in a read that would otherwise hold
+                // the connection open for the whole read timeout. The half-
+                // read connection never returns to ureq's pool. LMStudio
+                // logs `Client disconnected. Stopping generation...`.
                 break;
             }
         }

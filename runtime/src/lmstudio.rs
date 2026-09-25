@@ -15,7 +15,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 /// Default base URL the runtime container talks to. Configurable via
@@ -530,10 +530,20 @@ impl LmStudioClient {
     /// final `ChatResponse` via `into_response()`. The wire request is
     /// the same shape as `chat`, with `stream: true` injected
     /// unconditionally. (#205)
+    ///
+    /// Test-only since #2889's review: production streams through
+    /// [`Self::chat_streaming_ticking`], whose drop closes the connection.
+    #[cfg(test)]
     pub fn chat_streaming(
         &self,
         req: &ChatRequest,
-    ) -> Result<ChunkStream<BufReader<Box<dyn Read + Send + Sync>>>> {
+    ) -> Result<ChunkStream<BufReader<Box<dyn std::io::Read + Send + Sync>>>> {
+        let resp = self.send_streaming(req)?;
+        Ok(ChunkStream::new(BufReader::new(resp.into_reader())))
+    }
+
+    /// The one streaming POST both entry points share.
+    fn send_streaming(&self, req: &ChatRequest) -> Result<ureq::Response> {
         let url = self.effective_chat_url();
         let body = build_streaming_request_body(req, self.is_remote_brain())?;
         let request = self.apply_auth_header(
@@ -542,8 +552,18 @@ impl LmStudioClient {
                 .set("content-type", "application/json")
                 .set("accept", "text/event-stream"),
         );
-        let resp = send_capturing_error(request.send_json(body), "streaming")?;
-        Ok(ChunkStream::new(BufReader::new(resp.into_reader())))
+        send_capturing_error(request.send_json(body), "streaming")
+    }
+
+    /// (#2889) The streaming call behind a [`TickingStream`], holding a
+    /// second handle on the connection so that dropping the stream closes
+    /// it at once (see [`TickingStream`]'s doc for why the reader thread
+    /// cannot do that itself).
+    pub fn chat_streaming_ticking(&self, req: &ChatRequest, tick: Duration) -> Result<TickingStream> {
+        let resp = self.send_streaming(req)?;
+        let closer = connection_handle(resp.local_addr(), resp.remote_addr());
+        let inner = ChunkStream::new(BufReader::new(resp.into_reader()));
+        Ok(TickingStream::spawn(inner, tick).with_closer(closer))
     }
 }
 
@@ -1148,14 +1168,30 @@ pub enum StreamEvent {
 /// error, so an idle tick never extends how long a wedged endpoint is
 /// waited on.
 ///
-/// Dropping this early (the gate cutting a stream) drops the receiver; the
-/// reader thread exits at its next send, which closes the connection one
-/// chunk later than dropping the stream directly used to. A cut only ever
-/// happens while chunks are flowing, so that is milliseconds.
+/// Dropping this early (the gate cutting a stream) must close the
+/// connection at once, so the endpoint stops generating for nobody. The
+/// reader thread owns the response body and is usually blocked in a read,
+/// which only returns when bytes arrive or the socket's read timeout
+/// (`REQUEST_READ_TIMEOUT_SECS`, minutes) fires; dropping the receiver alone
+/// left the socket open that long (#2889 review). So the stream also holds
+/// a duplicate handle on the same socket ([`connection_handle`]) and shuts
+/// it down on drop: the blocked read returns at once, the thread's next
+/// send fails, and it exits, closing its end.
+///
+/// A short read timeout plus a retry loop on the reader thread was weighed
+/// and rejected: ureq 2's chunked decoder does not survive a timeout inside
+/// a chunk's framing (a partly read size line, or the CRLF after the data,
+/// is lost and the next read fails as a decode error), so a healthy stream
+/// could be broken by the very mechanism meant to end a dead one.
 pub struct TickingStream {
     rx: std::sync::mpsc::Receiver<Result<ChatChunk>>,
     tick: Duration,
     done: bool,
+    reader: Option<std::thread::JoinHandle<()>>,
+    closer: Option<std::net::TcpStream>,
+    /// The reader finished its iterator: the body was read to its end and
+    /// ureq may have pooled the connection, so the drop must leave it be.
+    clean_end: bool,
 }
 
 impl TickingStream {
@@ -1164,15 +1200,70 @@ impl TickingStream {
         I: Iterator<Item = Result<ChatChunk>> + Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             for item in inner {
                 if tx.send(item).is_err() {
                     break;
                 }
             }
         });
-        Self { rx, tick, done: false }
+        Self { rx, tick, done: false, reader: Some(reader), closer: None, clean_end: false }
     }
+
+    /// Hold `closer`, a second handle on the stream's socket, and shut the
+    /// socket down when this stream is dropped. `None` (the socket could not
+    /// be found) keeps the old behavior: the connection closes when the
+    /// reader thread's blocked read next returns.
+    pub fn with_closer(mut self, closer: Option<std::net::TcpStream>) -> Self {
+        self.closer = closer;
+        self
+    }
+}
+
+impl Drop for TickingStream {
+    fn drop(&mut self) {
+        if let Some(sock) = self.closer.take().filter(|_| !self.clean_end) {
+            // Shutdown acts on the socket, not this descriptor, so it also
+            // wakes the reader thread's blocked read on its own descriptor.
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+        // Never join here: without a closer the reader may still be blocked
+        // for the whole read timeout.
+    }
+}
+
+/// (#2889 review) A second, owned handle on the connection whose ends are
+/// `local` and `remote` — ureq exposes both addresses on the response but
+/// not the socket itself. The pair is the TCP connection's identity, so a
+/// descriptor matching both is this connection and nothing else (a pooled
+/// idle connection to the same endpoint has a different local port).
+///
+/// Found by walking this process's open descriptors: each one is queried
+/// for its addresses WITHOUT being taken over (`ManuallyDrop`, never
+/// closed), and only the match is duplicated. Returns `None` off Unix or
+/// when no descriptor matches.
+#[cfg(unix)]
+fn connection_handle(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Option<std::net::TcpStream> {
+    use std::os::fd::{FromRawFd, RawFd};
+    let dir = std::fs::read_dir("/dev/fd").or_else(|_| std::fs::read_dir("/proc/self/fd")).ok()?;
+    for entry in dir.flatten() {
+        let Some(fd) = entry.file_name().to_str().and_then(|n| n.parse::<RawFd>().ok()) else {
+            continue;
+        };
+        // SAFETY: the descriptor is only queried (getsockname/getpeername,
+        // which fail harmlessly on a non-socket or an already-closed fd) and
+        // `ManuallyDrop` guarantees it is never closed through this handle.
+        let probe = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(fd) });
+        if probe.local_addr().ok() == Some(local) && probe.peer_addr().ok() == Some(remote) {
+            return probe.try_clone().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn connection_handle(_local: std::net::SocketAddr, _remote: std::net::SocketAddr) -> Option<std::net::TcpStream> {
+    None
 }
 
 impl Iterator for TickingStream {
@@ -1188,7 +1279,16 @@ impl Iterator for TickingStream {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Ok(StreamEvent::Idle)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 self.done = true;
-                None
+                // (#2889 review) The sender is gone. A reader that finished
+                // its iterator ended the stream cleanly; one that panicked
+                // did not, and must not read as a complete response.
+                match self.reader.take().map(|h| h.join()) {
+                    Some(Err(_)) => Some(Err(anyhow!("SSE reader thread panicked mid-stream"))),
+                    _ => {
+                        self.clean_end = true;
+                        None
+                    }
+                }
             }
         }
     }
@@ -2146,5 +2246,252 @@ mod tests {
             "an idle stream must surface as StreamWentSilent, not a generic \
              transport failure — the caller routes on the type. got: {err}"
         );
+    }
+
+    // ─── (#2889 review) A TickingStream's lifetime is the connection's ───
+
+    fn one_line_req() -> ChatRequest {
+        ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: 0.0,
+            max_tokens: Some(16),
+            response_format: None,
+        }
+    }
+
+    /// Serve one SSE response: the head and ONE chunk, then go silent and
+    /// wait to learn when the client closes. Sends the moment the socket
+    /// read end-of-stream (or errored) on `closed`, or nothing if the client
+    /// held it open past `watch`.
+    fn sse_server_one_chunk_then_silent(
+        watch: std::time::Duration,
+    ) -> (String, std::sync::mpsc::Receiver<std::time::Instant>) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Drain the request head and body (see `sse_server_with_gaps`).
+            let mut head = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if head.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                let _ = head.read_exact(&mut body);
+            }
+            let payload = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"t0\"}}]}\n\n";
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+            // The model goes silent. The client sends nothing more, so the
+            // next read returns only when the client closes its end.
+            sock.set_read_timeout(Some(watch)).unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(std::time::Instant::now());
+                        return;
+                    }
+                    Ok(_) => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return; // held open past `watch`: send nothing
+                    }
+                    Err(_) => {
+                        let _ = tx.send(std::time::Instant::now());
+                        return;
+                    }
+                }
+            }
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
+    /// (#2889 review) Dropping a TickingStream while the endpoint is silent
+    /// must close the connection at once. Before this the reader thread
+    /// owned the body and held the socket until its blocked read returned —
+    /// up to `REQUEST_READ_TIMEOUT_SECS` — so a stream the degeneracy gate
+    /// cut kept the endpoint generating for nobody.
+    #[test]
+    fn dropping_a_ticking_stream_closes_the_connection_promptly() {
+        let (url, closed) = sse_server_one_chunk_then_silent(std::time::Duration::from_secs(6));
+        let client = LmStudioClient::with_base_url(url);
+        let mut stream = client
+            .chat_streaming_ticking(&one_line_req(), std::time::Duration::from_millis(50))
+            .unwrap();
+        loop {
+            match stream.next() {
+                Some(Ok(StreamEvent::Chunk(_))) => break,
+                Some(Ok(StreamEvent::Idle)) => continue,
+                other => panic!("expected the first chunk, got {:?}", other.map(|r| r.map(|_| ()))),
+            }
+        }
+        let dropped_at = std::time::Instant::now();
+        drop(stream);
+        let seen = closed
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .expect("the server never saw the connection close: the dropped stream held it open");
+        let lag = seen.saturating_duration_since(dropped_at);
+        assert!(
+            lag < std::time::Duration::from_millis(1500),
+            "the connection closed {lag:?} after the drop; it must close promptly"
+        );
+    }
+
+    /// (#2889 review) Ticking changes WHEN the caller wakes, never WHAT it
+    /// reads: the same chunks arrive, in the same order, with and without it.
+    #[test]
+    fn ticking_yields_the_same_chunks_as_the_plain_stream() {
+        let contents = |chunks: Vec<ChatChunk>| -> Vec<String> {
+            chunks
+                .iter()
+                .flat_map(|c| c.choices.iter().filter_map(|d| d.delta.content.clone()))
+                .collect()
+        };
+        let gap = std::time::Duration::from_millis(30);
+        let plain_client = LmStudioClient::with_base_url(sse_server_with_gaps(5, gap));
+        let plain: Vec<ChatChunk> =
+            plain_client.chat_streaming(&one_line_req()).unwrap().map(|c| c.unwrap()).collect();
+        let ticking_client = LmStudioClient::with_base_url(sse_server_with_gaps(5, gap));
+        let ticked: Vec<ChatChunk> = ticking_client
+            .chat_streaming_ticking(&one_line_req(), std::time::Duration::from_millis(10))
+            .unwrap()
+            .filter_map(|e| match e.unwrap() {
+                StreamEvent::Chunk(c) => Some(c),
+                StreamEvent::Idle => None,
+            })
+            .collect();
+        assert_eq!(contents(plain.clone()), vec!["t0", "t1", "t2", "t3", "t4"]);
+        assert_eq!(contents(ticked), contents(plain));
+    }
+
+    /// (#2889 review) A body read to its end hands its connection back to
+    /// ureq's keep-alive pool; the drop-time shutdown must not reach it, or
+    /// the next call on this client inherits a dead socket. (A stream ended
+    /// by `data: [DONE]` stops short of the body's end and is never pooled;
+    /// an endpoint that just ends the body without it, as this one does, is.)
+    #[test]
+    fn a_cleanly_finished_ticking_stream_leaves_its_pooled_connection_alive() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (a, sv) = (accepts.clone(), served.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { return };
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let sv2 = sv.clone();
+                std::thread::spawn(move || {
+                    let mut rd = std::io::BufReader::new(sock.try_clone().unwrap());
+                    loop {
+                        let mut content_length = 0usize;
+                        let mut first = true;
+                        loop {
+                            let mut line = String::new();
+                            if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" && !first {
+                                break;
+                            }
+                            first = false;
+                            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; content_length];
+                        if rd.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let payload = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"t0\"}}]}\n\n";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                             Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n0\r\n\r\n",
+                            payload.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).is_err() {
+                            return;
+                        }
+                        let _ = sock.flush();
+                        sv2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        let client = LmStudioClient::with_base_url(format!("http://{addr}/v1"));
+        for call in 0..2 {
+            let events: Vec<_> = client
+                .chat_streaming_ticking(&one_line_req(), std::time::Duration::from_millis(20))
+                .unwrap()
+                .collect();
+            assert!(
+                events.iter().all(|e| e.is_ok()),
+                "call {call} must stream cleanly on a reused connection"
+            );
+            assert!(
+                events.iter().any(|e| matches!(e, Ok(StreamEvent::Chunk(_)))),
+                "call {call} must deliver its chunk"
+            );
+        }
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call reuses the first call's pooled connection"
+        );
+    }
+
+    /// (#2889 review) A reader thread that panics is a failed stream, not a
+    /// finished one: the caller must see an error, never a clean end that
+    /// banks a truncated turn as complete.
+    #[test]
+    fn a_panicking_reader_thread_surfaces_as_an_error_not_a_clean_end() {
+        let chunk: ChatChunk =
+            serde_json::from_str(r#"{"id":"c","choices":[{"index":0,"delta":{"content":"t0"}}]}"#).unwrap();
+        let mut yielded = false;
+        let inner = std::iter::from_fn(move || {
+            if yielded {
+                panic!("reader blew up mid-stream");
+            }
+            yielded = true;
+            Some(Ok(chunk.clone()))
+        });
+        let mut stream = TickingStream::spawn(inner, std::time::Duration::from_millis(20));
+        let mut saw_chunk = false;
+        let mut saw_err = false;
+        for ev in stream.by_ref() {
+            match ev {
+                Ok(StreamEvent::Chunk(_)) => saw_chunk = true,
+                Ok(StreamEvent::Idle) => {}
+                Err(_) => saw_err = true,
+            }
+        }
+        assert!(saw_chunk, "the chunk before the panic still arrives");
+        assert!(saw_err, "a panicked reader must end the stream with an error");
     }
 }
