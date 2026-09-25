@@ -1,81 +1,62 @@
 /**
- * (#2890, operator 2026-09-25: "designate a square for the scope to utilize
- * a more full space on right") Sizes each fleet card's scope tube as a
- * reserved square on the right, from the room the card has, instead of one
- * fixed size and instead of letting the text on the left squeeze it.
+ * (#2890) Sizes each fleet card's scope tube from the room the card has.
  *
- * - **height room:** the tallest TEXT block of any card in the same row (a
- *   card is stretched to its row, e.g. by a neighbor's pager). Not the card's
- *   own height: that includes this card's `min-height` (tube + padding), so
- *   a tube sized from it could never shrink once the row got shorter. A card
- *   alone on its row (stacked, as on a phone) has no height bound: it grows
- *   downward to fit the square.
- * - **width share:** at most `TUBE_WIDTH_SHARE` of the card's inner width, so
- *   the text column keeps the rest. Text that does not fit ellipsizes; it
- *   never shrinks the square.
+ * Two layouts, matching `styles.css`:
  *
- * Clamped to [`TUBE_MIN`, `TUBE_MAX`] and written as the card's `--tube`,
- * which the CSS uses for the tube, the text gutter and the card's minimum
- * height.
+ * - **Desktop (over 560px):** the tube is a centered block between the
+ *   card's header and its status lines, so it is bounded by the card's
+ *   WIDTH only and the card grows downward to fit it (operator: with three
+ *   across "there's plenty of room down to make these taller"). 55% of the
+ *   inner width, clamped [`STACKED_MIN`, `STACKED_MAX`].
+ * - **Phone:** the tube sits to the right of the text as a reserved square:
+ *   at most `TUBE_WIDTH_SHARE` of the inner width and never into the
+ *   `TEXT_RESERVE` floor the text column keeps, clamped [`TUBE_MIN`,
+ *   `TUBE_MAX`]. The card grows to the square.
+ *
+ * Written as the card's `--tube`, which the CSS uses for the tube's size,
+ * the text gutter and (phone) the card's minimum height.
  */
 
 export const TUBE_MIN = 88;
 export const TUBE_MAX = 150;
 export const TUBE_WIDTH_SHARE = 0.45;
-/** The text column's floor: the lines beside the tube ("dispatch in
- *  flight", the hardware line) measure up to about 180px, so the square
- *  takes what is left after it, never the text's room. */
+/** The text column's floor beside a phone tube: the widest lines ("dispatch
+ *  in flight", the hardware line) measure up to about 180px. */
 export const TEXT_RESERVE = 184;
+export const STACKED_SHARE = 0.55;
+export const STACKED_MIN = 120;
+export const STACKED_MAX = 180;
 
 function px(v: string): number {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : 0;
 }
 
-/** Height of a card's in-flow text: from the top of its first row to the
- *  bottom of its last, which excludes the absolutely positioned tube and
- *  this card's own `min-height`. */
-function textBlockHeight(card: HTMLElement): number {
-  const kids = [...card.children] as HTMLElement[];
-  if (!kids.length) return 0;
-  const top = kids[0].getBoundingClientRect().top;
-  const bottom = Math.max(...kids.map((k) => k.getBoundingClientRect().bottom));
-  return Math.max(0, bottom - top);
+/** The tube beside the text (phone): its width share, never into the text
+ *  floor. Pure arithmetic, exported for tests. */
+export function tubeSize(innerWidth: number): number {
+  const byWidth = Math.min(innerWidth * TUBE_WIDTH_SHARE, innerWidth - TEXT_RESERVE - 12);
+  return Math.floor(Math.max(TUBE_MIN, Math.min(TUBE_MAX, byWidth)));
 }
 
-/** The tube size for one card: the row's height room (`null` = none, a card
- *  alone on its row), capped by the card's width share and by what the
- *  text column's floor leaves. Pure arithmetic,
- *  exported for tests. */
-export function tubeSize(innerWidth: number, rowTextHeight: number | null): number {
-  const byWidth = Math.min(innerWidth * TUBE_WIDTH_SHARE, innerWidth - TEXT_RESERVE - 12);
-  const bound = rowTextHeight === null ? byWidth : Math.min(byWidth, rowTextHeight);
-  return Math.floor(Math.max(TUBE_MIN, Math.min(TUBE_MAX, bound)));
+/** The tube stacked between header and status (desktop). */
+export function stackedTubeSize(innerWidth: number): number {
+  return Math.floor(Math.max(STACKED_MIN, Math.min(STACKED_MAX, innerWidth * STACKED_SHARE)));
 }
 
 /** Fits every scope-bearing card under `root`. Safe to call on every render
  *  and resize: it reads layout, then writes one custom property per card.
- *  Without layout (a test DOM) every size reads 0 and the CSS default is
+ *  Without layout (a test DOM) every width reads 0 and the CSS default is
  *  kept. */
 export function fitTubes(root: HTMLElement | null): void {
   if (!root) return;
-  const all = [...root.querySelectorAll<HTMLElement>(".mach")];
-  const cards = all.filter((c) => c.querySelector(".mach-scope"));
+  const cards = [...root.querySelectorAll<HTMLElement>(".mach")].filter((c) => c.querySelector(".mach-scope"));
   if (!cards.length) return;
-  const rowOf = (c: HTMLElement) => Math.round(c.getBoundingClientRect().top);
-  const rowText = new Map<number, number>();
-  const rowCount = new Map<number, number>();
-  for (const c of all) {
-    const r = rowOf(c);
-    rowText.set(r, Math.max(rowText.get(r) ?? 0, textBlockHeight(c)));
-    rowCount.set(r, (rowCount.get(r) ?? 0) + 1);
-  }
+  const phone = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(max-width: 560px)").matches;
   for (const card of cards) {
     const cs = getComputedStyle(card);
     const innerW = card.clientWidth - px(cs.paddingLeft) - px(cs.paddingRight);
     if (innerW <= 0) continue;
-    const r = rowOf(card);
-    const alone = (rowCount.get(r) ?? 1) === 1;
-    card.style.setProperty("--tube", `${tubeSize(innerW, alone ? null : (rowText.get(r) ?? null))}px`);
+    card.style.setProperty("--tube", `${phone ? tubeSize(innerW) : stackedTubeSize(innerW)}px`);
   }
 }

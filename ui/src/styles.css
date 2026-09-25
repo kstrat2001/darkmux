@@ -3455,7 +3455,10 @@ body {
    fill the row instead of leaving most of it empty. */
 .fleet {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(max(260px, calc((100% - 32px) / 3)), 1fr));
+  /* (#2890, operator on a large screen) A card is a third of the row, but
+     never under 260px or over 460px: past that a wide screen gets more
+     columns, not ever-longer, thinner cards. */
+  grid-template-columns: repeat(auto-fill, clamp(260px, calc((100% - 32px) / 3), 460px));
   gap: 16px;
   align-items: stretch;
 }
@@ -3655,6 +3658,34 @@ body {
     --tube: clamp(104px, calc(100vw - 262px), 150px);
   }
 }
+/* (#2890, operator: "if it's 3 across there's plenty of room down to make
+   these taller") On a desktop the tube is a centered block between the
+   header and the status lines, so it is sized by the card's width (see
+   `tubeFit.ts`) and the card grows downward, instead of being squeezed
+   beside the text. The phone keeps the tube beside the text above. */
+@media (min-width: 561px) {
+  .mach:has(> .mach-body--scope) {
+    --tube: 150px;
+    min-height: 0;
+  }
+  .mach:has(> .mach-body--scope) > .name,
+  .mach:has(> .mach-body--scope) > .spec {
+    margin-right: 0;
+  }
+  .mach:has(> .mach-body--scope) > .mach-body--scope {
+    display: flex;
+    flex-direction: column;
+    padding-right: 0;
+  }
+  .mach:has(> .mach-body--scope) .mach-scope {
+    position: static;
+    order: -1;
+    align-self: center;
+    width: var(--tube);
+    height: var(--tube);
+    margin: 12px 0 14px;
+  }
+}
 
 .mach-scope__rate {
   margin-top: 5px;
@@ -3784,6 +3815,11 @@ body {
 @media (max-width: 560px) {
   .mach {
     width: 100%;
+  }
+  /* A phone stacks full-width cards; the desktop track's 260-460px clamp
+     would leave one narrow column. */
+  .fleet {
+    grid-template-columns: 1fr;
   }
 }
 
