@@ -565,7 +565,9 @@ fn parse_libtest_summary_finds_a_summary_line_in_stderr_too() {
 ///
 /// Set `DARKMUX_LEAK_CHECK=1` to run it; add
 /// `DARKMUX_LEAK_CHECK_ONLY=<substring>` to narrow to one unit, which is
-/// what makes red-proving a single target cheap.
+/// what makes red-proving a single target cheap. Units run concurrently;
+/// `DARKMUX_LEAK_CHECK_JOBS=<n>` sets how many at once (default: the
+/// machine's parallelism; `1` is the old one-at-a-time order).
 #[test]
 fn no_test_unit_writes_into_a_sentinel_state_tree() {
     if std::env::var_os("DARKMUX_LEAK_CHECK").is_none() {
@@ -592,10 +594,19 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
          passes this test while measuring nothing"
     );
 
-    let mut offenders: Vec<String> = Vec::new();
-    let mut inconclusive: Vec<String> = Vec::new();
-    let mut clean = 0usize;
-    for unit in &units {
+    // (#2896) The units run CONCURRENTLY, `jobs` at a time. Each child still
+    // gets its own sentinel tree (its own `HOME`, `TMPDIR` and
+    // `DARKMUX_HOME`), and its census is taken the moment it exits, so one
+    // unit's writes can never be counted against another. Run one after
+    // another, this step was the longest in PR CI (346-510s measured on
+    // macos-latest). The verdicts below are then read in the units' own
+    // order, so the report does not depend on which child finished first.
+    let jobs = std::env::var("DARKMUX_LEAK_CHECK_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
+    let run_unit = |unit: &Unit| {
         let sentinel = StateLeakSentinel::new();
         let mut cmd = std::process::Command::new(&cargo);
         cmd.current_dir(manifest_dir).args(unit.cargo_args());
@@ -604,6 +615,7 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
         // runs starts a sweep of its own.
         cmd.env_remove("DARKMUX_LEAK_CHECK");
         cmd.env_remove("DARKMUX_LEAK_CHECK_ONLY");
+        cmd.env_remove("DARKMUX_LEAK_CHECK_JOBS");
         // Cargo's jobserver file descriptors do not survive into an
         // unrelated child cleanly; letting it negotiate its own avoids a
         // warning storm on every unit.
@@ -611,6 +623,35 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
 
         let out = cmd.output().unwrap_or_else(|e| panic!("spawning `cargo {}`: {e}", unit.label()));
         let census = sentinel.census();
+        (out, census)
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<_>>> = units.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(units.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(unit) = units.get(i) else { break };
+                let result = run_unit(unit);
+                *slots[i].lock().expect("a result slot") = Some(result);
+            });
+        }
+    });
+    eprintln!(
+        "ran {} unit(s), {jobs} at a time, in {:.0}s",
+        units.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut inconclusive: Vec<String> = Vec::new();
+    let mut clean = 0usize;
+    for (unit, slot) in units.iter().zip(slots) {
+        let (out, census) = slot
+            .into_inner()
+            .expect("a result slot")
+            .unwrap_or_else(|| panic!("`cargo {}` never ran: its worker died first", unit.label()));
         let stdout_text = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr_text = String::from_utf8_lossy(&out.stderr).into_owned();
 

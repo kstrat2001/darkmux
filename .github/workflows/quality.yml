@@ -56,9 +56,13 @@ name: quality
 on:
   pull_request:
     branches: [main]
+    # (#2896) `labeled` so adding `full-ci` to an open PR runs what it
+    # unlocks here: the PR-diff mutation jobs and coverage.
+    types: [opened, synchronize, reopened, labeled]
   # (#1792) Coverage also runs on main so the README badge reflects MAIN,
-  # not whichever PR happened to publish last. The mutation jobs stay
-  # PR/schedule-only — they are gated on their own `if:` below.
+  # not whichever PR happened to publish last. The PR-diff mutation jobs
+  # run only on PRs labeled `full-ci` (#2896); the nightly sweep covers the
+  # whole workspace. Each job is gated on its own `if:` below.
   push:
     branches: [main]
   schedule:
@@ -193,7 +197,11 @@ jobs:
     # new false-failure source.
     name: "mutation — tests that cannot fail (PR diff only, root, shard ${{ matrix.shard }}/6)"
     runs-on: macos-latest
-    if: github.event_name == 'pull_request'
+    # (#2896) Only on a PR labeled `full-ci`. An ordinary PR is the light
+    # gate; merged code is mutated by the nightly whole-workspace sweep
+    # below. Every PR queued up to 7 of these macOS jobs against a ~5-job
+    # macOS concurrency limit, measured at up to 13 minutes of queueing.
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -354,7 +362,10 @@ jobs:
     name: mutation — PR diff root floor check (aggregate across shards)
     runs-on: macos-latest
     needs: mutants-in-diff
-    if: always() && github.event_name == 'pull_request'
+    # (#2896) Same `full-ci` gate as the shards: without it, `always()` would
+    # start this job on an unlabeled PR whose shards were skipped, and it
+    # would fail on their missing artifacts.
+    if: always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -466,7 +477,8 @@ jobs:
     # for exactly the scope #2602 already showed could fill it.
     name: mutation — tests that cannot fail (PR diff only, runtime/ + bundler/)
     runs-on: macos-latest
-    if: github.event_name == 'pull_request'
+    # (#2896) Only on a PR labeled `full-ci`, like the root shards.
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -702,6 +714,10 @@ jobs:
   coverage:
     name: coverage — which lines never execute
     runs-on: macos-latest
+    # (#2896) On main pushes and the schedule, and on a PR labeled `full-ci`.
+    # It reports and gates nothing, and held a macOS slot for ~700s on
+    # every PR.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     permissions:
       contents: write   # pushes the badge branch (main only)
     timeout-minutes: 30

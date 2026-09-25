@@ -19,8 +19,10 @@
 #      accepted and never answered), turning a 6s suite into 10+ minutes of
 #      silence. A hang that reports nothing is the worst kind of green.
 #
-# The repo has ZERO doctests (verified), which nextest does not run — so
-# nothing is lost by routing everything through it.
+# nextest does not run doctests. The repo has ONE: a `compile_fail` check that
+# `darkmux_crew::workspace_spec::WorkspaceLock` stays `!Send` (#2399). CI runs
+# it in its own `cargo test --workspace --doc` step; locally, run that command
+# when you touch that type.
 #
 # Needs: cargo install cargo-nextest --locked
 #

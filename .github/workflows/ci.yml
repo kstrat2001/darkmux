@@ -47,6 +47,10 @@ on:
     # paths-filters below mean a UI-only PR into `ui/port` still skips the
     # heavy Rust jobs, so this costs little and closes a real hole.
     branches: [main, ui/port]
+    # (#2896) `labeled` so adding the `full-ci` label to an open PR runs the
+    # heavy checks it unlocks (the isolation leak check below) without a
+    # re-push.
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   # Daily advisory sweep: catches a newly-disclosed RUSTSEC advisory against an
@@ -138,9 +142,30 @@ jobs:
       # step: `cargo clippy --all-targets` below already compiles every
       # target (bins/examples/tests), so a plain build-only check would be
       # redundant work, not extra coverage.
+      # (#2896) nextest, the repo's documented runner (`.cargo/config.toml`'s
+      # `t-*` aliases), under `.config/nextest.toml`'s `ci` profile: no
+      # retries, so a flake fails the gate instead of passing on luck, and a
+      # per-test `terminate-after`, so a hung test fails loudly instead of
+      # running the job into its timeout. nextest does not run doctests; the
+      # step after this one does. The leak check below still drives `cargo
+      # test` children and reuses this step's build.
+      - name: Install cargo-nextest
+        if: steps.filter.outputs.rust == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
+
       - name: Test (whole workspace)
         if: steps.filter.outputs.rust == 'true'
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
+
+      # (#2896) The one doctest nextest skips: a `compile_fail` check that
+      # `WorkspaceLock` stays `!Send` (#2399), guarding a measured bug where a
+      # guard moved across threads let a second materialize tear the tree
+      # down mid-read. ~6s warm.
+      - name: Doc tests (nextest does not run them)
+        if: steps.filter.outputs.rust == 'true'
+        run: cargo test --workspace --doc
 
       # (#2717) The execution-side isolation check. It re-runs each test
       # unit as a child `cargo test` under a sentinel state tree and
@@ -169,8 +194,14 @@ jobs:
       # child proves nothing (measured — three of four leaking targets went
       # red and one stayed green while leaking, so the verdict is the file
       # count, never the status).
+      #
+      # (#2896) NOT on an ordinary PR any more: it runs on every push to main
+      # and on a PR labeled `full-ci`. A PR is the light gate (build, the
+      # full nextest suite, clippy); the trade is that a leak an unlabeled PR
+      # introduces is caught on main right after merge, not before it. Label
+      # a release candidate or a risky PR `full-ci` to get it at the gate.
       - name: Isolation leak check (each test unit under a sentinel tree)
-        if: steps.filter.outputs.rust == 'true'
+        if: steps.filter.outputs.rust == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci'))
         env:
           DARKMUX_LEAK_CHECK: "1"
         run: cargo test --test state_leak_execution_guard -- --nocapture
