@@ -1,10 +1,13 @@
 import { WorkStatus } from "../../components/WorkStatus";
-import { useMemo } from "react";
+import { Shimmer } from "../../components/Placeholder";
+import { useEffect, useMemo, useState } from "react";
+import { useCountUp } from "../../hooks/useCountUp";
+import { parseNumericLike } from "../../lib/numericLike";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { T, flowToRenderModel } from "../../lib/flow";
+import { T, flowToRenderModel, isDispatchStart } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
 import { getSource } from "../../lib/source";
@@ -18,6 +21,8 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
  *  asserting something the harness has already ruled out. */
 export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
+import { TokenScope } from "../../components/TokenScope";
+import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
@@ -50,6 +55,60 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * `pillLabel` (pre-uppercased, golden-pinned). */
 function pillStatusWord(cls: "run" | "err" | "done" | "canceled"): string {
   return cls === "run" ? "running" : cls === "err" ? "error" : cls === "done" ? "complete" : "canceled";
+}
+
+/** (#2878) A MODEL/SYSTEM metric tile's value (`.mv`), counting up/down
+ * when it changes on a live run — TURNS, COMPACTIONS, a host CPU/RAM/GPU
+ * percentage. `sessionRun.ts` hands this component an already-FORMATTED
+ * string (comma grouping, `%`, rounding all baked in), so
+ * `parseNumericLike` is the bridge: it recognizes a plain number (with
+ * that same comma/`%` shape) and reproduces it exactly at every
+ * intermediate frame. A value that ISN'T one plain number — a duration
+ * like "10:15", a model name, "—" — renders exactly as it always did, no
+ * animation, because there is nothing here safe to interpolate. */
+/** The TOK/S tile's state lamps: one per state, grey when off, exactly one
+ *  lit in its state's color. Seeing every state at once is what makes the
+ *  current one legible (operator: "is this resting? can't tell"). The rest
+ *  lamp carries its countdown while lit. */
+const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = [
+  { state: "generating", label: "gen" },
+  { state: "prompt", label: "prompt" },
+  { state: "tools", label: "tools" },
+  { state: "rest", label: "rest" },
+  { state: "stalled", label: "stall" },
+];
+function ScopeLamps({ reading }: { reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number } }) {
+  // `state: null` is no live execution (a mission between model steps):
+  // every lamp is off.
+  const aria =
+    reading.state === null
+      ? "no model working"
+      : reading.state === "generating"
+        ? "generating"
+        : liveStateLabel({ state: reading.state, restSecondsLeft: reading.restSecondsLeft } as LiveStateReading);
+  return (
+    <div className="scope-lamps" role="status" aria-label={`run state: ${aria}`}>
+      {SCOPE_LAMPS.map(({ state, label }) => {
+        const on = reading.state === state;
+        return (
+          <span key={state} className="scope-lamp" data-state={state} data-on={on ? "true" : "false"}>
+            <span className="scope-lamp__dot" aria-hidden="true" />
+            {label}
+            {on && state === "rest" && reading.restSecondsLeft != null ? ` ${reading.restSecondsLeft}s` : ""}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function AnimatedMetricValue({ value }: { value: string }) {
+  const parsed = parseNumericLike(value);
+  // `useCountUp` is called unconditionally either way — only the target it
+  // tweens toward (a number, or `null` for "nothing to animate") depends
+  // on `parsed`, so this never violates the rules of hooks.
+  const tweened = useCountUp(parsed ? parsed.n : null, (n) => (n === null ? "" : parsed!.render(n)));
+  return <>{parsed ? tweened : value}</>;
 }
 
 /** (#2000) `.brief-grid`'s `repeat(auto-fit, minmax(240px, 1fr))` resolves
@@ -93,6 +152,95 @@ function groupBriefEntries(entries: BriefEntry[]): BriefGroup[] {
   return groups;
 }
 
+/** One label/value pair in the pending info card — real label, shimmered
+ *  value. Mirrors the shape `groupBriefEntries`'s `"pair"` case renders once
+ *  data lands (`.brief-pair` > `.brief-label` + `.brief-value`), so nothing
+ *  shifts when the real value replaces the shimmer (#2068's CLS lesson). */
+function PendingBriefPair({ label }: { label: string }) {
+  return (
+    <div className="brief-pair">
+      <div className="brief-label">{label}</div>
+      <div className="brief-value">
+        <Shimmer minWidth="8em" />
+      </div>
+    </div>
+  );
+}
+
+/** One MODEL/SYSTEM tile in the pending state — real label, shimmered value,
+ *  same `.met`/`.mv`/`.ml` shape the loaded grid renders (see the `view.metrics`
+ *  map in the main render below). */
+function PendingTile({ label }: { label: string }) {
+  return (
+    <div className="met">
+      <div className="mv">
+        <Shimmer minWidth="3em" />
+      </div>
+      <div className="ml">{label}</div>
+    </div>
+  );
+}
+
+/**
+ * (#2862) The pending state for `#dispatch=<session_id>` — the session id is
+ * already known from the URL (the caller passed it in), so this draws the
+ * REAL header, the info card's labels (route/runtime/model/workspace/timing
+ * — the five `pushKv` calls in `sessionRun.ts` that are always present,
+ * unlike `image`/`mission` which are conditional), and the MODEL/SYSTEM tile
+ * grids with their labels. Only the values — which depend on records nobody
+ * has fetched yet — shimmer.
+ *
+ * The MODEL tiles shown (TURNS, TOKENS IN, TOKENS OUT, CONTEXT) and the
+ * SYSTEM tile shown (WALL CLOCK) are the set `sessionRun.ts` always produces
+ * for a model-bearing run before any telemetry has arrived (`CONTEXT` is
+ * literally `ctxLabel`'s own pre-data default, `!effNctx ? "CONTEXT" : ...`).
+ * A `procedural.shell`-only run's real page never shows a MODEL section at
+ * all (`hasModelWork` gates it) — this skeleton cannot know that in advance
+ * (nothing has been fetched), so it draws the common case, same as guessing
+ * six rows for the runs list. That is an inherent skeleton approximation,
+ * not a regression: the alternative is the bare "loading…" line this issue
+ * replaces.
+ */
+function SessionPendingHeader({ sessionId }: { sessionId: string }) {
+  // `.session-ph`, deliberately NOT `.session-run`/`.session-run__header`/
+  // `.pill` — a long list of existing specs use those bare classes (no
+  // `[data-state="data"]` qualifier) as their "real session data has
+  // landed" signal (`SessionReplay.test.tsx`, its transition sibling,
+  // `App.test.tsx`'s scrubber suite). See `.session-ph`'s own doc in
+  // styles.css for the collision this avoids and the CSS it stands in for.
+  return (
+    <div className="session-ph" data-state="pending" role="status" aria-label={`Loading session ${sessionId}`}>
+      <h2 className="session-ph__header">
+        <Shimmer as="span" className="pill" minWidth="5em" minHeight="1.3em" />{" "}
+        <Shimmer as="span" minWidth="6em" />{" "}
+        <span className="session-ph__meta">
+          ({sessionId} on <Shimmer as="span" minWidth="5em" />)
+        </span>
+      </h2>
+      <div className="track brief-grid">
+        <PendingBriefPair label="route" />
+        <PendingBriefPair label="runtime" />
+        <PendingBriefPair label="model" />
+        <PendingBriefPair label="workspace" />
+        <PendingBriefPair label="timing" />
+      </div>
+      <section className="runsec" data-head="model">
+        <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
+          <PendingTile label="TURNS" />
+          <PendingTile label="TOKENS IN" />
+          <PendingTile label="TOKENS OUT" />
+          <PendingTile label="CONTEXT" />
+        </div>
+      </section>
+      <section className="runsec" data-head="system">
+        <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
+          <PendingTile label="WALL CLOCK" />
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function BriefEntryContent({ entry }: { entry: BriefEntry }) {
   return entry.href ? (
     // A real anchor, so it is keyboard-reachable and middle-clickable like
@@ -126,7 +274,12 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // counting. `useSessionLiveness` owns that window; it also owns the SAME
   // query key this component reads, so the event log and the stage cannot
   // disagree about when the run ended.
-  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId);
+  // The mission this run belongs to, learned from the run's own records
+  // below. It reaches the liveness hook one render after those records land:
+  // a mission's run-grain session never beats itself, so without it the page
+  // is never live, fetches once, and freezes on its first read.
+  const [livenessMissionId, setLivenessMissionId] = useState<string | null>(null);
+  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId, livenessMissionId);
 
   // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
   // dispatch-row tap 404'd here. Read the committed file instead (the same
@@ -178,9 +331,10 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   const ownRaw = session?.ok ? session.data.records : null;
   const ownMissionId = useMemo(() => {
     if (!ownRaw) return null;
-    const start = ownRaw.find((r) => r.session_id === sessionId && r.action === "dispatch.start");
+    const start = ownRaw.find((r) => r.session_id === sessionId && isDispatchStart(r.action));
     return start?.mission_id ?? null;
   }, [ownRaw, sessionId]);
+  useEffect(() => setLivenessMissionId(ownMissionId), [ownMissionId]);
   const ownHasTelemetry = useMemo(
     () => (ownRaw ? ownRaw.some((r) => r.session_id === sessionId && r.category === "telemetry") : false),
     [ownRaw, sessionId],
@@ -191,12 +345,11 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     enabled: flowSrc === null && ownMissionId != null && !ownHasTelemetry,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
-  // `/flow-mission/<id>` is a SUPERSET of `/flow-session/<id>` — every record
-  // under a mission carries that mission's `mission_id`, including the run's
-  // own bookend records — so this REPLACES rather than merges. Merging the
-  // two raw arrays would double-count every record `ownRaw` and the mission
-  // fetch both return (this session's own dispatch.start/complete), which
-  // for a plain sum (TOKENS IN/OUT) is silently wrong, not just redundant.
+  // `/flow-mission/<id>` holds every record carrying this mission's id,
+  // including the run's own bookends, so it is not simply appended to
+  // `ownRaw`: that would double-count this session's dispatch records, which
+  // for a plain sum (TOKENS IN/OUT) is silently wrong. See `enrichedRaw`
+  // below for what is kept from `ownRaw`.
   //
   // Static builds get the same enrichment from the day's own committed file
   // (below, `staticMissionSlice`) rather than this query, which never runs
@@ -207,7 +360,18 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     const recs = day.raw.filter((r) => r.mission_id === ownMissionId);
     return recs.length ? recs : null;
   }, [flowSrc, day.raw, ownHasTelemetry, ownMissionId]);
-  const enrichedRaw = missionRaw ?? staticMissionSlice ?? ownRaw;
+  // A union of the two, each record once. Neither side covers the other: the
+  // session fetch carries host samples the daemon attaches by time window
+  // (no mission_id), and the two queries refresh separately, so the run's
+  // terminal record can reach the session fetch before the mission fetch has
+  // it. Both are served from the same JSONL by the same daemon, so a record
+  // present in both serializes identically.
+  const missionSlice = missionRaw ?? staticMissionSlice;
+  const enrichedRaw = useMemo(() => {
+    if (!missionSlice || !ownRaw) return missionSlice ?? ownRaw;
+    const seen = new Set(missionSlice.map((r) => JSON.stringify(r)));
+    return [...missionSlice, ...ownRaw.filter((r) => !seen.has(JSON.stringify(r)))];
+  }, [missionSlice, ownRaw]);
 
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
   // hooks per render, so calling `useNowMs` after the loading/error/empty
@@ -265,38 +429,49 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // counts. Note the counter can step BACKWARDS at that moment, from the
   // ticked value to the last record's own elapsed time; that is the point —
   // the run's last sign of life is a fact, and the seconds since are not.
-  const quietMs = base?.lastBeatMs != null ? Date.now() - base.lastBeatMs : Infinity;
+  // (Playback parity, Change A) `clockNow` — `playhead ?? wallNow` — is the
+  // ONE "now" every render-time derivation below reads, in both modes. This
+  // used to be `Date.now()` unconditionally (finding #1's `quietMs`, and
+  // the `ticking`/`base` split below): correct at the live edge, but a
+  // replay probed mid-scrub compared a RECORDED instant against the
+  // browser's real wall clock, which is what made a mid-generation replay
+  // read "stale"/"no recent activity" — the run had gone quiet relative to
+  // NOW, when the question is whether it was quiet as of the PLAYHEAD.
+  // `wallNow` is a plain per-render `Date.now()` read (not a hook) — it
+  // does not itself drive a re-render; see `ticking`/`useNowMs` below for
+  // what does, at the live edge only.
+  const wallNow = Date.now();
+  const clockNow = playhead ?? wallNow;
+  const quietMs = base?.lastBeatMs != null ? clockNow - base.lastBeatMs : Infinity;
   const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
-  // (#2757) `playhead === null` — added here, everything else on this line
-  // predates it. A non-null playhead means the operator has actively parked
-  // the shell's transport away from the live edge (`App.tsx`'s
+  // (#2757) `playhead === null` — a non-null playhead means the operator has
+  // actively parked the shell's transport away from the live edge (`App.tsx`'s
   // `isPlayheadReady`: `transport.scrubbed && transport.t < transport.tMax`;
-  // at the live edge `playhead` is `null`). Without this guard, `ticking`
-  // fed `nowMs` from `useNowMs` — the real `Date.now()` clock — into
-  // `runRegions` regardless of where the playhead sat, so WALL CLOCK climbed
-  // in real time even while every OTHER pane on the page (derived from
-  // `data`, itself cut to `playhead` above) stayed frozen at the scrubbed
-  // instant. Measured live (#2757): a run whose terminal record fell just
-  // after the parked playhead read "1:21 so far", then "2:25 so far" — the
-  // OPERATOR'S OWN wall-clock time elapsed while watching, not the run's.
-  //
-  // `playhead === null` is also what makes this correct at the live tip:
-  // unscrubbed, `playhead` is `null` and ticking behaves exactly as #1972
-  // designed it to (advance live so a stalled dispatch's clock doesn't
-  // freeze). Once the playhead reaches or passes the run's own terminal
-  // record, `data` already contains it, `base`'s own `done`/`runWallMs`
-  // computation (`sessionRun.ts`) takes over unticked, and the tile shows
-  // the run's fixed total instead of climbing past it.
+  // at the live edge `playhead` is `null`). This gate now decides ONLY
+  // whether the shared 1s clock subscribes (a pure perf/re-render concern —
+  // there is no reason to re-render every second while scrubbed, since the
+  // transport itself re-renders this component on every tick it advances).
+  // It no longer decides whether `runRegions` gets a moving "now" — that is
+  // `clockNow` above, unconditionally, in both modes (Change A). Before this
+  // split, the SAME boolean gated both, which is what made a scrubbed
+  // replay's "so far" clock freeze between records (finding #2): `view`
+  // below fell back to `base` — `runRegions` with NO override, i.e. the
+  // newest CUT record's own timestamp — instead of the playhead, so the
+  // reading only advanced when a new record happened to arrive.
   const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
   const nowMs = useNowMs(ticking);
+  // The override actually fed to `runRegions`: the playhead when scrubbed
+  // (unconditionally — a playhead means a replay, and a replay's clock is
+  // never "no override", full stop); otherwise the ticking clock's own
+  // snapshot while plausibly running, or `undefined` (record-time only) once
+  // the run is done/stale/static — `runRegions`'s own `Math.max(override,
+  // tMax)` clamp means passing nothing here is exactly equivalent to
+  // freezing at the newest record, which is what a finished/stale run
+  // should do either way.
+  const clockOverride: number | undefined = playhead ?? (ticking ? nowMs : undefined);
 
   if (!session) {
-    return (
-      <div data-state="pending" role="status" aria-label={`Loading session ${sessionId}`}>
-        <div className="stagehdr">session replay</div>
-        <div className="none">loading…</div>
-      </div>
-    );
+    return <SessionPendingHeader sessionId={sessionId} />;
   }
 
   if (!session.ok) {
@@ -339,8 +514,18 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
       </div>
     );
   }
-  const view = ticking ? runRegions(data, sessionId, nowMs) : base;
-  const liveness = livenessState({ done: !view.live, animate: ticking, lastBeatMs: view.lastBeatMs, nowMs });
+  // (Playback parity, Change A) Run ONCE, with `clockOverride`, in both
+  // modes — no more `ticking ? ... : base` branch selecting between a
+  // moving clock and a frozen one keyed on live/playback.
+  const view = runRegions(data, sessionId, clockOverride);
+  // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
+  // "should the shared clock subscribe" perf gate (see its own doc above)
+  // and is unconditionally `false` in playback (`playhead === null` fails
+  // whenever scrubbed), which is exactly finding #1: the pill read "stale"
+  // in playback regardless of whether the run was actually still going as
+  // of the playhead. `plausiblyRunning` is computed from `clockNow` above,
+  // so it answers the SAME question live and replayed.
+  const liveness = livenessState({ done: !view.live, animate: plausiblyRunning, lastBeatMs: view.lastBeatMs, nowMs: clockNow });
 
   return (
     <div data-state="data" className="session-run">
@@ -429,11 +614,54 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
             <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
               {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
-              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
+              <div className="mv"><AnimatedMetricValue value={m.value} />{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>
               ))}
+              {/* (#2877) The fifth MODEL tile, live only: a finished run's
+                  TOK/S is a plain pushed metric already inside the `.map`
+                  above (`sessionRun.ts`'s "TOK/S" push) — this renders ONLY
+                  while `view.liveTokScope` is non-null (model work, not yet
+                  done), and disappears the moment the run finishes, per the
+                  issue's "when the run finishes, the scope goes and the
+                  tile shows the final measured tok/s". */}
+              {/* (#2877 pass 2, "is this resting? can't tell") While
+                  generating, the center stays the tok/s number — unchanged.
+                  Otherwise it names the state a flat ring used to hide:
+                  `rest 12s` (counting down), `prompt` (a turn has started, no
+                  heartbeat for it yet), `tools` (waiting on a dispatched
+                  tool), or `stalled` (the existing stall rule). One
+                  derivation (`lib/tokenRate.ts::deriveLiveState`), read here
+                  and by `FleetLens.tsx`'s rate line — no branch on mode. */}
+              {view.liveTokScope && (
+                <div className="met scopetile" data-testid="run-token-scope">
+                  <div className="ml">TOK/S</div>
+                  <TokenScope
+                    // A stale reading from the LAST generating stretch must
+                    // not still drive the wave once the state has moved on
+                    // to rest/tools/prompt (only `stalled` used to zero it) —
+                    // otherwise the tube looks busy while the label says
+                    // "tools".
+                    tokensPerSec={view.liveTokScope.state === "generating" ? view.liveTokScope.tokensPerSec : 0}
+                    stalled={view.liveTokScope.stalled}
+                    resting={view.liveTokScope.state === "rest"}
+                    tone={view.liveTokScope.state ?? "none"}
+                    size="tile"
+                    // Only the reading goes inside the tube. A state is a
+                    // caption about the reading and sits under it: set at
+                    // the number's size, "prompt" ran through the ring.
+                    centerLabel={
+                      view.liveTokScope.state === "generating"
+                        ? view.liveTokScope.tokensPerSec != null
+                          ? String(Math.round(view.liveTokScope.tokensPerSec))
+                          : "—"
+                        : null
+                    }
+                  />
+                  <ScopeLamps reading={view.liveTokScope} />
+                </div>
+              )}
             </div>
           )}
           {view.showModelCard && (
@@ -466,7 +694,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
           <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
             {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i} title={m.hintTitle} data-subhint={m.sub ? undefined : m.hint}>
-              <div className="mv">{m.value}{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
+              <div className="mv"><AnimatedMetricValue value={m.value} />{m.unit ? <span className="munit">{m.unit}</span> : null}</div>
               <div className="ml" data-hint={m.hint}>{m.label}</div>
               {m.sub && <div className="msub">{m.sub}</div>}
             </div>

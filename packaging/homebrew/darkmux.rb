@@ -17,14 +17,14 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v3.11.0 — `darkmux lab run stats` derives per-run and
-  # per-set metrics from recorded lab runs (active time, billed tok/s,
-  # busy-only energy, cost per successful run) with a reconciliation check
-  # on every figure. A write-the-tests lab run now passes only when it did
-  # the work and broke nothing. The machine lens shows the battery, meters
-  # show how tight a resource is, and the run page reads by turn.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.11.0.tar.gz"
-  sha256 "1538d08da150e6a8728cf1ef6501c490cf32ef9592cb3036dfd9c85425a3fa05"
+  # Stable release: v3.12.0 — a live token-rate scope (a CRT oscilloscope
+  # with GEN/PROMPT/TOOLS/REST/STALL lamps) on fleet cards and run pages,
+  # motion and loading placeholders on live pages, playback that defaults to
+  # real time and renders what the live page showed, and mission run pages
+  # that roll up their executions and stay live. Rests are recorded when
+  # they start.
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v3.12.0.tar.gz"
+  sha256 "62254fcf78dc4857ffd25ccaf5fe82edea0ed03774b601faa93dc0f155090583"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 

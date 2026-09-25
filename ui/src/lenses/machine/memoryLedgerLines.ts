@@ -162,8 +162,10 @@ export function notLocalMessage(machineName: string): string {
 export const DAEMON_UNREACHABLE_MESSAGE =
   "daemon not reachable — the machine lens reads live probes via /machine/resources (CLI twin: darkmux machine resources).";
 
-/** The first-fetch-in-flight placeholder — viewer.html:1875. */
-export const LOADING_MESSAGE = "loading…";
+/** The first-fetch-in-flight placeholder (viewer.html:1875) retired by
+ * #2862 — `MachineHealthRegion` now draws a `Shimmer` in its place rather
+ * than this literal string. Kept out of the export surface on purpose so a
+ * new caller doesn't reach for the bare-text pattern this issue removed. */
 
 /** The stale-cached-snapshot banner — viewer.html:1880. Stage 2/3 renders
  * it as `.mm-stalebanner` above the desaturated hero, not as a `.memwarn`

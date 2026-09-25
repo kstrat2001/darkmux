@@ -43,17 +43,17 @@ const T_MAX = Date.parse("2026-08-09T00:00:00.000Z");
 describe("machActive", () => {
   it("is true when a dispatch.start on the machine belongs to a live session", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
-    expect(machActive(data, new Set(["s1"]), "m1", true, T_MAX)).toBe(true);
+    expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(true);
   });
 
   it("is false when the session isn't in the live set", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
-    expect(machActive(data, new Set(), "m1", true, T_MAX)).toBe(false);
+    expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
   it("is false for a different machine's live session", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "m2", session_id: "s1", action: "dispatch.start" })];
-    expect(machActive(data, new Set(["s1"]), "m1", true, T_MAX)).toBe(false);
+    expect(machActive(data, new Set(["s1"]), "m1", T_MAX)).toBe(false);
   });
 
   // (#1800 P2) The replay arm keys on the CLOSE-EDGE, not presence — the live
@@ -64,16 +64,33 @@ describe("machActive", () => {
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.complete" }),
     ];
-    expect(machActive(data, new Set(), "m1", false, T_MAX)).toBe(false);
+    expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
   // The INVERTED case, and the one that proves the check is doing work: same
-  // empty live set, same replay mode, no close-edge -> still active. Without
-  // this, a `machActive` hardwired to `false` in replay would pass the test
-  // above and look correct.
+  // empty live set, no close-edge, FRESH (inside the TTL as of the playhead)
+  // -> still active. Without this, a `machActive` hardwired to `false` in
+  // replay would pass the test above and look correct. (Playback parity,
+  // Change A, finding #7) The start record is now placed just before `T_MAX`
+  // — inside `FLOW_LIVE_TTL_MS` — rather than relying on the fixture's
+  // far-past default `ts`: `sessionRunning` no longer reads "no close edge"
+  // alone as running forever; see the orphan case below and
+  // `flow.sessionRunning.parity.test.ts` for the regression this guards.
   it("replay: a session with NO close-edge IS active, on the same empty live set", () => {
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: new Date(T_MAX - 60_000).toISOString() }),
+    ];
+    expect(machActive(data, new Set(), "m1", T_MAX)).toBe(true);
+  });
+
+  // (Playback parity, Change A, finding #7) The case the OLD replay
+  // algorithm could not express at all: no close edge, but stale well past
+  // `FLOW_LIVE_TTL_MS` as of the playhead — an orphaned session the
+  // container's own watchdog would already have killed. The old "no close
+  // edge => active" rule read this as running forever.
+  it("replay: a session with NO close-edge but stale past the TTL is NOT active", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" })];
-    expect(machActive(data, new Set(), "m1", false, T_MAX)).toBe(true);
+    expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
   // `session.end` alone closes a session (`sessionCloseEdge`) — an abandoned
@@ -84,7 +101,7 @@ describe("machActive", () => {
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "m1", session_id: "s1", action: "session.end" }),
     ];
-    expect(machActive(data, new Set(), "m1", false, T_MAX)).toBe(false);
+    expect(machActive(data, new Set(), "m1", T_MAX)).toBe(false);
   });
 
   // (#1869) `T_MAX` was always the day's true max pre-scrubber, so a
@@ -100,7 +117,7 @@ describe("machActive", () => {
     const data: FlowRecord[] = [
       rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: "2026-08-08T00:05:00.000Z" }),
     ];
-    expect(machActive(data, new Set(), "m1", false, playhead)).toBe(false);
+    expect(machActive(data, new Set(), "m1", playhead)).toBe(false);
   });
 });
 
@@ -238,10 +255,16 @@ describe("buildFleetCard", () => {
     expect(card.runsCount).toBe(0);
   });
 
-  // (#1800 P2) The replay arm of the SAME two branches. `goldens/playback-date.txt`
-  // reads "48 specialists" where `goldens/fleet.txt` reads "0 running"; both
-  // come from here, and the port had only the live arm.
-  it("replay: counts the whole day's sessions and labels them 'specialists'", () => {
+  // (Playback parity, Change A, findings #3/#4 — 2026-09-24) This used to be
+  // "replay: counts the whole day's sessions and labels them 'specialists'"
+  // — `goldens/playback-date.txt` read "48 specialists" where
+  // `goldens/fleet.txt` read "0 running" for the SAME closed-out day, because
+  // replay counted every session that EVER ran that day regardless of the
+  // playhead. That is the parity defect the audit named, not a feature: a
+  // replay of a day whose work is already finished, probed AT ITS END, now
+  // reads "0 running" — the same word and the same count a live viewer would
+  // have seen at that instant, because nothing is actually running any more.
+  it("replay: two finished sessions read '0 running', not '2 specialists'", () => {
     const data: FlowRecord[] = [
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
@@ -249,31 +272,22 @@ describe("buildFleetCard", () => {
       rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.complete" }),
     ];
     const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX);
-    expect(card.runsCount).toBe(2);
-    expect(card.runsLabel).toBe("specialists");
-    // The day's work is over: idle, not "dispatch in flight".
+    expect(card.runsCount).toBe(0);
+    expect(card.runsLabel).toBe("running");
     expect(card.stat).toBe("idle");
   });
 
-  it("replay: one session is 'specialist', singular", () => {
-    const data: FlowRecord[] = [
-      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
-      rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
-    ];
-    const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX);
-    expect(card.runsCount).toBe(1);
-    expect(card.runsLabel).toBe("specialist");
-  });
-
-  // The regression this pair guards: the SAME records, the SAME empty live
-  // set, differing only in mode. A replay that reused the live arm reports 0.
-  it("live vs replay disagree on the same closed-out day, and that is the point", () => {
+  // The regression this pair used to guard was the OPPOSITE of parity: "live
+  // and replay disagree on the same closed-out day, and that is the point."
+  // Change A's whole point is that they must NOT disagree at the same
+  // instant — this is the parity check that replaces it.
+  it("live and replay AGREE on the same closed-out day, probed at its end (parity)", () => {
     const data: FlowRecord[] = [
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
       rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
     ];
     expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX).runsCount).toBe(0);
-    expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX).runsCount).toBe(1);
+    expect(buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX).runsCount).toBe(0);
   });
 
   // (#2060) A mission's own top-level session (`session_id === mission_id`,
@@ -333,6 +347,146 @@ describe("buildFleetCard", () => {
     ];
     const card = buildFleetCard(data, new Map(), null, new Set(["mission-1", "mission-2"]), false, "u1", true, T_MAX);
     expect(card.runsCount).toBe(2);
+  });
+
+  // (#2877) Live token-rate scope input. `liveTokRate` is what
+  // `FleetLens.tsx` gates the mini scope's mount on — `null` means "render
+  // plain idle text, mount zero TokenScope instances".
+  describe("liveTokRate", () => {
+    // Heartbeats anchored 2s apart, ending exactly AT the playhead `t` —
+    // "fresh" for `isStalled`'s purposes, same as a real live poll where the
+    // newest heartbeat landed just before the client's own "now".
+    const BEAT1 = T_MAX - 2000;
+    const BEAT2 = T_MAX;
+
+    it("is null while idle, even with completed heartbeat history", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.complete" }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", true, T_MAX);
+      expect(card.stat).toBe("idle");
+      expect(card.liveTokRate).toBeNull();
+    });
+
+    it("a running session with fewer than two heartbeats mounts the scope at 0, not no scope", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 40 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.stat).toBe("dispatch in flight");
+      // One fresh heartbeat: generating, but not enough samples for a rate
+      // yet. The scope is up at 0 rather than absent.
+      expect(card.liveTokRate).toBe(0);
+      expect(card.liveTokState).toBe("generating");
+    });
+
+    it("is a positive number once a running session has two FRESH heartbeats to derive Δchars/Δms from", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      // 80 chars / 2000ms = 40 chars/sec, DEFAULT_CHARS_PER_TOKEN (4) → 10 tok/s.
+      expect(card.liveTokRate).toBeCloseTo(10, 5);
+      expect(card.liveTokStalled).toBe(false);
+    });
+
+    it("sums across two concurrently running sessions on the same machine", () => {
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+        rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.start" }),
+        rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s2", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: BEAT2, generated_chars: 200 } }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1", "s2"]), false, "u1", true, T_MAX);
+      // s1: 40 chars/sec / 4 = 10 tok/s. s2: 80 chars/sec / 4 = 20 tok/s.
+      expect(card.liveTokRate).toBeCloseTo(30, 5);
+    });
+
+    // (Playback parity, Change A, finding #3 — 2026-09-24) This used to be
+    // "is always null in replay (liveMode=false), even with a running-shaped
+    // session" — the OLD divergent behavior the audit's finding #3 named
+    // directly ("live: dispatch in flight · 89 tok/s · 1 running; playback:
+    // dispatch in flight · 1 specialist" for the SAME instant). A replay
+    // caller's `liveSet` is empty in practice (there is no presence to read
+    // about a past day), and the session's own freshness — via
+    // `sessionRunning`'s TTL fallback, not presence — is what makes it read
+    // as running, in both modes, so the tok/s scope is a fact about the
+    // recorded instant rather than a live-only instrument.
+    it("computes a real rate for a running-shaped session in replay too (parity)", () => {
+      // Record `ts` (not just the heartbeat payload's `sampled_at_ms`) has
+      // to be FRESH as of `T_MAX` too — `sessionRunning`'s TTL fallback
+      // measures staleness off the record's own `ts`, matching a real flow
+      // record where the two are close together. Both defaulted to the
+      // fixture's far-past `rec()` default `ts` here would make the
+      // session read as an orphan (finding #7's own fix), which is a
+      // different case than the one under test.
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(BEAT1).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(BEAT1).toISOString(), payload: { sampled_at_ms: BEAT1, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(BEAT2).toISOString(), payload: { sampled_at_ms: BEAT2, generated_chars: 120 } }),
+      ];
+      // Empty `liveSet` — a real replay call never has presence to consult.
+      const card = buildFleetCard(data, new Map(), null, new Set(), false, "u1", false, T_MAX);
+      expect(card.liveTokRate).toBeCloseTo(10, 5);
+    });
+
+    // (#2877 dogfood finding, live daemon) A mission observed live stuck
+    // `status: "running"` (no terminal record) hours after its last real
+    // heartbeat. Before this fix, `aggregateTokenRate` happily reported
+    // whatever its LAST two heartbeats measured — a fleet card reading a
+    // confident "N tok/s" for a session that stopped producing hours ago.
+    it("reads 0, not a stale historical rate, once the session's heartbeats go quiet", () => {
+      const data: FlowRecord[] = [
+        // `ts` matches the heartbeats' own (equally ancient) clock —
+        // `dispatch.start`'s `ts` is the only clock it has, and a mismatched
+        // one here (the old `rec()` default, 2026) would read as a NEWER
+        // marker than the stale heartbeats and wrongly explain the gap as
+        // "prompt" rather than genuinely stalled.
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.start", ts: new Date(1_000).toISOString() }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(1_000).toISOString(), payload: { sampled_at_ms: 1_000, generated_chars: 40 } }),
+        rec({ machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", ts: new Date(3_000).toISOString(), payload: { sampled_at_ms: 3_000, generated_chars: 120 } }),
+      ];
+      // The playhead is T_MAX (2026) while the heartbeats above are near
+      // epoch 0 — many hours stale by any measure, well past STALL_AFTER_MS.
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokStalled).toBe(true);
+      expect(card.liveTokRate).toBe(0);
+    });
+
+    it("a mission between model steps (only its run session beating) mounts no scope and claims no state", () => {
+      // The launcher beats presence for the mission's run session during a
+      // mod wait, a test gate, delivery: no model is involved, so the card
+      // must not say "reading prompt" or run a scope at 0.
+      const data: FlowRecord[] = [
+        rec({ machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "mission", mission_id: "m1" }),
+        rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
+        rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.complete", mission_id: "m1" }),
+      ];
+      const card = buildFleetCard(data, new Map(), null, new Set(["m1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokRate).toBeNull();
+      expect(card.liveTokState ?? null).toBeNull();
+    });
+
+    it("still works from an OLDER runtime's heartbeat shape (no sampled_at_ms/generated_chars)", () => {
+      const data: FlowRecord[] = [
+        rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+        rec({ ts: "2026-08-08T23:59:58.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 10 } }),
+        rec({ ts: "2026-08-09T00:00:00.000Z", machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { cumulative_chars: 30 } }),
+      ];
+      // T_MAX ("2026-08-09T00:00:00.000Z") matches the second (fallback,
+      // whole-second `ts`-derived) heartbeat exactly — fresh, not stalled.
+      const card = buildFleetCard(data, new Map(), null, new Set(["s1"]), false, "u1", true, T_MAX);
+      expect(card.liveTokRate).not.toBeNull();
+      expect(card.liveTokRate!).toBeGreaterThan(0);
+    });
   });
 
   // (#1923) The gap flow presence genuinely cannot cover: a lab run's

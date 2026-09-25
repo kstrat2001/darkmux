@@ -4,23 +4,27 @@
  * machine; each dispatch session is a bar positioned across the recorded
  * window.
  *
- * (#1151) Two anchorings, and which one applies is the whole of this file's
- * `liveMode` argument:
+ * (Playback parity, Change A, finding #8, 2026-09-24) Used to be TWO
+ * anchorings selected by `liveMode` — live drew a rolling window ending at
+ * `Math.max(tMax, nowMs)`; replay drew the recorded day's own fixed span
+ * with no window control, headed "activity" instead of "recent activity".
+ * That is a parity defect, not a feature (operator decision): a replay now
+ * draws the SAME rolling window as live, `tlMax = playheadT` unconditionally
+ * (live or replayed), `tlMin = tlMax - window`, same header, same 10m/1h/
+ * 4h/24h control. The day's own whole span lives only in the scrubber now.
+ * `playheadT` is the caller's one clock — `playhead ?? wallNow` — so at the
+ * live edge this is "now" (not the newest record's timestamp: see
+ * `FleetLens.tsx`'s own doc on the Side finding this also fixes), and under
+ * scrub it is the playhead, advancing with it during playback exactly as
+ * live's window advances with the wall clock.
  *
- * - **Live**: `tlMax = Math.max(tMax, nowMs)`, `tlMin = tlMax - window`. NOW,
- *   not the newest record — after a run ends `tMax` stops advancing while the
- *   clock does not, so a `tMax` anchor would read 16:00 at 16:04. "24h" draws
- *   a TRUE 24h axis ending at the current minute, and the operator picks the
- *   window from the 10m/1h/4h/24h control.
- * - **Replay**: `tlMin..tlMax = tMin..tMax`, the recorded day's own span, and
- *   NO window control (there is nothing to slide over — the dataset is the
- *   window). The header also drops "recent", because the day is not recent.
- *
- * (#1800 P2) The live arm used to be the only arm, since `/next` had no
- * historical route to reach the other one. `Math.max(tMax, nowMs)` on a
- * replayed day is `nowMs` by definition, which drew a 2026-08-07 page with an
- * "AUG 12–AUG 13" axis and zero bars — every bar fell before `tlMin` and was
- * dropped by the window filter below.
+ * (#1800 P2, historical) The live arm used to be the only arm, since `/next`
+ * had no historical route to reach the other one. `Math.max(tMax, nowMs)` on
+ * a replayed day was `nowMs` by definition, which drew a 2026-08-07 page
+ * with an "AUG 12–AUG 13" axis and zero bars — every bar fell before `tlMin`
+ * and was dropped by the window filter below. The per-mode branch this doc
+ * used to describe is what finding #8 above then found to be its own,
+ * different defect, one layer up.
  *
  * (#1869) `state.t` (the playhead) and `tMax` (the day's fixed ceiling) are
  * TWO SEPARATE VALUES in legacy — `tMax` is set once by `recompute()` at
@@ -137,30 +141,47 @@ export function buildActivityTimeline(
   liveMachines: Map<string, PresenceBeat>,
   uids: string[],
   liveSet: Set<string>,
-  /** The axis CEILING — `computeTMax` over the live window, or (in replay)
-   * the day's true, fixed max. Never moved by scrubbing; see this module's
-   * own doc for why that fixedness is load-bearing. */
+  /** The axis CEILING — kept as a parameter for `playheadT`'s default
+   * expression below (so every pre-existing caller that only ever passed
+   * one clock value is unaffected), but no longer read for anything else.
+   * See this module's own doc, Playback parity Change A. */
   tMax: number,
-  nowMs: number,
+  /** (Playback parity, Change A) No longer read — the rolling window is
+   * always anchored at `playheadT` now (`playhead ?? wallNow`, computed by
+   * the caller), in both modes. Kept as a parameter only so existing call
+   * sites don't need a positional rewrite. */
+  _nowMs: number,
   windowMinutes: number,
-  /** viewer.html:1727's `liveMode` — see this module's own doc for the two
-   * anchorings and why a replay must not use the live one. */
-  liveMode = true,
-  /** The dataset's earliest timestamp (`recompute()`'s `tMin`). Read only in
-   * replay, where it IS the left edge; ignored in live mode, whose left edge
-   * is `tlMax - window`. */
-  tMin = 0,
+  /** (Playback parity, Change A, finding #8) No longer read — see this
+   * module's own doc for why the day-span/no-window-control replay arm was
+   * a parity defect, not a feature: a replay now draws the SAME rolling
+   * window as live, anchored at the playhead, with the same header and the
+   * same window control. Kept as a parameter only so existing call sites
+   * don't need a positional rewrite. */
+  _liveMode = true,
+  /** (Playback parity, Change A, finding #8) No longer read — the day's own
+   * span now lives only in the scrubber (operator decision); this
+   * function's own left edge is always `tlMax - window`. Kept as a
+   * parameter only so existing call sites don't need a positional rewrite. */
+  _tMin = 0,
   /** (#1869) The PLAYHEAD — `state.t` in legacy terms, a genuinely separate
    * value from `tMax` once a replay can scrub. Defaults to `tMax` so every
    * caller that predates the transport (live mode; any test that only ever
    * passed one number) keeps its exact prior behavior — playhead == ceiling,
    * unconditionally. See this module's own doc for the bug this default
-   * exists to NOT reproduce when a real caller passes something else. */
+   * exists to NOT reproduce when a real caller passes something else.
+   *
+   * (Playback parity, Change A) This is now the ONE clock the whole
+   * function anchors on — `tlMax = playheadT` unconditionally, live or
+   * replayed. The caller computes it as `playhead ?? wallNow`, so at the
+   * live edge this is "now" (not the newest record's timestamp — see
+   * `FleetLens.tsx`'s own doc on the Side finding this fixes), and under
+   * scrub it is the playhead. */
   playheadT = tMax,
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
-  const tlMax = liveMode ? Math.max(tMax, nowMs) : tMax;
-  const tlMin = liveMode ? tlMax - winMs : tMin;
+  const tlMax = playheadT;
+  const tlMin = tlMax - winMs;
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 
@@ -194,7 +215,7 @@ export function buildActivityTimeline(
       // `sessionRunning` — live keys on presence, replay on the close-edge at
       // the playhead. (#1800 P2: this was `!liveSet.has(sid)`, the live arm
       // inlined, which read every session of a replayed day as running.)
-      const done = !sessionRunning(data, liveSet, sid, liveMode, playheadT, missionId);
+      const done = !sessionRunning(data, liveSet, sid, playheadT, missionId);
       const errored = done && dispatchErrored(term);
       const killed = dispatchKilled(term);
       const clean = done && !!term && !dispatchErrored(term);
@@ -216,7 +237,10 @@ export function buildActivityTimeline(
     // Legacy appended `· ${clkrange(tlMin,tlMax)}` here (viewer.html:1766);
     // dropped 2026-09-01 — see `headerText`'s own doc. Deliberate divergence
     // from legacy, not drift.
-    headerText: liveMode ? "recent activity" : "activity",
+    // (Playback parity, Change A, finding #8) Always "recent activity" now
+    // — a replay draws the SAME rolling window as live, anchored at the
+    // playhead, so the header no longer needs to say otherwise.
+    headerText: "recent activity",
     lanes,
     axis: [clkhm(tlMin), clkhm(tlMin + span / 2), clkhm(tlMax)],
     playheadPct: pct(playheadT),

@@ -43,6 +43,7 @@
  * compact caller simply omits.
  */
 import type { ReactNode } from "react";
+import { useCountUp } from "../hooks/useCountUp";
 
 /** The dial's own local coordinate system, in `viewBox` units — the VRAM
  * dial's ORIGINAL numbers (`MachineHealthRegion.tsx`, pre-extraction),
@@ -185,6 +186,15 @@ export interface MeterProps {
  * stays `—`, never coerced to 0 (absence is a different claim). */
 export function fmtPct(v: number | null): string {
   return v === null ? "—" : `${Math.round(v)}%`;
+}
+
+/** (#2878) "Numbers count to their new value" — every compact gauge's
+ * caption percentage (`.meter-now`) tweens through `useCountUp` rather
+ * than snapping. `fmtPct` stays the formatter of record — this component
+ * never re-derives its own rounding/`%`/`—` rules, it only hands the
+ * shared hook a value to animate toward. */
+function MeterNowValue({ now }: { now: number | null }) {
+  return <>{useCountUp(now, fmtPct)}</>;
 }
 
 /** (#2122) `quiet` / `warn` / `critical` — the three-band severity a
@@ -536,7 +546,9 @@ export function Meter({
         <div className="meter-caption">
           {label && <div className="meter-label">{label}</div>}
           {numerals && (
-            <div className={nowLevelCls ? `meter-now ${nowLevelCls}` : "meter-now"}>{fmtPct(numerals.now)}</div>
+            <div className={nowLevelCls ? `meter-now ${nowLevelCls}` : "meter-now"}>
+              <MeterNowValue now={numerals.now} />
+            </div>
           )}
         </div>
       )}

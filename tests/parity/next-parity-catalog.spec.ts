@@ -244,6 +244,12 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     await page.screenshot({ path: shot("mission-replay-empty.png"), fullPage: true });
   });
 
+  // (#2879, playback parity) A replay renders what live showed at the same
+  // instant: the card's count is "N running" at the playhead (not the whole
+  // day's "48 specialists"), and the activity lane is the live rolling window
+  // ("RECENT ACTIVITY" with its 10m/1h/4h/24h control) anchored at the
+  // playhead, not a fixed day-span "ACTIVITY" axis. Regenerated from the
+  // rendered page.
   test("bare #<date> hash matches playback-date.txt's #stage byte-for-byte (#1800 P2: a real historical render)", async ({
     page,
   }) => {

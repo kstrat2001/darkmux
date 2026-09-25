@@ -33,10 +33,14 @@ Orchestrator note: First editor-embedded review shipped tonight — the crew rev
 MacBook-Pro
 hardware unknown — nothing received
 idle
-48 specialists
-ACTIVITY
+0 running
+RECENT ACTIVITY
+10M
+1H
+4H
+24H
 MacBook-Pro
-02:09
-10:18
+18:28
+06:28
 18:28
 

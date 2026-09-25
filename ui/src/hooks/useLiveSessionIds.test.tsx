@@ -93,6 +93,16 @@ describe("useLiveSessionIds — the coverage half it used to discard (#2725)", (
     expect(result.current.coverage).toBeNull();
   });
 
+  it("collects the missions live executions run under, skipping beats that name none", async () => {
+    stub({
+      sessions: [{ session_id: "e-1", mission_id: "m-1" }, { session_id: "e-2" }],
+      meta: { sources: { fleet: { state: "ok" } }, complete: true },
+    });
+    const { result } = renderHook(() => useLiveSessionIds(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.sessions.size).toBe(2));
+    expect([...result.current.missions]).toEqual(["m-1"]);
+  });
+
   it("reports NO coverage problem when the fleet substrate is switched OFF", async () => {
     // Inverted case 2, and the one most likely to be got wrong: a standalone
     // machine has no fleet substrate BY DESIGN — that is the default, not a

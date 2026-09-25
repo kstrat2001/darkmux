@@ -117,7 +117,7 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
     <h3>Verify it's up</h3>
     <pre><code><span class="comment"># 8765 unless you set serve.port — `darkmux doctor`'s `serve address` row prints the resolved one.</span>
 curl -s http://127.0.0.1:8765/health
-<span class="comment"># {"darkmux_version":"3.11.0","flow_schema_version":"1.54.0"}</span></code></pre>
+<span class="comment"># {"darkmux_version":"3.12.0","flow_schema_version":"1.55.0"}</span></code></pre>
     <p>Or run <code>darkmux doctor</code>: the <code>daemon: reachable</code> check reports Pass, and shows the viewer URL. It resolves the address itself, which makes it the reliable answer when you are not certain what this daemon is listening on.</p>
   </div>
 </section>

@@ -113,11 +113,15 @@ function focusRange(dayRecords: FlowRecord[], focus: PlaybackFocus): { tMin: num
  * played out in 12 seconds), which made the "1×" label a lie — a 13-hour
  * demo day ran at ~3,900× real time under it (operator: "1× doesn't seem
  * 1×"). Labeled as recorded time per second (`speedLabel`) because a bare
- * multiplier is meaningless to a reader: `1h/s` is. Cycle order steps
- * DOWN from the default (1h/s → 10m/s → 1m/s) and wraps. */
-export const SPEEDS = [3600, 600, 60] as const;
+ * multiplier is meaningless to a reader: `1h/s` is. The default is REAL
+ * TIME (operator, 2026-09-24): a replay then plays every animation (the
+ * token scope easing between 2s heartbeats, events arriving) at the pace a
+ * live viewer saw it. The cycle steps UP from there (1s/s → 5s/s → 30s/s →
+ * 1m/s → 10m/s → 1h/s) and wraps; 5s/s and 30s/s sit between real time and
+ * 1m/s, which on its own "goes direct to hyper mode" (operator). */
+export const SPEEDS = [1, 5, 30, 60, 600, 3600] as const;
 export type Speed = (typeof SPEEDS)[number];
-export const DEFAULT_SPEED: Speed = 3600;
+export const DEFAULT_SPEED: Speed = 1;
 export const PLAY_TICK_MS = 100;
 
 export function speedLabel(speed: number): string {
@@ -148,6 +152,15 @@ export interface PlaybackTransport {
   rewind: () => void;
   togglePlay: () => void;
   cycleSpeed: () => void;
+  /** (Playback parity, Change B) Increments exactly once per SEEK — a
+   * scrub, a rewind, or pressing play again after running off the end
+   * (which restarts `t` at `tMin`, the same discrete jump). The 100ms play
+   * tick that ADVANCES `t` during ordinary playback never touches this.
+   * `App.tsx` provides it through `SeekSignalContext`; `useCountUp` and
+   * `useArrivalKeys` are its consumers — see that context's own doc for
+   * why this is the ONE signal that suppresses animation, rather than a
+   * per-caller `liveMode` gate. */
+  seekGen: number;
 }
 
 export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: PlaybackFocus = DAY_FOCUS): PlaybackTransport {
@@ -294,8 +307,24 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
   // is a public part of the transport's API — a direct call (a test, a
   // future caller) must not be able to punch the playhead outside the
   // focus it belongs to.
-  const scrub = useCallback((next: number) => setT(Math.min(tMax, Math.max(tMin, next))), [tMin, tMax]);
-  const rewind = useCallback(() => setT(tMin), [tMin]);
+  // (Playback parity, Change B) `seekGen` bumps on every SEEK — see the
+  // interface field's own doc. A plain counter, not a boolean: a consumer
+  // needs to tell "a seek happened since MY last render" from its own ref,
+  // and a boolean would need resetting by someone, which just moves the
+  // bookkeeping rather than removing it.
+  const [seekGen, setSeekGen] = useState(0);
+  const bumpSeek = useCallback(() => setSeekGen((g) => g + 1), []);
+  const scrub = useCallback(
+    (next: number) => {
+      bumpSeek();
+      setT(Math.min(tMax, Math.max(tMin, next)));
+    },
+    [tMin, tMax, bumpSeek],
+  );
+  const rewind = useCallback(() => {
+    bumpSeek();
+    setT(tMin);
+  }, [tMin, bumpSeek]);
   const togglePlay = useCallback(() => {
     if (playing) {
       setPlaying(false);
@@ -303,10 +332,14 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     }
     // Pressing play at the end starts over, same as the lens did. Two plain
     // setters, not a setter inside another's updater (updaters must stay
-    // pure; React may invoke them twice).
-    if (playheadT >= tMax) setT(tMin);
+    // pure; React may invoke them twice). Restarting at `tMin` is the same
+    // discrete jump `rewind` makes, so it counts as a seek too.
+    if (playheadT >= tMax) {
+      bumpSeek();
+      setT(tMin);
+    }
     setPlaying(true);
-  }, [playing, playheadT, tMin, tMax]);
+  }, [playing, playheadT, tMin, tMax, bumpSeek]);
   const cycleSpeed = useCallback(() => setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]), []);
 
   const visibleCount = useMemo(() => (records ? records.filter((r) => !(T(r.ts) > playheadT)).length : 0), [records, playheadT]);
@@ -325,5 +358,6 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null, focus: Pla
     rewind,
     togglePlay,
     cycleSpeed,
+    seekGen,
   };
 }

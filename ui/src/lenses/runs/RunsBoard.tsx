@@ -1,4 +1,5 @@
 import { WorkStatus } from "../../components/WorkStatus";
+import { Shimmer } from "../../components/Placeholder";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -476,9 +477,16 @@ export function RunsBoard({
     // Wait for `/runs` to know which page this run belongs on; a failed
     // fetch falls through to the record page, as before.
     if (!runsQuery.data || labRunRedirect) {
+      // (#2862) A genuinely brief, genuinely unknown-shape wait: at this
+      // point the board doesn't yet know whether `labRunDir` resolves to a
+      // lab-run detail page or a redirect elsewhere, so there is no real
+      // layout to draw ahead of it — unlike the runs list and a session's
+      // own page (both know their shape from the URL alone). A shimmer line
+      // still replaces the bare word so nothing on the page reads as inert
+      // text while it resolves.
       return (
         <div data-state="pending" role="status" aria-label="Loading run">
-          <div className="none">loading…</div>
+          <Shimmer as="div" minHeight="1em" style={{ maxWidth: "16em" }} />
         </div>
       );
     }
@@ -487,11 +495,41 @@ export function RunsBoard({
 
   // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`),
   // or (#2063) a static-build pin is still waiting on its alias source.
+  //
+  // (#2862) Used to be a bare "loading…" line under the header — no shape,
+  // no sense that a board full of rows is about to land. Nothing about a
+  // run is known yet (not even a count), so the header and a handful of
+  // placeholder rows THE SHAPE of a real `RunRow` (status badge, kind, id,
+  // meta line) draw immediately; only the values shimmer. `RUNS_KIND_BAR`
+  // is left undrawn deliberately: its counts are the one thing this state
+  // has no honest guess for, and a bar of shimmered zeros would read the
+  // same as #2817's "waiting is not zero" defect one level up (a filter
+  // chip showing "0" before the count is known).
   if (!runsQuery.data || !labRunsQuery.data || staticPinPending) {
     return (
       <div data-state="pending" role="status" aria-label="Loading runs">
         <div className="stagehdr">runs</div>
-        <div className="none">loading…</div>
+        <div className="lablist">
+          {/* `.labrunrow-ph`, NOT `.labrunrow` — several e2e/parity specs
+              assert exact `.labrunrow` counts as their "real data has
+              landed" signal (see that class's own doc in styles.css); a
+              skeleton row sharing the token would transiently satisfy those
+              counts and race the same way a settle-selector present in both
+              states always does. The inner pieces reuse the real classes
+              (same look) without the parent token those specs scope
+              descendant queries under (`.labrunrow .labruncrew` etc). */}
+          {Array.from({ length: 6 }, (_, i) => (
+            <div className="labrunrow-ph" key={i} aria-hidden="true">
+              <div className="labrunmain">
+                <Shimmer as="span" className="wstatus labbadge-ph" minWidth="4.5em" minHeight="1.3em" />
+                <Shimmer as="span" className="runkind" minWidth="3.5em" />
+                <Shimmer as="span" className="labruncrew" minWidth="9em" />
+                <Shimmer as="span" className="labrundir" minWidth="3em" />
+              </div>
+              <Shimmer as="div" className="labrunmeta" minHeight="1em" style={{ maxWidth: "60%" }} />
+            </div>
+          ))}
+        </div>
       </div>
     );
   }

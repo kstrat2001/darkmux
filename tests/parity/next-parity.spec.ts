@@ -626,6 +626,12 @@ test("next: fleet lens render-sanity screenshot at desktop width (populated, for
 // thing with an impossible input, and this golden pins it.
 const TWO_DAY_CLOCK_MS = Date.UTC(2026, 7, 8, 2, 0, 0);
 
+// (#2879, playback parity) A live page judges "now" by the wall clock, here
+// the frozen 02:00Z, not by the newest record. The golden used to anchor the
+// 24h window and the hero's "last 24h" totals at the corpus's last record
+// (14:28 on the 8th, twelve hours AFTER this clock), which no live viewer at
+// 02:00 could have seen. The window now ends at 02:00 and records after it
+// no longer count.
 test("next: fresh boot into the fleet lens over the CONCATENATED two-day window matches goldens/fleet-two-day.txt", async ({ page }) => {
   const meta = loadMeta();
   await installFrozenClock(page, TWO_DAY_CLOCK_MS);

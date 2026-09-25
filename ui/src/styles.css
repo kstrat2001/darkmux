@@ -6,6 +6,24 @@
      round 2 shipped a 10px mismatch by editing one of two literals). */
   --phone-drawer-closed-h: 76px;
   color-scheme: dark;
+  /* (#2877) The token-rate scope is an instrument with ONE look in both
+     themes: a green phosphor CRT, not the app accent. Its colors, and the
+     state lamps under it, live here so the rules below name them. */
+  --scope-phosphor: #7dffa0;
+  --scope-phosphor-glow: rgba(125, 255, 160, 0.6);
+  --scope-bezel-hi: #1a221c;
+  --scope-bezel-lo: #111712;
+  --scope-bezel-rim: #1c261e;
+  --scope-bezel-shadow: rgba(0, 0, 0, 0.5);
+  --scope-screen-hi: #0b130d;
+  --scope-screen-lo: #050806;
+  --scope-screen-inset: rgba(0, 0, 0, 0.9);
+  --scope-scanline: rgba(0, 0, 0, 0.18);
+  --lamp-off: #3a4048;
+  --lamp-prompt: #5eead4;
+  --lamp-tools: #7aa2ff;
+  --lamp-rest: #fbbf24;
+  --lamp-stall: #f87171;
   /* ONE mono stack, because there were three and they disagreed (#2001).
      Measured with CDP on macOS Chrome, what each of the old ones actually
      rendered:
@@ -1944,6 +1962,64 @@ body {
 .eventlog__turndur--slow {
   color: var(--warn);
 }
+/* (#2878) The in-progress turn's own subtle live pulse — a synthesized
+   "in progress" header (`turnGroups.ts`'s own `why: "in progress"`), the
+   one whose events are still being written. A thin accent bar rather than
+   pulsing the whole row: the row's TEXT must stay easy to read while it
+   breathes, and reuses the SAME `--beat` keyframe every other liveness
+   indicator on this page uses (`styles.css`'s own "defined once" doc) —
+   `--beat: none` under reduced motion turns this off along with all of
+   them, no separate override needed here. */
+.eventlog__rec--turn.eventlog__rec--live {
+  position: relative;
+}
+.eventlog__rec--turn.eventlog__rec--live::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  animation: var(--beat);
+}
+/* (#2878) "A new event row slides in... with a brief highlight" — only for
+   a row that arrives while the pane is open (`useArrivalKeys.ts`'s own
+   doc draws the line: never the initial list, never a row a filter merely
+   reveals). Transform + opacity, not a literal height grow: this list's
+   rows vary a lot in height (a one-line record next to a multi-line turn
+   header), and animating `max-height` risks clipping a tall row's own
+   content mid-slide. A CSS keyframe animation plays ONCE, automatically,
+   the moment a class naming it is first applied to an element — no JS
+   loop needed to drive or stop it. */
+@keyframes eventlog-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes eventlog-arrive-highlight {
+  0% {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.eventlog__rec--arriving {
+  animation:
+    eventlog-arrive 150ms ease-out,
+    eventlog-arrive-highlight 1000ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .eventlog__rec--arriving {
+    animation: none;
+  }
+}
 .eventlog__turnctx {
   display: grid;
   /* (#2863 review, finding 4) A bare `1fr` middle track can be squeezed to
@@ -1989,6 +2065,16 @@ body {
   border-radius: 2px;
   background: var(--accent);
   opacity: 0.8;
+  /* (#2878) Eases to a new context reading rather than jumping — same
+     ~1-2s sampling-interval feel as the machine-lens dials. Never on
+     first mount: React sets `width` inline at whatever the turn's own
+     reading already is, so there is no prior width to transition from. */
+  transition: width 1.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .eventlog__ctxfill {
+    transition: none;
+  }
 }
 .eventlog__ctxtick {
   position: absolute;
@@ -2372,7 +2458,19 @@ body {
   color: var(--good);
   border-color: var(--good);
 }
-.labrunrow {
+/* `.labrunrow-ph` (#2862) is the runs-list SKELETON row's own class — same
+   box as `.labrunrow` (below), deliberately a DIFFERENT class token rather
+   than `.labrunrow.flat` or a modifier on it. The e2e/parity suites count
+   `.labrunrow` as their "is real content here yet" signal
+   (`tests/e2e/viewer-lab.spec.js`, `runs-degraded.spec.js`,
+   `generated-fixture-contract.spec.js` all assert exact counts against it) —
+   a class TOKEN match doesn't care about extra modifier classes, so a
+   skeleton row sharing the token would transiently satisfy those counts
+   during the pending state and race exactly the way
+   `tests/parity/lib/extract-lens.js`'s own module doc warns a settle
+   selector must not. */
+.labrunrow,
+.labrunrow-ph {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -2380,10 +2478,13 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--panel-2);
-  cursor: pointer;
   margin-bottom: 6px;
 }
-.labrunrow:last-child {
+.labrunrow {
+  cursor: pointer;
+}
+.labrunrow:last-child,
+.labrunrow-ph:last-child {
   margin-bottom: 0;
 }
 .labrunrow.flat {
@@ -2492,6 +2593,13 @@ body {
 .wstatus.is-idle { color: var(--dim); border-color: var(--border); }
 
 .labbadge {
+  flex: 0 0 auto;
+}
+/* `.labbadge-ph` (#2862) — the runs-list skeleton's own badge-shaped
+   placeholder. Same box as `.labbadge`, deliberately a different token: see
+   `.labrunrow-ph`'s own comment above for why a skeleton element must never
+   share a class an e2e/parity spec counts as evidence real data landed. */
+.labbadge-ph {
   flex: 0 0 auto;
 }
 
@@ -3063,7 +3171,8 @@ body {
 .savlead {
   flex: 0 0 auto;
 }
-/* (#2817) WAITING IS NOT ZERO.
+/* (#2817, lifted into a shared component by #2862 — see
+   `components/Placeholder.tsx`'s own doc) WAITING IS NOT ZERO.
    Before the flow window arrives, every figure in the hero computes to 0 and
    renders as a measurement — "0 cloud tokens" reads as a fact about the
    fleet, and it holds for long enough to be believed. The digits are hidden
@@ -3071,28 +3180,32 @@ body {
    Implemented as a mask over the EXISTING elements rather than by swapping
    them for placeholders: #2068 measured CLS 1.21 from a tile whose mounting
    moved the layout, and a loading state that reflows would be the same
-   defect wearing a different hat. Geometry is identical in both states. */
-.savings[data-settled="false"] .savnum,
-.savings[data-settled="false"] .scv {
+   defect wearing a different hat. Geometry is identical in both states.
+
+   `.ph-shimmer` (the `Shimmer` component) is now the ONE implementation of
+   this mask — every "value still loading" site in the viewer uses it rather
+   than a second bespoke skeleton. The hero's own `.savnum`/`.scv` retrofit
+   onto it below (`Shimmer`'s `minHeight` prop supplies the `/1` vs `/1.1`
+   line-box floor #2830 needed per element, replacing the two selector-scoped
+   `min-height` rules this comment used to describe). */
+.ph-shimmer {
   position: relative;
 }
-/* (#2830) The figure text is NOT RENDERED while unsettled (see `SavingsHero`),
-   so these boxes would collapse to zero height without an explicit floor, and
-   #2068 measured CLS 1.21 from exactly that kind of reflow. Each value is the
-   element's OWN line box: `.savnum` is `/1`, `.savc .scv` is `/1.1`.
+/* (#2830) The figure text is NOT RENDERED while unsettled (`Shimmer` renders
+   no children at all), so an element with no intrinsic height would collapse
+   to zero without an explicit floor, and #2068 measured CLS 1.21 from exactly
+   that kind of reflow — `minHeight` is passed per call site (`Shimmer`'s own
+   default is `1em`).
 
-   This replaces a `color: transparent` that could not work. It tied on
-   specificity (0,3,0) with `.savlead.cloud .savnum`, `.savlead.unknown
-   .savnum`, `.savc.gen .scv` and `.savc.uncls .scv`, all of which are declared
-   LATER and therefore won on source order — so every tile except plain local
-   kept painting its figure, and the glyphs showed above and below a skeleton
-   that is inset inside a `line-height: 1` box. Not rendering the text removes
-   the whole class: there is no colour left to race, and a new tile variant
-   cannot silently reintroduce it. */
-.savings[data-settled="false"] .savnum { min-height: 1em; }
-.savings[data-settled="false"] .scv { min-height: 1.1em; }
-.savings[data-settled="false"] .savnum::after,
-.savings[data-settled="false"] .scv::after {
+   Not rendering text also replaces a `color: transparent` that could not
+   work: it tied on specificity (0,3,0) with `.savlead.cloud .savnum`,
+   `.savlead.unknown .savnum`, `.savc.gen .scv` and `.savc.uncls .scv`, all of
+   which are declared LATER and therefore won on source order — so every tile
+   except plain local kept painting its figure, and the glyphs showed above
+   and below a skeleton that is inset inside a `line-height: 1` box. Removing
+   the text removes the whole class: there is no colour left to race, and a
+   new tile variant cannot silently reintroduce it. */
+.ph-shimmer::after {
   content: "";
   position: absolute;
   inset: 0.12em 0 0.18em 0;
@@ -3106,8 +3219,7 @@ body {
   100% { background-position: -200% 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .savings[data-settled="false"] .savnum::after,
-  .savings[data-settled="false"] .scv::after { animation: none; }
+  .ph-shimmer::after { animation: none; }
 }
 
 .savnum {
@@ -3376,6 +3488,29 @@ body {
 .mach .stat {
   margin-top: 12px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
+}
+/* (#2877) Only present while the card computed a live tok/s reading — see
+   `FleetLens.tsx`'s render note next to `.mach-scope`. */
+.mach-body--scope {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: center;
+}
+.mach-body--scope > :not(.mach-scope) {
+  grid-column: 1;
+}
+.mach-scope {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: center;
+  margin-top: 12px;
+}
+.mach-scope__rate {
+  margin-top: 5px;
+  font: 600 calc(13px * var(--fs-scale)) var(--font-mono);
+  color: var(--scope-phosphor);
+  font-variant-numeric: tabular-nums;
 }
 .mach .runs {
   margin-top: 5px;
@@ -4132,6 +4267,44 @@ body {
   fill: var(--dim);
   font-size: calc(8.5px * var(--fs-scale));
   letter-spacing: 0.12em;
+}
+/* (#2878) "Ease between samples" — every dial's fill and needle transition
+   toward a new reading rather than snapping to it, roughly the sampling
+   interval (~1-2s the host reports at). CSS transitions on the SVG
+   presentation attributes that already encode the value — `stroke-dasharray`
+   for a band's extent, `transform` for the needle's rotation — need no JS
+   tween loop: the browser interpolates the attribute change directly, same
+   mechanism this file already leans on for `width`/`transform` elsewhere.
+   Covers every `<Meter>` instance (the VRAM pressure dial AND every compact
+   CPU/GPU/MEM/cluster gauge) because they all share this one geometry
+   (`Meter.tsx`'s own doc) and these are its only value-bearing classes.
+   `.mm-gauge-growth`'s hatch extent is included too — its `alwaysRender`
+   band still moves when committed-but-unmaterialized growth changes.
+   Never on FIRST mount: an element with no prior value has nothing to
+   transition FROM, so it simply appears at its true reading, matching this
+   app's "never animate on load" rule. */
+.mm-gauge-val,
+.mm-gauge-other,
+.mm-gauge-growth,
+.mm-gauge-inner-val,
+.mm-gauge-commit,
+.mm-gauge-fill-compact,
+.mm-gauge-needle {
+  transition:
+    stroke-dasharray 1.4s ease-out,
+    stroke-dashoffset 1.4s ease-out,
+    transform 1.4s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mm-gauge-val,
+  .mm-gauge-other,
+  .mm-gauge-growth,
+  .mm-gauge-inner-val,
+  .mm-gauge-commit,
+  .mm-gauge-fill-compact,
+  .mm-gauge-needle {
+    transition: none;
+  }
 }
 .mm-gauge-tick {
   stroke: var(--dim);
@@ -5330,6 +5503,26 @@ body {
   .session-run .metrics {
     grid-template-columns: repeat(2, 1fr);
   }
+  /* (#2877 pass 2, "grow it so the effect is large") The TOK/S scope tile
+     spans the full 2-column row at phone width, and its bezel grows to
+     match — the whole reason to give it the row. `--d`/`--rim` are
+     overridden here, not `aspect-ratio` + percentage padding — see the
+     token-scope block's own doc for why that renders as an oval in Safari;
+     this keeps the SAME explicit-square mechanism, just with bigger
+     numbers. Diameter sits in the 180-220px band the report asked for;
+     the center label scales up with it (below) so the number stays
+     legible at the new size instead of looking lost in the middle of a
+     much bigger tube. */
+  .session-run .met.scopetile {
+    grid-column: 1 / -1;
+  }
+  .session-run .met.scopetile .token-scope-bezel--tile {
+    --d: 200px;
+    --rim: 8px;
+  }
+  .session-run .met.scopetile .token-scope-center .token-scope-n {
+    font-size: 40px;
+  }
 }
 /* (operator, 2026-09-05) One tile anatomy — label, value, sub — at EVERY
    width, via `order` rather than DOM position. The DOM keeps `.mv` before
@@ -5376,6 +5569,17 @@ body {
   order: 1;
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
+}
+/* (#2877) The fifth MODEL tile, live only — see `SessionReplay.tsx`'s
+   render note next to `view.liveTokScope`. Centers the bezel under the
+   `TOK/S` label instead of the flex-start every other tile's short text
+   value uses. */
+.session-run .met.scopetile {
+  align-items: center;
+}
+.session-run .met.scopetile .token-scope-bezel {
+  order: 3;
+  margin-top: 4px;
 }
 /* (operator, 2026-09-05) The third slot — see `SessionRunView.metrics.sub`
    in `sessionRun.ts`. A qualifying fact (CTX's window ceiling, the peak
@@ -7232,6 +7436,16 @@ body {
    of the source"), so a threshold on top would double up on the same
    fact. */
 .battery-bar-fill {
+  /* (#2878) Eases to a new charge reading rather than snapping — same
+     ~1-2s sampling-interval feel as every other dial on this page. Never
+     on first mount: the `width` attribute JSX sets is the rect's only
+     width ever, so there is nothing to transition from at appearance. */
+  transition: width 1.4s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .battery-bar-fill {
+    transition: none;
+  }
 }
 /* (operator, 2026-09-24: "seems like a lightning bolt icon works inside
    the battery or next to it") The charging/on-AC glyph, drawn centered
@@ -7778,3 +7992,231 @@ body {
     padding-bottom: 4px;
   }
 }
+
+/* ── Session pending skeleton (#2862) ──────────────────────────────────
+   `SessionPendingHeader` (`lenses/catalog/SessionReplay.tsx`) draws the
+   dispatch page's real header/info-card/tile-grid shape before any record
+   has arrived. It deliberately does NOT carry the `.session-run`/
+   `.session-run__header`/`.pill` tokens the LOADED page uses: dozens of
+   existing specs (`SessionReplay.test.tsx`, `SessionReplay.transition.test.tsx`,
+   `App.test.tsx`) use `document.querySelector(".session-run")` and
+   `.session-run__header .pill` — bare, with no `[data-state="data"]`
+   qualifier — as their "real session data has landed" signal, exactly the
+   settle-selector race `tests/parity/lib/extract-lens.js`'s own module doc
+   warns about. A skeleton sharing those tokens would satisfy those waits
+   during the PENDING state and break every one of them (measured: it did,
+   four failures in `App.test.tsx`'s scrubber suite, before this rename).
+
+   So the skeleton uses its own `.session-ph` prefix, and the handful of
+   rules below are copied from (not layered onto) the `.session-run` rules
+   this component's own comment cites, kept in sync by hand since the two
+   are visually the same page in two different data states. */
+.session-ph .pill {
+  border-radius: 10px;
+  vertical-align: middle;
+}
+.session-ph .track.brief-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: 2px 20px;
+  align-content: start;
+}
+.session-ph .track {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+.session-ph .brief-label {
+  color: var(--dim);
+  font-size: calc(10px * var(--fs-scale));
+  letter-spacing: 0.08em;
+  margin-top: 8px;
+}
+.session-ph .brief-value {
+  font-size: calc(12px * var(--fs-scale));
+}
+.session-ph .runsec {
+  margin-top: 24px;
+  margin-bottom: 24px;
+}
+.session-ph .runsec::before {
+  display: block;
+  content: attr(data-head);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.session-ph .runsec::before,
+.session-ph .ml {
+  font-size: calc(10px * var(--fs-scale));
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+}
+.session-ph .metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+@media (max-width: 480px) {
+  .session-ph .metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+.session-ph .met {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-bg);
+}
+.session-ph .mv {
+  order: 2;
+  font-size: calc(15px * var(--fs-scale));
+  font-weight: 600;
+  margin-top: 3px;
+}
+.session-ph__header {
+  font: 600 calc(13px * var(--fs-scale))/1.4 var(--font-mono);
+  color: var(--accent);
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+.session-ph__meta {
+  color: var(--dim);
+  font-weight: 400;
+}
+/* (#2877) Live token-rate scope — a CRT oscilloscope, ported from the
+   operator-approved concept (token-scope-concept.html). Phosphor green
+   deliberately, not `--accent`: the concept's own reasoning is that it reads
+   as an instrument, not another meter. Colors are local constants, not
+   `:root` tokens — this is the one surface in the app that intentionally
+   does NOT follow the teal/dark palette, so tying it to shared tokens would
+   make future palette edits accidentally reshade an oscilloscope.
+
+   Sizing (component doc + issue #2877 constraint): an explicit square `--d`
+   diameter plus a fixed `--rim`, NEVER `aspect-ratio` + percentage padding —
+   Safari applies `aspect-ratio` to the content box when there is padding
+   (the bezel renders taller than wide), and percentage padding resolves
+   against the PARENT's width, so a small bezel in a wide tile squeezes its
+   own tube into an oval. Each placement below sets `--d`/`--rim`; nothing
+   here or in `TokenScope.tsx` ever reaches for `aspect-ratio`. */
+.token-scope-bezel {
+  --d: 100px;
+  --rim: 5px;
+  width: var(--d);
+  height: var(--d);
+  border-radius: 50%;
+  padding: var(--rim);
+  box-sizing: border-box;
+  flex: none;
+  background: radial-gradient(circle at 35% 30%, var(--scope-bezel-hi), var(--scope-bezel-lo) 60%);
+  box-shadow:
+    inset 0 0 0 2px var(--scope-bezel-rim),
+    0 10px 26px var(--scope-bezel-shadow);
+}
+.token-scope-bezel--mini {
+  --d: 40px;
+  --rim: 4px;
+}
+/* The TOK/S tile's state lamps: grey when off, one lit in its state's own
+   color with a glow. The tiles lay out by `order` and the bezel is order 3,
+   so the lamps say 4 or they sort above the label. */
+.scope-lamps {
+  order: 4;
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 12px;
+}
+.scope-lamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: calc(10px * var(--fs-scale)) var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+}
+.scope-lamp__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--lamp-off);
+}
+.scope-lamp[data-on="true"] {
+  opacity: 1;
+  color: var(--lit);
+}
+.scope-lamp[data-on="true"] .scope-lamp__dot {
+  background: var(--lit);
+  box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
+}
+/* The fleet card's rate line takes its state's color, same tokens as the
+   lamps and the trace. */
+.mach-scope__rate[data-tone="prompt"] { color: var(--lamp-prompt); }
+.mach-scope__rate[data-tone="tools"] { color: var(--lamp-tools); }
+.mach-scope__rate[data-tone="rest"] { color: var(--lamp-rest); }
+.mach-scope__rate[data-tone="stalled"] { color: var(--lamp-stall); }
+.scope-lamp[data-state="generating"] { --lit: var(--scope-phosphor); }
+.scope-lamp[data-state="prompt"] { --lit: var(--lamp-prompt); }
+.scope-lamp[data-state="tools"] { --lit: var(--lamp-tools); }
+.scope-lamp[data-state="rest"] { --lit: var(--lamp-rest); }
+.scope-lamp[data-state="stalled"] { --lit: var(--lamp-stall); }
+.token-scope-bezel--card {
+  --d: 64px;
+  --rim: 5px;
+}
+.token-scope-bezel--tile {
+  --d: 68px;
+  --rim: 5px;
+}
+.token-scope-screen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle, var(--scope-screen-hi) 0%, var(--scope-screen-lo) 70%);
+  box-shadow: inset 0 0 30px var(--scope-screen-inset);
+}
+.token-scope-screen canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+/* Scanlines. A pseudo-element rather than a canvas layer: static, so it
+   costs nothing per frame and never needs the ResizeObserver's redraw. */
+.token-scope-screen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, var(--scope-scanline) 0 1px, transparent 1px 3px);
+}
+.token-scope-center {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  pointer-events: none;
+  z-index: 1;
+}
+.token-scope-center .token-scope-n {
+  font: 400 16px/0.85 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--scope-phosphor);
+  text-shadow: 0 0 10px var(--scope-phosphor-glow);
+}
+/* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
+   frame and never animates again (see `TokenScope.tsx`), so nothing here
+   needs a reduced-motion media query of its own. */

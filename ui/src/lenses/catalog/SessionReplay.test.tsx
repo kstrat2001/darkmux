@@ -325,7 +325,14 @@ describe("SessionReplay", () => {
     expect(system?.textContent).toContain("WALL CLOCK");
   });
 
-  it("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry", async () => {
+  // Both producer lineages' bookend spellings. The space form is the one a
+  // mission's run-grain session really carries (darkmux-crew); a fixture that
+  // only used the dotted form passed while the live page never fetched the
+  // mission's records at all.
+  it.each([
+    ["space (darkmux-crew, what a mission emits)", " "],
+    ["dot (darkmux-lab and the runtime)", "."],
+  ])("(#2759) rolls the MODEL panes up from the run's INNER sessions when the run's OWN session carries no telemetry: %s spelling", async (_label, sep) => {
     // The defect: a mission mints a run-grain session (`dispatch start` /
     // `dispatch complete` / `mission.grow` — bookends only) distinct from its
     // inner role-execution session, which carries the real turns/tokens/
@@ -343,7 +350,7 @@ describe("SessionReplay", () => {
       // only, exactly the shape #2759 measured on a real run.
       {
         ts: "2026-09-16T05:30:44Z",
-        action: "dispatch.start",
+        action: `dispatch${sep}start`,
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -353,7 +360,7 @@ describe("SessionReplay", () => {
       { ts: "2026-09-16T05:31:00Z", action: "mission.grow", session_id: missionId, mission_id: missionId, machine_id: "M", payload: {} },
       {
         ts: "2026-09-16T05:31:41Z",
-        action: "dispatch.complete",
+        action: `dispatch${sep}complete`,
         session_id: missionId,
         mission_id: missionId,
         machine_id: "M",
@@ -363,7 +370,7 @@ describe("SessionReplay", () => {
       // dispatch, carrying the real telemetry.
       {
         ts: "2026-09-16T05:30:50Z",
-        action: "dispatch.start",
+        action: `dispatch${sep}start`,
         session_id: unitSid,
         mission_id: missionId,
         machine_id: "M",
@@ -402,19 +409,44 @@ describe("SessionReplay", () => {
         machine_id: "M",
         payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
       },
-      { ts: "2026-09-16T05:31:35Z", action: "dispatch.complete", session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+      { ts: "2026-09-16T05:31:35Z", action: `dispatch${sep}complete`, session_id: unitSid, mission_id: missionId, machine_id: "M", payload: {} },
+      // A SECOND inner execution (the crawl's coder) that saw the same model
+      // resident: its own load record must not list the model twice.
+      {
+        ts: "2026-09-16T05:31:36Z",
+        category: "telemetry",
+        source: "lms",
+        action: "telemetry.lms",
+        session_id: `${unitSid}-1`,
+        mission_id: missionId,
+        machine_id: "M",
+        payload: { event: "load", model: "qwen3.6-35b-a3b-turboquant-mlx", gb: 20 },
+      },
     ];
+    // Host samples as the daemon really serves them: `/flow-session` attaches
+    // the run window's `machine.telemetry` (no session_id, no mission_id);
+    // `/flow-mission` does not. Replacing the session's records with the
+    // mission's dropped these and blanked the SYSTEM host tiles.
+    const hostSamples = ["2026-09-16T05:30:50Z", "2026-09-16T05:31:20Z"].map((ts, i) => ({
+      ts,
+      category: "machinery",
+      source: "host",
+      action: "machine.telemetry",
+      machine_id: "M",
+      payload: { cpu_pct: 30 + i * 20, mem_pct: 70, gpu_pct: 50 },
+    }));
     const fetchMock = vi.fn((url: string) => {
       if (url.startsWith("/fleet/sessions/live")) {
         return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: {} }), { status: 200 }));
       }
+      const own = [...allRecords.filter((r) => r.session_id === missionId), ...hostSamples];
       const body = url.startsWith("/flow-mission/")
         ? { records: allRecords, count: allRecords.length, truncated: false, generated_at_ms: 0 }
         : {
-            // `/flow-session/<id>` — the run's OWN records ONLY, matching the
-            // real daemon's per-session scoping.
-            records: allRecords.filter((r) => r.session_id === missionId),
-            count: allRecords.filter((r) => r.session_id === missionId).length,
+            // `/flow-session/<id>` — the run's OWN records plus the run
+            // window's host samples, matching the real daemon.
+            records: own,
+            count: own.length,
             truncated: false,
             generated_at_ms: 0,
           };
@@ -443,6 +475,11 @@ describe("SessionReplay", () => {
     // The "loaded models" track: real data, not the own-session placeholder.
     expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();
     expect(document.querySelector(".session-run")?.textContent).toContain("qwen3.6-35b-a3b-turboquant-mlx · 20GB");
+    expect(document.querySelector(".session-run")?.textContent?.split("qwen3.6-35b-a3b-turboquant-mlx · 20GB").length).toBe(2);
+
+    // The run window's host samples survive the rollup.
+    expect(tileValue("CPU").value).toMatch(/^40%/);
+    expect(tileValue("HOST").tile).toBeUndefined();
   });
 
   it("(#2863) groups the page as MODEL (tiles, then which model), SYSTEM, SIGNALS", async () => {
@@ -565,7 +602,16 @@ describe("SessionReplay", () => {
     // "Now" is two full minutes after the run started — real time that has
     // NOTHING to do with the scrubbed playhead below. A clock reading real
     // time here reads "2:00 so far"; the correct, playhead-honoring reading
-    // is "0:20 so far" (the last record at-or-before the parked playhead).
+    // is "0:30 so far" — the PLAYHEAD's own elapsed (Playback parity, Change
+    // A: `clockNow = playhead ?? wallNow`, one derivation in both modes).
+    // This used to read "0:20" (the last record AT-OR-BEFORE the parked
+    // playhead, i.e. the heartbeat at t0+20s, ignoring the 10s gap up to the
+    // scrub itself) — correct for #2757's own narrow fix (stop real
+    // `Date.now()` from bleeding into a scrubbed view) but itself the
+    // parity defect the audit's finding #2 later named: a replay parked
+    // mid-generation must show the SAME "so far" a live viewer would have
+    // seen watching in real time to that same instant, gaps between
+    // records included — not freeze at the last one.
     vi.setSystemTime(t0 + 120_000);
     const records = [
       { ts: new Date(t0).toISOString(), action: "dispatch.start", session_id: "s-parked", machine_id: "M", payload: { role: "coder" } },
@@ -587,7 +633,7 @@ describe("SessionReplay", () => {
     // ── Position A: playhead BEFORE the run's own terminal record ──
     const parked = readWall();
     expect(parked).toContain("so far");
-    expect(parked).toContain("0:20"); // the scrubbed instant's own elapsed
+    expect(parked).toContain("0:30"); // the scrubbed instant's own elapsed
     expect(parked).not.toContain("2:00"); // NOT real Date.now() - start
 
     // Real time passes; the playhead does not move. Before the fix, this is
@@ -971,5 +1017,59 @@ describe("SessionReplay — dispatch-focus playhead never precedes the run's own
       </QueryClientProvider>,
     );
     await waitFor(() => expect(screen.getByRole("status", { name: /not started yet/i })).toBeInTheDocument());
+  });
+});
+
+// (#2862) The session page drew a bare "loading…" line while `/flow-session`
+// was in flight, even though the session id is already known from the URL.
+// The fix draws the real header (with the known id), the info card's labels
+// (route, runtime, model, workspace, timing), and the MODEL/SYSTEM tile
+// grids with their labels — only the not-yet-known VALUES shimmer.
+describe("SessionReplay — the pending state draws the page, not a bare line (#2862)", () => {
+  it("shows the known session id, the info-card labels, and the MODEL/SYSTEM tile labels while the fetch is in flight", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+
+    renderReplay("s-pending");
+
+    const pending = await waitFor(() => {
+      const el = screen.getByRole("status", { name: `Loading session s-pending` });
+      expect(el).toBeInTheDocument();
+      return el;
+    });
+
+    // The session id is already known from the URL — it must be on screen,
+    // not hidden behind a shimmer along with everything else.
+    expect(pending.textContent).toMatch(/s-pending/);
+
+    // No bare "loading…" text.
+    expect(pending.textContent).not.toMatch(/loading…/);
+
+    // The info card's labels are real text, not placeholders.
+    for (const label of ["route", "runtime", "model", "workspace", "timing"]) {
+      expect(pending.querySelector(`.brief-label`)?.parentElement, "brief grid should exist").toBeTruthy();
+      const labels = Array.from(pending.querySelectorAll(".brief-label")).map((el) => el.textContent);
+      expect(labels, `expected the "${label}" label to be drawn immediately`).toContain(label);
+    }
+    // Every corresponding value shimmers rather than showing text.
+    const values = pending.querySelectorAll(".brief-value");
+    expect(values.length).toBeGreaterThan(0);
+    for (const v of values) {
+      expect(v.querySelector(".ph-shimmer"), "brief value should shimmer while pending").toBeTruthy();
+      expect((v.textContent ?? "").trim()).toBe("");
+    }
+
+    // The MODEL and SYSTEM tile grids draw their labels, values shimmer.
+    const modelSection = pending.querySelector('.runsec[data-head="model"]');
+    const systemSection = pending.querySelector('.runsec[data-head="system"]');
+    expect(modelSection, "MODEL section should be drawn").toBeTruthy();
+    expect(systemSection, "SYSTEM section should be drawn").toBeTruthy();
+    for (const section of [modelSection, systemSection]) {
+      const tiles = section!.querySelectorAll(".met");
+      expect(tiles.length, "expected at least one tile").toBeGreaterThan(0);
+      for (const tile of tiles) {
+        expect(tile.querySelector(".ml")?.textContent?.trim(), "tile label must be real text").not.toBe("");
+        expect(tile.querySelector(".mv .ph-shimmer"), "tile value should shimmer").toBeTruthy();
+      }
+    }
   });
 });

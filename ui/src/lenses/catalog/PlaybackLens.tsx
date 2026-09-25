@@ -2,11 +2,12 @@ import { computeTMax, computeTMin } from "../../lib/flow";
 import { getSource } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { FleetLens } from "../fleet/FleetLens";
+import { Shimmer } from "../../components/Placeholder";
 import type { FlowRecord } from "../../types/handwritten";
 
 /** Legacy's own play-loop constants (viewer.html:2848-2860): a 100ms tick
  * advancing the playhead by the measured elapsed wall clock times the
- * labeled speed (`1h/s` by default). It used to be `(tMax-tMin)/120` per
+ * labeled speed (real time, `1s/s`, by default). It used to be `(tMax-tMin)/120` per
  * tick, a fixed ~12s per day under a "1×" label (#2071 follow-up). */
 
 /**
@@ -37,10 +38,16 @@ export function PlaybackLens({ date, playhead = null }: { date: string | null; p
   // (#2086) The day comes from the one resolver; this lens only renders it.
   const day = useDay(date);
   if (day.loading) {
+    // (#2862) Not one of the issue's two named surfaces (this composes
+    // `FleetLens`, whose own hero already carries the full #2817 shimmer
+    // treatment once `day` resolves) — a bare "loading…" line still isn't
+    // wanted here, so it becomes a shimmer bar rather than a full mock of
+    // the fleet hero's layout, which this component has no data to size yet
+    // (`FleetLens` itself doesn't run until `day` settles).
     return (
       <div data-state="pending" role="status" aria-label={date ? `Loading ${date}` : "Loading playback"}>
         <div className="stagehdr">playback</div>
-        <div className="none">loading…</div>
+        <Shimmer as="div" minHeight="1em" style={{ maxWidth: "50%" }} />
       </div>
     );
   }

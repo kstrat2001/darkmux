@@ -1090,3 +1090,45 @@ describe("RunsBoard — the machine pin on a static build (#2063)", () => {
   // this board reads that same cache slot, so the file is one download the
   // board neither triggers nor avoids.
 });
+
+// (#2862) The runs list drew a bare "loading…" line while `/runs` and
+// `/lab/runs` were in flight — no header, no sense of what was coming. The
+// fix draws the real header immediately and fills placeholder rows shaped
+// like real ones (status badge, run id, meta line) rather than nothing.
+describe("RunsBoard — the runs-list pending state draws the page, not a bare line (#2862)", () => {
+  it("shows the real header and shape-of-real-rows placeholders while /runs and /lab/runs are in flight", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+
+    renderBoard();
+
+    const pending = await waitFor(() => {
+      const el = screen.getByRole("status", { name: "Loading runs" });
+      expect(el).toBeInTheDocument();
+      return el;
+    });
+
+    // The header draws immediately — this is the whole point: the operator
+    // sees the page, not a blank screen with one word on it.
+    expect(pending.querySelector(".stagehdr")?.textContent).toMatch(/runs/);
+
+    // No bare "loading…" text anywhere in the pending state.
+    expect(pending.textContent).not.toMatch(/loading…/);
+
+    // Placeholder rows shaped like `RunRow` — badge, kind, id, meta line —
+    // each with a shimmer standing in for the not-yet-known value.
+    //
+    // `.labrunrow-ph`, deliberately NOT `.labrunrow`: several e2e specs
+    // assert exact `.labrunrow` counts as their "real data has landed"
+    // signal, so the skeleton must never carry that token (see
+    // `.labrunrow-ph`'s own doc in styles.css). This is the mutation-tested
+    // guard — see the self-QA section of the PR report.
+    const rows = pending.querySelectorAll(".labrunrow-ph");
+    expect(rows.length, "expected at least one placeholder row").toBeGreaterThan(0);
+    expect(pending.querySelectorAll(".labrunrow").length, "a skeleton row must never carry the real .labrunrow token").toBe(0);
+    for (const row of rows) {
+      expect(row.querySelector(".ph-shimmer"), "each placeholder row needs a shimmered value").toBeTruthy();
+      // Guard against a vacuous placeholder: no row may leak real text.
+      expect((row.textContent ?? "").trim()).toBe("");
+    }
+  });
+});

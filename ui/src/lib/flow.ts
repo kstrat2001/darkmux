@@ -661,35 +661,51 @@ export function sessionCloseEdge(data: FlowRecord[], sid: string, missionId?: st
 }
 
 /** `sessionRunning()` — viewer.html:1183-1187. THE single source of truth for
- * "is this session in flight?", and the reason it takes `liveMode`:
+ * "is this session in flight?"
  *
- * - **live** keys on PRESENCE (`liveSet`), which is TTL-self-healing — an
- *   orphaned session with no close-edge ages out of the live set on its own.
- * - **replay** keys on the durable CLOSE-EDGE relative to the playhead: the
- *   session was running iff nothing had closed it yet at time `t`.
+ * (Playback parity, Change A, finding #7) This used to run two DIFFERENT
+ * algorithms selected by a `liveMode` boolean: live trusted `liveSet`
+ * (presence) alone; replay asked only "is there a close edge before `t`",
+ * with no staleness check. A session that started, sent one heartbeat, and
+ * then went silent for 30 minutes with no terminal record read
+ * `running=true` under the replay arm and `running=false` under live's own
+ * flow-derived fallback (`flowLiveSessions`) at the identical instant.
  *
- * (#1800 P2) Before this, the port had only the live arm, because `/next` had
- * no historical route that reached it. A replay asking presence about a past
- * day is the "confidently wrong" failure `FleetLens`'s own doc names.
+ * Now there is ONE algorithm, run over records up to `t` in both modes:
  *
- * (#2125) `missionId` narrows the REPLAY arm's close-edge lookup only — the
- * live arm still keys on bare presence (`liveSet.has(sid)`), which has no
- * mission dimension to disambiguate: presence is a session-id set, full
- * stop, and `dispatch.map`'s hosted seats never write to it at all (see
- * `liveSessionSet`'s own #2123 doc) — so live mode's cross-mission
- * collision risk, if any, lives entirely in that separate, already-fixed
- * gap, not here. */
+ * 1. Presence (`liveSet`) — an OPTIONAL, purely ADDITIVE input. If it says
+ *    the session is live, that's authoritative; it never subtracts. A
+ *    replay caller always passes an empty set (there is no presence to
+ *    read about a past day), so this branch is simply never true there.
+ * 2. A close edge at or before `t` — the session is done, full stop.
+ * 3. Otherwise, TTL-self-healing exactly like the live flow-derived
+ *    fallback: the session must have started by `t`, and its most recent
+ *    activity as of `t` must be within `FLOW_LIVE_TTL_MS`. This is what
+ *    makes step 2's absence non-authoritative forever — an orphaned
+ *    session with no terminal record ages out of "running" the same way in
+ *    both modes, measured from `t` rather than `Date.now()` so a replay at
+ *    a past instant gets the SAME answer a live viewer got at that instant.
+ *
+ * (#2125) `missionId` narrows the close-edge lookup only — presence has no
+ * mission dimension to disambiguate (it's a bare session-id set, and
+ * `dispatch.map`'s hosted seats never write to it at all — see
+ * `liveSessionSet`'s own #2123 doc), so that collision risk, if any, lives
+ * entirely in that separate, already-fixed gap, not here. */
 export function sessionRunning(
   data: FlowRecord[],
   liveSet: Set<string>,
   sid: string,
-  liveMode: boolean,
   t: number,
   missionId?: string,
 ): boolean {
-  if (liveMode) return liveSet.has(sid);
+  if (liveSet.has(sid)) return true;
   const close = sessionCloseEdge(data, sid, missionId);
-  return !(close && T(close.ts) <= t);
+  if (close && T(close.ts) <= t) return false;
+  const started = data.some((r) => r.session_id === sid && isDispatchStart(r.action) && T(r.ts) <= t);
+  if (!started) return false;
+  const activityTimes = data.filter((r) => r.session_id === sid && T(r.ts) <= t).map((r) => T(r.ts));
+  const lastActivity = activityTimes.length ? Math.max(...activityTimes) : -Infinity;
+  return t - lastActivity <= FLOW_LIVE_TTL_MS;
 }
 
 /** `statusVisual()` — viewer.html:1140-1145. Only `lbl` is consumed here —

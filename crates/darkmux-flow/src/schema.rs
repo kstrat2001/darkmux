@@ -77,8 +77,29 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.54.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.55.0";
 // Version history:
+//   1.55.0 (#2877, live token-rate scope): additive payload keys
+//           `sampled_at_ms` and `generated_chars` on `dispatch.turn.
+//           heartbeat`.
+//
+//           `sampled_at_ms` is the trajectory's own millisecond-precision
+//           `model.partial` timestamp (`trajectory::unix_ms`), carried
+//           through — flow's own timestamps are whole seconds, too coarse
+//           to derive a rate from a ~2s heartbeat cadence (the same
+//           coarseness 1.53.0's `generation_ms` addressed for turn
+//           duration). `generated_chars` is everything the model emitted this
+//           turn: answer content, separate-field reasoning text, and
+//           streamed tool-call names and arguments; the existing
+//           `cumulative_chars` field is unchanged (answer text only, so it
+//           reads 0 while a model reasons before answering) and both ride
+//           the same record so a reader can prefer the richer field and
+//           fall back cleanly. Rate = Δchars/Δms between consecutive
+//           heartbeats, an ESTIMATE until the turn's billed usage lands.
+//           MINOR: an older reader ignores both unknown keys; a heartbeat
+//           forwarded from an older runtime (neither field present) still
+//           validates, with both keys `null`.
+//
 //   1.54.0 (run-page rest-reason cards): additive keys on `dispatch
 //           start`'s (and the finished envelope's) `bounds` block —
 //           `thermal_pacing_enabled`, `battery_pause_enabled`,

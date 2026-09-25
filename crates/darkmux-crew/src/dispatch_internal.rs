@@ -3399,6 +3399,7 @@ fn dispatch_remote(
         session_id.clone(),
         Some(opts.role_id.clone()),
         Some(pm.id.clone()),
+        mission_id.clone(),
     );
 
     let req_body = single_shot_body(
@@ -3769,6 +3770,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         session_id.clone(),
         Some(opts.role_id.clone()),
         Some(model_id.clone()),
+        mission_id.clone(),
     );
 
     let t0 = SystemTime::now();
@@ -5386,6 +5388,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         session_id.clone(),
         Some(opts.role_id.clone()),
         Some(model.clone()),
+        mission_id.clone(),
     );
 
     // 6. Spawn the docker container. Async via `spawn()` (vs the older
@@ -9666,13 +9669,11 @@ impl TailerState {
                         *lock_deadline(deadline) =
                             Instant::now() + Duration::from_secs(self.inactivity_secs);
                     }
-                    let payload = serde_json::json!({
-                        "runtime": "internal",
-                        "turn_seq": event.get("seq"),
-                        "partial_index": event.get("partial_index"),
-                        "cumulative_chars": event.get("cumulative_chars"),
-                    });
-                    self.emit("dispatch.turn.heartbeat", darkmux_flow::Level::Info, payload);
+                    self.emit(
+                        "dispatch.turn.heartbeat",
+                        darkmux_flow::Level::Info,
+                        heartbeat_payload(&event),
+                    );
                 }
             }
             // (#557 slice 2) Detector trajectory events → telemetry flow
@@ -9780,9 +9781,14 @@ impl TailerState {
                 if reason != "turn_delay" {
                     self.summary.paced_rest_ms = self.summary.paced_rest_ms.saturating_add(ms);
                 }
+                // (#2877) The runtime records a rest as it STARTS, so the
+                // margin must cover the rest itself as well as the usual
+                // inactivity window; a rest longer than the window would
+                // otherwise be killed while resting by design.
                 if let Some(deadline) = &self.inactivity_deadline {
-                    let new_deadline =
-                        Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    let new_deadline = Instant::now()
+                        + Duration::from_secs(self.inactivity_secs)
+                        + Duration::from_millis(ms);
                     *lock_deadline(deadline) = new_deadline;
                 }
                 let payload = runtime_rest_payload(
@@ -10091,6 +10097,32 @@ impl TailerState {
 /// the sum never sees), and `grok-4.3` does it on 30 of 30 recorded calls.
 /// The fallback stays for the runtime's older `model.completed` events,
 /// which have always written all three keys anyway.
+/// (#2877) Map a `model.partial` trajectory event to the `dispatch.turn.
+/// heartbeat` flow payload. Pure (no IO, no global sink) so the mapping is
+/// unit-testable in isolation from `handle_event`'s flow-record emission —
+/// same shape as `turn_tokens_payload` just above.
+///
+/// `sampled_at_ms` and `generated_chars` are ADDITIVE (FLOW_SCHEMA_VERSION
+/// bump alongside this change): the trajectory's `model.partial` event
+/// already carries `ts` at millisecond precision (`trajectory::unix_ms`),
+/// and — once the runtime side of #2877 lands — a `generated_chars` count
+/// that includes reasoning text and tool-call arguments, unlike `cumulative_chars` (answer text
+/// only, stays 0 while a separate-field-reasoning model reasons). Both
+/// read via `.get()`, so an OLDER runtime's event (neither field present)
+/// still forwards a valid heartbeat — `.get()` on a missing key yields
+/// `None`, which `serde_json::json!` serializes as `null`, and the UI rate
+/// module falls back to `cumulative_chars` + the record's own flow `ts`.
+fn heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "runtime": "internal",
+        "turn_seq": event.get("seq"),
+        "partial_index": event.get("partial_index"),
+        "cumulative_chars": event.get("cumulative_chars"),
+        "sampled_at_ms": event.get("ts"),
+        "generated_chars": event.get("generated_chars"),
+    })
+}
+
 fn turn_tokens_payload(event: &serde_json::Value) -> Option<serde_json::Value> {
     let usage = event.get("usage").filter(|u| u.is_object())?;
     let prompt = usage.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0);

@@ -209,6 +209,21 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
       source: "tokens",
       payload: { turn_seq: 1, prompt_tokens: 500, completion_tokens: 100, total_tokens: 600 },
     },
+    // (Playback parity, Change A, finding #7) A heartbeat just before the
+    // scrub point below (00:30:00) — `sessionRunning` now applies the SAME
+    // TTL-freshness fallback in both modes (a session with no close edge
+    // reads running only while its last recorded activity is within
+    // `FLOW_LIVE_TTL_MS` of the probed instant, not forever). Without this,
+    // the 30-minute gap between the one telemetry event above and the scrub
+    // point reads as an ORPHANED session (correctly, per finding #7's own
+    // fix) rather than the in-flight one this test means to scrub to.
+    {
+      ts: "2026-08-07T00:29:50.000Z",
+      machine_uid: "u1",
+      session_id: "s1",
+      action: "dispatch.turn.heartbeat",
+      payload: {},
+    },
     {
       ts: "2026-08-07T01:00:00.000Z",
       machine_uid: "u1",

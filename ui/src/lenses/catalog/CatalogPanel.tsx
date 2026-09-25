@@ -4,6 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import type { FlowDay, FlowDaysResponse, FlowMissionSummary, FlowMissionsResponse } from "../../types/handwritten";
 import { CATALOG_MISSION_CAP, daySummary, missionSummary, missionsHeader, todayUTC } from "./format";
+import { Shimmer } from "../../components/Placeholder";
 
 /**
  * The playback catalog (`#691`) — `viewer.html`'s `toggleCatalog()`/
@@ -172,7 +173,13 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
       {open && (
         <div className="catpanel" id="catpanel">
           {pending ? (
-            <div className="cathdr">loading…</div>
+            // (#2862) Not one of the issue's two named surfaces (a small
+            // history-browsing dropdown, not a page) — still no bare
+            // "loading…" text; a shimmer bar the size of a real `.cathdr`
+            // line stands in instead.
+            <div className="cathdr" role="status" aria-label="Loading history">
+              <Shimmer as="span" minWidth="8em" />
+            </div>
           ) : (
             <CatalogContent
               days={daysQuery.data?.ok ? daysQuery.data.data.days : []}

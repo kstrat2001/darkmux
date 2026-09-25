@@ -118,8 +118,9 @@ pub fn lab_doctor() -> Result<DoctorReport> {
 /// prior run) sits at the fixture root, and doctor's contract is
 /// cheap + offline — a deep recursive walk would betray that. We do NOT
 /// descend into `node_modules` (huge + legitimate, it's a
-/// HASH_ONLY_EXCLUDE not a run-artifact dir) nor into the artifact dirs
-/// themselves (no point — finding the dir is the whole signal).
+/// HASH_ONLY_EXCLUDE not a run-artifact dir), nor into `.git` (repository
+/// history, never flagged, #2888), nor into the artifact dirs themselves
+/// (no point — finding the dir is the whole signal).
 ///
 /// `RUN_ARTIFACT_DIRS` is consumed directly from `artifact_dirs` rather
 /// than re-listed here — re-listing is precisely the cross-copy drift
@@ -151,6 +152,15 @@ fn walk_for_artifacts(name: &str, dir: &Path, descend: bool, findings: &mut Vec<
             None => continue,
         };
 
+        // (#2888) `.git` is in RUN_ARTIFACT_DIRS so the hash skips it and
+        // the per-run clone prunes it, but in a fixture it is repository
+        // history: a published fixture is a `git clone`. Flagging it here
+        // advised `rm -rf` on that history, unpushed commits included.
+        // Never flag it, and never descend into it.
+        if file_name == ".git" {
+            continue;
+        }
+
         if RUN_ARTIFACT_DIRS.contains(&file_name) {
             findings.push(artifact_warning(name, file_name, &path));
             // Do NOT descend into the artifact dir — the dir itself is
@@ -172,9 +182,9 @@ fn walk_for_artifacts(name: &str, dir: &Path, descend: bool, findings: &mut Vec<
 }
 
 /// Advisory warning for one run-artifact dir found in a fixture source.
-/// `.git` is in `RUN_ARTIFACT_DIRS` (for hash exclusion), and a
-/// version-controlled fixture legitimately has one — so the wording is
-/// conditional ("if it's leftover from a prior run"), never imperative.
+/// The wording is conditional ("if it's leftover from a prior run"),
+/// never imperative. `.git` never reaches here (#2888): the walk skips
+/// it, because this remedy is `rm -rf`.
 fn artifact_warning(name: &str, dir: &str, path: &Path) -> String {
     let p = path.display();
     format!(
@@ -449,6 +459,52 @@ mod tests {
             findings.is_empty(),
             "node_modules must not trigger a cleanliness warning; got: {findings:?}"
         );
+    }
+
+    /// (#2888) A fixture that is a git checkout is the normal case for a
+    /// published one (`git clone` is how a reader gets pepper-grinder), so
+    /// `.git` is repository history, not a run artifact. The warning's
+    /// remedy is `rm -rf <path>`, which would delete that history,
+    /// unpushed commits included. No finding at the root or one level
+    /// down (a vendored submodule).
+    #[test]
+    fn cleanliness_check_never_flags_a_git_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("fx");
+        write_fixture(&dir, "demo");
+        let git = dir.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let sub_git = dir.join("vendor").join(".git");
+        std::fs::create_dir_all(&sub_git).unwrap();
+        std::fs::write(sub_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let mut reg = LabRegistry::default();
+        reg.register(&dir, None, false).unwrap();
+        let entry = reg.get("demo").unwrap();
+
+        let findings = check_fixture_cleanliness("demo", &entry.path);
+        assert!(
+            findings.is_empty(),
+            "a git checkout must not trigger a cleanliness warning (its remedy is rm -rf); got: {findings:?}"
+        );
+    }
+
+    /// (#2888) Skipping `.git` must not quiet the walk around it: a real
+    /// run artifact beside a `.git` still warns.
+    #[test]
+    fn cleanliness_check_still_warns_on_artifacts_beside_git() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("fx");
+        write_fixture(&dir, "demo");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("coverage")).unwrap();
+        let mut reg = LabRegistry::default();
+        reg.register(&dir, None, false).unwrap();
+        let entry = reg.get("demo").unwrap();
+
+        let findings = check_fixture_cleanliness("demo", &entry.path);
+        assert_eq!(findings.len(), 1, "exactly the coverage finding; got: {findings:?}");
+        assert!(findings[0].contains("'coverage'"), "got: {}", findings[0]);
     }
 
     #[test]

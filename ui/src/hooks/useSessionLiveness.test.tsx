@@ -41,6 +41,7 @@ import type { FlowWindowResult } from "./useFlowWindow";
 
 const h = vi.hoisted(() => ({
   liveIds: new Set<string>(),
+  liveMissions: new Set<string>(),
   coverage: null as { state: "unavailable" | "stale"; detail?: string } | null,
 }));
 // (#2725) The hook returns `{ sessions, coverage }` now — the coverage half
@@ -49,7 +50,9 @@ const h = vi.hoisted(() => ({
 // in this file except the block that names it.
 vi.mock("./useLiveSessionIds", () => ({
   useLiveSessionIds: (enabled = true) =>
-    enabled ? { sessions: h.liveIds, coverage: h.coverage } : { sessions: new Set<string>(), coverage: null },
+    enabled
+      ? { sessions: h.liveIds, missions: h.liveMissions, coverage: h.coverage }
+      : { sessions: new Set<string>(), missions: new Set<string>(), coverage: null },
 }));
 
 const LIVE: FlowWindowResult = {
@@ -99,6 +102,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   h.liveIds = new Set<string>();
+  h.liveMissions = new Set<string>();
   h.coverage = null;
 });
 
@@ -249,3 +253,25 @@ describe("endedByPresence under degraded fleet coverage (#2725)", () => {
     expect(result.current.coverage).toBeNull();
   });
 });
+
+describe("useSessionLiveness — a mission's run-grain session", () => {
+  // A mission's own session never beats: only its executions do, each under
+  // its own session id. Keyed on the run's id alone, a mission's page was
+  // never live, fetched once, and froze on its first read for the whole run.
+  it("is live while any present execution names the run's mission", async () => {
+    h.liveIds = new Set(["exec-under-m1"]);
+    h.liveMissions = new Set(["m-1"]);
+    const { result } = renderHook(() => useSessionLiveness("m-1-run", "m-1"), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.isLive).toBe(true));
+    expect(result.current.shouldPoll).toBe(true);
+  });
+
+  it("is NOT live when the present executions belong to a different mission", async () => {
+    h.liveIds = new Set(["exec-under-m2"]);
+    h.liveMissions = new Set(["m-2"]);
+    const { result } = renderHook(() => useSessionLiveness("m-1-run", "m-1"), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.isLive).toBe(false));
+    expect(result.current.shouldPoll).toBe(false);
+  });
+});
+
