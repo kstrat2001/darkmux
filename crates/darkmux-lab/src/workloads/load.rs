@@ -64,9 +64,13 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         "crawl-error-discard",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/crawl-error-discard.json")),
     ),
+    // The public long-agentic workload: binds the published pepper-grinder
+    // fixture (`node-pepper-grinder-js@2.0`) by contract, no seed dir. It
+    // replaced `long-agentic`, whose fixture contract only a private codebase
+    // ever satisfied, so no reader could run it.
     (
-        "long-agentic",
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/long-agentic.json")),
+        "pepper-grinder",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/pepper-grinder.json")),
     ),
     (
         "quick-coding",
@@ -92,7 +96,7 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
     // It embeds cleanly under `parse_str`'s rules: no `promptFile`, and
     // although it is `provider: coding-task` it declares NO `sandboxSeed`
     // (it binds a registered fixture + external sandbox instead), exactly
-    // like the already-embedded `long-agentic`.
+    // like the embedded `pepper-grinder`.
     (
         "demo-quickstart",
         include_str!(concat!(
@@ -744,6 +748,59 @@ mod tests {
             loaded.manifest.workload.sandbox_seed.is_none(),
             "demo-quickstart must not declare a sandboxSeed, or it can't be embedded"
         );
+    }
+
+    /// The files the PUBLISHED pepper-grinder fixture declares
+    /// (`required_files` in github.com/kstrat2001/pepper-grinder's
+    /// `.fixture.json`, contract `node-pepper-grinder-js@2.0`). Copied here
+    /// on purpose: a workload whose prompt names files its fixture does not
+    /// have is exactly how `long-agentic` came to ship pointing at a fixture
+    /// no reader could obtain.
+    const PUBLISHED_PEPPER_GRINDER_FILES: &[&str] = &[
+        "src/config.js",
+        "src/store.js",
+        "src/tokenRotation.js",
+        "test/tokenRotation.test.js",
+        "test/portability.test.js",
+        "package.json",
+    ];
+
+    /// The built-in pepper-grinder workload runs on a fixture anyone can
+    /// clone: it resolves from the binary alone, binds the published
+    /// fixture's contract, and its prompt names only files that fixture has.
+    #[serial_test::serial]
+    #[test]
+    fn pepper_grinder_resolves_from_the_binary_and_names_only_published_files() {
+        let tmp = TempDir::new().unwrap();
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        unsafe { env::set_var("DARKMUX_TEMPLATES_DIR", tmp.path().join("nope")) };
+        let result = load("pepper-grinder", None);
+        unsafe { env::remove_var("DARKMUX_TEMPLATES_DIR") };
+        env::set_current_dir(prev).unwrap();
+        let loaded = result.expect("pepper-grinder must resolve from the binary with no checkout");
+        let w = &loaded.manifest.workload;
+        assert_eq!(loaded.source, WorkloadSource::Embedded);
+        assert_eq!(w.id, "pepper-grinder");
+        assert_eq!(w.requires_fixture.as_deref(), Some("node-pepper-grinder-js@2.0"));
+        assert!(w.sandbox_seed.is_none(), "it binds the registered fixture, not a seed dir");
+        let verify = w.verify.as_ref().expect("pepper-grinder ships a verify spec");
+        assert_eq!(verify.command.as_deref(), Some("npm test"));
+
+        let prompt = w.prompt.as_deref().expect("pepper-grinder ships its prompt inline");
+        let named: Vec<&str> = prompt
+            .split("${SANDBOX_DIR}/")
+            .skip(1)
+            .map(|rest| rest.split(|c: char| c.is_whitespace() || c == ')' || c == '`').next().unwrap_or(""))
+            .filter(|p| p.contains('.'))
+            .collect();
+        assert!(!named.is_empty(), "the prompt should point the model at the fixture's files");
+        for path in named {
+            assert!(
+                PUBLISHED_PEPPER_GRINDER_FILES.contains(&path),
+                "prompt names `{path}`, which the published fixture does not have"
+            );
+        }
     }
 
     // ─── #2553 — the on-disk tier must NOT be cwd-sensitive ──────────────
