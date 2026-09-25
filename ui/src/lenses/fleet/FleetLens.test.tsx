@@ -521,21 +521,28 @@ describe("FleetLens", () => {
     }
   });
 
-  it("(#2890) a replay's activity window defaults to the smallest preset covering the recording", async () => {
+  it("(#2890) a replay's activity window defaults to \"all\", the recording's own span", async () => {
     // A 34-minute recording under the 24h default was a sliver at the right
     // edge of the timeline (operator, 2026-09-25: "I'm spending most of my
     // time watching nothing happen").
     const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
     const records = [mk("2026-08-26T10:00:00.000Z", "dispatch.start"), mk("2026-08-26T10:34:00.000Z", "dispatch.complete")];
     renderFleetLens({ records, tMin: Date.parse("2026-08-26T10:00:00.000Z"), tMax: Date.parse("2026-08-26T10:34:00.000Z"), historical: true });
-    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("1h"));
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("all"));
   });
 
-  it("(#2890) a replay longer than 4h keeps the 24h window; live keeps the 24h default", async () => {
+  it("(#2890) a picked preset replaces \"all\"; live has no \"all\" and keeps 24h", async () => {
     const mk = (ts: string, action: string) => ({ ts, machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
     const records = [mk("2026-08-26T01:00:00.000Z", "dispatch.start"), mk("2026-08-26T09:00:00.000Z", "dispatch.complete")];
-    renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z"), historical: true });
+    const r = renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("all"));
+    fireEvent.click(screen.getByRole("button", { name: "1h" }));
+    expect(document.querySelector(".twinb.on")?.textContent).toBe("1h");
+    r.unmount();
+    // Same records, not a replay: no "all", and the live 24h default.
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T01:00:00.000Z"), tMax: Date.parse("2026-08-26T09:00:00.000Z") });
     await waitFor(() => expect(document.querySelector(".twinb.on")?.textContent).toBe("24h"));
+    expect([...document.querySelectorAll(".twinb")].map((b) => b.textContent)).not.toContain("all");
   });
 
   it("(#2834) a session whose endpoint is unknown still counts: darkmux dispatched those tokens either way", async () => {
@@ -903,6 +910,9 @@ describe("FleetLens", () => {
     // (rather than asserting a literal — `clkhm` renders in the runner's
     // local timezone), which is what actually moves with the playhead.
     expect(document.querySelector(".tlhdr span")!.textContent).toBe("recent activity");
+    // (#2890) A replay now opens on "all" (the recording's fixed span); the
+    // rolling window this test pins is what any picked preset does.
+    fireEvent.click(screen.getByRole("button", { name: "24h" }));
     const axisBefore = [...document.querySelectorAll(".tlaxis span")].map((e) => e.textContent);
     expect(axisBefore.every(Boolean)).toBe(true);
     // The playhead marker sits at the window's own right edge at rest.

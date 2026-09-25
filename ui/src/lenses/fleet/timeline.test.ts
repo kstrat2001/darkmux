@@ -289,3 +289,22 @@ describe("buildActivityTimeline — reused step session ids across missions (#21
     expect(tl.lanes[0].bars[0].key).toBe("bare-1");
   });
 });
+
+describe("(#2890) a replay's timeline spans the recording", () => {
+  const t0 = Date.parse("2026-08-26T10:00:00.000Z");
+  const t1 = Date.parse("2026-08-26T10:34:00.000Z");
+  const rec = (ts: number, action: string) =>
+    ({ ts: new Date(ts).toISOString(), machine_uid: "u1", machine_id: "m5", session_id: "s1", action }) as unknown as FlowRecord;
+  it("a fixed range sets the axis to the recording and starts a bar at the left edge", () => {
+    const data = [rec(t0, "dispatch.start"), rec(t0 + 10 * 60_000, "dispatch.complete")];
+    const tl = buildActivityTimeline(data, new Map(), ["u1"], new Set(), t1, t1, 60, false, t0, t1, [t0, t1]);
+    expect(tl.axis).toEqual([clkhm(t0), clkhm(t0 + (t1 - t0) / 2), clkhm(t1)]);
+    expect(tl.lanes[0].bars[0].leftPct).toBe(0);
+  });
+  it("without a range the window still rolls back from the playhead", () => {
+    const data = [rec(t0, "dispatch.start"), rec(t0 + 10 * 60_000, "dispatch.complete")];
+    const tl = buildActivityTimeline(data, new Map(), ["u1"], new Set(), t1, t1, 60, false, t0, t1);
+    expect(tl.axis[0]).toBe(clkhm(t1 - 60 * 60_000));
+  });
+});
+

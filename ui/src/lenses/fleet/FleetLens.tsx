@@ -443,15 +443,18 @@ export function FleetLens({
    * a static build today, so their gated-off results were already the empty
    * values the consumers below receive. */
   const livePolling = liveMode && getSource().kind === "daemon";
-  // (#2890) A replay opens on the smallest preset that covers the whole
-  // recording, so a short recording (the demo is about half an hour) fills
-  // the timeline instead of sitting as a sliver at the right edge of 24h.
-  // Live keeps the 24h default. A preset the operator picks still wins.
-  const [windowMinutes, setWindowMinutes] = useState(() => {
-    if (!historical || tMin == null || tMax == null) return DEFAULT_ACTIVITY_WINDOW_MIN;
-    const spanMin = (tMax - tMin) / 60_000;
-    return ACTIVITY_WINDOW_PRESETS.find((p) => p.minutes >= spanMin)?.minutes ?? DEFAULT_ACTIVITY_WINDOW_MIN;
-  });
+  // (#2890) A replay's timeline defaults to "all": the recording's own span,
+  // edge to edge, so a short recording (the demo is about half an hour)
+  // fills the lanes instead of sitting as a sliver at the right edge of a
+  // preset. "all" is offered only in a replay; a preset the operator picks
+  // replaces it. Live keeps the 24h default and has no "all".
+  const recordingRange: [number, number] | null =
+    historical && tMin != null && tMax != null && tMax > tMin ? [tMin, tMax] : null;
+  const [windowMinutes, setWindowMinutes] = useState<number | "all">(() =>
+    recordingRange ? "all" : DEFAULT_ACTIVITY_WINDOW_MIN,
+  );
+  const fixedRange = windowMinutes === "all" ? (recordingRange ?? undefined) : undefined;
+  const windowMinutesNum = windowMinutes === "all" ? DEFAULT_ACTIVITY_WINDOW_MIN : windowMinutes;
   // (#2881) The pager's sticky PICK, per machine uid — the session id the
   // operator last chose with an arrow, if any. `FleetCard.executions` no
   // longer including it (that execution ended) falls back to the AUTO
@@ -741,12 +744,13 @@ export function FleetLens({
         // stay separate arguments once a replay can scrub.
         flowWindow.tMax,
         playheadT,
-        windowMinutes,
+        windowMinutesNum,
         liveMode,
         tMin ?? 0,
         playheadT,
+        fixedRange,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutes, liveMode, tMin, playheadT],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1]],
   );
 
   return (
@@ -1107,6 +1111,11 @@ export function FleetLens({
                 a replay drew the whole recorded day with nothing to slide
                 over. */}
             <span className="twin">
+              {recordingRange && (
+                <button className={`twinb${windowMinutes === "all" ? " on" : ""}`} onClick={() => setWindowMinutes("all")}>
+                  all
+                </button>
+              )}
               {ACTIVITY_WINDOW_PRESETS.map((p) => (
                 <button
                   key={p.minutes}
