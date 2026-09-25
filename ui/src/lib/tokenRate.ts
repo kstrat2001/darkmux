@@ -194,11 +194,15 @@ export interface GenerationRateReading {
 }
 
 /** A FINISHED run's generation rate: billed completion tokens over the time
- *  the model spent generating (`dispatch.turn`'s `generation_ms`), paired by
- *  turn within each execution. Not the wall clock, which includes rests,
- *  tools and prompt reading (a real run read 45 tok/s over wall clock
- *  against ~80 over generation time). `null` when no turn carries
- *  `generation_ms` (a runtime older than flow schema 1.53).
+ *  the model spent on its calls (`dispatch.turn`'s `generation_ms`), paired
+ *  by turn within each execution. `generation_ms` runs from
+ *  `model.streaming.start`, written BEFORE the request is sent, to the
+ *  stream's end, so it includes the model reading the prompt (prefill): on
+ *  a large context this reads below pure decoding speed. It is still not
+ *  the wall clock, which adds rests and tool time between calls (a real run
+ *  read 45 tok/s over wall clock against ~80 over `generation_ms`). `null`
+ *  when no turn carries `generation_ms` (a runtime older than flow schema
+ *  1.53).
  *
  * (#2886) A turn cut by a reasoning checkpoint bills only its final
  * continuation's tokens while `generation_ms` spans every continuation the
@@ -453,7 +457,13 @@ interface StateMarker {
  *    `"stalled"` (the pre-existing `isStalled` rule, unchanged).
  * 4. No heartbeat at all and no marker → `"prompt"` (a session that has
  *    started producing no evidence yet reads the same as right after
- *    `dispatch.start`). */
+ *    `dispatch.start`).
+ *
+ * (#2889) A fresh WRITING heartbeat (the model is writing a named tool call)
+ * reads `"tools"` with `writing`, never `"stalled"`: the runtime ticks for as
+ * long as it waits on that call. So an endpoint that hangs after naming a
+ * tool reads "writing · N s" until the host's inactivity watchdog ends the
+ * dispatch (600 s by default), never STALL. */
 export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveStateReading {
   // Cut ONCE, up front — every downstream read (`heartbeatSamples`,
   // `isStalled`, the marker scan) then agrees on "as of `nowMs`" instead of

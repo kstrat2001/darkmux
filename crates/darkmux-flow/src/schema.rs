@@ -90,6 +90,11 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
 //           `model.tool_call.writing`) and the host forwards each tick as a
 //           heartbeat with `generated_chars` UNCHANGED. Both keys are ABSENT,
 //           not null, on every other heartbeat: they mean "writing".
+//           A tick only says the runtime is still waiting on a named call,
+//           so an endpoint that hangs after naming a tool reads "writing"
+//           (never stalled) until the host's inactivity watchdog ends the
+//           dispatch (`runtime.inactivity_timeout_seconds`, 600s default):
+//           ticks deliberately never reset that watchdog.
 //           `prompt_chars` rides the turn's OPENING heartbeat, which the
 //           host now emits from `model.streaming.start` at
 //           `generated_chars: 0`: the request's size in chars (system +
@@ -117,9 +122,13 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
 //           (null on an observation, only ever populated by an abort — also
 //           the field a consumer uses to tell the two record shapes apart
 //           without a dedicated discriminator key), `policy`
-//           (`"enforce"`/`"observe"`/`"off"`) and `acted` (true only for
-//           `dispatch.gate.abort` — an observation, even a degenerate one,
-//           never itself ended the call). `policy`/`acted` are stamped by
+//           (`"enforce"`/`"observe"`/`"off"`) and `acted` (true on every
+//           `dispatch.gate.abort`, AND on the degenerate observation whose
+//           verdict ended the call — under `enforce` that observation is
+//           written for the same moment as the abort that follows it, and
+//           carries `acted: true` too; false on an observation that ended
+//           nothing, e.g. every degenerate observation under `observe`).
+//           `policy`/`acted` are stamped by
 //           the RUNTIME itself (`trajectory::append_gate_observation`/
 //           `append_gate_abort`), not reconstructed by the host from its
 //           own environment — a record from a runtime image that predates
