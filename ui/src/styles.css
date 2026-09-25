@@ -3586,8 +3586,8 @@ body {
      WIDTH down to match that unclamped height's square, which is what an
      oval bezel (found in an actual screenshot, not predicted) turns out to
      mean in practice. Matches `padding-right` above — see its own comment. */
-  max-width: var(--tube, 80px);
-  max-height: var(--tube, 80px);
+  max-width: var(--tube);
+  max-height: var(--tube);
 }
 /* (Mobile fix pass, #2877; widened #2881) The SAME width fix this file's
    `.mach { width: 100% }` rule already makes at this breakpoint turns a
