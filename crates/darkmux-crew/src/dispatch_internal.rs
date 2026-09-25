@@ -9020,6 +9020,10 @@ struct TailerState {
     /// dispatch — those records attribute via `session_id` alone.
     step_id: Option<String>,
     last_heartbeat_at: Option<Instant>,
+    /// (#2889 review, M2) Set by the opening heartbeat and by an emitted
+    /// writing tick; the next real `model.partial` then emits (and resets
+    /// the inactivity deadline) regardless of the 2 s coalescing window.
+    chunk_owed: bool,
     summary: TrajectorySummary,
     /// (#457) Shared with the watchdog thread. Tailer writes a new
     /// deadline (`now + inactivity_secs`) when a `compaction` event
@@ -9116,6 +9120,7 @@ impl TailerState {
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
+            chunk_owed: false,
             summary: TrajectorySummary::default(),
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
@@ -9196,6 +9201,7 @@ impl TailerState {
             phase_id: None,
             step_id: None,
             last_heartbeat_at: None,
+            chunk_owed: false,
             summary: TrajectorySummary::default(),
             inactivity_deadline: None,
             inactivity_secs: 600,
@@ -9657,7 +9663,12 @@ impl TailerState {
                 // starting within 2s of the last heartbeat would otherwise
                 // lose its only prompt size), and never proof of work — a
                 // request going out says nothing about the model producing.
-                self.last_heartbeat_at = Some(Instant::now());
+                // (#2889 review, M2) It must not consume the chunk rate gate
+                // either: stamping `last_heartbeat_at` here swallowed the
+                // turn's first real chunk (no heartbeat, no deadline reset),
+                // so a turn under 2 s never showed generation. Instead the
+                // next real chunk is owed an emission.
+                self.chunk_owed = true;
                 self.summary.heartbeats += 1;
                 self.emit(
                     "dispatch.turn.heartbeat",
@@ -9686,12 +9697,19 @@ impl TailerState {
                 // topology edges animated during long streaming turns
                 // without flooding the flow stream + audit chain. (#231)
                 let now = Instant::now();
-                let should_emit = match self.last_heartbeat_at {
+                let window_open = match self.last_heartbeat_at {
                     None => true,
                     Some(prev) => now.duration_since(prev) >= HEARTBEAT_MIN_INTERVAL,
                 };
+                // (#2889 review, M2) A real chunk after an opener or a tick
+                // always emits: those two are not proof of work, so they
+                // must never be what keeps the next proof of work from
+                // resetting the deadline. Ticks themselves stay coalesced.
+                let should_emit = window_open || (is_chunk && self.chunk_owed);
                 if should_emit {
                     self.last_heartbeat_at = Some(now);
+                    // A chunk settles the debt; a tick creates it.
+                    self.chunk_owed = !is_chunk;
                     self.summary.heartbeats += 1;
                     // (#1222 shakedown-3) Streamed chunks are the third
                     // proof-of-work signal. A model.partial event only fires

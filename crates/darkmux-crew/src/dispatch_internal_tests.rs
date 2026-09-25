@@ -10034,6 +10034,103 @@
         );
     }
 
+    /// (#2889 review, M2) Two-event helper: write `lines` as one trajectory
+    /// chunk, poll ONCE, and return (heartbeats, deadline) so a test can see
+    /// how one event's gate bookkeeping affects the next.
+    fn two_event_poll(lines: &[&str]) -> (Vec<serde_json::Value>, Instant, Instant) {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            600,
+        );
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        drop(f);
+        state.poll_and_emit();
+        // Payloads only: a full record carries the host's `machine_uid`,
+        // which must not reach a failing assertion's output.
+        let beats = heartbeats_in(&isolated.path().join("flows"))
+            .into_iter()
+            .map(|r| serde_json::json!({ "payload": r["payload"].clone() }))
+            .collect();
+        let deadline = *shared.lock().unwrap();
+        (beats, deadline, original_deadline)
+    }
+
+    /// (#2889 review, M2) The opening heartbeat must not consume the chunk
+    /// rate gate. Before the fix the opener stamped `last_heartbeat_at`, so
+    /// the turn's first real chunk (300 ms later on the runtime's clock, one
+    /// poll here) failed the 2 s gate: no heartbeat, and no deadline reset.
+    /// A turn shorter than 2 s never showed generation at all.
+    #[test]
+    #[serial]
+    fn tailer_first_chunk_after_the_opener_emits_and_resets_the_deadline() {
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":140000}"#,
+            r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":0,"generated_chars":12,"ts":1758700000300}"#,
+        ]);
+        assert_eq!(beats.len(), 2, "opener AND first chunk must both emit: {beats:?}");
+        assert_eq!(beats[0]["payload"]["generated_chars"], 0);
+        assert_eq!(beats[1]["payload"]["generated_chars"], 12);
+        assert!(deadline > original, "the first real chunk must reset the inactivity deadline");
+
+        // The previous turn's last chunk emitted moments before this turn's
+        // opener, so the 2 s window is shut: the new turn's first chunk
+        // still emits, because the opener left it owed.
+        let (beats, _, _) = two_event_poll(&[
+            r#"{"type":"model.partial","seq":2,"partial_index":40,"cumulative_chars":0,"generated_chars":900}"#,
+            r#"{"type":"model.streaming.start","seq":3,"ts":1758700000000,"system_chars":4000,"prompt_chars":140000}"#,
+            r#"{"type":"model.partial","seq":3,"partial_index":1,"cumulative_chars":0,"generated_chars":12,"ts":1758700000300}"#,
+        ]);
+        assert_eq!(beats.len(), 3, "prev chunk, opener, and the new turn's first chunk all emit: {beats:?}");
+    }
+
+    /// (#2889 review, M2) A writing tick must not swallow the real chunk
+    /// that follows it: the tick emits (no deadline reset), then the args
+    /// chunk emits AND resets the deadline even inside the 2 s window.
+    #[test]
+    #[serial]
+    fn tailer_real_chunk_after_a_writing_tick_emits_and_resets_the_deadline() {
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.tool_call.writing","seq":2,"partial_index":9,"cumulative_chars":0,"generated_chars":1500,"phase":"writing_tool_call","tool_name":"write","ts":1758700070000}"#,
+            r#"{"type":"model.partial","seq":2,"partial_index":10,"cumulative_chars":0,"generated_chars":1620,"ts":1758700070300}"#,
+        ]);
+        assert_eq!(beats.len(), 2, "tick AND the chunk after it must both emit: {beats:?}");
+        assert_eq!(beats[0]["payload"]["phase"], "writing_tool_call");
+        assert_eq!(beats[1]["payload"]["generated_chars"], 1620);
+        assert!(deadline > original, "the real chunk after a tick must reset the inactivity deadline");
+    }
+
+    /// (#2889 review, M2) The coalescing still holds for chunks: two real
+    /// chunks inside the window emit one heartbeat, and back-to-back ticks
+    /// emit one — the fix must not turn the gate into a pass-through.
+    #[test]
+    #[serial]
+    fn tailer_chunks_and_ticks_still_coalesce_inside_the_window() {
+        let (beats, _, _) = two_event_poll(&[
+            r#"{"type":"model.partial","seq":2,"partial_index":1,"cumulative_chars":0,"generated_chars":10}"#,
+            r#"{"type":"model.partial","seq":2,"partial_index":2,"cumulative_chars":0,"generated_chars":20}"#,
+        ]);
+        assert_eq!(beats.len(), 1, "two chunks in one window coalesce: {beats:?}");
+        let (beats, deadline, original) = two_event_poll(&[
+            r#"{"type":"model.tool_call.writing","seq":2,"partial_index":1,"cumulative_chars":0,"generated_chars":10,"phase":"writing_tool_call","tool_name":"write"}"#,
+            r#"{"type":"model.tool_call.writing","seq":2,"partial_index":1,"cumulative_chars":0,"generated_chars":10,"phase":"writing_tool_call","tool_name":"write"}"#,
+        ]);
+        assert_eq!(beats.len(), 1, "two ticks in one window coalesce: {beats:?}");
+        assert_eq!(deadline, original, "ticks never reset the deadline");
+    }
+
     /// Integration shape: feed a `dispatch.cycle.suspected` trajectory
     /// line through `handle_event` and assert the emitted FlowRecord is a
     /// telemetry record (`category:"telemetry"`, `source:"detector"`)
