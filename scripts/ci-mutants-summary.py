@@ -405,6 +405,12 @@ _TEST_MOD_HINT_RE = re.compile(r"\bmod\s+\w*test\w*\s*\{")
 _TEST_RANGE_CACHE: dict[str, list[tuple[int, int]] | None] = {}
 
 
+# (#2883) One char literal starting at a `'`: an escape (`'\\''`, `'\\n'`,
+# `'\\x7f'`, `'\\u{1F600}'`) or any single character but `\\`, `'` or a
+# newline, then the closing quote.
+_CHAR_LITERAL = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.)|[^\\'\n])'")
+
+
 def _brace_deltas_per_line(text: str) -> list[tuple[int, int]]:
     """Return `(opens, closes)` for every line of `text`, counting only `{`
     and `}` that are real Rust syntax — never one sitting inside a string, a
@@ -423,10 +429,11 @@ def _brace_deltas_per_line(text: str) -> list[tuple[int, int]]:
     block comment, or the file's `mod tests` itself can span lines) tracking
     which of `code` / a `"..."` string / a raw `r#"..."#` string / a `//`
     line comment / a `/* */` block comment we are inside. Only `{`/`}` seen
-    while in `code` state count. `'` is deliberately NOT specially handled:
-    a char literal (`'x'`) and a lifetime (`'a`) can never legitimately
-    contain a brace either way, so treating `'` as an ordinary character
-    never miscounts one.
+    while in `code` state count. A `'` that opens a char or byte literal
+    (`'x'`, `b'{'`, `'"'`, `'\\''`) skips the whole literal: it CAN hold a
+    brace or a quote, and reading that as code misplaced `mod tests` in
+    `runtime/src/plain_text_tool_calls.rs` (#2883). A lifetime (`'a`) has no
+    closing quote after one character, so it stays one ordinary character.
 
     Known gaps, same fail-open direction as the rest of this module: Rust
     block comments nest (`/* /* */ */`); this scanner does not, so a nested
@@ -466,6 +473,19 @@ def _brace_deltas_per_line(text: str) -> list[tuple[int, int]]:
                 continue
             if ch == "}":
                 deltas[lineno][1] += 1
+                i += 1
+                continue
+            if ch == "'":
+                # (#2883) A char or byte literal is skipped whole: `'{'`,
+                # `b'}'` and `'"'` are real Rust, and reading their brace
+                # or quote as code misplaced `mod tests` in
+                # `runtime/src/plain_text_tool_calls.rs`. A lifetime
+                # (`'a`) has no closing quote after one character, so it
+                # does not match and falls through as one ordinary char.
+                m = _CHAR_LITERAL.match(text, i)
+                if m:
+                    i = m.end()
+                    continue
                 i += 1
                 continue
             if ch == '"':
@@ -2266,6 +2286,75 @@ _CONST_ARRAY_SOURCE = (
     "];\n"
 )
 
+# (#2883) Brace and quote CHAR literals ahead of a test module: the real
+# shape of `runtime/src/plain_text_tool_calls.rs` (`b'{'` at 484 and 506,
+# `Some('"')` at 886, `mod tests` at 941). The scanner used to read `'"'` as
+# the start of a string and `b'{'` as a real brace, so the module "closed"
+# one line after it opened and every test line below counted as code. The
+# `_h` closure guards the other direction: three lifetimes, then a `{`, then a
+# char literal, all inside the module, where a too-greedy literal match
+# would swallow the brace and close the module early.
+_CHAR_LITERAL_SOURCE = (
+    "pub fn open(c: u8) -> bool {\n"
+    "    if c == b'{' {\n"
+    "        return true;\n"
+    "    }\n"
+    "    c == b'\"'\n"
+    "}\n"
+    "\n"
+    "pub fn close(c: char) -> bool {\n"
+    "    c == '}' || c == '\\''\n"
+    "}\n"
+    "\n"
+    "#[cfg(test)]\n"
+    "mod tests {\n"
+    "    #[test]\n"
+    "    fn t() {\n"
+    "        let _h = |x: &'static str, _y: &'static str| -> &'static str { let _c = 'x'; x };\n"
+    "    }\n"
+    "\n"
+    "    #[test]\n"
+    "    fn u() {\n"
+    "        assert!(super::open(b'{'));\n"
+    "        assert!(super::close('}'));\n"
+    "    }\n"
+    "}\n"
+)
+
+_DIFF_CHAR_LITERAL_TEST_ONLY = (
+    "--- a/crates/fake/src/chars.rs\n"
+    "+++ b/crates/fake/src/chars.rs\n"
+    "@@ -21,1 +21,2 @@ mod tests {\n"
+    "         assert!(super::open(b'{'));\n"
+    "+        assert!(super::close('}'));\n"
+)
+
+# The inverse: a production line AFTER the same char literals still counts,
+# so the fix cannot pass by over-excluding (a lifetime must not swallow code
+# either: `fn f<'a>(x: &'a str)` has no closing quote).
+_CHAR_LITERAL_PROD_SOURCE = (
+    "pub fn open(c: u8) -> bool {\n"
+    "    if c == b'{' {\n"
+    "        return true;\n"
+    "    }\n"
+    "    c == b'\"'\n"
+    "}\n"
+    "\n"
+    "pub fn first<'a>(x: &'a str) -> &'a str {\n"
+    "    if x.is_empty() { return x; }\n"
+    "    &x[..1]\n"
+    "}\n"
+)
+
+_DIFF_CHAR_LITERAL_PROD = (
+    "--- a/crates/fake/src/chars_prod.rs\n"
+    "+++ b/crates/fake/src/chars_prod.rs\n"
+    "@@ -8,2 +8,3 @@\n"
+    " pub fn first<'a>(x: &'a str) -> &'a str {\n"
+    "+    if x.is_empty() { return x; }\n"
+    "     &x[..1]\n"
+)
+
 TEST_MODULE_SELF_TEST_CASES = [
     {
         # This is the reproduction of #2582 / PR #2579 itself: a diff whose
@@ -2368,6 +2457,24 @@ TEST_MODULE_SELF_TEST_CASES = [
         "source_files": {"crates/fake/src/lib.rs": _CONST_ARRAY_SOURCE},
         "expect_count": 0,
         "expect_gate": 0,
+    },
+    {
+        # (#2883) char literals containing a brace or a quote must not move
+        # the test module's boundary. PR #2883's runtime diff was nine
+        # test-only lines; three of them, in plain_text_tool_calls.rs,
+        # counted as code and failed the floor.
+        "name": "#2883: brace/quote char literals before mod tests; a test-only line counts zero",
+        "diff": _DIFF_CHAR_LITERAL_TEST_ONLY,
+        "source_files": {"crates/fake/src/chars.rs": _CHAR_LITERAL_SOURCE},
+        "expect_count": 0,
+        "expect_gate": 0,
+    },
+    {
+        "name": "#2883: a production line after char literals and lifetimes still counts",
+        "diff": _DIFF_CHAR_LITERAL_PROD,
+        "source_files": {"crates/fake/src/chars_prod.rs": _CHAR_LITERAL_PROD_SOURCE},
+        "expect_count": 1,
+        "expect_gate": 1,
     },
 ]
 
