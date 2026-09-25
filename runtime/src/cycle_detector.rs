@@ -401,7 +401,7 @@ mod tests {
     ///
     /// Trajectory slice from the first run that fired cycle detection
     /// 10 times (10/100 turns triggered the warning). The model
-    /// repeatedly read/edited/test-ran `authenticationService.test.ts`
+    /// repeatedly read/edited/test-ran `tokenRotation.test.js`
     /// during a test-iteration loop. This is the canonical "model
     /// going in circles" pattern operators see in real dispatches.
     ///
@@ -435,10 +435,10 @@ mod tests {
                 // trace (path-only for read/edit; command-only for bash).
                 let synth_args = match tool_name {
                     "read" | "edit" | "write" => {
-                        r#"{"path":"/workspace/tests/services/authenticationService.test.ts"}"#
+                        r#"{"path":"/workspace/test/tokenRotation.test.js"}"#
                     }
                     "bash" => {
-                        r#"{"command":"cd /workspace && npm test -- tests/services/authenticationService.test.ts"}"#
+                        r#"{"command":"cd /workspace && npm test -- test/tokenRotation.test.js"}"#
                     }
                     _ => "{}",
                 };

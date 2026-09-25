@@ -3927,7 +3927,7 @@ mod tests {
         let json = r#"{
             "objective": "Audit refresh-token rotation tests",
             "current_truth": {
-                "active_files": "refreshTokenService.test.ts — 5 failures",
+                "active_files": "tokenRotation.test.js — 5 failures",
                 "test_outcomes": "npm test → 5 failed, 86 passed",
                 "external_state": "config mock state shared across tests"
             },
@@ -3946,7 +3946,7 @@ mod tests {
         assert_eq!(out.objective, "Audit refresh-token rotation tests");
         assert_eq!(
             out.current_truth.active_files.as_deref(),
-            Some("refreshTokenService.test.ts — 5 failures")
+            Some("tokenRotation.test.js — 5 failures")
         );
         assert_eq!(
             out.completed_decisions.as_deref(),
@@ -4587,7 +4587,7 @@ mod tests {
     /// but the template's substitution shape is independent of length.
     const FIXTURE_EXCERPT: &str =
         "[user]: please add tests for the rotation feature\n\n\
-         [assistant]: \n  tool_call: read({\"path\":\"src/refreshTokenService.ts\",\"offset\":1,\"limit\":50})\n\n\
+         [assistant]: \n  tool_call: read({\"path\":\"src/tokenRotation.js\",\"offset\":1,\"limit\":50})\n\n\
          [tool]: <file contents elided for fixture brevity>\n  (tool result for: read)\n\n";
 
     const FIXTURE_GENERATION: u32 = 7;

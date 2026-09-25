@@ -4,7 +4,7 @@ Summarize the following conversation excerpt into the structured-slot schema. Ou
 [user]: please add tests for the rotation feature
 
 [assistant]: 
-  tool_call: read({"path":"src/refreshTokenService.ts","offset":1,"limit":50})
+  tool_call: read({"path":"src/tokenRotation.js","offset":1,"limit":50})
 
 [tool]: <file contents elided for fixture brevity>
   (tool result for: read)

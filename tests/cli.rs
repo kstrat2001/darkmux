@@ -10662,11 +10662,51 @@ fn write_peer_mission_day_file(
         })
         .to_string()
     };
-    let mut lines = vec![rec("2026-09-10T01:00:00Z", "mission start")];
+    // Dated one hour ago, not a fixed day: `mission status` reads only the
+    // last `RUNS_FLOW_SCAN_WINDOW_DAYS` (14) of flow days, so a fixed
+    // 2026-09-10 fixture silently fell out of the window on 2026-09-25 and
+    // both tests below went red on every branch at once.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let start = now - 3600;
+    let (day, start_ts) = utc_day_and_ts(start);
+    let (_, close_ts) = utc_day_and_ts(start + 300);
+    let mut lines = vec![rec(&start_ts, "mission start")];
     if let Some(action) = terminal_action {
-        lines.push(rec("2026-09-10T01:05:00Z", action));
+        lines.push(rec(&close_ts, action));
     }
-    fs::write(flows.join("2026-09-10.jsonl"), lines.join("\n") + "\n").unwrap();
+    fs::write(flows.join(format!("{day}.jsonl")), lines.join("\n") + "\n").unwrap();
+}
+
+/// `(YYYY-MM-DD, YYYY-MM-DDTHH:MM:SSZ)` for a Unix time in UTC, without a
+/// date crate: the days-to-civil-date conversion (Howard Hinnant's
+/// `civil_from_days`).
+fn utc_day_and_ts(unix_secs: i64) -> (String, String) {
+    let days = unix_secs.div_euclid(86_400);
+    let secs = unix_secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let day = format!("{y:04}-{m:02}-{d:02}");
+    let ts = format!("{day}T{:02}:{:02}:{:02}Z", secs / 3600, (secs % 3600) / 60, secs % 60);
+    (day, ts)
+}
+
+#[test]
+fn utc_day_and_ts_matches_known_dates() {
+    assert_eq!(utc_day_and_ts(0), ("1970-01-01".into(), "1970-01-01T00:00:00Z".into()));
+    // 2026-09-10T01:00:00Z, the fixture's old fixed date.
+    assert_eq!(utc_day_and_ts(1_789_002_000), ("2026-09-10".into(), "2026-09-10T01:00:00Z".into()));
+    // A leap day.
+    assert_eq!(utc_day_and_ts(1_709_208_000).0, "2024-02-29");
 }
 
 #[test]

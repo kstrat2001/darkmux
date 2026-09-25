@@ -164,8 +164,8 @@ describe("recordObject", () => {
     ({ action: "dispatch.tool", fields: { result_chars: 10, ...fields } }) as never;
 
   it("names a file tool by its file, with the container prefix dropped", () => {
-    const o = recordObject(tool({ tool_name: "edit", args: '{"path":"/workspace/test/refreshTokenService.test.js","edits":[]}', ok: true, outcome: "ok" }));
-    expect(o).toEqual({ chip: "edit", kind: "tool", text: "test/refreshTokenService.test.js", mono: false, outcome: "ok" });
+    const o = recordObject(tool({ tool_name: "edit", args: '{"path":"/workspace/test/tokenRotation.test.js","edits":[]}', ok: true, outcome: "ok" }));
+    expect(o).toEqual({ chip: "edit", kind: "tool", text: "test/tokenRotation.test.js", mono: false, outcome: "ok" });
   });
 
   it("reads arguments that arrive double-encoded (a JSON string of JSON)", () => {
@@ -209,15 +209,15 @@ describe("recordObject", () => {
   // that is the fallback before showing raw JSON.
   it("names a write's path from the result when content ate the whole args cap", () => {
     const content = "x".repeat(7018);
-    const args = JSON.stringify({ content, path: "/workspace/test/refreshTokenService.gaps.test.js" }).slice(0, 7018) + "…";
+    const args = JSON.stringify({ content, path: "/workspace/test/tokenRotation.gaps.test.js" }).slice(0, 7018) + "…";
     const o = recordObject(
       tool({
         tool_name: "write",
         args,
-        result: "Wrote 6650 bytes to /workspace/test/refreshTokenService.gaps.test.js",
+        result: "Wrote 6650 bytes to /workspace/test/tokenRotation.gaps.test.js",
       }),
     );
-    expect(o.text).toBe("test/refreshTokenService.gaps.test.js");
+    expect(o.text).toBe("test/tokenRotation.gaps.test.js");
     expect(o.mono).toBe(false);
   });
 

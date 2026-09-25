@@ -10,7 +10,7 @@
 {"args_chars":103,"result_chars":34559,"seq":6,"tool_name":"bash","tool_seq":0,"ts":1779859523485,"type":"tool.completed"}
 {"args_chars":87,"result_chars":3294,"seq":7,"tool_name":"read","tool_seq":0,"ts":1779859530632,"type":"tool.completed"}
 {"args_chars":6277,"result_chars":98,"seq":8,"tool_name":"edit","tool_seq":0,"ts":1779859555223,"type":"tool.completed"}
-{"canonical_args":"{\"path\":\"/workspace/tests/services/refreshTokenService.test.ts\"}","count":3,"seq":9,"tool_name":"edit","ts":1779859587700,"type":"dispatch.cycle.suspected","window_size":10}
+{"canonical_args":"{\"path\":\"/workspace/test/tokenRotation.test.js\"}","count":3,"seq":9,"tool_name":"edit","ts":1779859587700,"type":"dispatch.cycle.suspected","window_size":10}
 {"args_chars":6022,"result_chars":240,"seq":9,"tool_name":"edit","tool_seq":0,"ts":1779859587701,"type":"tool.completed"}
 {"args_chars":88,"result_chars":4490,"seq":10,"tool_name":"read","tool_seq":0,"ts":1779859590612,"type":"tool.completed"}
 {"args_chars":5924,"result_chars":98,"seq":11,"tool_name":"edit","tool_seq":0,"ts":1779859615746,"type":"tool.completed"}
@@ -25,7 +25,7 @@
 {"args_chars":114,"result_chars":2728,"seq":20,"tool_name":"bash","tool_seq":0,"ts":1779859800929,"type":"tool.completed"}
 {"args_chars":123,"result_chars":1539,"seq":21,"tool_name":"bash","tool_seq":0,"ts":1779859806586,"type":"tool.completed"}
 {"args_chars":88,"result_chars":642,"seq":22,"tool_name":"read","tool_seq":0,"ts":1779859809239,"type":"tool.completed"}
-{"canonical_args":"{\"path\":\"/workspace/tests/services/refreshTokenService.test.ts\"}","count":3,"seq":23,"tool_name":"read","ts":1779859811817,"type":"dispatch.cycle.suspected","window_size":10}
+{"canonical_args":"{\"path\":\"/workspace/test/tokenRotation.test.js\"}","count":3,"seq":23,"tool_name":"read","ts":1779859811817,"type":"dispatch.cycle.suspected","window_size":10}
 {"args_chars":88,"result_chars":2150,"seq":23,"tool_name":"read","tool_seq":0,"ts":1779859811817,"type":"tool.completed"}
 {"args_chars":3196,"result_chars":98,"seq":24,"tool_name":"edit","tool_seq":0,"ts":1779859824149,"type":"tool.completed"}
 {"args_chars":147,"result_chars":1765,"seq":25,"tool_name":"bash","tool_seq":0,"ts":1779859829771,"type":"tool.completed"}
