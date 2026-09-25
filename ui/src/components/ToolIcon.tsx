@@ -4,14 +4,22 @@ import type { ToolIconKind } from "../lib/scopeMorph";
 /**
  * (#2890) The glowing line icon the scope's TOOLS center shows for the tool
  * being run: read = eye, edit = pencil, write = page with a plus, bash =
- * terminal prompt, search = magnifier, anything else = gear. Shapes are the
+ * terminal prompt, search = magnifier, anything else = gear; and, while the
+ * model is still generating the call, a wrench (`toolgen`). Shapes are the
  * operator-approved prototype's (`scope-states-prototype.html`) verbatim.
  * Same stroke-only glyph convention as `ActivityIcon.tsx`.
  *
  * No tool NAME is ever printed; the icon is the whole message. Tests assert
  * on `data-tool-icon`, since an inline SVG adds nothing to `innerText`.
  */
-const GLYPH: Record<ToolIconKind, ReactNode> = {
+/** (#2890, operator) The model is still GENERATING a tool call ("tool gen"):
+ *  a wrench, the same for every tool, so nothing reads as a tool already
+ *  running (the edit tool's pencil beside "writing" read as an edit in
+ *  progress). The tool's own icon takes over once darkmux runs it. */
+export type ScopeIconKind = ToolIconKind | "toolgen";
+
+const GLYPH: Record<ScopeIconKind, ReactNode> = {
+  toolgen: <path d="M14.5 3.5a5 5 0 0 0-4.6 6.8L3.8 16.4a1.9 1.9 0 0 0 2.7 2.7l6.1-6.1a5 5 0 0 0 6.8-4.6l-2.9 2.9-2.8-.4-.4-2.8z" />,
   read: (
     <>
       <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z" />
@@ -52,7 +60,7 @@ const GLYPH: Record<ToolIconKind, ReactNode> = {
   ),
 };
 
-export function ToolIcon({ kind, className }: { kind: ToolIconKind; className?: string }) {
+export function ToolIcon({ kind, className }: { kind: ScopeIconKind; className?: string }) {
   return (
     <svg
       className={className}

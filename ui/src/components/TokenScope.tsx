@@ -528,10 +528,11 @@ export function TokenScope({
   const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))));
   const shownLabel = whole !== null ? eased : centerLabel;
   const showIcon = state === "tools";
-  // (#2889) The writing caption is HELD after writing ends so it can fade
-  // out by CSS rather than vanish; the center's key does not change between
-  // writing and running, so the icon never crossfades.
-  const toolCaption = useLatched(showIcon && writing ? (centerUnit ?? null) : null);
+  // (#2889, #2890) While the model generates the call: a wrench over the
+  // "tool gen" caption. When darkmux runs the tool the icon becomes the
+  // tool's own, a change of kind, so the whole center crossfades and the
+  // caption leaves with the wrench.
+  const toolCaption = showIcon && writing ? (centerUnit ?? null) : null;
   // PROMPT shows a pulsing brain until the runtime reports the prompt size
   // mid-turn (#2889); then the count takes the center like any other number.
   const showBrain = state === "prompt" && centerLabel == null;
@@ -543,13 +544,13 @@ export function TokenScope({
   let centerKey = "none";
   let centerNode: ReactNode = null;
   if (showIcon) {
-    const kind = toolIconKind(toolName);
+    const kind = writing ? "toolgen" : toolIconKind(toolName);
     centerKey = `tools:${kind}`;
     centerNode = (
       <div className="token-scope-center token-scope-center--icon" data-state={state}>
         <ToolIcon kind={kind} className="token-scope-ico" />
         {toolCaption !== null ? (
-          <span className="token-scope-u token-scope-u--tools" data-on={writing ? "true" : "false"} aria-hidden={writing ? undefined : "true"}>
+          <span className="token-scope-u token-scope-u--tools" data-on="true">
             {toolCaption}
           </span>
         ) : null}
@@ -595,14 +596,6 @@ export function TokenScope({
       </div>
     </div>
   );
-}
-
-/** (#2889) The last non-null `value`, held after it goes `null` so a caption
- *  can fade out with its text still in place. Reset only by a new value. */
-function useLatched(value: string | null): string | null {
-  const held = useRef<string | null>(null);
-  if (value !== null) held.current = value;
-  return held.current;
 }
 
 /** Length of the center's crossfade, in ms; matches `token-scope-fade-*` in

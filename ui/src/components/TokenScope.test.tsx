@@ -41,24 +41,26 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(b.container.querySelector(".token-scope-n")?.textContent).toBe("36k");
   });
 
-  it("(#2889) TOOLS while WRITING the call: the same tool icon, a writing cue, and the caption under it", () => {
+  it("(#2889, #2890) TOOLS while the call is GENERATED: a wrench, not the tool's icon, with \"tool gen\" under it", () => {
     const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" toolWriting centerUnit="tool gen" />);
-    expect(container.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("edit");
+    // Not the edit tool's pencil: beside "writing" it read as an edit in progress.
+    expect(container.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("toolgen");
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-writing")).toBe("true");
     const cap = container.querySelector(".token-scope-u--tools");
     expect(cap?.textContent).toBe("tool gen");
     expect(cap?.getAttribute("data-on")).toBe("true");
   });
 
-  it("(#2889) writing -> running the same tool does not crossfade the center: the icon stays, the caption fades by CSS", () => {
+  it("(#2890) generated -> run: the wrench and its caption crossfade out, the tool's own icon comes in", () => {
     const { container, rerender } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" toolWriting centerUnit="tool gen" />);
     rerender(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" />);
-    expect(container.querySelector(".token-scope-fade--out")).toBeNull();
+    const ghost = container.querySelector(".token-scope-fade--out");
+    expect(ghost?.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("toolgen");
+    expect(ghost?.querySelector(".token-scope-u--tools")?.textContent).toBe("tool gen");
+    const live = [...container.querySelectorAll(".token-scope-center")].find((el) => !el.closest(".token-scope-fade--out"));
+    expect(live?.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("edit");
+    expect(live?.querySelector(".token-scope-u--tools")).toBeNull();
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-writing")).toBe("false");
-    const cap = container.querySelector(".token-scope-u--tools");
-    // Held (not removed) so it can fade out, and hidden from assistive tech.
-    expect(cap?.getAttribute("data-on")).toBe("false");
-    expect(cap?.getAttribute("aria-hidden")).toBe("true");
   });
 
   it("no brain outside PROMPT", () => {
