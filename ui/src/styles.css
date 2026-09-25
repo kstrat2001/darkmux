@@ -8654,7 +8654,7 @@ body {
    20% of the tube, the unit about 7% (never under 9px), the tool/brain
    glyph 27% (`--ico` below). */
 .token-scope-bezel--card .token-scope-center {
-  --scope-num: calc(var(--tube, 96px) * 0.2);
+  --scope-num: calc(var(--tube) * 0.2);
 }
 /* (#2890) A unit with no number above it (idle) sits at the center itself. */
 .token-scope-center:not(:has(.token-scope-n)) .token-scope-u {
@@ -8664,7 +8664,7 @@ body {
 /* (#2890) The card's tube shows the same center as the run page's, unit
    included; the larger tube and ring leave the unit clear of the trace. */
 .token-scope-bezel--card .token-scope-center .token-scope-u {
-  font-size: max(9px, calc(var(--tube, 96px) * 0.068));
+  font-size: max(9px, calc(var(--tube) * 0.068));
 }
 @media (max-width: 560px) {
   /* A phone card's tube is ~128px: a tighter unit keeps "think tok/s"
@@ -8704,7 +8704,7 @@ body {
   --ico: 16px;
 }
 .token-scope-bezel--card {
-  --ico: calc(var(--tube, 96px) * 0.27);
+  --ico: calc(var(--tube) * 0.27);
 }
 .token-scope-bezel--tile {
   --ico: 26px;
