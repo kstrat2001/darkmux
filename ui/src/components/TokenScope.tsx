@@ -192,7 +192,10 @@ function thinkingStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, p
 function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: ScopeParams, c: ScopeClocks, clock: number, dt: number) {
   const cx = w / 2;
   const cy = h / 2;
-  const R = Math.min(w, h) * 0.34;
+  // (#2890, operator: "nowhere near the edge") 40% of the screen, not 34%:
+  // the ring sits nearer the glass and farther from the center text; the
+  // GEN wave's peaks (R * 1.19) still clear the edge.
+  const R = Math.min(w, h) * 0.4;
   const { r: cr, g: cg, b: cb } = p;
   const tps = p.wave;
   const active = Math.min(1, tps / 25);
