@@ -894,7 +894,12 @@ export function FleetLens({
               <span className="mico">
                 <MachineIcon />
               </span>
-              {card.name}
+              {/* (#2890) Its own box, so a long name ellipsizes beside the
+                  tube (a flex row's bare text cannot); the full name is the
+                  tooltip. */}
+              <span className="mach-name" title={card.name}>
+                {card.name}
+              </span>
             </div>
             {/* (#1855) The dim fallback says WHICH kind of unknown this is —
                 a machine that beat and carried no hardware, vs one nothing
@@ -902,7 +907,7 @@ export function FleetLens({
                 cards this issue made visible in the first place). The
                 wording lives in `cards.ts::specUnknownLabel` so the card and
                 its tests read the same string. */}
-            <div className="spec">
+            <div className="spec" title={card.spec || undefined}>
               {card.spec ? (
                 card.spec
               ) : (

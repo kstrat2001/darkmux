@@ -1286,6 +1286,15 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     expect(card.querySelector('[data-testid="fleet-token-scope"]')).toBeNull();
   });
 
+  it("(#2890) the machine name and hardware line carry their full text as a tooltip", async () => {
+    const records = [
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m1-max-32gb-studio", action: "machine.online", source: "presence-reconciler" },
+    ] as unknown as FlowRecord[];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".mach-name")).not.toBeNull());
+    expect(document.querySelector(".mach-name")!.getAttribute("title")).toBe("m1-max-32gb-studio");
+  });
+
   it("(#2890) an online machine with nothing running shows its tube idle", async () => {
     const records = [
       { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },

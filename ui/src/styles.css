@@ -3485,6 +3485,11 @@ body {
   align-items: center;
   gap: 8px;
 }
+/* (#2890) The name's text box: it can shrink below its content so a long
+   name ellipsizes (see `.mach-scope`'s gutter rules). */
+.mach-name {
+  min-width: 0;
+}
 .mico {
   display: inline-flex;
   color: var(--accent);
@@ -3608,14 +3613,17 @@ body {
   --tube: 96px;
   min-height: calc(var(--tube) + 34px);
 }
+/* A MARGIN, not padding: `overflow: hidden` clips at the padding edge, so a
+   padded gutter let a long name or hardware line run under the tube before
+   it was cut (operator screenshot, "m1-max-32gb-studio"). */
 .mach:has(> .mach-body--scope) > .name,
 .mach:has(> .mach-body--scope) > .spec {
-  padding-right: calc(var(--tube) + 12px);
+  margin-right: calc(var(--tube) + 12px);
 }
 /* (#2890) The rows beside the tube stay on one line (ellipsized if they
    ever must), so `tubeFit.ts` can measure their natural width and a
    wrapped line never changes the card's height under it. */
-.mach:has(> .mach-body--scope) > .name,
+.mach-name,
 .mach:has(> .mach-body--scope) > .spec,
 .mach:has(> .mach-body--scope) .stat,
 .mach:has(> .mach-body--scope) .mach-scope__rate {
