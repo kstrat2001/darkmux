@@ -8656,8 +8656,10 @@ body {
 .token-scope-bezel--card .token-scope-center {
   --scope-num: calc(var(--tube) * 0.2);
 }
-/* (#2890) A unit with no number above it (idle) sits at the center itself. */
-.token-scope-center:not(:has(.token-scope-n)) .token-scope-u {
+/* (#2890) A unit with no number above it (idle) sits at the center itself.
+   Not an icon center: TOOLS has no number either, and its "writing" caption
+   hangs below the glyph (`.token-scope-u--tools`). */
+.token-scope-center:not(.token-scope-center--icon):not(:has(.token-scope-n)) .token-scope-u {
   top: 50%;
   transform: translateY(-50%);
 }
