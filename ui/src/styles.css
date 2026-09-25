@@ -3550,9 +3550,7 @@ body {
      one line and the block got SHORTER than the tube it used to size, so
      the tube is a fixed size the block grows to, the same rule the phone
      layout uses below. */
-  --tube: 96px;
   padding-right: calc(var(--tube) + 12px);
-  min-height: var(--tube);
 }
 /* (#2881) The tube itself. `top`/`bottom: 0` give it a DEFINITE height —
    its parent's own height, already resolved from the in-flow text per this
@@ -3597,15 +3595,39 @@ body {
    follows the screen: 100vw minus 248px leaves the status column 172px,
    which keeps "dispatch in flight" on one line (measured at 375px and
    390px), clamped to 104px..150px. */
+/* (#2890, operator 2026-09-25: "circle centered with same distance to top and
+   bottom") The tube is centered in the WHOLE card, not in the status block
+   under the name and hardware lines, which left it sitting low. The card is
+   the positioning context and owns the tube's size; every row (name,
+   hardware, status) keeps the same right gutter so no text runs under it;
+   and the card is at least the tube plus its padding tall, so the tube never
+   overflows a short card. Still absolutely positioned, so it adds no height
+   of its own. */
+.mach:has(> .mach-body--scope) {
+  position: relative;
+  --tube: 96px;
+  min-height: calc(var(--tube) + 34px);
+}
+.mach:has(> .mach-body--scope) > .name,
+.mach:has(> .mach-body--scope) > .spec {
+  padding-right: calc(var(--tube) + 12px);
+}
+.mach:has(> .mach-body--scope) > .mach-body--scope {
+  position: static;
+}
+.mach:has(> .mach-body--scope) .mach-scope {
+  top: 0;
+  bottom: 0;
+  right: 16px;
+  width: var(--tube);
+  height: var(--tube);
+  max-width: none;
+  max-height: none;
+  margin: auto 0;
+}
 @media (max-width: 560px) {
-  .mach-body--scope {
-    --tube: clamp(104px, calc(100vw - 248px), 150px);
-    padding-right: calc(var(--tube) + 12px);
-    min-height: var(--tube);
-  }
-  .mach-scope {
-    max-width: var(--tube);
-    max-height: var(--tube);
+  .mach:has(> .mach-body--scope) {
+    --tube: clamp(104px, calc(100vw - 262px), 150px);
   }
 }
 
