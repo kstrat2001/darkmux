@@ -142,6 +142,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   /** (#2889) TOOLS while the model writes the call — see `TokenScope`'s
    *  `toolWriting`. */
   toolWriting?: boolean;
+  /** (#2890) Generating while the model reasons: the scope tints violet to
+   *  pink and the rate shimmers; the words and number are unchanged. */
+  thinking?: boolean;
   centerLabel: string | null;
   centerUnit: string | null;
   centerCarried: boolean;
@@ -162,6 +165,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
       tokensPerSec: generating ? live.tokensPerSec : 0,
       toolName: state === "tools" ? live.toolName : undefined,
       toolWriting: state === "tools" ? writing : undefined,
+      thinking: generating && live.thinking === true,
       // Only the reading goes inside the tube while generating; a state is
       // said by the trace, the lamps and (TOOLS) the icon.
       // (#2890 operator review) REST puts its countdown in the center, amber
@@ -772,6 +776,7 @@ export function SessionReplay({
                       tokensPerSec={scopeHero.tokensPerSec}
                       toolName={scopeHero.toolName}
                       toolWriting={scopeHero.toolWriting}
+                      thinking={scopeHero.thinking}
                       size="tile"
                       centerLabel={scopeHero.centerLabel}
                       centerUnit={scopeHero.centerUnit}

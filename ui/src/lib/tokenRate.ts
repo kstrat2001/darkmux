@@ -41,6 +41,12 @@ export interface HeartbeatSample {
    *  arguments land in one chunk, so any pair touching it reads 0 or a
    *  spike, never generation speed. */
   writingTool?: string;
+  /** (#2890) Visible (answer) chars so far, `cumulative_chars`, kept only
+   *  when the record also carries `generated_chars` (content + reasoning):
+   *  the difference is reasoning, so comparing the two between samples
+   *  tells thinking from writing text. Older runtimes send only
+   *  `cumulative_chars` and never claim thinking. */
+  visible?: number;
   /** (#2889) The request's size in chars, carried only by a turn's opening
    *  heartbeat (flow schema 1.56.0). */
   promptChars?: number;
@@ -69,6 +75,8 @@ export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
     const atMs = num(f.sampled_at_ms) ?? Date.parse(r.ts);
     if (!Number.isFinite(atMs)) continue;
     const sample: HeartbeatSample = { atMs, chars, turn: f.turn_seq };
+    const visible = num(f.cumulative_chars);
+    if (num(f.generated_chars) !== null && visible !== null) sample.visible = visible;
     if (f.phase === WRITING_TOOL_CALL_PHASE) sample.writingTool = typeof f.tool_name === "string" ? f.tool_name : "";
     const promptChars = num(f.prompt_chars);
     if (promptChars !== null) sample.promptChars = promptChars;
@@ -410,6 +418,11 @@ export interface LiveStateReading {
    *  (the icon falls back to the gear). A previous turn's tool never carries
    *  over. */
   toolName?: string;
+  /** (#2890) Present (always `true`) only when `state === "generating"` and
+   *  the model is reasoning, not writing visible text: since the previous
+   *  sample of the same turn only the reasoning count grew (or, on the
+   *  turn's first chunk, nothing visible yet). */
+  thinking?: true;
   /** (#2889) Present (always `true`) only when `state === "tools"` because
    *  the model is WRITING a tool call — the arguments are being generated
    *  and nothing is streaming. Absent when darkmux is running the tool. */
@@ -595,9 +608,25 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       return reading;
     }
     if (last.chars === 0) return last.promptChars !== undefined ? { state: "prompt", promptChars: last.promptChars } : { state: "prompt" };
-    return { state: "generating" };
+    return isThinking(beats) ? { state: "generating", thinking: true } : { state: "generating" };
   }
   return lastBeatAt !== null ? { state: "stalled" } : { state: "prompt" };
+}
+
+/** (#2890) Whether the latest generating sample is reasoning rather than
+ *  visible text: against the previous sample of the same turn, the total
+ *  grew and the visible count did not; with no earlier sample in the turn,
+ *  nothing visible yet. `false` when the record cannot say (no `visible`). */
+function isThinking(beats: HeartbeatSample[]): boolean {
+  const last = beats[beats.length - 1];
+  if (last.visible === undefined) return false;
+  for (let i = beats.length - 2; i >= 0; i--) {
+    const prev = beats[i];
+    if (prev.turn !== last.turn) break;
+    if (prev.visible === undefined || prev.writingTool !== undefined) continue;
+    return last.chars > prev.chars && last.visible === prev.visible;
+  }
+  return last.chars > 0 && last.visible === 0;
 }
 
 const isCloseEdge = (a: string | undefined): boolean =>
@@ -860,6 +889,10 @@ export interface ExecutionTokenReading {
    *  `LiveStateReading.writing` / `writingSeconds`. */
   writing?: true;
   writingSeconds?: number;
+  /** (#2890) Present (always `true`) only while generating and the model is
+   *  reasoning rather than writing visible text. See
+   *  `LiveStateReading.thinking`. */
+  thinking?: true;
 }
 
 export function executionTokenReading(
@@ -892,6 +925,7 @@ export function executionTokenReading(
     carried: reading?.carried ?? false,
     toolName: state === "tools" ? liveState?.toolName : undefined,
     ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
+    ...(state === "generating" && liveState?.thinking ? { thinking: true as const } : {}),
   };
 }
 

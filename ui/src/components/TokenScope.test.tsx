@@ -230,3 +230,16 @@ describe("TokenScope canvas lifecycle (#2890)", () => {
     expect(h.remove).toHaveBeenCalledWith("visibilitychange", handler);
   });
 });
+
+describe("(#2890) thinking", () => {
+  it("marks the bezel while generating and thinking, never in another state", () => {
+    const gen = render(<TokenScope tokensPerSec={70} size="tile" state="generating" thinking centerLabel="70" centerUnit="tok/s" />);
+    expect(gen.container.querySelector(".token-scope-bezel")?.getAttribute("data-thinking")).toBe("true");
+    // The words and number are unchanged: thinking is color, not text.
+    expect(gen.container.querySelector(".token-scope-n")?.textContent).toBe("70");
+    expect(gen.container.querySelector(".token-scope-u")?.textContent).toBe("tok/s");
+    const tools = render(<TokenScope tokensPerSec={0} size="tile" state="tools" thinking />);
+    expect(tools.container.querySelector(".token-scope-bezel")?.getAttribute("data-thinking")).toBe("false");
+  });
+});
+

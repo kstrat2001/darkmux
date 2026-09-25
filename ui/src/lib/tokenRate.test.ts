@@ -59,8 +59,10 @@ describe("heartbeatSamples", () => {
   it("reads new-shape sampled_at_ms + generated_chars", () => {
     const samples = heartbeatSamples([beat(1_000, 40), beat(3_000, 120)]);
     expect(samples).toEqual([
-      { atMs: 1_000, chars: 40 },
-      { atMs: 3_000, chars: 120 },
+      // (#2890) `visible` (cumulative_chars) rides along when the record
+      // also has generated_chars; the old-runtime case below has none.
+      { atMs: 1_000, chars: 40, visible: 40 },
+      { atMs: 3_000, chars: 120, visible: 120 },
     ]);
   });
 
@@ -1124,3 +1126,32 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
     expect(promptTokensLabel(0, 4)).toBeNull();
   });
 });
+
+describe("(#2890) thinking vs visible text while generating", () => {
+  it("only reasoning grew since the last sample: generating, thinking", () => {
+    const recs = [beat(1_000, 400, 0), beat(3_000, 1_200, 0)];
+    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "generating", thinking: true });
+  });
+  it("visible text grew: generating, not thinking", () => {
+    const recs = [beat(1_000, 1_200, 0), beat(3_000, 1_900, 700)];
+    expect(deriveLiveState(recs, 3_500)).toEqual({ state: "generating" });
+  });
+  it("a turn's first chunk with no visible text yet reads as thinking", () => {
+    expect(deriveLiveState([beat(1_000, 300, 0)], 1_500)).toEqual({ state: "generating", thinking: true });
+  });
+  it("an old runtime (no generated_chars) never claims thinking", () => {
+    const recs = [oldBeat(1, 100), oldBeat(3, 500)];
+    expect(deriveLiveState(recs, Date.parse(atSec(3)) + 500)).toEqual({ state: "generating" });
+  });
+});
+
+describe("(#2890) executionTokenReading carries thinking", () => {
+  it("present only while generating and thinking", () => {
+    const thinking = executionTokenReading([beat(1_000, 400, 0), beat(3_000, 1_200, 0)], 3_500, true);
+    expect(thinking.state).toBe("generating");
+    expect(thinking.thinking).toBe(true);
+    const text = executionTokenReading([beat(1_000, 400, 0), beat(3_000, 1_200, 800)], 3_500, true);
+    expect(text.thinking).toBeUndefined();
+  });
+});
+

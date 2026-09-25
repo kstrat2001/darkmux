@@ -235,6 +235,9 @@ export interface SessionRunView {
          *  `LiveStateReading.writing` / `writingSeconds`. */
         writing?: true;
         writingSeconds?: number;
+        /** (#2890) Present only while generating and the model is reasoning
+         *  rather than writing visible text. See `LiveStateReading.thinking`. */
+        thinking?: true;
         /** (#2889) Present only in PROMPT when the turn's opening heartbeat
          *  said how big the request is: the estimate the scope's center shows
          *  ("~36k"). `null`/absent keeps the brain. */
@@ -1823,6 +1826,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
             ...(tokRateLiveState?.state === "tools" && tokRateLiveState.writing
               ? { writing: true as const, writingSeconds: tokRateLiveState.writingSeconds }
               : {}),
+            ...(tokRateLiveState?.state === "generating" && tokRateLiveState.thinking ? { thinking: true as const } : {}),
             promptLabel: tokRateLiveState?.state === "prompt" ? promptEstimate(tokRateRecordSets, nowMs) : null,
           }
         : null,

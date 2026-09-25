@@ -255,3 +255,13 @@ describe("(#2889) TOOLS while the model WRITES the call", () => {
     expect(settleMorph(createMorph(), "tools", 0, BLUE, true).scribe).toBe(1);
   });
 });
+
+describe("(#2890) the thinking tint", () => {
+  it("is on only in GEN while thinking", () => {
+    const rgb: [number, number, number] = [80, 220, 140];
+    expect(scopeTargets("generating", 0, 60, rgb, undefined, false, true).iris).toBe(1);
+    expect(scopeTargets("generating", 0, 60, rgb, undefined, false, false).iris).toBe(0);
+    expect(scopeTargets("tools", 0, 0, rgb, undefined, false, true).iris).toBe(0);
+  });
+});
+

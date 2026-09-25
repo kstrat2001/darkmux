@@ -76,6 +76,11 @@ export interface TokenScopeProps {
    *  running never pops. `centerUnit`, when given, is captioned under the
    *  icon ("writing · 23 s"). */
   toolWriting?: boolean;
+  /** (#2890) GEN while the model is reasoning rather than writing visible
+   *  text: the trace takes a slowly rotating violet-to-pink shimmer blended
+   *  into its GEN color, and the center's number shimmers the same way. The
+   *  words and number are unchanged. Ignored outside GEN. */
+  thinking?: boolean;
   /** No fresh heartbeat recently. Used only when `state` is omitted. */
   stalled?: boolean;
   /** A rest/pause (e.g. thermal). Used only when `state` is omitted. */
@@ -152,6 +157,29 @@ const INWARD_PASSES: ReadonlyArray<readonly [number, number]> = [
   [1, 0.8],
 ];
 
+/** (#2890) The thinking palette: violet and pink, blended into the GEN
+ *  color by the eased `iris` parameter. */
+const THINK_VIOLET: Rgb = [192, 132, 252];
+const THINK_PINK: Rgb = [244, 114, 182];
+
+/** (#2890) The main trace's stroke while the model is thinking: a conic
+ *  gradient around the ring that alternates the GEN color with violet and
+ *  pink, rotating slowly with the wave's phase, mixed in by `iris` so it
+ *  eases in and out like every other state change. Falls back to the plain
+ *  GEN color where conic gradients are unavailable. */
+function thinkingStroke(ctx: CanvasRenderingContext2D, cx: number, cy: number, phase: number, p: ScopeParams, alpha: number): string | CanvasGradient {
+  const base: Rgb = [p.r, p.g, p.b];
+  if (typeof ctx.createConicGradient !== "function") return rgba(p.r, p.g, p.b, alpha);
+  const g = ctx.createConicGradient(phase * 0.12, cx, cy);
+  const mix = (to: Rgb) => base.map((v, i) => Math.round(v + (to[i] - v) * p.iris)) as unknown as Rgb;
+  // Violet and pink carry most of the ring; the GEN color keeps two narrow
+  // bands so it still reads as generating. Additive blending washes a
+  // partial mix out to near white, so the stops are the full colors.
+  const stops: Rgb[] = [mix(THINK_VIOLET), base, mix(THINK_PINK), mix(THINK_VIOLET), base, mix(THINK_PINK), mix(THINK_VIOLET)];
+  stops.forEach((col, i) => g.addColorStop(i / (stops.length - 1), rgba(col[0], col[1], col[2], alpha)));
+  return g;
+}
+
 /** One frame of the scope, from the current morph parameters `p`. Ported
  *  from the prototype's `draw()`: an afterglow fill (a low-alpha fill rather
  *  than a hard clear, so the previous frame bleeds through), then, each
@@ -200,9 +228,13 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
         else ctx.lineTo(x, y);
       }
       ctx.closePath();
-      ctx.strokeStyle = rgba(cr, cg, cb, a * bright);
+      ctx.strokeStyle = p.iris > 0.01 ? thinkingStroke(ctx, cx, cy, c.phase, p, a * bright) : rgba(cr, cg, cb, a * bright);
       ctx.lineWidth = lw;
-      ctx.shadowColor = rgba(cr, cg, cb, 0.8);
+      // (#2890) Thinking shifts the glow toward violet with the trace, or the
+      // green halo around the thin line would dominate the tint.
+      ctx.shadowColor = p.iris > 0.01
+        ? rgba(cr + (THINK_VIOLET[0] - cr) * p.iris, cg + (THINK_VIOLET[1] - cg) * p.iris, cb + (THINK_VIOLET[2] - cb) * p.iris, 0.8)
+        : rgba(cr, cg, cb, 0.8);
       ctx.shadowBlur = lw * 3 * bright;
       ctx.stroke();
     }
@@ -339,6 +371,7 @@ export function TokenScope({
   state: stateProp,
   toolName,
   toolWriting = false,
+  thinking: thinkingProp = false,
   stalled = false,
   resting = false,
   size,
@@ -361,8 +394,9 @@ export function TokenScope({
   // every update (a heartbeat every ~2s would otherwise tear down and
   // rebuild the canvas/observer/listener on that same cadence).
   const writing = state === "tools" && toolWriting;
-  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing });
-  targetRef.current = { state, rate, rgb, writing };
+  const thinking = state === "generating" && thinkingProp;
+  const targetRef = useRef<{ state: ScopeState; rate: number; rgb: Rgb; writing: boolean; thinking: boolean }>({ state, rate, rgb: PHOSPHOR_FALLBACK, writing, thinking });
+  targetRef.current = { state, rate, rgb, writing, thinking };
   // Set by the effect: redraws one settled frame when motion is reduced.
   const staticRedrawRef = useRef<(() => void) | null>(null);
 
@@ -377,7 +411,7 @@ export function TokenScope({
       const w = canvas!.clientWidth;
       const h = canvas!.clientHeight;
       const t = targetRef.current;
-      const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing);
+      const p = settleMorph(morphRef.current, t.state, t.rate, t.rgb, t.writing, t.thinking);
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, 0);
     }
 
@@ -413,7 +447,7 @@ export function TokenScope({
       const dt = Math.min(0.1, Math.max(0, (now - last) / 1000)) || 0;
       last = now;
       const t = targetRef.current;
-      const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt, t.writing);
+      const p = advanceMorph(morphRef.current, t.state, t.rate, t.rgb, dt, t.writing, t.thinking);
       if (w && h) drawFrame(ctx!, w, h, p, clocksRef.current, morphRef.current.clock, dt);
       rafId = requestAnimationFrame(frame);
     }
@@ -446,7 +480,7 @@ export function TokenScope({
 
   useEffect(() => {
     staticRedrawRef.current?.();
-  }, [state, rate, rgb, writing]);
+  }, [state, rate, rgb, writing, thinking]);
 
   const whole = parseWhole(centerLabel);
   const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))));
@@ -500,7 +534,7 @@ export function TokenScope({
 
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
-    <div className={cls} data-tone={stateTone(state)} data-state={state} data-writing={writing ? "true" : "false"}>
+    <div className={cls} data-tone={stateTone(state)} data-state={state} data-writing={writing ? "true" : "false"} data-thinking={thinking ? "true" : "false"}>
       <div className="token-scope-screen">
         <canvas ref={canvasRef} aria-hidden="true" />
         {ghost && (

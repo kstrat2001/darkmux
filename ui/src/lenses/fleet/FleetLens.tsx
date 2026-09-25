@@ -920,7 +920,12 @@ export function FleetLens({
                   only one running), not a machine-wide aggregate: the tube,
                   its color and this word all belong to one run. */}
               {card.liveTokRate !== null && selectedExec && (
-                <div className="mach-scope__rate" data-tone={selectedExec.state ?? "none"} data-carried={selectedExec.carried ? "true" : "false"}>
+                <div
+                  className="mach-scope__rate"
+                  data-tone={selectedExec.state ?? "none"}
+                  data-carried={selectedExec.carried ? "true" : "false"}
+                  data-thinking={selectedExec.state === "generating" && selectedExec.thinking === true ? "true" : undefined}
+                >
                   {selectedExec.state === "generating"
                     ? // (#2886 pass 5, MUST — fresh-reviewer finding F3) A GEN
                       // lamp with no reading yet (fewer than two same-turn
@@ -1090,6 +1095,9 @@ export function FleetLens({
                     // (#2889) The writing cue; no caption on the card — the
                     // rate line above already says "writing · N s".
                     toolWriting={selectedExec.writing === true}
+                    // (#2890) Thinking tints the ring and shimmers the rate;
+                    // the words and number stay as they are.
+                    thinking={selectedExec.state === "generating" && selectedExec.thinking === true}
                     // (#2890, operator 2026-09-25) With the tube now sized to
                     // the card, the live rate sits in its center while
                     // generating, as on the run page. Other states keep the

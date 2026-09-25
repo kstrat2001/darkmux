@@ -8535,6 +8535,33 @@ body {
 }
 /* (#2890) The run page's hero: the rate (or the finished average) at the
    prototype's size, with its unit quietly under it. */
+/* (#2890) Thinking: the model is reasoning rather than writing visible
+   text. The words and number stay as they are; the characters' colors
+   flow through the GEN green, violet and pink, the same palette the ring
+   takes. Reduced motion keeps the gradient still. */
+.token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-n,
+.token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-u,
+.mach-scope__rate[data-thinking="true"] {
+  background-image: linear-gradient(90deg, var(--scope-phosphor), #c084fc, #f472b6, #c084fc, var(--scope-phosphor));
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-shadow: none;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, #c084fc 45%, transparent));
+  animation: token-scope-think 3.2s linear infinite;
+}
+@keyframes token-scope-think {
+  from { background-position: 0% 50%; }
+  to { background-position: 300% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-n,
+  .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-u,
+  .mach-scope__rate[data-thinking="true"] {
+    animation: none;
+  }
+}
 /* (#2890) The fleet card's tube (96px desktop, up to 150px on a phone)
    carries the live rate in its center, sized to the tube. */
 .token-scope-bezel--card .token-scope-center .token-scope-n {
