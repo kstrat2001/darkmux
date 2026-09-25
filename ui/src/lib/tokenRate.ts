@@ -535,12 +535,24 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
   const lastBeatSecondFloor = lastBeatAt === null ? null : Math.floor(lastBeatAt / 1000) * 1000;
   if (marker && (lastBeatSecondFloor === null || marker.atMs >= lastBeatSecondFloor)) {
     const found: StateMarker = marker;
+    // (#2889 review, M3) The tie above goes to the marker, but in most real
+    // turns the marker (`dispatch.start`, or the last `dispatch.tool`) shares
+    // a whole second with the turn's 0-char opener, which came AFTER it. The
+    // opener then still describes the request the model is reading, so a
+    // PROMPT reading carries its size (only an opener carries `prompt_chars`). An opener from before the marker's
+    // second belongs to a request the marker already closed, and never does.
+    const lastBeat = beats.length ? beats[beats.length - 1] : null;
+    const prompt = (): LiveStateReading =>
+      lastBeat !== null && lastBeat.promptChars !== undefined && lastBeat.atMs >= found.atMs
+        ? { state: "prompt", promptChars: lastBeat.promptChars }
+        : { state: "prompt" };
     if (found.kind === "rest" && found.restMs != null) {
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) return { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
-      return { state: "prompt" };
+      return prompt();
     }
     if (found.kind === "tools" && turnToolName !== null) return { state: "tools", toolName: turnToolName };
+    if (found.kind === "prompt") return prompt();
     return { state: found.kind };
   }
 

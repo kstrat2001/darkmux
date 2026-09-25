@@ -1057,6 +1057,66 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
     expect(promptEstimate([[rec(-5, "dispatch.start"), hb(0, 0)]], Date.parse(atSec(3)))).toBeNull();
   });
 
+  // (#2889 review, M3) The wire as it really lands: record `ts` is
+  // WHOLE-SECOND, and the heartbeat's own `sampled_at_ms` is ms-precise. In
+  // 9 of 12 real openers the marker (`dispatch.start`, or the turn's last
+  // `dispatch.tool`) shares a second with the 0-char opener, so the marker
+  // wins the tie. The size must still ride along for the whole PROMPT phase.
+  const wholeSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+  const base = Date.parse(atSec(0));
+  const wire = (atMs: number, action: string, payload: Record<string, unknown> = {}): FlowRecord =>
+    ({ ts: wholeSec(atMs), action, session_id: SID, payload }) as unknown as FlowRecord;
+
+  it("a dispatch.start in the same second as the opener still reads PROMPT with the opener's size", () => {
+    const records = [
+      wire(base + 100, "dispatch.start"),
+      wire(base + 300, "dispatch.turn.heartbeat", { sampled_at_ms: base + 300, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 }),
+    ];
+    expect(deriveLiveState(records, base + 1_500)).toEqual({ state: "prompt", promptChars: 144_000 });
+    // ...and for the whole prompt phase, past the stall threshold.
+    expect(deriveLiveState(records, base + 40_000)).toEqual({ state: "prompt", promptChars: 144_000 });
+  });
+
+  it("the turn's last dispatch.tool in the same second as the next opener still carries the size", () => {
+    const records = [
+      wire(base, "dispatch.start"),
+      wire(base + 200, "dispatch.turn.heartbeat", { sampled_at_ms: base + 200, generated_chars: 0, turn_seq: 1, prompt_chars: 90_000 }),
+      wire(base + 2_000, "dispatch.turn.heartbeat", { sampled_at_ms: base + 2_000, generated_chars: 400, turn_seq: 1 }),
+      wire(base + 3_000, "dispatch.turn", { turn_seq: 1, tool_calls_count: 1 }),
+      wire(base + 6_100, "dispatch.tool", { tool_name: "read" }),
+      wire(base + 6_400, "dispatch.turn.heartbeat", { sampled_at_ms: base + 6_400, generated_chars: 0, turn_seq: 2, prompt_chars: 96_000 }),
+    ];
+    expect(deriveLiveState(records, base + 7_000)).toEqual({ state: "prompt", promptChars: 96_000 });
+  });
+
+  it("an opener from BEFORE the winning marker's second never lends its size to a later PROMPT", () => {
+    // Turn 1's opener at :00.3, then its turn record at :03 says no tools:
+    // PROMPT, but the size belonged to a request already answered.
+    const records = [
+      wire(base + 100, "dispatch.start"),
+      wire(base + 300, "dispatch.turn.heartbeat", { sampled_at_ms: base + 300, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 }),
+      wire(base + 3_000, "dispatch.turn", { turn_seq: 1, tool_calls_count: 0 }),
+    ];
+    expect(deriveLiveState(records, base + 3_500)).toEqual({ state: "prompt" });
+  });
+
+  it("an elapsed rest in the same second as the next opener reads PROMPT with its size", () => {
+    const records = [
+      wire(base + 100, "dispatch.rest", { ms: 400 }),
+      wire(base + 700, "dispatch.turn.heartbeat", { sampled_at_ms: base + 700, generated_chars: 0, turn_seq: 2, prompt_chars: 60_000 }),
+    ];
+    expect(deriveLiveState(records, base + 1_500)).toEqual({ state: "prompt", promptChars: 60_000 });
+  });
+
+  it("promptEstimate reads the size when the marker shares the opener's second", () => {
+    const records = [
+      wire(base + 100, "dispatch.start"),
+      wire(base + 300, "dispatch.turn.heartbeat", { sampled_at_ms: base + 300, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 }),
+    ];
+    // No billed turn yet: the default 4 chars/token -> ~36k.
+    expect(promptEstimate([records], base + 1_500)).toBe("~36k");
+  });
+
   it("the size converts to an estimated token count with the session's own calibration", () => {
     expect(promptTokensLabel(144_000, 4)).toBe("~36k");
     expect(promptTokensLabel(144_000, 3)).toBe("~48k");
