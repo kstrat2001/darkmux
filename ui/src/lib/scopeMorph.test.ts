@@ -265,3 +265,15 @@ describe("(#2890) the thinking tint", () => {
   });
 });
 
+describe("(#2890) idle breathes like rest, without rest's dot", () => {
+  it("idle breathes with no drift; rest breathes and drifts", () => {
+    const rgb: [number, number, number] = [120, 130, 125];
+    const idle = scopeTargets("idle", 0, 0, rgb);
+    expect(idle.breath).toBeGreaterThan(0);
+    expect(idle.drift).toBe(0);
+    const rest = scopeTargets("rest", 0, 0, rgb);
+    expect(rest.breath).toBe(1);
+    expect(rest.drift).toBe(1);
+  });
+});
+

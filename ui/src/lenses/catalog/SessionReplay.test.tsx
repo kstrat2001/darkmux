@@ -1436,6 +1436,13 @@ describe("modelScopeHero (#2890)", () => {
     expect(h).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null });
   });
 
+  it("(#2890) GEN while thinking: the same number, \"think tok/s\" under it, and the thinking look", () => {
+    const h = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96, thinking: true }, finishedTokRate: null });
+    expect(h).toMatchObject({ state: "generating", centerLabel: "96", centerUnit: "think tok/s", thinking: true });
+    const text = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96 }, finishedTokRate: null });
+    expect(text).toMatchObject({ centerUnit: "tok/s", thinking: false });
+  });
+
   it("(#2889) TOOLS while writing: the tool icon, the writing cue, and 'writing · N s' under it", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: "tools", toolName: "edit", writing: true, writingSeconds: 70 }, finishedTokRate: null });
     expect(h).toMatchObject({ state: "tools", toolName: "edit", toolWriting: true, centerUnit: "writing · 70 s", tokensPerSec: 0 });

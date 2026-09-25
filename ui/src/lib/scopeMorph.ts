@@ -38,6 +38,8 @@ export type ScopeState = LiveState | "nosignal" | "finished" | "idle";
  *  - `tempo`: how fast the wave turns (1 live; slow for a finished run's echo)
  *  - `scribe`: (#2889) TOOLS while the model WRITES the call — the comet's
  *    tail stretches and its head scribbles, same color and icon as running
+ *  - `drift`: REST's slow dot drifting on the breathing circle (idle breathes
+ *    without it)
  *  - `iris`: (#2890) GEN while the model is THINKING (reasoning, not visible
  *    text): a violet-to-pink shimmer blended into the GEN color
  *  - `r`/`g`/`b`: color */
@@ -55,6 +57,7 @@ export interface ScopeParams {
   tempo: number;
   scribe: number;
   iris: number;
+  drift: number;
   r: number;
   g: number;
   b: number;
@@ -77,15 +80,16 @@ export const SCOPE_SPEED = {
   tempo: 4,
   scribe: 4,
   iris: 3,
+  drift: 4,
   rgb: 5,
 } as const;
 
 /** The morphing keys, in a fixed array so the per-frame loop does not call
  *  `Object.keys` (which allocates). Color is handled separately. */
-const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale", "tempo", "scribe", "iris"] as const;
+const MORPH_KEYS = ["ring", "wave", "comet", "inward", "breath", "fuzz", "sx", "sy", "ember", "rscale", "tempo", "scribe", "iris", "drift"] as const;
 
 function blankParams(): ScopeParams {
-  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, scribe: 0, iris: 0, r: 0, g: 0, b: 0 };
+  return { ring: 1, wave: 0, comet: 0, inward: 0, breath: 0, fuzz: 0, sx: 1, sy: 1, ember: 0, rscale: 1, tempo: 1, scribe: 0, iris: 0, drift: 0, r: 0, g: 0, b: 0 };
 }
 
 /** The targets for `state`, `sinceSec` seconds after entering it, written
@@ -117,6 +121,7 @@ export function scopeTargets(
   out.tempo = 1;
   out.scribe = 0;
   out.iris = 0;
+  out.drift = 0;
   out.r = rgb[0];
   out.g = rgb[1];
   out.b = rgb[2];
@@ -137,6 +142,7 @@ export function scopeTargets(
     case "rest":
       out.ring = 0.8;
       out.breath = 1;
+      out.drift = 1;
       out.rscale = 0.92;
       break;
     case "nosignal":
@@ -154,9 +160,13 @@ export function scopeTargets(
       out.tempo = 0.12;
       break;
     case "idle":
-      // No live execution and no average (a mission between model steps).
+      // No live execution: a machine with nothing running, or a mission
+      // between model steps. (#2890, operator: "similar to rest") It breathes
+      // like REST, dimmer, in the neutral color, with no drifting dot: on and
+      // waiting, not cooling down.
       out.ring = 0.45;
-      out.rscale = 0.96;
+      out.breath = 0.7;
+      out.rscale = 0.94;
       break;
     case "stalled":
       if (sinceSec < 0.3) {

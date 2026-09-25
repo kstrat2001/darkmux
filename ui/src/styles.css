@@ -3612,6 +3612,17 @@ body {
 .mach:has(> .mach-body--scope) > .spec {
   padding-right: calc(var(--tube) + 12px);
 }
+/* (#2890) The rows beside the tube stay on one line (ellipsized if they
+   ever must), so `tubeFit.ts` can measure their natural width and a
+   wrapped line never changes the card's height under it. */
+.mach:has(> .mach-body--scope) > .name,
+.mach:has(> .mach-body--scope) > .spec,
+.mach:has(> .mach-body--scope) .stat,
+.mach:has(> .mach-body--scope) .mach-scope__rate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .mach:has(> .mach-body--scope) > .mach-body--scope {
   position: static;
 }
@@ -8567,17 +8578,17 @@ body {
 .token-scope-bezel--card .token-scope-center .token-scope-n {
   font-size: 22px;
 }
+/* The card's tube shows the number alone: its ring passes through the
+   unit's line (measured: "think tok/s" crossed the trace and lost its ends),
+   and the rate line beside it already carries the unit. */
 .token-scope-bezel--card .token-scope-center .token-scope-u {
-  margin-top: 4px;
-  font-size: 9px;
+  display: none;
 }
 @media (max-width: 560px) {
   .token-scope-bezel--card .token-scope-center .token-scope-n {
     font-size: 30px;
   }
-  .token-scope-bezel--card .token-scope-center .token-scope-u {
-    font-size: 10px;
-  }
+
 }
 .session-run .modelbox__hero .token-scope-center .token-scope-n {
   font-size: 40px;

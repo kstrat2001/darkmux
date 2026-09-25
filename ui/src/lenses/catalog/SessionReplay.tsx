@@ -176,7 +176,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
           ? `${live.restSecondsLeft}s`
           : promptLabel,
       centerUnit: generating
-        ? "tok/s"
+        ? live.thinking
+          ? "think tok/s"
+          : "tok/s"
         : state === "rest" && live.restSecondsLeft != null
           ? "resting"
           : writing

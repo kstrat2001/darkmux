@@ -323,12 +323,13 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
     }
     ctx.shadowBlur = 0;
   }
-  // REST: a slow drifting dot on the breathing circle.
-  if (p.breath > 0.05) {
+  // REST: a slow drifting dot on the breathing circle (idle breathes without
+  // it, #2890).
+  if (p.breath > 0.05 && p.drift > 0.05) {
     const a = c.breathT * 0.32;
     ctx.beginPath();
     ctx.arc(cx + Math.cos(a) * rBase * p.sx, cy + Math.sin(a) * rBase * p.sy, Math.max(1.2, R * 0.03), 0, Math.PI * 2);
-    ctx.fillStyle = rgba(lift(cr, 0.5), lift(cg, 0.5), lift(cb, 0.5), 0.55 * p.breath);
+    ctx.fillStyle = rgba(lift(cr, 0.5), lift(cg, 0.5), lift(cb, 0.5), 0.55 * p.breath * Math.min(1, p.drift));
     ctx.fill();
   }
   // STALL: the ember left after the collapse, pulsing slowly.

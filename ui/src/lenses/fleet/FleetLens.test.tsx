@@ -1282,6 +1282,20 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     // vocabulary invented for this case (the project's "no snowflakes,
     // shared indicators" rule).
     expect(card.className).toContain("absent");
+    // (#2890) A machine that is off shows no tube at all.
+    expect(card.querySelector('[data-testid="fleet-token-scope"]')).toBeNull();
+  });
+
+  it("(#2890) an online machine with nothing running shows its tube idle", async () => {
+    const records = [
+      { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5", action: "machine.online", source: "presence-reconciler" },
+    ] as unknown as FlowRecord[];
+    renderFleetLens({ records, tMin: Date.parse("2026-08-26T09:00:00.000Z"), tMax: Date.parse("2026-08-26T10:00:00.000Z"), historical: true });
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.className).not.toContain("absent");
+    const probe = card.querySelector('[data-testid="token-scope-probe"]');
+    expect(probe && JSON.parse(probe.getAttribute("data-props")!)).toMatchObject({ state: "idle", size: "card" });
   });
 
   // (#1855) The card's HARDWARE line, on the same card. Rendering the

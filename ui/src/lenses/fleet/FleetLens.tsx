@@ -1,4 +1,5 @@
-import { useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { fitTubes } from "./tubeFit";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
@@ -477,6 +478,20 @@ export function FleetLens({
   // guarded update.
   const stickyDefaultByUidRef = useRef<Record<string, string>>({});
 
+  // (#2890) Size each card's tube to the room it has (see `tubeFit.ts`):
+  // after every render, since a rate or a pager changes the text, and on
+  // every resize of the card grid.
+  const fleetRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    fitTubes(fleetRef.current);
+  });
+  useEffect(() => {
+    const el = fleetRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const ro = new ResizeObserver(() => fitTubes(el));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const liveWindow = useFlowWindow(wallNow);
   const flowWindow = records !== undefined
     ? { data: records, tMax: tMax ?? 0, settled: true }
@@ -765,7 +780,7 @@ export function FleetLens({
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />
-      <div className="fleet">
+      <div className="fleet" ref={fleetRef}>
         {cards.map((card) => {
           // (#2881) Pager selection for this card. `execs` is already
           // sorted by session id (`cards.ts::buildFleetCard`'s own doc) —
@@ -898,7 +913,10 @@ export function FleetLens({
                 machine generates, the scope sits to their right at the
                 concept's card size, spanning those rows, so the card does
                 not grow taller and an idle card reserves no empty slot. */}
-            <div className={card.liveTokRate !== null ? "mach-body mach-body--scope" : "mach-body"}>
+            {/* (#2890) Every ONLINE card carries the tube: running work
+                drives it; a machine with nothing running shows it idle
+                (breathing, like rest). A machine that is off shows none. */}
+            <div className={(card.liveTokRate !== null && selectedExec) || !card.absent ? "mach-body mach-body--scope" : "mach-body"}>
               <div className="stat">
                 <span className="dot" />
                 {card.stat}
@@ -935,7 +953,7 @@ export function FleetLens({
                       // (`SessionReplay.tsx`'s `centerLabel`). `Math.round(...
                       // ?? 0)` used to print a confident "0 tok/s" here.
                       selectedExec.tokensPerSec != null
-                      ? `${fmtN(Math.round(selectedExec.tokensPerSec))} tok/s`
+                      ? `${fmtN(Math.round(selectedExec.tokensPerSec))} ${selectedExec.thinking ? "think tok/s" : "tok/s"}`
                       : "—"
                     : // (#2886 pass 3) `state: null` here (rather than the
                       // "no live execution" case, ruled out since
@@ -1109,10 +1127,15 @@ export function FleetLens({
                           : "—"
                         : null
                     }
-                    centerUnit={selectedExec.state === "generating" ? "tok/s" : null}
+                    centerUnit={selectedExec.state === "generating" ? (selectedExec.thinking ? "think tok/s" : "tok/s") : null}
                     centerCarried={selectedExec.state === "generating" && selectedExec.carried === true}
                     size="card"
                   />
+                </div>
+              )}
+              {!(card.liveTokRate !== null && selectedExec) && !card.absent && (
+                <div className="mach-scope" data-testid="fleet-token-scope">
+                  <TokenScope tokensPerSec={0} state="idle" size="card" />
                 </div>
               )}
             </div>
