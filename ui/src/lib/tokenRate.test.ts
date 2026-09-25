@@ -621,8 +621,8 @@ describe("averageGenerationRate", () => {
 });
 
 describe("liveStateLabel", () => {
-  it("names the prompt wait as 'reading prompt', not the bare word the page's prompt disclosure also uses", () => {
-    expect(liveStateLabel({ state: "prompt" } as never)).toBe("reading prompt");
+  it("names the prompt wait as 'processing prompt', not the bare word the page's prompt disclosure also uses", () => {
+    expect(liveStateLabel({ state: "prompt" } as never)).toBe("processing prompt");
   });
 });
 

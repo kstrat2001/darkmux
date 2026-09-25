@@ -17,7 +17,7 @@ describe("scopeCenter", () => {
     expect(scopeCenter({ state: "tools", tokensPerSec: 0 })).toMatchObject({ centerLabel: null, centerUnit: null });
   });
   it("PROMPT: the size over reading when known; nothing otherwise (the brain)", () => {
-    expect(scopeCenter({ state: "prompt", tokensPerSec: 0, promptLabel: "~18k" })).toMatchObject({ centerLabel: "~18k", centerUnit: "reading" });
+    expect(scopeCenter({ state: "prompt", tokensPerSec: 0, promptLabel: "~18k" })).toMatchObject({ centerLabel: "~18k", centerUnit: "processing" });
     expect(scopeCenter({ state: "prompt", tokensPerSec: 0 })).toMatchObject({ centerLabel: null, centerUnit: null });
   });
   it("IDLE says idle, on its own", () => {

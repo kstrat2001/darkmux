@@ -36,7 +36,7 @@ describe("TokenScope center, per state (#2890)", () => {
     const a = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel={null} />);
     expect(a.container.querySelector("[data-scope-icon]")?.getAttribute("data-scope-icon")).toBe("brain");
     expect(a.container.querySelector(".token-scope-n")).toBeNull();
-    const b = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel="36k" centerUnit="reading" />);
+    const b = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel="36k" centerUnit="processing" />);
     expect(b.container.querySelector("[data-scope-icon]")).toBeNull();
     expect(b.container.querySelector(".token-scope-n")?.textContent).toBe("36k");
   });

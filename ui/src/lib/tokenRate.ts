@@ -708,7 +708,8 @@ export function liveStateLabel(reading: LiveStateReading): string {
     case "prompt":
       // Not the bare word: the run page shows a "prompt · N chars"
       // disclosure just above the tile.
-      return "reading prompt";
+      // (#2890, operator) "processing", not "reading": too close to the read tool.
+      return "processing prompt";
     case "tools":
       // (#2889) Elapsed since the call's name arrived, while it is written.
       return reading.writing ? `writing · ${reading.writingSeconds ?? 0} s` : "tools";

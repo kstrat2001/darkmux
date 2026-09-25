@@ -158,7 +158,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
     const generating = state === "generating";
     // (#2889) The model writing a tool call: the tool's icon with the elapsed
     // time under it. PROMPT with the opening heartbeat's size: the estimate
-    // over "reading", in the prompt color; without one, the brain.
+    // over "processing", in the prompt color; without one, the brain.
     const writing = state === "tools" && live.writing === true;
     const promptLabel = state === "prompt" ? (live.promptLabel ?? null) : null;
     return {

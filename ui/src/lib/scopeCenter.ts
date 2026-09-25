@@ -10,7 +10,8 @@ import type { ScopeState } from "./scopeMorph";
  *  - REST: the countdown ("12s") over "resting";
  *  - TOOLS: the tool's icon (drawn by `TokenScope`), with "writing · N s"
  *    under it while the model writes the call;
- *  - PROMPT: the prompt's size ("~18k") over "reading" when the turn's
+ *  - PROMPT: the prompt's size ("~18k") over "processing" (not "reading",
+ *    which reads like the read tool) when the turn's
  *    opening heartbeat reported it; otherwise `TokenScope` draws the brain;
  *  - IDLE: the word "idle" on its own, centered;
  *  - everything else: nothing. */
@@ -53,7 +54,7 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
         : writing
           ? `writing · ${r.writingSeconds ?? 0} s`
           : promptLabel !== null
-            ? "reading"
+            ? "processing"
             : r.state === "idle"
               ? "idle"
               : null,

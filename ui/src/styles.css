@@ -3664,6 +3664,15 @@ body {
    `tubeFit.ts`) and the card grows downward, instead of being squeezed
    beside the text. The phone keeps the tube beside the text above. */
 @media (min-width: 561px) {
+  /* (#2890, operator: "the text is also small to read at 100% zoom") The
+     desktop card has room now: status lines one step up. */
+  .mach .stat,
+  .mach .runs {
+    font-size: calc(13px * var(--fs-scale));
+  }
+  .mach-scope__rate {
+    font-size: calc(14px * var(--fs-scale));
+  }
   .mach:has(> .mach-body--scope) {
     --tube: 150px;
     min-height: 0;
@@ -8639,10 +8648,13 @@ body {
     animation: none;
   }
 }
-/* (#2890) The fleet card's tube (96px desktop, up to 150px on a phone)
-   carries the live rate in its center, sized to the tube. */
+/* (#2890, operator: "with the extra space the glyphs are too small") The
+   fleet card's center scales with its tube (`--tube`, set per card by
+   `tubeFit.ts`: ~163-180px on a desktop, ~128px on a phone): the number is
+   20% of the tube, the unit about 7% (never under 9px), the tool/brain
+   glyph 27% (`--ico` below). */
 .token-scope-bezel--card .token-scope-center {
-  --scope-num: 22px;
+  --scope-num: calc(var(--tube, 96px) * 0.2);
 }
 /* (#2890) A unit with no number above it (idle) sits at the center itself. */
 .token-scope-center:not(:has(.token-scope-n)) .token-scope-u {
@@ -8652,19 +8664,14 @@ body {
 /* (#2890) The card's tube shows the same center as the run page's, unit
    included; the larger tube and ring leave the unit clear of the trace. */
 .token-scope-bezel--card .token-scope-center .token-scope-u {
-  font-size: 9px;
+  font-size: max(9px, calc(var(--tube, 96px) * 0.068));
 }
 @media (max-width: 560px) {
-  /* A phone card's tube is ~128px: a smaller number and a tighter unit keep
-     "think tok/s" inside the GEN wave's inner troughs. */
-  .token-scope-bezel--card .token-scope-center {
-    --scope-num: 26px;
-  }
+  /* A phone card's tube is ~128px: a tighter unit keeps "think tok/s"
+     inside the GEN wave's inner troughs. */
   .token-scope-bezel--card .token-scope-center .token-scope-u {
-    font-size: 8px;
     letter-spacing: 0.02em;
   }
-
 }
 .session-run .modelbox__hero .token-scope-center {
   --scope-num: 40px;
@@ -8697,7 +8704,7 @@ body {
   --ico: 16px;
 }
 .token-scope-bezel--card {
-  --ico: 28px;
+  --ico: calc(var(--tube, 96px) * 0.27);
 }
 .token-scope-bezel--tile {
   --ico: 26px;
@@ -8730,7 +8737,7 @@ body {
 .token-scope-center--icon .token-scope-u--tools[data-on="true"] {
   opacity: 0.85;
 }
-/* (#2889) PROMPT's size estimate ("~36k" over "reading") takes the prompt
+/* (#2889) PROMPT's size estimate ("~36k" over "processing") takes the prompt
    lamp's color, the way REST's countdown takes amber. */
 .token-scope-center[data-state="prompt"] .token-scope-n,
 .token-scope-center[data-state="prompt"] .token-scope-u {
@@ -8778,11 +8785,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .token-scope-center--brain .token-scope-ico { animation: none; }
 }
-@media (max-width: 560px) {
-  .token-scope-bezel--card {
-    --ico: 36px;
-  }
-}
+
 /* Static readout (`prefers-reduced-motion: reduce`): the canvas draws one
    settled frame per state change and never loops (see `TokenScope.tsx`), so
    nothing here needs a reduced-motion media query of its own. */

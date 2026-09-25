@@ -1428,7 +1428,7 @@ describe("modelScopeHero (#2890)", () => {
 
   it("(#2889) PROMPT with the opening heartbeat's size: '~36k' over 'reading'", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptLabel: "~36k" }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "prompt", centerLabel: "~36k", centerUnit: "reading", tokensPerSec: 0 });
+    expect(h).toMatchObject({ state: "prompt", centerLabel: "~36k", centerUnit: "processing", tokensPerSec: 0 });
   });
 
   it("(#2889) PROMPT without a size (older records) keeps the brain: no label", () => {

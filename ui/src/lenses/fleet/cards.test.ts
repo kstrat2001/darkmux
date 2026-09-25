@@ -546,7 +546,7 @@ describe("buildFleetCard", () => {
     it("a mission between model steps (only its run session beating) mounts no scope and claims no state", () => {
       // The launcher beats presence for the mission's run session during a
       // mod wait, a test gate, delivery: no model is involved, so the card
-      // must not say "reading prompt" or run a scope at 0.
+      // must not say "processing prompt" or run a scope at 0.
       const data: FlowRecord[] = [
         rec({ machine_uid: "u1", session_id: "m1", action: "dispatch.start", source: "mission", mission_id: "m1" }),
         rec({ machine_uid: "u1", session_id: "e1", action: "dispatch.start", mission_id: "m1" }),
