@@ -576,6 +576,13 @@ export function createFacetSeen(): FacetSeen {
   return { act: new Set(), cat: new Set(), tier: new Set(), src: new Set() };
 }
 
+/** An independent copy of a seen ledger, so a caller can hand
+ *  `absorbNewFacetValues` (which marks values seen as it goes) a ledger it
+ *  may mutate without touching the original. */
+export function cloneFacetSeen(seen: FacetSeen): FacetSeen {
+  return { act: new Set(seen.act), cat: new Set(seen.cat), tier: new Set(seen.tier), src: new Set(seen.src) };
+}
+
 /** `absorbNewFilterValues()` — viewer.html:3451-3457, called after every
  * `recompute()` (boot, `applyLive()`'s per-poll live-tail merge, and the
  * date-rollover reload). Mutates `seen` and returns a `filters` object

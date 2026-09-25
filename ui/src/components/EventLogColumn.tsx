@@ -9,6 +9,7 @@ import { RecordView } from "./RecordView";
 import { Shimmer } from "./Placeholder";
 import {
   absorbNewFacetValues,
+  cloneFacetSeen,
   activityOf,
   computeFacets,
   createFacetSeen,
@@ -413,7 +414,9 @@ export function EventLogColumn({
   // (`eventFilters.ts`'s `filtersKeyFor`) is safe to have back.
 
   const seenRef = useRef<FacetSeen>(createFacetSeen());
-  // The absorb runs in the EFFECT BODY, not inside the `setFilters` updater.
+  // (Superseded by the functional update below, which keeps the updater
+  // pure by absorbing against a copied snapshot.) The absorb used to run in
+  // the EFFECT BODY, not inside the `setFilters` updater.
   // `absorbNewFacetValues` mutates the `seen` ledger, and React requires
   // updaters to be pure — `<StrictMode>` (on, `main.tsx`) double-invokes them
   // precisely to punish impurity. On React 18.3 the impure version happened
@@ -465,9 +468,24 @@ export function EventLogColumn({
       setFilters(restored);
       return;
     }
-    const next = absorbNewFacetValues(filters, facets, seenRef.current, overridesRef.current);
-    if (next !== filters) setFilters(next);
-  }, [facets, filters]);
+    // (#2895 CI, measured) Absorb against the LATEST filters, not this
+    // render's closure. When the second day's records land before the
+    // first-arrival `setFilters(restored)` has rendered, this effect runs
+    // with the pre-restore (empty) `filters`; absorbing from that stale base
+    // kept only the never-seen values and overwrote the restored picks,
+    // while the restored values were already in the ledger and could never
+    // come back: "0 events · N hidden", permanently (15 of 60 loads under
+    // load, instrumented). The updater stays pure: the ledger is marked here
+    // in the effect body, and each updater call absorbs against its OWN copy
+    // of the pre-mark snapshot, so a StrictMode double-invoke computes the
+    // same result twice.
+    const seenBefore = cloneFacetSeen(seenRef.current);
+    for (const k of ["act", "cat", "tier", "src"] as const) {
+      for (const v of facets[k]) seenRef.current[k].add(v);
+    }
+    const overrides = overridesRef.current;
+    setFilters((prev) => absorbNewFacetValues(prev, facets, cloneFacetSeen(seenBefore), overrides));
+  }, [facets]);
   const [follow, setFollow] = useState(true);
   // (#1066) Collapsed is the operator's choice and must survive a route
   // change, or every tab switch reopens it and a "mainstay" becomes an
