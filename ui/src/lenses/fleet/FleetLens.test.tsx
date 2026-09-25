@@ -1034,6 +1034,22 @@ describe("FleetLens pager (#2881)", () => {
     expect(document.querySelector(".runs--live")!.textContent).toBe("1 running");
   });
 
+  it("(#2890) the card's tube carries the live rate in its center while generating, nothing while resting", async () => {
+    // `TokenScope` is mocked in this file (a probe that records its props),
+    // so this reads what the card HANDS the tube; TokenScope.test.tsx pins
+    // how the tube renders a center label.
+    const scopeProps = () =>
+      JSON.parse(document.querySelector('[data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+    renderThree(5);
+    await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("100 tok/s");
+    expect(scopeProps()).toMatchObject({ state: "generating", centerLabel: "100", centerUnit: "tok/s", centerCarried: false });
+    fireEvent.click(screen.getByLabelText("next execution"));
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 13s");
+    expect(scopeProps().centerLabel ?? null).toBeNull();
+    expect(scopeProps().centerUnit ?? null).toBeNull();
+  });
+
   it("an arrow click changes the page and does not fire the card's machine drill-in", async () => {
     renderThree(5);
     await waitFor(() => expect(document.querySelector(".mach-scope__pager")).not.toBeNull());

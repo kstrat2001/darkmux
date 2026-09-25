@@ -1090,6 +1090,19 @@ export function FleetLens({
                     // (#2889) The writing cue; no caption on the card — the
                     // rate line above already says "writing · N s".
                     toolWriting={selectedExec.writing === true}
+                    // (#2890, operator 2026-09-25) With the tube now sized to
+                    // the card, the live rate sits in its center while
+                    // generating, as on the run page. Other states keep the
+                    // center's own content (tool icon, brain) or none.
+                    centerLabel={
+                      selectedExec.state === "generating"
+                        ? selectedExec.tokensPerSec != null
+                          ? String(Math.round(selectedExec.tokensPerSec))
+                          : "—"
+                        : null
+                    }
+                    centerUnit={selectedExec.state === "generating" ? "tok/s" : null}
+                    centerCarried={selectedExec.state === "generating" && selectedExec.carried === true}
                     size="card"
                   />
                 </div>

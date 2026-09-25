@@ -8513,6 +8513,23 @@ body {
 }
 /* (#2890) The run page's hero: the rate (or the finished average) at the
    prototype's size, with its unit quietly under it. */
+/* (#2890) The fleet card's tube (96px desktop, up to 150px on a phone)
+   carries the live rate in its center, sized to the tube. */
+.token-scope-bezel--card .token-scope-center .token-scope-n {
+  font-size: 22px;
+}
+.token-scope-bezel--card .token-scope-center .token-scope-u {
+  margin-top: 4px;
+  font-size: 9px;
+}
+@media (max-width: 560px) {
+  .token-scope-bezel--card .token-scope-center .token-scope-n {
+    font-size: 30px;
+  }
+  .token-scope-bezel--card .token-scope-center .token-scope-u {
+    font-size: 10px;
+  }
+}
 .session-run .modelbox__hero .token-scope-center .token-scope-n {
   font-size: 40px;
   line-height: 0.9;
