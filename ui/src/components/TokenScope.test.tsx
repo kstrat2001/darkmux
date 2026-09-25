@@ -32,13 +32,14 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(container.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("bash");
   });
 
-  it("PROMPT shows the brain until a prompt size arrives, then the count", () => {
+  it("(#2890) PROMPT shows the brain for the whole phase, even if handed a center", () => {
     const a = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel={null} />);
     expect(a.container.querySelector("[data-scope-icon]")?.getAttribute("data-scope-icon")).toBe("brain");
     expect(a.container.querySelector(".token-scope-n")).toBeNull();
     const b = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" centerLabel="36k" centerUnit="processing" />);
-    expect(b.container.querySelector("[data-scope-icon]")).toBeNull();
-    expect(b.container.querySelector(".token-scope-n")?.textContent).toBe("36k");
+    expect(b.container.querySelector("[data-scope-icon]")?.getAttribute("data-scope-icon")).toBe("brain");
+    expect(b.container.querySelector(".token-scope-n")).toBeNull();
+    expect(b.container.querySelector(".token-scope-screen")?.textContent).toBe("");
   });
 
   it("(#2889, #2890) TOOLS while the call is GENERATED: a wrench, not the tool's icon, with \"tool gen\" under it", () => {

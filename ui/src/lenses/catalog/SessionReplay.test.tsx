@@ -1426,16 +1426,6 @@ describe("modelScopeHero (#2890)", () => {
     expect(h).toMatchObject({ state: "prompt", tokensPerSec: 0, centerLabel: null, centerUnit: null, lamps: { state: "prompt" } });
   });
 
-  it("(#2889) PROMPT with the opening heartbeat's size: '~36k' over 'reading'", () => {
-    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptLabel: "~36k" }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "prompt", centerLabel: "~36k", centerUnit: "processing", tokensPerSec: 0 });
-  });
-
-  it("(#2889) PROMPT without a size (older records) keeps the brain: no label", () => {
-    const h = modelScopeHero({ liveTokScope: { ...live, state: "prompt", promptLabel: null }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: null });
-  });
-
   it("(#2890) GEN while thinking: the same number and unit, with the thinking look", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96, thinking: true }, finishedTokRate: null });
     expect(h).toMatchObject({ state: "generating", centerLabel: "96", centerUnit: "tok/s", thinking: true });

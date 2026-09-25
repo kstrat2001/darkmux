@@ -8739,13 +8739,6 @@ body {
 .token-scope-center--icon .token-scope-u--tools[data-on="true"] {
   opacity: 0.85;
 }
-/* (#2889) PROMPT's size estimate ("~36k" over "processing") takes the prompt
-   lamp's color, the way REST's countdown takes amber. */
-.token-scope-center[data-state="prompt"] .token-scope-n,
-.token-scope-center[data-state="prompt"] .token-scope-u {
-  color: var(--lamp-prompt);
-  text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-prompt) 60%, transparent);
-}
 /* (#2890) The center crossfades at a change of kind. Each layer fills the
    screen like `.token-scope-center`, so the two overlap during the fade.
    The rest color rides the LAYER's own data-state, so a fading-out

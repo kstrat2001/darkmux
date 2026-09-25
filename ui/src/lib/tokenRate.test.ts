@@ -18,8 +18,6 @@ import {
   liveStateLabel,
   liveStateWhileConnected,
   lastHeartbeatMs,
-  promptTokensLabel,
-  promptEstimate,
 } from "./tokenRate";
 
 const SID = "darkmux-coder-1790125784225";
@@ -1050,15 +1048,6 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
     expect(deriveLiveState(records, Date.parse(atSec(3)))).toEqual({ state: "prompt" });
   });
 
-  it("promptEstimate reads the live execution's sized PROMPT with that execution's own calibration", () => {
-    const tokens = rec(-8, "telemetry.tokens", { turn_seq: 1, completion_tokens: 1_000 });
-    const turn1 = [hb(-12, 0), hb(-10, 3_000)].map((r) => ({ ...r, payload: { ...(r as unknown as { payload: object }).payload, turn_seq: 1 } }) as unknown as FlowRecord);
-    const records = [rec(-15, "dispatch.start"), ...turn1, tokens, hb(0, 0, { prompt_chars: 144_000 })];
-    // 3,000 chars over 1,000 billed tokens = 3 chars/token -> 48k, not the default 4's 36k.
-    expect(promptEstimate([records], Date.parse(atSec(3)))).toBe("~48k");
-    expect(promptEstimate([[rec(-5, "dispatch.start"), hb(0, 0)]], Date.parse(atSec(3)))).toBeNull();
-  });
-
   // (#2889 review, M3) The wire as it really lands: record `ts` is
   // WHOLE-SECOND, and the heartbeat's own `sampled_at_ms` is ms-precise. In
   // 9 of 12 real openers the marker (`dispatch.start`, or the turn's last
@@ -1110,21 +1099,6 @@ describe("(#2889) the prompt size on the opening heartbeat", () => {
     expect(deriveLiveState(records, base + 1_500)).toEqual({ state: "prompt", promptChars: 60_000 });
   });
 
-  it("promptEstimate reads the size when the marker shares the opener's second", () => {
-    const records = [
-      wire(base + 100, "dispatch.start"),
-      wire(base + 300, "dispatch.turn.heartbeat", { sampled_at_ms: base + 300, generated_chars: 0, turn_seq: 1, prompt_chars: 144_000 }),
-    ];
-    // No billed turn yet: the default 4 chars/token -> ~36k.
-    expect(promptEstimate([records], base + 1_500)).toBe("~36k");
-  });
-
-  it("the size converts to an estimated token count with the session's own calibration", () => {
-    expect(promptTokensLabel(144_000, 4)).toBe("~36k");
-    expect(promptTokensLabel(144_000, 3)).toBe("~48k");
-    expect(promptTokensLabel(3_200, 4)).toBe("~800");
-    expect(promptTokensLabel(0, 4)).toBeNull();
-  });
 });
 
 describe("(#2890) thinking vs visible text while generating", () => {

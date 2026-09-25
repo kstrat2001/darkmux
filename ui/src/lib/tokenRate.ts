@@ -431,8 +431,8 @@ export interface LiveStateReading {
    *  this writing stretch, i.e. since the call's name arrived. */
   writingSeconds?: number;
   /** (#2889) Present only when `state === "prompt"` and the turn's opening
-   *  heartbeat said how large the request is, in chars. The caller converts
-   *  it to an estimated token count (`promptTokensLabel`). */
+   *  heartbeat said how large the request is, in chars. Recorded, not
+   *  displayed: the scope shows the brain for all of PROMPT (#2890). */
   promptChars?: number;
 }
 
@@ -896,9 +896,6 @@ export interface ExecutionTokenReading {
    *  reasoning rather than writing visible text. See
    *  `LiveStateReading.thinking`. */
   thinking?: true;
-  /** (#2890) In PROMPT, the prompt's size estimate ("~18k") when the turn's
-   *  opening heartbeat reported it, the same label the run page shows. */
-  promptLabel?: string;
 }
 
 export function executionTokenReading(
@@ -932,42 +929,7 @@ export function executionTokenReading(
     toolName: state === "tools" ? liveState?.toolName : undefined,
     ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
     ...(state === "generating" && liveState?.thinking ? { thinking: true as const } : {}),
-    ...(state === "prompt" && liveState?.promptChars !== undefined
-      ? (() => {
-          const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(records.filter((r) => !(Date.parse(r.ts) > nowMs))));
-          return label !== null ? { promptLabel: label } : {};
-        })()
-      : {}),
   };
-}
-
-/** (#2889) The PROMPT center's size estimate for a reading aggregated over
- *  several executions: the first live execution whose own reading is a
- *  PROMPT with a size, converted with THAT execution's calibration (turn
- *  numbers are per execution, so records of different executions never
- *  share one ratio). `null` when no live execution is reading a sized
- *  prompt. */
-export function promptEstimate(perExecutionRecords: FlowRecord[][], nowMs: number): string | null {
-  for (const recs of liveExecutions(perExecutionRecords, nowMs)) {
-    const reading = deriveLiveState(recs, nowMs);
-    if (reading.state !== "prompt" || reading.promptChars === undefined) continue;
-    const cut = recs.filter((r) => !(Date.parse(r.ts) > nowMs));
-    const label = promptTokensLabel(reading.promptChars, measuredCharsPerToken(cut));
-    if (label !== null) return label;
-  }
-  return null;
-}
-
-/** (#2889) A request's size in chars as an estimated token count for the
- *  PROMPT center ("~36k"), converted with the session's own chars-per-token
- *  (`measuredCharsPerToken`, which already leaves out checkpointed turns).
- *  `~` because both the size and the ratio are estimates. `null` for a
- *  size that rounds to nothing, so the caller keeps its sizeless display. */
-export function promptTokensLabel(promptChars: number, charsPerToken: number): string | null {
-  if (!(promptChars > 0) || !(charsPerToken > 0)) return null;
-  const tokens = promptChars / charsPerToken;
-  if (tokens < 1) return null;
-  return tokens >= 1000 ? `~${Math.round(tokens / 1000)}k` : `~${Math.round(tokens)}`;
 }
 
 /** Accessor for `STATE_PRIORITY` — the pager's default-page pick

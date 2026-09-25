@@ -56,7 +56,7 @@
 import { T, dispatchErrored, dispatchKilled, statusLabel, runStateFrom, computeTMax } from "../../lib/flow";
 import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
-import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected, promptEstimate } from "../../lib/tokenRate";
+import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
@@ -238,10 +238,6 @@ export interface SessionRunView {
         /** (#2890) Present only while generating and the model is reasoning
          *  rather than writing visible text. See `LiveStateReading.thinking`. */
         thinking?: true;
-        /** (#2889) Present only in PROMPT when the turn's opening heartbeat
-         *  said how big the request is: the estimate the scope's center shows
-         *  ("~36k"). `null`/absent keeps the brain. */
-        promptLabel?: string | null;
       }
     | null;
   /** (#2890) A FINISHED run's average generation rate, shown in the MODEL
@@ -1827,7 +1823,6 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
               ? { writing: true as const, writingSeconds: tokRateLiveState.writingSeconds }
               : {}),
             ...(tokRateLiveState?.state === "generating" && tokRateLiveState.thinking ? { thinking: true as const } : {}),
-            promptLabel: tokRateLiveState?.state === "prompt" ? promptEstimate(tokRateRecordSets, nowMs) : null,
           }
         : null,
     finishedTokRate,

@@ -156,11 +156,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   if (live) {
     const state = scopeStateOf({ state: live.state, noSignal: live.noSignal });
     const generating = state === "generating";
-    // (#2889) The model writing a tool call: the tool's icon with the elapsed
-    // time under it. PROMPT with the opening heartbeat's size: the estimate
-    // over "processing", in the prompt color; without one, the brain.
+    // (#2889) The model generating a tool call: a wrench over "tool gen".
+    // PROMPT: the brain.
     const writing = state === "tools" && live.writing === true;
-    const promptLabel = state === "prompt" ? (live.promptLabel ?? null) : null;
     return {
       state,
       tokensPerSec: generating ? live.tokensPerSec : 0,
@@ -177,7 +175,6 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         writing,
         writingSeconds: live.writingSeconds,
         thinking: live.thinking === true,
-        promptLabel,
       }),
       lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft, writing: live.writing, writingSeconds: live.writingSeconds },
       note: state === "nosignal" ? "no signal" : null,

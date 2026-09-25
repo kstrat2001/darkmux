@@ -13,9 +13,9 @@ import type { ScopeState } from "./scopeMorph";
  *    generation"; not "writing", which read as the edit/write tools' own
  *    action). No seconds: a growing number made the caption variable-width
  *    and it overran the ring; the status line keeps "tool gen · N s";
- *  - PROMPT: the prompt's size ("~18k") over "processing" (not "reading",
- *    which reads like the read tool) when the turn's
- *    opening heartbeat reported it; otherwise `TokenScope` draws the brain;
+ *  - PROMPT: nothing; `TokenScope` draws the brain for the whole phase
+ *    (#2890, operator: a size estimate in the center made one phase look
+ *    like two; the size is in the event detail and the run page);
  *  - IDLE: the word "idle" on its own, centered;
  *  - everything else: nothing. */
 export interface ScopeCenterInput {
@@ -26,7 +26,6 @@ export interface ScopeCenterInput {
   writing?: boolean;
   writingSeconds?: number;
   thinking?: boolean;
-  promptLabel?: string | null;
 }
 
 export interface ScopeCenter {
@@ -38,7 +37,6 @@ export interface ScopeCenter {
 export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
   const generating = r.state === "generating";
   const writing = r.state === "tools" && r.writing === true;
-  const promptLabel = r.state === "prompt" ? (r.promptLabel ?? null) : null;
   const resting = r.state === "rest" && r.restSecondsLeft != null;
   return {
     centerLabel: generating
@@ -47,7 +45,7 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
         : "—"
       : resting
         ? `${r.restSecondsLeft}s`
-        : promptLabel,
+        : null,
     // (#2890, operator) "tok/s" while thinking too: "think tok/s" did not
     // fit inside the wave, and the violet shimmer plus the card's rate line
     // ("76 think tok/s") already say it is thinking.
@@ -57,11 +55,9 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
         ? "resting"
         : writing
           ? "tool gen"
-          : promptLabel !== null
-            ? "processing"
-            : r.state === "idle"
-              ? "idle"
-              : null,
+          : r.state === "idle"
+            ? "idle"
+            : null,
     centerCarried: generating && r.carried === true,
   };
 }

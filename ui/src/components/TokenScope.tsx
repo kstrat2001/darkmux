@@ -339,7 +339,7 @@ function drawFrame(ctx: CanvasRenderingContext2D, w: number, h: number, p: Scope
       // and fades out near 72% of the base radius so the center stays clear.
       // (#2890, operator: "prompt would also benefit from a larger radius")
       // They sink to about 72% of the base ring, not half, so they stay
-      // near the glass and clear of the "~18k reading" label.
+      // near the glass, well clear of the brain.
       const shrink = 1 - 0.28 * q;
       const waveAmp = amp * (1 - q);
       const a = Math.min(1, q / 0.12) * Math.pow(1 - q, 1.1) * 0.9 * p.inward;
@@ -533,9 +533,10 @@ export function TokenScope({
   // tool's own, a change of kind, so the whole center crossfades and the
   // caption leaves with the wrench.
   const toolCaption = showIcon && writing ? (centerUnit ?? null) : null;
-  // PROMPT shows a pulsing brain until the runtime reports the prompt size
-  // mid-turn (#2889); then the count takes the center like any other number.
-  const showBrain = state === "prompt" && centerLabel == null;
+  // PROMPT shows a pulsing brain for the whole phase, whatever center it is
+  // handed (#2890, operator: a size estimate in the center made one phase
+  // look like two; the size is in the event detail and on the run page).
+  const showBrain = state === "prompt";
   // A number with its unit under it, or (#2890, idle) a unit on its own.
   const showNumber = !showIcon && !showBrain && (centerLabel != null || !!centerUnit);
 

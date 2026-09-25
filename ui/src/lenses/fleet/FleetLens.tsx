@@ -1137,7 +1137,6 @@ export function FleetLens({
                       writing: selectedExec.writing === true,
                       writingSeconds: selectedExec.writingSeconds,
                       thinking: selectedExec.thinking === true,
-                      promptLabel: selectedExec.promptLabel ?? null,
                     })}
                     size="card"
                   />
