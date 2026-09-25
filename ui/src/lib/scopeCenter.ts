@@ -8,8 +8,10 @@ import type { ScopeState } from "./scopeMorph";
  *  - GEN: the rounded rate ("—" when not yet measured) over "tok/s"
  *    (also while thinking; the shimmer and the rate line say that);
  *  - REST: the countdown ("12s") over "resting";
- *  - TOOLS: the tool's icon (drawn by `TokenScope`), with "writing · N s"
- *    under it while the model writes the call;
+ *  - TOOLS: the tool's icon (drawn by `TokenScope`), with "writing" under
+ *    it while the model writes the call (no seconds: a growing number made
+ *    the caption variable-width and it overran the ring; the status line
+ *    under the tube keeps the live "writing · N s");
  *  - PROMPT: the prompt's size ("~18k") over "processing" (not "reading",
  *    which reads like the read tool) when the turn's
  *    opening heartbeat reported it; otherwise `TokenScope` draws the brain;
@@ -53,7 +55,7 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
       : resting
         ? "resting"
         : writing
-          ? `writing · ${r.writingSeconds ?? 0} s`
+          ? "writing"
           : promptLabel !== null
             ? "processing"
             : r.state === "idle"

@@ -42,16 +42,16 @@ describe("TokenScope center, per state (#2890)", () => {
   });
 
   it("(#2889) TOOLS while WRITING the call: the same tool icon, a writing cue, and the caption under it", () => {
-    const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" toolWriting centerUnit="writing · 23 s" />);
+    const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" toolWriting centerUnit="writing" />);
     expect(container.querySelector("[data-tool-icon]")?.getAttribute("data-tool-icon")).toBe("edit");
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-writing")).toBe("true");
     const cap = container.querySelector(".token-scope-u--tools");
-    expect(cap?.textContent).toBe("writing · 23 s");
+    expect(cap?.textContent).toBe("writing");
     expect(cap?.getAttribute("data-on")).toBe("true");
   });
 
   it("(#2889) writing -> running the same tool does not crossfade the center: the icon stays, the caption fades by CSS", () => {
-    const { container, rerender } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" toolWriting centerUnit="writing · 23 s" />);
+    const { container, rerender } = render(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" toolWriting centerUnit="writing" />);
     rerender(<TokenScope tokensPerSec={0} size="tile" state="tools" toolName="edit" />);
     expect(container.querySelector(".token-scope-fade--out")).toBeNull();
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-writing")).toBe("false");

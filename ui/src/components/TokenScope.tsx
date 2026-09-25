@@ -74,7 +74,7 @@ export interface TokenScopeProps {
    *  running it. Same color and icon; the comet stretches and its head
    *  scribbles, eased like every other morph parameter so the switch to
    *  running never pops. `centerUnit`, when given, is captioned under the
-   *  icon ("writing · 23 s"). */
+   *  icon ("writing"). */
   toolWriting?: boolean;
   /** (#2890) GEN while the model is reasoning rather than writing visible
    *  text: the trace takes a slowly rotating violet-to-pink shimmer blended

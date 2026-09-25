@@ -1116,8 +1116,8 @@ export function FleetLens({
                     // rate line prints, so the tube shows static.
                     state={scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null })}
                     toolName={selectedExec.toolName}
-                    // (#2889) The writing cue; no caption on the card — the
-                    // rate line above already says "writing · N s".
+                    // (#2889) The writing cue; the status line under the
+                    // tube carries the live "writing · N s".
                     toolWriting={selectedExec.writing === true}
                     // (#2890) Thinking tints the ring and shimmers the rate;
                     // the words and number stay as they are.
@@ -1127,8 +1127,8 @@ export function FleetLens({
                     // generating, as on the run page. Other states keep the
                     // center's own content (tool icon, brain) or none.
                     // (#2890) The same center as every scope in the app
-                    // (`lib/scopeCenter.ts`): rate and unit, "think tok/s",
-                    // the REST countdown, "writing · N s", the prompt size.
+                    // (`lib/scopeCenter.ts`): rate over "tok/s", the REST
+                    // countdown, "writing" (no seconds), the prompt size.
                     {...scopeCenter({
                       state: scopeStateOf({ state: selectedExec.state, noSignal: selectedExec.state === null }),
                       tokensPerSec: selectedExec.tokensPerSec,

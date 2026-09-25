@@ -8721,7 +8721,7 @@ body {
   color: var(--lamp-tools);
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--lamp-tools) 80%, transparent));
 }
-/* (#2889) TOOLS while the model WRITES the call: "writing · 23 s" under the
+/* (#2889) TOOLS while the model WRITES the call: "writing" under the
    icon, in the tools color. Positioned off the icon (not in the grid flow)
    so the icon never moves when it appears or goes, and faded by opacity:
    the text is held after writing ends so the fade has something to fade. */
