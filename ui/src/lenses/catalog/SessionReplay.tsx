@@ -79,12 +79,12 @@ const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = 
   { state: "rest", label: "rest" },
   { state: "stalled", label: "stall" },
 ];
-function ScopeLamps({
+export function ScopeLamps({
   reading,
   noSignal = false,
   finished = false,
 }: {
-  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number };
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number; thinking?: boolean };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
@@ -103,7 +103,9 @@ function ScopeLamps({
           ? "no signal — page disconnected from the daemon"
           : "no model working"
       : reading.state === "generating"
-        ? "generating"
+        ? reading.thinking
+          ? "generating, thinking"
+          : "generating"
         : liveStateLabel({
             state: reading.state,
             restSecondsLeft: reading.restSecondsLeft,
@@ -114,17 +116,19 @@ function ScopeLamps({
     <div className="scope-lamps" role="status" aria-label={`run state: ${aria}`}>
       {SCOPE_LAMPS.map(({ state, label }) => {
         const on = reading.state === state;
+        // (#2890, operator) While the model reasons rather than writing
+        // visible text, the lit GEN lamp reads "think" in the same shimmer
+        // as the ring and the fleet card's "think tok/s". A state's name,
+        // not live data; the dot stays GEN's green.
+        const thinking = on && state === "generating" && reading.thinking === true;
         return (
-          <span key={state} className="scope-lamp" data-state={state} data-on={on ? "true" : "false"}>
+          <span key={state} className="scope-lamp" data-state={state} data-on={on ? "true" : "false"} data-thinking={thinking ? "true" : undefined}>
             <span className="scope-lamp__dot" aria-hidden="true" />
             {/* Only the lit lamp shows its word; the rest read as dots, so
                 the row stays one line in a narrow tile (operator, 2026-09-24:
                 "the lights are too big, taking too much space"). The text
                 stays in the DOM for the status role. */}
-            <span className="scope-lamp__label">
-              {label}
-
-            </span>
+            <span className="scope-lamp__label">{thinking ? "think" : label}</span>
           </span>
         );
       })}
@@ -149,7 +153,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerLabel: string | null;
   centerUnit: string | null;
   centerCarried: boolean;
-  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number };
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; writing?: true; writingSeconds?: number; thinking?: boolean };
   note: string | null;
 } | null {
   const live = view.liveTokScope;
@@ -176,7 +180,13 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         writingSeconds: live.writingSeconds,
         thinking: live.thinking === true,
       }),
-      lamps: { state: live.state, restSecondsLeft: live.restSecondsLeft, writing: live.writing, writingSeconds: live.writingSeconds },
+      lamps: {
+        state: live.state,
+        restSecondsLeft: live.restSecondsLeft,
+        writing: live.writing,
+        writingSeconds: live.writingSeconds,
+        thinking: generating && live.thinking === true,
+      },
       note: state === "nosignal" ? "no signal" : null,
     };
   }

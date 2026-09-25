@@ -8542,6 +8542,11 @@ body {
   background: var(--lit);
   box-shadow: 0 0 6px var(--lit), 0 0 12px var(--lit);
 }
+/* (#2890) The lit GEN lamp reads "gen" or "think": its label keeps the
+   longer word's width, so flipping between them never shifts the row. */
+.scope-lamp[data-state="generating"][data-on="true"] .scope-lamp__label {
+  min-width: calc(5ch + 5 * 0.08em);
+}
 /* The fleet card's rate line takes its state's color, same tokens as the
    lamps and the trace. */
 .mach-scope__rate[data-tone="prompt"] { color: var(--lamp-prompt); }
@@ -8627,7 +8632,8 @@ body {
    takes. Reduced motion keeps the gradient still. */
 .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-n,
 .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-u,
-.mach-scope__rate[data-thinking="true"] {
+.mach-scope__rate[data-thinking="true"],
+.scope-lamp[data-thinking="true"] .scope-lamp__label {
   background-image: linear-gradient(90deg, var(--scope-phosphor), #c084fc, #f472b6, #c084fc, var(--scope-phosphor));
   background-size: 300% 100%;
   -webkit-background-clip: text;
@@ -8644,7 +8650,8 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-n,
   .token-scope-bezel[data-thinking="true"] .token-scope-center .token-scope-u,
-  .mach-scope__rate[data-thinking="true"] {
+  .mach-scope__rate[data-thinking="true"],
+  .scope-lamp[data-thinking="true"] .scope-lamp__label {
     animation: none;
   }
 }

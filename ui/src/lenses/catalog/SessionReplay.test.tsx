@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { SessionReplay, modelScopeHero } from "./SessionReplay";
+import { ScopeLamps, SessionReplay, modelScopeHero } from "./SessionReplay";
 
 // (#2886 pass 5, MUST — fresh-reviewer finding F5) Several fixes here stayed
 // green while broken in the actual render path — `effectiveConnected`/
@@ -1428,9 +1428,23 @@ describe("modelScopeHero (#2890)", () => {
 
   it("(#2890) GEN while thinking: the same number and unit, with the thinking look", () => {
     const h = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96, thinking: true }, finishedTokRate: null });
-    expect(h).toMatchObject({ state: "generating", centerLabel: "96", centerUnit: "tok/s", thinking: true });
+    expect(h).toMatchObject({ state: "generating", centerLabel: "96", centerUnit: "tok/s", thinking: true, lamps: { state: "generating", thinking: true } });
     const text = modelScopeHero({ liveTokScope: { ...live, state: "generating", tokensPerSec: 96 }, finishedTokRate: null });
-    expect(text).toMatchObject({ centerUnit: "tok/s", thinking: false });
+    expect(text).toMatchObject({ centerUnit: "tok/s", thinking: false, lamps: { thinking: false } });
+  });
+
+  it("(#2890) the lit GEN lamp reads 'think' in the shimmer while thinking; one lamp, relabeled, not a sixth", () => {
+    const lit = () => document.querySelector('.scope-lamp[data-on="true"]');
+    const a = render(<ScopeLamps reading={{ state: "generating", thinking: true }} />);
+    expect(a.container.querySelectorAll(".scope-lamp")).toHaveLength(5);
+    expect(lit()?.getAttribute("data-state")).toBe("generating");
+    expect(lit()?.getAttribute("data-thinking")).toBe("true");
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("think");
+    expect(a.container.querySelector(".scope-lamps")?.getAttribute("aria-label")).toBe("run state: generating, thinking");
+    a.unmount();
+    render(<ScopeLamps reading={{ state: "generating" }} />);
+    expect(lit()?.getAttribute("data-thinking")).toBeNull();
+    expect(lit()?.querySelector(".scope-lamp__label")?.textContent).toBe("gen");
   });
 
   it("(#2889) TOOLS while writing: the tool icon, the writing cue, and 'tool gen' under it", () => {
