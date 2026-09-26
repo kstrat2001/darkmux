@@ -145,7 +145,7 @@ const ENTRY_POINTS: &[Site] = &[
     },
 ];
 
-fn read_src(file: &str) -> String {
+pub(super) fn read_src(file: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {} for liveness conformance: {e}", path.display()))
@@ -161,7 +161,7 @@ fn read_src(file: &str) -> String {
 /// indentation levels (free functions at column 0, step-kind methods inside
 /// an `impl`), and a line-based rule that handles both is a rule that
 /// handles neither reliably.
-fn fn_body(src: &str, func: &str) -> String {
+pub(super) fn fn_body(src: &str, func: &str) -> String {
     let decl = format!("fn {func}(");
     let start = src
         .find(&decl)

@@ -227,6 +227,25 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     assert!(saw_start, "no dispatch.start flow record found for session {session_id}");
     assert!(saw_complete, "no terminal dispatch.complete/dispatch.error flow record found for session {session_id}");
 
+    // (#2902 step 1a, usage conformance: `dispatch_local_single_shot`) The
+    // one model call emits exactly one `telemetry.tokens` usage record with
+    // the canonical fields. The same check the in-crate conformance tests
+    // run through `usage::assert_one_usage_record`, inlined because an
+    // integration test cannot reach a `#[cfg(test)]` helper.
+    let usage: Vec<&Value> = records
+        .iter()
+        .filter(|r| r["category"] == "telemetry" && r["source"] == "tokens")
+        .collect();
+    assert_eq!(usage.len(), 1, "usage conformance, dispatch_local_single_shot: {usage:#?}");
+    let p = &usage[0]["payload"];
+    assert_eq!(usage[0]["action"], "telemetry.tokens");
+    assert_eq!(p["call_kind"], "single_shot");
+    assert_eq!(p["reported_model"], "mock-model");
+    assert!(p["requested_model"].as_str().is_some_and(|s| !s.is_empty()), "{p}");
+    assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+    assert_eq!(p["token_source"], "provider");
+    assert_eq!(p["total_tokens"], 10);
+
     // (#1645 inverted case) This dispatch set `phase_id: None` — the exact
     // shape RADIO's answering seat (`src/radio.rs`, `src/radio_answer.rs`)
     // uses in production, a genuinely mission-less single-shot dispatch.

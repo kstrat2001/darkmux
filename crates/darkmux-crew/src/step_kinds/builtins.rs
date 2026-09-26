@@ -1158,6 +1158,29 @@ impl DispatchSingleShotStepKind {
                 .with_context(|| format!("step `{}` dispatch.single_shot (local)", step.id))?
         };
 
+        // (#2902 step 1a) The one usage record for this one model call, from
+        // the shared reply seam, under the SAME handle/session/mission as
+        // this step's bookends (so it joins their run). Live through the
+        // scheduler's seam when streaming, like `dispatch.map`'s per-item
+        // record; batched into the outcome otherwise.
+        let usage_endpoint =
+            endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
+        let usage_record = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            crate::usage::USAGE_ACTION,
+            crate::usage::USAGE_SOURCE,
+            &step.id,
+            &darkmux_types::session_id::task(&step.task_id),
+            Some(wire_model.as_ref()),
+            None,
+            None,
+            reply.usage_payload(crate::usage::CallKind::SingleShot, wire_model.as_ref(), &usage_endpoint),
+        );
+        match ctx {
+            Some(c) => c.emit(usage_record),
+            None => flow_records.push(usage_record),
+        }
+
         // (#2344) The one call is over — no model work is in flight for this
         // step — so stop the heartbeat before the terminal record, the same
         // ordering `dispatch.map` and the container path both use.
@@ -1867,6 +1890,11 @@ impl DispatchMapStepKind {
         let endpoint_label: Option<String> = endpoint
             .as_ref()
             .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, wire_model.as_ref()));
+        // (#2902 step 1a) The endpoint fact on each item's usage record: the
+        // bookends' own label for a hosted step, else the LMStudio base the
+        // local items call (`base_url: None` below, so the configured one).
+        let usage_endpoint =
+            endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
@@ -2008,12 +2036,14 @@ impl DispatchMapStepKind {
             // landed in no bucket. Still never FABRICATED: a provider that
             // reported no split leaves both fields `None`, and the payload
             // omits them entirely rather than claiming a zero.
-            if let Some(payload) = map_item_token_payload(&res, endpoint.is_some()) {
+            if let Some(payload) =
+                map_item_token_payload(&res, endpoint.is_some(), wire_model.as_ref(), &usage_endpoint)
+            {
                 push(
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
-                        "telemetry.tokens",
-                        "tokens",
+                        crate::usage::USAGE_ACTION,
+                        crate::usage::USAGE_SOURCE,
                         &step.id,
                         &darkmux_types::session_id::task(&step.task_id),
                         Some(wire_model.as_ref()),
@@ -2262,49 +2292,64 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
 /// `telemetry.tokens` record. The DEFECT's population is narrower: only a
 /// record under a seat-SHARING session id can be misattributed, and
 /// `session_id::task` is minted by exactly two step kinds
-/// (`dispatch.single_shot` and `dispatch.map`), of which only THIS one emits
-/// `telemetry.tokens` at all — `dispatch.single_shot`'s tokens ride its own
-/// `dispatch complete` bookend, which the hero already classifies per
-/// completion. The other live producer, the container path's per-turn tailer
+/// (`dispatch.single_shot` and `dispatch.map`). (#2902 step 1a: the
+/// single-shot kind now emits `telemetry.tokens` too, `call_kind:
+/// "single_shot"`; the hero still counts that kind from its own `dispatch
+/// complete` bookend, classified per completion, and skips its usage
+/// records, `ui/src/lib/usageRecords.ts`.) The other live producer, the container path's per-turn tailer
 /// (`dispatch_internal.rs`'s `emit_telemetry`), runs under
 /// `session_id::step(&step.id)` (`dispatch_opts_for`, this file) — unique per
 /// step — and `crawl.unit` mints `crawl-<mission>-<rule>-<unit>` plus a
 /// per-draw suffix. Neither can share a key with another seat. So this one
 /// emitter is the whole live population.
-fn map_item_token_payload(res: &MapItemResult, remote: bool) -> Option<serde_json::Value> {
-    let total = res.total_tokens.or_else(|| match (res.prompt_tokens, res.completion_tokens) {
-        (None, None) => None,
-        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
-    })?;
-    // Unconditional, unlike every `Option` field below: these two are facts
-    // about THIS emitter's own call, never something a provider did or did
-    // not report, so the omit-never-zero rule that governs the token fields
-    // does not apply to them. A consumer can therefore treat an ABSENT
-    // `remote` as "not this producer" rather than "this producer had nothing
-    // to say", which is what lets the viewer keep its pre-#2690 fallback for
-    // every other `telemetry.tokens` lineage without a version check.
-    let mut payload = serde_json::json!({ "total_tokens": total, "remote": remote, "index": res.index });
-    let obj = payload.as_object_mut().expect("json! built an object");
-    if let Some(p) = res.prompt_tokens {
-        obj.insert("prompt_tokens".into(), serde_json::json!(p));
+fn map_item_token_payload(
+    res: &MapItemResult,
+    remote: bool,
+    requested_model: &str,
+    endpoint: &str,
+) -> Option<serde_json::Value> {
+    // (#2902 step 1a) One record per item a reply came back for. An item
+    // that never got a reply (a remote-budget skip before any call, or an
+    // error on every attempt) made no completed call, so it has nothing to
+    // account; an item that did reply without a usage block still emits,
+    // `token_source: "absent"`, with no counts. "A reply came back" is read
+    // from what the result carries: `ok`, or any reported count (an item
+    // whose later retry errored after an earlier reply still spent tokens).
+    let replied = res.ok
+        || res.total_tokens.is_some()
+        || res.prompt_tokens.is_some()
+        || res.completion_tokens.is_some();
+    if !replied {
+        return None;
     }
-    if let Some(c) = res.completion_tokens {
-        obj.insert("completion_tokens".into(), serde_json::json!(c));
-    }
-    // (#1444 review) Same omit-never-zero rule as the split above. NOTE the
-    // deliberate divergence from the runtime-side `telemetry.tokens`
-    // producers (`turn_tokens_payload`, `dispatch_remote`), which emit these
-    // keys as explicit JSON `null` when unreported: this emitter's whole
-    // convention is omission, and mixing the two inside one payload would be
-    // worse than either. Both readings mean "the provider didn't say"; the
-    // family-wide reconciliation this function's own doc already flags for
-    // `review_token_telemetry_payload` covers these two as well.
-    if let Some(r) = res.reasoning_tokens {
-        obj.insert("reasoning_tokens".into(), serde_json::json!(r));
-    }
-    if let Some(c) = res.cached_tokens {
-        obj.insert("cached_tokens".into(), serde_json::json!(c));
-    }
+    let mut payload = crate::usage::usage_payload(
+        &crate::usage::CallFacts {
+            call_kind: crate::usage::CallKind::MapItem,
+            requested_model,
+            // Hosted items only: `MapItemResult` keeps the served model for
+            // a hosted item and never for a local one (its own doc says why),
+            // so a local item's record omits it. Carrying the local reply's
+            // `model` needs a new `MapItemResult` field; left to #2902's
+            // later steps rather than widening the step's output shape here.
+            reported_model: res.served_model.as_deref(),
+            endpoint,
+        },
+        &crate::usage::UsageCounts {
+            prompt: res.prompt_tokens,
+            completion: res.completion_tokens,
+            total: res.total_tokens,
+            reasoning: res.reasoning_tokens,
+            cached: res.cached_tokens,
+        },
+    );
+    // Unconditional, unlike every count: these two are facts about THIS
+    // emitter's own call, never something a provider did or did not report.
+    // A consumer can therefore treat an ABSENT `remote` as "not this
+    // producer", which is what lets the viewer keep its pre-#2690 fallback
+    // for every other `telemetry.tokens` lineage without a version check.
+    let obj = payload.as_object_mut().expect("usage_payload builds an object");
+    obj.insert("remote".into(), serde_json::json!(remote));
+    obj.insert("index".into(), serde_json::json!(res.index));
     Some(payload)
 }
 
@@ -5157,7 +5202,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("a reply with usage emits a record");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a reply with usage emits a record");
         assert_eq!(payload["total_tokens"], 4547);
         assert_eq!(payload["prompt_tokens"], 2490, "GENERATED/fresh/re-read read the split");
         assert_eq!(payload["completion_tokens"], 2057);
@@ -5192,11 +5237,11 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&local, false).expect("emits");
+        let payload = map_item_token_payload(&local, false, "m", "ep").expect("emits");
         assert_eq!(payload["remote"], false, "a local seat's own tier, on its own token record");
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
 
-        let hosted = map_item_token_payload(&local, true).expect("emits");
+        let hosted = map_item_token_payload(&local, true, "m", "ep").expect("emits");
         assert_eq!(hosted["remote"], true);
         assert_eq!(hosted["index"], 3);
     }
@@ -5222,7 +5267,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("emits");
         let obj = payload.as_object().expect("object");
         assert!(obj.contains_key("remote"), "the key is present even when the seat is local");
         assert_eq!(obj["remote"], serde_json::Value::Bool(false));
@@ -5254,7 +5299,7 @@ mod tests {
             retried: 0,
         };
         for remote in [false, true] {
-            let tok = map_item_token_payload(&res, remote).expect("emits");
+            let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
             let item = DispatchMapStepKind::item_record(&step, "m", remote, &res);
             let item_payload = item.payload.as_ref().expect("payload");
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
@@ -5286,7 +5331,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, true).expect("a reply with usage emits a record");
+        let payload = map_item_token_payload(&res, true, "m", "ep").expect("a reply with usage emits a record");
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         // The neighbors must still land where they belong.
@@ -5315,7 +5360,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("emits");
         assert_eq!(payload["reasoning_tokens"], 300);
         assert!(
             payload.get("cached_tokens").is_none(),
@@ -5324,7 +5369,7 @@ mod tests {
         );
 
         let neither = MapItemResult { reasoning_tokens: None, cached_tokens: None, ..res };
-        let payload = map_item_token_payload(&neither, false).expect("emits");
+        let payload = map_item_token_payload(&neither, false, "m", "ep").expect("emits");
         assert!(payload.get("reasoning_tokens").is_none());
         assert!(payload.get("cached_tokens").is_none());
     }
@@ -5383,7 +5428,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("a total alone still emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a total alone still emits");
         assert_eq!(payload["total_tokens"], 1521);
         assert!(payload.get("prompt_tokens").is_none(), "never fabricate a split");
         assert!(payload.get("completion_tokens").is_none());
@@ -5410,7 +5455,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("a split alone still emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a split alone still emits");
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
         assert_eq!(payload["prompt_tokens"], 30);
         assert_eq!(payload["completion_tokens"], 12);
@@ -5419,7 +5464,7 @@ mod tests {
     /// An item that reported no usage at all emits NO record (pre-existing
     /// behavior, pinned here so the payload refactor didn't change it).
     #[test]
-    fn map_item_with_no_usage_emits_no_token_record() {
+    fn map_item_with_no_reply_emits_no_usage_record() {
         let res = MapItemResult {
             index: 0,
             ok: false,
@@ -5434,7 +5479,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        assert!(map_item_token_payload(&res, false).is_none());
+        assert!(map_item_token_payload(&res, false, "m", "ep").is_none());
     }
 
     /// The accumulator folds multi-attempt usage and keeps `None` honest.
@@ -7185,5 +7230,170 @@ mod tests {
         assert_eq!(pick(Some("p"), Some("q")), Ok("m-default".into()), "an explicit profile wins over the binding");
         let err = pick(None, Some("nope")).unwrap_err();
         assert!(err.contains("nope"), "a binding to an undefined profile is a loud error naming it, never a silent fallback: {err}");
+    }
+
+    // ─── (#2902 step 1a) usage conformance: one record per model call ──
+
+    /// The mock chat server every usage-conformance test below answers from.
+    /// `model` in the reply differs from the requested one on purpose, so
+    /// `reported_model` is provably the RESPONSE's field, not an echo.
+    fn usage_mock(server: &httpmock::MockServer, usage: bool) -> httpmock::Mock<'_> {
+        use httpmock::prelude::*;
+        let mut body = json!({
+            "id": "mock-usage",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "served-by-mock",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+        });
+        if usage {
+            body["usage"] = json!({ "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 12 });
+        }
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "application/json").json_body(body);
+        })
+    }
+
+    fn as_values(recs: &[darkmux_flow::FlowRecord]) -> Vec<serde_json::Value> {
+        recs.iter().map(|r| serde_json::to_value(r).unwrap()).collect()
+    }
+
+    /// Runs `f` with `DARKMUX_LMSTUDIO_URL` pointed at `url`, restoring it after.
+    fn with_lmstudio_url<T>(url: &str, f: impl FnOnce() -> T) -> T {
+        let key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, url) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_single_shot_step_local() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (local)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "darkmux:qwen3-4b");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+        assert_eq!(p["token_source"], "provider");
+        assert_eq!(p["total_tokens"], 12, "provider total wins over 7+3");
+        assert_eq!(rec["session_id"], darkmux_types::session_id::task(&s.task_id));
+        assert_eq!(rec["handle"], "s1");
+    }
+
+    #[test]
+    fn usage_conformance_single_shot_step_hosted() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": format!("{}/v1", server.base_url()) } }),
+        );
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (hosted)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "gpt-5.1");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        let ep: darkmux_types::ModelEndpoint =
+            serde_json::from_value(json!({ "url": format!("{}/v1", server.base_url()) })).unwrap();
+        assert_eq!(
+            p["endpoint"],
+            crate::dispatch_internal::remote_endpoint_label(&ep, "gpt-5.1"),
+            "the same label the bookends carry"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_single_shot_step_without_usage_is_absent() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, false);
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (no usage)");
+        assert_eq!(rec["payload"]["token_source"], "absent");
+        assert!(rec["payload"].get("total_tokens").is_none(), "no fabricated count: {rec}");
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_map_item_local() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let s = map_step(json!({ "model": "qwen3-4b", "user_template": "check {item}", "collection": ["a"] }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (local)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "darkmux:qwen3-4b");
+        // A LOCAL map item's reply model is not kept on `MapItemResult`
+        // (hosted only, by that struct's own doc), so it is absent here.
+        assert!(p.get("reported_model").is_none(), "{p}");
+        assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+        assert_eq!(p["total_tokens"], 12);
+        assert_eq!(p["remote"], false, "#2690's seat field is kept");
+        assert_eq!(p["index"], 0);
+    }
+
+    #[test]
+    fn usage_conformance_map_item_hosted() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let ep_json = json!({ "url": format!("{}/v1", server.base_url()) });
+        let s = map_step(json!({
+            "model": "gpt-5.1", "user_template": "check {item}", "collection": ["a"], "endpoint": ep_json,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (hosted)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "gpt-5.1");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        let ep: darkmux_types::ModelEndpoint = serde_json::from_value(ep_json).unwrap();
+        assert_eq!(p["endpoint"], crate::dispatch_internal::remote_endpoint_label(&ep, "gpt-5.1"));
+        assert_eq!(p["remote"], true);
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_map_item_without_usage_is_absent() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, false);
+        let s = map_step(json!({ "model": "qwen3-4b", "user_template": "check {item}", "collection": ["a"] }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (no usage)");
+        assert_eq!(rec["payload"]["token_source"], "absent");
     }
 }

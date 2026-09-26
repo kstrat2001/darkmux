@@ -1093,7 +1093,12 @@ where
         };
         let action = rec.get("action").and_then(|a| a.as_str()).unwrap_or("");
         let payload = rec.get("payload");
-        let endpoint = payload.and_then(|p| p.get("endpoint")).map(|v| !v.is_null()).unwrap_or(false);
+        // (#2902 step 1a) A usage record's (`telemetry.tokens`) `endpoint`
+        // is the fact of what was called, LMStudio included, never a
+        // hosted marker; only the dispatch/step vocabulary's `endpoint`
+        // (stamped for hosted work only) marks a step cloud.
+        let endpoint = action != "telemetry.tokens"
+            && payload.and_then(|p| p.get("endpoint")).map(|v| !v.is_null()).unwrap_or(false);
         // (silent-miss audit, 2026-09-06) Was a hand-spelled literal pair —
         // exactly the drift risk `darkmux_flow::is_dispatch_complete`
         // exists to close off; see `runs.rs`'s `is_dispatch_lifecycle_
@@ -1960,21 +1965,37 @@ mod tests {
         assert_eq!(out["s1"].tokens, Some(900));
     }
 
-    /// (#1445 gate consider 1) Cloud parity with the JS fold: ANY matched
-    /// record naming a hosted endpoint marks its step cloud, even a
-    /// non-terminal one (the JS flags cloud before its action branches).
-    /// Totals stay absent — only the cloud marker folds.
+    /// (#1445 gate consider 1) Cloud parity with the JS fold: a matched
+    /// NON-TERMINAL record naming a hosted endpoint marks its step cloud
+    /// (the JS flags cloud before its action branches). Totals stay absent.
     #[test]
     fn fold_finals_cloud_marker_on_nonterminal_matched_record() {
         let step_ids = ids(&["s1"]);
         let rec = serde_json::json!({
-            "action": "telemetry.tokens", "handle": "s1",
-            "payload": { "total_tokens": 7, "endpoint": "https://api.example/v1" }
+            "action": "dispatch start", "handle": "s1",
+            "payload": { "step_id": "s1", "endpoint": "azure:example.azure.com/gpt" }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert!(out["s1"].cloud, "non-terminal endpoint record still marks cloud (JS parity)");
-        assert_eq!(out["s1"].tokens, None, "running increment still never folds a total");
+        assert_eq!(out["s1"].tokens, None, "a start never folds a total");
         assert_eq!(out["s1"].turns, None);
+    }
+
+    /// (#2902 step 1a) A usage record's `endpoint` is the fact of what was
+    /// called (an LMStudio base URL included), not a hosted marker, so it
+    /// never marks a step cloud. Before 1a no `telemetry.tokens` carried the
+    /// field, so this changes nothing already displayed; after it, a LOCAL
+    /// step's usage records would otherwise flip it to cloud. Same rule in
+    /// the JS fold (`ui/src/lenses/mission/graph.ts`).
+    #[test]
+    fn fold_finals_usage_record_endpoint_never_marks_cloud() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "telemetry.tokens", "handle": "s1",
+            "payload": { "total_tokens": 7, "call_kind": "single_shot", "endpoint": "http://127.0.0.1:1234/v1" }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
+        assert!(!out.contains_key("s1"), "a usage record folds nothing here: {out:?}");
     }
 
     /// (#1445 gate consider 4) Colon-era session ids (`step:<id>`, retired in

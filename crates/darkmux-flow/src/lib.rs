@@ -3239,7 +3239,11 @@ mod tests {
         //            `telemetry.detector` `kind:"repetition"` records and
         //            the `policy`/`would_conclude` keys added to
         //            `dispatch.checkpoint`.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.56.0");
+        //   1.57.0 — (#2902 step 1a) one `telemetry.tokens` per model call:
+        //            new single-shot producers, and additive `call_kind` /
+        //            `requested_model` / `reported_model` / `endpoint` /
+        //            `token_source` on every record of the family.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.57.0");
     }
 
     #[test]

@@ -81,6 +81,41 @@ pub struct SingleShotReply {
     pub model: Option<String>,
 }
 
+impl SingleShotReply {
+    /// (#2902 step 1a) The counts this reply reported, tri-state as read.
+    pub fn usage_counts(&self) -> crate::usage::UsageCounts {
+        crate::usage::UsageCounts {
+            prompt: self.prompt_tokens,
+            completion: self.completion_tokens,
+            total: self.total_tokens,
+            reasoning: self.reasoning_tokens,
+            cached: self.cached_tokens,
+        }
+    }
+
+    /// (#2902 step 1a) The shared reply seam's usage record: this call's
+    /// canonical `telemetry.tokens` payload, through the one writer
+    /// ([`crate::usage::usage_payload`]). `reported_model` is this reply's
+    /// own `model` field, absent when the response carried none. Every
+    /// caller of either single-shot transport emits one record built here.
+    pub fn usage_payload(
+        &self,
+        call_kind: crate::usage::CallKind,
+        requested_model: &str,
+        endpoint: &str,
+    ) -> serde_json::Value {
+        crate::usage::usage_payload(
+            &crate::usage::CallFacts {
+                call_kind,
+                requested_model,
+                reported_model: self.model.as_deref(),
+                endpoint,
+            },
+            &self.usage_counts(),
+        )
+    }
+}
+
 /// The local LMStudio chat-completions request body. Pure — unit-testable.
 /// LOCAL dialect: `"max_tokens"` (not the hosted `"max_completion_tokens"`
 /// form built by `dispatch_internal::single_shot_body`), `"temperature"`,
@@ -276,7 +311,7 @@ pub fn single_shot_chat_hosted(req: &HostedSingleShotRequest) -> Result<SingleSh
 /// ruled out the error-in-body shapes — this only runs on a body that
 /// passed that classification). Empty/missing content is `Ok("")`, never
 /// an error — degeneracy is the caller's call.
-fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
+pub(crate) fn extract_reply(resp: &serde_json::Value) -> SingleShotReply {
     let content = resp
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())

@@ -3220,6 +3220,32 @@ pub(crate) fn parse_hosted_response(
     Ok(resp)
 }
 
+/// (#2902 step 1a) Emit one single-shot call's usage record through the
+/// process-wide sink — the same sink the bookends of `dispatch_remote` and
+/// `dispatch_local_single_shot` go through — with the SAME role, session,
+/// mission and phase those bookends carry, so the record joins its run
+/// (the savings hero keys runs on `(session_id, mission_id)`).
+fn emit_single_shot_usage(
+    role_id: &str,
+    session_id: &str,
+    model: &str,
+    mission_id: Option<&str>,
+    phase_id: Option<&str>,
+    payload: serde_json::Value,
+) {
+    let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        crate::usage::USAGE_ACTION,
+        crate::usage::USAGE_SOURCE,
+        role_id,
+        session_id,
+        Some(model),
+        mission_id,
+        phase_id,
+        payload,
+    ));
+}
+
 /// Build a dispatch flow record for a hosted call (#1230 Packet 0: split out
 /// of the former `emit_remote_record` so the bookend guard's `open`/`close`
 /// can emit it instead of this function emitting directly). Same builder +
@@ -3545,6 +3571,23 @@ fn dispatch_remote(
         reasoning: reasoning_tok,
         cached: cached_tok,
     } = remote_usage_tokens(&usage);
+
+    // (#2902 step 1a) The one usage record for this one model call, from
+    // the shared reply seam — before the terminal, so a reader of the
+    // stream sees the call's cost no later than its completion.
+    emit_single_shot_usage(
+        &opts.role_id,
+        &session_id,
+        &pm.id,
+        mission_id.as_deref(),
+        phase,
+        crate::single_shot::extract_reply(&resp).usage_payload(
+            crate::usage::CallKind::SingleShot,
+            &pm.id,
+            &label,
+        ),
+    );
+
 
     let mut complete_payload = serde_json::json!({
         "result_class": "ok",
@@ -3906,6 +3949,23 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
             return Err(e);
         }
     };
+
+    // (#2902 step 1a) The one usage record for this one model call. The
+    // endpoint is the LMStudio base `single_shot_chat` just called (the
+    // override when set, else the configured `lmstudio_url`).
+    emit_single_shot_usage(
+        &opts.role_id,
+        &session_id,
+        &model_id,
+        mission_id.as_deref(),
+        phase,
+        reply.usage_payload(
+            crate::usage::CallKind::SingleShot,
+            &model_id,
+            &crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref()),
+        ),
+    );
+
 
     let mut complete_payload = serde_json::json!({
         "result_class": "ok",
@@ -5920,6 +5980,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // name it rather than the specialist this dispatch is for.
         compaction.compactor_model.clone(),
         opts.record_context.clone(),
+        // (#2902 step 1a) The endpoint fact on every per-turn usage record:
+        // the hosted label when the brain is endpoint-staffed, else the
+        // resolved LMStudio base (host-side form; see `usage::lmstudio_endpoint`).
+        Some(remote_endpoint_raw_label.clone().unwrap_or_else(|| {
+            crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())
+        })),
     );
 
     // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
@@ -7540,6 +7606,7 @@ fn spawn_guarded_tailer(
     compaction_threshold: Option<u32>,
     compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
+    endpoint: Option<String>,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -7563,6 +7630,7 @@ fn spawn_guarded_tailer(
             compaction_threshold,
             compactor_model,
             record_context,
+            endpoint,
         )
     });
     (guard, handle)
@@ -7596,6 +7664,7 @@ fn run_tailer(
     compaction_threshold: Option<u32>,
     compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
+    endpoint: Option<String>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -7612,6 +7681,7 @@ fn run_tailer(
     .with_step(step_id)
     .with_compaction_threshold(compaction_threshold)
     .with_compactor_model(compactor_model)
+    .with_endpoint(endpoint)
     .with_record_context(record_context);
 
     loop {
@@ -9131,6 +9201,11 @@ struct TailerState {
     /// the SPECIALIST this dispatch is for. `None` when no compactor is bound.
     compactor_model: Option<String>,
     compaction_threshold: Option<u32>,
+    /// (#2902 step 1a) The endpoint this dispatch's model calls went to, as
+    /// a fact: the hosted label for an endpoint-staffed brain, else the
+    /// resolved LMStudio base. Stamped on every per-turn usage record.
+    /// `None` only in test fixtures that never set it.
+    endpoint: Option<String>,
     /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
     /// forwarded from the call site — provenance the runtime cannot know
     /// (e.g. the crawl launcher's `workspace`/`source`/`sha`/`rule`/`unit`),
@@ -9215,15 +9290,23 @@ impl TailerState {
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
             compaction_threshold: None,
+            endpoint: None,
             record_context: None,
         }
     }
 
-    /// (#1959 flow-record vocabulary retirement) Forward
+    /// (#2902 step 1a) The endpoint fact every per-turn usage record carries.
+    /// Builder-style like its neighbors; only production `run_tailer` opts in.
+    /// (#1959 flow-record vocabulary retirement, next fn) Forward
     /// `DispatchOpts::record_context` so every record this tailer emits
     /// can carry provenance the runtime itself has no concept of.
     /// Builder-style, same pattern as `with_step`/`with_compaction_threshold`;
     /// only production `run_tailer` opts in.
+    fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.endpoint = endpoint;
+        self
+    }
+
     fn with_record_context(mut self, record_context: Option<serde_json::Value>) -> Self {
         self.record_context = record_context;
         self
@@ -9296,6 +9379,7 @@ impl TailerState {
             inactivity_deadline: None,
             inactivity_secs: 600,
             compaction_threshold: None,
+            endpoint: None,
             record_context: None,
         }
     }
@@ -9430,7 +9514,16 @@ impl TailerState {
                 // nothing double-counts. Skipped when the event carries no
                 // `usage` (such turns also don't accumulate in
                 // metrics.json — symmetric).
-                if let Some(tokens_payload) = turn_tokens_payload(&event) {
+                // (#2902 step 1a) ONE record per call, usage or not: a turn
+                // whose event carried no usage still emits, marked
+                // `token_source: "absent"` with no counts, so it adds zero
+                // to every sum below and to every reader's.
+                {
+                    let tokens_payload = turn_tokens_payload(
+                        &event,
+                        &self.model,
+                        self.endpoint.as_deref().unwrap_or_default(),
+                    );
                     // (#2263 review, minor) `u32::try_from(..).unwrap_or(u32::MAX)`,
                     // not `as u32` — an `as` cast WRAPS on a u64 that exceeds
                     // u32::MAX, silently truncating instead of clamping.
@@ -10250,14 +10343,12 @@ impl TailerState {
 /// mapping is unit-testable in isolation from `handle_event`'s
 /// flow-record emission, same pattern as `detector_telemetry_payload`.
 ///
-/// Returns `None` when the event carries no `usage` object (upstream
-/// omitted it — rare). Such turns also don't accumulate into the
-/// runtime's metrics.json totals (`loop_runner.rs` only adds when
-/// `response.usage` is `Some`), so skipping the record preserves the
-/// invariant that per-turn `telemetry.tokens` records SUM to the
-/// dispatch's metrics totals exactly. Absent token counts inside a
-/// present `usage` object degrade to 0 (defensive; the runtime always
-/// writes both fields).
+/// (#2902 step 1a) An event with no `usage` object (upstream omitted it —
+/// rare) still yields a record, `token_source: "absent"` with no counts, so
+/// per-turn records remain one per call AND still sum to the dispatch's
+/// metrics totals exactly (an absent record adds nothing). Absent token
+/// counts inside a present `usage` object degrade to 0 (defensive; the
+/// runtime always writes both fields). See `turn_usage_counts`.
 ///
 /// (#1444 review) `total_tokens` PREFERS the provider's own reported total
 /// and only falls back to `prompt + completion`. It used to compute the sum
@@ -10329,35 +10420,48 @@ fn opening_heartbeat_payload(event: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-fn turn_tokens_payload(event: &serde_json::Value) -> Option<serde_json::Value> {
-    let usage = event.get("usage").filter(|u| u.is_object())?;
-    let prompt = usage.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
-    let completion = usage.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
-    // (#1444 review) The provider's own number wins; the sum is the fallback,
-    // never the override. Same precedence `dispatch_remote`'s `ttok` uses.
-    let total = usage
-        .get("total_tokens")
-        .and_then(|n| n.as_u64())
-        .unwrap_or_else(|| prompt.saturating_add(completion));
-    // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0) Unlike
-    // `prompt`/`completion` (which degrade a truly-absent field to `0`
-    // because the runtime always writes them), these two stay tri-state:
-    // `event["usage"]["reasoning_tokens"]` is JSON `null` when the
-    // provider never reported it, and `.and_then(as_u64)` already maps
-    // both an absent key and an explicit `null` to `None` — so this reads
-    // exactly the same absence the runtime's `Usage::reasoning_tokens`
-    // observed, with no extra branching. Whether the reasoning figure sits
-    // inside `completion_tokens` is provider-scoped; nothing here assumes it.
-    let reasoning_tokens = usage.get("reasoning_tokens").and_then(|n| n.as_u64());
-    let cached_tokens = usage.get("cached_tokens").and_then(|n| n.as_u64());
-    Some(serde_json::json!({
-        "turn_seq": event.get("seq"),
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-        "reasoning_tokens": reasoning_tokens,
-        "cached_tokens": cached_tokens,
-    }))
+fn turn_tokens_payload(
+    event: &serde_json::Value,
+    requested_model: &str,
+    endpoint: &str,
+) -> serde_json::Value {
+    // (#2902 step 1a) Through the one accounting writer. `turn_seq` is the
+    // one field only a turn has; `reported_model` stays absent until the
+    // runtime forwards the served model (#2902 step 1b).
+    let mut payload = crate::usage::usage_payload(
+        &crate::usage::CallFacts {
+            call_kind: crate::usage::CallKind::Turn,
+            requested_model,
+            reported_model: None,
+            endpoint,
+        },
+        &turn_usage_counts(event),
+    );
+    payload["turn_seq"] = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
+    payload
+}
+
+/// (#795, #2902 step 1a) The counts a `model.completed` event reported.
+/// No `usage` object (upstream omitted it) is "not reported": the record
+/// then carries `token_source: "absent"` and no counts, rather than being
+/// skipped, because the call still happened. Inside a PRESENT usage object
+/// a missing prompt/completion count degrades to 0 (the runtime always
+/// writes both; pre-existing behavior). `total_tokens` stays the provider's
+/// own number when sent (#1444 review: the writer falls back to the sum
+/// only when it is absent). `reasoning_tokens`/`cached_tokens` stay
+/// tri-state (#1444).
+fn turn_usage_counts(event: &serde_json::Value) -> crate::usage::UsageCounts {
+    let Some(usage) = event.get("usage").filter(|u| u.is_object()) else {
+        return crate::usage::UsageCounts::default();
+    };
+    let count = |k: &str| usage.get(k).and_then(|n| n.as_u64());
+    crate::usage::UsageCounts {
+        prompt: Some(count("prompt_tokens").unwrap_or(0)),
+        completion: Some(count("completion_tokens").unwrap_or(0)),
+        total: count("total_tokens"),
+        reasoning: count("reasoning_tokens"),
+        cached: count("cached_tokens"),
+    }
 }
 
 /// (#557 slice 2) Map a detector trajectory event to its telemetry

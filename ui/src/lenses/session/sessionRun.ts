@@ -58,6 +58,7 @@ import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
+import { countsInLegacyTokenSums } from "../../lib/usageRecords";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
 
@@ -475,7 +476,8 @@ function rollUpMissionModelWork(data: FlowRecord[], missionId: string, excludeSi
     if (isUtilityRoleHandle(cStart?.handle)) continue; // sub-execution — never blended in
     const tel = own.filter((r) => r.category === "telemetry");
     const rt = tel.filter((r) => r.source === "runtime").slice(-1)[0] ?? null;
-    const toks = tel.filter((r) => r.source === "tokens");
+    // (#2902 step 1a) The records this rollup read before per-call usage records.
+    const toks = tel.filter((r) => r.source === "tokens" && countsInLegacyTokenSums(r.fields as Record<string, unknown>));
     const cx = tel
       .filter((r) => r.source === "context")
       .slice()
@@ -771,7 +773,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const remoteEp = sp.endpoint || dp.endpoint;
   const model = d?.model ? d.model : remoteEp ? remoteEp.slice(remoteEp.lastIndexOf("/") + 1) : (distinct[0] as string | undefined) ?? null;
 
-  const toks = tel.filter((r) => r.source === "tokens");
+  // (#2902 step 1a) The records these tiles read before per-call usage
+  // records; a single-shot run's tiles keep reading its `dispatch complete`.
+  const toks = tel.filter((r) => r.source === "tokens" && countsInLegacyTokenSums(r.fields as Record<string, unknown>));
   const tokIn = toks.length
     ? toks.reduce((a, r) => a + (Number((r.fields as Record<string, unknown>)?.prompt_tokens) || 0), 0)
     : (dp.prompt_tokens ?? null);

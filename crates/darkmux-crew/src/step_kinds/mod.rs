@@ -69,6 +69,8 @@ mod types;
 /// not.
 #[cfg(test)]
 mod liveness_conformance;
+#[cfg(test)]
+mod usage_conformance;
 
 /// (#1610 / #1617 review) Smallest grant [`RemoteBudget::admit_reserve`]
 /// will hand a single `dispatch.map` item — the floor this module's own

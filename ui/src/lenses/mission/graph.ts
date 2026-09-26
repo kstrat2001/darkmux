@@ -25,6 +25,7 @@
  */
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtElapsed } from "../../lib/format";
+import { countsInLegacyTokenSums } from "../../lib/usageRecords";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -568,7 +569,10 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   const next: StepMetrics = { ...cur, lastTs: Math.max(cur.lastTs, recMs) };
 
   const action = rec.action || "";
-  const isTok = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
+  const isUsage = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
+  // (#2902 step 1a) The new single-shot and count-less usage records stay out
+  // of the running sum, so it reads what it read before them.
+  const isTok = isUsage && countsInLegacyTokenSums(p as Record<string, unknown>);
   const isTurn = action === "dispatch.turn";
   const isTool = action === "dispatch.tool";
   const isComplete = action === "dispatch complete" || action === "dispatch.complete";
@@ -588,7 +592,10 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   // Three-state local/cloud/unknown attribution — see mission-graph.html's
   // #1626 comment: `local` requires POSITIVE evidence (a clean terminal
   // with no endpoint), never a bare absence-of-endpoint default.
-  if (p.endpoint) next.cloud = true;
+  // (#2902 step 1a) A usage record's `endpoint` is the fact of what was
+  // called (an LMStudio base URL included), never a hosted marker. Same rule
+  // as `fold_step_finals` in crates/darkmux-serve/src/mission_graph.rs.
+  if (p.endpoint && !isUsage) next.cloud = true;
   if (action === "dispatch complete" || action === "dispatch.complete") {
     if (!p.endpoint) next.localOk = true;
   }

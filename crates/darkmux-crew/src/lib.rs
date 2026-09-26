@@ -171,6 +171,7 @@ pub mod sleep_assertion;
 // run_step_graph shape.
 pub mod scheduler;
 pub mod single_shot;
+pub mod usage;
 // (#1230 Packet 2) Step-kind registry — the execution contract
 // `scheduler::run_step_graph` dispatches through.
 /// (#2301) `Output<T>` — the typed envelope every step output rides in.
