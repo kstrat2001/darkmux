@@ -16,6 +16,15 @@
 //! the one function, or, if it genuinely is a new home for the rule, add it
 //! here with the reason.
 //!
+//! What this sweep CANNOT see, stated so a green run is not read as more
+//! than it is: it matches spellings, per line of production text. A chat URL
+//! assembled from pieces split across arguments (`format!("{}/{}", base,
+//! "chat")`), a classification written as a pattern match
+//! (`matches!(&ep.url, Some(_))`, `if let Some(u) = &ep.url`), or a body
+//! built through a renamed helper are not caught. It is a tripwire for the
+//! idioms each duplicated rule was actually written in, not a proof that no
+//! other spelling exists; review still owns the rest.
+//!
 //! Out of scope, by construction: the `runtime/` crate is not a workspace
 //! member and cannot depend on darkmux-types. It receives the chat URL
 //! (`--base-url`/`--chat-url`) and the dialect (`--dialect`) from the host,
@@ -32,7 +41,14 @@ struct Idiom {
 }
 
 const FORBIDDEN: &[Idiom] = &[
-    Idiom { pattern: "/chat/completions", route: "ModelEndpoint::chat_url (or endpoint::lmstudio_chat_url for an explicit LM Studio base)" },
+    Idiom { pattern: "chat/completions", route: "ModelEndpoint::chat_url (or endpoint::lmstudio_chat_url for an explicit LM Studio base)" },
+    Idiom { pattern: ".endpoint.is_some()", route: "ProfileModel::is_managed / ModelEndpoint::kind" },
+    Idiom { pattern: ".endpoint.is_none()", route: "ProfileModel::is_managed / ModelEndpoint::kind" },
+    Idiom { pattern: "strip_prefix(\"https://\")", route: "ModelEndpoint::host / endpoint::url_host" },
+    Idiom { pattern: "strip_prefix(\"http://\")", route: "ModelEndpoint::host / endpoint::url_host" },
+    Idiom { pattern: "\"max_tokens\":", route: "single_shot::chat_body" },
+    Idiom { pattern: ".keychain", route: "EndpointAuth::credential_source" },
+    Idiom { pattern: "default_model_id()", route: "target::resolve_in (the SELECTED model), or dispatch::profile_default_window for a role-less window" },
     Idiom { pattern: ".is_remote()", route: "ProfileModel::is_managed / ModelEndpoint::kind (managed replaces `url.is_none()`)" },
     Idiom { pattern: "get(\"endpoint\").is_some()", route: "target::step_unmanaged_endpoint" },
     Idiom { pattern: "get(\"endpoint\").is_none()", route: "target::step_unmanaged_endpoint" },
@@ -48,7 +64,7 @@ const FORBIDDEN: &[Idiom] = &[
 
 /// The homes: `(workspace-relative file, pattern, count, why)`.
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
-    ("crates/darkmux-types/src/endpoint.rs", "/chat/completions", 3, "THE chat-URL builder: the unmanaged form with and without api-version, and the LM Studio form"),
+    ("crates/darkmux-types/src/endpoint.rs", "chat/completions", 3, "THE chat-URL builder: the unmanaged form with and without api-version, and the LM Studio form"),
     ("crates/darkmux-types/src/endpoint.rs", ".url.is_some()", 1, "THE classification (kind): an explicit managed endpoint that also declares a url is refused"),
     ("crates/darkmux-types/src/endpoint.rs", ".key_env", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".key_env", 2, "resolve_endpoint_secret's Keychain-read hint naming the variable to export (message text), downstream of credential_source"),
@@ -56,6 +72,19 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_completion_tokens\"", 1, "THE body builder, chat-completions dialect"),
     ("crates/darkmux-crew/src/single_shot.rs", "insert(\"max_tokens\"", 1, "THE body builder, chat-completions-max-tokens dialect"),
     ("crates/darkmux-crew/src/target.rs", "select_model(", 1, "THE resolver's selection (select_in_profile)"),
+    ("crates/darkmux-types/src/endpoint.rs", ".keychain", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
+    ("crates/darkmux-crew/src/dispatch_internal.rs", ".keychain", 2, "resolve_endpoint_secret: the env var vanished between credential_source and the read, fall to the same declared item; and a message naming the field"),
+    ("crates/darkmux-doctor/src/lib.rs", ".keychain", 3, "the probe's dedup key (two credentials to one deployment both probe) and two messages naming the field"),
+    ("crates/darkmux-crew/src/dispatch_internal.rs", "\"max_tokens\":", 1, "a telemetry snapshot of the configured cap (value + source), not a request body"),
+    ("crates/darkmux-flow/src/hooks.rs", "strip_prefix(\"http://\")", 2, "the hooks destination URL policy, not a model endpoint"),
+    ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_some()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),
+    ("crates/darkmux-serve/src/runs.rs", ".endpoint.is_none()", 1, "a run aggregate's recorded `endpoint` label (from flow records), not a profile endpoint"),
+    ("crates/darkmux-crew/src/dispatch.rs", "default_model_id()", 1, "profile_default_window: the role-less window, documented as never a dispatch's own"),
+    ("crates/darkmux-crew/src/select.rs", "default_model_id()", 1, "select_model's own tie-break default (the selection itself)"),
+    ("crates/darkmux-doctor/src/lib.rs", "default_model_id()", 2, "which profile the LOADED residents match (profile match / active profile), not a model choice"),
+    ("crates/darkmux-lab/src/lab/profile_check.rs", "default_model_id()", 1, "a lab envelope warning about whether the profile's default model is loaded, not a model choice"),
+    ("src/main.rs", "default_model_id()", 1, "`profile list`'s `default` marker (display)"),
+    ("src/mission_config_cli.rs", "default_model_id()", 1, "`show`'s fallback for a role this binary does not know (it cannot select without the role)"),
 ];
 
 /// Files that name the idioms as DATA.
@@ -167,4 +196,9 @@ fn the_sweep_counts_production_idioms_and_skips_test_modules() {
     assert_eq!(text.matches("/chat/completions").count(), 1, "{text}");
     assert_eq!(text.matches(".is_remote()").count(), 1);
     assert_eq!(text.matches("split(\"://\")").count(), 1, "production code after the test module still counts");
+    // (#2902 review C2) The URL split across arguments, and a presence test
+    // on the model's endpoint.
+    let more = production_text("fn e(b: &str) -> String { format!(\"{b}/{}\", \"chat/completions\") }\nfn f(pm: &P) -> bool { pm.endpoint.is_some() }\n");
+    assert_eq!(more.matches("chat/completions").count(), 1);
+    assert_eq!(more.matches(".endpoint.is_some()").count(), 1);
 }

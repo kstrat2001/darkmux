@@ -75,8 +75,14 @@ darkmux release.
   with `"endpoint": "<id>"`. **Limits are parsed, validated and shown by
   `darkmux doctor` but not enforced yet** (#2902 step 5); the `remote.*`
   knobs still apply. Inline `endpoint` objects keep working, and doctor's
-  new `endpoints` check names the move to an id. An id that `endpoints`
-  does not define is refused when used, never sent to LM Studio on a guess.
+  new `endpoints` check names the move to an id (as advice; it passes). An
+  id that `endpoints` does not define is refused when used, never sent to
+  LM Studio on a guess. The registry stays lenient: a value this darkmux
+  does not know in `managed`, `dialect` or `limits` loads and round-trips,
+  and is refused when used (and named by doctor); any other broken
+  `endpoints` entry is quarantined alone. A `"managed": "lmstudio"`
+  endpoint that also declares a `url`, an `api_version` or another dialect
+  is refused when used: its address is `lmstudio_url`.
   `profiles.example.json` (what `darkmux init` writes) uses the id form.
   PROFILES schema stays 2.0: the string form joins that unreleased major
   (a binary from before it quarantines a profile that uses it).
