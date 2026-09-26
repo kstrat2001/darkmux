@@ -11,6 +11,8 @@ describe("scope tone: the trace takes the lit lamp's color", () => {
       stalled: "--lamp-stall",
       none: "--scope-phosphor",
       nosignal: "--scope-nosignal",
+      // (#2915) The utility treatment (compacting): its own gray, no lamp.
+      utility: "--scope-utility",
     });
   });
 

@@ -239,6 +239,10 @@ export interface SessionRunView {
         /** (#2890) Present only while generating and the model is reasoning
          *  rather than writing visible text. See `LiveStateReading.thinking`. */
         thinking?: true;
+        /** (#2915) Present only while PROMPT because the execution is
+         *  compacting. See `LiveStateReading.compacting`. */
+        compacting?: true;
+        compactingSeconds?: number;
       }
     | null;
   /** (#2890) A FINISHED run's average generation rate, shown in the MODEL
@@ -1817,6 +1821,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
               ? { writing: true as const, writingSeconds: tokRateLiveState.writingSeconds }
               : {}),
             ...(tokRateLiveState?.state === "generating" && tokRateLiveState.thinking ? { thinking: true as const } : {}),
+            ...(tokRateLiveState?.state === "prompt" && tokRateLiveState.compacting
+              ? { compacting: true as const, compactingSeconds: tokRateLiveState.compactingSeconds }
+              : {}),
           }
         : null,
     finishedTokRate,

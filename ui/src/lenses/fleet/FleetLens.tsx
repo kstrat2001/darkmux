@@ -17,6 +17,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { TokenScope } from "../../components/TokenScope";
+import { UtilityGlyph } from "../../components/UtilityGlyph";
 import { scopeStateOf } from "../../lib/scopeMorph";
 import { liveStateLabel } from "../../lib/tokenRate";
 import { tokensOffMeter } from "./savings";
@@ -973,6 +974,10 @@ export function FleetLens({
               <span className="mach-name" title={card.name}>
                 {card.name}
               </span>
+              {/* (#2915) The utility strip: a fixed box at the end of the
+                  name row, always present, so a job starting or ending never
+                  changes the card's layout. See `UtilityGlyph`. */}
+              <UtilityGlyph strip={card.utility} />
             </div>
             {/* (#1855) The dim fallback says WHICH kind of unknown this is —
                 a machine that beat and carried no hardware, vs one nothing
@@ -1062,6 +1067,9 @@ export function FleetLens({
                             toolName: selectedExec.toolName,
                             writing: selectedExec.writing,
                             writingSeconds: selectedExec.writingSeconds,
+                            // (#2915) "compacting · 12s" on this line.
+                            compacting: selectedExec.compacting,
+                            compactingSeconds: selectedExec.compactingSeconds,
                           })}
                 </div>
               )}
@@ -1225,6 +1233,7 @@ export function FleetLens({
                       writing: selectedExec.writing === true,
                       writingSeconds: selectedExec.writingSeconds,
                       thinking: selectedExec.thinking === true,
+                      compacting: selectedExec.compacting === true,
                     })}
                     size="card"
                   />

@@ -24,7 +24,9 @@ const RUN = {
   lamps: ".session-run .modelbox__hero .scope-lamps",
   tube: ".session-run .modelbox__hero .token-scope-bezel",
 };
-const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate" };
+// (#2915) `util`: the utility strip at the end of the name row. It is always
+// there, so it too must keep one size whatever the machine's utility job.
+const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__rate", util: ".mach-util" };
 
 async function openState(browser, viewport, state, { mode, surface }) {
   const ctx = await browser.newContext({ viewport, timezoneId: "UTC", locale: "en-US" });
@@ -67,7 +69,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       }
       // The readout under the lamps is present in the tool-gen states and
       // absent elsewhere; that is the case the layout must absorb.
-      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "finished"]));
+      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["toolgen-named", "finished", "compacting", "radio-routing"]));
     });
 
     test(`fleet card: one size across its running states (${vpName}, ${mode})`, async ({ browser }) => {
@@ -81,16 +83,21 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         } else {
           await expect(page.locator(CARD.rateLine)).toHaveCount(0);
         }
+        // (#2915) The utility strip shows the state's job, or is quiet.
+        await expect(page.locator(CARD.util).first(), `${state.id}: the utility strip`).toHaveAttribute("data-visual", state.utilVisual ?? "quiet");
         await page.waitForTimeout(400);
         rows.push({ state: state.id, running: !!state.rateText, ...(await measure(page, CARD)) });
         await ctx.close();
       }
+      expect(rows.map((r) => r.state)).toEqual(expect.arrayContaining(["compacting", "radio-routing"]));
       const running = rows.filter((r) => r.running);
-      for (const key of ["card", "cardScope", "rateLine"]) {
+      for (const key of ["card", "cardScope", "rateLine", "util"]) {
         const groups = sizeGroups(running, key);
         expect(groups, `${key} changed size between running states (${vpName}, ${mode}):\n  ${groups.join("\n  ")}`).toHaveLength(1);
       }
       // On a phone the card is also the same size idle and running.
+      // (#2915) The strip is one size in EVERY state, idle included.
+      expect(sizeGroups(rows, "util"), `the utility strip changed size (${vpName}, ${mode})`).toHaveLength(1);
       if (vpName === "phone") {
         for (const key of ["card", "cardScope"]) {
           const groups = sizeGroups(rows, key);

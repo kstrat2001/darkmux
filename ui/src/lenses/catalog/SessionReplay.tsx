@@ -87,7 +87,7 @@ export function ScopeLamps({
   noSignal = false,
   finished = false,
 }: {
-  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean };
+  reading: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   /** (#2886 pass 3) `state: null` is ALSO what a disconnection-downgraded
    *  stall reads as (`liveStateWhileConnected`) — visually identical
    *  (every lamp off) but a different fact, so the aria text says which. */
@@ -115,6 +115,8 @@ export function ScopeLamps({
             toolName: reading.toolName,
             writing: reading.writing,
             writingSeconds: reading.writingSeconds,
+            compacting: reading.compacting,
+            compactingSeconds: reading.compactingSeconds,
           } as LiveStateReading);
   return (
     <div className="scope-lamps" role="status" aria-label={`run state: ${aria}`}>
@@ -157,7 +159,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
   centerLabel: string | null;
   centerUnit: string | null;
   centerCarried: boolean;
-  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean };
+  /** (#2915) The tube shows a utility job (compacting), not the work model. */
+  utility?: true;
+  lamps: { state: LiveStateReading["state"] | null; restSecondsLeft?: number; toolName?: string; writing?: true; writingSeconds?: number; thinking?: boolean; compacting?: true; compactingSeconds?: number };
   note: string | null;
 } | null {
   const live = view.liveTokScope;
@@ -167,6 +171,9 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
     // (#2889) The model generating a tool call: a wrench over "tool gen".
     // PROMPT: the brain.
     const writing = state === "tools" && live.writing === true;
+    // (#2915) The execution is compacting: PROMPT stays lit, the tube reads
+    // "compacting" with the utility treatment.
+    const compacting = state === "prompt" && live.compacting === true;
     return {
       state,
       tokensPerSec: generating ? live.tokensPerSec : 0,
@@ -183,6 +190,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         writing,
         writingSeconds: live.writingSeconds,
         thinking: live.thinking === true,
+        compacting,
         // (#2911) A live scope means the run is in flight: `state: null`
         // (a mission between model steps) reads "no model working" in the
         // tube, the same phrase the lamps' status gives it.
@@ -195,6 +203,7 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         writing: live.writing,
         writingSeconds: live.writingSeconds,
         thinking: generating && live.thinking === true,
+        ...(compacting ? { compacting: true as const, compactingSeconds: live.compactingSeconds } : {}),
       },
       // (#2926) While the model generates a tool call, the readout line
       // under the lamps says which tool and for how long ("tool gen · write
@@ -206,7 +215,11 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
           ? "no signal"
           : writing
             ? liveStateLabel({ state: "tools", toolName: live.toolName, writing: true, writingSeconds: live.writingSeconds })
-            : null,
+            : compacting
+              ? // (#2915) "compacting · Ns" in the same readout slot, counting
+                // with the page's clock; the tube center carries no timer.
+                liveStateLabel({ state: "prompt", compacting: true, compactingSeconds: live.compactingSeconds })
+              : null,
     };
   }
   const fin = view.finishedTokRate;
@@ -797,6 +810,7 @@ export function SessionReplay({
                       toolName={scopeHero.toolName}
                       toolWriting={scopeHero.toolWriting}
                       thinking={scopeHero.thinking}
+                      utility={scopeHero.utility === true}
                       size="tile"
                       centerLabel={scopeHero.centerLabel}
                       centerUnit={scopeHero.centerUnit}

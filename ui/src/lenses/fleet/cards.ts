@@ -42,6 +42,7 @@ import type { FlowRecord, MachineSpecs, PresenceBeat, RosterMachineEntry } from 
 import { machineNames, machineUids, isSelfMachine, displayNameOf } from "../../lib/flow";
 import type { RosterName } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
+import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
  * of its started sessions is still running — routed through the shared
@@ -555,6 +556,11 @@ export interface FleetCard {
   /** (#2881) The pager's default page's session id — the busiest of
    *  `executions` (`busiestExecution`). `null` when `executions` is empty. */
   defaultExecutionSessionId: string | null;
+  /** (#2915) The machine's utility strip: its utility model, residency, and
+   *  live utility job (compaction, radio routing, or any newer job), quiet
+   *  when none. Machine-level, separate from the work model's scope: a radio
+   *  routing job has no session, so it reaches the card only here. */
+  utility: UtilityStrip;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -785,6 +791,10 @@ export function buildFleetCard(
   // half of "self is unknown", and why the floor can never outvote a name the
   // window actually observed.
   const name = displayNameOf(data, liveMachines, specs, m, roster);
+  // (#2915) `/machine/specs` answers for THIS machine only; a peer's model is
+  // read off its own utility records and its residency is unknown.
+  const self = specs != null && isSelfMachine(data, liveMachines, specs, m);
+  const utility = utilityStrip(data, m, t, self ? (specs?.utility_model ?? null) : null);
   return {
     uid: m,
     name,
@@ -807,5 +817,6 @@ export function buildFleetCard(
     liveTokCarried,
     executions,
     defaultExecutionSessionId,
+    utility,
   };
 }

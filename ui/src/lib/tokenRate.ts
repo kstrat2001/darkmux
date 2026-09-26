@@ -1,6 +1,7 @@
 import type { FlowRecord } from "../types/handwritten";
 import { isTurnUsage } from "./usageRecords";
 import { isDispatchStart, isDispatchTerminal } from "./flow";
+import { UTILITY_JOB, UTILITY_JOB_DEFAULT_STALL_MS, isUtilityEnd, isUtilityStart, utilityJobOf } from "./utilityJobs";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -461,6 +462,16 @@ export interface LiveStateReading {
    *  status line shows it as an estimate (`promptTokensLabel`); the scope
    *  shows the brain for all of PROMPT (#2890). */
   promptChars?: number;
+  /** (#2915) Present (always `true`) only when `state === "prompt"` because
+   *  this execution is COMPACTING: its `utility.start` (job `compaction`) is
+   *  the latest evidence and no usage record has ended it. The PROMPT lamp
+   *  stays lit (operator, 2026-09-26: no sixth lamp); the tube reads
+   *  "compacting" with the utility treatment and the status line
+   *  "compacting · Ns". */
+  compacting?: true;
+  /** (#2915) Alongside `compacting`: whole seconds since the compaction
+   *  started, counting like REST. */
+  compactingSeconds?: number;
 }
 
 /** A record whose action marks a state transition, reduced to its ordering
@@ -469,8 +480,10 @@ export interface LiveStateReading {
  * don't need one. */
 interface StateMarker {
   atMs: number;
-  kind: "prompt" | "tools" | "rest";
+  kind: "prompt" | "tools" | "rest" | "compacting";
   restMs?: number;
+  /** (#2915) `compacting` only: the job's own bound. */
+  stallAfterMs?: number;
 }
 
 /** The single state derivation both the run page (`sessionRun.ts`'s
@@ -557,6 +570,21 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       const name = fields(r).tool_name;
       if (typeof name === "string" && name) turnToolName = name;
       m = { atMs, kind: pendingTools === null || pendingTools > 0 ? "tools" : "prompt" };
+    } else if (isUtilityStart(r) && utilityJobOf(r) === UTILITY_JOB.compaction) {
+      // (#2915) This execution's compactor is running. A routing job (or any
+      // other job that serves no execution) never lands here: it carries no
+      // session, so it is not in an execution's records at all.
+      const bound = num(fields(r).stall_after_seconds);
+      m = { atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound * 1000 : UTILITY_JOB_DEFAULT_STALL_MS };
+    } else if (
+      marker?.kind === "compacting" &&
+      ((isUtilityEnd(r) && utilityJobOf(r) === UTILITY_JOB.compaction) || r.action === "dispatch.compaction")
+    ) {
+      // (#2915) The compaction ended; the runtime's next step is the next
+      // prompt. Only ever ENDS a compaction: with none open, a compaction
+      // usage record is not a marker (a run from before 1.61.0 reads as it
+      // always did).
+      m = { atMs, kind: "prompt" };
     } else if (r.action === "dispatch.rest") {
       // Only the completed-rest shape (`ms` present) counts — the
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the
@@ -600,6 +628,13 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       const remaining = found.restMs - (nowMs - found.atMs);
       if (remaining > 0) return { state: "rest", restSecondsLeft: Math.ceil(remaining / 1000) };
       return prompt();
+    }
+    if (found.kind === "compacting") {
+      // (#2915) A compaction with no end inside its own bound reads STALL,
+      // so a hung compactor never claims to be busy forever.
+      const elapsed = nowMs - found.atMs;
+      if (elapsed > (found.stallAfterMs ?? UTILITY_JOB_DEFAULT_STALL_MS)) return { state: "stalled" };
+      return { state: "prompt", compacting: true, compactingSeconds: Math.max(0, Math.floor(elapsed / 1000)) };
     }
     if (found.kind === "tools" && turnToolName !== null) return { state: "tools", toolName: turnToolName };
     if (found.kind === "prompt") return prompt();
@@ -733,6 +768,8 @@ export function liveStateLabel(reading: LiveStateReading): string {
     case "rest":
       return `rest ${reading.restSecondsLeft ?? 0}s`;
     case "prompt":
+      // (#2915) Compacting: the elapsed seconds, counting like REST.
+      if (reading.compacting) return `compacting · ${reading.compactingSeconds ?? 0}s`;
       // Not the bare word: the run page shows a "prompt · N chars"
       // disclosure just above the tile.
       // (#2890, operator) "processing", not "reading": too close to the read tool.
@@ -929,6 +966,10 @@ export interface ExecutionTokenReading {
    *  reasoning rather than writing visible text. See
    *  `LiveStateReading.thinking`. */
   thinking?: true;
+  /** (#2915) Present only while `state === "prompt"` because the execution
+   *  is compacting. See `LiveStateReading.compacting`. */
+  compacting?: true;
+  compactingSeconds?: number;
   /** (#2890) In PROMPT, the prompt's estimated size ("~18k") when the turn's
    *  opening heartbeat reported it. For the fleet card's status line only:
    *  the scope's center shows the brain for all of PROMPT. */
@@ -966,6 +1007,7 @@ export function executionTokenReading(
     toolName: state === "tools" ? liveState?.toolName : undefined,
     ...(state === "tools" && liveState?.writing ? { writing: true as const, writingSeconds: liveState.writingSeconds } : {}),
     ...(state === "generating" && liveState?.thinking ? { thinking: true as const } : {}),
+    ...(state === "prompt" && liveState?.compacting ? { compacting: true as const, compactingSeconds: liveState.compactingSeconds } : {}),
     ...(state === "prompt" && liveState?.promptChars !== undefined
       ? (() => {
           const label = promptTokensLabel(liveState.promptChars, measuredCharsPerToken(records.filter((r) => !(Date.parse(r.ts) > nowMs))));

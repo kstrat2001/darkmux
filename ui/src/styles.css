@@ -13,6 +13,9 @@
   --scope-phosphor-glow: rgba(125, 255, 160, 0.6);
   /* (#2890) The no-signal static's gray. */
   --scope-nosignal: #96a0aa;
+  /* (#2915) The utility treatment: the tube while a utility job (compaction)
+     does this execution's work. Achromatic, brighter than no-signal's static. */
+  --scope-utility: #c9d1da;
   --scope-bezel-hi: #1a221c;
   --scope-bezel-lo: #111712;
   --scope-bezel-rim: #1c261e;
@@ -3582,6 +3585,94 @@ body {
 .mico {
   display: inline-flex;
   color: var(--accent);
+}
+/* (#2915) The fleet card's utility strip (`UtilityGlyph`): a FIXED box at
+   the end of the name row, present in every state, no taller than the
+   machine icon beside it (19px), so a utility job starting or ending changes no
+   box's size. Identity gray (fill + gray = identity), never a status hue,
+   except the STALL lamp's color on a stalled job. */
+.mach-util {
+  flex: 0 0 20px;
+  width: 20px;
+  height: 18px;
+  margin-left: auto;
+  display: inline-flex;
+  color: var(--scope-utility);
+}
+.mach-util svg {
+  width: 20px;
+  height: 18px;
+  display: block;
+  overflow: visible;
+}
+.mach-util__dot {
+  fill: currentColor;
+  stroke: currentColor;
+  stroke-width: 1;
+  opacity: 0.55;
+}
+.mach-util[data-dot="hollow"] .mach-util__dot {
+  fill: none;
+}
+.mach-util[data-dot="unknown"] .mach-util__dot {
+  fill: none;
+  stroke-dasharray: 1.4 1.4;
+}
+.mach-util:not([data-visual="quiet"]) .mach-util__dot {
+  opacity: 1;
+}
+.mach-util__arc,
+.mach-util__chev,
+.mach-util__ping {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* Radio routing: the arcs radiate outward, inner then outer. */
+.mach-util__arc {
+  animation: mach-util-radiate 1.2s ease-out infinite;
+}
+.mach-util__arc--2 {
+  animation-delay: 0.3s;
+}
+@keyframes mach-util-radiate {
+  0% { opacity: 0.15; }
+  35% { opacity: 1; }
+  100% { opacity: 0.15; }
+}
+/* Compacting: the chevrons squeeze toward the dot. */
+.mach-util__chev--l { animation: mach-util-squeeze-l 1s ease-in-out infinite; }
+.mach-util__chev--r { animation: mach-util-squeeze-r 1s ease-in-out infinite; }
+@keyframes mach-util-squeeze-l {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(2px); }
+}
+@keyframes mach-util-squeeze-r {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(-2px); }
+}
+/* Any other job: a ring pulsing out of the dot. */
+.mach-util__ping {
+  transform-origin: 9px 8px;
+  animation: mach-util-ping 1.4s ease-out infinite;
+}
+@keyframes mach-util-ping {
+  0% { transform: scale(0.35); opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
+}
+.mach-util[data-stalled="true"] {
+  color: var(--lamp-stall);
+}
+.mach-util[data-stalled="true"] *,
+.mach.absent .mach-util * {
+  animation: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mach-util * {
+    animation: none;
+  }
 }
 .mico svg {
   width: 19px;
@@ -8449,6 +8540,54 @@ body {
 }
 
 /* ── (#1833) The machine lens's own live CPU/GPU/MEM section ────────────── */
+/* (#2915) The machine page's Utility section: the same section rule and
+   title treatment as the live-load section below it. */
+.mm-utility {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font: 400 calc(12px * var(--fs-scale)) / 1.5 var(--font-mono);
+  color: var(--fg);
+}
+.mm-utility__title {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  margin-bottom: 10px;
+}
+.mm-utility__id {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.mm-utility__facts {
+  color: var(--dim);
+}
+.mm-utility__live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+}
+.mm-utility__live .mach-util {
+  margin-left: 0;
+}
+.mm-utility__jobs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  column-gap: 16px;
+}
+.mm-utility__job {
+  display: contents;
+}
+.mm-utility__job > span:not(:first-child) {
+  text-align: right;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.mm-utility__job[data-known="false"] > span:first-child {
+  font-style: italic;
+}
 .mm-live-section {
   margin-top: 16px;
   padding-top: 14px;
@@ -8739,6 +8878,12 @@ body {
 .token-scope-center[data-state="rest"] .token-scope-u {
   color: var(--lamp-rest);
   text-shadow: 0 0 10px color-mix(in srgb, var(--lamp-rest) 60%, transparent);
+}
+/* (#2915) Compacting: the center's word takes the utility treatment's gray,
+   not the PROMPT lamp's teal (the lamp stays lit; the tube shows the job). */
+.token-scope-bezel[data-utility="true"] .token-scope-center .token-scope-u {
+  color: var(--scope-utility);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--scope-utility) 50%, transparent);
 }
 /* (#2890) The run page's hero: the rate (or the finished average) at the
    prototype's size, with its unit quietly under it. */

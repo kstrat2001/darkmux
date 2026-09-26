@@ -2373,5 +2373,89 @@ describe("(#2929) fleet-card links carry a machine key, never the hardware uid",
     fireEvent.click(count!);
     expect(window.location.hash).toBe(`#lens=runs&machine=unnamed-${machineKeyHash(UNNAMED_1).slice(0, 6)}`);
     expect(UUID_RE.test(window.location.hash)).toBe(false);
+// (#2915) Utility work on the fleet card, over the real run: the work model's
+// tube reads "compacting" while its execution compacts, and the machine's
+// utility strip shows the job (a radio signal while routing, the generic
+// indicator for a job this build has no visual for), quiet otherwise.
+describe("(#2915) fleet card: utility work is visible", () => {
+  function renderAt(records: FlowRecord[], playhead: number) {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
+      </QueryClientProvider>,
+    );
+  }
+  const extra = { machine_uid: "u1" };
+  const SID = pepperRecords({ extra })[0].session_id;
+  const rec = (hms: string, action: string, payload: Record<string, unknown>, more: Record<string, unknown> = {}) =>
+    ({ ts: `2026-09-26T${hms}Z`, action, category: "telemetry", machine_uid: "u1", machine_id: "pepper", payload, ...more }) as unknown as FlowRecord;
+  // Turn 9's tool completes at 10:52:09; turn 10's opener is 10:52:22.
+  const compactStart = rec("10:52:10", "utility.start", { job: "compaction", model: "darkmux:util-4b", serves: SID, stall_after_seconds: 600 }, { session_id: SID, source: "utility", handle: "compactor" });
+  const compactEnd = rec("10:52:20", "telemetry.tokens", { purpose: "utility", call_kind: "compaction", job: "compaction", total_tokens: 900 }, { session_id: SID, source: "tokens", handle: "compactor" });
+  const routeStart = (job: string) => rec("10:52:12", "utility.start", { job, model: "darkmux:util-4b", stall_after_seconds: 30 }, { source: "utility", handle: "radio-router" });
+  const routeEnd = rec("10:52:14", "telemetry.tokens", { purpose: "utility", call_kind: "single_shot", job: "radio_routing", total_tokens: 40 }, { source: "tokens", handle: "radio-router" });
+  const rateLine = () =>
+    waitFor(() => {
+      const el = document.querySelector(".mach-scope__rate");
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+  const strip = () =>
+    waitFor(() => {
+      const el = document.querySelector('[data-testid="fleet-utility"]');
+      expect(el, "every card carries the utility strip").toBeTruthy();
+      return el as HTMLElement;
+    });
+
+  it("compacting: the rate line counts, the tube reads 'compacting' with the utility treatment, PROMPT stays the state", async () => {
+    renderAt([...pepperRecords({ extra }), compactStart], pepperAt("10:52:15"));
+    expect((await rateLine()).textContent).toBe("compacting · 5s");
+    expect(latestTokenScopeProps()).toMatchObject({ state: "prompt", centerLabel: null, centerUnit: "compacting", utility: true });
+    expect((await strip()).getAttribute("data-visual")).toBe("compacting");
+  });
+
+  it("the compaction's usage record ends it: plain PROMPT, the brain, a quiet strip", async () => {
+    renderAt([...pepperRecords({ extra }), compactStart, compactEnd], pepperAt("10:52:21"));
+    expect((await rateLine()).textContent).toBe("processing prompt");
+    const props = latestTokenScopeProps();
+    expect(props).toMatchObject({ state: "prompt", centerUnit: null });
+    expect(props.utility).toBeUndefined();
+    expect((await strip()).getAttribute("data-visual")).toBe("quiet");
+  });
+
+  it("radio routing: the strip radiates while the job runs, and the work model's tube is untouched", async () => {
+    const before = pepperAt("10:52:13");
+    renderAt([...pepperRecords({ extra }), routeStart("radio_routing")], before);
+    const el = await strip();
+    expect(el.getAttribute("data-visual")).toBe("radio");
+    expect(el.querySelectorAll(".mach-util__arc")).toHaveLength(2);
+    expect(latestTokenScopeProps().utility).toBeUndefined();
+  });
+
+  it("radio routing ended: quiet", async () => {
+    renderAt([...pepperRecords({ extra }), routeStart("radio_routing"), routeEnd], pepperAt("10:52:15"));
+    const el = await strip();
+    expect(el.getAttribute("data-visual")).toBe("quiet");
+    expect(el.querySelectorAll(".mach-util__arc")).toHaveLength(0);
+  });
+
+  it("a job this build has no visual for gets the generic indicator", async () => {
+    renderAt([...pepperRecords({ extra }), routeStart("dream_job")], pepperAt("10:52:13"));
+    const el = await strip();
+    expect(el.getAttribute("data-visual")).toBe("generic");
+    expect(el.querySelector(".mach-util__ping")).toBeTruthy();
+    expect(el.getAttribute("aria-label")).toContain("dream job");
+  });
+
+  it("a routing job with no end past its bound reads stalled", async () => {
+    renderAt([...pepperRecords({ extra }), routeStart("radio_routing")], pepperAt("10:52:43"));
+    expect((await strip()).getAttribute("data-stalled")).toBe("true");
+  });
+
+  it("the strip adds no text to the card (the model rides in the tooltip)", async () => {
+    renderAt([...pepperRecords({ extra }), routeStart("radio_routing")], pepperAt("10:52:13"));
+    const el = await strip();
+    expect(el.textContent).toBe("");
+    expect(el.getAttribute("title")).toContain("darkmux:util-4b");
   });
 });

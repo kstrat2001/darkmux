@@ -1,4 +1,25 @@
     use super::*;
+
+    /// (#2915) `/machine/specs`' `utility_model` carries the binding's
+    /// declared window, `null` when undeclared, beside the residency match
+    /// (by namespaced identifier or bare key).
+    #[test]
+    fn utility_model_json_carries_the_declared_window() {
+        let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
+            identifier: identifier.into(),
+            model: model.into(),
+            status: "idle".into(),
+            size: "2 GB".into(),
+            context: 120_000,
+            queued: None,
+        };
+        let v = utility_model_json("darkmux:util-4b", Some(120_000), &[lm("darkmux:util-4b", "util-4b")]);
+        assert_eq!(v, serde_json::json!({ "id": "darkmux:util-4b", "loaded": true, "n_ctx": 120_000 }));
+        let bare = utility_model_json("util-4b", None, &[lm("darkmux:util-4b", "util-4b")]);
+        assert_eq!(bare["loaded"], true, "matched by bare key");
+        assert!(bare["n_ctx"].is_null(), "undeclared is null, never a guess: {bare}");
+        assert_eq!(utility_model_json("util-4b", None, &[])["loaded"], false);
+    }
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use std::{fs, path::PathBuf};

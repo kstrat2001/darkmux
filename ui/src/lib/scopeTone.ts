@@ -13,6 +13,10 @@ export const SCOPE_TONE_TOKEN = {
   // (#2890) A stall the page could not trust (connection lost): the static
   // draws in a neutral gray, not a lamp's color, since no lamp is lit.
   nosignal: "--scope-nosignal",
+  // (#2915) A utility job (compaction) running for this execution: an
+  // achromatic trace, the viewer's IDENTITY color (fill + gray = identity,
+  // `.mm-row-chip.is-identity`), since no state lamp owns it.
+  utility: "--scope-utility",
 } as const;
 
 export type ScopeTone = keyof typeof SCOPE_TONE_TOKEN;

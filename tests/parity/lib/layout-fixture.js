@@ -62,7 +62,7 @@ function build(sid) {
     for (let s = 12; s <= 30; s += 2) out.push(beat(d, `12:00:${String(s).padStart(2, "0")}`, 2, 800, 500, { phase: "writing_tool_call", ...(name ? { tool_name: name } : {}) }));
     return out;
   };
-  return { rec, usage, beat, prefix, opener, complete, writing };
+  return { sid, rec, usage, beat, prefix, opener, complete, writing };
 }
 
 // A record that only moves the day's end (a playback page's playhead) to the
@@ -134,6 +134,31 @@ const STATES = [
         tick(d, "12:00:20"),
       ];
     },
+  },
+  {
+    // (#2915) The execution compacting: turn 1's tool has completed and the
+    // runtime's compactor is running (its `utility.start`, no usage record
+    // yet). PROMPT stays lit; the readout slot counts; the machine's utility
+    // strip shows the compacting glyph.
+        // The run page's playback transport ends at the run's own last record
+    // (the start itself), so it reads "compacting · 0s" there.
+    id: "compacting", date: "2026-08-31", now: "12:00:15", runText: /compacting · \d+s$/, rateText: /^compacting · \d+s$/, utilVisual: "compacting",
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.rec(at(d, "12:00:08"), "utility.start", { job: "compaction", model: "darkmux:util-layout", serves: b.sid, stall_after_seconds: 600 }, { category: "telemetry", source: "utility", handle: "compactor" }),
+      tick(d, "12:00:15"),
+    ],
+  },
+  {
+    // (#2915) A radio routing job on the machine while its execution reads
+    // the next prompt: machine-level (no session), so the work model's
+    // readings are PROMPT's and only the utility strip radiates.
+    id: "radio-routing", date: "2026-09-02", now: "12:00:09", runText: "processing prompt", rateText: "processing", utilVisual: "radio",
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.opener(d),
+      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+    ],
   },
   {
     // A stall seen with the page's live connection down: the page cannot

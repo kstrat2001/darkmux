@@ -64,6 +64,22 @@ describe("TokenScope center, per state (#2890)", () => {
     expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-writing")).toBe("false");
   });
 
+  it("(#2915) PROMPT while compacting: the utility treatment, its word in the center, no brain", () => {
+    const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="prompt" utility centerLabel={null} centerUnit="compacting" />);
+    const bezel = container.querySelector(".token-scope-bezel");
+    expect(bezel?.getAttribute("data-tone")).toBe("utility");
+    expect(bezel?.getAttribute("data-utility")).toBe("true");
+    expect(container.querySelector("[data-scope-icon]")).toBeNull();
+    expect(container.querySelector(".token-scope-u")?.textContent).toBe("compacting");
+    expect(container.querySelector(".token-scope-n")).toBeNull();
+  });
+
+  it("(#2915) the utility treatment is PROMPT's only: ignored in any other state", () => {
+    const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="stalled" utility />);
+    expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-tone")).toBe("stalled");
+    expect(container.querySelector(".token-scope-bezel")?.getAttribute("data-utility")).toBe("false");
+  });
+
   it("no brain outside PROMPT", () => {
     for (const state of ["generating", "tools", "rest", "stalled", "finished", "idle", "nosignal"] as const) {
       const { container } = render(<TokenScope tokensPerSec={0} size="tile" state={state} />);

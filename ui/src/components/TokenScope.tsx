@@ -83,6 +83,12 @@ export interface TokenScopeProps {
    *  into its GEN color, and the center's number shimmers the same way. The
    *  words and number are unchanged. Ignored outside GEN. */
   thinking?: boolean;
+  /** (#2915) While `state` is `"prompt"`: a UTILITY job (compaction) is
+   *  doing this execution's work, not the work model. The trace keeps
+   *  PROMPT's motion in the utility treatment's gray, and the center shows
+   *  its word (`centerUnit`, "compacting") instead of the brain. Ignored
+   *  outside PROMPT. */
+  utility?: boolean;
   /** No fresh heartbeat recently. Used only when `state` is omitted. */
   stalled?: boolean;
   /** A rest/pause (e.g. thermal). Used only when `state` is omitted. */
@@ -117,6 +123,8 @@ function legacyState(stalled: boolean, resting: boolean, tone: ScopeTone): Scope
   if (stalled) return "stalled";
   if (resting) return "rest";
   if (tone === "none") return "idle";
+  // (#2915) `utility` is a treatment on PROMPT, not a state of its own.
+  if (tone === "utility") return "prompt";
   return tone;
 }
 
@@ -413,6 +421,7 @@ export function TokenScope({
   toolName,
   toolWriting = false,
   thinking: thinkingProp = false,
+  utility: utilityProp = false,
   stalled = false,
   resting = false,
   size,
@@ -430,7 +439,9 @@ export function TokenScope({
   const rate = state === "generating" || state === "finished" ? Math.max(0, tokensPerSec ?? 0) : 0;
   // The trace takes the state's color, read once per state change from the
   // same :root token its lamp uses (never per frame).
-  const rgb = useMemo(() => toneRgb(stateTone(state)), [state]);
+  const utility = state === "prompt" && utilityProp;
+  const traceTone: ScopeTone = utility ? "utility" : stateTone(state);
+  const rgb = useMemo(() => toneRgb(traceTone), [traceTone]);
   // Live values the rAF loop reads without restarting the effect below on
   // every update (a heartbeat every ~2s would otherwise tear down and
   // rebuild the canvas/observer/listener on that same cadence).
@@ -543,7 +554,8 @@ export function TokenScope({
   // PROMPT shows a pulsing brain for the whole phase, whatever center it is
   // handed (#2890, operator: a size estimate in the center made one phase
   // look like two; the size is in the event detail and on the run page).
-  const showBrain = state === "prompt";
+  // (#2915) Not while a utility job works: the brain is the work model's.
+  const showBrain = state === "prompt" && !utility;
   // A number with its unit under it, or (#2890, idle) a unit on its own.
   const showNumber = !showIcon && !showBrain && (centerLabel != null || !!centerUnit);
 
@@ -588,7 +600,7 @@ export function TokenScope({
 
   const cls = ["token-scope-bezel", `token-scope-bezel--${size}`, className].filter(Boolean).join(" ");
   return (
-    <div className={cls} data-tone={stateTone(state)} data-state={state} data-writing={writing ? "true" : "false"} data-thinking={thinking ? "true" : "false"}>
+    <div className={cls} data-tone={traceTone} data-utility={utility ? "true" : "false"} data-state={state} data-writing={writing ? "true" : "false"} data-thinking={thinking ? "true" : "false"}>
       <div className="token-scope-screen">
         <canvas ref={canvasRef} aria-hidden="true" />
         {ghost && (
