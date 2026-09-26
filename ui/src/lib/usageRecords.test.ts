@@ -89,6 +89,38 @@ describe("the shared usage golden (tests/usage-golden)", () => {
     expect({ total: t.total, input: t.input, generated: t.generated, cached: t.cached }).toEqual(expected.overall);
     expect(t.utility).toBe(expected.by_purpose.utility.total);
   });
+
+  /** (#2902 step 2b review) The ONE value domain, pinned on both sides:
+   *  a finite number floors to an integer in [0, 2^53]; a string, bool,
+   *  null or negative reads as 0 and reports nothing; a legacy complete is
+   *  token-bearing by the same reading. `domain.jsonl` covers the low
+   *  edge, `clamp.jsonl` the high one (kept apart so the sums stay exactly
+   *  representable). */
+  it.each([
+    ["domain.jsonl", "domain-expected.json"],
+    ["clamp.jsonl", "clamp-expected.json"],
+  ])("the shared value-domain golden %s", (recordsFile, expectedFile) => {
+    const records: UsageRecordLike[] = readFileSync(path.join(GOLDEN_DIR, recordsFile), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    const exp = JSON.parse(readFileSync(path.join(GOLDEN_DIR, expectedFile), "utf8"));
+    const s = sumUsage(records);
+    expect({ total: s.total, input: s.prompt, generated: s.completion, cached: s.cached }).toEqual(exp.overall);
+    expect(s.usageRecords).toBe(exp.usage_records);
+    expect(s.legacyCompletes).toBe(exp.legacy_completes_counted);
+    expect(s.reported).toBe(exp.reported_entries);
+    if (exp.by_requested_model) {
+      const out: Record<string, number> = {};
+      const counted = [...records.filter((r) => r.action === "telemetry.tokens"), ...legacyCompleteCounts(records)];
+      for (const r of counted) {
+        const p = r.payload as Record<string, unknown>;
+        const k = typeof p.requested_model === "string" ? p.requested_model : "(none)";
+        out[k] = (out[k] ?? 0) + sumUsage([r]).total;
+      }
+      expect(out).toEqual(exp.by_requested_model);
+    }
+  });
 });
 
 // ── the legacy fallback ──────────────────────────────────────────────────

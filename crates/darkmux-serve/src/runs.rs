@@ -513,6 +513,11 @@ fn build_runs_in(
                 .and_then(|sid| flow_index.get(sid))
                 .map(|agg| session_is_live(agg, now_ms));
             let mut run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live);
+            // (#2902 step 2b) The session the run's provider recorded, read
+            // whole. A finished tool-bench row publishes no `session_id`
+            // (its trials each ran under their own session — see
+            // `LabRunSummary::session_id`'s doc and `lab_summary_to_run`),
+            // so it reads `-` by construction, not by omission.
             run.tokens = summary.session_id.as_deref().and_then(|sid| usage.tokens_for_session(sid));
             runs.push(run);
         }
@@ -7089,6 +7094,92 @@ mod tests {
         // The wire drops the field entirely when absent.
         let silent = serde_json::to_value(runs.iter().find(|r| r.id == "crew-dispatch-silent").unwrap()).unwrap();
         assert!(silent.get("tokens").is_none(), "{silent}");
+    }
+
+    /// (#2902 step 2b, review CONSIDER 3) A lab row reads its tokens
+    /// through the session its provider recorded in `manifest.json`, the
+    /// same session `known_session_ids` claims for it.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_lab_row_carries_its_dispatch_sessions_token_sum() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_lab_run_with_dispatch_session(lab.path(), "case-x/run1", "lab-sess-1");
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "lab-sess-1", "handle": "coder" }),
+                usage_record(&now, "lab-sess-1", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 4200 })),
+                serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "lab-sess-1", "handle": "coder", "payload": { "total_tokens": 1 } }),
+            ],
+        );
+        let runs = build_runs(flows.path(), Some(lab.path()), &[]);
+        let lab_row = runs.iter().find(|r| r.kind == RunKind::Lab).unwrap_or_else(|| panic!("{runs:?}"));
+        assert_eq!(lab_row.session_id.as_deref(), Some("lab-sess-1"));
+        assert_eq!(lab_row.tokens, Some(4200), "the lab row's own session, not its complete");
+        assert!(runs.iter().all(|r| r.kind != RunKind::Dispatch), "the session is claimed, no ghost: {runs:?}");
+    }
+
+    /// (#2902 step 2b) The same usage record in the fleet stream AND the
+    /// local day file (this machine's own work lands in both sinks) is
+    /// counted ONCE — the fold rides the session index's identity dedup.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_with_usage_counts_a_record_in_both_sinks_once() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let now = darkmux_flow::ts_utc_now();
+        let start = serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "both-sinks", "handle": "coder", "source": "crew_dispatch" });
+        let mut usage = usage_record(&now, "both-sinks", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 333 }));
+        usage["handle"] = serde_json::json!("coder");
+        write_day_file(flows.path(), &today(), &[start.clone(), usage.clone()]);
+        let fleet = vec![start, usage];
+        let built = build_runs_with_usage(flows.path(), None, &fleet, None);
+        assert_eq!(built.usage.overall.total, 333, "{:?}", built.usage);
+        assert_eq!(built.usage.overall.usage_records, 1);
+        let row = built.runs.iter().find(|r| r.id == "both-sinks").expect("one row");
+        assert_eq!(row.tokens, Some(333));
+    }
+
+    /// (#2902 step 2b, review MUST FIX 1's day-file edge) A run whose usage
+    /// records sit in a day file OLDER than the scan window and whose
+    /// complete sits inside it. The walk never opens the older file, so
+    /// those usage records are unobservable here and the run looks
+    /// legacy: its row reads the complete's total, which is the writer's
+    /// own WHOLE-run figure, not a partial sum. That is the honest
+    /// reading the bounded scan can give; `--since` past the edge widens
+    /// the walk and the usage records then win (the assertion below). It
+    /// cannot be closed without opening files outside the window, which
+    /// is the cost bound `/runs` exists to keep. Pinned so a change here
+    /// is a decision, not a drift.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_at_the_window_edge_reads_a_straddling_runs_complete_whole() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let old_day = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS + 1);
+        write_day_file(
+            flows.path(),
+            &old_day,
+            &[
+                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch start", "session_id": "straddle", "handle": "coder" }),
+                usage_record(&format!("{old_day}T12:01:00Z"), "straddle", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 900 })),
+            ],
+        );
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[serde_json::json!({ "ts": now, "action": "dispatch complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
+        );
+        let built = build_runs_with_usage(flows.path(), None, &[], None);
+        assert_eq!((built.usage.overall.total, built.usage.overall.legacy_completes), (1000, 1), "the bounded scan's reading");
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let widened = build_runs_with_usage(flows.path(), None, &[], Some(now_secs - (RUNS_FLOW_SCAN_WINDOW_DAYS as u64 + 2) * 86_400));
+        assert_eq!((widened.usage.overall.total, widened.usage.overall.legacy_completes), (900, 0), "widened past the edge, the usage records win");
     }
 
     /// (#2902 step 2b) `build_runs_with_usage`'s breakdown is the same fold

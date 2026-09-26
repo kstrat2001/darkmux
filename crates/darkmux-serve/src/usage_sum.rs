@@ -57,18 +57,32 @@ pub struct UsageSum {
 
 impl UsageSum {
     fn add(&mut self, a: &UsageAmount) {
-        self.total += a.total;
-        self.prompt += a.prompt;
-        self.completion += a.completion;
+        self.total = self.total.saturating_add(a.total);
+        self.prompt = self.prompt.saturating_add(a.prompt);
+        self.completion = self.completion.saturating_add(a.completion);
         if let Some(c) = a.cached {
-            self.cached = Some(self.cached.unwrap_or(0) + c);
+            self.cached = Some(self.cached.unwrap_or(0).saturating_add(c));
         }
         if a.purpose == UsagePurpose::Utility {
-            self.utility += a.total;
+            self.utility = self.utility.saturating_add(a.total);
         }
         if a.reported {
             self.reported += 1;
         }
+    }
+
+    /// Fold another sum into this one (the overall over every run key).
+    fn merge(&mut self, o: &UsageSum) {
+        self.total = self.total.saturating_add(o.total);
+        self.prompt = self.prompt.saturating_add(o.prompt);
+        self.completion = self.completion.saturating_add(o.completion);
+        if let Some(c) = o.cached {
+            self.cached = Some(self.cached.unwrap_or(0).saturating_add(c));
+        }
+        self.utility = self.utility.saturating_add(o.utility);
+        self.usage_records += o.usage_records;
+        self.reported += o.reported;
+        self.legacy_completes += o.legacy_completes;
     }
 }
 
@@ -97,15 +111,33 @@ fn payload_of(v: &serde_json::Value) -> &serde_json::Value {
     v.get("payload").unwrap_or(&EMPTY)
 }
 
-/// A count as the viewer reads it: a finite non-negative number, else 0.
+/// The largest count either side holds exactly: `2^53`, the edge of a JS
+/// number's integer range and comfortably inside `u64`. Every count is
+/// clamped to it, so a sum of clamped counts is the same arithmetic in
+/// both twins (`usageRecords.ts` spells the same constant).
+pub const MAX_COUNT: u64 = 1 << 53;
+
+/// THE value domain, shared with the viewer's `num`: a finite number is
+/// floored to an integer and clamped to `[0, MAX_COUNT]`; anything else (a
+/// string, a bool, null, a negative) reads as 0. "Reported" is judged by
+/// this same reading everywhere, so a negative count is not a count.
 fn num(v: Option<&serde_json::Value>) -> u64 {
-    match v {
-        Some(x) => x
-            .as_u64()
-            .or_else(|| x.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))
-            .unwrap_or(0),
-        None => 0,
+    let Some(x) = v else { return 0 };
+    if let Some(u) = x.as_u64() {
+        return u.min(MAX_COUNT);
     }
+    match x.as_f64() {
+        // `as u64` already saturates and truncates toward zero; the clamp
+        // is what keeps the two twins on one edge.
+        Some(f) if f.is_finite() && f > 0.0 => (f as u64).min(MAX_COUNT),
+        _ => 0,
+    }
+}
+
+/// True when a value is a finite number at all — the presence test for
+/// `cached_tokens` (a reported `-3` is a reported 0, not an absence).
+fn is_finite_number(v: &serde_json::Value) -> bool {
+    v.as_u64().is_some() || v.as_i64().is_some() || v.as_f64().is_some_and(f64::is_finite)
 }
 
 /// A record's `purpose`. Records from before flow schema 1.59.0 carry none;
@@ -150,10 +182,7 @@ fn amount_of(p: &serde_json::Value) -> UsageAmount {
         // `dispatch complete` only.
         total = num(p.get("remote_tokens"));
     }
-    let cached = p
-        .get("cached_tokens")
-        .filter(|c| c.as_u64().is_some() || c.as_f64().is_some_and(|f| f.is_finite()))
-        .map(|c| num(Some(c)));
+    let cached = p.get("cached_tokens").filter(|c| is_finite_number(c)).map(|c| num(Some(c)));
     UsageAmount { total, prompt, completion, cached, purpose: usage_purpose(p), reported: has_any_token_counts(p) }
 }
 
@@ -256,11 +285,11 @@ pub struct UsageSplit {
 impl UsageSplit {
     fn add(&mut self, a: &UsageAmount) {
         self.calls += 1;
-        self.total += a.total;
-        self.input += a.prompt;
-        self.generated += a.completion;
+        self.total = self.total.saturating_add(a.total);
+        self.input = self.input.saturating_add(a.prompt);
+        self.generated = self.generated.saturating_add(a.completion);
         if let Some(c) = a.cached {
-            self.cached = Some(self.cached.unwrap_or(0) + c);
+            self.cached = Some(self.cached.unwrap_or(0).saturating_add(c));
         }
     }
 }
@@ -294,12 +323,17 @@ struct PendingComplete {
 
 /// The fold: feed it every record in a window (any order), then `finish`.
 /// Linear in the records, one small allocation per NEW run key or group.
-/// `since` (an ISO `YYYY-MM-DDTHH:MM:SSZ` bound, inclusive) drops records
-/// stamped before it; the flow schema's timestamps sort as plain strings,
-/// so this is a lexical compare, the same one `runs.rs` uses everywhere.
+/// `since` (an ISO `YYYY-MM-DDTHH:MM:SSZ` bound, inclusive) keeps records
+/// stamped before it out of the SUMS only; the flow schema's timestamps
+/// sort as plain strings, so this is a lexical compare, the same one
+/// `runs.rs` uses everywhere. Every usage record the pass visits still
+/// marks its run key as one that HAS usage records, whatever its stamp:
+/// the legacy rule asks whether the run ever wrote one, and a bound that
+/// cut a modern run's turns off must not turn its complete into a legacy
+/// count (review MUST FIX 1).
 pub struct UsageFold {
     since: Option<String>,
-    runs: Vec<(RunKeyParts, UsageSum)>,
+    runs: Vec<RunEntry>,
     run_index: HashMap<String, usize>,
     groups: HashMap<GroupKey, UsageGroup>,
     completes: Vec<PendingComplete>,
@@ -311,6 +345,17 @@ pub struct UsageFold {
 struct RunKeyParts {
     session_id: String,
     mission_id: String,
+}
+
+/// One run key's state inside the fold.
+#[derive(Debug, Default)]
+struct RunEntry {
+    parts: RunKeyParts,
+    /// True once ANY usage record for this key was visited, in the window
+    /// or not — the legacy rule's question. `sum.usage_records` counts
+    /// only the ones in the window.
+    has_usage: bool,
+    sum: UsageSum,
 }
 
 impl UsageFold {
@@ -325,31 +370,40 @@ impl UsageFold {
         }
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let parts = RunKeyParts { session_id: s("session_id"), mission_id: s("mission_id") };
-        self.runs.push((parts, UsageSum::default()));
+        self.runs.push(RunEntry { parts, ..Default::default() });
         let i = self.runs.len() - 1;
         self.run_index.insert(key, i);
         i
     }
 
+    /// True when `v` is stamped inside the window (or carries no stamp:
+    /// kept, the same posture the runs scan takes for an unattributable
+    /// record).
+    fn in_window(&self, v: &serde_json::Value) -> bool {
+        match &self.since {
+            Some(since) => {
+                let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+                ts.is_empty() || ts >= since.as_str()
+            }
+            None => true,
+        }
+    }
+
     /// Fold one flow record. Anything that is neither a usage record nor a
     /// `dispatch complete` is ignored at no cost beyond the action read.
     pub fn add(&mut self, v: &serde_json::Value) {
-        if let Some(since) = &self.since {
-            let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-            // No parseable ts: keep it, the same posture the runs scan takes
-            // for an unattributable record.
-            if !ts.is_empty() && ts < since.as_str() {
+        if is_usage_record(v) {
+            let i = self.run_slot(v);
+            self.runs[i].has_usage = true;
+            if !self.in_window(v) {
                 return;
             }
-        }
-        if is_usage_record(v) {
             let amount = amount_of(payload_of(v));
-            let i = self.run_slot(v);
-            let sum = &mut self.runs[i].1;
+            let sum = &mut self.runs[i].sum;
             sum.add(&amount);
             sum.usage_records += 1;
             self.group(group_key(v), &amount);
-        } else if is_dispatch_complete(v) && has_any_token_counts(payload_of(v)) {
+        } else if is_dispatch_complete(v) && self.in_window(v) && has_any_token_counts(payload_of(v)) {
             let run = self.run_slot(v);
             self.completes.push(PendingComplete { run, group: group_key(v), amount: amount_of(payload_of(v)) });
         }
@@ -373,33 +427,24 @@ impl UsageFold {
     pub fn finish(mut self) -> UsageIndex {
         let completes = std::mem::take(&mut self.completes);
         for c in completes {
-            let sum = &mut self.runs[c.run].1;
-            if sum.usage_records > 0 {
+            let entry = &mut self.runs[c.run];
+            if entry.has_usage {
                 continue;
             }
-            sum.add(&c.amount);
-            sum.legacy_completes += 1;
+            entry.sum.add(&c.amount);
+            entry.sum.legacy_completes += 1;
             self.group(c.group, &c.amount);
         }
         let mut overall = UsageSum::default();
         let mut by_session: HashMap<String, Vec<usize>> = HashMap::new();
         let mut by_mission: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, (parts, sum)) in self.runs.iter().enumerate() {
-            overall.total += sum.total;
-            overall.prompt += sum.prompt;
-            overall.completion += sum.completion;
-            if let Some(c) = sum.cached {
-                overall.cached = Some(overall.cached.unwrap_or(0) + c);
+        for (i, entry) in self.runs.iter().enumerate() {
+            overall.merge(&entry.sum);
+            if !entry.parts.session_id.is_empty() {
+                by_session.entry(entry.parts.session_id.clone()).or_default().push(i);
             }
-            overall.utility += sum.utility;
-            overall.usage_records += sum.usage_records;
-            overall.reported += sum.reported;
-            overall.legacy_completes += sum.legacy_completes;
-            if !parts.session_id.is_empty() {
-                by_session.entry(parts.session_id.clone()).or_default().push(i);
-            }
-            if !parts.mission_id.is_empty() {
-                by_mission.entry(parts.mission_id.clone()).or_default().push(i);
+            if !entry.parts.mission_id.is_empty() {
+                by_mission.entry(entry.parts.mission_id.clone()).or_default().push(i);
             }
         }
         let mut groups: Vec<UsageGroup> = self.groups.into_values().collect();
@@ -411,7 +456,8 @@ impl UsageFold {
                 .then_with(|| a.requested_model.cmp(&b.requested_model))
                 .then_with(|| a.reported_model.cmp(&b.reported_model))
         });
-        UsageIndex { runs: self.runs, by_session, by_mission, breakdown: UsageBreakdown { overall, groups } }
+        let runs = self.runs.into_iter().map(|e| (e.parts, e.sum)).collect();
+        UsageIndex { runs, by_session, by_mission, breakdown: UsageBreakdown { overall, groups } }
     }
 }
 
@@ -430,28 +476,39 @@ impl UsageIndex {
     /// `mission_id` OR one of `session_ids`, each run key counted once.
     /// `None` when nothing was measured: no run key matched, or none of
     /// the matched keys' records reported a count.
+    ///
+    /// With a `mission_id`, a session hit counts only when its records
+    /// name that mission or none: the scheduler stamps `session_id` from
+    /// the TASK id (#1918), so two missions' steps can share one session,
+    /// and a mission must never read the other's share of it (review
+    /// CONSIDER 2). Without one (a ghost, a lab run) the session is read
+    /// whole.
     pub fn tokens_for<'a>(
         &self,
         mission_id: Option<&str>,
         session_ids: impl IntoIterator<Item = &'a str>,
     ) -> Option<u64> {
+        let mission_id = mission_id.filter(|m| !m.is_empty());
         let mut seen: HashSet<usize> = HashSet::new();
         let mut total = 0u64;
         let mut reported = 0u64;
         let mut take = |i: usize, runs: &[(RunKeyParts, UsageSum)]| {
             if seen.insert(i) {
-                total += runs[i].1.total;
+                total = total.saturating_add(runs[i].1.total);
                 reported += runs[i].1.reported;
             }
         };
-        if let Some(mid) = mission_id.filter(|m| !m.is_empty()) {
+        if let Some(mid) = mission_id {
             for &i in self.by_mission.get(mid).into_iter().flatten() {
                 take(i, &self.runs);
             }
         }
         for sid in session_ids {
             for &i in self.by_session.get(sid).into_iter().flatten() {
-                take(i, &self.runs);
+                let owner = self.runs[i].0.mission_id.as_str();
+                if owner.is_empty() || mission_id.is_none() || mission_id == Some(owner) {
+                    take(i, &self.runs);
+                }
             }
         }
         (reported > 0).then_some(total)
@@ -509,16 +566,64 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn golden() -> (Vec<serde_json::Value>, serde_json::Value) {
+    fn golden_named(records: &str, expected: &str) -> (Vec<serde_json::Value>, serde_json::Value) {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/usage-golden");
-        let records = std::fs::read_to_string(dir.join("records.jsonl"))
+        let records = std::fs::read_to_string(dir.join(records))
             .unwrap()
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        let expected = serde_json::from_str(&std::fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
+        let expected = serde_json::from_str(&std::fs::read_to_string(dir.join(expected)).unwrap()).unwrap();
         (records, expected)
+    }
+
+    fn golden() -> (Vec<serde_json::Value>, serde_json::Value) {
+        golden_named("records.jsonl", "expected.json")
+    }
+
+    /// The shared value domain (`domain.jsonl` + `clamp.jsonl`): both sums
+    /// floor a finite number to an integer in `[0, 2^53]`, read anything
+    /// else as 0, and judge "reported" (usage record or legacy complete
+    /// alike) by that same reading.
+    #[test]
+    fn shared_domain_goldens_match_the_viewer() {
+        for (records_file, expected_file) in [("domain.jsonl", "domain-expected.json"), ("clamp.jsonl", "clamp-expected.json")] {
+            let (records, expected) = golden_named(records_file, expected_file);
+            let idx = fold_all(&records, None);
+            let s = &idx.breakdown.overall;
+            assert_eq!(shape(s.total, s.prompt, s.completion, s.cached), expected["overall"], "{records_file}: overall");
+            assert_eq!(s.usage_records, expected["usage_records"].as_u64().unwrap(), "{records_file}");
+            assert_eq!(s.legacy_completes, expected["legacy_completes_counted"].as_u64().unwrap(), "{records_file}");
+            assert_eq!(s.reported, expected["reported_entries"].as_u64().unwrap(), "{records_file}: reported");
+            if let Some(by_model) = expected.get("by_requested_model") {
+                assert_eq!(breakdown_by(&records, "requested_model"), *by_model, "{records_file}");
+            }
+        }
+    }
+
+    /// The sums themselves never overflow: a run of clamped maxima
+    /// saturates rather than wrapping (release) or panicking (debug).
+    #[test]
+    fn sums_saturate_instead_of_overflowing() {
+        let huge = UsageAmount { total: u64::MAX, prompt: u64::MAX, completion: u64::MAX, cached: Some(u64::MAX), purpose: UsagePurpose::Utility, reported: true };
+        let mut sum = UsageSum::default();
+        sum.add(&huge);
+        sum.add(&huge);
+        assert_eq!((sum.total, sum.prompt, sum.completion, sum.cached, sum.utility), (u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX), u64::MAX));
+        let mut split = UsageSplit::default();
+        split.add(&huge);
+        split.add(&huge);
+        assert_eq!((split.total, split.input, split.generated, split.cached), (u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX)));
+        // And the fold's overall, across two runs at the maximum.
+        let rec = |sid: &str| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":sid,"payload":{"total_tokens":1e300,"prompt_tokens":1e300}});
+        let mut fold = UsageFold::new(None);
+        for _ in 0..3 {
+            fold.add(&rec("a"));
+            fold.add(&rec("b"));
+        }
+        let o = fold.finish().breakdown.overall;
+        assert_eq!(o.total, 6 * (1u64 << 53), "six clamped maxima, exactly");
     }
 
     fn fold_all(records: &[serde_json::Value], since: Option<&str>) -> UsageIndex {
@@ -653,6 +758,55 @@ mod tests {
         assert_eq!(idx.breakdown.overall.total, 2228);
     }
 
+    /// (review MUST FIX 1) The reviewer's repro: a modern run whose usage
+    /// records fall before `since` and whose complete falls after it. The
+    /// complete must not be counted as legacy; the run's in-window sum is
+    /// simply zero, and it holds no `(none)` group.
+    #[test]
+    fn since_never_turns_a_modern_run_into_a_legacy_one() {
+        let usage = |ts: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"S1","ts":ts,"payload":{"call_kind":"turn","purpose":"work","requested_model":"m","endpoint":"http://h/v1","token_source":"provider","total_tokens":total}});
+        let records = vec![
+            serde_json::json!({"action":"dispatch start","session_id":"S1","ts":"2026-09-26T08:00:00Z"}),
+            usage("2026-09-26T08:01:00Z", 120),
+            usage("2026-09-26T08:02:00Z", 90),
+            usage("2026-09-26T08:03:00Z", 180),
+            serde_json::json!({"action":"dispatch complete","session_id":"S1","ts":"2026-09-26T09:30:00Z","payload":{"total_tokens":300}}),
+        ];
+        let whole = fold_all(&records, None);
+        assert_eq!((whole.tokens_for_session("S1"), whole.breakdown.overall.legacy_completes), (Some(390), 0));
+        let bounded = fold_all(&records, Some("2026-09-26T09:00:00Z"));
+        assert_eq!(bounded.breakdown.overall.total, 0);
+        assert_eq!(bounded.breakdown.overall.legacy_completes, 0);
+        assert_eq!(bounded.tokens_for_session("S1"), None, "nothing measured in the window");
+        assert!(bounded.breakdown.groups.is_empty(), "no (none) group: {:?}", bounded.breakdown.groups);
+        // A genuinely legacy run in the same window is still counted.
+        let mut with_legacy = records.clone();
+        with_legacy.push(serde_json::json!({"action":"dispatch complete","session_id":"S2","ts":"2026-09-26T09:40:00Z","payload":{"total_tokens":50}}));
+        let bounded = fold_all(&with_legacy, Some("2026-09-26T09:00:00Z"));
+        assert_eq!((bounded.breakdown.overall.total, bounded.breakdown.overall.legacy_completes), (50, 1));
+    }
+
+    /// (review CONSIDER 2) Two missions whose steps share a session id (the
+    /// scheduler stamps `task-<id>`, which carries no per-run identity):
+    /// each mission reads only the keys carrying its own `mission_id` or
+    /// no mission at all, never the other mission's.
+    #[test]
+    fn tokens_for_a_mission_never_reads_another_missions_share_of_a_common_session() {
+        let usage = |mid: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"task-t1","mission_id":mid,"payload":{"token_source":"provider","total_tokens":total}});
+        let records = vec![
+            usage("M-A", 100),
+            usage("M-B", 1000),
+            // A record on the same session naming no mission: reachable by either.
+            serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"task-t1","payload":{"token_source":"provider","total_tokens":7}}),
+        ];
+        let idx = fold_all(&records, None);
+        assert_eq!(idx.tokens_for(Some("M-A"), ["task-t1"]), Some(107));
+        assert_eq!(idx.tokens_for(Some("M-B"), ["task-t1"]), Some(1007));
+        assert_eq!(idx.tokens_for(Some("M-A"), std::iter::empty()), Some(100));
+        // With no mission to filter on (a ghost), the session is read whole.
+        assert_eq!(idx.tokens_for_session("task-t1"), Some(1107));
+    }
+
     /// `reported_model` is a group key only when it differs from the
     /// request; a matching served model is folded into the request's line.
     #[test]
@@ -719,10 +873,13 @@ mod tests {
         let idx = fold_all(&records, Some("2026-09-26T10:11:01Z"));
         assert_eq!(idx.breakdown.overall.total, 1120);
         // A bound after the old-2 turn but before its complete: the turn is
-        // outside, so the complete (10:16) is the run's only in-window
-        // record and the legacy rule counts it — the window is the truth.
+        // outside the SUM, but the run still HAS a usage record, so its
+        // complete (10:16) is never read — a modern run must not turn into
+        // a legacy one because the window cut its turns off (review MUST
+        // FIX 1). Only the fixer's 80 remain.
         let idx = fold_all(&records, Some("2026-09-26T10:16:00Z"));
-        assert_eq!((idx.breakdown.overall.total, idx.breakdown.overall.legacy_completes), (40 + 80, 1));
+        assert_eq!((idx.breakdown.overall.total, idx.breakdown.overall.legacy_completes), (80, 0));
+        assert_eq!(idx.tokens_for_session("crew-dispatch-old-2"), None, "nothing of it is in the window");
         // A record with no ts is kept.
         let idx = fold_all(
             &[serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","payload":{"total_tokens":7}})],

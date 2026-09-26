@@ -49,14 +49,16 @@ pub(crate) fn run(
         breakdown: built.usage,
     });
 
+    // The bound to name, whenever the operator gave one.
+    let since_label = since.map(|_| built.since.as_str());
     if json {
-        let payload = json_payload(&filtered, kind, &fleet.state, report.as_ref());
+        let payload = json_payload(&filtered, kind, &fleet.state, since_label, report.as_ref());
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(0);
     }
 
     let selection = select_rows(filtered, limit, all);
-    render_text(&selection, kind, &fleet.state);
+    render_text(&selection, kind, &fleet.state, since_label);
     if let Some(report) = &report {
         println!();
         for line in usage_lines(report, style::terminal_width()) {
@@ -614,7 +616,24 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
     }
 }
 
-fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_state::SourceState) {
+/// The empty state. With `--since` it names the bound (review CONSIDER
+/// 6): "nothing recorded yet" would be a claim about all history, and a
+/// bounded question deserves a bounded answer.
+fn empty_state_line(kind: RunKindArg, since: Option<&str>) -> String {
+    match (kind, since) {
+        (RunKindArg::All, None) => "no recorded run activity yet".to_string(),
+        (_, None) => format!("no recorded {} runs yet", kind_arg_label(kind)),
+        (RunKindArg::All, Some(bound)) => format!("no run activity since {bound}"),
+        (_, Some(bound)) => format!("no {} runs since {bound}", kind_arg_label(kind)),
+    }
+}
+
+fn render_text(
+    sel: &Selection,
+    kind: RunKindArg,
+    fleet: &darkmux_serve::source_state::SourceState,
+    since: Option<&str>,
+) {
     // Printed BEFORE the table (and before the empty-state line) — an
     // incomplete answer has to be qualified where the reader meets it, not
     // in a footnote under rows they have already believed.
@@ -622,12 +641,7 @@ fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_
         eprintln!("{}", style::warn(&warning));
     }
     if sel.rows.is_empty() {
-        let msg = if matches!(kind, RunKindArg::All) {
-            "no recorded run activity yet".to_string()
-        } else {
-            format!("no recorded {} runs yet", kind_arg_label(kind))
-        };
-        println!("{}", style::dim(&msg));
+        println!("{}", style::dim(&empty_state_line(kind, since)));
         return;
     }
 
@@ -657,12 +671,14 @@ struct UsageReport {
     breakdown: UsageBreakdown,
 }
 
-/// The `--json` document. `usage` (and the top-level `since`) appear only
-/// with `--usage`/`--since`; every row carries its own `tokens` regardless.
+/// The `--json` document. The top-level `since` appears whenever `--since`
+/// was given, `usage` only with `--usage`; every row carries its own
+/// `tokens` regardless.
 fn json_payload(
     rows: &[Run],
     kind: RunKindArg,
     fleet: &darkmux_serve::source_state::SourceState,
+    since: Option<&str>,
     usage: Option<&UsageReport>,
 ) -> serde_json::Value {
     // (#1905, matching `mission status --json`'s posture) NEVER paginated —
@@ -678,8 +694,10 @@ fn json_payload(
         // able to tell an incomplete answer from a quiet fleet.
         "fleet": fleet,
     });
+    if let Some(bound) = since {
+        payload["since"] = serde_json::json!(bound);
+    }
     if let Some(report) = usage {
-        payload["since"] = serde_json::json!(report.since);
         payload["usage"] = serde_json::json!({
             "since": report.since,
             "default_window": report.default_window,
@@ -1508,13 +1526,28 @@ mod tests {
         }
     }
 
+    /// (review CONSIDER 5) `--since` alone still names its bound in the
+    /// JSON, and the empty state names it in text (CONSIDER 6).
+    #[test]
+    fn since_without_usage_still_reports_its_bound() {
+        let rows = vec![mk_run("m1", RunKind::Mission, RunStatus::Complete, 100)];
+        let fleet = darkmux_serve::source_state::SourceState::Off;
+        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some("2026-09-12T00:00:00Z"), None);
+        assert_eq!(payload["since"], "2026-09-12T00:00:00Z");
+        assert!(payload.get("usage").is_none());
+        assert_eq!(empty_state_line(RunKindArg::All, None), "no recorded run activity yet");
+        assert_eq!(empty_state_line(RunKindArg::Lab, None), "no recorded lab runs yet");
+        assert_eq!(empty_state_line(RunKindArg::All, Some("2026-09-12T00:00:00Z")), "no run activity since 2026-09-12T00:00:00Z");
+        assert_eq!(empty_state_line(RunKindArg::Lab, Some("2026-09-12T00:00:00Z")), "no lab runs since 2026-09-12T00:00:00Z");
+    }
+
     /// The same breakdown, structurally, plus the bound it covers.
     #[test]
     fn usage_json_carries_the_same_breakdown_structurally() {
         let rows = vec![mk_run("m1", RunKind::Mission, RunStatus::Complete, 100)];
         let fleet = darkmux_serve::source_state::SourceState::Off;
         let report = sample_report();
-        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some(&report));
+        let payload = json_payload(&rows, RunKindArg::All, &fleet, Some(&report.since), Some(&report));
         assert_eq!(payload["usage"]["since"], "2026-09-12T00:00:00Z");
         assert_eq!(payload["usage"]["default_window"], true);
         assert_eq!(payload["usage"]["overall"]["total"], 2045);
@@ -1528,7 +1561,7 @@ mod tests {
         assert_eq!(payload["since"], "2026-09-12T00:00:00Z");
         // Without --usage there is no usage key at all, and rows still
         // carry their own `tokens`.
-        let plain = json_payload(&rows, RunKindArg::All, &fleet, None);
+        let plain = json_payload(&rows, RunKindArg::All, &fleet, None, None);
         assert!(plain.get("usage").is_none() && plain.get("since").is_none());
         assert_eq!(plain["runs"][0]["id"], "m1");
     }

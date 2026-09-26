@@ -5894,6 +5894,15 @@ fn run_list_usage_breakdown_end_to_end() {
     assert_eq!(json["total"], 0, "{json}");
     assert_eq!(json["usage"]["overall"]["total"], 0);
     assert_eq!(json["since"], "2999-01-01T00:00:00Z");
+    // (review CONSIDER 5/6) --since without --usage still names its bound,
+    // in JSON and in the text empty state.
+    let out = run(&["run", "list", "--json", "--since", "2999-01-01"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["since"], "2999-01-01T00:00:00Z", "{json}");
+    assert!(json.get("usage").is_none(), "{json}");
+    let out = run(&["run", "list", "--since", "2999-01-01"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no run activity since 2999-01-01T00:00:00Z"), "{text}");
 
     // A bound the verb cannot read is refused by name, not defaulted.
     let out = run(&["run", "list", "--since", "yesterday"]);
