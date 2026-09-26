@@ -2609,6 +2609,14 @@ fn build_hooks_check(
     out
 }
 
+/// The `config.json` that `DarkmuxConfig::load_resolved()` reads — the
+/// file a removed-key hint has to name. Honors `DARKMUX_HOME`, so an
+/// operator whose root is not `~/.darkmux` is told the file that actually
+/// holds the leftover key (#2913 review C4).
+fn resolved_config_path() -> std::path::PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
+}
+
 /// (#1876/#1877; #2310 P4d; #2404 P4d round 3) The `review{}` config block
 /// (`judge_fail_on_any_skip` / `judge_concurrency`) was REMOVED from
 /// `DarkmuxConfig` in CONFIG_SCHEMA_VERSION 1.22 — the review funnel those
@@ -2642,11 +2650,11 @@ fn check_removed_review_config_block() -> Check {
         // live constant here would make this message quietly lie about
         // WHEN the removal happened the moment the schema bumps again.
         message: "config.json has a `review` key — removed in CONFIG 1.22; delete it from config.json".into(),
-        hint: Some(
+        hint: Some(format!(
             "the review funnel this block configured was deleted in #2310 P4d; remove the \
-             `review` block from ~/.darkmux/config.json — it is read leniently but has no effect"
-                .into(),
-        ),
+             `review` block from {} — it is read leniently but has no effect",
+            resolved_config_path().display()
+        )),
     }
 }
 
@@ -2709,14 +2717,17 @@ fn check_removed_notebook_settings() -> Check {
         return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
     }
     let mut found: Vec<&str> = Vec::new();
-    let mut steps: Vec<&str> = Vec::new();
+    let mut steps: Vec<String> = Vec::new();
     if config_set {
         found.push("config.json sets `dirs.notebook`");
-        steps.push("delete `dirs.notebook` from the `dirs` block in ~/.darkmux/config.json");
+        steps.push(format!(
+            "delete `dirs.notebook` from the `dirs` block in {}",
+            resolved_config_path().display()
+        ));
     }
     if env_set {
         found.push("`DARKMUX_NOTEBOOK_DIR` is exported");
-        steps.push("unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc)");
+        steps.push("unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc)".into());
     }
     Check {
         name: name.into(),
@@ -9723,6 +9734,28 @@ mod tests {
         );
     }
 
+    /// (#2913 review C4) Same as the notebook check: the hint names the
+    /// config file darkmux read, not a hardcoded default path.
+    #[serial_test::serial]
+    #[test]
+    fn check_review_judge_removed_hint_names_the_resolved_config_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cfg = home.path().join("config.json");
+        std::fs::write(&cfg, r#"{"review":{"judge_concurrency":1}}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
+        let check = check_removed_review_config_block();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
+        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
+    }
+
     #[serial_test::serial]
     #[test]
     fn check_review_judge_removed_warns_and_names_the_key_when_present() {
@@ -10214,6 +10247,36 @@ mod tests {
         assert!(check.message.contains("dirs.notebook") && check.message.contains("DARKMUX_NOTEBOOK_DIR"));
         let hint = check.hint.expect("a removal step");
         assert!(hint.contains("delete `dirs.notebook`") && hint.contains("unset DARKMUX_NOTEBOOK_DIR"));
+    }
+
+    /// (#2913 review C4) The removal step names the config file darkmux
+    /// actually read, not a hardcoded `~/.darkmux/config.json`: under
+    /// `DARKMUX_HOME=/x` the leftover key lives in `/x/config.json`.
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_hint_names_the_resolved_config_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cfg = home.path().join("config.json");
+        std::fs::write(&cfg, r#"{"dirs":{"notebook":"~/nb"}}"#).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::remove_var("DARKMUX_NOTEBOOK_DIR");
+        }
+        let check = check_removed_notebook_settings();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            if let Some(v) = prev_nb {
+                std::env::set_var("DARKMUX_NOTEBOOK_DIR", v);
+            }
+        }
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains(&cfg.display().to_string()), "names the resolved file: {hint}");
+        assert!(!hint.contains("~/.darkmux/config.json"), "no hardcoded default path: {hint}");
     }
 
     /// An empty env value is "unset", the same reading every other env-tier
