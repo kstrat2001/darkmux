@@ -4405,6 +4405,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
     let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: getrlimit on a stack struct.
     unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    #[allow(clippy::unnecessary_cast)] // `rlim_t` is not u64 on every target
     let hard = lim.rlim_max as u64;
     if hard <= 1024 {
         eprintln!("skipping: this process's hard open-file limit ({hard}) leaves no room to raise");

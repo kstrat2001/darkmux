@@ -1075,7 +1075,7 @@ mod tests {
             let _ = t.join();
         }
         let max = slow.max.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(max >= 1 && max <= ConnLimits::PRODUCTION.per_ip, "concurrent lookups from one address: {max}");
+        assert!((1..=ConnLimits::PRODUCTION.per_ip).contains(&max), "concurrent lookups from one address: {max}");
     }
 
     #[test]

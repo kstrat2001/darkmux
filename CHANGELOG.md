@@ -199,7 +199,12 @@ darkmux release.
   a LAN address, and not behind `tailscale serve`, which makes every peer
   arrive as loopback). One route, `POST /fleet/work`; every request on the
   port passes the token, then the network identity, then the allow-list.
-  The token is checked before the provider runs. CONFIG 1.29 adds
+  The token is checked before the provider runs. The listener serves at
+  most 32 connections and 3 per peer address, allows 3 s for request
+  headers, logs refusals at most 5 per peer address per minute (the rest
+  counted), drops a submitted job's `phase_id`, and runs it under its own
+  session id (`<sender id>-from-<peer>`). `/health` reports the listener's
+  state (in full only to this machine). CONFIG 1.29 adds
   `fleet.identity{provider,bin}`, `fleet.listener{enabled,port}` and
   `fleet.accept_work`; env `DARKMUX_FLEET_LISTENER_ENABLED` /
   `DARKMUX_FLEET_LISTENER_PORT` (the identity provider and the allow-list

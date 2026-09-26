@@ -14,6 +14,10 @@
 //!
 //! `peer_token_conformance` (this crate's tests) fails if anything else in
 //! the workspace reads the fleet token to send it.
+//!
+//! The functions return `ureq::Error` unboxed on purpose (callers match on
+//! its status), hence the `result_large_err` allowance.
+#![allow(clippy::result_large_err)]
 
 use crate::identity::IdentityProvider;
 use crate::roster::MachineEntry;
