@@ -108,11 +108,12 @@ function machineRunsHash(uid: string, runningSessionIds: string[]): string | nul
  * own doc in `styles.css`). `.scv` is a `<div>`, matching `.savnum`'s own
  * block-fills-its-track sizing, so only a height floor (`minHeight="1.1em"`,
  * `.savc .scv`'s own line-height) is needed. */
-function Chip({ value, label, cls, loading }: { value?: string | number; label: string; cls?: string; loading?: boolean }) {
+function Chip({ value, label, cls, loading, part }: { value?: string | number; label: string; cls?: string; loading?: boolean; part?: string | null }) {
   return (
     <div className={`savc${cls ? ` ${cls}` : ""}`}>
       {loading ? <Shimmer as="div" className="scv" minHeight="1.1em" /> : <div className="scv">{value}</div>}
       <div className="scl">{label}</div>
+      {part && !loading ? <div className="savpart">{part}</div> : null}
     </div>
   );
 }
@@ -224,7 +225,14 @@ function SavingsHero({
               total counts up on new work. The count-up hook is hoisted above
               the return (hooks cannot sit in a conditional branch). */}
           {settled ? <div className="savnum">{heroTotal}</div> : <Shimmer as="div" className="savnum" minHeight="1em" />}
-          <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+          {/* (#2902) UTILITY is a PART of all tokens, not a peer figure, so
+              it sits under the total it belongs to; a peer chip read as a
+              third bucket to add. Wrapped with the label so the phone
+              layout's column-reverse keeps label and part together. */}
+          <div className="savlblwrap">
+            <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
+            {t.utility && settled ? <div className="savpart">{fmtC(t.utility)} utility</div> : null}
+          </div>
         </div>
         <div className="savclasses">
           {/* (#2902 step 2a) Every chip is a sum of provider-reported
@@ -232,13 +240,13 @@ function SavingsHero({
               absent when no record in the window reports `cached_tokens`
               (a 0 there would be an assumption, not a measurement), and
               UTILITY (darkmux's own compaction and radio routing) is
-              hidden at 0 (the chip UNCLASSIFIED used, dim). INPUT + GENERATED equal
+              hidden at 0 (the chip UNCLASSIFIED used, dim). CACHED and UTILITY are shares of
+              INPUT and ALL TOKENS, so each renders as a part line under the
+              figure it belongs to, never as a peer chip. INPUT + GENERATED equal
               ALL TOKENS whenever providers report total = prompt +
               completion; no filler chip covers a provider total above it. */}
-          <Chip value={fmtC(t.input)} loading={!settled} label="input" />
-          {t.cached != null ? <Chip value={fmtC(t.cached)} loading={!settled} label="cached" /> : null}
+          <Chip value={fmtC(t.input)} loading={!settled} label="input" part={t.cached != null ? `${fmtC(t.cached)} cached` : null} />
           <Chip value={fmtC(t.generated)} loading={!settled} label="generated" cls="gen" />
-          {t.utility ? <Chip value={fmtC(t.utility)} loading={!settled} label="utility" cls="util" /> : null}
           <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
       </div>

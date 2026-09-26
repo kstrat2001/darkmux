@@ -3216,7 +3216,7 @@ body {
 
    Not rendering text also replaces a `color: transparent` that could not
    work: it tied on specificity (0,3,0) with `.savlead.cloud .savnum`,
-   `.savlead.unknown .savnum`, `.savc.gen .scv` and `.savc.util .scv`, all of
+   `.savlead.unknown .savnum`, `.savc.gen .scv` and `.savc.util .scv` (since removed), all of
    which are declared LATER and therefore won on source order — so every tile
    except plain local kept painting its figure, and the glyphs showed above
    and below a skeleton that is inset inside a `line-height: 1` box. Removing
@@ -3409,8 +3409,15 @@ body {
 .savc.gen .scv {
   color: var(--good);
 }
-.savc.util .scv {
+/* (#2902) A share of the figure above it (cached of input, utility of all
+   tokens): quieter than the label so it never reads as a peer figure. */
+.savpart {
+  font: calc(10px * var(--fs-scale))/1.4 var(--font-mono);
   color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
+  opacity: 0.8;
 }
 .savc .scl {
   font: calc(10px * var(--fs-scale))/1.5 var(--font-mono);

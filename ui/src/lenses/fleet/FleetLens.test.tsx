@@ -177,6 +177,36 @@ describe("FleetLens", () => {
     // (#2834) The cloud tile is withdrawn; one figure is the hero now.
   });
 
+  // (#2902) CACHED is a share of INPUT and UTILITY a share of ALL TOKENS, so
+  // each renders as a part line under the figure it belongs to. As peer chips
+  // they read as extra buckets to add, which double-counts.
+  it("(#2902) renders cached under input and utility under all tokens, never as peer chips", async () => {
+    const today = todayUTC();
+    const usage = (ts: string, payload: Record<string, unknown>) => ({
+      ts: `${today}T${ts}.000Z`, machine_uid: "u1", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens", payload,
+    });
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        usage("10:00:05", { call_kind: "turn", purpose: "work", prompt_tokens: 1920, completion_tokens: 163, total_tokens: 2083, cached_tokens: 140 }),
+        usage("10:00:09", { call_kind: "compaction", purpose: "utility", prompt_tokens: 130, completion_tokens: 15, total_tokens: 145 }),
+        { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: {} },
+      ],
+    });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(screen.getByText("140 cached")).toBeInTheDocument());
+    expect(screen.getByText("145 utility")).toBeInTheDocument();
+    // The part lines sit with their parents: cached inside the INPUT chip,
+    // utility beside the ALL TOKENS label.
+    const cached = screen.getByText("140 cached");
+    expect(cached.closest(".savc")?.querySelector(".scl")?.textContent).toBe("input");
+    expect(screen.getByText("145 utility").closest(".savlead")).not.toBeNull();
+    // No chip is labeled cached or utility on its own.
+    const labels = Array.from(container.querySelectorAll(".savc .scl")).map((e) => e.textContent);
+    expect(labels).not.toContain("cached");
+    expect(labels).not.toContain("utility");
+  });
+
   it("sums a locally-run session's telemetry into local tokens, and renders its machine card", async () => {
     const today = todayUTC();
     mockFleetFetch({
