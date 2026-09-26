@@ -103,18 +103,39 @@ describe("(#2927) dispatch bookends read the same in either spelling", () => {
     }
   });
 
-  it("run page: a utility sub-execution under either spelling never folds into the run's model numbers", () => {
-    for (const s of SPELLINGS) {
+  // The mission rollup (a run session with no telemetry of its own, reading
+  // its inner executions) under either spelling. Utility is decided by the
+  // usage record's own `purpose` (and, before `purpose` existed, by
+  // `call_kind: "compaction"`), never by a role handle: the compactor's calls
+  // ride inside the specialist's own session as sub-executions (contract 8),
+  // and must not fold into the run's model numbers.
+  it("run page: a compaction sub-execution under either spelling never folds into the run's model numbers", () => {
+    const usage = (sid: string, sec: number, handle: string, p: Record<string, unknown>) => {
+      const f = { total_tokens: Number(p.prompt_tokens) + Number(p.completion_tokens), ...p };
+      return rec("telemetry.tokens", sec, { mission_id: "m1", session_id: sid, handle, category: "telemetry", source: "tokens", payload: f, fields: f });
+    };
+    const views = SPELLINGS.map((s) => {
       const m = { mission_id: "m1" };
       const runSess = [rec(act(s, "start"), 0, { ...m, session_id: "run" }), rec(act(s, "complete"), 30, { ...m, session_id: "run" })];
-      const tel = (sid: string, handle: string, turns: number) => [
-        rec(act(s, "start"), 1, { ...m, session_id: sid, handle }),
-        rec("telemetry.runtime", 2, { ...m, session_id: sid, handle, category: "telemetry", source: "runtime", fields: { turns } }),
+      const spec = [
+        rec(act(s, "start"), 1, { ...m, session_id: "spec" }),
+        usage("spec", 2, "coder", { prompt_tokens: 1000, completion_tokens: 200, call_kind: "turn", purpose: "work" }),
       ];
-      const withUtility = runRegions([...runSess, ...tel("spec", "coder", 3), ...tel("comp", "compactor", 50)], "run", T0 + 31_000);
-      const without = runRegions([...runSess, ...tel("spec", "coder", 3)], "run", T0 + 31_000);
-      expect(JSON.stringify(withUtility.metrics), s).toBe(JSON.stringify(without.metrics));
+      const compaction = [usage("spec", 3, "compactor", { prompt_tokens: 50_000, completion_tokens: 9_000, call_kind: "compaction", purpose: "utility" })];
+      const at = T0 + 31_000;
+      return {
+        withUtility: runRegions([...runSess, ...spec, ...compaction], "run", at).metrics,
+        without: runRegions([...runSess, ...spec], "run", at).metrics,
+        noWork: runRegions(runSess, "run", at).metrics,
+      };
+    });
+    for (const v of views) {
+      expect(JSON.stringify(v.withUtility)).toBe(JSON.stringify(v.without));
+      // Non-vacuous: the specialist's own tokens DO reach the run.
+      expect(JSON.stringify(v.without)).not.toBe(JSON.stringify(v.noWork));
     }
+    const strip = (v: unknown) => JSON.stringify(v).replaceAll("dispatch start", "dispatch.start").replaceAll("dispatch complete", "dispatch.complete");
+    expect(strip(views[0].withUtility)).toBe(strip(views[1].withUtility));
   });
 
   it("turn groups: a spaced start opens a new execution like a dotted one", () => {
