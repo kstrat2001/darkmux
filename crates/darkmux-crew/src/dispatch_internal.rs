@@ -6876,6 +6876,15 @@ struct TrajectorySummary {
     /// attributed to whichever model this dispatch happens to be running.
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// (#2903) Live running sum of each turn's `total_tokens` AS
+    /// `turn_tokens_payload` resolved it: the provider's own total wins, the
+    /// turn's prompt+completion is the fallback. Accumulated from the same
+    /// per-turn payload the `telemetry.tokens` records carry, so the
+    /// complete record's total always equals the sum of the per-turn
+    /// totals. NOT `prompt_tokens + completion_tokens`: a provider that
+    /// bills a third token class outside `completion_tokens` reports a
+    /// total greater than that sum, and recomputing it drops the difference.
+    total_tokens: u32,
     /// (#2263) Same tri-state contract as the runtime's own
     /// `LoopOutcome::total_reasoning_tokens`/`total_cached_tokens`:
     /// `None` until at least one turn this dispatch reports the field.
@@ -7743,7 +7752,10 @@ fn build_dispatch_complete_payload(
         // for the whole-task total.
         "prompt_tokens": summary.prompt_tokens,
         "completion_tokens": summary.completion_tokens,
-        "total_tokens": summary.prompt_tokens.saturating_add(summary.completion_tokens),
+        // (#2903) The provider's own total wins; the sum is the fallback,
+        // never the override. Resolved per turn by `turn_tokens_payload` and
+        // summed by the tailer, so this equals the per-turn records' total.
+        "total_tokens": summary.total_tokens,
         // (#1444, payload-additive — FLOW_SCHEMA_VERSION 1.44.0) `null`
         // when the field was never reported for this dispatch (every
         // local LMStudio dispatch today) — never a fabricated `0`. Whether
@@ -9363,6 +9375,15 @@ impl TailerState {
                                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
                                 .unwrap_or(0),
                         );
+                    // (#2903) The per-turn total, precedence already applied
+                    // by `turn_tokens_payload` — never recomputed here.
+                    self.summary.total_tokens = self.summary.total_tokens.saturating_add(
+                        tokens_payload
+                            .get("total_tokens")
+                            .and_then(|n| n.as_u64())
+                            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                            .unwrap_or(0),
+                    );
                     if let Some(rt) =
                         tokens_payload.get("reasoning_tokens").and_then(|n| n.as_u64())
                     {
