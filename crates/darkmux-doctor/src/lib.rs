@@ -16693,6 +16693,17 @@ pub struct FleetIdentityKnowledge {
     pub local_name: Option<String>,
     /// Whether live presence was read.
     pub presence: PresenceState,
+    /// This machine's hardware uid, when readable. A history-only trace to
+    /// it is weak: throwaway session names collect here.
+    pub local_uid: Option<String>,
+    /// uids whose current name came from a LIVE source (this machine, a
+    /// presence beat), not from history.
+    pub live_uids: std::collections::BTreeSet<String>,
+    /// True when `local_name` came from the `DARKMUX_MACHINE_ID` env tier
+    /// (a per-shell override), which is not evidence of the machine's name.
+    pub local_name_from_env: bool,
+    /// `Some(n)` when older flow files exist beyond the last `n` read.
+    pub history_truncated_to: Option<usize>,
 }
 
 impl FleetIdentityKnowledge {
@@ -16702,15 +16713,35 @@ impl FleetIdentityKnowledge {
     }
 }
 
+/// How strong the link is between a roster entry and the machine it is
+/// traced to. Only `DeclaredLive` licenses repairs that reuse the entry's
+/// address or rename a machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// The entry's own declared uid, and that machine's current name comes
+    /// from a live source (this machine, a presence beat).
+    DeclaredLive,
+    /// The entry's own declared uid, but the current name is only the last
+    /// one flow history saw.
+    DeclaredHistory,
+    /// No declared uid: flow history links the name to exactly one machine.
+    History,
+}
+
 /// How one roster entry fails to join the fleet's canonical names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RosterNameIssue {
     /// The entry names a machine that now goes by `current`.
-    /// `by_declared_uid`: the entry's own declared uid says so (strong).
-    /// Otherwise only flow history links the name to that machine.
     /// `name_held_by_other`: another machine currently goes by the entry's id
     /// (a replaced machine), so the id must not be handed back to `current`.
-    Renamed { current: String, by_declared_uid: bool, name_held_by_other: bool },
+    Renamed { current: String, evidence: Evidence, name_held_by_other: bool },
+    /// The entry's declared uid is a machine that already has its own entry
+    /// under its current name: this one is a duplicate.
+    Duplicate { current: String },
+    /// History links the name only to a machine that already has its own
+    /// entry, or only to THIS machine (where session names collect) while the
+    /// entry points elsewhere. A note: not evidence against the entry.
+    WeakTrace { current: String, to_self: bool },
     /// Flow history saw this name on several machines; nothing says which.
     Ambiguous { machines: usize },
     /// No machine this machine can see has gone by this name.
@@ -16720,20 +16751,36 @@ enum RosterNameIssue {
 /// Classify one entry against the canonical-name rule (#2924): a roster
 /// entry's id must be the machine_id of the machine it describes, because
 /// that one name is what flow records, presence beats and (in 4.0)
-/// `profile@machine` addresses all join on.
-fn roster_name_issue(e: &RosterEntryView, known: &FleetIdentityKnowledge) -> Option<RosterNameIssue> {
+/// `profile@machine` addresses all join on. `roster_ids` is every id in the
+/// roster, so a repair never re-adds over an entry that already exists.
+fn roster_name_issue(
+    e: &RosterEntryView,
+    known: &FleetIdentityKnowledge,
+    roster_ids: &std::collections::BTreeSet<&str>,
+) -> Option<RosterNameIssue> {
     // A declared uid is the strongest evidence: if that machine is known and
     // goes by another name now, the entry is stale. An unknown uid is a peer
     // this machine has not seen, which is not evidence against the entry.
     if let Some(uid) = &e.machine_uid {
-        return match known.current_name_by_uid.get(uid) {
-            Some(current) if *current != e.id => Some(RosterNameIssue::Renamed {
-                current: current.clone(),
-                by_declared_uid: true,
-                name_held_by_other: known.is_current_name(&e.id),
-            }),
-            _ => None,
-        };
+        let current = known.current_name_by_uid.get(uid)?;
+        if *current == e.id {
+            return None;
+        }
+        // (#2924 C-b) This machine's name from a per-shell override is not
+        // its name for the roster: never ask to rename its entry to it.
+        if known.local_name_from_env && known.local_uid.as_deref() == Some(uid.as_str()) {
+            return None;
+        }
+        if roster_ids.contains(current.as_str()) {
+            return Some(RosterNameIssue::Duplicate { current: current.clone() });
+        }
+        let evidence =
+            if known.live_uids.contains(uid) { Evidence::DeclaredLive } else { Evidence::DeclaredHistory };
+        return Some(RosterNameIssue::Renamed {
+            current: current.clone(),
+            evidence,
+            name_held_by_other: known.is_current_name(&e.id),
+        });
     }
     if known.is_current_name(&e.id) {
         return None;
@@ -16743,9 +16790,16 @@ fn roster_name_issue(e: &RosterEntryView, known: &FleetIdentityKnowledge) -> Opt
         1 => {
             let uid = known.uids_by_name[&e.id].iter().next().expect("len 1");
             if let Some(current) = known.current_name_by_uid.get(uid) {
+                let to_self = known.local_uid.as_deref() == Some(uid.as_str());
+                // (#2924 C-a) Only this machine's own loopback entry is
+                // provably this machine; any other entry traced to it may be a
+                // session name that a real peer happens to share.
+                if (to_self && !e.address_is_loopback) || roster_ids.contains(current.as_str()) {
+                    return Some(RosterNameIssue::WeakTrace { current: current.clone(), to_self });
+                }
                 return Some(RosterNameIssue::Renamed {
                     current: current.clone(),
-                    by_declared_uid: false,
+                    evidence: Evidence::History,
                     name_held_by_other: false,
                 });
             }
@@ -16789,16 +16843,17 @@ pub fn check_roster_identity(
     entries: &[RosterEntryView],
     known: &FleetIdentityKnowledge,
 ) -> Check {
+    let roster_ids: std::collections::BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     let mut warn_msg: Vec<String> = Vec::new();
     let mut note_msg: Vec<String> = Vec::new();
     let mut hint: Vec<String> = Vec::new();
     for e in entries {
         let id = e.id.as_str();
-        match roster_name_issue(e, known) {
+        let addr = if e.address_is_loopback { "<tailnet-dns-name>" } else { e.address.as_str() };
+        match roster_name_issue(e, known, &roster_ids) {
             None => {}
-            Some(RosterNameIssue::Renamed { current, by_declared_uid: true, name_held_by_other: false }) => {
+            Some(RosterNameIssue::Renamed { current, evidence: Evidence::DeclaredLive, name_held_by_other: false }) => {
                 warn_msg.push(format!("`{id}` declares the hardware identity of the machine now called `{current}`"));
-                let addr = if e.address_is_loopback { "<tailnet-dns-name>" } else { e.address.as_str() };
                 hint.push(format!(
                     "For `{id}`: rename the entry to the machine's own name (`darkmux machine remove {id}` \
                      then `darkmux machine add {current} --address {addr}`), or keep `{id}` by running \
@@ -16806,12 +16861,11 @@ pub fn check_roster_identity(
                      (presence reads the name once, at daemon start)."
                 ));
             }
-            Some(RosterNameIssue::Renamed { current, by_declared_uid: true, name_held_by_other: true }) => {
+            Some(RosterNameIssue::Renamed { current, evidence: Evidence::DeclaredLive | Evidence::DeclaredHistory, name_held_by_other: true }) => {
                 warn_msg.push(format!(
                     "`{id}` declares the hardware identity of the machine now called `{current}`, while \
                      another machine currently goes by `{id}` (a replaced machine?)"
                 ));
-                let addr = if e.address_is_loopback { "<tailnet-dns-name>" } else { e.address.as_str() };
                 hint.push(format!(
                     "For `{id}`: if it means the machine that goes by `{id}` now, re-add it so it drops the \
                      old identity (`darkmux machine remove {id}` then `darkmux machine add {id} --address \
@@ -16819,16 +16873,38 @@ pub fn check_roster_identity(
                      `darkmux machine add {current} --address <its-tailnet-dns-name>`)."
                 ));
             }
-            Some(RosterNameIssue::Renamed { current, by_declared_uid: false, .. }) => {
+            Some(RosterNameIssue::Renamed { current, evidence, .. }) => {
+                let how = if evidence == Evidence::History {
+                    "was last used, in this machine's flow history, by the machine now called"
+                } else {
+                    "declares the hardware identity of a machine not live now, last seen in flow history as"
+                };
+                warn_msg.push(format!("`{id}` {how} `{current}`"));
+                hint.push(format!(
+                    "For `{id}`: flow history is the only source of that name, and a name set for one \
+                     session (`DARKMUX_MACHINE_ID`) lands there too, so confirm which machine the entry \
+                     means. If it means `{current}`: `darkmux machine remove {id}` then `darkmux machine \
+                     add {current} --address <its-tailnet-dns-name>`. If it means another machine, re-add \
+                     it under that machine's machine_id (its `darkmux doctor` prints it)."
+                ));
+            }
+            Some(RosterNameIssue::Duplicate { current }) => {
                 warn_msg.push(format!(
-                    "`{id}` was last used, in this machine's flow history, by the machine now called `{current}`"
+                    "`{id}` declares the hardware identity of `{current}`, which already has its own roster entry"
                 ));
                 hint.push(format!(
-                    "For `{id}`: flow history is the only link, and a name set for one session \
-                     (`DARKMUX_MACHINE_ID`) lands there too, so confirm which machine the entry means. If \
-                     it means `{current}`: `darkmux machine remove {id}` then `darkmux machine add \
-                     {current} --address <its-tailnet-dns-name>`. If it means another machine, re-add it \
-                     under that machine's machine_id (its `darkmux doctor` prints it)."
+                    "For `{id}`: it is a second entry for `{current}`; remove it with `darkmux machine remove {id}`."
+                ));
+            }
+            Some(RosterNameIssue::WeakTrace { current, to_self: true }) => {
+                note_msg.push(format!(
+                    "`{id}` is a name this machine (`{current}`) once used, likely for one session; nothing \
+                     links it to another machine"
+                ));
+            }
+            Some(RosterNameIssue::WeakTrace { current, to_self: false }) => {
+                note_msg.push(format!(
+                    "`{id}` was last used in flow history by `{current}`, which already has its own roster entry"
                 ));
             }
             Some(RosterNameIssue::Ambiguous { machines }) => {
@@ -16838,12 +16914,23 @@ pub fn check_roster_identity(
                 ));
             }
             Some(RosterNameIssue::Unknown) => {
+                let window = match known.history_truncated_to {
+                    Some(n) => format!("; only the last {n} flow files were read, so an older name is not checked"),
+                    None => String::new(),
+                };
                 note_msg.push(format!(
                     "`{id}` matches no machine_id this machine can see (normal for a peer that is off, or \
-                     whose records do not reach here)"
+                     whose records do not reach here{window})"
                 ));
             }
         }
+    }
+    if known.local_name_from_env {
+        note_msg.push(format!(
+            "this machine's machine_id `{}` comes from DARKMUX_MACHINE_ID in this shell, so it is not used \
+             to judge this machine's own entry",
+            known.local_name.as_deref().unwrap_or("?")
+        ));
     }
     let presence_note = match known.presence {
         PresenceState::Read => None,
@@ -16903,6 +16990,7 @@ pub fn check_roster_identity(
 /// own uid is the evidence, the re-add command uses the machine's current
 /// name, so the two rows agree on one command.
 pub fn check_roster_addresses(entries: &[RosterEntryView], known: &FleetIdentityKnowledge) -> Check {
+    let roster_ids: std::collections::BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     let loopback: Vec<&RosterEntryView> =
         entries.iter().filter(|e| e.address_is_loopback && !e.loopback_intended).collect();
     let intended: Vec<&str> = entries
@@ -16934,14 +17022,15 @@ pub fn check_roster_addresses(entries: &[RosterEntryView], known: &FleetIdentity
     let named: Vec<String> = loopback.iter().map(|e| format!("`{}` at {}", e.id, e.address)).collect();
     let fixes: Vec<String> = loopback
         .iter()
-        .map(|e| match roster_name_issue(e, known) {
+        .map(|e| match roster_name_issue(e, known, &roster_ids) {
             // Agree with the identity row: a machine whose own uid says it has
-            // a new name is re-added under that name.
-            Some(RosterNameIssue::Renamed { current, by_declared_uid: true, name_held_by_other: false }) => format!(
+            // a new name is re-added under that name; a duplicate is removed.
+            Some(RosterNameIssue::Renamed { current, evidence: Evidence::DeclaredLive, name_held_by_other: false }) => format!(
                 "`darkmux machine remove {}` then `darkmux machine add {current} --address <tailnet-dns-name>`",
                 e.id
             ),
-            Some(RosterNameIssue::Renamed { current, by_declared_uid: false, .. }) => format!(
+            Some(RosterNameIssue::Duplicate { .. }) => format!("`darkmux machine remove {}`", e.id),
+            Some(RosterNameIssue::Renamed { current, .. }) => format!(
                 "`darkmux machine add {id} --address <tailnet-dns-name>` (or, if `roster identity`'s \
                  rename applies, `darkmux machine remove {id}` then `darkmux machine add {current} \
                  --address <tailnet-dns-name>`)",
@@ -16988,6 +17077,7 @@ mod roster_identity_tests {
             uidless_names: uidless.iter().map(|s| s.to_string()).collect(),
             local_name: None,
             presence: PresenceState::Read,
+            ..Default::default()
         }
     }
 
@@ -17011,10 +17101,9 @@ mod roster_identity_tests {
     /// repairs, with the entry's address, and the restart the name needs.
     #[test]
     fn an_entry_whose_declared_uid_now_goes_by_another_name_gets_both_repairs() {
-        let check = check_roster_identity(
-            &[entry("laptop", Some("UID-A"))],
-            &known(&[("UID-A", "MacBook-Pro")], &[], &[]),
-        );
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        k.live_uids.insert("UID-A".into());
+        let check = check_roster_identity(&[entry("laptop", Some("UID-A"))], &k);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("`laptop`") && check.message.contains("`MacBook-Pro`"), "{}", check.message);
         let hint = check.hint.unwrap();
@@ -17080,10 +17169,9 @@ mod roster_identity_tests {
     /// give that name to the retired machine too.
     #[test]
     fn a_replaced_machines_entry_never_offers_a_duplicate_machine_id() {
-        let check = check_roster_identity(
-            &[entry("studio", Some("UID-OLD"))],
-            &known(&[("UID-OLD", "studio-retired"), ("UID-NEW", "studio")], &[], &[]),
-        );
+        let mut k = known(&[("UID-OLD", "studio-retired"), ("UID-NEW", "studio")], &[], &[]);
+        k.live_uids.extend(["UID-OLD".to_string(), "UID-NEW".to_string()]);
+        let check = check_roster_identity(&[entry("studio", Some("UID-OLD"))], &k);
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("another machine currently goes by `studio`"), "{}", check.message);
         let hint = check.hint.unwrap();
@@ -17129,10 +17217,9 @@ mod roster_identity_tests {
 
     #[test]
     fn a_rename_repair_never_suggests_a_loopback_address() {
-        let check = check_roster_identity(
-            &[loopback(entry("laptop", Some("UID-A")))],
-            &known(&[("UID-A", "MacBook-Pro")], &[], &[]),
-        );
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        k.live_uids.insert("UID-A".into());
+        let check = check_roster_identity(&[loopback(entry("laptop", Some("UID-A")))], &k);
         let hint = check.hint.unwrap();
         assert!(hint.contains("--address <tailnet-dns-name>"), "{hint}");
         assert!(!hint.contains("127.0.0.1"), "{hint}");
@@ -17168,6 +17255,114 @@ mod roster_identity_tests {
         assert_eq!(check.status, Status::Pass);
     }
 
+    // ── #2924 re-review C-a, C-b, C-e ──
+
+    fn with_local(mut k: FleetIdentityKnowledge, uid: &str, name: &str) -> FleetIdentityKnowledge {
+        k.local_uid = Some(uid.into());
+        k.local_name = Some(name.into());
+        k.live_uids.insert(uid.into());
+        k.current_name_by_uid.insert(uid.into(), name.into());
+        k
+    }
+
+    /// C-a: a throwaway session name this machine once used, on an entry at
+    /// another machine's address, is a note: nothing links it to another
+    /// machine, and a real peer with that name must not warn whenever it is
+    /// off.
+    #[test]
+    fn a_history_trace_to_this_machines_own_uid_is_a_note() {
+        let k = with_local(known(&[], &[("review-scratch", "UID-SELF")], &[]), "UID-SELF", "MacBook-Pro");
+        let check = check_roster_identity(&[entry("review-scratch", None)], &k);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("`review-scratch`"), "{}", check.message);
+        assert!(!check.hint.unwrap_or_default().contains("machine add MacBook-Pro"));
+    }
+
+    /// ...but this machine's own stale entry at a loopback address IS this
+    /// machine (loopback reaches only here), so it still warns.
+    #[test]
+    fn a_loopback_entry_traced_to_this_machine_still_warns() {
+        let k = with_local(known(&[], &[("laptop", "UID-SELF")], &[]), "UID-SELF", "MacBook-Pro");
+        let check = check_roster_identity(&[loopback(entry("laptop", None))], &k);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("now called `MacBook-Pro`"), "{}", check.message);
+    }
+
+    /// C-a: the traced machine's current name already has its own entry.
+    /// Following "add MacBook-Pro" would overwrite that correct entry.
+    #[test]
+    fn a_history_trace_to_an_already_rostered_name_is_a_note() {
+        let k = known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A")], &[]);
+        let check = check_roster_identity(&[entry("laptop", None), entry("MacBook-Pro", None)], &k);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("already has its own roster entry"), "{}", check.message);
+        assert!(!check.hint.unwrap_or_default().contains("machine add MacBook-Pro"));
+    }
+
+    /// With declared-uid proof, a second entry for an already-rostered
+    /// machine is a duplicate: the repair removes it, never re-adds over the
+    /// correct entry.
+    #[test]
+    fn a_declared_uid_duplicate_of_a_rostered_machine_is_removed_not_re_added() {
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        k.live_uids.insert("UID-A".into());
+        let check = check_roster_identity(&[entry("laptop", Some("UID-A")), entry("MacBook-Pro", None)], &k);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("darkmux machine remove laptop"), "{hint}");
+        assert!(!hint.contains("machine add MacBook-Pro"), "{hint}");
+        assert!(!hint.contains("config set machine_id"), "{hint}");
+    }
+
+    /// C-b: the current name for a declared uid came from HISTORY (the
+    /// machine is not live): same conservative repair as a history trace.
+    #[test]
+    fn a_declared_uid_whose_current_name_is_only_historical_gets_the_conservative_repair() {
+        let check = check_roster_identity(
+            &[entry("laptop", Some("UID-A"))],
+            &known(&[("UID-A", "MacBook-Pro")], &[], &[]),
+        );
+        let hint = check.hint.unwrap();
+        assert!(!hint.contains("laptop.tailnet.example"), "{hint}");
+        assert!(!hint.contains("config set machine_id"), "{hint}");
+        assert!(hint.contains("--address <its-tailnet-dns-name>"), "{hint}");
+    }
+
+    /// C-b: a `DARKMUX_MACHINE_ID` session override is not this machine's
+    /// name for the roster; the row names that provenance.
+    #[test]
+    fn the_row_names_a_session_machine_id_override() {
+        let mut k = known(&[], &[], &[]);
+        k.local_name = Some("review-scratch".into());
+        k.local_name_from_env = true;
+        let check = check_roster_identity(&[entry("studio", None)], &k);
+        assert!(check.message.contains("DARKMUX_MACHINE_ID"), "{}", check.message);
+    }
+
+    /// C-b: under a session override, this machine's correct entry (its own
+    /// declared uid) is never told to take the session name.
+    #[test]
+    fn a_session_override_never_renames_this_machines_entry() {
+        let mut k = with_local(known(&[], &[], &[]), "UID-SELF", "review-scratch");
+        k.local_name_from_env = true;
+        let check = check_roster_identity(&[entry("MacBook-Pro", Some("UID-SELF"))], &k);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(!check.hint.unwrap_or_default().contains("review-scratch --address"));
+    }
+
+    /// C-e: when older flow files were not read, an unknown name's note says
+    /// so.
+    #[test]
+    fn an_unknown_names_note_mentions_a_truncated_history_window() {
+        let mut k = known(&[], &[], &[]);
+        k.history_truncated_to = Some(120);
+        let check = check_roster_identity(&[entry("studio", None)], &k);
+        assert!(check.message.contains("last 120 flow files"), "{}", check.message);
+        k.history_truncated_to = None;
+        let check = check_roster_identity(&[entry("studio", None)], &k);
+        assert!(!check.message.contains("flow files"), "{}", check.message);
+    }
+
     // ── roster addresses (#2924) ──
 
     #[test]
@@ -17184,7 +17379,8 @@ mod roster_identity_tests {
     /// re-add under the machine's current name, agreeing with the identity row.
     #[test]
     fn a_renamed_loopback_entrys_re_add_uses_the_current_name() {
-        let k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        let mut k = known(&[("UID-A", "MacBook-Pro")], &[], &[]);
+        k.live_uids.insert("UID-A".into());
         let e = loopback(entry("laptop", Some("UID-A")));
         let check = check_roster_addresses(std::slice::from_ref(&e), &k);
         let hint = check.hint.unwrap();

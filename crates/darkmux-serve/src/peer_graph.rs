@@ -465,6 +465,7 @@ mod tests {
                 added_unix_ms: 0,
                 machine_uid: None,
                 loopback_intended: false,
+                extras: Default::default(),
             },
         );
         roster

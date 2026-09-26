@@ -123,10 +123,12 @@ pub(crate) fn roster_doctor_checks() -> Vec<crate::doctor::Check> {
             None => (Vec::new(), crate::doctor::PresenceState::Unreadable),
         },
     };
+    let resolved = darkmux_flow::resolve_machine_id_with_source();
     let live = LiveIdentity {
         beats,
         local_uid: darkmux_hardware::machine_uid().map(str::to_string),
-        local_name: flow::resolve_machine_id(),
+        local_name_from_env: matches!(resolved, Some((_, darkmux_flow::MachineIdSource::Env))),
+        local_name: resolved.map(|(id, _)| id),
         presence,
     };
     // Flow history is read only when this machine and the live beats cannot
@@ -149,15 +151,18 @@ struct LiveIdentity {
     local_uid: Option<String>,
     /// This machine's resolved machine_id.
     local_name: Option<String>,
+    /// True when `local_name` came from the `DARKMUX_MACHINE_ID` env tier.
+    local_name_from_env: bool,
     presence: crate::doctor::PresenceState,
 }
 
-/// (#2924 C-5) How many of the most recent flow day-files the roster
-/// identity check reads. Bounds doctor's cost as history is retained without
+/// (#2924 C-5) How many of the most recent flow FILES the roster identity
+/// check reads (one file per day in practice, but it counts files: a day
+/// with no records has none). Bounds doctor's cost as history is retained without
 /// limit (the laptop holds ~130 days, ~300 MB). 120 covers the live rename
 /// this check was written for; a rename older than the window is reported as
 /// a note ("matches no machine_id this machine can see"), never a warning.
-const ROSTER_HISTORY_DAYS: usize = 120;
+const ROSTER_HISTORY_FILES: usize = 120;
 
 /// True when some roster entry cannot be settled from live knowledge alone:
 /// it declares no uid and is not a current name, or declares a uid nobody
@@ -235,7 +240,7 @@ fn roster_checks(
 }
 
 /// Build [`crate::doctor::FleetIdentityKnowledge`] from the last
-/// [`ROSTER_HISTORY_DAYS`] flow day-files, presence beats, and this
+/// [`ROSTER_HISTORY_FILES`] flow day-files, presence beats, and this
 /// machine's own resolution. Later sources override earlier ones for a uid's
 /// CURRENT name. Every uid a name was ever seen under is kept (a set, never
 /// last-writer-wins), because one machine collects throwaway session names
@@ -259,7 +264,10 @@ fn gather_identity_knowledge(
         })
         .unwrap_or_default();
     files.sort();
-    let skip = files.len().saturating_sub(ROSTER_HISTORY_DAYS);
+    let skip = files.len().saturating_sub(ROSTER_HISTORY_FILES);
+    if skip > 0 {
+        known.history_truncated_to = Some(ROSTER_HISTORY_FILES);
+    }
     for path in files.into_iter().skip(skip) {
         let Ok(file) = std::fs::File::open(&path) else { continue };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
@@ -275,16 +283,27 @@ fn gather_identity_knowledge(
             }
         }
     }
+    // (#2924 C-b) A `DARKMUX_MACHINE_ID` override is a per-shell name, not
+    // this machine's name for the fleet, so it is not overlaid onto the local
+    // uid; that uid keeps whatever presence or history says.
+    let local_overlay = if live.local_name_from_env {
+        None
+    } else {
+        live.local_uid.as_deref().zip(live.local_name.as_deref())
+    };
     let overlays = live
         .beats
         .iter()
         .map(|(u, n)| (u.as_str(), n.as_str()))
-        .chain(live.local_uid.as_deref().zip(live.local_name.as_deref()));
+        .chain(local_overlay);
     for (uid, name) in overlays {
         known.uids_by_name.entry(name.to_string()).or_default().insert(uid.to_string());
         known.current_name_by_uid.insert(uid.to_string(), name.to_string());
+        known.live_uids.insert(uid.to_string());
     }
     known.local_name = live.local_name.clone();
+    known.local_name_from_env = live.local_name_from_env;
+    known.local_uid = live.local_uid.clone();
     known.presence = live.presence;
     known
 }
@@ -924,6 +943,7 @@ mod tests {
             beats: beats.iter().map(|(u, n)| (u.to_string(), n.to_string())).collect(),
             local_uid: local_uid.map(str::to_string),
             local_name: local_name.map(str::to_string),
+            local_name_from_env: false,
             presence: crate::doctor::PresenceState::Read,
         }
     }
@@ -961,12 +981,12 @@ mod tests {
         assert!(!k.current_name_by_uid.contains_key("UID-Z"), "only .jsonl flow files are read");
     }
 
-    /// C-5: only the most recent `ROSTER_HISTORY_DAYS` day files are read.
+    /// C-5: only the most recent `ROSTER_HISTORY_FILES` day files are read.
     #[test]
     fn gather_identity_knowledge_reads_a_bounded_window_of_day_files() {
         let tmp = tempfile::tempdir().unwrap();
         write_flow(tmp.path(), "2000-01-01.jsonl", &[r#"{"machine_id":"ancient","machine_uid":"UID-OLD"}"#]);
-        for i in 0..ROSTER_HISTORY_DAYS {
+        for i in 0..ROSTER_HISTORY_FILES {
             write_flow(tmp.path(), &format!("2026-{:02}-{:02}.jsonl", 1 + i / 28, 1 + i % 28), &[
                 r#"{"machine_id":"recent","machine_uid":"UID-R"}"#,
             ]);
@@ -974,6 +994,10 @@ mod tests {
         let k = gather_identity_knowledge(Some(tmp.path()), &live(&[], None, None));
         assert!(k.uids_by_name.contains_key("recent"));
         assert!(!k.uids_by_name.contains_key("ancient"), "a file older than the window is not read");
+        assert_eq!(k.history_truncated_to, Some(ROSTER_HISTORY_FILES), "C-e: the row can say so");
+        std::fs::remove_file(tmp.path().join("2000-01-01.jsonl")).unwrap();
+        let k = gather_identity_knowledge(Some(tmp.path()), &live(&[], None, None));
+        assert_eq!(k.history_truncated_to, None, "nothing was skipped");
     }
 
     /// Presence outranks history, and this machine's own resolution outranks
@@ -991,6 +1015,79 @@ mod tests {
         assert_eq!(k.local_name.as_deref(), Some("studio"));
         let no_uid = gather_identity_knowledge(None, &live(&[], None, Some("studio")));
         assert_eq!(no_uid.local_name.as_deref(), Some("studio"), "C-3: the name without a uid");
+    }
+
+    /// Which uids have a LIVE current name, and this machine's uid.
+    #[test]
+    fn gather_identity_knowledge_marks_live_uids_and_the_local_uid() {
+        let k = gather_identity_knowledge(None, &live(&[("UID-A", "MacBook-Pro")], Some("UID-B"), Some("studio")));
+        assert!(k.live_uids.contains("UID-A") && k.live_uids.contains("UID-B"));
+        assert_eq!(k.local_uid.as_deref(), Some("UID-B"));
+        assert!(!k.local_name_from_env);
+    }
+
+    /// C-b: a `DARKMUX_MACHINE_ID` session override is not this machine's
+    /// current name: it is not overlaid onto the local uid, and the knowledge
+    /// says where the local name came from.
+    #[test]
+    fn gather_identity_knowledge_does_not_overlay_a_session_override() {
+        let mut l = live(&[], Some("UID-B"), Some("review-scratch"));
+        l.local_name_from_env = true;
+        let tmp = tempfile::tempdir().unwrap();
+        write_flow(tmp.path(), "2026-09-01.jsonl", &[r#"{"machine_id":"studio","machine_uid":"UID-B"}"#]);
+        let k = gather_identity_knowledge(Some(tmp.path()), &l);
+        assert_eq!(k.current_name_by_uid.get("UID-B").map(String::as_str), Some("studio"));
+        assert!(k.local_name_from_env);
+        assert!(!k.live_uids.contains("UID-B"));
+    }
+
+    /// C-d: pin the Unreadable classification at its call site: Redis is
+    /// configured but nothing answers.
+    #[serial_test::serial]
+    #[test]
+    fn roster_doctor_checks_say_when_redis_is_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        unsafe {
+            std::env::set_var("DARKMUX_FLEET_FILE", tmp.path().join("fleet.json"));
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
+            std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
+            std::env::set_var("DARKMUX_MACHINE_ID", "this-test-host");
+        }
+        fleet::mutate_roster(|r| fleet::add_machine(r, "studio", "studio.tailnet.example", None, None)).unwrap();
+        let checks = roster_doctor_checks();
+        unsafe {
+            for k in ["DARKMUX_FLEET_FILE", "DARKMUX_FLOWS_DIR", "DARKMUX_REDIS_URL", "DARKMUX_MACHINE_ID"] {
+                std::env::remove_var(k);
+            }
+        }
+        let ident = checks.iter().find(|c| c.name == "roster identity").unwrap();
+        assert!(ident.message.contains("Redis unreachable"), "{}", ident.message);
+    }
+
+    /// C-b at the call site: an env-tier machine_id reaches the knowledge as
+    /// a session override.
+    #[serial_test::serial]
+    #[test]
+    fn roster_doctor_checks_name_an_env_tier_machine_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("DARKMUX_FLEET_FILE", tmp.path().join("fleet.json"));
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path().join("flows"));
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_MACHINE_ID", "session-name");
+        }
+        fleet::mutate_roster(|r| fleet::add_machine(r, "studio", "studio.tailnet.example", None, None)).unwrap();
+        let checks = roster_doctor_checks();
+        unsafe {
+            for k in ["DARKMUX_FLEET_FILE", "DARKMUX_FLOWS_DIR", "DARKMUX_MACHINE_ID"] {
+                std::env::remove_var(k);
+            }
+        }
+        let ident = checks.iter().find(|c| c.name == "roster identity").unwrap();
+        assert!(ident.message.contains("comes from DARKMUX_MACHINE_ID"), "{}", ident.message);
     }
 
     /// The live fleet from #2924 through the row builder: the Studio's self

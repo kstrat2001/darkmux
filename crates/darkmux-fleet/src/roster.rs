@@ -54,7 +54,10 @@ pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
 const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One machine in the fleet roster — operator-declared. Hand-edits OK;
-/// CLI verbs preserve unknown fields via the BTreeMap shape.
+/// fields this binary does not know are kept in `extras` and written back,
+/// so a CLI verb run by an older binary does not drop a newer binary's field
+/// (e.g. `loopback_intended`) or an operator's hand-added one (#2924 C-c).
+/// Unknown fields at the roster's top level are NOT preserved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineEntry {
     /// Logical machine identifier — what flow records carry as
@@ -115,6 +118,10 @@ pub struct MachineEntry {
     /// (false) on every entry written before #2924.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loopback_intended: bool,
+
+    /// Fields this binary does not know, preserved verbatim on rewrite.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 /// The full roster — operator's declared fleet topology. Lives at
@@ -132,8 +139,9 @@ pub struct FleetRoster {
     /// **Advisory, not code-gated.** `load_roster` neither reads nor validates
     /// this tag, and the roster is operator-owned hand-edited JSON without
     /// `deny_unknown_fields` — so a legacy `"1"` roster still carrying the
-    /// dropped `tier` field loads cleanly, the stale field is silently
-    /// absorbed, and it's gone on the next `save_roster`. The tag is a
+    /// dropped `tier` field loads cleanly; since #2924 C-c the stale field is
+    /// kept in the entry's `extras` and written back unchanged, like any
+    /// other field this binary does not know. The tag is a
     /// human-facing format marker, not an enforced compat boundary. (Contrast
     /// `WorkJob`'s `WORK_JOB_SCHEMA_VERSION`, which IS a hard wire break via
     /// `deny_unknown_fields` because it's an on-the-wire message from a
@@ -395,6 +403,7 @@ pub fn add_machine(
     let existing = roster.machines.get(id);
     let existing_added_at = existing.map(|m| m.added_unix_ms);
     let existing_uid = existing.and_then(|m| m.machine_uid.clone());
+    let existing_extras = existing.map(|m| m.extras.clone()).unwrap_or_default();
     let entry = MachineEntry {
         id: id.to_string(),
         address: address.to_string(),
@@ -402,6 +411,7 @@ pub fn add_machine(
         added_unix_ms: existing_added_at.unwrap_or(now),
         machine_uid: uid.map(String::from).or(existing_uid),
         loopback_intended: false,
+        extras: existing_extras,
     };
     roster.machines.insert(id.to_string(), entry);
     Ok(())

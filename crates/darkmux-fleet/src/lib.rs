@@ -147,6 +147,30 @@ mod tests {
         });
     }
 
+    /// (#2924 C-c) A field this binary does not know (a newer binary's
+    /// `loopback_intended`, an operator's hand-added note) survives a
+    /// load -> add -> save cycle, on the entry being updated and on every
+    /// other entry. Without this, an older binary rewriting the roster
+    /// silently dropped `loopback_intended`.
+    #[test]
+    #[serial]
+    fn unknown_entry_fields_survive_a_rewrite() {
+        with_roster_env(|path| {
+            std::fs::write(
+                path,
+                r#"{"version":"2","machines":{
+                    "a":{"id":"a","address":"a.example","added_unix_ms":1,"future_field":{"x":1}},
+                    "b":{"id":"b","address":"b.example","added_unix_ms":2,"note":"hand-added"}}}"#,
+            )
+            .unwrap();
+            mutate_roster(|r| add_machine(r, "a", "a2.example", None, None)).unwrap();
+            let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(raw["machines"]["a"]["future_field"]["x"], 1, "{raw}");
+            assert_eq!(raw["machines"]["a"]["address"], "a2.example");
+            assert_eq!(raw["machines"]["b"]["note"], "hand-added", "{raw}");
+        });
+    }
+
     #[test]
     #[serial]
     fn add_then_load_round_trips() {

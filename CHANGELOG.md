@@ -155,12 +155,22 @@ darkmux release.
   `machine_id`, never the second when another machine already holds the
   name), or flow history links the name to exactly one machine that now
   goes by another name (a conservative repair: no address reuse and no
-  `machine_id` change, since session-only names land in history too). A
-  name several machines have used, or one nothing is known about (the
-  normal state of a peer that is off), is a note, not a warning, and the
-  row says when presence could not be read. Nothing in the roster or
-  config is rewritten. Flow history is read only when this machine and
-  presence cannot settle an entry, and only the last 120 day-files.
+  `machine_id` change, since session-only names land in history too; the
+  same conservative repair applies when a declared uid's current name is
+  only known from history). A second entry for a machine that already has
+  its own is a duplicate to remove. A name several machines have used, a
+  name only this machine used (session names collect there), a name whose
+  machine already has its own entry, or one nothing is known about (the
+  normal state of a peer that is off) is a note, not a warning. The row
+  says when presence could not be read and when this machine's
+  `machine_id` comes from a `DARKMUX_MACHINE_ID` override, which is then
+  not used to judge its own entry. Nothing in the roster or config is
+  rewritten. Flow history is read only when this machine and presence
+  cannot settle an entry, and only the last 120 flow files.
+- **Roster entries keep fields the running binary does not know** (#2924).
+  A `machine add` by an older binary used to drop a newer field (such as
+  `loopback_intended`) or an operator's hand-added one; unknown entry
+  fields are now written back unchanged.
 
 - **`/machine-status` is a built-in advertised command** (#2918). "Which
   models are loaded on this machine right now?" was refused: the catalog

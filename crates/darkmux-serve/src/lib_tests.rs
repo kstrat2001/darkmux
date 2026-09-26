@@ -7259,6 +7259,7 @@ mod fleet_cache_wall_clock {
                 added_unix_ms: 1,
                 machine_uid: None,
                 loopback_intended: false,
+                extras: Default::default(),
             },
             darkmux_fleet::MachineEntry {
                 id: "studio".into(),
@@ -7268,6 +7269,7 @@ mod fleet_cache_wall_clock {
                 // The operator's own declaration must never be overwritten.
                 machine_uid: Some("DECLARED-WINS".into()),
                 loopback_intended: false,
+                extras: Default::default(),
             },
             darkmux_fleet::MachineEntry {
                 id: "no-uid-anywhere".into(),
@@ -7276,6 +7278,7 @@ mod fleet_cache_wall_clock {
                 added_unix_ms: 3,
                 machine_uid: None,
                 loopback_intended: false,
+                extras: Default::default(),
             },
         ];
 
