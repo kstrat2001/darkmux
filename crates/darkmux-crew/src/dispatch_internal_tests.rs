@@ -10601,6 +10601,7 @@
         assert_eq!(state.summary.completion_tokens, u32::MAX, "must clamp, not wrap to 4");
         assert_eq!(state.summary.reasoning_tokens, Some(u32::MAX), "must clamp, not wrap to 4");
         assert_eq!(state.summary.cached_tokens, Some(u32::MAX), "must clamp, not wrap to 4");
+        assert_eq!(state.summary.total_tokens, u32::MAX, "must clamp, not wrap");
     }
 
     /// (#1483) A multi-turn / multi-tool agent loop stamps EVERY live per-event
@@ -15381,6 +15382,90 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(payload["cumulative_completion_tokens"], 9600);
         assert_eq!(payload["cumulative_turns"], 7);
         assert_eq!(payload["cumulative_compactions"], 3);
+    }
+
+    /// (#2903) Feed `model.completed` events through the REAL tailer, then
+    /// build the complete payload from the summary it accumulated. Shared by
+    /// the two tests below so both exercise the live accumulation path, not
+    /// a hand-built summary that could encode the answer.
+    fn complete_payload_after_turns(session: &str, events: &[&str]) -> serde_json::Value {
+        let tmp = TempDir::new().unwrap();
+        let mut state = super::TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            session.into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        for e in events {
+            state.handle_event(e);
+        }
+        let stats = super::reduce_host_stats(&[]);
+        super::build_dispatch_complete_payload(
+            1000,
+            super::RestTotals { rest_ms: 0, rests: 0 },
+            None,
+            "",
+            "",
+            0,
+            &state.summary,
+            super::TokenTotals { prompt: 0, completion: 0, reasoning: None, cached: None },
+            super::CumulativeCounts { turns: 0, compactions: 0 },
+            None,
+            &stats,
+            &no_extras(),
+            &None,
+            None,
+            None,
+        )
+    }
+
+    /// (#2903) The complete record's `total_tokens` takes the SAME
+    /// precedence as the per-turn `telemetry.tokens` records
+    /// (`turn_tokens_payload`): the provider's own total wins, the sum is
+    /// the fallback. The first turn's figures are a real recorded shape
+    /// (#1444's corpus: `prompt=9970 completion=128 total=11598`), a
+    /// provider billing a third token class outside `completion_tokens`;
+    /// the second turn reports no total, so it contributes its sum. The
+    /// complete total must equal the sum of the per-turn totals, never the
+    /// recomputed prompt+completion (10248), which drops 1500 tokens.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn build_dispatch_complete_payload_total_tokens_prefers_the_provider_total() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let events = [
+            r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":9970,"completion_tokens":128,"total_tokens":11598}}"#,
+            r#"{"type":"model.completed","seq":2,"finish_reason":"stop","usage":{"prompt_tokens":100,"completion_tokens":50}}"#,
+        ];
+        let payload = complete_payload_after_turns("sess-2903-provider", &events);
+        let per_turn_sum: u64 = events
+            .iter()
+            .map(|e| {
+                let ev: serde_json::Value = serde_json::from_str(e).unwrap();
+                super::turn_tokens_payload(&ev).unwrap()["total_tokens"].as_u64().unwrap()
+            })
+            .sum();
+        assert_eq!(per_turn_sum, 11598 + 150);
+        assert_eq!(payload["total_tokens"], 11598 + 150, "provider total must win over prompt+completion");
+        assert_eq!(payload["total_tokens"].as_u64().unwrap(), per_turn_sum, "complete and per-turn records must agree");
+        // prompt/completion keep their meaning: still the plain sums.
+        assert_eq!(payload["prompt_tokens"], 9970 + 100);
+        assert_eq!(payload["completion_tokens"], 128 + 50);
+    }
+
+    /// (#2903) The fallback half: no turn reports a provider total, so the
+    /// complete record's `total_tokens` is prompt+completion.
+    #[test]
+    #[serial] // reaches emit() -> darkmux_flow::record()
+    fn build_dispatch_complete_payload_total_tokens_falls_back_to_the_sum() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let payload = complete_payload_after_turns(
+            "sess-2903-fallback",
+            &[
+                r#"{"type":"model.completed","seq":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":31000,"completion_tokens":1200}}"#,
+                r#"{"type":"model.completed","seq":2,"finish_reason":"stop","usage":{"prompt_tokens":400,"completion_tokens":20}}"#,
+            ],
+        );
+        assert_eq!(payload["total_tokens"], 31000 + 1200 + 400 + 20);
     }
 
     #[test]
