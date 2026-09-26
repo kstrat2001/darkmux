@@ -43,6 +43,7 @@ import { machineNames, machineUids, isSelfMachine, displayNameOf } from "../../l
 import type { RosterName } from "../../lib/flow";
 import type { Run } from "../../types/generated/Run";
 import { utilityStrip, type UtilityStrip } from "../../lib/utilityJobs";
+import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
  * of its started sessions is still running — routed through the shared
@@ -617,6 +618,13 @@ export function buildFleetCard(
   /** (#2921 follow-up) The declared roster, so a machine nothing else names
    *  takes its roster id — the same `displayNameOf` its activity lane uses. */
   roster: readonly RosterName[] = [],
+  /** (#2928) The live channel's overlay (`lib/liveChannel.ts`), passed by the
+   *  live fleet lens at the live edge only. `null` (every replay, every test
+   *  that does not opt in) derives from durable records exactly as before.
+   *  Merged per execution into the scope's record sets and, for this
+   *  machine only (the channel is local-daemon only), into the utility
+   *  strip. */
+  live: LiveOverlay | null = null,
 ): FleetCard {
   const flowActive = machActive(data, liveSet, m, t);
   const labRunning = runningLabRunCount(machineRuns);
@@ -693,7 +701,9 @@ export function buildFleetCard(
   // would read heartbeats from AFTER the playhead too, inflating/changing
   // the rate a live viewer actually saw at `t` (measured: 122 tok/s off a
   // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
-  const liveTokRecordSets = runningSids.map((sid) => sessionRecords(data, sid).filter((r) => T(r.ts) <= t));
+  const liveTokRecordSets = runningSids.map((sid) =>
+    mergeLive(sessionRecords(data, sid), live?.bySession.get(sid)).filter((r) => T(r.ts) <= t),
+  );
   // (#2877 dogfood finding) A session can be `active` (no terminal record
   // yet — a mission genuinely stuck open, observed live: `status: "running"`
   // hours after its last real heartbeat) while its heartbeat stream has long
@@ -794,7 +804,7 @@ export function buildFleetCard(
   // (#2915) `/machine/specs` answers for THIS machine only; a peer's model is
   // read off its own utility records and its residency is unknown.
   const self = specs != null && isSelfMachine(data, liveMachines, specs, m);
-  const utility = utilityStrip(data, m, t, self ? (specs?.utility_model ?? null) : null);
+  const utility = utilityStrip(data, m, t, self ? (specs?.utility_model ?? null) : null, self && live ? live.utility : []);
   return {
     uid: m,
     name,

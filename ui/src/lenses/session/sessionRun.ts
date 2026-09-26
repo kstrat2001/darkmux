@@ -58,6 +58,7 @@ import { fmtElapsed, clk, fmtC } from "../../lib/format";
 import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import { aggregateLiveState, aggregateTokenRate, averageGenerationRate, lastHeartbeatMs, liveStateWhileConnected } from "../../lib/tokenRate";
 import type { LiveState } from "../../lib/tokenRate";
+import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { PURPOSE, sumUsage, type UsageRecordLike } from "../../lib/usageRecords";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 import { toolOutcome } from "../../lib/recordDetail";
@@ -566,7 +567,18 @@ function flowSchemaAtLeast(version: string | null, min: string): boolean {
  * check inside `liveStateWhileConnected` and falls back to the plain
  * `connected` boolean, same as omitting it there.
  */
-export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number, connected = true, lastContactMs: number | null = null): SessionRunView {
+export function runRegions(
+  data: FlowRecord[],
+  sid: string,
+  nowOverride?: number,
+  connected = true,
+  lastContactMs: number | null = null,
+  /** (#2928) The live channel's overlay, at the live edge only (see
+   *  `SessionReplay.tsx`); merged into the scope's per-execution record sets
+   *  alone, never into turns, tokens or the event rows. `null` derives from
+   *  durable records exactly as before. */
+  live: LiveOverlay | null = null,
+): SessionRunView {
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
@@ -940,7 +952,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
           }
           return set.size ? [...set] : [sid];
         })();
-  const tokRateRecordSets = tokRateSids.map((s) => data.filter((r) => r.session_id === s));
+  const tokRateRecordSets = tokRateSids.map((s) => mergeLive(data.filter((r) => r.session_id === s), live?.bySession.get(s)));
   // (#2877 pass 2) ONE state derivation, `lib/tokenRate.ts::deriveLiveState`,
   // aggregated across the same sibling-session candidates the tok/s reading
   // already sums (`aggregateLiveState`'s own doc: the best/most-informative

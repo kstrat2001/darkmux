@@ -202,6 +202,31 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metrics.find((m) => m.label === "TOK/S")).toBeUndefined();
   });
 
+  // (#2928) The live overlay drives the run page's scope, and only its scope.
+  it("the live overlay drives the scope's rate between durable heartbeats, and nothing else", async () => {
+    const { LiveStore } = await import("../../lib/liveChannel");
+    const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
+    const beat2Ms = Date.parse("2026-01-01T00:00:03Z");
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:01Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat1Ms, generated_chars: 40 } },
+      { ts: "2026-01-01T00:00:03Z", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { sampled_at_ms: beat2Ms, generated_chars: 120 } },
+    ];
+    const store = new LiveStore();
+    const sample = (at: number, gen: number) =>
+      JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: at, cadence_ms: 250, fields: { sampled_at_ms: at, generated_chars: gen } });
+    store.ingest(sample(beat2Ms + 250, 220), beat2Ms + 250);
+    store.ingest(sample(beat2Ms + 500, 420), beat2Ms + 500);
+    const now = beat2Ms + 500;
+    const durableView = runRegions(flowToRenderModel(data), "s1", now);
+    const liveView = runRegions(flowToRenderModel(data), "s1", now, true, null, store.snapshot());
+    // 200 chars / 250 ms at 4 chars/token = 200 tok/s, where the durable pair reads 10.
+    expect(durableView.liveTokScope!.tokensPerSec).toBeCloseTo(10, 5);
+    expect(liveView.liveTokScope!.tokensPerSec).toBeCloseTo(200, 5);
+    // Turns, tokens and the event rows never see a live sample.
+    expect(liveView.metrics).toEqual(durableView.metrics);
+  });
+
   it("a run with heartbeats but a long gap since the last one reads as stalled", () => {
     const beat1Ms = Date.parse("2026-01-01T00:00:01Z");
     const beat2Ms = Date.parse("2026-01-01T00:00:03Z");

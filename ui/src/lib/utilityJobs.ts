@@ -23,6 +23,7 @@ import type { FlowRecord } from "../types/handwritten";
 import type { UtilityJobKind } from "../types/generated/UtilityJobKind";
 import { isDispatchStart, isDispatchTerminal, sessionRecords, uidOf } from "./flow";
 import { CALL_KIND, PURPOSE, isUsageRecord, usagePurpose, type UsagePayload } from "./usageRecords";
+import { mergeLive } from "./liveChannel";
 
 /** Every `UtilityJobKind` variant, by name. A key missing or extra relative
  *  to the generated union is a type error. */
@@ -32,6 +33,11 @@ export const UTILITY_JOB = { compaction: "compaction", radio_routing: "radio_rou
 export const UTILITY_START_ACTION = "utility.start";
 /** The flow-record action a started job writes when its model call fails. */
 export const UTILITY_ERROR_ACTION = "utility.error";
+/** (#2928) A utility job's END as the LIVE channel delivers it (a record the
+ *  viewer builds from a live sample, `lib/liveChannel.ts`; never a flow
+ *  record on the wire). Its durable twin is the job's usage record or
+ *  `utility.error`, which carry the same `job_id`. */
+export const LIVE_UTILITY_END_ACTION = "utility.end";
 
 /** The bound a `utility.start` that carries none is held to: the runtime's
  *  default inactivity window (`runtime.inactivity_timeout_seconds`, 600 s).
@@ -95,7 +101,7 @@ export function utilityJobOf(r: FlowRecord): string | null {
 /** True when `r` ENDS a utility job: a utility usage record, or a
  *  `utility.error`. */
 export function isUtilityEnd(r: FlowRecord): boolean {
-  if (r.action === UTILITY_ERROR_ACTION) return true;
+  if (r.action === UTILITY_ERROR_ACTION || r.action === LIVE_UTILITY_END_ACTION) return true;
   return isUsageRecord(r) && usagePurpose(payloadOf(r) as UsagePayload) === PURPOSE.utility;
 }
 
@@ -319,8 +325,14 @@ export function utilityStrip(
   uid: string,
   t: number,
   binding: { id: string; loaded: boolean } | null,
+  /** (#2928) This machine's live utility edges (`LiveOverlay.utility`), for
+   *  the machine the page is served from only: the live channel is
+   *  local-daemon only. A sub-second job shows open while it runs, instead
+   *  of arriving start-and-end in one durable delivery. Durable edges win
+   *  (`mergeLive`). */
+  liveEdges: readonly FlowRecord[] = [],
 ): UtilityStrip {
-  const own = machineUtilityRecords(data, uid);
+  const own = mergeLive(machineUtilityRecords(data, uid), liveEdges);
   // A served execution's own records can end its compaction (the execution
   // moved on); pull them in, once each.
   const served = new Set<string>();

@@ -1200,3 +1200,50 @@ describe("(#2915) buildFleetCard's utility strip", () => {
     expect(card([start, end], tAt(5)).utility.job).toBeNull();
   });
 });
+
+// (#2928) The live channel's overlay on the fleet card.
+describe("(#2928) buildFleetCard with the live overlay", () => {
+  const T = Date.parse("2026-08-09T00:00:00.000Z");
+  const durable: FlowRecord[] = [
+    rec({ ts: new Date(T - 60_000).toISOString(), machine_uid: "u1", session_id: "s1", action: "dispatch.start" }),
+    rec({ ts: new Date(T - 2000).toISOString(), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: T - 2000, generated_chars: 40, cumulative_chars: 40 } }),
+    rec({ ts: new Date(T).toISOString(), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: T, generated_chars: 120, cumulative_chars: 120 } }),
+  ];
+  const liveModel = (at: number, gen: number, vis: number) =>
+    JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: at, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: at, generated_chars: gen, cumulative_chars: vis } });
+  const selfSpecs = machineSpecs({ machine_id: "studio", machine_uid: "u1", utility_model: { id: "u4b", loaded: true } } as Partial<MachineSpecs> & Pick<MachineSpecs, "machine_id">);
+
+  it("no overlay: exactly the durable reading (playback and every existing caller)", () => {
+    const a = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T);
+    const b = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T, undefined, [], true, null, [], null);
+    expect(b.liveTokRate).toBeCloseTo(10, 5);
+    expect(b).toEqual(a);
+  });
+
+  it("live samples drive the rate and the THINK reading between durable heartbeats", async () => {
+    const { LiveStore } = await import("../../lib/liveChannel");
+    const store = new LiveStore();
+    store.ingest(liveModel(T + 250, 200, 200), T + 250);
+    store.ingest(liveModel(T + 500, 400, 200), T + 500); // reasoning: the text holds
+    const card = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T + 500, undefined, [], true, null, [], store.snapshot());
+    // 200 chars / 250 ms = 800 chars/s at 4 chars/token = 200 tok/s.
+    expect(card.liveTokRate).toBeCloseTo(200, 5);
+    expect(card.liveTokState).toBe("generating");
+    expect(card.executions[0]?.thinking).toBe(true);
+    // The same instant from durable records alone: the last pair (40 -> 120,
+    // both visible) reads GEN, not THINK.
+    const durableOnly = buildFleetCard(durable, new Map(), null, new Set(["s1"]), false, "u1", true, T + 500);
+    expect(durableOnly.executions[0]?.thinking).toBeUndefined();
+  });
+
+  it("a sub-second routing job lights this machine's utility glyph live, and only this machine's", async () => {
+    const { LiveStore } = await import("../../lib/liveChannel");
+    const { UTILITY_JOB } = await import("../../lib/utilityJobs");
+    const store = new LiveStore();
+    store.ingest(JSON.stringify({ v: 1, kind: "utility", role: "radio-router", model: "u4b", at_ms: T, cadence_ms: 250, fields: { event: "start", job: UTILITY_JOB.radio_routing, job_id: "r1", stall_after_seconds: 30 } }), T);
+    const self = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u1", true, T + 100, undefined, [], true, null, [], store.snapshot());
+    expect(self.utility.job?.visual).toBe("radio");
+    const peer = buildFleetCard(durable, new Map(), selfSpecs, new Set(["s1"]), false, "u2", true, T + 100, undefined, [], true, null, [], store.snapshot());
+    expect(peer.utility.job).toBeNull();
+  });
+});

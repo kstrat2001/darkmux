@@ -1629,3 +1629,50 @@ describe("(#2915) run page: compacting", () => {
     expect(document.querySelector(".modelbox__note")).toBeNull();
   });
 });
+
+// (#2928) The live channel drives the run page's scope at the live edge only.
+describe("(#2928) the live overlay on the run page", () => {
+  const t0 = 1_800_000_000_000;
+  const records = [
+    { ts: new Date(t0 - 30_000).toISOString(), action: "dispatch.start", session_id: "s-lv", machine_id: "M", payload: { role: "coder" } },
+    { ts: new Date(t0 - 4_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-lv", machine_id: "M", payload: { turn_seq: 1, sampled_at_ms: t0 - 4_000, generated_chars: 40, cumulative_chars: 40 } },
+    { ts: new Date(t0 - 2_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-lv", machine_id: "M", payload: { turn_seq: 1, sampled_at_ms: t0 - 2_000, generated_chars: 120, cumulative_chars: 120 } },
+  ];
+  async function feed() {
+    const { liveStore } = await import("../../lib/liveChannel");
+    liveStore.reset();
+    for (const [dt, gen] of [[-1_000, 220], [-750, 420]] as const) {
+      liveStore.ingest(JSON.stringify({ v: 1, kind: "model", session_id: "s-lv", at_ms: t0 + dt, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: t0 + dt, generated_chars: gen, cumulative_chars: gen } }), t0 + dt);
+    }
+    return liveStore;
+  }
+
+  it("live: the scope reads the live samples' rate", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(t0);
+    const store = await feed();
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-lv");
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(latestTokenScopeProps().tokensPerSec).toBeCloseTo(200, 5);
+    store.reset();
+    vi.useRealTimers();
+  });
+
+  it("parked playhead: the same samples change nothing (the durable 10 tok/s)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(t0);
+    const store = await feed();
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <SessionReplay sessionId="s-lv" playhead={t0 - 500} />
+      </QueryClientProvider>,
+    );
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(latestTokenScopeProps().tokensPerSec).toBeCloseTo(10, 5);
+    store.reset();
+    vi.useRealTimers();
+  });
+});

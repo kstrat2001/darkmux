@@ -24,6 +24,7 @@ export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
+import { useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
@@ -623,6 +624,10 @@ export function SessionReplay({
   // reading only advanced when a new record happened to arrive.
   const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null && playhead === null;
   const nowMs = useNowMs(ticking);
+  // (#2928) The live channel, on the same gate as the clock: the live edge
+  // of a live route only, so a scrubbed or played-back run shows its
+  // durable 2 s heartbeats and nothing else.
+  const liveOverlay = useLiveOverlay(ticking);
   // The override actually fed to `runRegions`: the playhead when scrubbed
   // (unconditionally — a playhead means a replay, and a replay's clock is
   // never "no override", full stop); otherwise the ticking clock's own
@@ -695,7 +700,7 @@ export function SessionReplay({
   // "right now", not about the playhead's moment.
   const effectiveConnected = connected || playhead !== null;
   const effectiveLastContactMs = playhead !== null ? null : lastContactMs;
-  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs);
+  const view = runRegions(data, sessionId, clockOverride, effectiveConnected, effectiveLastContactMs, ticking ? liveOverlay : null);
   // `animate: plausiblyRunning`, not `ticking` — `ticking` is now purely the
   // "should the shared clock subscribe" perf gate (see its own doc above)
   // and is unconditionally `false` in playback (`playhead === null` fails

@@ -7,6 +7,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useNowMs } from "../../lib/clock";
+import { useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
@@ -691,6 +692,11 @@ export function FleetLens({
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
   const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);
 
+  // (#2928) The live channel's overlay: at the live edge of a live route
+  // only (`livePolling` is false on a static build, `playhead` is set on a
+  // replay), so playback and a scrubbed view derive from durable records
+  // alone. Subscribing re-renders this lens on each live sample.
+  const liveOverlay = useLiveOverlay(livePolling && playhead == null);
   const liveSet = useMemo(
     // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
     // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
@@ -759,6 +765,7 @@ export function FleetLens({
           connected,
           lastContactMs,
           roster,
+          liveOverlay,
         );
         // (#2768, corrected by the #2802 regression fix) A roster entry
         // whose declared hardware identity matches this uid still prevents a
@@ -802,7 +809,7 @@ export function FleetLens({
         name: entry.id,
       })),
     ],
-    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs],
+    [uids, rosterOnly, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode, specBeats, runs, roster, connected, lastContactMs, liveOverlay],
   );
   // (#2911) The card ticks while an execution is live. Nothing above
   // re-rendered this lens between records: SSE contact is a ref, presence

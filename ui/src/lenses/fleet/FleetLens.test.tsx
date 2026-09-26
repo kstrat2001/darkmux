@@ -2462,3 +2462,41 @@ describe("(#2915) fleet card: utility work is visible", () => {
     expect(el.getAttribute("title")).toContain("darkmux:util-4b");
   });
 });
+
+// (#2928) The live channel reaches the fleet card at the live edge only.
+describe("(#2928) the live overlay on the rendered fleet card", () => {
+  const at = (s: string) => `${todayUTC()}T${s}Z`;
+  const records = (): FlowRecord[] => [
+    { ts: at("10:01:00.000"), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+    { ts: at("10:01:56.000"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: Date.parse(at("10:01:56.000")), generated_chars: 40, cumulative_chars: 40 } },
+    { ts: at("10:01:58.000"), machine_uid: "u1", session_id: "s1", action: "dispatch.turn.heartbeat", payload: { turn_seq: 1, sampled_at_ms: Date.parse(at("10:01:58.000")), generated_chars: 120, cumulative_chars: 120 } },
+  ];
+  const feedLive = async () => {
+    const { liveStore } = await import("../../lib/liveChannel");
+    liveStore.reset();
+    for (const [t, gen] of [["10:01:59.000", 220], ["10:01:59.250", 420]] as const) {
+      const ms = Date.parse(at(t));
+      liveStore.ingest(JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: ms, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: ms, generated_chars: gen, cumulative_chars: gen } }), ms);
+    }
+    return liveStore;
+  };
+
+  it("live: the card's rate comes from the live samples (200 tok/s), not the 2 s heartbeats (10 tok/s)", async () => {
+    const store = await feedLive();
+    mockFleetFetch({ flowToday: records() });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("200 tok/s"));
+    store.reset();
+  });
+
+  it("replay: the same samples in the store change nothing (the durable 10 tok/s)", async () => {
+    const store = await feedLive();
+    mockFleetFetch({});
+    const t = Date.parse(FROZEN_NOW);
+    const { container } = renderFleetLens({ records: records(), tMax: t, tMin: Date.parse(at("10:00:00.000")), playhead: t, historical: true });
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("tok/s"));
+    expect(container.querySelector(".mach")!.textContent).toContain("10 tok/s");
+    expect(container.querySelector(".mach")!.textContent).not.toContain("200 tok/s");
+    store.reset();
+  });
+});
