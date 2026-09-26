@@ -5616,6 +5616,11 @@ fn pair_runtime_image_labels(tags: &[String], inspect_stdout: &str) -> Option<Ve
 }
 
 fn check_runtime_image_freshness() -> Check {
+    // (#2923) Unit tests that run the whole doctor must never reach the
+    // host's Docker; the classifier is tested directly.
+    if cfg!(test) {
+        return not_applicable(RUNTIME_IMAGE_CHECK_NAME, "Docker is not probed from unit tests");
+    }
     classify_runtime_image_freshness(probe_runtime_image(), env!("CARGO_PKG_VERSION"))
 }
 
@@ -6495,6 +6500,11 @@ fn check_profile_loaded_match() -> Check {
 /// `swap`/`status`/`profiles`-only operator (no dispatching yet) isn't
 /// blocked by a doctor check for a capability they haven't used.
 fn check_docker_runtime() -> Check {
+    // (#2923) See `check_runtime_image_freshness`: no host Docker from unit
+    // tests; `docker_status_to_check` is tested directly.
+    if cfg!(test) {
+        return not_applicable("docker runtime", "Docker is not probed from unit tests");
+    }
     docker_status_to_check(darkmux_crew::dispatch_internal::docker_runtime_status())
 }
 

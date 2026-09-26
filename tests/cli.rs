@@ -212,7 +212,80 @@ fn darkmux_std_cmd() -> std::process::Command {
     neutralize_state_vars(&mut cmd);
     pin_child_tmpdir(&mut cmd, &home);
     cmd.env("HOME", home).env("DARKMUX_HOME", darkmux_home);
+    // (#2923) Every spawn resolves `docker` to a shim that refuses loudly,
+    // so no CLI test can pull, build, tag or run a real image on a
+    // developer machine or in CI. A test that needs Docker behavior puts
+    // its own fake `docker` earlier on PATH (`fake_docker_for_runtime_image`).
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    cmd.env("PATH", format!("{}:{real_path}", docker_shim_dir().display()));
     cmd
+}
+
+/// Exit code of the refusing `docker` shim; distinctive so a failure that
+/// came from it is recognizable.
+const DOCKER_SHIM_EXIT: i32 = 97;
+
+/// A directory holding only a `docker` that refuses every call, written
+/// once per test run under cargo's per-target temp dir (never the shared
+/// temp root, #2707).
+fn docker_shim_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-docker-shim");
+        fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("docker");
+        let tmp = dir.join(format!("docker.{}", std::process::id()));
+        fs::write(
+            &tmp,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"tests/cli.rs docker shim: refused \\`docker $*\\`; CLI tests never reach \
+                 the host's Docker (#2923). Put a fake docker on PATH for this test.\" >&2\n\
+                 exit {DOCKER_SHIM_EXIT}\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Atomic publish: nextest runs each test in its own process, and a
+        // half-written shim would be an exec failure, not a refusal.
+        fs::rename(&tmp, &shim).unwrap();
+        dir
+    })
+    .clone()
+}
+
+/// (#2923) The guard itself: through the spawn helper's own PATH, an
+/// accidental `docker pull` (or any other docker call) fails loudly instead
+/// of reaching the host's Docker. Before this, `mission launch review`
+/// tests ran the real image resolver, and one pulled a GHCR image onto a
+/// developer machine.
+#[test]
+fn cli_spawns_cannot_reach_the_hosts_docker() {
+    use std::ffi::OsStr;
+    let cmd = darkmux_std_cmd();
+    let path = cmd
+        .get_envs()
+        .find(|(k, _)| *k == OsStr::new("PATH"))
+        .and_then(|(_, v)| v)
+        .expect("the spawn helper must pin PATH")
+        .to_owned();
+    for args in [["pull", "ghcr.io/kstrat2001/darkmux-runtime:0.0.0"], ["version", "--format"]] {
+        let out = std::process::Command::new("docker")
+            .args(args)
+            .env("PATH", &path)
+            .output()
+            .expect("`docker` must resolve to the shim");
+        assert_eq!(out.status.code(), Some(DOCKER_SHIM_EXIT), "docker {args:?} reached a real docker");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("docker shim: refused"),
+            "the refusal must say what happened: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// (#2707) The child's temp root is pinned under this spawn's own tree.

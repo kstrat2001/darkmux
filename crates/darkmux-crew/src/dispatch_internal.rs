@@ -11399,6 +11399,23 @@ pub enum DockerRuntimeStatus {
 /// presentation decision — callers map the returned status to a bail
 /// (dispatch) or a Warn (doctor).
 pub fn docker_runtime_status() -> DockerRuntimeStatus {
+    // (#2923) This crate's unit tests never touch the host's Docker: the
+    // daemon is taken as up and the image plan runs against the same fixed
+    // store `ensure_darkmux_image_present` uses under `cfg(test)`.
+    #[cfg(test)]
+    {
+        status_for_plan(crate::runtime_image::plan_default_image(
+            &crate::runtime_image::UnitTestMatchingLatest,
+            env!("CARGO_PKG_VERSION"),
+            None,
+        ))
+    }
+    #[cfg(not(test))]
+    docker_runtime_status_live()
+}
+
+#[cfg(not(test))]
+fn docker_runtime_status_live() -> DockerRuntimeStatus {
     // Step 1: docker binary exists + daemon is reachable.
     match Command::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
