@@ -7280,6 +7280,7 @@
                 None, // (#2794) compactor_model
                 None,
                 None, // (#2902) endpoint
+                None, // (#2902 step 1b) compactor endpoint
             )
         });
 
@@ -13773,6 +13774,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None,
             None, // (#2902) endpoint
+            None, // (#2902 step 1b) compactor endpoint
         );
         let elapsed = started.elapsed();
 
@@ -14128,6 +14130,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None, // (#2794) compactor_model
                 None,
                 None, // (#2902) endpoint
+                None, // (#2902 step 1b) compactor endpoint
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");
@@ -16446,7 +16449,132 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["turn_seq"], 2);
         assert_eq!(p["total_tokens"], 130);
         assert_eq!(p["token_source"], "provider");
-        assert!(p.get("reported_model").is_none(), "step 1b: {p}");
+        assert!(p.get("reported_model").is_none(), "the event named no model: {p}");
+    }
+
+    /// (#2902 step 1b) Drive the tailer with `events` and return its session's
+    /// flow records plus the tailer's own summary afterward.
+    fn tail_events_for_usage(
+        session: &str,
+        events: &[&str],
+    ) -> (Vec<serde_json::Value>, TrajectorySummary) {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            session.into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        // A hosted brain: the turns' endpoint is the hosted label, while
+        // the compactor always calls LMStudio.
+        .with_endpoint(Some("azure:gpt-hosted".into()))
+        .with_compactor_endpoint(Some("http://h:1234/v1".into()))
+        .with_compactor_model(Some("darkmux:compactor-4b".into()));
+        for e in events {
+            state.handle_event(e);
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        (drain_flow_records_for_session(tmp.path(), session), state.summary.clone())
+    }
+
+    /// (#2902 step 1b) One compactor call → exactly one `telemetry.tokens`
+    /// with `call_kind: "compaction"`, attributed to the COMPACTOR (record
+    /// `handle` and `model`), never the specialist (contract 8, #1974). Its
+    /// endpoint is the LMStudio base the compactor called, not the hosted
+    /// label the turns went to, and it never enters the specialist's own
+    /// totals (the `dispatch complete` payload is built from the summary).
+    #[test]
+    #[serial]
+    fn usage_conformance_compaction_call() {
+        let (records, summary) = tail_events_for_usage(
+            "sess-usage-compaction",
+            &[r#"{"type":"compaction.call","generation":2,"requested_model":"darkmux:compactor-4b","reported_model":"compactor-4b","usage":{"prompt_tokens":500,"completion_tokens":80,"total_tokens":580,"reasoning_tokens":null,"cached_tokens":null}}"#],
+        );
+        let rec = crate::usage::assert_one_usage_record(
+            &records,
+            crate::usage::CallKind::Compaction,
+            "compaction call",
+        );
+        assert_eq!(rec["handle"], "compactor", "the sub-execution's own role: {rec}");
+        assert_eq!(rec["model"], "darkmux:compactor-4b", "the compactor's model: {rec}");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "darkmux:compactor-4b");
+        assert_eq!(p["reported_model"], "compactor-4b");
+        assert_eq!(p["endpoint"], "http://h:1234/v1");
+        assert!(
+            p.get("remote").is_none(),
+            "a usage record states facts; it never classifies local/cloud: {p}"
+        );
+        assert_eq!(p["generation"], 2);
+        assert_eq!(p["total_tokens"], 580);
+        assert_eq!(p["token_source"], "provider");
+        assert!(p.get("reasoning_tokens").is_none(), "unreported, omitted: {p}");
+        assert_eq!(p["parent_role_id"], "coder");
+        assert_eq!(p["parent_model"], "darkmux:qwen3.6");
+        assert!(p.get("turn_seq").is_none(), "a compactor call is not a turn: {p}");
+        assert!(
+            !records.iter().any(|r| r["action"] == "dispatch.turn"),
+            "no turn record for a compactor call"
+        );
+        assert_eq!(summary.turns, 0, "a compactor call is not a turn");
+        assert_eq!(
+            (summary.prompt_tokens, summary.completion_tokens, summary.total_tokens),
+            (0, 0, 0),
+            "never blended into the specialist's own totals"
+        );
+    }
+
+    /// (#2902 step 1b) A compactor reply with no usage block is still one
+    /// record, `token_source: "absent"`, no counts.
+    #[test]
+    #[serial]
+    fn usage_conformance_compaction_call_without_usage_is_absent() {
+        let (records, _) = tail_events_for_usage(
+            "sess-usage-compaction-absent",
+            &[r#"{"type":"compaction.call","generation":1,"requested_model":"darkmux:compactor-4b","usage":null}"#],
+        );
+        let rec = crate::usage::assert_one_usage_record(
+            &records,
+            crate::usage::CallKind::Compaction,
+            "compaction call, no usage",
+        );
+        let p = &rec["payload"];
+        assert_eq!(p["token_source"], "absent");
+        assert!(p.get("total_tokens").is_none(), "{p}");
+        assert!(p.get("reported_model").is_none(), "{p}");
+    }
+
+    /// (#2902 step 1b) A turn names the model the server says answered it.
+    #[test]
+    #[serial]
+    fn usage_conformance_container_turn_carries_the_reported_model() {
+        let (records, _) = tail_events_for_usage(
+            "sess-usage-turn-reported",
+            &[r#"{"type":"model.completed","seq":1,"finish_reason":"stop","reported_model":"gpt-served","usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#],
+        );
+        let rec = crate::usage::assert_one_usage_record(
+            &records,
+            crate::usage::CallKind::Turn,
+            "container turn, reported model",
+        );
+        assert_eq!(rec["payload"]["reported_model"], "gpt-served");
+        assert_eq!(rec["payload"]["endpoint"], "azure:gpt-hosted");
+        assert_eq!(rec["handle"], "coder", "a turn stays the specialist's");
     }
 
     /// `dispatch_remote` (hosted `darkmux dispatch`), `"single_shot"`.

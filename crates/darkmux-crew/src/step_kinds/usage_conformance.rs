@@ -17,8 +17,11 @@
 //!   without deciding its usage record. [`every_roster_path_calls_the_writer`]
 //!   checks each emitting path's body reaches the one writer.
 //!
-//! Scope: host-side only. The runtime's own compaction calls are #2902 step
-//! 1b and live in `runtime/`, outside this crate. No other workspace crate
+//! Scope: host-side only. The runtime's own calls (turns and compaction,
+//! #2902 step 1b) are rostered in `runtime/src/usage_conformance.rs`; their
+//! records are written here by the container tailer (`handle_event`'s
+//! `model.completed` and `compaction.call` arms), driven by
+//! `usage_conformance_container_turn` and `usage_conformance_compaction_call`. No other workspace crate
 //! calls a transport directly: `darkmux-lab` and the binary reach models
 //! through `dispatch::dispatch` / `dispatch_local_single_shot` (checked
 //! with a grep when this roster was written).

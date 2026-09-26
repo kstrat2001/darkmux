@@ -2207,12 +2207,15 @@ fn run_with_sleeper(
             // dispatch there discards the work the checkpoint existed to
             // preserve.
             let attempted_generation = compactions.saturating_add(1);
+            // (#2902 step 1b) Same accounting as the main loop's site.
+            let mut compactor_calls = Vec::new();
             let summary_chars = match compaction_cfg.strategy {
                 compaction::CompactionStrategy::Narrative => compaction::compact(
                     compactor_client,
                     &mut messages,
                     attempted_generation,
                     compaction_cfg,
+                    &mut compactor_calls,
                 ),
                 compaction::CompactionStrategy::StructuredSlot => {
                     let budget = compaction::BudgetSnapshot {
@@ -2228,6 +2231,7 @@ fn run_with_sleeper(
                         attempted_generation,
                         compaction_cfg,
                         Some(budget),
+                        &mut compactor_calls,
                     )
                     .map(|(parsed, summary_chars)| {
                         persist_structured_compaction_output(
@@ -2239,6 +2243,9 @@ fn run_with_sleeper(
                     })
                 }
             };
+            for call in &compactor_calls {
+                trajectory.append_compaction_call(call);
+            }
             let installed_summary_chars = match summary_chars {
                 Ok(chars) => {
                     compactions = attempted_generation;
@@ -3153,6 +3160,7 @@ fn run_with_sleeper(
             &trajectory_finish_reason,
             response.usage.as_ref(),
             trajectory_tool_calls.as_deref(),
+            response.served_model(),
         );
 
         // Take the first choice — LMStudio's OpenAI-compatible endpoint
@@ -4140,12 +4148,17 @@ fn run_with_sleeper(
                     // success the parsed output is persisted to
                     // `<RUNTIME_OUT_BASE>/.darkmux-runtime/compaction-<gen>.json`
                     // per #352 Step 5 "persistence falls out for free."
+                    // (#2902 step 1b) Every compactor call that got a reply,
+                    // installed or refused, drained below into one
+                    // `compaction.call` event each.
+                    let mut compactor_calls = Vec::new();
                     let summary_chars = match compaction_cfg.strategy {
                         compaction::CompactionStrategy::Narrative => compaction::compact(
                             compactor_client,
                             &mut messages,
                             attempted_generation,
                             compaction_cfg,
+                            &mut compactor_calls,
                         ),
                         compaction::CompactionStrategy::StructuredSlot => {
                             // (#439) Build budget snapshot so the
@@ -4170,6 +4183,7 @@ fn run_with_sleeper(
                                 attempted_generation,
                                 compaction_cfg,
                                 Some(budget),
+                                &mut compactor_calls,
                             )
                             .map(|(parsed, summary_chars)| {
                                 // Persist the JSON for downstream
@@ -4187,6 +4201,9 @@ fn run_with_sleeper(
                             })
                         }
                     };
+                    for call in &compactor_calls {
+                        trajectory.append_compaction_call(call);
+                    }
 
                     // (#2792 merge-gate) A compaction that cannot help must
                     // not kill the dispatch.
@@ -10309,6 +10326,106 @@ mod tests {
             "the scenario must contain at least one refusal that is excluded from \
              the count, else this pins nothing"
         );
+    }
+
+    /// (#2902 step 1b) LOOP grain: every compactor call the loop makes lands
+    /// in the trajectory as exactly one `compaction.call` event, installed or
+    /// refused, and a turn names the model the server says answered it. The
+    /// scenario is the one above (refusals, then a later install), so both
+    /// outcomes are exercised. `model.completed` stays one per PRIMARY call:
+    /// a consumer counting turns must never see a compactor call.
+    #[test]
+    #[serial_test::serial]
+    fn every_compactor_call_lands_as_one_compaction_call_event_and_turns_name_their_model() {
+        let cfg = compaction::CompactionConfig {
+            compactor_context_window: None,
+            threshold_tokens: 5000,
+            compactor_model: Some("test-compactor".to_string()),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: None,
+            custom_instructions: None,
+        };
+        let server = crate::test_support::GuardedMockServer::start();
+        let primary = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":0}",
+                    },
+                }])),
+                "tool_calls",
+                1000,
+                50,
+            ));
+        });
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some(
+                    "Summary: the assistant issued a read tool call against the workspace \
+                     file and inspected the returned contents. No decisions were finalized \
+                     and no files were modified. The next concrete action is to continue \
+                     reading and then act on what the file contains.",
+                ),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("compaction-call").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let huge = "x".repeat(120_000);
+        let initial = vec![
+            Message::system("test system"),
+            Message::user("seed"),
+            Message::user("tiny middle"),
+            Message::assistant("ok"),
+            Message::user("go"),
+            Message::assistant("sure"),
+            Message::user(&huge),
+        ];
+        let tools = [Tool::Read];
+        run(
+            &client, &client, "test-primary", initial, &tools, &mut traj, false,
+            &cfg, Some(4), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("the scenario completes");
+        let raw = std::fs::read_to_string(
+            tmp.path().join(".darkmux-runtime").join("trajectory.jsonl"),
+        )
+        .unwrap();
+        let events: Vec<serde_json::Value> =
+            raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let calls: Vec<&serde_json::Value> =
+            events.iter().filter(|v| v["type"] == "compaction.call").collect();
+        assert!(compactor_mock.hits() >= 2, "the scenario must compact more than once");
+        assert_eq!(
+            calls.len(),
+            compactor_mock.hits(),
+            "one `compaction.call` per compactor call the server answered"
+        );
+        for c in &calls {
+            assert_eq!(c["requested_model"], "test-compactor", "{c}");
+            assert_eq!(c["reported_model"], "ignored-by-test", "{c}");
+            assert_eq!(c["usage"]["total_tokens"], 530, "{c}");
+        }
+        let turns: Vec<&serde_json::Value> =
+            events.iter().filter(|v| v["type"] == "model.completed").collect();
+        assert_eq!(turns.len(), primary.hits(), "model.completed is one per PRIMARY call");
+        assert!(turns.iter().all(|t| t["reported_model"] == "ignored-by-test"), "{turns:?}");
     }
 
     // ─── effective_prompt_occupancy (#2792) ─────────────────────────

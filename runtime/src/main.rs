@@ -44,6 +44,8 @@ mod tools;
 mod trajectory;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod usage_conformance;
 
 use lmstudio::{LmStudioClient, Message};
 use tools::Tool;

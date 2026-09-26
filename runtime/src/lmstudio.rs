@@ -250,6 +250,17 @@ pub struct ChatRequest {
     pub response_format: Option<serde_json::Value>,
 }
 
+/// (#2902 step 1b) `model` is read only as a string. Any other JSON value (an
+/// object, a number) reads as `None` rather than failing the whole reply's
+/// parse, as it did not before the field was read.
+fn lenient_model_id<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as Deserialize>::deserialize(d)?;
+    Ok(v.as_str().map(str::to_string))
+}
+
 /// One chat-completion response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatResponse {
@@ -258,8 +269,21 @@ pub struct ChatResponse {
     /// future cross-tier diagnostics).
     #[allow(dead_code)]
     pub id: String,
+    /// (#2902 step 1b) The model the server says produced this reply
+    /// (OpenAI-compatible `model`). `None` when the server did not send one;
+    /// never filled in from the request. Read through [`Self::served_model`].
+    #[serde(default, deserialize_with = "lenient_model_id")]
+    pub model: Option<String>,
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
+}
+
+impl ChatResponse {
+    /// (#2902 step 1b) The served model, when the server named one. An
+    /// empty string is not a model id and reads as `None`.
+    pub fn served_model(&self) -> Option<&str> {
+        self.model.as_deref().filter(|m| !m.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -647,6 +671,10 @@ pub(crate) fn build_streaming_request_body(req: &ChatRequest, remote: bool) -> R
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatChunk {
     pub id: String,
+    /// (#2902 step 1b) OpenAI-compatible servers name the serving model on
+    /// every chunk; the accumulator keeps the first non-empty one.
+    #[serde(default, deserialize_with = "lenient_model_id")]
+    pub model: Option<String>,
     pub choices: Vec<ChoiceDelta>,
     /// Some servers (LMStudio included, when `stream_options.include_usage`
     /// is on) emit `usage` on the final chunk. Optional everywhere.
@@ -748,6 +776,8 @@ pub struct ChunkAccumulator {
     /// Number of chunks ingested. Drives `model.partial.partial_index`
     /// (1-based) in the trajectory.
     partial_count: u32,
+    /// (#2902 step 1b) The first non-empty `model` any chunk carried.
+    model: Option<String>,
 }
 
 impl ChunkAccumulator {
@@ -760,6 +790,7 @@ impl ChunkAccumulator {
             usage: None,
             reasoning_content: String::new(),
             partial_count: 0,
+            model: None,
         }
     }
 
@@ -768,6 +799,11 @@ impl ChunkAccumulator {
     pub fn ingest(&mut self, chunk: &ChatChunk) -> u32 {
         if self.id.is_empty() && !chunk.id.is_empty() {
             self.id = chunk.id.clone();
+        }
+        if self.model.is_none() {
+            if let Some(m) = chunk.model.as_deref().filter(|m| !m.is_empty()) {
+                self.model = Some(m.to_string());
+            }
         }
         for choice in &chunk.choices {
             if let Some(content) = &choice.delta.content {
@@ -940,6 +976,7 @@ impl ChunkAccumulator {
         };
         ChatResponse {
             id: self.id,
+            model: self.model,
             choices: vec![Choice {
                 index: 0,
                 message: assistant_message,
@@ -1713,6 +1750,7 @@ mod tests {
 
     fn content_chunk(content: &str) -> ChatChunk {
         ChatChunk {
+            model: None,
             id: "t".to_string(),
             choices: vec![ChoiceDelta {
                 index: 0,
@@ -1731,6 +1769,7 @@ mod tests {
     /// (#2877) The separate-field-reasoning counterpart to `content_chunk`.
     fn reasoning_chunk(reasoning: &str) -> ChatChunk {
         ChatChunk {
+            model: None,
             id: "t".to_string(),
             choices: vec![ChoiceDelta {
                 index: 0,
@@ -1764,6 +1803,7 @@ mod tests {
         args: Option<&str>,
     ) -> ChatChunk {
         ChatChunk {
+            model: None,
             id: "t".to_string(),
             choices: vec![ChoiceDelta {
                 index: 0,
@@ -1935,6 +1975,7 @@ mod tests {
         acc.ingest(&content_chunk("hi"));
         // Final chunk carries usage.
         let final_chunk = ChatChunk {
+            model: None,
             id: "t".to_string(),
             choices: vec![ChoiceDelta {
                 index: 0,
@@ -1994,6 +2035,7 @@ mod tests {
         // `<think>` tags.
         let mut acc = ChunkAccumulator::new();
         let chunk = ChatChunk {
+            model: None,
             id: "t".to_string(),
             choices: vec![ChoiceDelta {
                 index: 0,
@@ -2526,5 +2568,70 @@ mod tests {
         }
         assert!(saw_chunk, "the chunk before the panic still arrives");
         assert!(saw_err, "a panicked reader must end the stream with an error");
+    }
+
+    // ─── (#2902 step 1b) the served model ────────────────────────────
+
+    /// A non-streaming reply's own `model` field is parsed, so a turn's
+    /// usage record can say which model actually answered; a reply without
+    /// one parses as `None`, never a fabricated id.
+    #[test]
+    fn chat_response_parses_the_served_model_when_the_server_sends_one() {
+        let with: ChatResponse = serde_json::from_str(
+            r#"{"id":"x","model":"served-a","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(with.model.as_deref(), Some("served-a"));
+        let without: ChatResponse = serde_json::from_str(
+            r#"{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(without.model, None);
+    }
+
+    /// A streamed reply carries `model` on its chunks (OpenAI-compatible
+    /// servers repeat it on every chunk); the accumulated response keeps it.
+    /// An empty string is not a model id and must not overwrite a real one.
+    #[test]
+    fn accumulated_stream_carries_the_served_model_from_its_chunks() {
+        let mut acc = ChunkAccumulator::new();
+        for raw in [
+            r#"{"id":"c","model":"served-b","choices":[{"index":0,"delta":{"role":"assistant","content":"a"}}]}"#,
+            r#"{"id":"c","model":"","choices":[{"index":0,"delta":{"content":"b"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"c","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+        ] {
+            let chunk: ChatChunk = serde_json::from_str(raw).unwrap();
+            acc.ingest(&chunk);
+        }
+        assert_eq!(acc.into_response().model.as_deref(), Some("served-b"));
+
+        let mut bare = ChunkAccumulator::new();
+        let chunk: ChatChunk = serde_json::from_str(
+            r#"{"id":"c","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        bare.ingest(&chunk);
+        assert_eq!(bare.into_response().model, None, "absent on the wire, absent here");
+    }
+
+    /// (#2902 step 1b review) A `model` that is not a string (an object, a
+    /// number) must not fail the whole reply's parse, as it did not before
+    /// the field was read: it reads as `None`.
+    #[test]
+    fn a_non_string_model_is_ignored_not_fatal() {
+        for model in [r#"{"name":"x"}"#, "7", "null", "[1]"] {
+            let resp = format!(
+                r#"{{"id":"x","model":{model},"choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}},"finish_reason":"stop"}}]}}"#
+            );
+            let r: ChatResponse = serde_json::from_str(&resp)
+                .unwrap_or_else(|e| panic!("model={model}: reply must still parse: {e}"));
+            assert_eq!(r.model, None, "model={model}");
+            let chunk = format!(
+                r#"{{"id":"c","model":{model},"choices":[{{"index":0,"delta":{{"content":"a"}}}}]}}"#
+            );
+            let c: ChatChunk = serde_json::from_str(&chunk)
+                .unwrap_or_else(|e| panic!("model={model}: chunk must still parse: {e}"));
+            assert_eq!(c.model, None, "model={model}");
+        }
     }
 }
