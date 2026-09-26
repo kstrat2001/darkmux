@@ -544,6 +544,74 @@ mod tests {
         assert_eq!(code, 200);
     }
 
+    /// A caller without the token is answered before the allow-list is
+    /// read or the provider runs.
+    #[test]
+    fn a_caller_without_the_token_reads_nothing() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = reads.clone();
+        let provider = StaticIdentityProvider {
+            local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+            peers: vec![laptop()],
+            down: None,
+        };
+        let state = FleetListenerState {
+            receiver: "studio".into(),
+            provider: Arc::new(provider),
+            token: Arc::new(|| Some(TOKEN.to_string())),
+            allow_list: Arc::new(move || {
+                r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(allow())
+            }),
+            resolve_profile: Arc::new(|_, _| ProfileResolution::Work("host".into())),
+            execute: Arc::new(|_, _| panic!("never runs")),
+            busy: Arc::new(Mutex::new(None)),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let resp = rt.block_on(async {
+            use tower::ServiceExt;
+            let body = serde_json::to_vec(&WorkSubmission::new(job("s", None), true)).unwrap();
+            let mut req = axum::http::Request::post(darkmux_fleet::SUBMISSION_PATH)
+                .header("Authorization", "Bearer wrong")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
+            router(state).oneshot(req).await.unwrap()
+        });
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "the allow-list was read for a caller without the token");
+    }
+
+    /// A request with no peer address is refused (fail closed), even with
+    /// the right token.
+    #[test]
+    fn a_request_without_a_peer_address_is_refused() {
+        let h_state = FleetListenerState {
+            receiver: "studio".into(),
+            provider: Arc::new(StaticIdentityProvider {
+                local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+                peers: vec![laptop()],
+                down: None,
+            }),
+            token: Arc::new(|| Some(TOKEN.to_string())),
+            allow_list: Arc::new(|| Ok(allow())),
+            resolve_profile: Arc::new(|_, _| ProfileResolution::Work("host".into())),
+            execute: Arc::new(|_, _| panic!("never runs")),
+            busy: Arc::new(Mutex::new(None)),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let resp = rt.block_on(async {
+            use tower::ServiceExt;
+            let body = serde_json::to_vec(&WorkSubmission::new(job("s", None), true)).unwrap();
+            let req = axum::http::Request::post(darkmux_fleet::SUBMISSION_PATH)
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            router(h_state).oneshot(req).await.unwrap()
+        });
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[test]
     fn the_listener_binds_only_a_specific_overlay_address() {
         let local = test_node("n", "studio", "100.64.0.2");
