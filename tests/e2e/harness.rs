@@ -81,6 +81,140 @@ use crate::e2e::mock_lmstudio::MockLmStudio;
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const REDIS_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// (#2898) How many times a fixture that EXITS during startup is respawned
+/// on a fresh port before boot gives up. A startup death is almost always a
+/// lost port (see [`pick_fixture_port`]); a fixture that is genuinely broken
+/// dies every time and still fails boot, naming each attempt's exit.
+const FIXTURE_START_ATTEMPTS: usize = 4;
+
+/// (#2898) Fixture ports come from 20000-32767, below every OS ephemeral
+/// range (Linux assigns 32768-60999, macOS 49152-65535). The old way, bind
+/// port 0, read it, drop the listener, spawn, handed out a port FROM the
+/// ephemeral range and freed it; in the gap, an outgoing connection (this
+/// process polls redis and the daemons connect to it, all the time) could
+/// take it as its source port, and the fixture then failed to bind and
+/// exited at once. Boot reported that as "fixture pid N was already gone
+/// when it was registered". Ports in this range are never assigned as a
+/// source port, so only another fixture choosing the same number can
+/// collide: within a process `pick_fixture_port` never hands a port out
+/// twice, and across processes `start_fixture` only accepts the answer of
+/// its OWN child, so the loser exits and retries (`FIXTURE_START_ATTEMPTS`).
+const FIXTURE_PORT_RANGE: std::ops::Range<u16> = 20_000..32_768;
+
+fn pick_fixture_port() -> Result<u16, String> {
+    use std::hash::{BuildHasher, Hasher};
+    // (#2898 review) Every port this PROCESS has handed out, never handed
+    // out again: libtest runs a binary's tests as threads, and two of them
+    // must not pick the same number at the same moment. Collisions across
+    // processes (nextest runs each test as its own) are caught by
+    // `start_fixture`'s identity check instead.
+    static HANDED_OUT: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
+    let span = u64::from(FIXTURE_PORT_RANGE.end - FIXTURE_PORT_RANGE.start);
+    let mut handed_out = HANDED_OUT.lock().unwrap_or_else(|e| e.into_inner());
+    let handed_out = handed_out.get_or_insert_with(Default::default);
+    for _ in 0..64 {
+        // `RandomState` is freshly keyed per instance, which is all the
+        // randomness a port choice needs, with no new dependency.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        let port = FIXTURE_PORT_RANGE.start + (h.finish() % span) as u16;
+        if !handed_out.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            handed_out.insert(port);
+            return Ok(port);
+        }
+    }
+    Err(format!("no free fixture port in {FIXTURE_PORT_RANGE:?} after 64 tries"))
+}
+
+/// (#2898) Why a fixture did not come up.
+enum StartFailure {
+    /// It exited during startup: retry on a fresh port.
+    Exited(String),
+    /// It is running but never answered, or it could not be recorded:
+    /// not a port problem, so no retry.
+    Other(String),
+}
+
+/// (#2898) Registers a just-spawned fixture and waits for `ready` to report
+/// it answering, noticing if it EXITS meanwhile. The exit is what the flake
+/// looked like; before this, a fixture that died on a stolen port either
+/// failed registration or, worse, left readiness polling a port something
+/// else now owned.
+fn start_fixture(
+    child: &mut Child,
+    port: u16,
+    fixtures: &mut FixtureGroup,
+    timeout: Duration,
+    log: &std::path::Path,
+    mut ready: impl FnMut() -> bool,
+) -> Result<(), StartFailure> {
+    let exited = |child: &mut Child| -> Option<String> {
+        match child.try_wait() {
+            Ok(Some(status)) => Some(format!("exited ({status}) during startup; {}", log_tail(log))),
+            _ => None,
+        }
+    };
+    if let Err(e) = fixtures.register(child) {
+        return Err(match exited(child) {
+            Some(why) => StartFailure::Exited(why),
+            None => StartFailure::Other(e),
+        });
+    }
+    // Registered from here on, so a death also takes its registry entry
+    // with it: the replacement gets its own.
+    let mut died = |child: &mut Child, why: String| -> StartFailure {
+        match fixtures.forget(child.id()) {
+            Ok(()) => StartFailure::Exited(why),
+            Err(e) => StartFailure::Other(format!("{why}; and then {e}")),
+        }
+    };
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(why) = exited(child) {
+            return Err(died(child, why));
+        }
+        // (#2898 review) Ready means THIS child answers: something answering
+        // on the port may be another fixture that took the same number, and
+        // this child is then about to exit on EADDRINUSE (the loop above
+        // catches that and the caller retries).
+        if ready() && listener_pids(port).contains(&child.id()) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(match exited(child) {
+        Some(why) => died(child, why),
+        None => StartFailure::Other(format!("did not answer within {timeout:?}; {}", log_tail(log))),
+    })
+}
+
+/// (#2898 review) The pids with a TCP listener on `port`, from the OS
+/// (`lsof`, present on macOS and on GitHub's ubuntu runners). Readiness uses
+/// it to confirm the process answering is the fixture it just spawned: an
+/// answer alone can come from ANOTHER fixture that took the same port.
+fn listener_pids(port: u16) -> Vec<u32> {
+    Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// The last few lines of a fixture's log, for an error message.
+fn log_tail(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().rev().take(4).collect();
+            if lines.is_empty() {
+                format!("{} is empty", path.display())
+            } else {
+                format!("{} ends: {}", path.display(), lines.into_iter().rev().collect::<Vec<_>>().join(" | "))
+            }
+        }
+        Err(e) => format!("no log at {} ({e})", path.display()),
+    }
+}
+
 /// Build `target/release/darkmux` once per `cargo test` invocation.
 /// Subsequent calls in THIS process are no-ops (per-process `OnceLock`
 /// memoization); the actual build is additionally serialized ACROSS
@@ -568,7 +702,6 @@ impl FleetHarness {
             RedisSource::Dedicated => {
                 let (redis, redis_url) =
                     spawn_redis(&tempdir.path().join("redis"), &mut fixtures)?;
-                wait_for_redis(&redis_url)?;
                 (RedisOwnership::Owned(redis), redis_url, None)
             }
             RedisSource::Shared(stream) => {
@@ -592,9 +725,6 @@ impl FleetHarness {
                 &mut fixtures,
             )?;
             nodes.push(node);
-        }
-        for node in &nodes {
-            wait_for_daemon_health(node.daemon_port)?;
         }
 
         Ok(Self {
@@ -714,7 +844,6 @@ fn shared_redis_url() -> Result<String, String> {
             let workdir = tempfile::tempdir().map_err(|e| format!("shared redis tempdir: {e}"))?;
             let mut fixtures = FixtureGroup::arm();
             let (child, url) = spawn_redis(&workdir.path().join("redis"), &mut fixtures)?;
-            wait_for_redis(&url)?;
             // `fixtures` (and its watchdog) is intentionally leaked into
             // this closure's return value having nowhere to go — it is
             // NOT stored on `SharedRedis` because nothing ever needs to
@@ -791,63 +920,81 @@ fn spawn_redis(
     workdir: &std::path::Path,
     fixtures: &mut FixtureGroup,
 ) -> Result<(Child, String), String> {
-    std::fs::create_dir_all(workdir)
-        .map_err(|e| format!("creating redis workdir: {e}"))?;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("binding redis port: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("redis local_addr: {e}"))?
-        .port();
-    drop(listener); // release for redis-server to bind
-
-    // (#2716) Built rather than chained so the fixture group can place it
-    // in the watchdog's process group before it is spawned.
-    let mut cmd = Command::new("redis-server");
-    cmd.arg("--port")
-        .arg(port.to_string())
-        .arg("--save")
-        .arg("") // disable RDB persistence (test ephemeral)
-        .arg("--appendonly")
-        .arg("no")
-        .arg("--dir")
-        .arg(workdir)
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--protected-mode")
-        .arg("no")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    fixtures.place(&mut cmd);
-    let child = cmd.spawn().map_err(|e| {
-        format!("spawning redis-server (is `redis-server` on PATH? `brew install redis`): {e}")
-    })?;
-    fixtures.register(&child)?;
-
-    let url = format!("redis://127.0.0.1:{port}");
-    Ok((child, url))
+    spawn_redis_on(workdir, fixtures, &mut pick_fixture_port)
 }
 
-fn wait_for_redis(url: &str) -> Result<(), String> {
-    let client = redis::Client::open(url)
-        .map_err(|e| format!("redis::Client::open: {e}"))?;
-    let start = Instant::now();
-    while start.elapsed() < REDIS_READY_TIMEOUT {
-        if let Ok(mut conn) = client.get_connection() {
-            let ping: redis::RedisResult<String> =
-                redis::cmd("PING").query(&mut conn);
-            if let Ok(s) = ping {
-                if s == "PONG" {
-                    return Ok(());
-                }
-            }
+/// [`spawn_redis`] with the port source injected, so a test can hand it a
+/// port that is already taken (#2898). Returns once redis answers PING; a
+/// redis that exits during startup is respawned on the next port.
+fn spawn_redis_on(
+    workdir: &std::path::Path,
+    fixtures: &mut FixtureGroup,
+    next_port: &mut dyn FnMut() -> Result<u16, String>,
+) -> Result<(Child, String), String> {
+    std::fs::create_dir_all(workdir)
+        .map_err(|e| format!("creating redis workdir: {e}"))?;
+    let log = workdir.join("redis.log");
+    let mut deaths = Vec::new();
+    for _ in 0..FIXTURE_START_ATTEMPTS {
+        let port = next_port()?;
+        // (#2716) Built rather than chained so the fixture group can place
+        // it in the watchdog's process group before it is spawned.
+        let mut cmd = Command::new("redis-server");
+        cmd.arg("--port")
+            .arg(port.to_string())
+            .arg("--save")
+            .arg("") // disable RDB persistence (test ephemeral)
+            .arg("--appendonly")
+            .arg("no")
+            .arg("--dir")
+            .arg(workdir)
+            .arg("--bind")
+            .arg("127.0.0.1")
+            .arg("--protected-mode")
+            .arg("no")
+            // (#2898) Its own log, so a startup death can say why.
+            .arg("--logfile")
+            .arg(&log)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        fixtures.place(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| {
+            format!("spawning redis-server (is `redis-server` on PATH? `brew install redis`): {e}")
+        })?;
+        let url = format!("redis://127.0.0.1:{port}");
+        match start_fixture(&mut child, port, fixtures, REDIS_READY_TIMEOUT, &log, || redis_answers(&url)) {
+            Ok(()) => return Ok((child, url)),
+            Err(StartFailure::Exited(why)) => deaths.push(format!("port {port}: {why}")),
+            Err(StartFailure::Other(why)) => return Err(format!("redis-server on port {port}: {why}")),
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!(
-        "redis at {url} did not become ready within {:?}",
-        REDIS_READY_TIMEOUT
+        "redis-server exited during startup {FIXTURE_START_ATTEMPTS} times:\n  {}",
+        deaths.join("\n  ")
     ))
+}
+
+/// One PING, bounded at every step. (#2898) Deliberately raw TCP rather than
+/// redis-rs: the client's `get_connection_with_timeout` bounds only the TCP
+/// connect, then runs its own setup exchange with NO read timeout, so a port
+/// held by anything that accepts and never replies blocked readiness forever
+/// (sampled: `get_connection_with_timeout` -> `setup_connection` -> `read`).
+fn redis_answers(url: &str) -> bool {
+    use std::io::{Read, Write};
+    let Some(port) = url.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+        return false;
+    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if stream.write_all(b"PING\r\n").is_err() {
+        return false;
+    }
+    let mut reply = [0u8; 7];
+    matches!(stream.read(&mut reply), Ok(n) if reply[..n].starts_with(b"+PONG"))
 }
 
 fn spawn_daemon(
@@ -885,46 +1032,67 @@ fn spawn_daemon(
     let process_home = node_dir.join("process-home");
     std::fs::create_dir_all(&process_home).map_err(|e| format!("process home dir: {e}"))?;
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("binding daemon port: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("daemon local_addr: {e}"))?
-        .port();
-    drop(listener);
-
-    // (#2710) Through the one constructor, so the daemon — which is
-    // long-lived and writes flow records for the whole scenario — gets
-    // the same neutralization every `FleetNode::cmd()` child gets.
-    let mut daemon_cmd = darkmux_release_cmd();
-    daemon_cmd
-        .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
-        .env("HOME", &process_home)
-        .env("DARKMUX_HOME", &home_dir)
-        .env("DARKMUX_MACHINE_ID", &spec.machine_id)
-        .env("DARKMUX_REDIS_URL", redis_url)
-        .env("DARKMUX_FLOWS_DIR", &flows_dir)
-        .env("DARKMUX_FLEET_FILE", &fleet_file)
-        .env("DARKMUX_CREW_DIR", &crew_root)
-        // Point the internal runtime at our mock LMStudio.
-        .env("OPENAI_BASE_URL", lmstudio_base_url)
-        .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // (#2727) Only set for a `boot_sharing_redis` harness — see
-    // `FleetNode::cmd()`'s matching pin for why the daemon and this
-    // node's own one-shot CLI commands must agree on the same value.
-    if let Some(stream) = redis_stream {
-        daemon_cmd.env("DARKMUX_REDIS_STREAM", stream);
+    // (#2898) Same port and startup handling as `spawn_redis`: a port from
+    // outside the ephemeral range, readiness that notices the daemon
+    // exiting, and a respawn on a fresh port if it does. Readiness is a real
+    // `GET /health` answered 200, not a bare TCP connect, which succeeds
+    // against whatever happens to hold the port.
+    let log = node_dir.join("daemon.log");
+    let mut deaths = Vec::new();
+    let mut started = None;
+    for _ in 0..FIXTURE_START_ATTEMPTS {
+        let port = pick_fixture_port()?;
+        let stderr = std::fs::File::create(&log).map_err(|e| format!("daemon log: {e}"))?;
+        // (#2710) Through the one constructor, so the daemon — which is
+        // long-lived and writes flow records for the whole scenario — gets
+        // the same neutralization every `FleetNode::cmd()` child gets.
+        let mut daemon_cmd = darkmux_release_cmd();
+        daemon_cmd
+            .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
+            .env("HOME", &process_home)
+            .env("DARKMUX_HOME", &home_dir)
+            .env("DARKMUX_MACHINE_ID", &spec.machine_id)
+            .env("DARKMUX_REDIS_URL", redis_url)
+            .env("DARKMUX_FLOWS_DIR", &flows_dir)
+            .env("DARKMUX_FLEET_FILE", &fleet_file)
+            .env("DARKMUX_CREW_DIR", &crew_root)
+            // Point the internal runtime at our mock LMStudio.
+            .env("OPENAI_BASE_URL", lmstudio_base_url)
+            .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)
+            .stdout(Stdio::null())
+            // (#2898) Kept, so a startup death can say why.
+            .stderr(stderr);
+        // (#2727) Only set for a `boot_sharing_redis` harness — see
+        // `FleetNode::cmd()`'s matching pin for why the daemon and this
+        // node's own one-shot CLI commands must agree on the same value.
+        if let Some(stream) = redis_stream {
+            daemon_cmd.env("DARKMUX_REDIS_STREAM", stream);
+        }
+        // (#2716) The daemon is the SECOND child with the leaked-orphan
+        // shape, not just redis — same `Drop`-only teardown, same outcome
+        // under a hard kill. It goes through the same guard.
+        fixtures.place(&mut daemon_cmd);
+        let mut daemon = daemon_cmd
+            .spawn()
+            .map_err(|e| format!("spawning darkmux serve for {}: {e}", spec.machine_id))?;
+        match start_fixture(&mut daemon, port, fixtures, DAEMON_READY_TIMEOUT, &log, || daemon_healthy(port)) {
+            Ok(()) => {
+                started = Some((daemon, port));
+                break;
+            }
+            Err(StartFailure::Exited(why)) => deaths.push(format!("port {port}: {why}")),
+            Err(StartFailure::Other(why)) => {
+                return Err(format!("darkmux serve for {} on port {port}: {why}", spec.machine_id));
+            }
+        }
     }
-    // (#2716) The daemon is the SECOND child with the leaked-orphan shape,
-    // not just redis — same `Drop`-only teardown, same outcome under a hard
-    // kill. It goes through the same guard.
-    fixtures.place(&mut daemon_cmd);
-    let daemon = daemon_cmd
-        .spawn()
-        .map_err(|e| format!("spawning darkmux serve for {}: {e}", spec.machine_id))?;
-    fixtures.register(&daemon)?;
+    let Some((daemon, port)) = started else {
+        return Err(format!(
+            "darkmux serve for {} exited during startup {FIXTURE_START_ATTEMPTS} times:\n  {}",
+            spec.machine_id,
+            deaths.join("\n  ")
+        ));
+    };
 
     Ok(FleetNode {
         machine_id: spec.machine_id.clone(),
@@ -941,23 +1109,160 @@ fn spawn_daemon(
     })
 }
 
-fn wait_for_daemon_health(port: u16) -> Result<(), String> {
-    let addr: SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .map_err(|e| format!("parse daemon addr: {e}"))?;
-    let start = Instant::now();
-    while start.elapsed() < DAEMON_READY_TIMEOUT {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            // TCP-reachable; daemon is up. Could also poll /health
-            // via reqwest for a stronger signal, but TCP is sufficient
-            // for the v1 harness — daemon's bind happens just after
-            // banner-print so TCP-up = serve-loop running.
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// One bounded `GET /health`: ready means the daemon answered 200.
+fn daemon_healthy(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1000)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
     }
-    Err(format!(
-        "darkmux serve on :{port} did not become reachable within {:?}",
-        DAEMON_READY_TIMEOUT
-    ))
+    let mut head = [0u8; 16];
+    let Ok(n) = stream.read(&mut head) else { return false };
+    let head = String::from_utf8_lossy(&head[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
+#[cfg(test)]
+mod fixture_port_tests {
+    use super::*;
+
+    /// Same contract as the e2e targets' own `redis_available`: skip where
+    /// redis-server is absent, fail where the run requires it (#1662).
+    fn redis_available() -> bool {
+        let ok = Command::new("redis-server")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok && std::env::var("DARKMUX_E2E_REQUIRED").is_ok() {
+            panic!("redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set");
+        }
+        ok
+    }
+
+    /// (#2898) Fixture ports never come from an OS ephemeral range, where an
+    /// outgoing connection could take one as its source port before the
+    /// fixture binds it.
+    #[test]
+    fn fixture_ports_stay_below_every_ephemeral_range() {
+        for _ in 0..200 {
+            let port = pick_fixture_port().expect("a free fixture port");
+            assert!(
+                FIXTURE_PORT_RANGE.contains(&port) && port < 32_768,
+                "port {port} is outside {FIXTURE_PORT_RANGE:?} or inside Linux's ephemeral range"
+            );
+        }
+    }
+
+    /// (#2898 review) Readiness must confirm WHO answered. Two fixtures
+    /// that pick the same port: the loser exits on EADDRINUSE, the winner
+    /// answers on that port, and a readiness check that only asks "does
+    /// something answer here?" reported the dead loser as started (measured
+    /// 5 of 5 by the reviewer's probe). Here redis A holds the port first,
+    /// and B is handed that same port; B must come up on its OWN port.
+    #[test]
+    fn a_fixture_is_ready_only_when_its_own_process_answers() {
+        if !redis_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let mut fixtures = FixtureGroup::arm();
+        let (mut a, url_a) = spawn_redis(dir_a.path(), &mut fixtures).expect("redis A");
+        let port_a: u16 = url_a.rsplit(':').next().and_then(|p| p.parse().ok()).expect("A's port");
+        let mut handed_out = 0usize;
+        let mut ports = || -> Result<u16, String> {
+            handed_out += 1;
+            if handed_out == 1 { Ok(port_a) } else { pick_fixture_port() }
+        };
+        let result = spawn_redis_on(dir_b.path(), &mut fixtures, &mut ports);
+        let (mut b, url_b) = match result {
+            Ok(ok) => ok,
+            Err(e) => {
+                let _ = a.kill();
+                let _ = a.wait();
+                fixtures.stand_down();
+                panic!("B must start on a fresh port: {e}");
+            }
+        };
+        let b_alive = matches!(b.try_wait(), Ok(None));
+        let port_b: u16 = url_b.rsplit(':').next().and_then(|p| p.parse().ok()).expect("B's port");
+        let owner = listener_pids(port_b);
+        for child in [&mut a, &mut b] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        fixtures.stand_down();
+        assert_ne!(url_b, url_a, "B was reported ready on A's port: it answered for A, not itself");
+        assert!(b_alive, "B was reported ready while it had already exited");
+        assert!(owner.contains(&b.id()), "port {port_b} is not B's listener: owners {owner:?}");
+    }
+
+    /// (#2898) The fleet e2e flake: a fixture's port is freed before the
+    /// fixture binds it, and something else can take it in between (an
+    /// outgoing connection's source port comes from the same ephemeral
+    /// range). The fixture then fails to bind and exits at once, and boot
+    /// failed with "fixture pid N was already gone when it was registered".
+    /// Here the collision is forced: the first port handed out is held open,
+    /// and boot must still produce a redis that answers.
+    #[test]
+    fn a_redis_fixture_whose_first_port_is_taken_still_starts() {
+        if !redis_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("holding a port");
+        let taken = holder.local_addr().expect("held port").port();
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let mut fixtures = FixtureGroup::arm();
+        let mut handed_out = 0usize;
+        let mut ports = || -> Result<u16, String> {
+            handed_out += 1;
+            if handed_out == 1 {
+                return Ok(taken);
+            }
+            let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+            Ok(l.local_addr().map_err(|e| e.to_string())?.port())
+        };
+        let result = spawn_redis_on(workdir.path(), &mut fixtures, &mut ports)
+            .and_then(|(child, url)| {
+                if redis_answers(&url) {
+                    Ok((child, url))
+                } else {
+                    Err(format!("{url} does not answer PING"))
+                }
+            });
+        let (mut child, url) = match result {
+            Ok(ok) => ok,
+            Err(e) => {
+                fixtures.stand_down();
+                panic!("boot must survive a fixture port that is already taken: {e}");
+            }
+        };
+        assert!(
+            !url.ends_with(&format!(":{taken}")),
+            "the redis that answered must be on a fresh port, not the taken {taken}: {url}"
+        );
+        // (#2898 review) The dead first attempt's registry entry is gone;
+        // only the redis that started is recorded.
+        let recorded: Vec<u32> = crate::e2e::fixture_reaper::registry_entries(fixtures.registry_path())
+            .into_iter()
+            .filter(|(role, _)| role == "child")
+            .map(|(_, p)| p.pid)
+            .collect();
+        assert_eq!(recorded, vec![child.id()], "the registry must hold only the fixture that started");
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(holder);
+        fixtures.stand_down();
+    }
 }

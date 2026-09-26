@@ -166,8 +166,9 @@ fn fixtures_die_when_the_harness_is_sigkilled() {
 /// a power cut, or a panic between spawn and teardown. For those the next
 /// run's startup sweep is the only recourse, and it can only reap what the
 /// registry names — so every process the harness spawns has to actually
-/// reach the file. Removing either `fixtures.register(...)` call in
-/// `harness.rs` makes this fail.
+/// reach the file. Removing the `fixtures.register(...)` call in
+/// `harness.rs`'s `start_fixture` (every fixture goes through it, #2898)
+/// makes this fail.
 #[test]
 fn every_fixture_reaches_this_run_s_registry_file() {
     if !redis_available() {

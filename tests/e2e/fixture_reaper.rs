@@ -733,6 +733,29 @@ impl FixtureGroup {
         })
     }
 
+    /// (#2898) Removes `pid`'s `child` entry from the registry. For a
+    /// fixture that EXITED during startup and is being replaced on a fresh
+    /// port: its entry names a process that no longer exists, so the sweep
+    /// would never reap anything by it, and every live-entry assertion over
+    /// the registry would read it as a fixture that got away. Other entries,
+    /// the owner line included, are kept byte for byte. Written to a sibling
+    /// file and renamed over, so a reader never sees a half-written registry.
+    pub fn forget(&mut self, pid: u32) -> Result<(), String> {
+        let body = std::fs::read_to_string(&self.registry)
+            .map_err(|e| format!("reading the fixture registry {}: {e}", self.registry.display()))?;
+        let kept: String = body
+            .split_inclusive('\n')
+            .filter(|line| {
+                !matches!(ProcId::from_line(line.trim_end_matches('\n')),
+                    Some((ref role, ref proc)) if role == "child" && proc.pid == pid)
+            })
+            .collect();
+        let tmp = PathBuf::from(format!("{}.forget", self.registry.display()));
+        std::fs::write(&tmp, kept)
+            .and_then(|()| std::fs::rename(&tmp, &self.registry))
+            .map_err(|e| format!("rewriting the fixture registry {}: {e}", self.registry.display()))
+    }
+
     /// Orderly teardown: tell the watchdog NOT to signal the group (the
     /// harness's own `Drop` has already killed, or is about to kill, each
     /// child individually), wait for it to exit, and drop this run's
@@ -768,9 +791,9 @@ impl FixtureGroup {
 // every scope exit — including the ones where the fixtures are still alive.
 //
 // `FleetHarness::boot` is the case that matters. It arms the group, spawns
-// redis through it, and then has four fallible steps before it returns:
-// `wait_for_redis`, `MockLmStudio::spawn`, `spawn_daemon`, and a
-// 15-second `wait_for_daemon_health` TCP poll. On `?` from any of them the
+// redis through it, and then has fallible steps before it returns: redis's
+// readiness wait, `MockLmStudio::spawn`, and `spawn_daemon` with its
+// 15-second `/health` wait (#2898). On `?` from any of them the
 // nodes' own `Drop` kills the daemons, but `redis: Child` drops to NOTHING
 // — `std::process::Child` has no killing `Drop` — and a `Drop` here would
 // then tell the watchdog to stand down and delete the record. The redis
@@ -1122,6 +1145,38 @@ mod tests {
     /// write failure) leaves this run's fixtures unregistered for its whole
     /// lifetime. Swallowing that in an `if let Ok` is the repo's
     /// no-silent-wrong-key rule inverted.
+    #[test]
+    fn forget_removes_only_the_named_child_entry() {
+        let mut group = FixtureGroup::arm();
+        let mut kept = spawn_stranger();
+        let mut gone = spawn_stranger();
+        group.register(&kept).expect("registering the kept fixture");
+        group.register(&gone).expect("registering the forgotten fixture");
+        let before = std::fs::read_to_string(group.registry_path()).expect("registry");
+
+        group.forget(gone.id()).expect("forgetting a registered fixture");
+
+        let after = std::fs::read_to_string(group.registry_path()).expect("registry");
+        let pids: Vec<u32> = registry_entries(group.registry_path())
+            .into_iter()
+            .filter(|(role, _)| role == "child")
+            .map(|(_, p)| p.pid)
+            .collect();
+        assert_eq!(pids, vec![kept.id()], "only the forgotten pid's entry may go");
+        assert!(after.starts_with("owner\t"), "the owner line must survive: {after:?}");
+        assert_eq!(
+            before.lines().filter(|l| !l.contains(&format!("\t{}\t", gone.id()))).collect::<Vec<_>>(),
+            after.lines().collect::<Vec<_>>(),
+            "every other line must be kept as it was"
+        );
+
+        for child in [&mut kept, &mut gone] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        group.stand_down();
+    }
+
     #[test]
     fn register_reports_a_failure_instead_of_swallowing_it() {
         let mut group = FixtureGroup::arm();
