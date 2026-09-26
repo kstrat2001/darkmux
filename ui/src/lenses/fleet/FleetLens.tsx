@@ -651,10 +651,8 @@ export function FleetLens({
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
   // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
   // this call site rather than inside `tokensOffMeter`/`hybridNote`
-  // themselves (see `savings.ts`'s module doc for the full reasoning). A
-  // no-op in live mode: `playheadT` there is `flowWindow.tMax`, which is
-  // `computeTMax(flowWindow.data)` by construction, so every record already
-  // satisfies `ts <= playheadT`. In replay, `playheadT` is the scrubbable
+  // themselves (see `savings.ts`'s module doc for the full reasoning). In
+  // replay, `playheadT` is the scrubbable
   // position `PlaybackLens` passes as its `playhead` prop, so this is what
   // makes scrubbing before a session's completion drop that session's
   // tokens out of "local" and into "unattributed" — the token half of the

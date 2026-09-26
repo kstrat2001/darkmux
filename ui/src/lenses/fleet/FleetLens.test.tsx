@@ -1928,8 +1928,11 @@ describe("(#2911) the fleet card ticks while an execution is live", () => {
     // per-session index built over it depend only on records, and a tick
     // brings none: rebuilding them every second was a ~100 ms hitch per
     // second on a busy day. Measured here as "no new session index is built
-    // across ticks", which holds only while the window array is the same
-    // object AND the card's session lookups go through its index.
+    // across ticks", which pins the window half: the merged array stayed the
+    // same object. It does NOT pin that the card's lookups use the index (a
+    // lookup reverted to a whole-window scan builds nothing either); that
+    // half is pinned where each lookup lives, in `flow.test.ts`
+    // (`sessionRunning`) and `cards.test.ts` (the heartbeat reads).
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     vi.setSystemTime(new Date(FROZEN_NOW));
     mockFleetFetch({
@@ -2049,5 +2052,49 @@ describe("(#2911) fleet card wording", () => {
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     expect(document.querySelector(".mach")!.textContent).toContain("idle");
     expect(latestTokenScopeProps()).toMatchObject({ state: "idle", centerUnit: "idle" });
+  });
+});
+
+// (#2911) Live, the hero reads the window by reference: a record the daemon
+// already delivered counts even when it is stamped ahead of the viewer's own
+// clock (a peer whose clock runs fast). That matches the live event log and
+// `/runs`, which never filtered on the viewer's clock. A replay keeps the
+// playhead gate, where excluding what has not happened yet is the point.
+describe("(#2911) a record stamped ahead of the viewer's clock", () => {
+  const records = () => {
+    const today = todayUTC();
+    return [
+      { ts: `${today}T09:00:00.000Z`, action: "note", source: "orchestrator", handle: "the earlier note" },
+      { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // FROZEN_NOW is 10:02; both of these are two minutes in its future.
+      { ts: `${today}T10:04:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
+      { ts: `${today}T10:04:00.000Z`, action: "note", source: "orchestrator", handle: "the future-stamped note" },
+    ];
+  };
+
+  it("counts in the live hero", async () => {
+    expect(Date.now()).toBeLessThan(Date.parse(`${todayUTC()}T10:04:00.000Z`));
+    mockFleetFetch({ flowToday: records() });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
+    expect(screen.getByText(/the future-stamped note/)).toBeInTheDocument();
+  });
+
+  it("is excluded under a playhead before it", async () => {
+    const today = todayUTC();
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens
+          records={records()}
+          tMax={Date.parse(`${today}T10:04:00.000Z`)}
+          tMin={Date.parse(`${today}T09:00:00.000Z`)}
+          playhead={Date.parse(`${today}T10:02:00.000Z`)}
+          historical
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
+    expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
   });
 });

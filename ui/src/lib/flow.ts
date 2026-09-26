@@ -630,31 +630,40 @@ export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[
  * first read. Every producer builds a new array (`buildFlowWindow`, the
  * playback slices), so that already holds; a caller that appended to an
  * array in place after reading it would get the stale grouping. */
-const sessionIndexCache = new WeakMap<readonly FlowRecord[], Map<string, FlowRecord[]>>();
-const NO_RECORDS: FlowRecord[] = [];
+const sessionIndexCache = new WeakMap<readonly FlowRecord[], Map<unknown, readonly FlowRecord[]>>();
+/** Returned on every miss, shared: typed `readonly` (as are the groups) so a
+ *  caller cannot `push` into it and corrupt every later lookup. */
+const NO_RECORDS: readonly FlowRecord[] = [];
 let sessionIndexBuilds = 0;
 
 /** Test-only: how many session indexes have been built. A test that ticks a
- *  lens asserts this does NOT move, which pins both halves of the #2911 cost
- *  fix at once: the window array stayed the same object across the tick,
- *  and the per-session lookups went through the index built for it. */
+ *  lens asserts this does NOT move, which pins that the window array stayed
+ *  the same object across the tick. It cannot see whether a lookup went
+ *  through the index (a whole-window scan builds nothing); the callers'
+ *  own tests pin that by reading from an index the array has outgrown. */
 export function __sessionIndexBuilds(): number {
   return sessionIndexBuilds;
 }
 
-export function sessionRecords(data: readonly FlowRecord[], sid: string): FlowRecord[] {
+export function sessionRecords(data: readonly FlowRecord[], sid: string): readonly FlowRecord[] {
   let index = sessionIndexCache.get(data);
   if (!index) {
-    index = new Map();
+    // Keyed on `session_id` exactly as the record carries it, whatever its
+    // type: the scans this replaces compared `r.session_id === sid`, and a
+    // `Map` key matches the same way (SameValueZero). Its one difference,
+    // `NaN` equal to itself, is answered below the way the scan answered it.
+    const groups = new Map<unknown, FlowRecord[]>();
     for (const r of data) {
-      if (!r || typeof r.session_id !== "string") continue;
-      const group = index.get(r.session_id);
+      if (!r) continue;
+      const group = groups.get(r.session_id);
       if (group) group.push(r);
-      else index.set(r.session_id, [r]);
+      else groups.set(r.session_id, [r]);
     }
+    index = groups;
     sessionIndexCache.set(data, index);
     sessionIndexBuilds++;
   }
+  if (Number.isNaN(sid)) return NO_RECORDS;
   return index.get(sid) ?? NO_RECORDS;
 }
 

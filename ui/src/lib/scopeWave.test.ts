@@ -58,6 +58,9 @@ describe("(#2911) wavePhaseStep: the GEN wave's visible speed follows the rate a
     expect(wavePhaseStep(30, Number.NaN, 1)).toBe(0);
     expect(wavePhaseStep(-50, 1 / 60, 1)).toBe(0);
     expect(wavePhaseStep(Number.POSITIVE_INFINITY, 0, 1)).toBe(0);
+    // A finite rate large enough that the soft clip's own `u` overflows to
+    // Infinity must still read as the cap, not `Infinity / Infinity`.
+    expect(wavePhaseStep(Number.MAX_VALUE, 1 / 60, 10)).toBeCloseTo(PHASE_STEP_CAP, 12);
   });
 });
 

@@ -14,6 +14,7 @@ import {
   asRecordArray,
   missionReplayDate,
   sessionRecords,
+  sessionRunning,
   dispatchEnd,
   __sessionIndexBuilds,
 } from "./flow";
@@ -457,7 +458,8 @@ describe("missionReplayDate (header owns liveness — a RUNNING mission is live,
 });
 
 describe("(#2911) sessionRecords — the per-window session index", () => {
-  const rec = (sid: string | undefined, action: string, ts: string) => ({ ts, session_id: sid, action }) as FlowRecord;
+  const rec = (sid: unknown, action: string, ts: string) => ({ ts, session_id: sid, action }) as FlowRecord;
+  const dup = rec("b", "dispatch.turn", "2026-09-26T10:00:04Z");
   const data: FlowRecord[] = [
     rec("a", "dispatch.start", "2026-09-26T10:00:00Z"),
     rec("b", "dispatch.start", "2026-09-26T10:00:01Z"),
@@ -465,14 +467,56 @@ describe("(#2911) sessionRecords — the per-window session index", () => {
     // An empty id is still a string, and the scan matched it for `""`.
     rec("", "dispatch.start", "2026-09-26T10:00:02Z"),
     rec("a", "dispatch.complete", "2026-09-26T10:00:03Z"),
+    // The same record object twice: the scan returns it twice, in place.
+    dup,
+    rec("a", "dispatch.turn", "2026-09-26T10:00:05Z"),
+    dup,
+    // A malformed id is not a string. The scan compared with `===`, so a
+    // caller holding the same value (a sid read off such a record) found it.
+    rec(42, "dispatch.start", "2026-09-26T10:00:06Z"),
+    rec(null, "note", "2026-09-26T10:00:07Z"),
+    // `NaN === NaN` is false, so the scan found nothing for it.
+    rec(Number.NaN, "note", "2026-09-26T10:00:08Z"),
   ];
 
   it("is exactly the whole-window scan it replaces, in window order", () => {
-    for (const sid of ["a", "b", "missing", ""]) {
+    for (const sid of ["a", "b", "missing", "", "42", 42, undefined, null, Number.NaN] as unknown as string[]) {
       expect(sessionRecords(data, sid)).toEqual(data.filter((r) => r.session_id === sid));
     }
+    expect(sessionRecords(data, 42 as unknown as string)).toHaveLength(1);
+    expect(sessionRecords(data, "42")).toHaveLength(0);
+    expect(sessionRecords(data, "b")).toEqual([data[1], dup, dup]);
     expect(dispatchEnd(data, "a")).toBe(data[4]);
     expect(dispatchEnd(data, "b")).toBeUndefined();
+  });
+
+  it("hands out groups (and the shared miss) as readonly, so a push cannot corrupt later lookups", () => {
+    // Type-level: `bun run typecheck` fails if either return widens back to a
+    // mutable array (the directives below would then be unused). Never run.
+    const typeOnly = () => {
+      // @ts-expect-error a session's group is readonly
+      sessionRecords(data, "a").push(data[0]);
+      // @ts-expect-error the shared miss is readonly
+      sessionRecords(data, "missing").push(data[0]);
+    };
+    void typeOnly;
+    expect(sessionRecords(data, "missing")).toBe(sessionRecords([...data], "other-miss"));
+  });
+
+  // Pins that `sessionRunning` reads a session's records THROUGH the index
+  // (the #2911 cost fix), not with a whole-window scan that happens to agree.
+  // The instrument deliberately breaks the never-mutated-after-read contract:
+  // a record appended after the index is built is invisible to the index and
+  // visible to any scan, so the two routes give different answers.
+  it("sessionRunning answers from the window's index, not a whole-window scan", () => {
+    const t = Date.parse("2026-09-26T10:00:10Z");
+    const win: FlowRecord[] = [rec("x", "dispatch.start", "2026-09-26T10:00:00Z")];
+    expect(sessionRunning(win, new Set(), "s", t)).toBe(false);
+    win.push(rec("s", "dispatch.start", "2026-09-26T10:00:09Z"));
+    expect(sessionRunning(win, new Set(), "s", t)).toBe(false);
+    // Control: a fresh array (a fresh index) does see it, so the `false`
+    // above is the index talking, not a record that never counted.
+    expect(sessionRunning([...win], new Set(), "s", t)).toBe(true);
   });
 
   it("indexes a window once, and a new window array gets its own index", () => {
@@ -483,7 +527,7 @@ describe("(#2911) sessionRecords — the per-window session index", () => {
     sessionRecords(win, "b");
     expect(__sessionIndexBuilds()).toBe(before + 1);
     const next = [...win, rec("a", "dispatch.turn", "2026-09-26T10:00:04Z")];
-    expect(sessionRecords(next, "a")).toHaveLength(3);
+    expect(sessionRecords(next, "a")).toHaveLength(4);
     expect(__sessionIndexBuilds()).toBe(before + 2);
   });
 });

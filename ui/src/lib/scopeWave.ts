@@ -57,10 +57,12 @@ export function wavePhaseStep(tps: number, dt: number, tempo: number): number {
   if (raw <= PHASE_STEP_KNEE) return raw;
   // A rational soft clip, `u / (1 + u)`: slope 1 at the knee (no kink) and
   // strictly increasing all the way, where `tanh` would saturate exactly in
-  // floating point past a few hundred tok/s at 60 Hz.
+  // floating point past a few hundred tok/s at 60 Hz. Written as
+  // `1 - 1 / (1 + u)` so a finite `raw` whose `u` overflows to Infinity
+  // still lands on the cap instead of `Infinity / Infinity`.
   const room = PHASE_STEP_CAP - PHASE_STEP_KNEE;
   const u = (raw - PHASE_STEP_KNEE) / room;
-  return PHASE_STEP_KNEE + room * (u / (1 + u));
+  return PHASE_STEP_KNEE + room * (1 - 1 / (1 + u));
 }
 
 /** The wave's WHOLE lobe count now, the one it is leaving, and how far the
