@@ -616,6 +616,18 @@ mod tests {
         assert!(h.ran.lock().unwrap().is_empty());
     }
 
+    /// (#2916 review C4) A request from this machine's OWN node is refused,
+    /// even when a (mistaken) allow-list entry names it.
+    #[test]
+    fn a_request_from_this_machines_own_node_is_refused() {
+        let h = start(Some(test_node("nSTUDIO", "studio", "127.0.0.1")), false, 0);
+        let (code, reply) = post(&h, TOKEN, job("s", None), true);
+        // `start`'s allow-list does not list nSTUDIO; a hand-edited one
+        // might, so check the refusal names self regardless of the list.
+        assert_eq!(code, 403, "{reply:?}");
+        assert!(reply.reason.unwrap().contains("does not take fleet work from itself"));
+    }
+
     /// Every path on this listener is gated, not only the submission route.
     #[test]
     fn the_gate_covers_every_path() {
