@@ -57,9 +57,11 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
 
   it("machines sharing a name are all disambiguated, and the bare name then opens neither", () => {
     const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac")]);
-    expect(encodeMachineKey(c, UID_A)).toBe(`mac~${h(UID_A)}`);
-    expect(encodeMachineKey(c, UID_B)).toBe(`mac~${h(UID_B)}`);
-    expect(decodeMachineKey(c, `mac~${h(UID_B)}`).uid).toBe(UID_B);
+    expect(encodeMachineKey(c, UID_A)).toBe(`mac_${h(UID_A)}`);
+    expect(encodeMachineKey(c, UID_B)).toBe(`mac_${h(UID_B)}`);
+    expect(decodeMachineKey(c, `mac_${h(UID_B)}`).uid).toBe(UID_B);
+    // The separator survives URLSearchParams unencoded, so a link reads as typed.
+    expect(new URLSearchParams({ machine: encodeMachineKey(c, UID_B) }).toString()).toBe(`machine=mac_${h(UID_B)}`);
     expect(decodeMachineKey(c, "mac")).toEqual(NOT_FOUND);
   });
 
@@ -74,8 +76,8 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
       assertBijective(ctx([rec(UID_A, "2026-09-27T01:00:00Z", fake), rec(UID_B, "2026-09-27T02:00:00Z")]), [UID_A, UID_B]);
       assertBijective(ctx([rec(UID_B, "2026-09-27T01:00:00Z"), rec(UID_A, "2026-09-27T02:00:00Z", fake)]), [UID_A, UID_B]);
     });
-    it("a machine literally named like another's disambiguated key — either order", () => {
-      const fake = `mac~${h(UID_B)}`;
+    for (const sep of ["_", "~"]) it(`a machine literally named like another's disambiguated key ("${sep}") — either order`, () => {
+      const fake = `mac${sep}${h(UID_B)}`;
       const three = (fakeFirst: boolean) =>
         ctx(
           fakeFirst
@@ -149,6 +151,11 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
       const after = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_D, "2026-09-27T00:00:00Z", "mac")]);
       expect(decodeMachineKey(after, ka)).toEqual(NOT_FOUND);
     });
+  });
+
+  it("an already-shared `~` key (the earlier separator) still opens its machine, and is rewritten to the `_` form", () => {
+    const c = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_B, "2026-09-27T02:00:00Z", "mac")]);
+    expect(decodeMachineKey(c, `mac~${h(UID_B)}`)).toEqual({ uid: UID_B, key: `mac_${h(UID_B)}`, stale: true });
   });
 
   it("a presence-only machine is keyed by its beat's display name", () => {

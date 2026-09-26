@@ -824,6 +824,21 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     expect(screen.getByText(/machine: studio/)).toBeInTheDocument();
   });
 
+  it("(#2929) a link shared with the earlier `~` separator opens its machine and is rewritten to the `_` form", async () => {
+    const TWIN = "1B2C3D4E-5F60-4172-9384-B5C6D7E8F9A0";
+    mockPinnedFetch({
+      flowToday: [
+        { ts: `${todayUTC()}T00:00:00Z`, machine_uid: FAKE_UID, machine_id: "MacBook-Pro" },
+        { ts: `${todayUTC()}T01:00:00Z`, machine_uid: TWIN, machine_id: "MacBook-Pro" },
+      ],
+    });
+    const hx = machineKeyHash(TWIN).slice(0, 6);
+    window.location.hash = `#lens=runs&machine=MacBook-Pro%7E${hx}`;
+    renderBoard("all", null, `MacBook-Pro~${hx}`);
+    await waitFor(() => expect(window.location.hash).toBe(`#lens=runs&machine=MacBook-Pro_${hx}`));
+    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+  });
+
   it("(#2929) a name key pins the machine it names", async () => {
     mockPinnedFetch();
     renderBoard("all", null, "MacBook-Pro");

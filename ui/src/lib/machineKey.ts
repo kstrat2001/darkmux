@@ -14,7 +14,7 @@ import { T, displayNameOf, machineUids, ownMachineName, type RosterName, type Se
  * - a machine whose name (`ownMachineName`: an observed `machine_id`, this
  *   daemon's specs name, then the roster id) no other machine holds is keyed
  *   by that bare name — what its fleet card is titled with;
- * - a machine whose name another machine also holds is `<name>~<hash>`, and
+ * - a machine whose name another machine also holds is `<name>_<hash>`, and
  *   a machine with no name is `unnamed-<hash>`, where `<hash>` is a short
  *   one-way hash of its uid (`machineKeyHash`, 6 hex by default);
  * - a roster-only card (declared, never seen) is keyed by its roster id,
@@ -32,7 +32,7 @@ import { T, displayNameOf, machineUids, ownMachineName, type RosterName, type Se
  *
  * No two machines ever share a key: generated keys are assigned first, and a
  * name that equals one already taken (a machine literally named
- * `unnamed-3fa1c2`, or `studio~3fa1c2`), or the not-found marker, is
+ * `unnamed-3fa1c2`, or `studio_3fa1c2`), or the not-found marker, is
  * disambiguated with its own hash instead.
  *
  * Old links carried the uid itself. `decodeMachineKey` still resolves those
@@ -82,8 +82,17 @@ export function machineKeyHash(uid: string): string {
   return n.toString(16).padStart(14, "0");
 }
 
-/** A generated key's hash part: `unnamed-<hex>` or `<anything>~<hex>`. */
-const HASHED_KEY = /^(?:unnamed-|.*~)([0-9a-f]{6,14})$/;
+/** Between a shared name and its hash. `_` because `URLSearchParams` leaves
+ *  it unencoded (it keeps only alphanumerics and `*-._`), so a link reads as
+ *  typed, and because a hostname-derived `machine_id` cannot contain it (DNS
+ *  labels are letters, digits and `-`; `.` would have looked like the mDNS
+ *  `.local` suffix names already carry). `~` was the first separator; links
+ *  shared with it still resolve (below) and are rewritten to `_`. */
+const SEP = "_";
+
+/** A generated key's hash part: `unnamed-<hex>`, or `<anything>_<hex>`
+ *  (`~` accepted from links minted before the separator changed). */
+const HASHED_KEY = /^(?:unnamed-|.*[_~])([0-9a-f]{6,14})$/;
 
 interface KeyTable {
   keyOf: Map<string, string>;
@@ -179,17 +188,17 @@ function buildKeyTable(ctx: MachineKeyContext): KeyTable {
   for (const uid of seen) {
     const name = names.get(uid) ?? null;
     if (name === null) assign(uid, hashed(uid, UNNAMED_PREFIX));
-    else if ((nameCount.get(name) ?? 0) > 1) assign(uid, hashed(uid, `${name}~`));
+    else if ((nameCount.get(name) ?? 0) > 1) assign(uid, hashed(uid, `${name}${SEP}`));
   }
   // 2. Unique names, bare when free; otherwise disambiguated like a shared
   //    one. Then roster-only ids, the same way.
   for (const uid of seen) {
     if (keyOf.has(uid)) continue;
     const name = names.get(uid) as string;
-    assign(uid, taken.has(name) ? hashed(uid, `${name}~`) : name);
+    assign(uid, taken.has(name) ? hashed(uid, `${name}${SEP}`) : name);
   }
   for (const id of rosterOnly) {
-    assign(id, taken.has(id) || (nameCount.get(id) ?? 0) > 1 ? hashed(id, `${id}~`) : id);
+    assign(id, taken.has(id) || (nameCount.get(id) ?? 0) > 1 ? hashed(id, `${id}${SEP}`) : id);
   }
   return { keyOf, uidOf, rosterOnly: new Set(rosterOnly), declaredUid };
 }
