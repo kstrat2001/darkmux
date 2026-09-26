@@ -53,32 +53,59 @@ use darkmux_types::{CapabilityProfile, Profile, ProfileModel};
 /// **Precedence note:** operator-pin precedence sits ABOVE this in the
 /// dispatch path (a later slice of #590).
 ///
+/// **`utility_model`** (#2914) is the machine's utility model
+/// (`internal.utility`), which is NEVER a task's model: it is set aside
+/// before anything else happens, so a profile that still lists it (a
+/// pre-4.0 leftover `darkmux doctor` flags) can neither default to it nor
+/// score it. Compared on the bare model key, so a namespaced binding
+/// matches a bare profile entry and vice versa. `None` means nothing is
+/// set aside — the lab's benchmark opt-in (`DispatchOpts::
+/// allow_utility_model`), which is how a candidate utility model gets
+/// measured through a profile before it is registered.
+///
 /// **Errors** with an operator-actionable message when the profile has no
-/// models at all. The caller decides whether to bail or fall back
-/// (`dispatch_internal::dispatch` probes for back-compat with a loud
-/// deprecation warning).
-pub(crate) fn select_model<'a, F>(role: &Role, profile: &Profile, skill_lookup: F) -> Result<String>
+/// work models: none at all, or only the utility model. The caller decides
+/// whether to bail or fall back (`dispatch_internal::dispatch` probes for
+/// back-compat with a loud deprecation warning).
+pub(crate) fn select_model<'a, F>(
+    role: &Role,
+    profile: &Profile,
+    skill_lookup: F,
+    utility_model: Option<&str>,
+) -> Result<String>
 where
     F: Fn(&str) -> Option<&'a Skill>,
 {
     let request = role.capabilities(skill_lookup);
-    // (#590) The profile's `models[]` are all work models — the compactor moved
-    // to the registry's `internal.utility` binding, so there's no util model to
-    // exclude from the candidate set.
-    let any_offers = profile.models.iter().any(|m| !m.capabilities.is_empty());
+    let candidates = work_models(profile, utility_model);
+    if candidates.is_empty() {
+        return Err(match utility_model {
+            Some(util) if !profile.models.is_empty() => utility_only_error(util),
+            _ => no_default_error(),
+        });
+    }
+    let any_offers = candidates.iter().any(|m| !m.capabilities.is_empty());
+
+    // The deterministic default among the WORK models: the declared
+    // `default_model` when it is one of them, else the first work model
+    // (a declared default that names the utility model is set aside with
+    // it).
+    let default_id = profile
+        .default_model_id()
+        .filter(|d| candidates.iter().any(|m| m.id == *d))
+        .or_else(|| candidates.first().map(|m| m.id.as_str()));
 
     // Nothing to differentiate on (no requested capabilities, or no model
     // offers a vector) → the deterministic default model. This is the path
     // every shipped profile takes until operators populate `capabilities`.
     if request.is_empty() || !any_offers {
-        return default_or_error(profile);
+        return default_id.map(String::from).ok_or_else(no_default_error);
     }
 
     // Capability scoring: highest weighted-dot-product wins; a flat tie breaks
     // toward the default model, then first-declared.
-    let default_id = profile.default_model_id();
     let mut best: Option<(&ProfileModel, f32)> = None;
-    for m in &profile.models {
+    for m in candidates {
         let s = score(&request, m);
         let take = match best {
             None => true,
@@ -93,8 +120,51 @@ where
             best = Some((m, s));
         }
     }
-    // `any_offers` ⇒ models is non-empty, so `best` is always `Some` here.
+    // `candidates` is non-empty (checked above), so `best` is always `Some`.
     best.map(|(m, _)| m.id.clone()).ok_or_else(no_default_error)
+}
+
+/// (#2914) A profile's WORK models: its `models[]` with the machine's
+/// utility model set aside (matched on the bare model key, either spelling).
+/// The one predicate every selection path and the mission launcher's
+/// staffing refusal share, so "which models may a task run on" has one
+/// answer. `None` sets nothing aside.
+pub fn work_models<'a>(profile: &'a Profile, utility_model: Option<&str>) -> Vec<&'a ProfileModel> {
+    profile
+        .models
+        .iter()
+        .filter(|m| !is_local_utility_model(m, utility_model))
+        .collect()
+}
+
+/// (#2914 review, C2) Whether a profile model IS the machine's local
+/// utility instance: a LOCAL model (no endpoint) whose bare id matches the
+/// binding. A hosted model that happens to share the id is served
+/// elsewhere and is never the utility instance, so it stays a work model.
+pub fn is_local_utility_model(model: &ProfileModel, utility_model: Option<&str>) -> bool {
+    !model.is_remote() && utility_model.is_some_and(|u| names_utility_model(&model.id, u))
+}
+
+/// (#2914) Whether `candidate` names the machine's utility model, in either
+/// spelling: the bare model key or the `darkmux:`-namespaced identifier on
+/// either side (`internal.utility` accepts both, #1615, and a step's
+/// `config.model` carries the namespaced wire id). The ONE comparison every
+/// utility-model check uses.
+pub fn names_utility_model(candidate: &str, utility_model: &str) -> bool {
+    let bare = crate::dispatch_internal::bare_model_key;
+    bare(candidate) == bare(utility_model)
+}
+
+/// (#2914) The error for a profile whose only model is the utility model.
+/// Public so the mission launcher refuses a task staffed on such a profile
+/// with the same words the dispatch would have used.
+pub fn utility_only_error(utility_model: &str) -> anyhow::Error {
+    anyhow!(
+        "the profile lists only `{utility_model}`, the machine's utility model \
+         (`internal.utility`), and a task never runs on the utility model. Add a work \
+         model to the profile's `models[]` (and drop `{utility_model}` from it: its window \
+         is declared in `internal.utility`). (#2914)"
+    )
 }
 
 /// Weighted dot product Σ `request[c] × offer[c]`. A model with no declared
@@ -119,13 +189,6 @@ fn score(request: &CapabilityProfile, model: &ProfileModel) -> f32 {
             req_w * offer_w
         })
         .sum()
-}
-
-fn default_or_error(profile: &Profile) -> Result<String> {
-    profile
-        .default_model_id()
-        .map(String::from)
-        .ok_or_else(no_default_error)
 }
 
 fn no_default_error() -> anyhow::Error {
@@ -206,7 +269,7 @@ mod tests {
         let profile = profile_with_primary("darkmux:qwen3.6-35b-a3b-turboquant-mlx");
         let role = make_role("coder", &["coding"]);
 
-        let id = select_model(&role, &profile, no_skills).unwrap();
+        let id = select_model(&role, &profile, no_skills, None).unwrap();
         assert_eq!(id, "darkmux:qwen3.6-35b-a3b-turboquant-mlx");
     }
 
@@ -219,9 +282,9 @@ mod tests {
         let reviewer = make_role("code-reviewer", &["code-reviewing"]);
         let analyst = make_role("analyst", &["analyzing"]);
 
-        assert_eq!(select_model(&coder, &profile, no_skills).unwrap(), "darkmux:test-model");
-        assert_eq!(select_model(&reviewer, &profile, no_skills).unwrap(), "darkmux:test-model");
-        assert_eq!(select_model(&analyst, &profile, no_skills).unwrap(), "darkmux:test-model");
+        assert_eq!(select_model(&coder, &profile, no_skills, None).unwrap(), "darkmux:test-model");
+        assert_eq!(select_model(&reviewer, &profile, no_skills, None).unwrap(), "darkmux:test-model");
+        assert_eq!(select_model(&analyst, &profile, no_skills, None).unwrap(), "darkmux:test-model");
     }
 
     /// (#590) A profile with no models AND no basis to score fails loudly with a
@@ -235,7 +298,7 @@ mod tests {
             models: vec![],
             ..Default::default()
         };
-        let result = select_model(&make_role("coder", &[]), &profile, no_skills);
+        let result = select_model(&make_role("coder", &[]), &profile, no_skills, None);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("no models configured"),
@@ -247,7 +310,7 @@ mod tests {
     /// error. Pins the edge case.
     #[test]
     fn select_errors_when_profile_is_empty() {
-        let result = select_model(&make_role("coder", &[]), &Profile::default(), no_skills);
+        let result = select_model(&make_role("coder", &[]), &Profile::default(), no_skills, None);
         assert!(result.is_err());
     }
 
@@ -269,7 +332,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(select_model(&role, &profile, lookup).unwrap(), "codestar");
+        assert_eq!(select_model(&role, &profile, lookup, None).unwrap(), "codestar");
     }
 
     /// Phase-2: an unvectored model is a 0.5-everywhere generalist — it beats a
@@ -286,7 +349,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(select_model(&role, &profile, lookup).unwrap(), "generalist");
+        assert_eq!(select_model(&role, &profile, lookup, None).unwrap(), "generalist");
     }
 
     /// Phase-2 tie-break: a non-empty request but all-empty offers resolves the
@@ -305,7 +368,7 @@ mod tests {
             ..Default::default()
         };
         // No model offers a vector → fallback path → default_model_id = "the-default".
-        assert_eq!(select_model(&role, &profile, lookup).unwrap(), "the-default");
+        assert_eq!(select_model(&role, &profile, lookup, None).unwrap(), "the-default");
     }
 
     /// Phase-2 tie-break, implicit default: with no `default_model` set, an
@@ -320,6 +383,89 @@ mod tests {
             models: vec![model_with("first", &[]), model_with("second", &[])],
             ..Default::default()
         };
-        assert_eq!(select_model(&role, &profile, lookup).unwrap(), "first");
+        assert_eq!(select_model(&role, &profile, lookup, None).unwrap(), "first");
+    }
+
+    // ─── #2914: the machine utility model is never a task's model ──────
+
+    /// (#2914) The machine's utility model is excluded from selection even
+    /// when a profile still lists it (a pre-4.0 leftover, which doctor
+    /// flags) and even when it is the profile's declared default.
+    #[test]
+    fn select_excludes_the_machine_utility_model_even_as_the_declared_default() {
+        let profile = Profile {
+            default_model: Some("util-4b".into()),
+            models: vec![model_with("util-4b", &[]), model_with("worker-35b", &[])],
+            ..Default::default()
+        };
+        // Namespaced binding, bare profile entry: matched on the bare key.
+        let id = select_model(&make_role("coder", &[]), &profile, no_skills, Some("darkmux:util-4b")).unwrap();
+        assert_eq!(id, "worker-35b", "the utility model is not a work model");
+    }
+
+    /// (#2914) Scoring never picks it either: a utility model with a perfect
+    /// capability fit still loses to the only work model.
+    #[test]
+    fn select_scoring_never_picks_the_utility_model() {
+        let coding = skill_with("coding", &[(Capability::Code, 1.0)]);
+        let lookup = |id: &str| (id == "coding").then_some(&coding);
+        let profile = Profile {
+            models: vec![
+                model_with("util-4b", &[(Capability::Code, 1.0)]),
+                model_with("worker-35b", &[(Capability::Code, 0.1)]),
+            ],
+            ..Default::default()
+        };
+        let id = select_model(&make_role("coder", &["coding"]), &profile, lookup, Some("util-4b")).unwrap();
+        assert_eq!(id, "worker-35b");
+    }
+
+    /// (#2914) A profile that lists ONLY the utility model has no work model:
+    /// a loud error naming the model, the profile's fix, and the binding.
+    #[test]
+    fn select_errors_when_a_profile_lists_only_the_utility_model() {
+        let profile = profile_with_primary("util-4b");
+        let err = select_model(&make_role("coder", &[]), &profile, no_skills, Some("util-4b")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("util-4b"), "names the model: {msg}");
+        assert!(msg.contains("utility model"), "says why: {msg}");
+        assert!(msg.contains("internal.utility"), "names the fix: {msg}");
+    }
+
+    /// (#2914) The lab's benchmark opt-in: with no exclusion supplied, a
+    /// candidate utility model IS selectable through a profile that lists
+    /// it. This is how a candidate gets measured before it is registered.
+    #[test]
+    fn select_allows_the_utility_model_when_no_exclusion_is_supplied() {
+        let profile = profile_with_primary("util-4b");
+        assert_eq!(select_model(&make_role("coder", &[]), &profile, no_skills, None).unwrap(), "util-4b");
+    }
+
+    /// (#2914 review, C2) A HOSTED profile model whose bare id happens to
+    /// match the utility id is never the local utility instance: it stays a
+    /// work model, is selectable, and is not set aside.
+    #[test]
+    fn a_hosted_model_sharing_the_utility_id_is_still_a_work_model() {
+        let hosted = ProfileModel {
+            endpoint: Some(darkmux_types::ModelEndpoint { url: Some("https://provider.example/v1".into()), ..Default::default() }),
+            ..model_with("util-4b", &[])
+        };
+        let profile = Profile { models: vec![hosted], ..Default::default() };
+        assert_eq!(work_models(&profile, Some("util-4b")).len(), 1, "a hosted model is never the local utility instance");
+        assert_eq!(select_model(&make_role("coder", &[]), &profile, no_skills, Some("util-4b")).unwrap(), "util-4b");
+    }
+
+    /// (#2914) The pure predicate the mission launcher refuses on: a profile
+    /// with no work model once the utility model is set aside.
+    #[test]
+    fn work_models_sets_the_utility_model_aside() {
+        let profile = Profile {
+            models: vec![model_with("darkmux:util-4b", &[]), model_with("worker-35b", &[])],
+            ..Default::default()
+        };
+        let ids: Vec<&str> = work_models(&profile, Some("util-4b")).iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["worker-35b"]);
+        assert!(work_models(&profile_with_primary("util-4b"), Some("util-4b")).is_empty());
+        assert_eq!(work_models(&profile, None).len(), 2, "no binding, nothing to set aside");
     }
 }

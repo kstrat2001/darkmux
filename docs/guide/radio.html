@@ -89,11 +89,10 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
 <section>
   <div class="wrap">
     <h2>Configuration</h2>
-    <p>Three keys under <code>radio</code> in <code>config.json</code>; <code>darkmux init</code> writes them visible with their defaults. Each has an env override that wins live.</p>
+    <p>Two keys under <code>radio</code> in <code>config.json</code>; <code>darkmux init</code> writes them visible with their defaults. Each has an env override that wins live. The routing seat has no key: it runs on the machine's utility model, declared once as <code>internal.utility</code> in <code>profiles.json</code> (with its own <code>n_ctx</code>), the same model that compacts context for your workers. That model is never selectable for a task, and the router's calls show up in the fleet total as utility, never as runs.</p>
     <table class="cfg">
       <thead><tr><th>Key</th><th>Env</th><th>Default</th><th>Effect</th></tr></thead>
       <tbody>
-        <tr><td><code>radio.router_profile</code></td><td><code>DARKMUX_RADIO_ROUTER_PROFILE</code></td><td>unset</td><td>Profile for the routing seat. Unset falls through to <code>role_profiles.radio-router</code>, then <code>default_profile</code>.</td></tr>
         <tr><td><code>radio.answerer_profile</code></td><td><code>DARKMUX_RADIO_ANSWERER_PROFILE</code></td><td>unset</td><td>Profile for the answering seat. Same fall-through via <code>role_profiles.radio-host</code>.</td></tr>
         <tr><td><code>radio.humor</code></td><td><code>DARKMUX_RADIO_HUMOR</code></td><td><code>50</code></td><td>0 to 100, substituted into the persona. Out-of-range values are clamped when read.</td></tr>
       </tbody>

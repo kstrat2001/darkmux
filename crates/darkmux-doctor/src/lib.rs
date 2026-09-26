@@ -170,6 +170,7 @@ pub fn run() -> DoctorReport {
         check_gh_allowlist(),
         check_removed_review_config_block(),
         check_removed_telemetry_record_every_samples(),
+        check_removed_radio_router_staffing(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -195,6 +196,7 @@ pub fn run() -> DoctorReport {
         check_state_file_permissions(),
         check_daemon_auth(),
         check_utility_model_binding(),
+        check_utility_model_in_profiles(),
         check_unpriceable_residents(),
         check_unreachable_darkmux_residents(),
         check_role_profiles(),
@@ -1231,23 +1233,28 @@ fn check_daemon_auth() -> Check {
 /// half of the silent-eviction guard (the dispatch-time check lands with the
 /// wiring); doctor flags "registered but not loaded" before you dispatch.
 fn check_utility_model_binding() -> Check {
-    let registry_util = darkmux_profiles::profiles::load_registry(None)
-        .ok()
-        .and_then(|l| l.registry.utility_model_id().map(str::to_string));
+    let registry = darkmux_profiles::profiles::load_registry(None).ok().map(|l| l.registry);
+    let registry_util = registry.as_ref().and_then(|r| r.utility_model_id().map(str::to_string));
+    let n_ctx = registry.as_ref().and_then(|r| r.utility_model_n_ctx());
     // Only query LMStudio when there's a binding to check.
     let loaded = if registry_util.is_some() {
         darkmux_profiles::lms::list_loaded().ok()
     } else {
         None
     };
-    utility_binding_status(registry_util.as_deref(), loaded.as_deref())
+    utility_binding_status(registry_util.as_deref(), n_ctx, loaded.as_deref())
 }
 
 /// Pure decision for `check_utility_model_binding`, split out so every arm is
 /// unit-testable without a live LMStudio. `loaded` is `None` when the binding
-/// is set but `lms ps` couldn't be queried.
+/// is set but `lms ps` couldn't be queried. (#2914) `n_ctx` is the window the
+/// binding declares (`internal.utility.n_ctx`); `None` for the bare-string
+/// form, which still works but gets nudged to declare one, since that window
+/// is now the ONLY source of the compactor's own context (a profile entry
+/// no longer counts).
 fn utility_binding_status(
     registry_util: Option<&str>,
+    n_ctx: Option<u32>,
     loaded: Option<&[darkmux_types::LoadedModel]>,
 ) -> Check {
     let name = "utility model".to_string();
@@ -1280,7 +1287,7 @@ fn utility_binding_status(
                       dispatch on this machine (no runtime fallback since #2571)"
                 .into(),
             hint: Some(
-                "If you're deliberately running without compaction, no action needed. To enable it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": \"<model-id>\" }`. It serves compaction (and future estimation/mission-compile) for every role, decoupled from your profiles — without it, long dispatches run without compaction. (#590, #2571)".into(),
+                "No action needed for compaction if you are deliberately running without it; radio and ACP routing NEED this binding (a message cannot be routed without a utility model). To set it: register a small fast model as this machine's utility model in ~/.darkmux/profiles.json — `\"internal\": { \"utility\": { \"id\": \"<model-id>\", \"n_ctx\": <window> } }`. It serves compaction and radio routing for every role, decoupled from your profiles, and is never selectable for a task. (#590, #2571, #2914)".into(),
             ),
         };
     };
@@ -1299,8 +1306,11 @@ fn utility_binding_status(
                 Check {
                     name,
                     status: Status::Pass,
-                    message: format!("utility model `{id}` registered and loaded"),
-                    hint: None,
+                    message: match n_ctx {
+                        Some(n) => format!("utility model `{id}` registered and loaded (n_ctx {n})"),
+                        None => format!("utility model `{id}` registered and loaded (no window declared)"),
+                    },
+                    hint: bare_binding_window_hint(id, n_ctx),
                 }
             } else {
                 Check {
@@ -1334,11 +1344,172 @@ fn utility_binding_status(
                     // What remains true is only that a hand-load moves the
                     // cost earlier. Say that and nothing more.
                     hint: Some(
-                        "No verb needs this loaded first — the binding's only job is to name the compactor, and every dispatch path self-loads it at its declared `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675)".into(),
+                        "No verb needs this loaded first — the binding names the model darkmux's own jobs run on (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it at the binding's `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch or route; if you do, keep the namespace and the context — `lms load <id> --context-length <n> --identifier darkmux:<id>` — since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675, #2914)".into(),
                     ),
                 }
             }
         }
+    }
+}
+
+/// (#2914) The nudge for a bare-string binding: since #2914 the window in
+/// `internal.utility` is the only source of the compactor's own context (a
+/// profile entry no longer counts), so an undeclared window falls back to
+/// the primary's for compaction and to a fixed 16K for radio routing, both
+/// named on stderr when they apply. `None` when a window is declared.
+fn bare_binding_window_hint(id: &str, n_ctx: Option<u32>) -> Option<String> {
+    n_ctx.is_none().then(|| {
+        format!(
+            "Declare the utility model's window once, in the binding: `\"internal\": {{ \"utility\": \
+             {{ \"id\": \"{id}\", \"n_ctx\": <window> }} }}`. Without it, compaction loads the model at \
+             the primary's window and radio routing at 16384, each saying so at dispatch time. (#2914)"
+        )
+    })
+}
+
+/// (#2914) `utility model in profiles`: a profile that still lists the
+/// machine's utility model in its `models[]` is a pre-4.0 leftover. It is
+/// harmless to a task (every selection path sets the utility model aside)
+/// but misleading: the entry looks like a work model, and its `n_ctx` no
+/// longer does anything (the window comes from `internal.utility` alone).
+/// Warn naming each profile and the window it declared, so the operator can
+/// move that number into the binding and drop the entry.
+fn check_utility_model_in_profiles() -> Check {
+    match darkmux_profiles::profiles::load_registry(None) {
+        Ok(l) => utility_in_profiles_status(&l.registry),
+        Err(_) => Check {
+            name: "utility model in profiles".into(),
+            status: Status::Warn,
+            message: "no profile registry — can't check whether a profile lists the utility model".into(),
+            hint: None,
+        },
+    }
+}
+
+/// Pure decision for [`check_utility_model_in_profiles`].
+fn utility_in_profiles_status(registry: &darkmux_types::ProfileRegistry) -> Check {
+    let name = "utility model in profiles".to_string();
+    let Some(utility) = registry.utility_model_id() else {
+        return Check { name, status: Status::Pass, message: "no machine utility model registered".into(), hint: None };
+    };
+    // Match on the bare model key in either spelling, the same comparison
+    // every utility-model check in darkmux-crew uses.
+    let bare = |id: &str| id.strip_prefix("darkmux:").unwrap_or(id).to_string();
+    let utility_key = bare(utility);
+    let mut offenders: Vec<(String, Option<u32>)> = registry
+        .profiles
+        .iter()
+        .filter_map(|(profile_name, profile)| {
+            // (C2) A hosted model sharing the id is served elsewhere, never
+            // the local utility instance: not a leftover.
+            profile
+                .models
+                .iter()
+                .find(|m| !m.is_remote() && bare(&m.id) == utility_key)
+                .map(|m| (profile_name.clone(), m.n_ctx))
+        })
+        .collect();
+    offenders.sort();
+    if offenders.is_empty() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: format!("no profile lists the utility model `{utility}`; profiles hold work models only"),
+            hint: None,
+        };
+    }
+    let listed: Vec<String> = offenders
+        .iter()
+        .map(|(p, n)| match n {
+            Some(n) => format!("{p} (n_ctx {n})"),
+            None => p.clone(),
+        })
+        .collect();
+    let window = match (registry.utility_model_n_ctx(), offenders.iter().filter_map(|(_, n)| *n).max()) {
+        (Some(declared), _) => format!("The binding already declares n_ctx {declared}"),
+        (None, Some(largest)) => format!(
+            "Move the window into the binding — `\"internal\": {{ \"utility\": {{ \"id\": \"{utility}\", \
+             \"n_ctx\": {largest} }} }}` (the largest a profile declared for it)"
+        ),
+        (None, None) => format!(
+            "Declare its window in the binding — `\"internal\": {{ \"utility\": {{ \"id\": \"{utility}\", \
+             \"n_ctx\": <window> }} }}`"
+        ),
+    };
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "profile{} list{} the utility model `{utility}` as a work model: {}",
+            if offenders.len() == 1 { "" } else { "s" },
+            if offenders.len() == 1 { "s" } else { "" },
+            listed.join(", ")
+        ),
+        hint: Some(format!(
+            "A task never runs on the utility model (#2914), so these entries are inert and their \
+             n_ctx is ignored; the window comes from `internal.utility` alone. {window}, then remove \
+             `{utility}` from each profile's `models[]` in ~/.darkmux/profiles.json. A profile with \
+             no other model needs a work model added."
+        )),
+    }
+}
+
+/// (#2914, CONFIG 1.28) The removed radio ROUTING-seat staffing:
+/// `radio.router_profile` (a config key), `role_profiles.radio-router` (a
+/// binding in the dynamic map), and the `DARKMUX_RADIO_ROUTER_PROFILE` env
+/// var. Routing runs on the machine's utility model now, so each of these
+/// is inert; `Warn` naming whichever are still set, with the one fix.
+/// Same shape as `check_removed_review_config_block` (the key is read off
+/// `radio.extras`, where the typed struct no longer has a field for it).
+fn check_removed_radio_router_staffing() -> Check {
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    let router_profile_present = cfg.radio.as_ref().is_some_and(|r| r.extras.contains_key("router_profile"));
+    let role_binding = darkmux_types::config_access::role_profile("radio-router");
+    let env_set = std::env::var("DARKMUX_RADIO_ROUTER_PROFILE").ok().is_some_and(|s| !s.trim().is_empty());
+    removed_radio_router_staffing_status(router_profile_present, role_binding.as_deref(), env_set)
+}
+
+/// Pure decision for [`check_removed_radio_router_staffing`].
+fn removed_radio_router_staffing_status(
+    router_profile_present: bool,
+    role_binding: Option<&str>,
+    env_set: bool,
+) -> Check {
+    let name = "radio router staffing (removed)".to_string();
+    let mut leftovers: Vec<String> = Vec::new();
+    if router_profile_present {
+        // Hardcoded "1.28", not `CONFIG_SCHEMA_VERSION`: the key was removed
+        // in that one version, which never changes as the schema marches on.
+        leftovers.push("config.json has `radio.router_profile` — removed in CONFIG 1.28; delete it".into());
+    }
+    if let Some(profile) = role_binding {
+        // (C6) No CLI removes a `role_profiles` binding (`config set`
+        // refuses a blank value like any other, and there is no `config
+        // unset`), so this is a hand edit, the way every other removed key's
+        // check says: name the file and the block.
+        leftovers.push(format!(
+            "config.json binds `role_profiles.radio-router` to `{profile}` — the router has no profile; \
+             delete the `radio-router` entry from the `role_profiles` block in ~/.darkmux/config.json by hand"
+        ));
+    }
+    if env_set {
+        leftovers.push("`DARKMUX_RADIO_ROUTER_PROFILE` is set in this shell — removed in CONFIG 1.28; unset it".into());
+    }
+    if leftovers.is_empty() {
+        return Check { name, status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    Check {
+        name,
+        status: Status::Warn,
+        message: leftovers.join("; "),
+        hint: Some(
+            "Since 4.0 (#2914) radio routing runs on the machine's utility model, declared once as \
+             `internal.utility` in ~/.darkmux/profiles.json (with its `n_ctx`), never on a profile. \
+             None of these settings has any effect; a profile that existed only for the router can \
+             be deleted. The answering seat is still staffed by `radio.answerer_profile` / \
+             `role_profiles.radio-host`."
+                .into(),
+        ),
     }
 }
 
@@ -12243,9 +12414,12 @@ mod tests {
         // `grep -cE '^        (checks_[a-z_]+::)?check_'` instead, or just
         // count the non-comment lines in the block.
         //
+        // (#2914) 64, not 62: `check_utility_model_in_profiles` and
+        // `check_removed_radio_router_staffing` joined the static array.
+        //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 62 + darkmux_eureka::all_rules().len();
+        let expected = 64 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -13127,6 +13301,111 @@ mod tests {
         );
     }
 
+    // ─── #2914: the machine utility model ─────────────────────────────
+
+    /// (#2914) A profile that still lists the utility model as a work model
+    /// is flagged, naming the profile(s), the window each declared, and the
+    /// fix (declare the window in `internal.utility`, drop the entry).
+    #[test]
+    fn utility_in_profiles_warns_naming_each_profile_and_the_fix() {
+        let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "internal": { "utility": "util-4b" },
+            "profiles": {
+                "deep": { "models": [{ "id": "primary-big", "n_ctx": 262144 }, { "id": "darkmux:util-4b", "n_ctx": 120000 }] },
+                "radio": { "models": [{ "id": "util-4b", "n_ctx": 16000 }] },
+                "clean": { "models": [{ "id": "worker-35b", "n_ctx": 65536 }] }
+            }
+        }))
+        .unwrap();
+        let c = super::utility_in_profiles_status(&registry);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("deep") && c.message.contains("radio"), "names both: {}", c.message);
+        assert!(!c.message.contains("clean"), "a clean profile is not named: {}", c.message);
+        let hint = c.hint.clone().unwrap_or_default();
+        assert!(hint.contains("internal.utility") && hint.contains("n_ctx"), "names the fix: {hint}");
+        assert!(hint.contains("120000"), "carries the window the operator declared, so nothing is lost: {hint}");
+
+        let clean: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
+            "profiles": { "clean": { "models": [{ "id": "worker-35b", "n_ctx": 65536 }] } }
+        }))
+        .unwrap();
+        assert_eq!(super::utility_in_profiles_status(&clean).status, Status::Pass);
+        let unbound: darkmux_types::ProfileRegistry =
+            serde_json::from_value(serde_json::json!({ "profiles": { "radio": { "models": [{ "id": "util-4b", "n_ctx": 16000 }] } } }))
+                .unwrap();
+        assert_eq!(super::utility_in_profiles_status(&unbound).status, Status::Pass, "no binding, nothing to compare");
+    }
+
+    /// (#2914 review, C2) A hosted model sharing the utility id is not a
+    /// leftover: it is served elsewhere, never the local utility instance,
+    /// so the check does not name it.
+    #[test]
+    fn utility_in_profiles_ignores_a_hosted_model_sharing_the_id() {
+        let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
+            "profiles": {
+                "hosted": { "models": [{ "id": "util-4b", "endpoint": { "url": "https://provider.example/v1" } }] }
+            }
+        }))
+        .unwrap();
+        let c = super::utility_in_profiles_status(&registry);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+    }
+
+    /// (#2914 review, C6) There is no CLI removal for a `role_profiles`
+    /// binding, so the leftover message says to edit config.json by hand
+    /// and names the path, the way every other removed key's check does.
+    #[test]
+    fn removed_radio_router_binding_says_to_edit_config_json_by_hand() {
+        let c = super::removed_radio_router_staffing_status(false, Some("radio"), false);
+        assert!(c.message.contains("~/.darkmux/config.json"), "names the file: {}", c.message);
+        assert!(c.message.contains("by hand"), "{}", c.message);
+    }
+
+    /// (#2914) The removed routing-seat staffing: `radio.router_profile`,
+    /// `role_profiles.radio-router`, and the `DARKMUX_RADIO_ROUTER_PROFILE`
+    /// env var each get named, with the fix; nothing set is a Pass.
+    #[test]
+    fn removed_radio_router_staffing_names_each_leftover() {
+        let c = super::removed_radio_router_staffing_status(false, None, false);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+
+        let c = super::removed_radio_router_staffing_status(true, None, false);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("radio.router_profile") && c.message.contains("1.28"), "{}", c.message);
+
+        let c = super::removed_radio_router_staffing_status(false, Some("radio"), false);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("role_profiles.radio-router") && c.message.contains("radio"), "{}", c.message);
+
+        let c = super::removed_radio_router_staffing_status(false, None, true);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("DARKMUX_RADIO_ROUTER_PROFILE"), "{}", c.message);
+
+        let c = super::removed_radio_router_staffing_status(true, Some("radio"), true);
+        let hint = c.hint.clone().unwrap_or_default();
+        assert!(hint.contains("internal.utility"), "the fix, once: {hint}");
+        assert!(c.message.matches("radio").count() >= 2, "every leftover named: {}", c.message);
+    }
+
+    /// (#2914) The binding check reports the declared window, and points a
+    /// bare-string binding at declaring one.
+    #[test]
+    fn utility_binding_reports_its_window_and_nudges_a_bare_binding() {
+        let loaded = vec![lm("darkmux:util-4b", "util-4b")];
+        let c = super::utility_binding_status(Some("util-4b"), Some(120_000), Some(&loaded));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("120000"), "{}", c.message);
+        let c = super::utility_binding_status(Some("util-4b"), None, Some(&loaded));
+        assert_eq!(c.status, Status::Pass, "a bare binding still works: {}", c.message);
+        assert!(
+            c.hint.clone().unwrap_or_default().contains("n_ctx"),
+            "but the hint says to declare the window: {:?}",
+            c.hint
+        );
+    }
+
     // ─── check_utility_model_binding (#590) ───────────────────────────
     fn lm(identifier: &str, model: &str) -> darkmux_types::LoadedModel {
         darkmux_types::LoadedModel {
@@ -13145,7 +13424,7 @@ mod tests {
     /// action is needed if the operator is doing this deliberately.
     #[test]
     fn utility_binding_unregistered_warns_with_setup_hint() {
-        let c = super::utility_binding_status(None, None);
+        let c = super::utility_binding_status(None, None, None);
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("no machine utility model"));
         let hint = c.hint.unwrap();
@@ -13171,7 +13450,7 @@ mod tests {
     /// is what this test pins.)
     #[test]
     fn utility_binding_unregistered_message_says_compaction_is_off_not_defaulted() {
-        let c = super::utility_binding_status(None, None);
+        let c = super::utility_binding_status(None, None, None);
         assert!(
             c.message.to_ascii_lowercase().contains("off"),
             "message must say compaction is OFF, not that it falls back to a default: {}",
@@ -13186,7 +13465,7 @@ mod tests {
 
     #[test]
     fn utility_binding_registered_but_lms_unreachable_warns() {
-        let c = super::utility_binding_status(Some("darkmux:util-4b"), None);
+        let c = super::utility_binding_status(Some("darkmux:util-4b"), None, None);
         assert_eq!(c.status, Status::Warn);
         assert!(c.message.contains("couldn't query LMStudio"));
     }
@@ -13195,11 +13474,11 @@ mod tests {
     fn utility_binding_registered_and_loaded_passes() {
         // Match by modelKey...
         let loaded = vec![lm("darkmux:util-4b", "util-4b"), lm("worker", "worker-35b")];
-        let c = super::utility_binding_status(Some("util-4b"), Some(&loaded));
+        let c = super::utility_binding_status(Some("util-4b"), None, Some(&loaded));
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("registered and loaded"));
         // ...or by the namespaced identifier.
-        let c2 = super::utility_binding_status(Some("darkmux:util-4b"), Some(&loaded));
+        let c2 = super::utility_binding_status(Some("darkmux:util-4b"), None, Some(&loaded));
         assert_eq!(c2.status, Status::Pass);
     }
 
@@ -13217,7 +13496,7 @@ mod tests {
     #[test]
     fn utility_binding_not_loaded_hint_does_not_prescribe_a_bare_manual_load() {
         let loaded = vec![lm("worker", "worker-35b")];
-        let c = super::utility_binding_status(Some("util-4b"), Some(&loaded));
+        let c = super::utility_binding_status(Some("util-4b"), None, Some(&loaded));
         assert_eq!(c.status, Status::Warn, "an unloaded utility binding is still worth surfacing");
         assert!(c.message.contains("registered but NOT loaded"));
         let hint = c.hint.expect("a warn carries a remedy");
@@ -13440,7 +13719,7 @@ mod tests {
     #[test]
     fn unreachable_residents_utility_binding_counts_as_addressable() {
         let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
-        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some("util-4b".to_string()) });
+        registry.internal = Some(darkmux_types::RegistryInternal { utility: Some(darkmux_types::UtilityBinding::id("util-4b")) });
         let loaded = vec![
             lm("darkmux:qwen/qwen3.8-27b", "qwen/qwen3.8-27b"),
             lm("darkmux:util-4b", "util-4b"),

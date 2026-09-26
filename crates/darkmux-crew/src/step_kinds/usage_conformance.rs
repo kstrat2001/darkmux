@@ -94,6 +94,18 @@ const ROSTER: &[CallSite] = &[
             test: "tests/mock_single_shot_proof.rs::container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_server",
         },
     },
+    // (#2914) The lean utility path: one usage record (`purpose: utility`,
+    // no session), and deliberately no bookends. Its proof also pins that
+    // the usage record is the ONLY record the job leaves.
+    CallSite {
+        file: "src/utility.rs",
+        caller: "run_utility_single_shot",
+        transport: "single_shot_chat(",
+        duty: Duty::Emits {
+            writer_in: ("src/utility.rs", "run_utility_single_shot"),
+            test: "tests/mock_utility_single_shot_proof.rs::a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record",
+        },
+    },
     CallSite {
         file: "src/step_kinds/builtins.rs",
         caller: "run_single_shot",

@@ -246,7 +246,18 @@ use std::path::Path;
 //           Parsing happens at the accessor, which reports an
 //           unrecognized value as `config-invalid` rather than coercing
 //           it silently.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.27";
+//   1.28 (#2914, darkmux 4.0): REMOVED `radio.router_profile` (added in
+//           1.7). The radio ROUTING seat runs on the machine's one utility
+//           model (`internal.utility` in profiles.json) and is never staffed
+//           through a profile, so the knob has no meaning; the interim
+//           `role_profiles.radio-router` binding it superseded is refused by
+//           `config set` for the same reason. Clean break, no deprecation
+//           read (the 4.0 posture): an older config still carrying the key
+//           loads fine (it lands in `radio.extras`, same lenient-read
+//           guarantee as 1.8's `orchestrator` and 1.22's `review`), has no
+//           effect, and `darkmux doctor` names it with the fix.
+//           `radio.answerer_profile` stays: answering the user is work.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.28";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -1158,18 +1169,12 @@ pub struct MissionBoardConfig {
 /// `radio` interpreter (routing + answering), not general dispatch behavior.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RadioConfig {
-    /// Explicit profile override for the ROUTING seat (`radio-router`).
-    /// **Empty/absent preserves today's behavior exactly**: `None` is passed
-    /// through to the ordinary dispatch precedence, which honors an existing
-    /// `role_profiles.radio-router` pin (the interim staffing operators set
-    /// per the issue's live-dogfood notes) ahead of `default_profile`.
-    /// Setting this field to a NAMED profile is the "proper fix" migration
-    /// path the issue names — a profile override takes precedence OVER
-    /// `role_profiles.radio-router` (the same precedence every other
-    /// `--profile`-style override uses), so operators migrating off the
-    /// interim `role_profiles` pin set this field to the same profile name;
-    /// leaving both set is harmless (this field simply wins).
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub router_profile: Option<String>,
+    // (#2914, CONFIG 1.28) `router_profile` REMOVED. The ROUTING seat runs on
+    // the machine's utility model (`internal.utility` in profiles.json), not
+    // on a profile, so there is nothing to bind it to; `role_profiles.
+    // radio-router` is refused by `config set` for the same reason. An older
+    // config still carrying `router_profile` lands it in `extras` below
+    // (lenient-on-read), and `darkmux doctor` names it with the fix.
     /// Explicit profile override for the ANSWERING seat (`radio-host`).
     /// Empty/absent falls through to `role_profiles.radio-host` (if bound)
     /// then `default_profile` — the fresh-install floor, per the issue's
@@ -1642,12 +1647,11 @@ impl DarkmuxConfig {
                 stale_active_days: Some(14),
                 extras: Default::default(),
             }),
-            // (#1698 Packet B2) Written visible with empty (unset) profile
-            // overrides — see `RadioConfig::router_profile`'s own doc for
-            // why an empty string, not an absent field, is the correct
-            // "preserve today's behavior" default.
+            // (#1698 Packet B2) Written visible with an empty (unset)
+            // answering-seat override: an empty string, not an absent field,
+            // falls through to `role_profiles.radio-host` then
+            // `default_profile`. (#2914) The routing seat has no knob here.
             radio: Some(RadioConfig {
-                router_profile: Some(String::new()),
                 answerer_profile: Some(String::new()),
                 humor: Some(crate::config_access::RADIO_HUMOR_DEFAULT),
                 extras: Default::default(),
@@ -1857,6 +1861,25 @@ mod tests {
         assert_eq!(back.fleet.as_ref().unwrap().mode.as_deref(), Some("standalone"));
         assert_eq!(back.remote.as_ref().unwrap().max_tokens_per_execution, Some(500_000));
         assert_eq!(back.remote.as_ref().unwrap().concurrent_cap, Some(1));
+    }
+
+    /// (#2914) `radio.router_profile` is REMOVED (CONFIG 1.28): routing runs
+    /// on the machine's utility model. `with_defaults()` no longer writes it,
+    /// and an older config still carrying it loads leniently into
+    /// `radio.extras`, where `darkmux doctor` names it.
+    #[test]
+    fn radio_router_profile_is_removed_and_a_leftover_lands_in_extras() {
+        let cfg = DarkmuxConfig::with_defaults();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("router_profile"), "with_defaults must not write the removed key: {json}");
+        assert!(json.contains("answerer_profile"), "the answering seat's knob stays: {json}");
+
+        let old: DarkmuxConfig =
+            serde_json::from_str(r#"{"schema_version":"1.27","radio":{"router_profile":"radio","answerer_profile":""}}"#)
+                .unwrap();
+        let radio = old.radio.as_ref().unwrap();
+        assert_eq!(radio.extras.get("router_profile").and_then(|v| v.as_str()), Some("radio"), "lenient-on-read");
+        assert_eq!(radio.answerer_profile.as_deref(), Some(""));
     }
 
     /// (#1475 packet 1) `role_profiles` is written by `init` as a visible empty

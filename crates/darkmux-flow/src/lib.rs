@@ -3248,7 +3248,10 @@ mod tests {
         //            per compactor call, attributed to the compactor.
         //   1.59.0 — (#2902 step 2a, #2914) `purpose` (work | utility) on
         //            every usage record.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.59.0");
+        //   1.60.0 — (#2914) utility jobs run lean: a usage record and no
+        //            bookends/session (contract 2 amended); one utility
+        //            seat tag on `telemetry.lms` (`compactor` retired).
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.60.0");
     }
 
     #[test]

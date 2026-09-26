@@ -250,7 +250,8 @@ fn resolve_local_placement_inner_with(
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    let model_id = select_model(role, profile, |id| skill_index.get(id))
+    // (#2914) A step never runs on the machine's utility model.
+    let model_id = select_model(role, profile, |id| skill_index.get(id), loaded.registry.utility_model_id())
         .map_err(|e| ResolutionFailed(format!("select_model: {e}")))?;
     let pm = profile
         .models
@@ -497,6 +498,8 @@ pub(crate) fn dispatch_opts_for(
     .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
     let opts = DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs,
         workspace_read_only: false,
         record_context: None,
@@ -7250,6 +7253,46 @@ mod tests {
         assert_eq!(pick(Some("p"), Some("q")), Ok("m-default".into()), "an explicit profile wins over the binding");
         let err = pick(None, Some("nope")).unwrap_err();
         assert!(err.contains("nope"), "a binding to an undefined profile is a loud error naming it, never a silent fallback: {err}");
+    }
+
+    /// (#2914) The step-placement path sets the machine's utility model
+    /// aside exactly like the dispatch does: a profile that still lists it
+    /// places the work model, and a profile that lists only it is a loud
+    /// resolution failure naming the fix, never a placement of the utility
+    /// model.
+    #[serial_test::serial]
+    #[test]
+    fn placement_never_puts_a_step_on_the_machine_utility_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            serde_json::json!({
+                "default_profile": "leftover",
+                "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
+                "profiles": {
+                    "leftover": {
+                        "default_model": "util-4b",
+                        "models": [{"id": "util-4b", "n_ctx": 16000}, {"id": "worker-35b", "n_ctx": 65536}]
+                    },
+                    "utility-only": {"models": [{"id": "darkmux:util-4b", "n_ctx": 16000}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = reg.to_str().unwrap();
+        let pick = |name: Option<&str>| {
+            resolve_local_placement_inner_with("coder", name, None, Some(cfg), "step:s")
+                .map(|p| p.model_key)
+                .map_err(|e| match e {
+                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::ResolutionFailed(r) => r,
+                })
+        };
+        assert_eq!(pick(None), Ok("worker-35b".into()), "the declared default is the utility model; the work model places");
+        let err = pick(Some("utility-only")).unwrap_err();
+        assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
     }
 
     // ─── (#2902 step 1a) usage conformance: one record per model call ──

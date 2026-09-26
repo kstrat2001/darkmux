@@ -2523,6 +2523,7 @@ fn resolve_selected_profile_model(
     role: &crate::types::Role,
     profile_override: Option<&str>,
     config_path: Option<&str>,
+    allow_utility_model: bool,
 ) -> Result<Option<darkmux_types::ProfileModel>> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
@@ -2559,7 +2560,9 @@ fn resolve_selected_profile_model(
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    let Ok(id) = select_model(role, profile, |id| skill_index.get(id)) else {
+    // (#2914) Same set-aside as `resolve_dispatch_model_with_hosts`.
+    let set_aside = if allow_utility_model { None } else { loaded.registry.utility_model_id() };
+    let Ok(id) = select_model(role, profile, |id| skill_index.get(id), set_aside) else {
         return Ok(None);
     };
     Ok(profile.models.iter().find(|m| m.id == id).cloned())
@@ -2668,6 +2671,7 @@ fn try_resolve_remote_target(
         &role,
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
+        opts.allow_utility_model,
     )? {
         Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
         _ => return Ok(None), // local ⇒ container path
@@ -2750,7 +2754,8 @@ pub fn dispatch_resolves_remote(
     let Some(role) = roles.iter().find(|r| r.id == role_id) else {
         return true;
     };
-    match resolve_selected_profile_model(role, profile_name, config_path) {
+    // (#2914) A work question: the utility model is set aside here too.
+    match resolve_selected_profile_model(role, profile_name, config_path, false) {
         Ok(Some(pm)) => pm.endpoint.as_ref().is_some_and(|e| e.is_remote()),
         // No profile model resolves ⇒ the container path's local fallback.
         Ok(None) => false,
@@ -3671,8 +3676,10 @@ fn dispatch_remote(
 /// substitution seam #1509 built for `dispatch_as_crew_of_one` — see that
 /// function's own doc: "Every caller ... passes the raw `crew::dispatch::
 /// dispatch` primitive ... the CLI verb passes `dispatch_as_crew_of_one`
-/// ... which runs the SAME primitive wrapped in a ... graph"). `src/
-/// radio.rs::dispatch_router_call` is this function's first caller.
+/// ... which runs the SAME primitive wrapped in a ... graph"). Radio's
+/// ANSWERING seat (`src/radio_answer.rs`) is this function's caller;
+/// (#2914) the ROUTING seat, its first caller, moved to the lean utility
+/// path (`crate::utility::run_utility_single_shot`).
 ///
 /// Mirrors [`dispatch_remote`]'s shape — bookended `dispatch start`/
 /// `dispatch complete`/`dispatch error` flow records (contract 2, dispatch
@@ -3695,8 +3702,8 @@ fn dispatch_remote(
 /// (`role_wants_agentic_remote`) — this primitive has no agent loop and no
 /// container, so a tool-bearing role could never actually use its tools
 /// here; the caller should use the ordinary [`dispatch`] for those.
-/// `radio-router`'s own manifest declares an empty `tool_palette.allow`
-/// (see `src/radio.rs`'s own doc on `dispatch_router_call`), so this
+/// `radio-host`'s own manifest declares an empty `tool_palette.allow`
+/// (see `src/radio_answer.rs`), so this
 /// refusal is not expected to fire for its own caller in practice — it's a
 /// safety rail for any FUTURE caller of this primitive with a tool-bearing
 /// role, not a live code path today.
@@ -3827,6 +3834,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
         opts.model_base_url_override.is_some(),
+        opts.allow_utility_model,
     )?;
 
     let session_id = opts
@@ -3892,9 +3900,11 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
     // (#2344) Session-liveness heartbeat — see the hosted path above for the
-    // full reasoning. This is the primitive `darkmux acp`'s radio router and
-    // answering seats run on (`src/radio.rs::dispatch_router_call` via
-    // `darkmux_fleet::routing::dispatch_routed_via`), so before this the
+    // full reasoning. This is the primitive `darkmux acp`'s radio answering
+    // seat runs on (`src/radio_answer.rs` via
+    // `darkmux_fleet::routing::dispatch_routed_via`; #2914 moved the
+    // routing seat to the lean utility path, which beats no presence), so
+    // before this the
     // ONLY interactive local-AI surface darkmux ships was also the one the
     // live fleet view could never show as running.
     let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
@@ -5187,6 +5197,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.profile_name.as_deref(),
             opts.config_path.as_deref(),
             opts.model_base_url_override.is_some(),
+            opts.allow_utility_model,
         )
         .context(
             "model selection failed. Ensure `~/.darkmux/profiles.json` has \
@@ -5599,11 +5610,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // TRIGGER formula). Passing that same number as the LOAD ctx for a
     // DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
     // compactor silently loaded at the primary's 262144-token window instead
-    // of its own declared 120000. `resolve_dispatch_windows_with` looks the
-    // compactor's id up in the resolved profile's own `models[]`; the primary's
-    // window is used ONLY when the compactor declares none there, and that
-    // fallback is named in the load message (operator sovereignty, #44) —
-    // never silently substituted.
+    // of its own declared 120000. (#2914) The compactor's own window is
+    // `internal.utility.n_ctx` (`resolve_utility_model_internal`), declared
+    // once for the machine; the primary's window is used ONLY when the
+    // binding declares none, and that fallback is named in the load message
+    // (operator sovereignty, #44) — never silently substituted.
     //
     // Warns rather than aborting; skipped for the mock-model harness (no real
     // LMStudio to load into, same gate as the dispatch model's residency).
@@ -5620,9 +5631,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             if let Some(window) = load_window {
                 if used_fallback {
                     eprintln!(
-                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in the \
-                         active profile; loading it at the primary model's context window \
-                         ({window}) as a fallback. (#1616)"
+                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in \
+                         `internal.utility`; loading it at the primary model's context window \
+                         ({window}) as a fallback. Declare it once, for every profile: \
+                         `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N }} }}` \
+                         in ~/.darkmux/profiles.json. (#1616, #2914)"
                     );
                 }
                 // (#2536) `apply_compactor_residency` both ensures residency
@@ -5652,11 +5665,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 // integration test this crate does not have — and the mock-model
                 // harness cannot supply one, since the enclosing
                 // `model_base_url_override.is_none()` gate skips this block.
+                // (#2914 review, C5) The compactor's window is the binding's
+                // (or the named fallback); the load message says which.
+                let source = if used_fallback { WindowSource::UtilityFallback } else { WindowSource::UtilityBinding };
                 if let Some(warning) = apply_compactor_residency(
                     &mut compaction,
                     &compactor_id,
                     window,
-                    ensure_model_loaded_at_ctx,
+                    |pm| ensure_model_loaded_at_ctx_from(pm, source),
                 ) {
                     eprintln!("{warning}");
                 }
@@ -8273,12 +8289,19 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
 fn tag_lms_role(
     mut payload: serde_json::Value,
     primary: &str,
-    compactor: Option<&str>,
-    utility: Option<&str>,
+    utility: &[String],
     baseline: bool,
 ) -> serde_json::Value {
     if let Some(model_id) = payload.get("model").and_then(|v| v.as_str()) {
-        let role = crate::telemetry_sampler::role_for_load(model_id, primary, compactor, utility);
+        // (#2914 review, C7) The utility SEAT can be declared under two ids
+        // at one dispatch (a pinned compactor and the binding itself); a
+        // load matching either is the seat. First non-resident answer wins;
+        // `role_for_load`'s primary-first order holds for each.
+        let role = utility
+            .iter()
+            .map(|u| crate::telemetry_sampler::role_for_load(model_id, primary, Some(u)))
+            .find(|r| *r != "resident")
+            .unwrap_or_else(|| crate::telemetry_sampler::role_for_load(model_id, primary, None));
         payload["role"] = serde_json::json!(role);
     }
     if baseline {
@@ -8314,8 +8337,11 @@ struct LmsTelemetryTracker {
     /// This dispatch's own wire model id (namespaced since #2240 —
     /// `role_for_load` normalizes, so it is stored as given).
     primary: String,
-    compactor: Option<String>,
-    utility: Option<String>,
+    /// (#2914) The machine's one utility SEAT, under every id this dispatch
+    /// declared for it: the compactor's wire id when one is bound, and the
+    /// binding itself (the same model in either spelling, normally; a
+    /// pinned compactor that differs still shares the seat, #2914 review C7).
+    utility: Vec<String>,
     /// The previous SUCCESSFUL `list_loaded` snapshot. A failed probe leaves
     /// this intact so a transient `lms` hiccup can't emit a flurry of
     /// spurious unloads.
@@ -8326,8 +8352,8 @@ struct LmsTelemetryTracker {
 }
 
 impl LmsTelemetryTracker {
-    fn new(primary: String, compactor: Option<String>, utility: Option<String>) -> Self {
-        Self { primary, compactor, utility, prev: Vec::new(), seeded: false }
+    fn new(primary: String, utility: Vec<String>) -> Self {
+        Self { primary, utility, prev: Vec::new(), seeded: false }
     }
 
     /// One sampler tick. Probes via `list_loaded`, emits one tagged
@@ -8353,13 +8379,7 @@ impl LmsTelemetryTracker {
             crate::telemetry_sampler::lms_diff(prev, &cur)
         };
         for payload in payloads {
-            emit(tag_lms_role(
-                payload,
-                &self.primary,
-                self.compactor.as_deref(),
-                self.utility.as_deref(),
-                baseline,
-            ));
+            emit(tag_lms_role(payload, &self.primary, &self.utility, baseline));
         }
         self.prev = cur;
         self.seeded = true;
@@ -8626,7 +8646,13 @@ fn run_telemetry_sampler(
     // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
     // all moved into `LmsTelemetryTracker` — see its doc for why the state
     // machine lives behind an injected-effect seam instead of inline here.
-    let mut lms_tracker = LmsTelemetryTracker::new(model.clone(), compactor_model.clone(), utility_model.clone());
+    // (#2914) One utility seat, under every id this dispatch declared for
+    // it: the compactor's resolved wire id and the binding (normally the same
+    // model; a pinned compactor that differs still shares the seat).
+    let mut lms_tracker = LmsTelemetryTracker::new(
+        model.clone(),
+        [compactor_model.clone(), utility_model.clone()].into_iter().flatten().collect(),
+    );
     // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
     // last thermal sample — NOT a hardcoded per-tick constant. A tick can
     // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
@@ -10564,9 +10590,12 @@ fn compaction_call_tokens_payload(
 }
 
 /// The role label a compactor call's usage record is attributed to: the
-/// SEAT name `telemetry_sampler::role_for_load` already gives the compactor
-/// on `telemetry.lms` records. No role manifest names the compactor; the
-/// utility model bound to `internal.utility` fills this seat.
+/// JOB, the way a routing call's record is attributed to `radio-router`.
+/// No role manifest names the compactor; the machine's utility model
+/// (`internal.utility`) runs it. (#2914) Distinct from the model-load SEAT
+/// tag on `telemetry.lms` records, which is `utility` for every load of
+/// that model whichever job it serves: the seat says WHICH model, the
+/// handle says WHICH job.
 const COMPACTOR_ROLE: &str = "compactor";
 
 /// (#795, #2902 step 1a) The counts a `model.completed` event reported.
@@ -11475,12 +11504,14 @@ fn resolve_dispatch_model_internal(
     profile_override: Option<&str>,
     config_path: Option<&str>,
     skip_lmstudio_residency: bool,
+    allow_utility_model: bool,
 ) -> Result<String> {
     resolve_dispatch_model_with_hosts(
         role,
         profile_override,
         config_path,
         skip_lmstudio_residency,
+        allow_utility_model,
         &ensure_model_loaded_at_ctx,
         &probe_loaded_model_list,
     )
@@ -11508,6 +11539,7 @@ fn resolve_dispatch_model_with_hosts(
     profile_override: Option<&str>,
     config_path: Option<&str>,
     skip_lmstudio_residency: bool,
+    allow_utility_model: bool,
     ensure_resident: &dyn Fn(&darkmux_types::ProfileModel) -> Result<()>,
     list_loaded: &dyn Fn() -> Result<Vec<String>>,
 ) -> Result<String> {
@@ -11598,7 +11630,10 @@ fn resolve_dispatch_model_with_hosts(
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    match select_model(role, profile, |id| skill_index.get(id)) {
+    // (#2914) The machine's utility model is never a task's model; only the
+    // lab's benchmark opt-in leaves it selectable.
+    let set_aside = if allow_utility_model { None } else { loaded.registry.utility_model_id() };
+    match select_model(role, profile, |id| skill_index.get(id), set_aside) {
         Ok(id) => {
             // (#2038) Before anything else: a placeholder id would reach
             // LM Studio and come back as "model not found", which reads as
@@ -11723,26 +11758,33 @@ fn resolve_dispatch_model_with_hosts(
 }
 
 /// (#590) Best-effort: the machine's registered utility model
-/// (`internal.utility`), for overlaying onto the compactor. `None` if the
-/// registry isn't loadable or no utility model is registered — (#2571) NOT
-/// a case where the runtime keeps a built-in default compactor; there is no
-/// runtime default any more. This `None` flows straight through
-/// `apply_utility_model` into `compaction.compactor_model`, which stays
-/// `None`, which means compaction is OFF outright for the dispatch
-/// (disclosed loudly by `unset_compactor_warning` at the call site above).
-/// Mirrors the loud-but-soft posture of `resolve_dispatch_model_internal`: a
-/// missing binding is not an error, just an absent overlay — but "absent
-/// overlay" is a genuinely different, disclosed degraded mode now, not a
-/// silent substitution.
-fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
-    darkmux_profiles::profiles::load_registry(config_path)
-        .ok()
-        .and_then(|l| l.registry.utility_model_id().map(str::to_string))
+/// (`internal.utility`) and (#2914) its declared window, for overlaying onto
+/// the compactor. `None` if the registry isn't loadable or no utility model
+/// is registered — (#2571) NOT a case where the runtime keeps a built-in
+/// default compactor; there is no runtime default any more. This `None`
+/// flows straight through `apply_utility_model` into
+/// `compaction.compactor_model`, which stays `None`, which means compaction
+/// is OFF outright for the dispatch (disclosed loudly by
+/// `unset_compactor_warning` at the call site above). Mirrors the
+/// loud-but-soft posture of `resolve_dispatch_model_internal`: a missing
+/// binding is not an error, just an absent overlay — but "absent overlay"
+/// is a genuinely different, disclosed degraded mode now, not a silent
+/// substitution.
+///
+/// The window is the SECOND element: `internal.utility.n_ctx`, `None` for
+/// the bare-string binding. Since #2914 this is the only source of the
+/// compactor's own window — never a profile's `models[]` entry, which
+/// would make the utility model a work model.
+pub(crate) fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {
+    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
+    let id = loaded.registry.utility_model_id()?.to_string();
+    Some((id, loaded.registry.utility_model_n_ctx()))
 }
 
 /// (#2905) What `dispatch()` resolves about compaction before the container
 /// starts: the args (role override, utility model, primary window applied),
-/// the compactor's own declared `n_ctx`, and the utility model binding.
+/// the compactor's own declared `n_ctx` (#2914: `internal.utility.n_ctx`),
+/// and the utility model binding.
 #[derive(Debug)]
 struct DispatchCompaction {
     compaction: crate::dispatch::CompactionDispatchArgs,
@@ -11753,23 +11795,33 @@ struct DispatchCompaction {
 /// (#2905) `dispatch()`'s compaction resolution, extracted so a test drives
 /// it with the SAME inputs `dispatch()` has (the role and the opts) and the
 /// live `role_profiles` binding read from config. ONE role-aware profile
-/// resolution feeds both the primary's compaction-trigger window and the
-/// compactor's own `n_ctx`, with the same precedence model selection uses:
-/// `--profile` > `role_profiles.<role>` > `default_profile`.
+/// resolution feeds the primary's compaction-trigger window, with the same
+/// precedence model selection uses: `--profile` > `role_profiles.<role>` >
+/// `default_profile`. (#2914) The compactor's own `n_ctx` does NOT come
+/// from that profile: it is `internal.utility`'s declaration, the same for
+/// every profile, so switching profiles never reloads the utility model.
 fn resolve_dispatch_compaction(
     role: &crate::types::Role,
     opts: &crate::dispatch::DispatchOpts,
 ) -> Result<DispatchCompaction> {
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
-    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
+    let utility = resolve_utility_model_internal(opts.config_path.as_deref());
+    let utility_model = utility.as_ref().map(|(id, _)| id.clone());
     compaction.apply_utility_model(utility_model.as_deref());
-    let (primary_window, compactor_n_ctx) = resolve_dispatch_windows_with(
+    // The binding's window applies only when the binding IS the compactor
+    // (the common case). A caller that pinned a different compactor on
+    // `opts.compaction` gets no window from the binding; the primary's
+    // window is then the named fallback, as before.
+    let compactor_n_ctx = match (&compaction.compactor_model, &utility) {
+        (Some(compactor), Some((id, n_ctx))) if bare_model_key(compactor) == bare_model_key(id) => *n_ctx,
+        _ => None,
+    };
+    let primary_window = resolve_dispatch_windows_with(
         &role.id,
         opts.profile_name.as_deref(),
         role_profile_binding(Some(&role.id), opts.profile_name.as_deref()),
         opts.config_path.as_deref(),
-        compaction.compactor_model.as_deref(),
     )?;
     ensure_context_window(&mut compaction, primary_window);
     Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model })
@@ -11886,44 +11938,25 @@ fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
     crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
 }
 
-/// (#1616) The compactor/utility model's OWN declared `n_ctx`, looked up by
-/// id in the resolved profile's `models[]` — never the primary/default model's
-/// context window (that value feeds the compaction TRIGGER formula and
-/// belongs to a DIFFERENT model). `None` when the profile carries no entry for
-/// this model id, or an entry with no `n_ctx` declared — the caller
-/// (`resolve_compactor_load_window`) then falls back to the primary's window
-/// and must say so.
-///
-/// `bare_model_key`-normalized on both sides: a profile entry may name the
-/// model as either the bare key or the `darkmux:`-namespaced identifier (the
-/// same tolerance `ensure_model_loaded_at_ctx` already applies), and the
-/// machine-level `internal.utility` binding this id comes from is typically
-/// namespaced.
-fn profile_model_n_ctx(profile: &darkmux_types::Profile, model_id: &str) -> Option<u32> {
-    let want = bare_model_key(model_id);
-    profile.models.iter().find(|m| bare_model_key(&m.id) == want).and_then(|m| m.n_ctx)
-}
+// (#2914) `profile_model_n_ctx` — the #1616 lookup of the compactor's `n_ctx`
+// by id in the resolved profile's `models[]` — is gone. The compactor's own
+// window is `internal.utility.n_ctx` (`resolve_utility_model_internal`); a
+// profile entry for the utility model is a leftover `darkmux doctor` flags,
+// never a source.
 
-/// (#2905) The dispatch's two compaction windows from ONE profile resolution:
-/// the primary's compaction-trigger window and the compactor's own declared
-/// `n_ctx` (`None` when no compactor is bound). Both are read off the same
-/// role-aware profile model selection resolved, so neither can come from
-/// `default_profile` while the model came from a `role_profiles` mapping.
-/// Takes the binding explicitly (`mapped`) so a test can drive the mapped arm.
+/// (#2905) The dispatch's compaction-trigger window from ONE role-aware
+/// profile resolution: the primary's declared `n_ctx`. Read off the same
+/// profile model selection resolved, so it cannot come from `default_profile`
+/// while the model came from a `role_profiles` mapping. Takes the binding
+/// explicitly (`mapped`) so a test can drive the mapped arm.
 fn resolve_dispatch_windows_with(
     role_id: &str,
     profile_override: Option<&str>,
     mapped: Option<String>,
     config_path: Option<&str>,
-    compactor_model_id: Option<&str>,
-) -> Result<(Option<u32>, Option<u32>)> {
+) -> Result<Option<u32>> {
     let profile = resolve_active_profile_with(Some(role_id), profile_override, mapped, config_path)?;
-    let Some(profile) = profile else {
-        return Ok((None, None));
-    };
-    let window = profile_context_window(&profile);
-    let compactor_n_ctx = compactor_model_id.and_then(|id| profile_model_n_ctx(&profile, id));
-    Ok((window, compactor_n_ctx))
+    Ok(profile.as_ref().and_then(profile_context_window))
 }
 
 /// (#1616) Pick the window the compactor loads at: its OWN declared `n_ctx`
@@ -11992,7 +12025,7 @@ fn ensure_context_window(
 /// CONTEXT WINDOW is its required `n_ctx` — a compaction payload is sized to
 /// that window, so the model must be loaded at least that large). Pure; the
 /// wiring's unit-test seam.
-fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::ProfileModel {
+pub(crate) fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::ProfileModel {
     darkmux_types::ProfileModel {
         id: util_id.to_string(),
         n_ctx: Some(context_window),
@@ -12256,10 +12289,48 @@ pub(crate) fn identifier_already_resident(detail: &str) -> bool {
     detail.contains("identifier") && detail.contains("already exists")
 }
 
-fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
+pub(crate) fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
+    ensure_model_loaded_at_ctx_from(pm, WindowSource::Profile)
+}
+
+/// (#2914 review, C5) Where the `n_ctx` a residency load is asked for came
+/// from, so the load message can say so: a work model's window is its
+/// profile entry's; the utility model's is the `internal.utility` binding,
+/// or the named fallback when the binding declares none. Wording only; the
+/// load itself is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowSource {
+    Profile,
+    UtilityBinding,
+    UtilityFallback,
+}
+
+impl WindowSource {
+    fn describe(self) -> &'static str {
+        match self {
+            WindowSource::Profile => "the profile's declared context",
+            WindowSource::UtilityBinding => "the `internal.utility` binding's declared context",
+            WindowSource::UtilityFallback => "the fallback window, since `internal.utility` declares none",
+        }
+    }
+}
+
+/// The one line printed before a fresh residency load. Pure, so the wording
+/// per [`WindowSource`] is pinned by a test.
+pub(crate) fn loading_message(model_key: &str, n_ctx: u32, source: WindowSource) -> String {
+    format!(
+        "darkmux dispatch: loading `{model_key}` at n_ctx={n_ctx} ({}) before dispatch. (#1135)",
+        source.describe()
+    )
+}
+
+/// [`ensure_model_loaded_at_ctx`] with the window's source named in the
+/// load messages (#2914 review, C5).
+pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<()> {
     use darkmux_profiles::lms;
-    ensure_model_resident(
+    ensure_model_resident_from(
         pm,
+        source,
         &|| lms::list_loaded().unwrap_or_default(),
         &|identifier| lms::unload(identifier),
         &|model_key, identifier, n_ctx| load_at_ctx_bounded(model_key, identifier, n_ctx),
@@ -12268,8 +12339,21 @@ fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
 
 /// (#1135/#2318) The residency preflight, pure over its host effects so the
 /// concurrency + recovery contracts are unit-testable without LMStudio.
+/// (#2914 review, C5) Test-facing shorthand for [`ensure_model_resident_from`]
+/// with the profile as the window's source; production callers name theirs.
+#[cfg(test)]
 fn ensure_model_resident(
     pm: &darkmux_types::ProfileModel,
+    list: &dyn Fn() -> Vec<darkmux_types::LoadedModel>,
+    unload: &dyn Fn(&str) -> Result<()>,
+    load: &dyn Fn(&str, &str, u32) -> Result<()>,
+) -> Result<()> {
+    ensure_model_resident_from(pm, WindowSource::Profile, list, unload, load)
+}
+
+fn ensure_model_resident_from(
+    pm: &darkmux_types::ProfileModel,
+    source: WindowSource,
     list: &dyn Fn() -> Vec<darkmux_types::LoadedModel>,
     unload: &dyn Fn(&str) -> Result<()>,
     load: &dyn Fn(&str, &str, u32) -> Result<()>,
@@ -12331,10 +12415,13 @@ fn ensure_model_resident(
         Some(m) if m.context >= u64::from(n_ctx) => return Ok(()),
         Some(m) => {
             eprintln!(
-                "darkmux dispatch: `{}` is resident at context {} but the profile \
-                 declares n_ctx={}; reloading at {} so the dispatch gets the declared \
-                 context. (#1135)",
-                model_key, m.context, n_ctx, n_ctx
+                "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
+                 ({}); reloading at {} so the dispatch gets that context. (#1135)",
+                model_key,
+                m.context,
+                n_ctx,
+                source.describe(),
+                n_ctx
             );
             unload(&m.identifier).with_context(|| {
                 format!("unloading `{}` to reload at n_ctx={}", m.identifier, n_ctx)
@@ -12355,11 +12442,7 @@ fn ensure_model_resident(
                     model_key, foreign.identifier, n_ctx, foreign.identifier
                 );
             } else {
-                eprintln!(
-                    "darkmux dispatch: loading `{}` at n_ctx={} (the profile's declared \
-                     context) before dispatch. (#1135)",
-                    model_key, n_ctx
-                );
+                eprintln!("{}", loading_message(model_key, n_ctx, source));
             }
         }
     }

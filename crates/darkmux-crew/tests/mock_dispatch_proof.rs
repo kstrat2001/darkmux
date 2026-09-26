@@ -261,6 +261,8 @@ fn run_mock_dispatch(
 
     let session_id = format!("mock-model-proof-{}-{}", std::process::id(), port);
     let opts = DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -751,6 +753,8 @@ fn run_mock_dispatch_with_timeout_override(
 
     let session_id = format!("mock-model-proof-i2596-{}-{}", std::process::id(), port);
     let opts = DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

@@ -3517,6 +3517,20 @@ fn responding_endpoint_profiles_json(port: u16) -> String {
     )
 }
 
+/// (#2914) A registry whose ONLY model is the machine utility binding: the
+/// radio routing seat runs on it, over the LMStudio URL the test points at
+/// its stub (`DARKMUX_LMSTUDIO_URL`), with `DARKMUX_LMS_BIN=/usr/bin/true`
+/// so the residency preflight never shells to a real LMStudio. `n_ctx`
+/// small on purpose: nothing here loads anything.
+fn utility_binding_profiles_json() -> String {
+    r#"{
+        "profiles": { "work": { "models": [ {"id": "stub-worker", "n_ctx": 8000} ] } },
+        "default_profile": "work",
+        "internal": { "utility": { "id": "stub-util", "n_ctx": 8000 } }
+    }"#
+    .to_string()
+}
+
 fn hanging_endpoint_profiles_json(port: u16) -> String {
     format!(
         r#"{{
@@ -4721,14 +4735,20 @@ fn radio_sigterm_mid_dispatch_reaps_curl() {
     let flows = TempDir::new().unwrap();
     let os_home = TempDir::new().unwrap();
 
+    // (#2914) The routing seat runs on the machine's utility model over the
+    // LOCAL LMStudio path, so the hanging stub is reached as the LMStudio
+    // URL and the binding (not a profile) names the model; a fake `lms`
+    // keeps the residency preflight off any real LMStudio.
     let profiles_path = home.path().join("profiles.json");
-    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
 
     let mut child = darkmux_std_cmd()
         .env("HOME", os_home.path())
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{}", stub.port))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["radio", "reboot the router please"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -4943,8 +4963,8 @@ fn start_route_decision_stub(command: &str) -> u16 {
 /// child BEFORE exiting, so the child's own `LaunchFinalizeGuard`
 /// (`launch_guard.rs`) runs and writes a terminal record — the mission
 /// reaches `finalized` (never left `active`), with its phase `abandoned`
-/// (never left `active` either). Two DIFFERENT profiles keep the routing
-/// call (radio-router, unmapped -> `default_profile`) and the launched
+/// (never left `active` either). Two DIFFERENT paths keep the routing call
+/// (the utility binding over the LMStudio URL, #2914) and the launched
 /// dispatch (`dialectic-judge`, pinned via the step's OWN `profile_name`)
 /// pointed at two DIFFERENT stub servers, so the router call can answer
 /// immediately (routing this test's message to the launch target) while the
@@ -4959,24 +4979,24 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
     let flows = TempDir::new().unwrap();
     let os_home = TempDir::new().unwrap();
 
+    // (#2914) The routing seat runs on the machine's utility binding over
+    // the LOCAL LMStudio path (`DARKMUX_LMSTUDIO_URL` = the route stub, a
+    // fake `lms` for the residency preflight); the LAUNCHED dispatch keeps
+    // its own hosted pin at the hang stub. Two servers, two paths, no race.
     let profiles_path = home.path().join("profiles.json");
     fs::write(
         &profiles_path,
         format!(
             r#"{{
                 "profiles": {{
-                    "route-stub": {{
-                        "models": [
-                            {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{route_port}"}}}}
-                        ]
-                    }},
                     "hang-stub": {{
                         "models": [
                             {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{}"}}}}
                         ]
                     }}
                 }},
-                "default_profile": "route-stub"
+                "default_profile": "hang-stub",
+                "internal": {{ "utility": {{ "id": "stub-util", "n_ctx": 8000 }} }}
             }}"#,
             hang.port
         ),
@@ -5017,6 +5037,8 @@ fn radio_sigterm_forwards_to_the_launched_child_which_finalizes() {
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["radio", "please help me with something"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -5141,9 +5163,11 @@ fn start_hosted_error_stub() -> u16 {
 }
 
 /// One `darkmux radio "<text>"` invocation that routes to `mission launch
-/// <config_id>`, is NEVER signaled, and runs to natural completion against
-/// `dispatch_port` (dialectic-judge's own `profile_name` pin, same shape as
-/// the SIGTERM test above). Returns radio's own exit status.
+/// <config_id>` (the routing seat on the utility binding, answered by the
+/// route stub standing in as LMStudio, #2914), is NEVER signaled, and runs
+/// to natural completion against `dispatch_port` (dialectic-judge's own
+/// `profile_name` pin, same shape as the SIGTERM test above). Returns
+/// radio's own exit status.
 fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::process::ExitStatus, TempDir) {
     let route_port = start_route_decision_stub(config_id);
 
@@ -5151,20 +5175,22 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
     let flows = TempDir::new().unwrap();
     let os_home = TempDir::new().unwrap();
 
+    // (#2914) The routing seat runs on the utility binding over the local
+    // LMStudio path (the route stub); the launched dispatch pins its own
+    // hosted profile. See `radio_sigterm_forwards_to_the_launched_child_
+    // which_finalizes` for the same split.
     let profiles_path = home.path().join("profiles.json");
     fs::write(
         &profiles_path,
         format!(
             r#"{{
                 "profiles": {{
-                    "route-stub": {{
-                        "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{route_port}"}}}}]
-                    }},
                     "dispatch-stub": {{
                         "models": [{{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{dispatch_port}"}}}}]
                     }}
                 }},
-                "default_profile": "route-stub"
+                "default_profile": "dispatch-stub",
+                "internal": {{ "utility": {{ "id": "stub-util", "n_ctx": 8000 }} }}
             }}"#
         ),
     )
@@ -5198,6 +5224,8 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
         .env("DARKMUX_HOME", home.path())
         .env("DARKMUX_FLOWS_DIR", flows.path())
         .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
         .args(["radio", "please help me with something unrelated"])
         .output()
         .expect("running darkmux radio to completion");

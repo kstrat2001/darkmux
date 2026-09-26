@@ -284,6 +284,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     let compile_start_instant = std::time::Instant::now();
 
     let opts = crate::crew::dispatch::DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

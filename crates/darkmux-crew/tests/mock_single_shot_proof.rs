@@ -5,8 +5,10 @@
 //! path").
 //!
 //! Runs `darkmux_crew::dispatch::dispatch_local_single_shot` — the light
-//! primitive `src/radio.rs::dispatch_router_call` now wires into via
-//! `darkmux_fleet::routing::dispatch_routed_via` — against a REAL,
+//! primitive radio's ANSWERING seat (`src/radio_answer.rs`) wires into via
+//! `darkmux_fleet::routing::dispatch_routed_via`; (#2914) the ROUTING seat
+//! moved to the lean utility path, `mock_utility_single_shot_proof.rs` —
+//! against a REAL,
 //! in-process HTTP mock server (`httpmock`, genuinely bound to a real
 //! local TCP port, genuinely reached over `curl` — the same hardened curl
 //! path every hosted/local single-shot call in this crate uses). Zero
@@ -146,6 +148,8 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
 
     let session_id = format!("mock-single-shot-proof-{}", std::process::id());
     let opts = DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -153,11 +157,12 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
         host_out: None,
         max_turns_override: None,
         timeout_override_seconds: None, // (#2480)
-        // `radio-router` is the packet's own real caller (#1698) — a
-        // BUILT-IN role (`crates/darkmux-crew/src/loader.rs`'s
-        // `BUILTIN_ROLES`/`BUILTIN_ROLE_PROMPTS`), so no on-disk role
-        // manifest is needed for this test to resolve it.
-        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID.to_string(),
+        // `radio-host` (the ANSWERING seat) is this primitive's surviving
+        // real caller — a BUILT-IN role, so no on-disk role manifest is
+        // needed for this test to resolve it. (#2914) The ROUTING seat no
+        // longer rides this path: it is a utility job on the lean path,
+        // proven in `mock_utility_single_shot_proof.rs`.
+        role_id: "radio-host".to_string(),
         message: "the exact routing-seat user message doesn't matter here — the mock \
                   server ignores request content and returns its fixed scripted reply \
                   regardless"
@@ -245,12 +250,14 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
     assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
     assert_eq!(p["token_source"], "provider");
     assert_eq!(p["total_tokens"], 10);
-    // (#2914) This dispatch runs the radio ROUTING role, one of darkmux's
-    // own utility jobs, so its record is `purpose: utility` end to end.
+    // (#2914) This dispatch runs the radio ANSWERING role, ordinary work,
+    // so its record is `purpose: work` end to end. (The ROUTING seat, a
+    // utility job, is proven `utility` on the lean path in
+    // `mock_utility_single_shot_proof.rs`.)
     assert_eq!(
         p["purpose"],
-        serde_json::json!(darkmux_crew::usage::UsagePurpose::Utility),
-        "a radio-router call is a utility job: {p}"
+        serde_json::json!(darkmux_crew::usage::UsagePurpose::Work),
+        "a radio-host call is work: {p}"
     );
 
     // (#1645 inverted case) This dispatch set `phase_id: None` — the exact
@@ -323,6 +330,8 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
 
     let session_id = format!("mock-single-shot-mission-proof-{}", std::process::id());
     let opts = DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -330,7 +339,8 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         host_out: None,
         max_turns_override: None,
         timeout_override_seconds: None,
-        role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID.to_string(),
+        // (#2914) The answering seat; see the sibling test above.
+        role_id: "radio-host".to_string(),
         message: "content doesn't matter — the mock server ignores it".to_string(),
         session_id: Some(session_id.clone()),
         timeout_seconds: 30,

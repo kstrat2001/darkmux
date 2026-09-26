@@ -175,6 +175,8 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
 /// under `~/.darkmux/roles/`).
 fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Result<String> {
     let opts = DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

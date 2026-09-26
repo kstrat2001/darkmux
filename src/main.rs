@@ -1534,6 +1534,8 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         }
     }
     let opts = crew::dispatch::DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         // (#2774 review F2) Operator-settable now, so a checkpoint written
         // under a read-only mount (every crawl unit) can actually be
         // resumed — the resume gate refuses an origin-read-only checkpoint

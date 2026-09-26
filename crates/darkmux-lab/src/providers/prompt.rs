@@ -200,6 +200,8 @@ fn dispatch_via_internal(
 ) -> Result<(String, String, bool)> {
     use darkmux_crew::dispatch::{dispatch, DispatchOpts};
     let opts = DispatchOpts {
+        // (#2914) The lab benchmarks candidate utility models.
+        allow_utility_model: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

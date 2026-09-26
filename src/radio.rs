@@ -18,23 +18,24 @@
 //!
 //! - **The ROUTING seat** (this module, Packet A) — bounded classification:
 //!   free text + the advertised catalog in, one command id + args (or a
-//!   refusal) out. Dispatches through the `radio-router` role
-//!   (`role_family: "utility"`), the SAME `crate::fleet::dispatch_routed`
-//!   mechanism `src/mission_propose.rs`'s `dispatch_compiler` uses — no new
-//!   dispatch path invented.
+//!   refusal) out. (#2914) A UTILITY job: it runs on the machine's one
+//!   utility model (`internal.utility` in profiles.json) through the lean
+//!   utility path (`crate::crew::utility::run_utility_single_shot`) — no
+//!   profile, no session, no dispatch bookends, no run; just its usage
+//!   record. The `radio-router` role (`role_family: "utility"`) supplies
+//!   the frozen system prompt.
 //! - **The ANSWERING seat** (Packet B) — reasoning-bearing grounded answers
-//!   over session artifacts. Not built here.
+//!   over session artifacts. Not built here. Still ordinary WORK: a full
+//!   dispatch and a run, staffed through `radio.answerer_profile` /
+//!   `role_profiles.radio-host`.
 //!
-//! **Deferred to Packet B in the original design (deliberately, "one schema
-//! change, not two"), landed in Packet B2:** config-block staffing for the
-//! routing seat. Packet A's `dispatch_router_call` passed
-//! `profile_name: None` unconditionally, resolving through the SAME
-//! precedence every other role dispatch uses (the `role_profiles.<role_id>`
-//! map if an operator has set one, else `default_profile`). Packet B2 adds
-//! `radio.router_profile` — see `dispatch_router_call`'s own doc — an EMPTY
-//! value still resolves to `None` here, so the pre-B2 fallback chain (and
-//! any interim `role_profiles.radio-router` pin) keeps working unchanged
-//! until the operator opts into the new knob.
+//! **Staffing history, so the 4.0 shape is not re-litigated.** Packet A
+//! resolved the routing seat like any other role (`role_profiles.
+//! radio-router`, else `default_profile`); Packet B2 added
+//! `radio.router_profile` on top. Both are REMOVED in 4.0 (#2914, a clean
+//! break): routing is darkmux's own job, and darkmux's own jobs run on the
+//! utility model, declared once with its window. `darkmux doctor` names a
+//! leftover setting; `config set role_profiles.radio-router` is refused.
 //!
 //! # Safety walls this module is directly responsible for (issue #1698)
 //!
@@ -228,15 +229,14 @@ const SOURCE_TEXT_RECORD_CAP: usize = 512;
 /// The record carries the source text (capped, see
 /// [`SOURCE_TEXT_RECORD_CAP`]), the chosen command id + args on a
 /// [`RouteDecision::Route`], or the refusal reason on a
-/// [`RouteDecision::Refuse`] — emitted AFTER the decision is known (a
-/// single record per invocation, not a start/complete bookend pair: the
-/// underlying model call already gets its own `dispatch.start`/
-/// `dispatch.complete` bookends via [`dispatch_router_call`]'s
-/// `dispatch_routed_via` call, so this is a HIGHER-LEVEL record about the
-/// routing OUTCOME, not a second liveness pair for the same call — the
-/// same "outer record wraps an inner dispatch's own bookends" shape
-/// `mission_propose.rs`'s `mission.compile.start`/`.complete` uses around
-/// its own `dispatch_routed` call).
+/// [`RouteDecision::Refuse`] — emitted AFTER the decision is known, a
+/// single record per invocation, not a start/complete pair. (#2914) The
+/// underlying model call is a UTILITY job on the lean path
+/// ([`dispatch_router_call`] -> `crate::crew::utility::run_utility_single_shot`):
+/// it leaves its `telemetry.tokens` usage record and NO dispatch bookends,
+/// so this record is the only routing-level record there is — a record
+/// about the routing OUTCOME, never a liveness pair (the amended contract
+/// 2: bookends are for work executions).
 pub fn route_and_record(
     text: &str,
     catalog: &[CatalogEntry],
@@ -517,84 +517,40 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
     Some(after_open[..close_rel].to_string())
 }
 
-/// The production [`ModelCall`] implementation — ONE single-shot dispatch to
-/// the `radio-router` role via `crate::fleet::dispatch_routed_via(opts,
-/// crate::crew::dispatch::dispatch_local_single_shot)` (#1698 Packet B —
-/// updated from Packet A's plain `dispatch_routed`, which rode the full
-/// internal-runtime container for a tool-less single-shot; see
-/// `dispatch_local_single_shot`'s own doc for the container-free path).
-/// The underlying primitive still emits the `dispatch.start`/
-/// `dispatch.complete` flow-record bookends (contract 2, dispatch
-/// liveness) — no additional bookend is added here, unlike
-/// `dispatch_compiler`'s extra `mission.compile.*` pair. Wall 4's own
-/// flow record (source text + chosen route/refusal + surface) is a
-/// SEPARATE, higher-level record — see [`route_and_record`]/
-/// [`emit_route_record`] above, which now exists (Packet B landed it in
-/// this same module, not deferred any further).
+/// The production [`ModelCall`] implementation — ONE utility call on the
+/// machine's utility model (#2914), through
+/// `crate::crew::utility::run_utility_single_shot`: the `radio-router`
+/// role's frozen system prompt, this module's assembled user message, a
+/// bounded ceiling, and the binding's own model + window. LEAN by the
+/// amended contract 2: the call leaves its `telemetry.tokens` usage record
+/// (`purpose: utility`, `handle: radio-router`) and nothing else — no
+/// session, no `dispatch start`/`complete`, no run. Wall 4's own flow
+/// record (source text + chosen route/refusal + surface) is a SEPARATE,
+/// higher-level record — see [`route_and_record`]/[`emit_route_record`]
+/// above.
+///
+/// Pre-#2914 this rode `dispatch_local_single_shot` through the fleet
+/// routing seam with a profile resolved from `radio.router_profile` /
+/// `role_profiles.radio-router`, which put 54 `radio-router` runs on the
+/// operator's runs board in a day and let the routing seat be staffed on
+/// any model at all. Both knobs are gone; the binding is the staffing.
 ///
 /// `timeout_seconds: 300` — a deliberately BOUNDED ceiling for a
-/// bounded-classification dispatch (well under `dispatch_compiler`'s 600s,
-/// which budgets for a much larger structured-proposal task). Not yet
-/// operator-tunable.
+/// bounded-classification call. A busy utility instance (a compaction in
+/// flight on it) makes this WAIT, by the operator's decision on the issue;
+/// #2915 shows why.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
-    let opts = crate::crew::dispatch::DispatchOpts {
-        brief_refs: Vec::new(),
-        workspace_read_only: false,
-        record_context: None,
-        resume_from: None,
-        host_out: None,
-        max_turns_override: None,
-        timeout_override_seconds: None, // (#2480)
-        role_id: crate::crew::loader::RADIO_ROUTER_ROLE_ID.to_string(),
-        message: message.to_string(),
-        session_id: None,
+    let reply = crate::crew::utility::run_utility_single_shot(&crate::crew::utility::UtilityJob {
+        role_id: crate::crew::loader::RADIO_ROUTER_ROLE_ID,
+        message,
         timeout_seconds: 300,
-        skip_preflight: false,
-        // radio-router parses its answer from the dispatch's human-readable
-        // stdout (a fenced ```json block) — no JSON envelope needed, same
-        // as mission-compiler.
-        json: false,
-        workdir: None,
-        phase_id: None,
-        // A system-level utility dispatch; local-only (`machine: None`
-        // never routes to the fleet queue — #309, #1405).
-        machine: None,
-        wait: true,
-        compaction: crate::crew::dispatch::CompactionDispatchArgs::default(),
-        // (#1698 Packet B2) `radio.router_profile` when the operator has
-        // set one — an explicit override that takes precedence OVER
-        // `role_profiles.radio-router` (the same precedence every other
-        // `--profile`-style override uses). Unset (the common case today)
-        // resolves to `None` here, preserving the PRE-B2 behavior exactly:
-        // falls through to `role_profiles.radio-router` (the interim pin
-        // operators set per this issue's own live-dogfood notes) then
-        // `default_profile`. See `RadioConfig::router_profile`'s own doc.
-        profile_name: darkmux_types::config_access::radio_router_profile(),
+        // The routing seat answers with one small fenced JSON object; the
+        // work single-shot primitive's 4096 default was never needed here.
+        max_tokens: 1024,
         config_path: None,
-        force_container: false,
-        max_completion_tokens: None,
-        image: None,
-        model_base_url_override: None,
-        step_id: None,
-        system_prompt_override: None,
-    };
-    // (#1698 Packet B — the container-path fix the issue's live dogfood
-    // comment named: "the route rides the FULL internal-runtime container
-    // dispatch ... for a tool-less single-shot — the routing seat should
-    // take a direct single-shot HTTP path.") `dispatch_routed_via` (not the
-    // plain `dispatch_routed` Packet A used) takes a caller-injected LOCAL
-    // execution primitive — the exact substitution seam #1509 built for
-    // `dispatch_as_crew_of_one` — so this swaps in
-    // `crate::crew::dispatch::dispatch_local_single_shot` (a container-free
-    // HTTP call straight to LMStudio, #1135-safe residency included) in
-    // place of the ordinary `crate::crew::dispatch::dispatch` (full
-    // internal-runtime container spin). `opts.machine` stays `None` above,
-    // so this is always the LOCAL fall-through — never a fleet-queue
-    // publish — and `dispatch_local_single_shot` itself falls back to the
-    // light REMOTE path automatically when the resolved profile targets a
-    // hosted endpoint (see its own doc), same as before this change.
-    let result = crate::fleet::dispatch_routed_via(opts, crate::crew::dispatch::dispatch_local_single_shot)?;
-    Ok(result.stdout)
+        base_url_override: None,
+    })?;
+    Ok(reply.content)
 }
 
 #[cfg(test)]

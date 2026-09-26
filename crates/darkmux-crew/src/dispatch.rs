@@ -391,6 +391,15 @@ pub struct DispatchOpts {
     /// `None` (every existing caller) preserves today's loader-resolved
     /// behavior exactly.
     pub system_prompt_override: Option<String>,
+    /// (#2914) Let model selection resolve to the machine's utility model
+    /// (`internal.utility`). `false` everywhere work is dispatched: the
+    /// utility model is set aside by every selection path
+    /// (`select::select_model`), so a profile that still lists it never
+    /// puts a task on it. `true` ONLY on the lab's providers, which is how
+    /// a candidate utility model gets benchmarked through a profile that
+    /// lists it before it is registered as the binding. Not a general
+    /// override: no CLI flag or config key sets it.
+    pub allow_utility_model: bool,
     /// (#1959 packet 2) Mount `/workspace` read-only (`-v <ws>:/workspace:ro`)
     /// instead of the default read-write bind. The crawler role reads a
     /// workspace tree it must never modify — a role holding only `read`/`exec`/
