@@ -4412,6 +4412,204 @@
         assert_eq!(argv.len(), 70);
     }
 
+    // ─── #2904: the container's LMStudio base URL follows the configured one ───
+
+    /// A minimal argv config whose only variable is the container base URL.
+    fn argv_config_with_base_url(base_url: Option<String>) -> DockerRunConfig {
+        DockerRunConfig {
+            output_schema: None,
+            container_name: "darkmux-dispatch-2904".to_string(),
+            workspace: PathBuf::from("/tmp/ws"),
+            host_out: PathBuf::from("/tmp/out"),
+            mod_attachment_mounts: Vec::new(),
+            inject: false,
+            runtime_binary: None,
+            image: "darkmux-runtime:latest".to_string(),
+            role_id: "test-role".to_string(),
+            session_id: "sess-test".to_string(),
+            model: "default-model".to_string(),
+            system_prompt: "Basic role.".to_string(),
+            message: "Hello world".to_string(),
+            json: false,
+            allowed_tools: None,
+            compaction: crate::dispatch::CompactionDispatchArgs::default(),
+            feedback_templates: serde_json::Value::Null,
+            cache_dir: PathBuf::from("/tmp/cache"),
+            feedback_injection: false,
+            turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: crate::dispatch_internal::InactivityBudgetSource::Resolved(
+                darkmux_types::config_access::Source::BuiltIn,
+            ),
+            max_pause_ms_env: None,
+            remote_chat_url: None,
+            remote_needs_auth: false,
+            base_url_override: base_url,
+            workspace_read_only: false,
+            resume_checkpoint: false,
+        }
+    }
+
+    /// The value following `--base-url` in `argv`, if the flag is present.
+    fn base_url_flag(argv: &[String]) -> Option<String> {
+        argv.iter()
+            .position(|a| a == "--base-url")
+            .and_then(|i| argv.get(i + 1).cloned())
+    }
+
+    /// Resolve the container base URL with `DARKMUX_LMSTUDIO_URL` set to
+    /// `configured` (the env tier production reads live), then build the
+    /// argv from it — the same two steps `dispatch()` performs.
+    fn container_argv_base_url_for_env(configured: &str, override_url: Option<&str>) -> Option<String> {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let prev = std::env::var_os("DARKMUX_LMSTUDIO_URL");
+        // SAFETY: caller holds #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", configured) };
+        let resolved = container_lmstudio_base_url(override_url);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
+                None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+            }
+        }
+        base_url_flag(&build_docker_run_argv(&argv_config_with_base_url(resolved)))
+    }
+
+    #[test]
+    #[serial]
+    fn container_argv_carries_the_configured_lmstudio_port_translated_for_docker() {
+        assert_eq!(
+            container_argv_base_url_for_env("http://localhost:4321", None).as_deref(),
+            Some("http://host.docker.internal:4321/v1"),
+            "a non-default lmstudio_url must reach the container's --base-url (#2904)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_reads_the_config_json_tier_too() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let prev = std::env::var_os("DARKMUX_LMSTUDIO_URL");
+        unsafe { std::env::remove_var("DARKMUX_LMSTUDIO_URL") };
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            lmstudio_url: Some("http://127.0.0.1:5555/".to_string()),
+            ..Default::default()
+        };
+        let resolved = {
+            let _guard = darkmux_types::config_access::set_config_for_test(cfg);
+            container_lmstudio_base_url(None)
+        };
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", v) };
+        }
+        assert_eq!(resolved.as_deref(), Some("http://host.docker.internal:5555/v1"));
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_is_the_same_with_or_without_a_v1_suffix() {
+        for configured in [
+            "http://localhost:4321",
+            "http://localhost:4321/",
+            "http://localhost:4321/v1",
+            "http://localhost:4321/v1/",
+        ] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None).as_deref(),
+                Some("http://host.docker.internal:4321/v1"),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_translates_every_loopback_spelling() {
+        for (configured, want) in [
+            ("http://localhost:1234", "http://host.docker.internal:1234/v1"),
+            ("http://127.0.0.1:1234", "http://host.docker.internal:1234/v1"),
+            ("http://[::1]:1234", "http://host.docker.internal:1234/v1"),
+            ("http://LOCALHOST", "http://host.docker.internal/v1"),
+            // Review of #2906: each of these worked pre-PR (the container
+            // used its default) and must not regress to dialing the
+            // container's own loopback.
+            ("http://0.0.0.0:1234", "http://host.docker.internal:1234/v1"),
+            ("http://127.0.0.2:1234", "http://host.docker.internal:1234/v1"),
+            ("http://127.255.0.9:4321/v1", "http://host.docker.internal:4321/v1"),
+            ("http://[0:0:0:0:0:0:0:1]:1234", "http://host.docker.internal:1234/v1"),
+            ("http://[::]:1234", "http://host.docker.internal:1234/v1"),
+            ("https://Localhost:8443", "https://host.docker.internal:8443/v1"),
+        ] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None).as_deref(),
+                Some(want),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_keeps_userinfo_while_rewriting_a_loopback_host() {
+        for (configured, want) in [
+            ("http://user@localhost:4321", "http://user@host.docker.internal:4321/v1"),
+            ("http://user:pw@127.0.0.1:4321", "http://user:pw@host.docker.internal:4321/v1"),
+            // Userinfo on a non-loopback host: untouched.
+            ("http://user@192.168.1.5:4321", "http://user@192.168.1.5:4321/v1"),
+            // A userinfo that merely LOOKS like a loopback host is not the host.
+            ("http://localhost@192.168.1.5:4321", "http://localhost@192.168.1.5:4321/v1"),
+        ] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None).as_deref(),
+                Some(want),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_without_a_scheme_omits_the_flag_rather_than_pass_a_malformed_one() {
+        // A scheme-less `lmstudio_url` cannot be dialed as-is; forwarding it
+        // would hand the runtime a malformed `--base-url`. Omitting the flag
+        // leaves the runtime's own default in place, which is the pre-#2904
+        // behavior for every configured URL.
+        for configured in ["localhost:4321", "192.168.1.5:4321/v1"] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None),
+                None,
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_passes_a_non_loopback_host_through() {
+        for (configured, want) in [
+            ("http://192.168.1.5:4321", "http://192.168.1.5:4321/v1"),
+            ("https://models.example.com:8443/v1", "https://models.example.com:8443/v1"),
+            // A host that merely CONTAINS a loopback spelling is not loopback.
+            ("http://localhost.example.com:1234", "http://localhost.example.com:1234/v1"),
+        ] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None).as_deref(),
+                Some(want),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_mock_override_wins_verbatim() {
+        assert_eq!(
+            container_argv_base_url_for_env("http://localhost:4321", Some("http://127.0.0.1:1/v1")).as_deref(),
+            Some("http://127.0.0.1:1/v1"),
+            "the mock-model harness override must beat the configured URL, untranslated"
+        );
+    }
+
     #[test]
     fn build_docker_run_argv_minimal_dispatch_no_injection() {
         // Minimal dispatch: default darkmux image (inject=false), no
