@@ -4234,13 +4234,16 @@ fn endpoints_status(registry: &darkmux_types::ProfileRegistry) -> Check {
     } else {
         format!("{} endpoint(s): {}", lines.len(), lines.join("; "))
     };
+    // (#2902 review C6) Advice, not a warning: an inline endpoint works, so
+    // the check passes and names the move instead of flagging every
+    // working pre-4.0 config.
     if advice.is_empty() {
         Check { name, status: Status::Pass, message: listed, hint: None }
     } else {
         Check {
             name,
-            status: Status::Warn,
-            message: format!("{listed}; {}", advice.join("; ")),
+            status: Status::Pass,
+            message: format!("{listed}; advice: {}", advice.join("; ")),
             hint: Some(
                 "Inline `endpoint` objects still work. Declaring each endpoint once under the \
                  top-level `endpoints` map and naming it by id (`\"endpoint\": \"<id>\"`) keeps \
@@ -12435,7 +12438,8 @@ mod tests {
     fn endpoints_check_names_the_move_from_inline_to_an_id() {
         let r = materialized(r#"{"profiles":{"p":{"models":[{"id":"grok-4","endpoint":{"url":"https://api.x.ai/v1"}}]}}}"#);
         let c = endpoints_status(&r);
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.status, Status::Pass, "advice, not a warning, for a working inline endpoint");
+        assert!(c.message.contains("advice: "), "{}", c.message);
         assert!(c.message.contains("move the object to `endpoints.\"api.x.ai\"`"), "{}", c.message);
         assert!(c.hint.as_deref().is_some_and(|h| h.contains("still work")));
     }

@@ -892,6 +892,36 @@ mod tests {
         assert!(legacy.validate().unwrap_err().contains("api_version"));
     }
 
+    /// (#2902 review C6) Each distinct inline endpoint gets a UNIQUE
+    /// suggested id: two deployments on one host are told apart by the
+    /// deployment, the same definition shared by two models gets one id, and
+    /// an id `endpoints` already defines is never suggested again.
+    #[test]
+    fn inline_advice_suggests_a_unique_id_per_distinct_endpoint() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                    {"id":"a","endpoint":{"url":"https://r.example/openai/deployments/gpt-4o","api_version":"v1"}},
+                    {"id":"b","endpoint":{"url":"https://r.example/openai/deployments/gpt-5","api_version":"v1"}},
+                    {"id":"c","endpoint":{"url":"https://r.example/openai/deployments/gpt-5","api_version":"v1"}},
+                    {"id":"d","endpoint":{"url":"https://api.x.ai/v1"}}]}},
+                "endpoints":{"api.x.ai":{"url":"https://other.example/v1"}}}"#,
+        );
+        let advice: Vec<String> = r
+            .validate()
+            .into_iter()
+            .filter(|i| i.severity == crate::IssueSeverity::Advice)
+            .map(|i| i.message)
+            .collect();
+        let suggested = |model: &str| {
+            let line = advice.iter().find(|m| m.contains(&format!("model \"{model}\""))).unwrap();
+            line.split("`endpoints.\"").nth(1).unwrap().split('"').next().unwrap().to_string()
+        };
+        assert_eq!(suggested("a"), "r.example-gpt-4o");
+        assert_eq!(suggested("b"), "r.example-gpt-5");
+        assert_eq!(suggested("c"), "r.example-gpt-5", "one definition, one id");
+        assert_eq!(suggested("d"), "api.x.ai-2", "never an id `endpoints` already defines");
+    }
+
     #[test]
     fn limits_summary_names_each_set_limit() {
         let l = UsageLimits {

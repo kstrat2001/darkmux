@@ -770,6 +770,7 @@ impl ProfileRegistry {
     /// problems at use. Assumes [`Self::materialize_endpoints`] has run.
     pub fn validate(&self) -> Vec<RegistryIssue> {
         let mut out = Vec::new();
+        let suggestions = self.inline_endpoint_ids();
         for (id, def) in &self.endpoints {
             if let Err(reason) = def.validate() {
                 out.push(RegistryIssue::error(format!("endpoint \"{id}\": {reason}")));
@@ -800,7 +801,7 @@ impl ProfileRegistry {
                                     m.id
                                 )));
                             }
-                            let suggested = ep.host().unwrap_or_else(|| "lmstudio".to_string());
+                            let suggested = suggestions.get(&endpoint_key(ep)).cloned().unwrap_or_default();
                             out.push(RegistryIssue::advice(format!(
                                 "profile \"{pname}\" model \"{}\" declares its endpoint inline; move the \
                                  object to `endpoints.\"{suggested}\"` and write `\"endpoint\": \"{suggested}\"` \
@@ -823,6 +824,53 @@ impl ProfileRegistry {
         out
     }
 
+    /// (#2902 review C6) A suggested `endpoints` id for each DISTINCT inline
+    /// endpoint definition (keyed by [`endpoint_key`]): its host (or
+    /// `lmstudio` for a managed one); when several distinct definitions
+    /// share a host, the host plus the URL's last path segment (an Azure
+    /// deployment name); then a numeric suffix until the id is unique, never
+    /// reusing an id `endpoints` already defines. The same definition used by
+    /// several models gets one id.
+    fn inline_endpoint_ids(&self) -> BTreeMap<String, String> {
+        let mut defs: Vec<(String, String, String)> = Vec::new(); // (key, host base, last segment)
+        for profile in self.profiles.values() {
+            for m in &profile.models {
+                let Some(ep) = m.endpoint.as_ref().filter(|e| e.source == EndpointSource::Inline) else { continue };
+                let key = endpoint_key(ep);
+                if defs.iter().any(|(k, _, _)| *k == key) {
+                    continue;
+                }
+                let base = ep.host().unwrap_or_else(|| "lmstudio".to_string());
+                // The last segment of the URL's PATH (never the host).
+                let last = ep
+                    .url
+                    .as_deref()
+                    .and_then(|u| u.split_once("://"))
+                    .and_then(|(_, rest)| rest.trim_end_matches('/').split_once('/'))
+                    .and_then(|(_, path)| path.rsplit('/').next())
+                    .filter(|seg| !seg.is_empty() && !seg.eq_ignore_ascii_case("v1"))
+                    .unwrap_or_default()
+                    .to_string();
+                defs.push((key, base, last));
+            }
+        }
+        let mut taken: std::collections::BTreeSet<String> = self.endpoints.keys().cloned().collect();
+        let mut out = BTreeMap::new();
+        for (key, base, last) in &defs {
+            let shared = defs.iter().filter(|(_, b, _)| b == base).count() > 1;
+            let mut id = if shared && !last.is_empty() { format!("{base}-{last}") } else { base.clone() };
+            let stem = id.clone();
+            let mut n = 2;
+            while taken.contains(&id) {
+                id = format!("{stem}-{n}");
+                n += 1;
+            }
+            taken.insert(id.clone());
+            out.insert(key.clone(), id);
+        }
+        out
+    }
+
     pub fn quarantine_error_for(&self, name: &str) -> Option<String> {
         self.quarantined
             .iter()
@@ -835,6 +883,12 @@ impl ProfileRegistry {
                 )
             })
     }
+}
+
+/// A definition's identity for de-duplicating inline endpoints: its
+/// serialized form (the runtime-only `source` is not serialized).
+fn endpoint_key(ep: &ModelEndpoint) -> String {
+    serde_json::to_string(ep).unwrap_or_default()
 }
 
 fn named_endpoint(endpoints: &BTreeMap<String, ModelEndpoint>, id: &str) -> ModelEndpoint {
