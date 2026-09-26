@@ -500,6 +500,39 @@ mod tests {
         assert!(files.is_empty(), "no flow record may be written before the refusal: {files:?}");
     }
 
+    /// (#2916 re-review C6) A receiver's echoed session id is used only
+    /// when well-formed: one carrying a terminal escape is dropped and the
+    /// sender's own id is kept.
+    #[test]
+    #[serial]
+    fn a_malformed_echoed_session_id_is_not_used() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut b = [0u8; 65536];
+                let _ = s.read(&mut b);
+                let body = r#"{"status":"completed","session_id":"x\u001b]0;pwned\u0007","exit_code":0,"stdout":"ok"}"#;
+                let _ = s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                        .as_bytes(),
+                );
+            }
+        });
+        let _env = PeerEnv::new(port);
+        crate::submission::test_sender_provider::set(Box::new(crate::identity::StaticIdentityProvider {
+            local: crate::identity::test_node("nLOCAL", "local-a", "100.64.0.1"),
+            peers: vec![crate::identity::test_node("nPEERB", "peer-b", "127.0.0.1")],
+            down: None,
+        }));
+        let mut opts = local_opts("pr-reviewer");
+        opts.machine = Some("peer-b".to_string());
+        let r = dispatch_routed_via(opts, |_| panic!("never local")).unwrap();
+        assert!(!r.session_id.contains('\u{1b}'), "{:?}", r.session_id);
+        assert!(r.session_id.starts_with("pr-reviewer") || !r.session_id.contains("pwned"), "{:?}", r.session_id);
+    }
+
     /// Positive control for the test above: the same setup WITHOUT a resume
     /// does dial the peer (and fails loudly, since the peer answers
     /// nothing), so "never dialed" above means refused, not misconfigured.
