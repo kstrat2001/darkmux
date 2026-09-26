@@ -9511,9 +9511,9 @@ impl TailerState {
                 // metrics.json-sourced (cumulative, seeded) totals.
                 //
                 // The former at-complete aggregate record is gone so
-                // nothing double-counts. Skipped when the event carries no
-                // `usage` (such turns also don't accumulate in
-                // metrics.json — symmetric).
+                // nothing double-counts. A turn whose event carries no
+                // `usage` accumulates nothing here (nor in metrics.json)
+                // but still gets its record, per #2902 below.
                 // (#2902 step 1a) ONE record per call, usage or not: a turn
                 // whose event carried no usage still emits, marked
                 // `token_source: "absent"` with no counts, so it adds zero

@@ -1073,9 +1073,11 @@ fn step_for_record<'a>(
 /// `applyRecordToMetrics`. The per-turn RUNNING increments
 /// (`telemetry.tokens`, `dispatch.turn`) are deliberately NOT folded here:
 /// those stay the page's live SSE channel, so the backfill can never race
-/// ahead of or double-count the live meter. ANY matched record naming a
-/// hosted `payload.endpoint` marks its step `cloud` — terminal or not,
-/// mirroring the JS fold (which flags cloud before its action branches).
+/// ahead of or double-count the live meter. A matched dispatch/step record
+/// naming a hosted `payload.endpoint` marks its step `cloud` — terminal or
+/// not, mirroring the JS fold (which flags cloud before its action
+/// branches). A usage record's (`telemetry.tokens`) `endpoint` never does:
+/// it names what was called, LMStudio included (#2902 step 1a).
 /// Pure + iterator-driven so the correlation/fold logic is unit-testable
 /// without touching the filesystem.
 pub(crate) fn fold_step_finals<I>(

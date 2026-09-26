@@ -27,7 +27,7 @@
 //! `token_source: "absent"`. `total_tokens` prefers the provider's own total
 //! and falls back to `prompt + completion` only when the provider reported a
 //! split without a total (arithmetic on reported numbers, the same precedence
-//! `turn_tokens_payload` and `map_item_token_payload` always used).
+//! `turn_tokens_payload` and the map-item payload always used).
 //!
 //! The producers, each calling [`usage_payload`] (directly or through
 //! [`crate::single_shot::SingleShotReply::usage_payload`], the shared reply
@@ -36,7 +36,8 @@
 //! - the container path's per-turn tailer (`dispatch_internal`, `"turn"`)
 //! - `dispatch_remote` and `dispatch_local_single_shot` (`"single_shot"`)
 //! - the `dispatch.single_shot` step kind, both arms (`"single_shot"`)
-//! - `dispatch.map`'s per-item emitter (`"map_item"`)
+//! - `dispatch.map`, one record per model call of each item, retries included
+//!   (`"map_item"`, via `map_call_token_payload`)
 //!
 //! `usage_conformance` (tests) drives each one and holds the roster.
 

@@ -162,9 +162,16 @@ pub(super) fn read_src(file: &str) -> String {
 /// an `impl`), and a line-based rule that handles both is a rule that
 /// handles neither reliably.
 pub(super) fn fn_body(src: &str, func: &str) -> String {
-    let decl = format!("fn {func}(");
+    block_from(src, &format!("fn {func}("))
+}
+
+/// The brace-balanced block that follows the first `decl` in `src` (the
+/// lexer [`fn_body`] uses; also reached by `usage_conformance` to cut a
+/// `mod tests { … }` block out of a file).
+pub(super) fn block_from(src: &str, decl: &str) -> String {
+    let func = decl;
     let start = src
-        .find(&decl)
+        .find(decl)
         .unwrap_or_else(|| panic!("no `{decl}` in source — did the function get renamed?"));
     let cs: Vec<char> = src[start..].chars().collect();
     let mut i = 0usize;

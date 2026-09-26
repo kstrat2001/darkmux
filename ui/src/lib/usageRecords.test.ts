@@ -142,6 +142,34 @@ describe("#2902 step 1a: per-call usage records change no consumer's result", ()
     expect(turnItems(vis(after), after)).toEqual(turnItems(vis(before), before));
   });
 
+  it("a retried map item's per-call records total the same as its old single per-item record", () => {
+    // (#2902 review) Before: one record per ITEM with the attempts' counts
+    // accumulated. After: one per CALL. Three attempts of 10 tokens each.
+    clock = 0;
+    const M = "m-1";
+    const head = [
+      r({ action: "dispatch start", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map" } }),
+    ];
+    const one = usage("task-t9", "mp", { total_tokens: 30, prompt_tokens: 24, completion_tokens: 6, remote: false, index: 0 }, M);
+    const per = [0, 1, 2].map(() =>
+      ({ ...usage("task-t9", "mp", { call_kind: "map_item", requested_model: "q", endpoint: LMS, token_source: "provider", total_tokens: 10, prompt_tokens: 8, completion_tokens: 2, remote: false, index: 0 }, M), ts: one.ts }),
+    );
+    const tail = [
+      r({ action: "dispatch complete", session_id: "task-t9", handle: "mp", mission_id: M, payload: { step_id: "mp", kind: "dispatch.map", result_class: "ok" } }),
+    ];
+    const before = [...head, one, ...tail];
+    const after = [...head, ...per, ...tail];
+    expect(tokensOffMeter(after)).toEqual(tokensOffMeter(before));
+    expect(tokensOffMeter(after).total).toBe(30);
+    expect(runRegions(after, "task-t9", Date.UTC(2026, 8, 27))).toEqual(runRegions(before, "task-t9", Date.UTC(2026, 8, 27)));
+    const idx = indexGraph({ nodes: [{ id: "t9", kind: "task", steps: [{ id: "mp", kind: "dispatch.map" }] }] as never });
+    const fold = (recs: FlowRecord[]) => recs.reduce<MetricsMap>((m, x) => applyRecordToMetrics(m, x, idx, M), {});
+    const a = fold(after);
+    const b = fold(before);
+    expect(a.mp?.tokRun).toBe(30);
+    expect({ ...a.mp, lastTs: 0 }).toEqual({ ...b.mp, lastTs: 0 });
+  });
+
   it("the predicates", () => {
     expect(countsInLegacyTokenSums({})).toBe(true);
     expect(countsInLegacyTokenSums({ call_kind: "turn", token_source: "provider" })).toBe(true);

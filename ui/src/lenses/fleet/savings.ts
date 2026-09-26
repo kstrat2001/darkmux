@@ -579,11 +579,10 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       total += p.total_tokens || 0;
       prompt += p.prompt_tokens || 0;
       completion += p.completion_tokens || 0;
-      // A `telemetry.tokens` record carries no `endpoint` of its own on any
-      // producer (the only emitter is the container path's per-turn tailer,
-      // `crates/darkmux-crew/src/dispatch_internal.rs:8539`, whose payload
-      // is `{turn_seq, prompt_tokens, completion_tokens, total_tokens}`), so
-      // this split can never be per-seat — the finest grain available to it
+      // A `telemetry.tokens` record's `endpoint` (#2902 step 1a) names what
+      // was CALLED, an LMStudio base URL included; it is not the hosted
+      // marker the bookends carry, so this split never reads it. Without a
+      // seat verdict of its own (`remote`, below) the finest grain available
       // is the RUN the record itself belongs to. Which is precisely why the
       // key has to be `runKey` and not a bare session id: this record names
       // its own `mission_id`, so joining on `(session_id, mission_id)` reads

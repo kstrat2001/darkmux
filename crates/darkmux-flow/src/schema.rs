@@ -90,8 +90,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.57.0";
 //           `dispatch.single_shot` step kind (both arms). Before this their
 //           tokens reached only the `dispatch complete` payload, which keeps
 //           carrying them unchanged. Existing producers (the container
-//           path's per-turn tailer, `dispatch.map`'s per-item emitter) now
-//           go through the same writer.
+//           path's per-turn tailer, `dispatch.map`) now go through the same
+//           writer. `dispatch.map` now emits one record per model CALL, not
+//           per item: an item that retries (`retry_on_empty` /
+//           `retry_on_error`) emits one record per attempt that got a reply,
+//           each with that attempt's own counts and `reported_model`, all
+//           carrying the item's `index`; they sum to the item's totals.
+//           An attempt with no reply (transport error, budget skip) made no
+//           completed call and emits none.
 //
 //           New payload keys on every `telemetry.tokens`:
 //           `call_kind` (`"turn"` | `"single_shot"` | `"map_item"`;
