@@ -2043,6 +2043,83 @@ fn retired_top_level_external_verb_is_unknown() {
         ));
 }
 
+/// (#2912, 4.0) `mission propose` retired outright with the mission-compiler
+/// role — no compat alias, so clap rejects `propose` as an unknown
+/// subcommand of `mission`.
+#[test]
+fn retired_mission_propose_is_unknown() {
+    let mut cmd = darkmux_cmd();
+    cmd.arg("mission")
+        .arg("propose")
+        .arg("plan a trip")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("propose").and(
+                predicate::str::contains("unrecognized subcommand")
+                    .or(predicate::str::contains("unexpected argument")),
+            ),
+        );
+}
+
+/// (#2913, 4.0) `lab notebook draft`/`list` retired outright with the scribe
+/// role; the bundled `darkmux-lab-notebook` skill replaces them. No compat
+/// alias, so clap rejects `notebook` as an unknown subcommand of `lab`.
+#[test]
+fn retired_lab_notebook_is_unknown() {
+    let mut cmd = darkmux_cmd();
+    cmd.arg("lab")
+        .arg("notebook")
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("notebook").and(
+                predicate::str::contains("unrecognized subcommand")
+                    .or(predicate::str::contains("unexpected argument")),
+            ),
+        );
+}
+
+/// (#2912 review M1) The upgrade repro: a pre-4.0 user-tier
+/// `roles/mission-compiler.json` names the `mission-compiling` skill 4.0
+/// deleted. Before the fix, the crew index rebuild failed its deferred FK at
+/// COMMIT and EVERY `role list` / `role show` exited with `FOREIGN KEY
+/// constraint failed`. Now the dangling link is skipped with a warning and
+/// both verbs work.
+#[test]
+fn role_verbs_survive_a_leftover_role_naming_a_deleted_skill() {
+    let tmp = TempDir::new().unwrap();
+    let roles = tmp.path().join(".darkmux").join("roles");
+    fs::create_dir_all(&roles).unwrap();
+    fs::write(
+        roles.join("mission-compiler.json"),
+        r#"{
+          "id": "mission-compiler",
+          "description": "Leftover pre-4.0 role.",
+          "skills": ["mission-compiling"],
+          "tool_palette": {"allow": ["read"], "deny": ["edit", "write", "exec", "process"]},
+          "escalation_contract": "bail-with-explanation",
+          "role_family": "utility"
+        }"#,
+    )
+    .unwrap();
+
+    darkmux_cmd_in_project(tmp.path())
+        .args(["role", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("coder"))
+        .stderr(
+            predicate::str::contains("mission-compiling")
+                .and(predicate::str::contains("FOREIGN KEY").not()),
+        );
+    darkmux_cmd_in_project(tmp.path())
+        .args(["role", "show", "coder"])
+        .assert()
+        .success();
+}
+
 // ── mission migrate integration tests (#148 Task 8) ───────────────────────
 
 fn write_flat_mission_file(root: &std::path::Path, id: &str) {

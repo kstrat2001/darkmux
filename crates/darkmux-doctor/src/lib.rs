@@ -172,6 +172,8 @@ pub fn run() -> DoctorReport {
         check_removed_telemetry_record_every_samples(),
         check_removed_radio_router_staffing(),
         check_removed_notebook_settings(),
+        check_retired_role_leftovers(),
+        check_role_skill_references(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -2725,6 +2727,104 @@ fn check_removed_notebook_settings() -> Check {
              (installed by `darkmux init`) drafts an entry from `darkmux lab run stats <run-id> --json` \
              and writes it wherever your own instructions say",
             steps.join("; ")
+        )),
+    }
+}
+
+/// (#2912 review M1) Every role → skill reference resolves to a skill
+/// manifest. A dangling one is reachable on upgrade: 4.0 deleted the builtin
+/// `mission-compiling` skill, and a pre-4.0 user-tier
+/// `roles/mission-compiler.json` still names it. The crew index skips such a
+/// link (and warns once, on the rebuild) rather than failing — this check is
+/// the persistent surface that names the file, the missing skill, and the
+/// edit (lenient on read, loud in doctor — contract 7).
+fn check_role_skill_references() -> Check {
+    let name = "role skill references";
+    let refs = match darkmux_crew::index::dangling_skill_refs() {
+        Ok(r) => r,
+        Err(e) => {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!("could not load the role/skill manifests: {e:#}"),
+                hint: None,
+            }
+        }
+    };
+    if refs.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: "every role's skills resolve to a skill manifest".into(),
+            hint: None,
+        };
+    }
+    let found: Vec<String> = refs
+        .iter()
+        .map(|r| match &r.manifest {
+            Some(p) => format!(
+                "role `{}` ({}) names skill `{}`",
+                r.role_id,
+                p.display(),
+                r.skill_id
+            ),
+            None => format!("builtin role `{}` names skill `{}`", r.role_id, r.skill_id),
+        })
+        .collect();
+    let steps: Vec<String> = refs
+        .iter()
+        .map(|r| match &r.manifest {
+            Some(p) => format!(
+                "remove `{}` from the `skills` list in {} (or delete the file if it is a retired role you \
+                 never customized)",
+                r.skill_id,
+                p.display()
+            ),
+            None => format!(
+                "builtin role `{}` names a skill this binary does not embed; please file an issue",
+                r.role_id
+            ),
+        })
+        .collect();
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!(
+            "{} — no skill manifest defines it; the crew index skips that link",
+            found.join("; ")
+        ),
+        hint: Some(steps.join("; ")),
+    }
+}
+
+/// (#2912/#2913, 4.0) The `mission-compiler` and `scribe` builtin roles
+/// retired with `mission propose` and `lab notebook`. A user-tier copy of
+/// either (a `.json` override or a `.md` prompt left in `<root>/roles/`) is
+/// not inert: the `.json` still loads as a user role and shows in `darkmux
+/// role list`, though nothing in darkmux dispatches it. Same shape as
+/// `check_removed_notebook_settings`: `Pass` when none is present, `Warn`
+/// naming each file with the removal step.
+fn check_retired_role_leftovers() -> Check {
+    let name = "retired roles (mission-compiler, scribe)";
+    let dir = darkmux_crew::loader::user_roles_dir();
+    let present: Vec<std::path::PathBuf> = ["mission-compiler", "scribe"]
+        .iter()
+        .flat_map(|id| ["json", "md"].map(|ext| dir.join(format!("{id}.{ext}"))))
+        .filter(|p| p.is_file())
+        .collect();
+    if present.is_empty() {
+        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    let list: Vec<String> = present.iter().map(|p| p.display().to_string()).collect();
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!("retired-role file(s) left in the user tier: {}", list.join(", ")),
+        hint: Some(format!(
+            "delete {} — `mission-compiler` retired with `mission propose` (#2912) and `scribe` with \
+             `lab notebook` (#2913) in 4.0; a leftover `.json` still loads as a user role and appears in \
+             `darkmux role list`, but nothing dispatches it",
+            list.join(" and ")
         )),
     }
 }
@@ -12563,9 +12663,10 @@ mod tests {
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        // 64 plus (#2913) `check_removed_notebook_settings`, the 4.0
-        // migration note for `dirs.notebook` / `DARKMUX_NOTEBOOK_DIR`.
-        let expected = 65 + darkmux_eureka::all_rules().len();
+        // 64 on main, plus three 4.0 retirement checks: (#2913)
+        // `check_removed_notebook_settings`, and (#2912/#2913 review)
+        // `check_retired_role_leftovers` and `check_role_skill_references`.
+        let expected = 67 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -14356,6 +14457,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── (#2912 review M1) role skill references + retired-role leftovers ──
+
+    /// The pre-4.0 builtin `mission-compiler` manifest, byte-for-byte the
+    /// shape an upgrading operator's user tier can hold (it names the
+    /// `mission-compiling` skill 4.0 deleted).
+    const LEFTOVER_MISSION_COMPILER: &str = r#"{
+      "id": "mission-compiler",
+      "description": "Utility-family role that takes unstructured intent.",
+      "skills": ["mission-compiling"],
+      "tool_palette": {"allow": ["read"], "deny": ["edit", "write", "exec", "process"]},
+      "escalation_contract": "bail-with-explanation",
+      "role_family": "utility"
+    }"#;
+
+    #[serial_test::serial]
+    #[test]
+    fn role_skill_references_pass_for_the_builtin_set() {
+        let _guard = CrewRootGuard::new();
+        let check = check_role_skill_references();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn role_skill_references_warn_naming_file_skill_and_fix() {
+        let guard = CrewRootGuard::new();
+        let roles = guard.path().join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        let file = roles.join("mission-compiler.json");
+        std::fs::write(&file, LEFTOVER_MISSION_COMPILER).unwrap();
+        let check = check_role_skill_references();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("mission-compiler"), "names the role: {}", check.message);
+        assert!(check.message.contains("mission-compiling"), "names the skill: {}", check.message);
+        assert!(
+            check.message.contains(&file.display().to_string()),
+            "names the file: {}",
+            check.message
+        );
+        let hint = check.hint.expect("a fix");
+        assert!(hint.contains("remove `mission-compiling`"), "the exact edit: {hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn retired_role_leftovers_pass_when_none_present() {
+        let guard = CrewRootGuard::new();
+        // A live user-tier role override is not a leftover.
+        let roles = guard.path().join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("coder.md"), "custom prompt").unwrap();
+        let check = check_retired_role_leftovers();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn retired_role_leftovers_warn_naming_each_file() {
+        let guard = CrewRootGuard::new();
+        let roles = guard.path().join("roles");
+        std::fs::create_dir_all(&roles).unwrap();
+        std::fs::write(roles.join("mission-compiler.json"), LEFTOVER_MISSION_COMPILER).unwrap();
+        std::fs::write(roles.join("scribe.md"), "old scribe prompt").unwrap();
+        let check = check_retired_role_leftovers();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        for f in ["mission-compiler.json", "scribe.md"] {
+            assert!(
+                check.message.contains(&roles.join(f).display().to_string()),
+                "names {f}: {}",
+                check.message
+            );
+        }
+        assert!(!check.message.contains("scribe.json"), "only files that exist: {}", check.message);
+        let hint = check.hint.expect("a fix");
+        assert!(hint.contains("delete"), "the fix: {hint}");
     }
 
     #[serial_test::serial]

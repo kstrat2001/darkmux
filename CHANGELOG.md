@@ -45,9 +45,15 @@ darkmux release.
   `~/.darkmux/mission-configs/<id>.json`, then `darkmux mission launch
   <id>`; `darkmux mission config list`/`show` render the configs you can
   launch. A config's `ticket` key still sets the mission's ticket (the
-  old `--ticket` flag went with the verb). An operator role override at
-  `<DARKMUX_HOME>/roles/mission-compiler.json` is now just an unused
-  file.
+  old `--ticket` flag went with the verb). A leftover
+  `<DARKMUX_HOME>/roles/mission-compiler.json` (or `scribe.json`, below)
+  still loads as a user role and shows in `darkmux role list`, though
+  nothing dispatches it; delete it. `darkmux doctor` names any such file
+  still present, and names any role whose `skills` list points at a skill
+  that no longer exists (the old `mission-compiler` manifest names the
+  deleted `mission-compiling` skill). The crew index skips that one link
+  with a warning instead of failing, so `role list` and `role show` keep
+  working.
 - **`darkmux lab notebook draft` / `lab notebook list`, the `scribe`
   role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting**
   (#2913). Built-in notebook prose is not needed when a skill can do it

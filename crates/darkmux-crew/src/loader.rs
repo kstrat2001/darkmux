@@ -259,6 +259,39 @@ pub(crate) fn roles_dir() -> PathBuf {
     resolve_user_subdir("roles")
 }
 
+/// Public read of the user-tier roles directory, for `darkmux doctor`'s
+/// leftover-role checks (#2912/#2913 review). Same resolution as
+/// [`roles_dir`].
+pub fn user_roles_dir() -> PathBuf {
+    roles_dir()
+}
+
+/// (#2912 review M1) The user-tier manifest that declares `role_id`, or
+/// `None` when the role is builtin-only. The manifest's `id` field is
+/// authoritative (#892), so a misnamed file is still found; the
+/// `<role_id>.json` filename is checked first because it is the common
+/// case. Unreadable or unparseable files are skipped silently — the loader
+/// already warns about those on every load.
+pub fn user_role_manifest_path(role_id: &str) -> Option<PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct IdOnly {
+        id: String,
+    }
+    let dir = roles_dir();
+    let id_of = |p: &std::path::Path| read_json::<IdOnly>(p).ok().map(|r| r.id);
+    let direct = dir.join(format!("{role_id}.json"));
+    if direct.is_file() && id_of(&direct).as_deref() == Some(role_id) {
+        return Some(direct);
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    entries.sort();
+    entries.into_iter().find(|p| id_of(p).as_deref() == Some(role_id))
+}
+
 /// User-side missions directory. Post-Beat-33: `<root>/missions/`.
 /// Falls back to `<root>/crew/missions/` for operators on the legacy
 /// layout.
