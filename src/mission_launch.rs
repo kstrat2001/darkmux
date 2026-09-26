@@ -4602,7 +4602,7 @@ fn loaded_registry_for_staffing(
         Err(e) => (
             darkmux_types::ProfileRegistry::default(),
             Some(format!(
-                "mission launch: the utility-model staffing check was not checked: the profile \
+                "mission launch: the utility-model staffing check did not run: the profile \
                  registry did not load ({e:#}). Each dispatch will stop on the same error."
             )),
         ),
@@ -4903,7 +4903,7 @@ mod tests {
         let (registry, warning) = loaded_registry_for_staffing(&collected);
         assert!(registry.profiles.is_empty());
         let warning = warning.expect("an unloadable registry must be reported");
-        assert!(warning.contains("not checked") && warning.contains("profiles.json"), "{warning}");
+        assert!(warning.contains("did not run") && warning.contains("profiles.json"), "{warning}");
         let good = tmp.path().join("good.json");
         std::fs::write(&good, r#"{"profiles":{"p":{"models":[{"id":"m","n_ctx":1}]}}}"#).unwrap();
         collected.insert("profiles".to_string(), serde_json::json!(good.to_str().unwrap()));

@@ -1202,16 +1202,8 @@ mod tests {
         assert_eq!(fine.profile.as_deref(), Some("fast"));
     }
 
-    // ── n_ctx gate (merge-gate MUST-FIX 1) ─────────────────────────────
-    // Every real dispatch path (resourcing.rs::resolve_task_role,
-    // dispatch_internal.rs, darkmux-lab's review.rs) refuses a local model
-    // with no declared n_ctx before staffing it. `show` must refuse the
-    // same way, not render it as a healthy `not loaded`.
+    // ── #2902: the model `show` names is the one the dispatch runs ──────
 
-    /// (#2902 step 3) `show` names the model the dispatch will RUN: the one
-    /// resolver's selection within the bound profile, not simply its
-    /// default. `coder` (skills `coding`, `test-designing`) selects the
-    /// code-weighted model over the declared default.
     /// (#2902 review C1) A seat whose selected model names an endpoint the
     /// registry cannot resolve is shown as unusable with the reason, never
     /// as a healthy hosted seat.
@@ -1249,6 +1241,10 @@ mod tests {
         assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
     }
 
+    /// (#2902 step 3) `show` names the model the dispatch will RUN: the one
+    /// resolver's selection within the bound profile, not simply its
+    /// default. `coder` (skills `coding`, `test-designing`) selects the
+    /// code-weighted model over the declared default.
     #[test]
     fn show_names_the_selected_model_not_simply_the_profile_default() {
         let model = |id: &str, cap: &str| {
@@ -1266,6 +1262,12 @@ mod tests {
         let unknown = resolve_role("role-a", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
         assert_eq!(unknown.model.as_ref().map(|m| m.id.as_str()), Some("generalist"));
     }
+
+    // ── n_ctx gate (merge-gate MUST-FIX 1) ─────────────────────────────
+    // Every real dispatch path (resourcing.rs::resolve_task_role,
+    // dispatch_internal.rs, darkmux-lab's review.rs) refuses a local model
+    // with no declared n_ctx before staffing it. `show` must refuse the
+    // same way, not render it as a healthy `not loaded`.
 
     #[test]
     fn local_model_without_n_ctx_is_refused_like_launch_would_refuse_it() {
