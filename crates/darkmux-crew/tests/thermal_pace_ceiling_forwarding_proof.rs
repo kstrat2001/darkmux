@@ -172,7 +172,7 @@ fn the_fakes_are_written_once_not_per_test() {
 /// `DARKMUX_THERMAL_MAX_PAUSE_MS` set to `max_pause_ms`, and return every
 /// argv line the shim recorded.
 fn captured_docker_argv(max_pause_ms: &str) -> String {
-    captured_docker_argv_with(max_pause_ms, Some("http://127.0.0.1:1/v1"), None, "[]")
+    captured_docker_argv_with(max_pause_ms, Some("http://127.0.0.1:1/v1"), None, "[]", None)
 }
 
 /// The general form: `base_url_override` is `DispatchOpts::
@@ -185,6 +185,7 @@ fn captured_docker_argv_with(
     base_url_override: Option<&str>,
     lmstudio_url: Option<&str>,
     lms_ps_json: &str,
+    remote_origin: Option<&str>,
 ) -> String {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home_dir = tmp.path().join("home");
@@ -216,7 +217,7 @@ fn captured_docker_argv_with(
     let opts = DispatchOpts {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
-        remote_origin: None,
+        remote_origin: remote_origin.map(str::to_string),
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -333,7 +334,7 @@ fn a_finite_max_pause_forwards_the_operators_own_value() {
 #[serial_test::serial]
 fn a_configured_lmstudio_url_reaches_the_container_translated_for_docker() {
     let resident = r#"[{"identifier":"darkmux:mock-model","modelKey":"mock-model","contextLength":8192,"status":"idle"}]"#;
-    let recorded = captured_docker_argv_with("120000", None, Some("http://localhost:4321"), resident);
+    let recorded = captured_docker_argv_with("120000", None, Some("http://localhost:4321"), resident, None);
     // Proves a `docker run` reached the shim. The runtime args follow the
     // multi-line `--system` prompt, so they land on later record lines:
     // assert against the whole record, not just the env-block line.
@@ -359,4 +360,17 @@ fn the_container_runs_by_the_checked_image_id_not_by_tag() {
         !run_line.contains("darkmux-runtime:latest"),
         "a tag can be re-pointed after the check: {run_line}"
     );
+}
+
+/// (#2916 re-review C2) Pins the CALL SITE, not just the helper: the argv
+/// `dispatch()` really builds for a job another machine submitted mounts no
+/// shared toolchain cache, while a local dispatch still does.
+#[test]
+#[serial_test::serial]
+fn a_remote_origin_dispatch_really_mounts_no_shared_cache() {
+    let local = captured_docker_argv_with("1000", Some("http://127.0.0.1:1/v1"), None, "[]", None);
+    assert!(docker_run_line(&local).contains(":/darkmux-cache"), "a local dispatch keeps its cache mount");
+    let remote = captured_docker_argv_with("1000", Some("http://127.0.0.1:1/v1"), None, "[]", Some("laptop"));
+    let line = docker_run_line(&remote);
+    assert!(!line.contains("darkmux-cache"), "a remote-origin dispatch must not mount the shared cache: {line}");
 }

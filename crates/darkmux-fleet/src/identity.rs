@@ -353,6 +353,32 @@ pub(crate) fn parse_status_json(raw: &[u8]) -> Result<(NodeIdentity, Vec<NodeIde
     Ok((me, peers))
 }
 
+/// A provider that could not be built (an unknown `fleet.identity.provider`
+/// value): every question is answered with that error, so a caller that
+/// only SOMETIMES needs the provider (loopback targets never do) fails only
+/// when it does.
+pub struct UnavailableProvider(pub String);
+
+impl IdentityProvider for UnavailableProvider {
+    fn provider_name(&self) -> &str {
+        "unavailable"
+    }
+    fn identify(&self, _peer: IpAddr) -> Result<Option<NodeIdentity>> {
+        bail!("{}", self.0)
+    }
+    fn local_node(&self) -> Result<NodeIdentity> {
+        bail!("{}", self.0)
+    }
+    fn nodes(&self) -> Result<Vec<NodeIdentity>> {
+        bail!("{}", self.0)
+    }
+}
+
+/// [`configured_provider`], or an [`UnavailableProvider`] carrying why not.
+pub fn configured_provider_or_unavailable() -> Box<dyn IdentityProvider> {
+    configured_provider().unwrap_or_else(|e| Box::new(UnavailableProvider(format!("{e:#}"))))
+}
+
 /// A provider with a fixed answer table, for tests (and only tests: no
 /// config value builds one).
 #[cfg(any(test, feature = "test-support"))]

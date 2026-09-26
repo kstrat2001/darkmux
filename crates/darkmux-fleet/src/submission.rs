@@ -455,9 +455,44 @@ pub fn submission_url(roster_address: &str, port: u16) -> Result<String> {
     Ok(format!("http://{host}:{port}{SUBMISSION_PATH}"))
 }
 
-/// Send one job to `url` with the fleet token. `Ok(reply)` for every answer
-/// the receiver gave (including a refusal); `Err` only when no answer came
-/// (unreachable, timed out, not darkmux).
+fn read_reply(
+    where_: &str,
+    resp: std::result::Result<ureq::Response, ureq::Error>,
+) -> Result<(u16, SubmissionReply)> {
+    let (code, resp) = match resp {
+        Ok(r) => (r.status(), r),
+        Err(ureq::Error::Status(code, r)) => (code, r),
+        Err(ureq::Error::Transport(t)) => {
+            return Err(anyhow!("no answer from {where_}: {t}"));
+        }
+    };
+    let text = resp.into_string().context("reading the submission reply")?;
+    let reply: SubmissionReply = serde_json::from_str(&text).map_err(|_| {
+        anyhow!(
+            "{where_} answered HTTP {code} but not as a darkmux fleet listener (is `fleet.listener` \
+             enabled on that machine, on the same port as here?): {}",
+            sanitize_remote_text(&text.chars().take(200).collect::<String>())
+        )
+    })?;
+    Ok((code, reply))
+}
+
+/// Send one job to a VERIFIED target's fleet listener (the token is
+/// attached by `peer`, the only place that does). `Ok(reply)` for every
+/// answer the receiver gave (including a refusal); `Err` only when no
+/// answer came.
+pub fn send_submission(
+    target: &crate::peer::PeerTarget,
+    submission: &WorkSubmission,
+    read_timeout: Duration,
+) -> Result<(u16, SubmissionReply)> {
+    let body = serde_json::to_string(submission).context("serializing the work submission")?;
+    let where_ = format!("{}{SUBMISSION_PATH}", target.base());
+    read_reply(&where_, crate::peer::fleet_post_json(target, SUBMISSION_PATH, &body, read_timeout))
+}
+
+/// Tests only: send one job to `url` with an explicit token, unverified.
+#[cfg(any(test, feature = "test-support"))]
 pub fn post_submission(
     url: &str,
     token: &str,
@@ -465,40 +500,48 @@ pub fn post_submission(
     read_timeout: Duration,
 ) -> Result<(u16, SubmissionReply)> {
     let body = serde_json::to_string(submission).context("serializing the work submission")?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(read_timeout)
-        .timeout_write(Duration::from_secs(30))
-        .build();
-    let resp = agent
-        .post(url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .send_string(&body);
-    let (code, resp) = match resp {
-        Ok(r) => (r.status(), r),
-        Err(ureq::Error::Status(code, r)) => (code, r),
-        Err(ureq::Error::Transport(t)) => {
-            return Err(anyhow!("no answer from {url}: {t}"));
-        }
-    };
-    let text = resp.into_string().context("reading the submission reply")?;
-    let reply: SubmissionReply = serde_json::from_str(&text).map_err(|_| {
-        anyhow!(
-            "{url} answered HTTP {code} but not as a darkmux fleet listener (is `fleet.listener` \
-             enabled on that machine, on the same port as here?): {}",
-            text.chars().take(200).collect::<String>()
-        )
-    })?;
-    Ok((code, reply))
+    let base = url.strip_suffix(SUBMISSION_PATH).unwrap_or(url);
+    let target = crate::peer::unverified_target_for_test(base);
+    read_reply(url, crate::peer::post_json_with_token_for_test(&target, SUBMISSION_PATH, &body, read_timeout, token))
 }
 
-/// (#2916 review C1) Text that came back from another machine, safe to
-/// print: every control character except newline and tab is dropped, so a
-/// reply cannot move the cursor, rewrite earlier lines or set the terminal
-/// title with escape sequences.
+/// (#2916 review C1, re-review MUST 4) Text that came back from another
+/// machine, safe to print: every control character except newline and tab
+/// is dropped, so a reply cannot move the cursor, rewrite earlier lines or
+/// set the terminal title with escape sequences; and the bidirectional
+/// overrides and zero-width characters (U+202A-202E, U+2066-2069,
+/// U+200B-200F, U+FEFF) are dropped, so it cannot reorder or hide text.
 pub fn sanitize_remote_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect()
+    s.chars().filter(|c| !is_unsafe_remote_char(*c)).collect()
+}
+
+fn is_unsafe_remote_char(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}')
+}
+
+/// Every string inside a JSON value another machine sent, through
+/// [`sanitize_remote_text`] (keys included), so no field of it can carry a
+/// terminal escape into anything that prints it.
+pub fn sanitize_remote_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => *s = sanitize_remote_text(s),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(sanitize_remote_json),
+        serde_json::Value::Object(o) => {
+            let entries: Vec<(String, serde_json::Value)> = std::mem::take(o).into_iter().collect();
+            for (k, mut val) in entries {
+                sanitize_remote_json(&mut val);
+                o.insert(sanitize_remote_text(&k), val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`sanitize_remote_text`] for a one-line value (a table cell): newlines
+/// and tabs are dropped too.
+pub fn sanitize_remote_line(s: &str) -> String {
+    sanitize_remote_text(s).chars().filter(|c| *c != '\n' && *c != '\t').collect()
 }
 
 /// The provider the SENDER verifies a target with. Tests in this crate may
@@ -589,46 +632,45 @@ pub fn submit_work(job: WorkJob, wait: bool) -> Result<SubmissionReply> {
     job.validate().context("validating the job before it leaves")?;
     let target = job.target_machine.clone();
     let roster = crate::load_roster().context("reading the fleet roster")?;
-    let entry = crate::find_machine(&roster, &target).cloned().ok_or_else(|| {
+    let entry = crate::find_machine(&roster, &target)?.cloned().ok_or_else(|| {
         anyhow!(
             "machine `{target}` is not in this machine's roster ({}); add it with \
              `darkmux machine add {target} --address <its tailnet DNS name>`",
             crate::roster_path().display()
         )
     })?;
-    let token = darkmux_flow::serve_token().ok_or_else(|| {
-        anyhow!(
+    if !darkmux_flow::serve_token_present() {
+        return Err(anyhow!(
             "no fleet token on this machine: submitting work to {target} needs the serve token \
              (Keychain item `darkmux-serve-token` or DARKMUX_SERVE_TOKEN), the same value {target} holds"
-        )
-    })?;
+        ));
+    }
     let provider = sender_provider()?;
-    let verified = verify_target(&target, &entry, provider.as_ref())?;
-    if verified.newly_pinned {
-        let id = entry.id.clone();
-        let node_id = verified.node.node_id.clone();
-        crate::mutate_roster(|r| {
-            if let Some(e) = r.machines.get_mut(&id) {
-                e.node_id = Some(node_id);
-            }
-            Ok(())
-        })
-        .context("pinning the target's node in the roster")?;
+    let port = darkmux_types::config_access::fleet_listener_port();
+    // Every address is verified for work, loopback included (the listener
+    // never binds loopback, so a real provider refuses it).
+    let peer = crate::peer::peer_target(&target, &entry, None, Some(port), port, false, provider.as_ref())?;
+    if peer.newly_pinned.is_some() {
+        crate::peer::persist_pin(&entry.id, &peer).context("pinning the target's node in the roster")?;
         eprintln!(
-            "darkmux dispatch: pinned {target} to the {} node `{}` (first contact); later sends check it",
-            provider.provider_name(),
-            verified.node.dns_name.as_deref().unwrap_or(&verified.node.name)
+            "darkmux dispatch: pinned {target} to its {} node (first contact); later sends check it",
+            provider.provider_name()
         );
     }
-    let port = darkmux_types::config_access::fleet_listener_port();
-    let url = submission_url(&verified.ip.to_string(), port)?;
     let read_timeout = if wait {
         Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
     } else {
         Duration::from_secs(60)
     };
     let submission = WorkSubmission::new(job, wait);
-    let (code, reply) = post_submission(&url, token.expose_for_compare(), &submission, read_timeout)?;
+    let (code, mut reply) = send_submission(&peer, &submission, read_timeout)?;
+    // (#2916 re-review C6) The echoed session id is printed and stored:
+    // only a well-formed one is kept.
+    if let Some(sid) = &reply.session_id {
+        if crate::job::validate_reply_session_id(sid).is_err() {
+            reply.session_id = None;
+        }
+    }
     match reply.status.as_str() {
         "completed" | "accepted" => Ok(reply),
         "error" => Err(anyhow!(
@@ -928,6 +970,21 @@ mod tests {
         // Provider down: refused.
         let down = crate::identity::StaticIdentityProvider { down: Some("x".into()), ..provider };
         assert!(verify_target("studio", &roster_entry("100.64.0.2", None), &down).is_err());
+    }
+
+    #[test]
+    fn remote_json_is_sanitized_throughout() {
+        let mut v = serde_json::json!({"os": "mac\u{1b}]0;x\u{7}", "m": [{"id\u{202e}": "a\u{1b}[2J"}]});
+        sanitize_remote_json(&mut v);
+        assert_eq!(v, serde_json::json!({"os": "mac]0;x", "m": [{"id": "a[2J"}]}));
+    }
+
+    #[test]
+    fn remote_text_loses_bidi_and_zero_width_characters() {
+        let s = "a\u{202E}b\u{2066}c\u{200B}d\u{200F}e\u{FEFF}f\u{85}g";
+        assert_eq!(sanitize_remote_text(s), "abcdefg");
+        assert_eq!(sanitize_remote_line("a\nb\tc"), "abc");
+        assert_eq!(sanitize_remote_text("naïve 日本"), "naïve 日本", "ordinary text is untouched");
     }
 
     #[test]

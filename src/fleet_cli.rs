@@ -36,8 +36,18 @@ pub(crate) fn cmd_machine_add(
         eprintln!("{msg}");
         return Ok(2);
     }
+    // (#2916 re-review C7) Machine names are case-insensitive: an entry that
+    // differs only in case is the SAME machine, updated under its existing
+    // spelling rather than added twice.
+    let requested = id;
+    let existing_key = fleet::find_machine_key(&fleet::load_roster()?, requested)?;
+    let id_owned = existing_key.clone().unwrap_or_else(|| requested.to_string());
+    let id = id_owned.as_str();
+    if id != requested {
+        println!("machine: `{requested}` is the existing entry `{id}` (machine names are case-insensitive)");
+    }
     let local_id = flow::resolve_machine_id();
-    let is_self_entry = local_id.as_deref() == Some(id);
+    let is_self_entry = local_id.as_deref().is_some_and(|l| fleet::same_machine(l, id));
     // A peer's hardware cannot be probed from here — `machine add` performs no
     // network call — so a non-self entry passes `None`, which `add_machine`
     // treats as "keep whatever the entry already had" (see its own doc).
@@ -359,7 +369,10 @@ fn gather_identity_knowledge(
 }
 
 pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
-    let removed = fleet::mutate_roster(|roster| Ok(fleet::remove_machine(roster, id)))?;
+    let removed = fleet::mutate_roster(|roster| {
+        let key = fleet::find_machine_key(roster, id)?.unwrap_or_else(|| id.to_string());
+        Ok(fleet::remove_machine(roster, &key))
+    })?;
     match removed {
         Some(entry) => {
             println!("machine: removed {id} (address was {})", entry.address);
@@ -373,39 +386,35 @@ pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
     }
 }
 
-/// Resolve a roster `id` to its normalized daemon base URL, then GET `path`
-/// with the shared fleet bearer token (#1426, #881). Used by `machine status
-/// [id]` / `machine resources [id]` to read a peer over its serve daemon —
-/// the same shared-token mechanism `machine list --deep` uses. Reads only;
-/// mutations never target a peer.
+/// Resolve a roster `id` and GET `path` from its daemon with the shared
+/// fleet token (#1426, #881). Used by `machine status [id]` / `machine
+/// resources [id]`. (#2916 re-review MUST 3) The request goes through
+/// `darkmux_fleet::peer_target` + `fleet_get`, the one place the token is
+/// attached: a peer's address must resolve to its pinned tailnet node
+/// (this machine's own entry and loopback entries excepted), and it is
+/// dialed at that verified address. Every string in the answer is
+/// sanitized before anything prints it (MUST 4). Reads only.
 pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value> {
     let roster = fleet::load_roster()?;
-    let entry = roster.machines.get(id).ok_or_else(|| {
+    let entry = fleet::find_machine(&roster, id)?.cloned().ok_or_else(|| {
         anyhow::anyhow!(
             "no machine `{id}` in roster — add it with `darkmux machine add {id} --address <dns-name>`, \
              or omit the id to read this host"
         )
     })?;
     let local_id = flow::resolve_machine_id();
-    let dialed = dial_address(entry, local_id.as_deref(), &darkmux_types::config_access::serve_client_addr());
-    let base = normalize_daemon_base(&dialed);
-    let url = format!("{base}{path}");
-    let token = darkmux_flow::serve_token();
-    let token_str = token.as_ref().map(|t| t.expose_for_compare());
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(2000))
-        .build();
-    let mut req = agent.get(&url);
-    if let Some(tok) = token_str {
-        req = req.set("Authorization", &format!("Bearer {tok}"));
-    }
-    match req.call() {
+    let dialed = dial_address(&entry, local_id.as_deref(), &darkmux_types::config_access::serve_client_addr());
+    let target = peer_target_for(&entry, local_id.as_deref())?;
+    let url = format!("{}{path}", target.base());
+    match fleet::fleet_get(&target, path, std::time::Duration::from_millis(2000), &[]) {
         Ok(resp) => {
             let body = resp
                 .into_string()
                 .map_err(|e| anyhow::anyhow!("reading response from `{id}` ({url}): {e}"))?;
-            serde_json::from_str(&body)
-                .map_err(|e| anyhow::anyhow!("parsing JSON from `{id}` ({url}): {e}"))
+            let mut v: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("parsing JSON from `{id}` ({url}): {e}"))?;
+            fleet::sanitize_remote_json(&mut v);
+            Ok(v)
         }
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => anyhow::bail!(
             "peer `{id}` requires a bearer token this machine isn't sending. Set DARKMUX_SERVE_TOKEN \
@@ -418,6 +427,27 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
         }
         Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
     }
+}
+
+/// (#2916 re-review MUST 3) Where a token-bearing read of roster entry
+/// `entry` may go: this machine's own daemon (loopback) for its own entry,
+/// a loopback entry as written, else the verified, pinned tailnet node.
+/// A first-contact pin is persisted.
+fn peer_target_for(entry: &fleet::MachineEntry, local_id: Option<&str>) -> Result<fleet::PeerTarget> {
+    let is_self = local_id.is_some_and(|l| fleet::same_machine(l, &entry.id)) && !fleet::address_host_is_loopback(&entry.address);
+    let local_addr = is_self.then(darkmux_types::config_access::serve_client_addr);
+    let provider = fleet::configured_provider_or_unavailable();
+    let target = fleet::peer_target(
+        &entry.id,
+        entry,
+        local_addr.as_deref(),
+        None,
+        crate::serve::DEFAULT_DAEMON_PORT,
+        true,
+        provider.as_ref(),
+    )?;
+    fleet::persist_pin(&entry.id, &target)?;
+    Ok(target)
 }
 
 /// (#2924 MF-3) The address to dial for a roster entry. This machine's own
@@ -437,7 +467,7 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
 /// that node's daemon listens on, which the CLI's own serve config need not
 /// know.
 fn dial_address(entry: &fleet::MachineEntry, local_id: Option<&str>, local_addr: &str) -> String {
-    if local_id == Some(entry.id.as_str()) && !fleet::address_host_is_loopback(&entry.address) {
+    if local_id.is_some_and(|l| fleet::same_machine(l, &entry.id)) && !fleet::address_host_is_loopback(&entry.address) {
         local_addr.to_string()
     } else {
         entry.address.clone()
@@ -522,9 +552,10 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     // (#881) Resolve THIS machine's serve token once and send it to peers — a
     // single shared fleet token. Track peers that answered 401/403 so a missing
     // token surfaces a real "auth?" signal instead of looking like a timeout.
-    let token = darkmux_flow::serve_token();
-    let token_str = token.as_ref().map(|t| t.expose_for_compare());
     let mut auth_required: Vec<String> = Vec::new();
+    // (#2916 re-review MUST 3) Peers whose address did not verify as their
+    // pinned tailnet node: the token was NOT sent to them.
+    let mut unverified: Vec<String> = Vec::new();
     // (#1849) Peers that answered with a 404 on `/machine/specs` — reachable,
     // but no route, distinct from a generic probe failure.
     let mut route_missing: Vec<String> = Vec::new();
@@ -532,8 +563,17 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
         probes
             .iter()
             .map(|(m, dialed, p)| {
+                let _ = dialed;
                 let value = if p.reachable {
-                    match fetch_machine_specs(dialed, token_str) {
+                    let probe = match peer_target_for(m, local_id.as_deref()) {
+                        Ok(t) => fetch_machine_specs(&t),
+                        Err(_) => SpecsProbe::Unverified,
+                    };
+                    match probe {
+                        SpecsProbe::Unverified => {
+                            unverified.push(m.id.clone());
+                            None
+                        }
                         SpecsProbe::Ok(v) => Some(v),
                         SpecsProbe::AuthRequired => {
                             auth_required.push(m.id.clone());
@@ -596,6 +636,9 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                     // generic probe failure — the same signal the text
                     // table's `no-route?` column carries.
                     "specs_route_missing": route_missing.contains(&m.id),
+                    // (#2916) The address did not verify as the pinned
+                    // tailnet node, so nothing (and no token) was sent.
+                    "specs_unverified": unverified.contains(&m.id),
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -710,6 +753,9 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
                 None if route_missing.contains(&m.id) => {
                     ("no-route?".into(), "—".into(), "—".into(), "—".into())
                 }
+                None if unverified.contains(&m.id) => {
+                    ("unverified".into(), "—".into(), "—".into(), "—".into())
+                }
                 None => ("specs?".into(), "—".into(), "—".into(), "—".into()),
             };
             let row = format!(
@@ -729,6 +775,18 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
         if let Some(err) = &p.error {
             println!("{}", style::error(&format!("               error: {err}")));
         }
+    }
+    if !unverified.is_empty() {
+        println!(
+            "{}",
+            style::warn(&format!(
+                "  ! {} peer(s) not asked for specs ({}): the address is not their pinned tailnet \
+node, so the fleet token was not sent. Re-add each by its tailnet DNS name \
+(`darkmux machine add <id> --address <dns-name>`).",
+                unverified.len(),
+                unverified.join(", ")
+            ))
+        );
     }
     // (#881) If any peer returned 401/403, the local machine is missing the
     // shared fleet token — surface the fix rather than leaving a silent "auth?".
@@ -794,33 +852,24 @@ enum SpecsProbe {
     AuthRequired,
     RouteMissing,
     Unavailable,
+    /// (#2916) The address did not verify; nothing was sent.
+    Unverified,
 }
 
 /// Fetch `/machine/specs` from a peer's daemon at `address`, sending the shared
 /// fleet bearer `token` if one is configured (#881). Bounded at 1s total — the
 /// operator gets a row per peer even when one is slow or wedged. (#275 PR-B)
-fn fetch_machine_specs(address: &str, token: Option<&str>) -> SpecsProbe {
-    let normalized = if address.contains("://") {
-        address.to_string()
-    } else if address.contains(':') {
-        format!("http://{address}")
-    } else {
-        // (#907) Use the typed port const — string-splitting the addr is
-        // wrong for IPv6 / port-less forms.
-        format!("http://{address}:{}", crate::serve::DEFAULT_DAEMON_PORT)
-    };
-    let url = format!("{normalized}/machine/specs");
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(1000))
-        .build();
-    let mut req = agent.get(&url);
-    if let Some(tok) = token {
-        req = req.set("Authorization", &format!("Bearer {tok}"));
-    }
-    match req.call() {
+fn fetch_machine_specs(target: &fleet::PeerTarget) -> SpecsProbe {
+    let resp = fleet::fleet_get(target, "/machine/specs", std::time::Duration::from_millis(1000), &[]);
+    match resp {
         Ok(resp) => match resp.into_string() {
-            Ok(body) => match serde_json::from_str(&body) {
-                Ok(v) => SpecsProbe::Ok(v),
+            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                // (#2916 re-review MUST 4) Every peer-provided string is
+                // sanitized before the table prints it.
+                Ok(mut v) => {
+                    fleet::sanitize_remote_json(&mut v);
+                    SpecsProbe::Ok(v)
+                }
                 Err(_) => SpecsProbe::Unavailable,
             },
             Err(_) => SpecsProbe::Unavailable,
@@ -1283,7 +1332,7 @@ pub(crate) fn cmd_machine_trust(
         .collect();
     let roster_host = fleet::load_roster()
         .ok()
-        .and_then(|r| fleet::find_machine(&r, name).and_then(|e| fleet::address_host(&e.address)));
+        .and_then(|r| fleet::find_machine(&r, name).ok().flatten().and_then(|e| fleet::address_host(&e.address)));
     let req = TrustRequest { name, node_hint: node, profiles, roles, images, workspace };
     let msg = trust_at(
         &user_config_path(),
@@ -2018,13 +2067,14 @@ mod tests {
         // renders `RouteMissing` as `no-route?`, never the same `specs?`
         // a timeout or bad-JSON response gets.
         let addr = one_shot_http("404 Not Found", "{}");
-        match fetch_machine_specs(&addr, None) {
+        match fetch_machine_specs(&fleet::unverified_target_for_test(&format!("http://{addr}"))) {
             SpecsProbe::RouteMissing => {}
             SpecsProbe::Unavailable => {
                 panic!("404 read as generic Unavailable, not RouteMissing")
             }
             SpecsProbe::Ok(_) => panic!("expected RouteMissing, got Ok"),
             SpecsProbe::AuthRequired => panic!("expected RouteMissing, got AuthRequired"),
+            SpecsProbe::Unverified => panic!("expected RouteMissing, got Unverified"),
         }
     }
 
@@ -2034,13 +2084,14 @@ mod tests {
         // NOT read as RouteMissing — the two outcomes stay distinguishable
         // in both directions.
         let addr = one_shot_http("200 OK", "this is not json");
-        match fetch_machine_specs(&addr, None) {
+        match fetch_machine_specs(&fleet::unverified_target_for_test(&format!("http://{addr}"))) {
             SpecsProbe::Unavailable => {}
             SpecsProbe::RouteMissing => {
                 panic!("bad JSON on 200 read as RouteMissing, not Unavailable")
             }
             SpecsProbe::Ok(_) => panic!("expected Unavailable, got Ok"),
             SpecsProbe::AuthRequired => panic!("expected Unavailable, got AuthRequired"),
+            SpecsProbe::Unverified => panic!("expected Unavailable, got Unverified"),
         }
     }
 }

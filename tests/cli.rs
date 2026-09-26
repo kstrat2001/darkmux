@@ -4397,6 +4397,52 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
     Some(FleetDaemon { child, serve_port, fleet_addr })
 }
 
+/// (#2916 re-review C3) `darkmux serve` raises its open-file soft limit at
+/// start: started at 256 (launchd's default) with a higher hard limit, the
+/// running daemon reports a soft limit well above 256.
+#[test]
+fn serve_raises_its_open_file_soft_limit_at_start() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit on a stack struct.
+    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    let hard = lim.rlim_max as u64;
+    if hard <= 1024 {
+        eprintln!("skipping: this process's hard open-file limit ({hard}) leaves no room to raise");
+        return;
+    }
+    let (home, darkmux_home) = isolated_roots();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut cmd = darkmux_std_cmd();
+    cmd.env("HOME", &home)
+        .env("DARKMUX_HOME", &darkmux_home)
+        .env("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0")
+        .args(["serve", "--bind", "127.0.0.1", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only setrlimit between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit { rlim_cur: 256, rlim_max: hard as libc::rlim_t };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let _child = DirectChildGuard(cmd.spawn().expect("spawning darkmux serve"));
+    wait_for_serve_health(port, std::time::Duration::from_secs(15));
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/health")).call().unwrap().into_string().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let soft = v["open_file_limit"].as_u64().expect("the daemon reports its open-file limit to loopback");
+    assert!(soft >= 1024, "the daemon's soft open-file limit stayed at {soft}");
+}
+
 /// (#2916 review M1) A tokenless peer flooding the fleet listener with
 /// half-sent requests must not take the daemon down: under an open-file
 /// limit of 256 (launchd's default; pinned soft AND hard so the daemon

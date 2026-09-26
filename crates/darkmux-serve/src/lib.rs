@@ -1488,7 +1488,9 @@ fn current_exe_mtime() -> Option<u64> {
 /// The mtime is deliberately reported as a bare integer rather than the exe
 /// PATH: `/health` is auth-exempt even for non-loopback peers, and a path would
 /// disclose the operator's home directory to anything that can reach the port.
-async fn health() -> axum::Json<serde_json::Value> {
+async fn health(peer: Option<ConnectInfo<SocketAddr>>) -> axum::Json<serde_json::Value> {
+    // (#2916 re-review C9) A peer sees only the listener's coarse state.
+    let loopback_caller = peer.is_some_and(|c| c.0.ip().is_loopback());
     axum::Json(serde_json::json!({
         "darkmux_version": env!("CARGO_PKG_VERSION"),
         "build": darkmux_types::build_version(),
@@ -1497,8 +1499,21 @@ async fn health() -> axum::Json<serde_json::Value> {
         // (#2916 review C8) What the fleet listener is doing (`null` when it
         // is off), so `darkmux doctor` reads the DAEMON's view rather than
         // re-deriving it from a shell whose PATH may differ.
-        "fleet_listener": fleet_listener::listener_state(),
+        "fleet_listener": fleet_listener::listener_state(loopback_caller),
+        // (#2916 re-review C3) The open-file soft limit this daemon runs
+        // with (raised at start), for this machine only.
+        "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },
     }))
+}
+
+/// The current soft open-file limit.
+#[allow(clippy::unnecessary_cast)]
+pub fn current_open_file_limit() -> Option<u64> {
+    // SAFETY: plain getrlimit on a stack struct.
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        (libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0).then_some(lim.rlim_cur as u64)
+    }
 }
 
 /// (#2916 review M1) Raise the soft open-file limit toward the hard one at

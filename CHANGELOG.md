@@ -177,7 +177,21 @@ darkmux release.
   darkmux's own runtime image); `--workspace true` lets its jobs mount any
   directory under this machine's worktrees base read-write. A submitted job
   never mounts this machine's shared toolchain cache. The confirmation shows
-  the node's online state and owner. Untrust removes the entry. The listener reads
+  the node's online state and owner. Untrust removes the entry.
+  `--workspace true` is, in effect, letting that machine run code here
+  (its jobs write into live worktrees your own git and test commands run
+  in): grant it only to a machine you would give a shell.
+- **Every request that carries the fleet token checks where it is going**
+  (#2916): a `--machine` dispatch, `machine status`/`resources <id>`,
+  `machine list --deep` and the daemon's peer mission-graph proxy all go
+  through one helper that resolves the roster address, requires the node
+  there to be the tailnet node pinned for that entry (pinned by `machine
+  add` or first contact), and connects to that verified address; only this
+  machine's own daemon and loopback entries skip it. A peer that fails the
+  check is shown as `unverified` in `machine list --deep`. Everything a
+  peer sends back is printed with control characters, bidirectional
+  overrides and zero-width characters removed. Machine names are
+  case-insensitive everywhere and may not contain `-from-`. The listener reads
   the allow-list per request, so both take effect with no restart.
 - **The fleet listener** (#2916): with `fleet.listener.enabled`,
   `darkmux serve` opens a second port bound only to the address the

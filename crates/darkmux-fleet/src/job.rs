@@ -122,6 +122,9 @@ impl WorkJob {
         validate_machine_name("WorkJob.target_machine", &self.target_machine)?;
         validate_work_identifier("role_id", &self.role_id)?;
         validate_session_id(&self.session_id)?;
+        if let Some(p) = &self.phase_id {
+            validate_work_identifier("phase_id", p)?;
+        }
         if let Some(p) = &self.profile {
             if p.is_empty() || p.len() > MAX_WORK_IDENTIFIER_LEN || !p.chars().all(|c| c.is_ascii_graphic()) {
                 return Err(anyhow!(
@@ -210,6 +213,27 @@ pub fn validate_machine_name(label: &str, value: &str) -> Result<()> {
     }
     if let Some(c) = value.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_')) {
         return Err(anyhow!("{label} contains invalid char {c:?} (allowlist [A-Za-z0-9_-]): {value:?}"));
+    }
+    // (#2916 re-review C8) The receiver names a submitted run
+    // `<sender session>-from-<peer>`; a machine name containing the
+    // separator could make two peers' runs collide.
+    if value.to_ascii_lowercase().contains(SESSION_PEER_SEPARATOR) {
+        return Err(anyhow!("{label} may not contain `{SESSION_PEER_SEPARATOR}`: {value:?}"));
+    }
+    Ok(())
+}
+
+/// The separator in a receiver's session id, `<sender session>-from-<peer>`.
+pub const SESSION_PEER_SEPARATOR: &str = "-from-";
+
+/// (#2916 re-review C6) A session id a receiver echoes back: the sender's
+/// own id plus `-from-<peer>`, so up to 128 + 6 + 64 characters, same charset.
+pub fn validate_reply_session_id(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_SESSION_ID_LEN + SESSION_PEER_SEPARATOR.len() + MAX_WORK_IDENTIFIER_LEN {
+        return Err(anyhow!("a reply session_id is too long"));
+    }
+    if value.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))) {
+        return Err(anyhow!("a reply session_id carries a character outside [A-Za-z0-9._-]"));
     }
     Ok(())
 }
@@ -324,6 +348,22 @@ mod tests {
             job.profile = Some(bad.to_string());
             assert!(job.validate().unwrap_err().to_string().contains("profile"), "{bad:?}");
         }
+    }
+
+    /// (#2916 re-review C4/C6/C8) phase ids are identifiers; machine names
+    /// may not contain the session separator; echoed session ids are bounded.
+    #[test]
+    fn phase_ids_separator_and_reply_ids_are_checked() {
+        let mut job = make_valid_job();
+        job.phase_id = Some("../x".into());
+        assert!(job.validate().unwrap_err().to_string().contains("phase_id"));
+        job.phase_id = Some("phase-1".into());
+        assert!(job.validate().is_ok());
+        assert!(validate_machine_name("m", "laptop-from-home").is_err());
+        assert!(validate_machine_name("m", "laptop").is_ok());
+        assert!(validate_reply_session_id(&format!("{}-from-{}", "a".repeat(128), "b".repeat(64))).is_ok());
+        assert!(validate_reply_session_id("x\u{1b}]0;t").is_err());
+        assert!(validate_reply_session_id(&"a".repeat(199)).is_err());
     }
 
     /// (#2916) A session id is a join key and part of file names on the

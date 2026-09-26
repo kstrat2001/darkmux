@@ -120,11 +120,14 @@ pub struct MachineEntry {
     pub loopback_intended: bool,
 
     /// (#2916 review C1) The overlay network's stable id for the node this
-    /// entry's address reached, pinned by `machine add` or on the first
-    /// work submission. Every later submission checks the node at the
-    /// address is still this one before sending the fleet token or the
-    /// prompt, so a changed DNS answer or a LAN impostor gets nothing.
-    /// Cleared when `machine add` changes the address. Never printed.
+    /// entry's address reached, pinned by `machine add` or by the first
+    /// token-bearing request from the CLI (a work submission, `machine
+    /// status`/`resources <id>`, `machine list --deep`). EVERY token-bearing
+    /// request (`darkmux_fleet::peer`) checks the node at the address is
+    /// this one before anything is sent, and an entry with no pin must at
+    /// least resolve to a tailnet node. The daemon's peer-graph proxy checks
+    /// but never writes a pin. Cleared when `machine add` changes the
+    /// address. Never printed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
 
@@ -429,14 +432,30 @@ pub fn add_machine(
     Ok(())
 }
 
-/// (#2916) The roster entry for `name`, compared case-insensitively
-/// (machine names are ASCII case-insensitive); the entry's own key keeps
-/// its case.
-pub fn find_machine<'a>(roster: &'a FleetRoster, name: &str) -> Option<&'a MachineEntry> {
-    roster
-        .machines
-        .get(name)
-        .or_else(|| roster.machines.values().find(|m| m.id.eq_ignore_ascii_case(name)))
+/// (#2916) The roster KEY naming `name`: machine names are ASCII
+/// case-insensitive, so an exact key wins, else the one key equal ignoring
+/// case. Two keys differing only in case (a roster written before this
+/// rule) are ambiguous: an error naming both, never a pick by map order.
+pub fn find_machine_key(roster: &FleetRoster, name: &str) -> Result<Option<String>> {
+    if roster.machines.contains_key(name) {
+        return Ok(Some(name.to_string()));
+    }
+    let hits: Vec<&String> = roster.machines.keys().filter(|k| k.eq_ignore_ascii_case(name)).collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => Err(anyhow!(
+            "the roster has several entries for `{name}` differing only in case ({}); machine names \
+             are case-insensitive, so remove all but one with `darkmux machine remove <exact name>`",
+            many.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// (#2916) The roster entry for `name`, case-insensitively (see
+/// [`find_machine_key`]).
+pub fn find_machine<'a>(roster: &'a FleetRoster, name: &str) -> Result<Option<&'a MachineEntry>> {
+    Ok(find_machine_key(roster, name)?.and_then(|k| roster.machines.get(&k)))
 }
 
 /// (#2916 review C1) Resolve a roster address's host to its IP addresses,

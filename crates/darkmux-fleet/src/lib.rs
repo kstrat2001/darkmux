@@ -4,6 +4,7 @@
 
 mod identity;
 mod job;
+mod peer;
 mod roster;
 mod routing;
 mod runner;
@@ -11,6 +12,7 @@ mod submission;
 
 pub use identity::*;
 pub use job::*;
+pub use peer::*;
 pub use roster::*;
 pub use routing::*;
 pub use runner::*;
@@ -45,6 +47,20 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    /// (#2916 re-review C7) Case-insensitive lookup: exact wins, one
+    /// case-variant is found, two are an error, never a pick by map order.
+    #[test]
+    fn roster_lookup_is_case_insensitive_and_never_guesses() {
+        let mut r = FleetRoster::default();
+        add_machine(&mut r, "MacBook-Pro", "laptop", None, None).unwrap();
+        assert_eq!(find_machine_key(&r, "macbook-pro").unwrap().as_deref(), Some("MacBook-Pro"));
+        assert_eq!(find_machine(&r, "MACBOOK-PRO").unwrap().unwrap().address, "laptop");
+        assert_eq!(find_machine_key(&r, "studio").unwrap(), None);
+        add_machine(&mut r, "macbook-pro", "laptop2", None, None).unwrap();
+        assert_eq!(find_machine_key(&r, "macbook-pro").unwrap().as_deref(), Some("macbook-pro"), "an exact key wins");
+        assert!(find_machine_key(&r, "MACBOOK-PRO").is_err(), "two case-variants are ambiguous");
     }
 
     #[test]

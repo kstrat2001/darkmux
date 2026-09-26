@@ -1250,8 +1250,11 @@ pub(crate) enum MachineCmd {
         images: Option<Vec<String>>,
         /// Whether the peer may name a working directory here: `true`
         /// lets a job mount any directory under this machine's darkmux
-        /// worktrees base READ-WRITE. Default false; given again, it
-        /// replaces the setting. (#755 builds the workspace handoff on it.)
+        /// worktrees base READ-WRITE, including live worktrees that this
+        /// machine's own git and test commands later run in. That is, in
+        /// effect, letting the peer run code on this machine: grant it only
+        /// to a machine you would give a shell. Default false; given again,
+        /// it replaces the setting. (#755 builds the workspace handoff on it.)
         #[arg(long, value_name = "true|false")]
         workspace: Option<bool>,
     },
