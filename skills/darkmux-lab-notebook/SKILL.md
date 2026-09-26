@@ -28,19 +28,19 @@ darkmux lab run stats "<run-id>" --json
 One run prints one JSON object. The fields an entry is built from:
 
 - **Identity:** `run`, `model`, `bounds` (the resolved caps with their provenance, read from the run rather than assumed).
-- **Outcome:** `result` (the runtime's terminal reason, e.g. `stop`), `ok` (did the dispatch path finish), and `verify` (`"pass"`, `"fail"`, or `null` when the workload declares no verify). `verify_ungated: true` means the run predates the write-the-tests gate, so its `verify` is the older, weaker signal; say so if you quote it.
+- **Outcome:** `result` (the runtime's terminal reason, e.g. `"stop"`), `ok` (did the dispatch path finish), and `verify` (`"pass"`, `"fail"`, or `null` when the workload declares no verify). `verify_ungated: true` means the run predates the write-the-tests gate, so its `verify` is the older, weaker signal; say so if you quote it.
 - **Time:** `wall_ms`, `active_ms` (wall minus rest), `rest_ms`, `rest_events`, `rest_reasons`, `thermal_ratchet_fired`.
 - **Work:** `turns`, `compactions`, `tool_calls` (per tool), `tool_calls_total`, `tool_calls_failed`, `completion_tokens`, `reasoning_tokens`.
 - **Rate:** `tok_per_s` (over billed generation only), `billed_gen_fraction`, `gen_ms_billed`.
-- **Detection:** `gates.stream` and `gates.checkpoint` (`observations`, `aborts`, `degenerate_turns`, `policy`), `suspect_turns`.
+- **Detection:** `gates.stream.{observations,aborts,degenerate_turns,min_tail_ratio}` for the streaming gate, and `gates.checkpoint.{observations,degenerate_turns,concluded_turns,min_tail_ratio,policy}` for the per-call-cap gate. `gates.checkpoint.policy` is the detection policy in force; under the `"observe"` policy a turn can appear in `gates.checkpoint.degenerate_turns` without appearing in `gates.checkpoint.concluded_turns`, which is the policy working, not a missing cut. Also `suspect_turns`.
 - **Host:** `gpu_w_busy`, `pkg_w_busy`, `pkg_j_busy`, `gpu_duty_pct`, `thermal_states_busy`, `throttled_samples`, `mem_pct_busy_max`.
-- **Trust:** `checks`. Every figure above still prints when a check fails; the check tells you whether it may be quoted. Read `checks` before quoting anything, and carry the caveat into the entry (for example `tokens_reconcile: false` next to any token figure).
+- **Trust:** `checks`. Every figure above still prints when a check fails; the check tells you whether it may be quoted. Read `checks` before quoting anything, and carry the caveat into the entry (for example, when `checks.tokens_reconcile` is false, say so next to any token figure).
 
 Several run ids print a set instead: `runs` (one object each, as above), `summary` (median with min and max, never a bare mean), `errors`, `duplicates`, and with `--baseline`, a `baseline` set plus `cross_arm_overlap`. Quote the set's ranges, not one run's numbers, when the entry is about a series.
 
 ## Step 3 — Read the manifest when the entry needs what stats does not carry
 
-`manifest.json` sits in the run directory (`<lab dir>/<run-id>/`; `darkmux doctor` prints the resolved lab dir, `~/.darkmux/runs` by default). It carries `workload`, `provider`, `profile`, `session_id`, `duration_ms`, `ok`, the fixture that was used (`fixture`), and `verify` as `{passed, details}`. `details` is where a failed verify says why; quote it.
+`manifest.json` sits in the run directory. Runs live under `~/.darkmux/runs/<run-id>/` by default (under `$DARKMUX_HOME/runs/` when that is set, or `./.darkmux/runs/` when the run was launched from a directory with its own `.darkmux/`); `$DARKMUX_LAB_DIR` or `dirs.lab` in `config.json` moves that root. `darkmux lab run stats` also accepts the run directory's path in place of an id, and when a run id does not resolve its error names the root it searched. It carries `workload`, `provider`, `profile`, `session_id`, `duration_ms`, `ok`, the fixture that was used (`fixture`), and `verify` as `{passed, details}`. `details` is where a failed verify says why; quote it.
 
 ## Step 4 — Draft the entry
 
@@ -69,6 +69,6 @@ If the operator collates entries across machines, open the entry with the darkmu
 <!-- darkmux:notebook-entry: run=<run-id> machine=<machine-id> date=<YYYY-MM-DD> -->
 ```
 
-`darkmux doctor` prints the resolved machine id.
+`darkmux doctor --verbose` prints the resolved machine id (the `machine_id` line).
 
 Show the operator the entry before writing it. They may want the OBSERVATION reframed; the numbers are darkmux's, the reading is theirs.

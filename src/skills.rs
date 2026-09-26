@@ -1404,4 +1404,78 @@ mod tests {
              (add to EMBEDDED_SKILLS or MAINTAINER_ONLY_SKILLS): {unshipped:?}"
         );
     }
+
+    /// Expand one `{a,b}` brace group (shell-style, one level): the skill
+    /// writes `gates.stream.{observations,aborts}` for a reader and this
+    /// turns it back into the two field paths.
+    fn expand_braces(token: &str) -> Vec<String> {
+        match (token.find('{'), token.find('}')) {
+            (Some(open), Some(close)) if open < close => token[open + 1..close]
+                .split(',')
+                .map(|alt| format!("{}{}{}", &token[..open], alt.trim(), &token[close + 1..]))
+                .collect(),
+            _ => vec![token.to_string()],
+        }
+    }
+
+    /// Every JSON field path the `darkmux-lab-notebook` skill documents in
+    /// its Step 2 field list: backticked tokens on the `- **Label:**`
+    /// bullets that look like a path (`a`, `a.b`, `a.{b,c}`). Values the
+    /// prose quotes (`"stop"`, `null`, `verify_ungated: true`) are not paths
+    /// and do not match.
+    fn documented_run_stats_paths(skill_md: &str) -> Vec<String> {
+        let start = skill_md.find("## Step 2").expect("SKILL.md has a Step 2 section");
+        let rest = &skill_md[start + 3..];
+        let section = &rest[..rest.find("\n## ").unwrap_or(rest.len())];
+        let is_path = |t: &str| {
+            t != "null"
+                && !t.is_empty()
+                && t.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
+                && !t.starts_with('.')
+                && !t.ends_with('.')
+        };
+        let mut out = Vec::new();
+        for line in section.lines().filter(|l| l.starts_with("- **")) {
+            for (i, tok) in line.split('`').enumerate() {
+                if i % 2 == 1 {
+                    let compact: String = tok.chars().filter(|c| !c.is_whitespace()).collect();
+                    out.extend(expand_braces(&compact).into_iter().filter(|p| is_path(p)));
+                }
+            }
+        }
+        out
+    }
+
+    /// (#2913 review C2) The lab-notebook skill tells an agent which
+    /// `lab run stats --json` fields to read. A field it names that the
+    /// output does not carry (it once listed `policy` under `gates.stream`,
+    /// which has none) sends the agent after data that is not there. Pin
+    /// every documented path against a serialized `RunStats`, whose fields
+    /// all serialize (no `skip_serializing_if`), so the skill cannot drift
+    /// from the struct silently.
+    #[test]
+    fn lab_notebook_skill_documents_only_real_run_stats_fields() {
+        let skill_md = EMBEDDED_SKILLS
+            .iter()
+            .find(|(name, _)| *name == "darkmux-lab-notebook")
+            .map(|(_, body)| *body)
+            .expect("darkmux-lab-notebook is embedded");
+        let paths = documented_run_stats_paths(skill_md);
+        // Non-vacuity: the extractor found the list, including the nested
+        // gate fields, rather than passing on an empty set.
+        assert!(paths.len() >= 30, "expected the full field list, got {paths:?}");
+        for must in ["gates.stream.aborts", "gates.checkpoint.policy", "checks.tokens_reconcile"] {
+            assert!(paths.iter().any(|p| p == must), "extractor missed `{must}`: {paths:?}");
+        }
+        let json = serde_json::to_value(crate::lab::stats::RunStats::default()).unwrap();
+        let missing: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.split('.').try_fold(&json, |v, k| v.get(k)).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "skills/darkmux-lab-notebook/SKILL.md documents field(s) `lab run stats --json` does not \
+             emit: {missing:?}"
+        );
+    }
 }
