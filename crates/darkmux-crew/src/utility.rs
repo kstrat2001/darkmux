@@ -185,13 +185,16 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     // the job from here until its usage record (or `utility.error`) lands.
     // Emitted after residency on purpose: a job that failed to load never
     // started, and must not leave a start with no end behind.
+    // (#2915 review) Its own job id, echoed by its end, and ms times.
     let job_kind = crate::usage::utility_job(crate::usage::CallKind::SingleShot, Some(job.role_id));
+    let job_id = job_kind.map(crate::usage::mint_utility_job_id).unwrap_or_default();
+    let started_at_ms = crate::usage::unix_ms_now();
     if let Some(kind) = job_kind {
         let _ = darkmux_flow::record(crate::usage::utility_marker_record(
             crate::usage::UTILITY_START_ACTION,
             job.role_id,
             &wire_model,
-            crate::usage::utility_start_payload(kind, &wire_model, None, u64::from(job.timeout_seconds)),
+            crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds), started_at_ms),
         ));
     }
     let reply = match crate::single_shot::single_shot_chat(&req) {
@@ -199,11 +202,13 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         Err(e) => {
             // (#2915) The end of a started job that has no usage record.
             if let Some(kind) = job_kind {
+                let mut payload = serde_json::json!({ "job": kind, "model": wire_model });
+                crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
                 let _ = darkmux_flow::record(crate::usage::utility_marker_record(
                     crate::usage::UTILITY_ERROR_ACTION,
                     job.role_id,
                     &wire_model,
-                    serde_json::json!({ "job": kind, "model": wire_model }),
+                    payload,
                 ));
             }
             return Err(match crate::dispatch_internal::residency_lost_detail(&wire_model, &format!("{e:#}")) {
@@ -215,12 +220,15 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
 
     // The one record: the job's usage, attributed to the job's role, on the
     // utility model, with no session.
-    let payload = reply.usage_payload(
+    let mut payload = reply.usage_payload(
         crate::usage::CallKind::SingleShot,
         Some(job.role_id),
         &wire_model,
         &crate::usage::lmstudio_endpoint(job.base_url_override),
     );
+    if job_kind.is_some() {
+        crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
+    }
     let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, payload));
 
     Ok(UtilityReply { content: reply.content })

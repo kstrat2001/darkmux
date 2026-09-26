@@ -9280,6 +9280,10 @@ struct TailerState {
     /// `internal.utility` binding — as distinct from `model` above, which is
     /// the SPECIALIST this dispatch is for. `None` when no compactor is bound.
     compactor_model: Option<String>,
+    /// (#2915 review) Compaction attempts seen in this execution (the job
+    /// id's counter), and the one in flight: its job id and start ms.
+    compaction_attempts: u64,
+    open_compaction: Option<(String, u64)>,
     compaction_threshold: Option<u32>,
     /// (#2902 step 1a) The endpoint this dispatch's model calls went to, as
     /// a fact: the hosted label for an endpoint-staffed brain, else the
@@ -9358,6 +9362,8 @@ impl TailerState {
     ) -> Self {
         Self {
             compactor_model: None,
+            compaction_attempts: 0,
+            open_compaction: None,
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
@@ -9454,6 +9460,8 @@ impl TailerState {
     ) -> Self {
         Self {
             compactor_model: None,
+            compaction_attempts: 0,
+            open_compaction: None,
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
@@ -9806,11 +9814,21 @@ impl TailerState {
                 // (a start is not proof of progress; the install is).
                 let model = event_model_id(&event, "requested_model").or_else(|| self.compactor_model.clone());
                 let model = model.unwrap_or_default();
+                // (#2915 review, MUST 1 / C4) One job id per compaction
+                // ATTEMPT in this execution (a refused attempt can repeat its
+                // generation), echoed on every call's usage record below;
+                // the runtime event's own ms `ts` is the start time.
+                self.compaction_attempts += 1;
+                let job_id = format!("{}:compaction:{}", self.session_id, self.compaction_attempts);
+                let started_at_ms = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
+                self.open_compaction = Some((job_id.clone(), started_at_ms));
                 let mut payload = crate::usage::utility_start_payload(
                     crate::usage::UtilityJobKind::Compaction,
+                    &job_id,
                     &model,
                     Some(&self.session_id),
                     self.inactivity_secs,
+                    started_at_ms,
                 );
                 payload["generation"] = event.get("generation").cloned().unwrap_or(serde_json::Value::Null);
                 self.emit_telemetry_as(
@@ -9837,6 +9855,13 @@ impl TailerState {
                     &self.role_id,
                     &self.model,
                 );
+                // (#2915 review) The attempt this call served: its job id
+                // and ms times (an older runtime writes no start: no id).
+                let mut payload = payload;
+                if let Some((job_id, started_at_ms)) = &self.open_compaction {
+                    let ended_at_ms = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
+                    crate::usage::stamp_utility_end(&mut payload, job_id, *started_at_ms, ended_at_ms);
+                }
                 let model = payload["requested_model"].as_str().map(str::to_string);
                 self.emit_telemetry_as(
                     COMPACTOR_ROLE,

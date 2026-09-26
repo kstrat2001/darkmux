@@ -153,6 +153,15 @@ fn a_utility_job_runs_on_the_binding_and_leaves_only_its_usage_record() {
     assert_eq!(start["payload"]["stall_after_seconds"], 30, "the job's own bound: {start}");
     assert_eq!(start["handle"], darkmux_crew::loader::RADIO_ROUTER_ROLE_ID);
     assert!(start["session_id"].is_null(), "a utility job mints no session: {start}");
+    // (#2915 review, MUST 1 / C4) The start and its end share a job id, and
+    // carry ms-precision times: a flow `ts` is whole-second.
+    let id = start["payload"]["job_id"].as_str().expect("a start mints a job id");
+    assert!(!id.is_empty());
+    assert_eq!(rec["payload"]["job_id"], id, "the usage record echoes the start's job id: {rec}");
+    let started = start["payload"]["started_at_ms"].as_u64().expect("started_at_ms");
+    let ended = rec["payload"]["ended_at_ms"].as_u64().expect("ended_at_ms");
+    assert!(ended >= started, "{started} <= {ended}");
+    assert_eq!(rec["payload"]["duration_ms"].as_u64(), Some(ended - started));
 }
 
 /// (#2915) A utility job whose model call fails after it started says so:
@@ -191,7 +200,46 @@ fn a_utility_job_whose_call_fails_ends_with_utility_error() {
     );
     let end = &records[1];
     assert_eq!(end["payload"]["job"], "radio_routing", "{end}");
+    assert_eq!(end["payload"]["job_id"], records[0]["payload"]["job_id"], "the error echoes the start's job id");
+    assert!(end["payload"]["ended_at_ms"].as_u64().is_some(), "{end}");
     assert!(end["session_id"].is_null(), "{end}");
+}
+
+/// (#2915 review, MUST 1) Two jobs never share an id.
+#[test]
+#[serial_test::serial]
+fn each_utility_job_mints_its_own_id() {
+    let server = MockServer::start();
+    let _m = server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200).header("content-type", "application/json").json_body(serde_json::json!({
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+        }));
+    });
+    let registry_dir = tempfile::tempdir().unwrap();
+    let profiles_path = write_registry(registry_dir.path());
+    let flows_dir = tempfile::tempdir().unwrap();
+    with_isolated_flows(flows_dir.path(), || {
+        for _ in 0..2 {
+            run_utility_single_shot(&UtilityJob {
+                role_id: darkmux_crew::loader::RADIO_ROUTER_ROLE_ID,
+                message: "x",
+                timeout_seconds: 5,
+                max_tokens: 8,
+                config_path: Some(profiles_path.to_str().unwrap()),
+                base_url_override: Some(&server.base_url()),
+            })
+            .unwrap();
+        }
+    });
+    let records = all_flow_records(flows_dir.path());
+    let ids: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter(|r| r["action"] == darkmux_crew::usage::UTILITY_START_ACTION)
+        .map(|r| r["payload"]["job_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "{records:#?}");
 }
 
 #[test]

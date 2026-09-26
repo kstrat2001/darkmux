@@ -79,28 +79,41 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
 
 pub const FLOW_SCHEMA_VERSION: &str = "1.61.0";
 // Version history:
-//   1.61.0 (#2915, utility work is lean but VISIBLE): additive, three
-//           actions and one field.
+//   1.61.0 (#2915, utility work is lean but VISIBLE): additive, two
+//           actions and utility fields on the usage record.
 //
 //           `utility.start` (category `telemetry`, source `utility`): a
 //           utility job is starting. Payload: `job` (the
 //           `darkmux_crew::usage::UtilityJobKind` enum, `"compaction"` ·
-//           `"radio_routing"`), `model` (the wire id), `serves` (the session
-//           id of the execution the job serves; ABSENT when it serves none,
-//           as routing does) and `stall_after_seconds` (the job's own bound:
-//           the dispatch's inactivity window for a compaction, the call
-//           timeout for routing). `handle` is the job's role (`compactor` /
-//           `radio-router`), as on its usage record. Still lean: a routing
-//           start has no `session_id`; a compaction start keeps the session
-//           of the execution it serves, as its usage records do. No
-//           bookends, no run, no presence. Its usage record marks the end.
+//           `"radio_routing"`), `job_id` (minted per job and echoed by its
+//           end; a routing job has no session, so this is what pairs its
+//           end with its start), `model` (the wire id), `serves` (the
+//           session id of the execution the job serves; ABSENT when it
+//           serves none, as routing does), `stall_after_seconds` (the job's
+//           own bound: the dispatch's inactivity window for a compaction,
+//           the call timeout for routing) and `started_at_ms` (ms
+//           precision; `ts` is whole-second, so a sub-second job's start and
+//           end would otherwise tie). `handle` is the job's role
+//           (`compactor` / `radio-router`), as on its usage record. Still
+//           lean: a routing start has no `session_id`; a compaction start
+//           keeps the session of the execution it serves, as its usage
+//           records do. No bookends, no run, no presence. Its usage record
+//           marks the end.
 //
-//           `utility.error` (same family, `Level::Warn`): a started job's
-//           model call failed. Payload `job`, `model`. The end of a job that
+//           `utility.error` (same family, `Level::Warn`): a started ROUTING
+//           job's model call failed (the same wording as CLAUDE.md contract
+//           2; a compaction whose calls all failed writes none, and is ended
+//           by its execution's next record). Payload `job`, `model`,
+//           `job_id`, `ended_at_ms`, `duration_ms`. The end of a job that
 //           has no usage record.
 //
-//           `telemetry.tokens` `job`: a `purpose: "utility"` usage record
-//           names its `UtilityJobKind`; work records carry no `job` key.
+//           `telemetry.tokens`: a `purpose: "utility"` usage record names its
+//           `UtilityJobKind` as `job`, and, when its start carried one, the
+//           same `job_id` plus `ended_at_ms` / `duration_ms`. A compaction's
+//           job id is its execution's session id and attempt number
+//           (`<session>:compaction:<n>`, minted by the host's tailer, since
+//           the runtime's events already carry the session and ms times).
+//           Work records carry none of these keys.
 //
 //           The compaction start comes from a new runtime trajectory event,
 //           `compaction.start`, written BEFORE the compactor call (every

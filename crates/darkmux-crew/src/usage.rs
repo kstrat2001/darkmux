@@ -156,6 +156,43 @@ pub const UTILITY_ERROR_ACTION: &str = "utility.error";
 /// (#2915) The telemetry `source` `utility.start` / `utility.error` carry.
 pub const UTILITY_SOURCE: &str = "utility";
 
+/// (#2915 review, MUST 1) A fresh id for one utility job, echoed by its
+/// start and its end (usage record or `utility.error`), so the viewer pairs
+/// an end with ITS start. Routing has no session to pair on, and a start
+/// orphaned by a killed process must never absorb a later job's end.
+/// Unique per process (a counter) and across processes (pid, microseconds).
+pub fn mint_utility_job_id(job: UtilityJobKind) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    let job = serde_json::to_value(job).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    format!("{job}-{micros}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Milliseconds since the epoch, for the ms-precision times utility markers
+/// carry (a flow record's `ts` is whole-second).
+pub fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// (#2915 review, C4) Stamp a utility job's END (its usage record or its
+/// `utility.error`): the `job_id` its start minted, `ended_at_ms`, and
+/// `duration_ms` from the start's `started_at_ms`. A sub-second job's start
+/// and end share a whole-second `ts`; these keep them apart.
+pub fn stamp_utility_end(payload: &mut serde_json::Value, job_id: &str, started_at_ms: u64, ended_at_ms: u64) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("job_id".into(), serde_json::json!(job_id));
+        obj.insert("ended_at_ms".into(), serde_json::json!(ended_at_ms));
+        obj.insert("duration_ms".into(), serde_json::json!(ended_at_ms.saturating_sub(started_at_ms)));
+    }
+}
+
 /// (#2915) The payload of a `utility.start`: the `job`, the `model` it runs
 /// on (the wire id), the session id of the execution it `serves` (ABSENT
 /// when it serves none, as routing does), and `stall_after_seconds`, the
@@ -163,16 +200,23 @@ pub const UTILITY_SOURCE: &str = "utility";
 /// inactivity window for a compaction, the call timeout for routing). The
 /// bound rides on the record so the viewer never guesses a knob the host
 /// already knows (a recorded cadence, not an assumed one).
+///
+/// (#2915 review) Also `job_id` (echoed by the job's end) and
+/// `started_at_ms` (ms precision; the record's `ts` is whole-second).
 pub fn utility_start_payload(
     job: UtilityJobKind,
+    job_id: &str,
     model: &str,
     serves: Option<&str>,
     stall_after_seconds: u64,
+    started_at_ms: u64,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "job": job,
+        "job_id": job_id,
         "model": model,
         "stall_after_seconds": stall_after_seconds,
+        "started_at_ms": started_at_ms,
     });
     if let Some(sid) = serves {
         payload["serves"] = serde_json::json!(sid);
@@ -457,17 +501,29 @@ mod tests {
     /// and `serves` only when the job serves an execution.
     #[test]
     fn utility_start_payload_names_job_model_bound_and_what_it_serves() {
-        let p = utility_start_payload(UtilityJobKind::Compaction, "darkmux:u4b", Some("sid-1"), 600);
+        let p = utility_start_payload(UtilityJobKind::Compaction, "j-1", "darkmux:u4b", Some("sid-1"), 600, 5);
+        assert_eq!(p["job_id"], "j-1");
+        assert_eq!(p["started_at_ms"], 5);
         assert_eq!(p["job"], "compaction");
         assert_eq!(p["model"], "darkmux:u4b");
         assert_eq!(p["serves"], "sid-1");
         assert_eq!(p["stall_after_seconds"], 600);
-        let r = utility_start_payload(UtilityJobKind::RadioRouting, "u4b", None, 30);
+        let r = utility_start_payload(UtilityJobKind::RadioRouting, "j-2", "u4b", None, 30, 5);
         assert!(r.get("serves").is_none(), "absent, never null: {r}");
         let rec = utility_marker_record(UTILITY_START_ACTION, "radio-router", "u4b", r);
         assert_eq!(rec.action, UTILITY_START_ACTION);
         assert_eq!(rec.source.as_deref(), Some(UTILITY_SOURCE));
         assert!(rec.session_id.is_none(), "a host-side utility job has no session");
+    }
+
+    /// (#2915 review, MUST 1) Ids minted back to back, inside one
+    /// microsecond, never collide: the counter, not the clock, guarantees it.
+    #[test]
+    fn utility_job_ids_are_unique_even_within_one_microsecond() {
+        let ids: std::collections::BTreeSet<String> =
+            (0..2000).map(|_| mint_utility_job_id(UtilityJobKind::RadioRouting)).collect();
+        assert_eq!(ids.len(), 2000);
+        assert!(ids.iter().all(|i| i.starts_with("radio_routing-")));
     }
 
     /// The wire spellings the viewer reads, pinned so a serde rename is a
