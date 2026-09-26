@@ -1,3 +1,5 @@
+import { useDecodedMachineKey, useMachineKeyContext } from "../../hooks/useMachineKey";
+import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
@@ -143,9 +145,11 @@ export function lineClass(line: string): string | undefined {
  * that list; nothing on this page needs session liveness anymore.
  */
 export function MachineLens({
-  uid: routeUid,
+  machineKey,
 }: {
-  uid: string | null;
+  /** (#2929) The route's machine KEY (`lib/machineKey.ts`) — never the
+   *  hardware uid, except on an old link, which is resolved and rewritten. */
+  machineKey: string | null;
 }) {
   const nowMs = Date.now();
 
@@ -215,6 +219,16 @@ export function MachineLens({
   // The machine THIS page is showing — the route's explicit uid (a
   // fleet-card drill, local or remote) or, absent one, the local machine
   // (the nav-tab/deep-link entry — legacy's `goMachine`).
+  // (#2929) The route names the drilled machine by KEY; resolve it to the
+  // uid from the same inputs its fleet card was named from, and rewrite an
+  // old uid link to the key once they have settled. An unresolved key
+  // stands in as its own identity — it matches no record, which is the
+  // not-found page an unknown uid always got.
+  const drillKey = useMachineKeyContext(flowWindow.data, flowWindow.settled, daemonBacked && machineKey != null);
+  const drillDecoded = useDecodedMachineKey(machineKey, drillKey.ctx, drillKey.settled, (k) =>
+    writeHash(canonicalHash({ kind: "machine", machine: k })),
+  );
+  const routeUid = machineKey == null ? null : (drillDecoded?.uid ?? machineKey);
   const targetUid = routeUid ?? localUid;
   // (#2921 follow-up) The roster names a drilled machine nothing else does,
   // as it names that machine's fleet card. Read once, no poller.
@@ -274,7 +288,7 @@ export function MachineLens({
   // mission/dispatch-scoped branch never triggers for a `kind:"machine"`
   // route, so there is nothing for it to scope. */
   const { liveBlock } = useMachineStatsContent({
-    route: { kind: "machine", uid: routeUid },
+    route: { kind: "machine", machine: machineKey },
     routeRecords: [],
     flowWindow: flowWindow.data,
     localUid,

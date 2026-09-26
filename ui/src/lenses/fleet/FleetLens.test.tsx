@@ -684,7 +684,7 @@ describe("FleetLens", () => {
     expect(card.textContent).toContain("MacBook-Pro");
     expect(card).toHaveAttribute("role", "button");
     fireEvent.click(card);
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=MacBook-Pro");
   });
 
   it("Enter/Space also activates the LOCAL fleet-card drill-in (keyboard parity with the click)", async () => {
@@ -703,7 +703,7 @@ describe("FleetLens", () => {
     const card = document.querySelector(".mach")!;
     expect(card.textContent).toContain("MacBook-Pro");
     fireEvent.keyDown(card, { key: "Enter" });
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=MacBook-Pro");
   });
 
   // (#1809, merge-gate fix) The runs lens is for a machine POSITIVELY known
@@ -730,7 +730,7 @@ describe("FleetLens", () => {
     // confirmed one now agree, so there is no frame in which this card points
     // somewhere it will not point once `/machine/specs` resolves. That
     // flicker is what the old locality branch was working around.
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=MacBook-Pro");
   });
 
   it("a CONFIRMED-REMOTE card goes to the runs lens, pinned to that machine", async () => {
@@ -747,7 +747,7 @@ describe("FleetLens", () => {
     await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(2));
     const studio = [...document.querySelectorAll(".mach")].find((c) => c.textContent?.includes("studio"))!;
     fireEvent.click(studio);
-    expect(window.location.hash).toBe("#lens=runs&machine=u2");
+    expect(window.location.hash).toBe("#lens=runs&machine=studio");
   });
 
   it("the savings hero renders tokens-only — no currency symbol or rate figure, even with non-zero savings (#803 regression coverage, restored post-#1806)", async () => {
@@ -829,7 +829,7 @@ describe("FleetLens", () => {
     const countEl = card.querySelector(".runs--live")!;
     expect(countEl).not.toBeNull();
     fireEvent.click(countEl);
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=MacBook-Pro");
 
     // The card BODY now reaches the SAME destination as the count. Before
     // 2026-08-23 it went to the residency room on a local card; the operator
@@ -838,7 +838,7 @@ describe("FleetLens", () => {
     // flicker the locality branch existed to make harmless.
     window.location.hash = "";
     fireEvent.click(card.querySelector(".name")!);
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=MacBook-Pro");
   });
 
   it("(#1903) tapping the running count with exactly 1 live session opens that run's session drill directly", async () => {
@@ -2307,5 +2307,62 @@ describe("(#2921 follow-up) fleet page: roster names and unnamed ordinals", () =
     expect(cardName(B)).toBe("unnamed machine");
     expect(cardName(A)).toBe("unnamed machine 2");
     expect(new Set(names(".mach-name"))).toEqual(new Set(lanes));
+  });
+});
+
+// (#2929) The machine a card link names rides in the address bar, so it is a
+// machine KEY (the machine's name, or "unnamed-<n>"), never the hardware uid.
+// FAKE uuids, mixed case, so a leak would be caught case-insensitively.
+describe("(#2929) fleet-card links carry a machine key, never the hardware uid", () => {
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const NAMED = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const UNNAMED_1 = "1b2c3d4e-5f60-4172-9384-b5c6d7e8f9a0";
+  const UNNAMED_2 = "2C3D4E5F-6071-4283-A495-C6D7E8F9A0B1";
+
+  function mountThree() {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: NAMED, machine_id: "studio", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:01.000Z`, machine_uid: UNNAMED_1, session_id: "s2", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:01.500Z`, machine_uid: UNNAMED_1, session_id: "s3", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:02.000Z`, machine_uid: UNNAMED_2, session_id: "s4", action: "dispatch.start", handle: "coder" },
+      ],
+    });
+    renderFleetLens();
+  }
+  const cardNamed = (name: string) =>
+    [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".name")?.textContent?.trim().endsWith(name))!;
+
+  it("card body click and Enter: a name, or distinct unnamed ordinals — no uid in any hash", async () => {
+    mountThree();
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(3));
+    const hashes: Record<string, string[]> = {};
+    for (const name of ["studio", "unnamed machine", "unnamed machine 2"]) {
+      const card = cardNamed(name);
+      expect(card, name).toBeTruthy();
+      window.location.hash = "";
+      fireEvent.click(card);
+      const byClick = window.location.hash;
+      window.location.hash = "";
+      fireEvent.keyDown(card, { key: "Enter" });
+      hashes[name] = [byClick, window.location.hash];
+    }
+    expect(hashes["studio"]).toEqual(["#lens=runs&machine=studio", "#lens=runs&machine=studio"]);
+    expect(hashes["unnamed machine"]).toEqual(["#lens=runs&machine=unnamed-1", "#lens=runs&machine=unnamed-1"]);
+    expect(hashes["unnamed machine 2"]).toEqual(["#lens=runs&machine=unnamed-2", "#lens=runs&machine=unnamed-2"]);
+    for (const h of Object.values(hashes).flat()) expect(UUID_RE.test(h), h).toBe(false);
+  });
+
+  it("the running-count tap (2 live runs) carries the key too", async () => {
+    mountThree();
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(3));
+    const card = cardNamed("unnamed machine");
+    const count = card.querySelector(".runs--live");
+    expect(count).not.toBeNull();
+    window.location.hash = "";
+    fireEvent.click(count!);
+    expect(window.location.hash).toBe("#lens=runs&machine=unnamed-1");
+    expect(UUID_RE.test(window.location.hash)).toBe(false);
   });
 });

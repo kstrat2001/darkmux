@@ -1827,10 +1827,22 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
     mount([{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }]);
     await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("studio"));
     expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+    // (#2929) The old `uid=` link is rewritten to the machine's key.
+    await waitFor(() => expect(window.location.hash).toBe("#lens=machine&machine=studio"));
   });
   it("unrostered: #logscope reads 'unnamed machine', never the uid", async () => {
     mount([]);
     await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine"));
+    expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
+    await waitFor(() => expect(window.location.hash).toBe("#lens=machine&machine=unnamed-1"));
+    // Rewritten in place: the title still names the same machine.
+    expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine");
+  });
+  it("(#2929) an old #lens=runs&machine=<uid> link is rewritten to the key through the app's own routing", async () => {
+    mount([{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }]);
+    window.location.hash = `#lens=runs&machine=${FAKE_UID}`;
+    await waitFor(() => expect(window.location.hash).toBe("#lens=runs&machine=studio"));
+    await waitFor(() => expect(screen.getByText(/machine: studio/)).toBeInTheDocument());
     expect(UUID_RE.test(document.body.textContent ?? "")).toBe(false);
   });
 });

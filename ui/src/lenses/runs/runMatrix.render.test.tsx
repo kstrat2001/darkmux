@@ -92,7 +92,7 @@ function renderBoard(initialKind: "all" | "mission" | "dispatch" | "lab" = "all"
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <RunsBoard initialKind={initialKind} initialRun={null} initialMachineUid={null} />
+      <RunsBoard initialKind={initialKind} initialRun={null} initialMachineKey={null} />
     </QueryClientProvider>,
   );
 }

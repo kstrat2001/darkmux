@@ -18,7 +18,7 @@ describe("NavChrome", () => {
   it.each<[Route, string]>([
     [{ kind: "fleet" }, "lens-fleet"],
     [{ kind: "runs", runsKind: "all", run: null, machine: null }, "lens-runs"],
-    [{ kind: "machine", uid: null }, "lens-machine"],
+    [{ kind: "machine", machine: null }, "lens-machine"],
     [{ kind: "console", panelId: "", opts: {} }, "lens-console"],
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
     // fleet tab lit — see `NavChrome.tsx`'s own `isActive` doc.
@@ -28,11 +28,11 @@ describe("NavChrome", () => {
     // full measurement, and its #1868 note for why this still holds now
     // that the route renders `MissionGraphLens` for real.
     [{ kind: "mission", missionId: "m1", stepId: null }, "lens-fleet"],
-    // (#1809) A fleet-card drill (uid set) is the SAME shape as the session
+    // (#1809) A fleet-card drill (machine set) is the SAME shape as the session
     // drill above — arriving IN from fleet, not from a lens tab — so it
-    // keeps FLEET lit, not MACHINE. The inverted case (uid: null) is
+    // keeps FLEET lit, not MACHINE. The inverted case (machine: null) is
     // already covered two rows up.
-    [{ kind: "machine", uid: "remote-uid" }, "lens-fleet"],
+    [{ kind: "machine", machine: "remote-machine" }, "lens-fleet"],
   ])("highlights exactly the tab matching %o -> %s", (route, expectedOnId) => {
     render(<NavChrome route={route} />);
     const tabs = screen.getAllByRole("link");
@@ -62,7 +62,7 @@ describe("NavChrome", () => {
 
   it("clicking the fleet tab from elsewhere clears the hash", () => {
     window.location.hash = "#lens=machine";
-    render(<NavChrome route={{ kind: "machine", uid: null }} />);
+    render(<NavChrome route={{ kind: "machine", machine: null }} />);
     fireEvent.click(screen.getByRole("link", { name: "fleet" }));
     expect(window.location.hash).toBe("");
   });

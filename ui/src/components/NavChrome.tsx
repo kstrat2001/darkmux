@@ -50,10 +50,10 @@ function isActive(route: Route, tab: TabAct): boolean {
       return tab === "fleet";
     case "runs":
       return tab === "runs";
-    // (#1809) A fleet-card drill (`route.uid != null`) is the SAME shape as
+    // (#1809) A fleet-card drill (`route.machine != null`) is the SAME shape as
     // the session drill above it — arriving IN from fleet, not from a lens
     // tab — so it keeps FLEET lit, matching that case's own reasoning. Only
-    // the tab click / bare `#lens=machine` deep-link (`uid == null`, always
+    // the tab click / bare `#lens=machine` deep-link (`machine == null`, always
     // "the local machine" — see `route.ts`'s own doc on the widened
     // variant) lights MACHINE. Before this, the stage's own `fleet ›
     // machine · <name>` back-link said "child of fleet" while the tab bar
@@ -61,7 +61,7 @@ function isActive(route: Route, tab: TabAct): boolean {
     // #1809 traced back to #1508 step 2 unifying the two views without
     // revisiting the nav.
     case "machine":
-      return route.uid == null ? tab === "machine" : tab === "fleet";
+      return route.machine == null ? tab === "machine" : tab === "fleet";
     case "console":
       return tab === "console";
     case "unknown":

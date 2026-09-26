@@ -1,3 +1,4 @@
+import { encodeMachineKey } from "../../lib/machineKey";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { fitTubes } from "./tubeFit";
 import { scopeCenter } from "../../lib/scopeCenter";
@@ -65,8 +66,10 @@ import { runsForMachine } from "../runs/format";
  * clicking that card ... would be an unusable result. The machine tab is
  * this machine and that makes sense ... Always going to runs would make it
  * consistent nav regardless of machine." */
-function machineDrillHash(uid: string): string {
-  return `lens=runs&machine=${encodeURIComponent(uid)}`;
+function machineDrillHash(machineKey: string): string {
+  // (#2929) A machine KEY (`lib/machineKey.ts`), never the hardware uid: the
+  // address bar lands in screenshots and shared links.
+  return `lens=runs&machine=${encodeURIComponent(machineKey)}`;
 }
 
 /** (#1903) The running COUNT's own tap target — distinct from
@@ -94,10 +97,10 @@ function machineDrillHash(uid: string): string {
  * the SAME hash `machineDrillHash` already constructs for a confirmed-
  * remote card body) — a list, not a single run, is the honest surface for
  * "several things running here". */
-function machineRunsHash(uid: string, runningSessionIds: string[]): string | null {
+function machineRunsHash(machineKey: string, runningSessionIds: string[]): string | null {
   if (runningSessionIds.length === 0) return null;
   if (runningSessionIds.length === 1) return `dispatch=${encodeURIComponent(runningSessionIds[0])}`;
-  return `lens=runs&machine=${encodeURIComponent(uid)}`;
+  return machineDrillHash(machineKey);
 }
 
 /** `sc()` — viewer.html:1633. One token-class chip (value over label).
@@ -728,6 +731,12 @@ export function FleetLens({
     () => rosterOnlyEntries(flowWindow.data, liveMachines, roster, specs),
     [flowWindow.data, liveMachines, roster, specs],
   );
+  // (#2929) What a card's link names its machine by: the key the runs board
+  // resolves back from the same window, beats, specs and roster.
+  const machineKeyCtx = useMemo(
+    () => ({ data: flowWindow.data, liveMachines, specs, roster }),
+    [flowWindow.data, liveMachines, specs, roster],
+  );
 
   const cards = useMemo(
     () => [
@@ -945,12 +954,12 @@ export function FleetLens({
             // cleanup that nesting still needs.
             aria-label={card.name}
             onClick={() => {
-              location.hash = machineDrillHash(card.uid);
+              location.hash = machineDrillHash(encodeMachineKey(machineKeyCtx, card.uid));
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                location.hash = machineDrillHash(card.uid);
+                location.hash = machineDrillHash(encodeMachineKey(machineKeyCtx, card.uid));
               }
             }}
           >
@@ -1143,7 +1152,7 @@ export function FleetLens({
                   collapse), which is the common case — that keeps the
                   original "N running · X tok/s" wording unchanged. */}
               {(() => {
-                const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+                const runsHash = machineRunsHash(encodeMachineKey(machineKeyCtx, card.uid), card.runningSessionIds);
                 const rateText = `${fmtN(Math.round(card.liveTokRate ?? 0))} tok/s`;
                 const countText = pagerActive
                   ? card.runsCount === execs.length
@@ -1283,7 +1292,7 @@ export function FleetLens({
                     even though the fetch + render it needs (`/flow-session/<id>`
                     → `runRegions`) has worked since Packet 4.
                     This is a deliberate WIDENING beyond legacy's own address-bar
-                    behavior, same precedent as `machineDrillHash`'s `uid=` and
+                    behavior, same precedent as `machineDrillHash`'s machine key and
                     the `machine=` runs-lens pin above: the activity lane already
                     names every session on screen (`bar.sid`, carried into
                     `bar.title`), so it is the least-surprising place to attach

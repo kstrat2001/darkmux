@@ -7,6 +7,7 @@ import { usePlaybackTransport, type PlaybackFocus } from "./hooks/usePlaybackTra
 import { SeekSignalContext } from "./lib/seekSignal";
 import { Scrubber } from "./lenses/catalog/Scrubber";
 import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
+import { decodeMachineKey } from "./lib/machineKey";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
@@ -504,11 +505,19 @@ export function App() {
   // itself does for its header, not a second implementation.
   // (#2921 follow-up) The roster names a drilled machine nothing else does,
   // exactly as it names that machine's fleet card. Read once, no poller.
-  const { machines: roster } = useFleetRoster(isLiveRoute(route) && route.kind === "machine" && route.uid != null, false);
+  const drilledKey = route.kind === "machine" ? route.machine : null;
+  const { machines: roster } = useFleetRoster(isLiveRoute(route) && drilledKey != null, false);
+  // (#2929) The route carries a machine KEY, not the uid; resolve it the way
+  // `MachineLens` does (an unresolved key names no machine, and labels as
+  // one nothing knows — the same not-found title an unknown uid got).
+  const drilledUid = useMemo(() => {
+    if (drilledKey == null) return null;
+    return decodeMachineKey({ data: flowWindow.data, liveMachines, specs, roster }, drilledKey).uid ?? drilledKey;
+  }, [drilledKey, flowWindow.data, liveMachines, specs, roster]);
   const targetMachineName =
     route.kind === "machine"
-      ? route.uid != null
-        ? displayNameOf(flowWindow.data, liveMachines, specs, route.uid, roster)
+      ? drilledUid != null
+        ? displayNameOf(flowWindow.data, liveMachines, specs, drilledUid, roster)
         : localName
       : null;
 
@@ -1056,9 +1065,9 @@ function renderRoute(
     case "fleet":
       return <FleetLens connected={connected} lastContactMs={routeLastContactMs} />;
     case "runs":
-      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
+      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineKey={route.machine} />;
     case "machine":
-      return <MachineLens uid={route.uid} />;
+      return <MachineLens machineKey={route.machine} />;
     case "console":
       // (#1911) `route.opts` — already sanitized against the panel's own
       // table by `parseRoute` (or forced by `PANEL_ALIASES`) — seeds the

@@ -49,15 +49,15 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("machine (local, uid: null) round-trips WITHOUT a uid param", () => {
-    const route: Route = { kind: "machine", uid: null };
+  it("machine (local, machine: null) round-trips WITHOUT a machine param", () => {
+    const route: Route = { kind: "machine", machine: null };
     expect(canonicalHash(route)).toBe("lens=machine");
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("machine (a specific/remote uid) round-trips with an explicit uid param — the drill-in widening", () => {
-    const route: Route = { kind: "machine", uid: "studio-uid-123" };
-    expect(canonicalHash(route)).toBe("lens=machine&uid=studio-uid-123");
+  it("machine (a specific/remote drill) round-trips with an explicit machine key — the drill-in widening (#2929: machine=, never uid=)", () => {
+    const route: Route = { kind: "machine", machine: "studio" };
+    expect(canonicalHash(route)).toBe("lens=machine&machine=studio");
     expect(roundTrip(route)).toEqual(route);
   });
 

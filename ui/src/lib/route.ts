@@ -106,7 +106,13 @@ export type Route =
    * `MachineLens`'s `RUNS ON <MACHINE>` list moving out into a real lens —
    * see `MachineLens.tsx`'s own doc and #1508 step 2's commit message
    * (`d2041ae3`), which named this the deliberately-interim piece step 4
-   * was always going to replace. */
+   * was always going to replace.
+   *
+   * (#2929) The value is a machine KEY (`lib/machineKey.ts`: the machine's
+   * name, or `unnamed-<n>`), never the hardware uid — a uid in the address
+   * bar identifies the physical machine to anyone shown a screenshot or a
+   * link. The parser stays lenient: an old link's uid lands here verbatim,
+   * and `RunsBoard` resolves it and rewrites the hash to the key. */
   | { kind: "runs"; runsKind: RunsKind; run: string | null; machine: string | null }
   /** `uid` — widened this packet (the drill-in packet) to carry a SPECIFIC
    * machine uid: `null` for the nav-tab/deep-link entry (`goMachine` in
@@ -123,8 +129,13 @@ export type Route =
    * machine uids are arbitrary hardware-derived identifiers, matching
    * `dispatch.dispatchId`'s existing open-string precedent below. An
    * unrecognized/stale uid degrades gracefully (see `MachineLens`'s own
-   * doc) rather than needing its own validation here. */
-  | { kind: "machine"; uid: string | null }
+   * doc) rather than needing its own validation here.
+   *
+   * (#2929) Renamed `uid` -> `machine`, and the param with it: the value is
+   * a machine KEY (`lib/machineKey.ts`), never the hardware uid, written as
+   * `machine=<key>` like the runs lens's pin. An old `uid=<uid>` link still
+   * parses (into this same field) and `MachineLens` rewrites it to the key. */
+  | { kind: "machine"; machine: string | null }
   /** `panelId` is `""` for "no explicit panel requested" AND for "an
    * unrecognized id" — both parse the same way, matching legacy's
    * `consoleQuery()`: `PANELS.some(x=>x.id===id) ? id : ""`. The router
@@ -399,8 +410,9 @@ export function parseRoute(): Route {
   }
 
   if (lens === "machine") {
-    const uid = get("uid");
-    return { kind: "machine", uid: uid ? uid : null };
+    // (#2929) `machine=<key>` is canonical; `uid=` is an old link's spelling.
+    const machine = get("machine") || get("uid");
+    return { kind: "machine", machine: machine ? machine : null };
   }
 
   if (lens === "console") {

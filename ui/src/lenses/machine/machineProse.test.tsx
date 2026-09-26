@@ -91,7 +91,7 @@ function mount(machine: unknown) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MachineLens uid={null} />
+      <MachineLens machineKey={null} />
     </QueryClientProvider>,
   );
 }

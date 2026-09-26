@@ -36,7 +36,7 @@ import { canonicalOptPairs } from "../lenses/console/panels";
  *   effect just names it in the address bar.
  *
  * Scope: the params every ported lens drives (`lens`/`kind`/`panel`/
- * `session`/`uid`/`machine`) are written. `mission` (#1868 — the
+ * `session`/`machine`) are written. `mission` (#1868 — the
  * mission-graph lens) stays out of scope for this write-back path too, for
  * a DIFFERENT reason than before this packet: `#mission=<id>` used to be a
  * full navigation away (nothing to write back to); now it renders in-place,
@@ -90,18 +90,22 @@ export function canonicalHash(route: Route): string | null {
       // `kind`/`run` above, independent params on the same hash (matching
       // `route.ts`'s own doc: a pinned kind filter and a pinned lab-run
       // drill-in are both real, simultaneously reachable states).
+      // (#2929) A machine KEY, never a uid: every writer encodes through
+      // `lib/machineKey.ts`. Written verbatim here because this function has
+      // no window to encode with — an old uid link passes through until the
+      // lens resolves it and rewrites it (see `useDecodedMachineKey`).
       if (route.machine) p.set("machine", route.machine);
       return p.toString();
     }
     case "machine": {
       const p = new URLSearchParams();
       p.set("lens", "machine");
-      // (drill-in packet) `uid` — see `route.ts`'s own doc on the widened
-      // `machine` route: a genuine widening beyond legacy's own address bar
-      // (which never named the drilled uid), written only for a REMOTE/
-      // explicit drill (`uid` non-null); the local nav-tab/deep-link entry
-      // stays exactly `#lens=machine`, unchanged from before this packet.
-      if (route.uid) p.set("uid", route.uid);
+      // (drill-in packet) The drilled machine — see `route.ts`'s own doc on
+      // the widened `machine` route: written only for an explicit drill
+      // (non-null); the local nav-tab/deep-link entry stays exactly
+      // `#lens=machine`. (#2929) As `machine=<key>`, never `uid=<uid>`: an
+      // old `uid=` link parses into the same field and is rewritten here.
+      if (route.machine) p.set("machine", route.machine);
       return p.toString();
     }
     case "console": {
