@@ -116,9 +116,9 @@ darkmux release.
   requested profile is quarantined is reported as unplaced instead of
   being placed on the default profile's model.
 - **`darkmux lab run` with no `--profile` runs on the role's bound
-  profile** (#2902). It used `default_profile` even when the workload's
-  role (its manifest `role`, else `runtime.default_role`) had a
-  `role_profiles` binding, so the run's `profile=` stamp named a profile
+  profile** (#2902). It used `default_profile` even when the role the
+  workload dispatches as (the manifest's `role`, else the provider's own
+  default) had a `role_profiles` binding, so the run's `profile=` stamp named a profile
   the operator had not bound. It now follows the same precedence
   `darkmux dispatch <role>` does; an explicit `--profile` still wins.
 
