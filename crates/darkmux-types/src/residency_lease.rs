@@ -79,20 +79,32 @@
 //! BOTH `is_darkmux_owned` and present in `facts.residents`. So this module
 //! does no residency intersection itself — it only tracks liveness.
 //!
-//! # pid-liveness, not pid+start-time
+//! # pid-liveness, checked against the process start time
 //!
 //! [`live_leased_models`] treats a lease's pid as live via a `kill(pid, 0)`
 //! probe (`ESRCH` = dead; anything else, including a permission error,
 //! counts as alive). This is the CRASH backstop, not the primary release
 //! mechanism — a clean process exit removes its own lease via
 //! [`LeaseGuard`]'s `Drop`, so pid-liveness only matters for a lease whose
-//! owner crashed (SIGKILL, power loss — nothing that runs a destructor).
-//! Hardening against pid REUSE (stamping the process start-time alongside
-//! the pid) is deliberately NOT built in v1: the failure direction of a
-//! reused pid without it is a *missed* eviction (the stale lease still
-//! reads as "live," so its named model stays pinned a little longer than
-//! necessary) — never a *wrongful* one. Add start-time pinning here if that
-//! slack ever proves to matter in practice.
+//! owner crashed (SIGKILL, power loss, a reboot — nothing that runs a
+//! destructor).
+//!
+//! **pid reuse is not harmless** (an earlier revision of this section
+//! argued it was, on the grounds that a reused pid only pins a model a
+//! little longer). A lease survives a reboot, pids restart low, and
+//! `kill(pid, 0)` answers `EPERM` for a live process owned by another user
+//! — so a crash-orphaned `<pid>.lease` whose pid now belongs to, say,
+//! `launchd` (pid 1) reads as live FOREVER, and a reader that turns a lease
+//! into a user-visible claim (#2917: radio saying "darkmux process 1 is
+//! dispatching to it") repeats that claim on every call. So each lease is
+//! stamped with its writer's process START TIME (`started`, an opaque
+//! per-OS value from [`process_start_stamp`]) and every read compares it
+//! against the live pid's: a mismatch is a different process under a
+//! reused pid, swept like a dead one. A lease with no stamp (written by an
+//! older binary) or a pid whose start time cannot be read keeps the old
+//! fail-safe for PINNING (it still pins), but is not VERIFIED, and
+//! [`live_loaded_models_by_process`] — the read that backs a user-visible
+//! busy claim — returns only verified leases.
 //!
 //! # The crash-orphan sweep rides the read path
 //!
@@ -124,6 +136,12 @@ struct LeaseFile {
     models: Vec<String>,
     #[serde(default)]
     loaded: Vec<String>,
+    /// (#2917) The writer's process start time ([`process_start_stamp`]),
+    /// so a reader can tell the writer from a later process that reused
+    /// its pid. `None` on a lease from an older binary, or where the start
+    /// time could not be read; see the module doc's pid-liveness section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started: Option<u64>,
 }
 
 /// The process-wide same-process-aggregation registry (#2651): every
@@ -369,7 +387,7 @@ impl LeaseGuard {
             }
         }
 
-        for lease in live_foreign_leases(self.pid) {
+        for ForeignLease { lease, .. } in live_foreign_leases(self.pid) {
             for m in &lease.loaded {
                 if candidate_set.contains(m.as_str()) {
                     in_use.insert(m.clone());
@@ -445,7 +463,8 @@ fn write_lease_file(pid: u32, models: &[String], loaded: &[String]) -> Result<()
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = lease_path(&dir, pid);
     let tmp = dir.join(format!("{pid}.lease.tmp"));
-    let payload = LeaseFile { pid, models: models.to_vec(), loaded: loaded.to_vec() };
+    let payload =
+        LeaseFile { pid, models: models.to_vec(), loaded: loaded.to_vec(), started: process_start_stamp(pid) };
     let json = serde_json::to_string_pretty(&payload).context("serializing residency lease")?;
     fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, &path)
@@ -464,7 +483,7 @@ fn write_lease_file(pid: u32, models: &[String], loaded: &[String]) -> Result<()
 /// is skipped silently; this function never panics and never fails — a
 /// registry read that can't be trusted degrades to "nothing pinned," which
 /// is the same fail-open leniency `config.json` reads use elsewhere.
-fn live_foreign_leases(own_pid: u32) -> Vec<LeaseFile> {
+fn live_foreign_leases(own_pid: u32) -> Vec<ForeignLease> {
     let dir = residency_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
@@ -487,9 +506,30 @@ fn live_foreign_leases(own_pid: u32) -> Vec<LeaseFile> {
             let _ = fs::remove_file(&path); // best-effort crash-orphan sweep
             continue;
         }
-        out.push(lease);
+        let verified = match (lease.started, process_start_stamp(pid)) {
+            // (#2917) The pid is alive but is NOT the process that wrote
+            // this lease: a crash orphan under a reused pid. Swept exactly
+            // like a dead pid's.
+            (Some(stamped), Some(now)) if stamped != now => {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            (Some(_), Some(_)) => true,
+            // No stamp to compare (an older binary's lease), or the live
+            // pid's start time is unreadable: still pins (the fail-safe
+            // direction), but is not verified.
+            _ => false,
+        };
+        out.push(ForeignLease { lease, verified });
     }
     out
+}
+
+/// One [`live_foreign_leases`] result: the lease, and whether its pid was
+/// confirmed to still be the process that wrote it (start times match).
+struct ForeignLease {
+    lease: LeaseFile,
+    verified: bool,
 }
 
 /// Every `darkmux:*` model id leased (desired) by an OTHER live process —
@@ -497,8 +537,8 @@ fn live_foreign_leases(own_pid: u32) -> Vec<LeaseFile> {
 /// this builds on.
 pub fn live_leased_models(own_pid: u32) -> Vec<String> {
     let mut models = Vec::new();
-    for lease in live_foreign_leases(own_pid) {
-        models.extend(lease.models);
+    for foreign in live_foreign_leases(own_pid) {
+        models.extend(foreign.lease.models);
     }
     models
 }
@@ -512,12 +552,18 @@ pub fn live_leased_models(own_pid: u32) -> Vec<String> {
 /// the consumer — "a darkmux process is dispatching to the instance I
 /// would send to" is a fact this registry holds and `lms ps` cannot state
 /// (it reports the instance's status, never whose request it is serving).
-/// Same scan, liveness sweep and leniency as [`live_leased_models`].
+/// Same scan, liveness sweep and leniency as [`live_leased_models`], with
+/// one addition: only a VERIFIED lease counts — its pid's start time
+/// matches the one stamped when it was written. A lease that cannot be
+/// verified (an older binary's, or a pid whose start time is unreadable)
+/// may belong to whatever process now holds a reused pid, and a claim this
+/// read backs is shown to the user, so it says less rather than risk
+/// naming the wrong process (see the module doc's pid-liveness section).
 pub fn live_loaded_models_by_process(own_pid: u32) -> Vec<(u32, Vec<String>)> {
     live_foreign_leases(own_pid)
         .into_iter()
-        .filter(|lease| !lease.loaded.is_empty())
-        .map(|lease| (lease.pid, lease.loaded))
+        .filter(|foreign| foreign.verified && !foreign.lease.loaded.is_empty())
+        .map(|foreign| (foreign.lease.pid, foreign.lease.loaded))
         .collect()
 }
 
@@ -557,10 +603,10 @@ fn residency_dir() -> PathBuf {
 /// Is `pid` a live process? `kill(pid, 0)` sends no signal — it only probes
 /// existence/permission. `ESRCH` (no such process) is the only "dead"
 /// answer; anything else (success, or `EPERM` for a live process owned by
-/// another user) counts as alive. This is the FAIL-SAFE direction named in
-/// the module docs: a pid-reuse false positive here means a stale lease
-/// reads as live a little longer than it should (a *missed* eviction,
-/// never a *wrongful* one).
+/// another user) counts as alive. This is the FAIL-SAFE direction for
+/// PINNING: a stale lease is never wrongfully reclaimed here. pid reuse is
+/// caught separately, by comparing start times ([`process_start_stamp`]),
+/// because a reused pid can read as alive indefinitely (module doc).
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -568,6 +614,43 @@ fn process_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// (#2917) An opaque, per-OS stamp of when `pid` started, or `None` when it
+/// cannot be read. Compared only for EQUALITY against a stamp this same
+/// function produced for the lease's writer on this same machine, so the
+/// unit never matters. macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`'s start
+/// time in microseconds since the epoch. Linux: `/proc/<pid>/stat` field
+/// 22 (start time in clock ticks since boot). Elsewhere: `None`.
+#[cfg(target_os = "macos")]
+pub fn process_start_stamp(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a correctly sized, writable buffer for
+    // `PROC_PIDTBSDINFO`; the return value is checked before it is read.
+    let n = unsafe {
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size)
+    };
+    if n != size {
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` filled all `size` bytes.
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_start_stamp(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) is parenthesized and may contain spaces; fields
+    // after the LAST `)` are space-separated, starting at field 3.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_start_stamp(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Non-POSIX fallback (darkmux's audit/flock substrate is already
@@ -662,13 +745,105 @@ mod tests {
 
         let pid = dead_pid();
         let path = lease_path(&dir, pid);
-        let payload = LeaseFile { pid, models: vec!["darkmux:orphan".to_string()], loaded: vec![] };
+        let payload = LeaseFile { pid, models: vec!["darkmux:orphan".to_string()], loaded: vec![], started: None };
         fs::write(&path, serde_json::to_string(&payload).unwrap()).unwrap();
         assert!(path.exists(), "precondition: the orphan lease file exists");
 
         let models = live_leased_models(std::process::id());
         assert!(models.is_empty(), "a dead pid's models must never come back pinned: {models:?}");
         assert!(!path.exists(), "the dead-pid lease must be best-effort swept on read");
+    }
+
+    /// (#2917) A process the radio busy check may name must be one that
+    /// really wrote the lease. The only pid every macOS/Linux machine is
+    /// guaranteed to have live is 1, and it is never darkmux: a
+    /// crash-orphaned lease left by a reboot under a reused pid 1 must not
+    /// make `live_loaded_models_by_process` report "pid 1 holds it", while
+    /// the pinning read keeps its fail-safe (still pins).
+    #[serial_test::serial]
+    #[test]
+    fn an_unstamped_lease_on_a_live_non_darkmux_pid_is_not_a_verified_holder() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let dir = residency_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let mut holder = std::process::Command::new("sleep").arg("30").spawn().expect("spawning a live non-darkmux pid");
+        let pid = holder.id();
+        for (p, started) in [(1u32, None), (pid, None)] {
+            let lease = LeaseFile {
+                pid: p,
+                models: vec!["darkmux:m".to_string()],
+                loaded: vec!["darkmux:m".to_string()],
+                started,
+            };
+            fs::write(lease_path(&dir, p), serde_json::to_string(&lease).unwrap()).unwrap();
+        }
+        let verified = live_loaded_models_by_process(std::process::id());
+        assert!(verified.is_empty(), "an unverifiable lease must not back a busy claim: {verified:?}");
+        assert!(
+            live_leased_models(std::process::id()).contains(&"darkmux:m".to_string()),
+            "…but it still pins: that read's fail-safe is unchanged"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// (#2917) A lease stamped with a start time the live pid does not
+    /// have was written by a DIFFERENT process that held the pid before:
+    /// swept like a dead pid's, from every read.
+    #[serial_test::serial]
+    #[test]
+    fn a_lease_whose_start_stamp_does_not_match_the_live_pid_is_swept() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let dir = residency_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let mut holder = std::process::Command::new("sleep").arg("30").spawn().expect("spawning a live pid");
+        let pid = holder.id();
+        let now = process_start_stamp(pid).expect("a live child's start time is readable on this platform");
+        let lease = LeaseFile {
+            pid,
+            models: vec!["darkmux:m".to_string()],
+            loaded: vec!["darkmux:m".to_string()],
+            started: Some(now.wrapping_add(1)),
+        };
+        let path = lease_path(&dir, pid);
+        fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+        assert!(live_loaded_models_by_process(std::process::id()).is_empty());
+        assert!(live_leased_models(std::process::id()).is_empty(), "a reused pid pins nothing");
+        assert!(!path.exists(), "the reused-pid lease is swept on read");
+
+        // The inverted case: the SAME lease stamped with the pid's real
+        // start time is verified and reported.
+        let lease = LeaseFile { started: Some(now), ..lease };
+        fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+        assert_eq!(live_loaded_models_by_process(std::process::id()), vec![(pid, vec!["darkmux:m".to_string()])]);
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// (#2917) What `LeaseGuard` writes is stamped, so a live holder's
+    /// CONFIRMED-loaded identifiers are reported under its pid — and
+    /// identifiers it only DESIRES (still acquiring) are not: intent is
+    /// not busy. Read as another process would (own pid + 1).
+    #[serial_test::serial]
+    #[test]
+    fn live_loaded_models_by_process_reports_loaded_not_merely_desired() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let guard = LeaseGuard::acquire();
+        guard.write(&["darkmux:acquiring".to_string(), "darkmux:in-use".to_string()]).unwrap();
+        let reader = std::process::id().wrapping_add(1);
+        assert!(
+            live_loaded_models_by_process(reader).is_empty(),
+            "a holder that has only DESIRED an identifier is not dispatching to it"
+        );
+        guard.mark_loaded(&["darkmux:in-use".to_string()]).unwrap();
+        assert_eq!(
+            live_loaded_models_by_process(reader),
+            vec![(std::process::id(), vec!["darkmux:in-use".to_string()])]
+        );
+        assert!(live_loaded_models_by_process(std::process::id()).is_empty(), "never its own lease");
     }
 
     #[serial_test::serial]
@@ -945,6 +1120,7 @@ mod tests {
             pid: holder_pid,
             models: vec!["darkmux:cross-process".to_string()],
             loaded: vec![],
+            started: None,
         };
         fs::write(lease_path(&dir, holder_pid), serde_json::to_string(&cross_process_lease).unwrap())
             .expect("hand-writing a lease for the external holder pid");
