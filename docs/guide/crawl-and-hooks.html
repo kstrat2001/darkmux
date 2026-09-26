@@ -418,17 +418,20 @@ http.createServer((req, res) => {
     <pre><code>darkmux mission launch review --dry-run \
   --param workspace=ws.json --param diff_file=pr.diff \
   --param mod_seat_profile=grok-mod-seat</code></pre>
-    <p><code>mod_seat_profile</code> names a profile in <code>~/.darkmux/profiles.json</code>; leave it unset and the dispatch resolves <code>coder</code> through the machine's own <code>role_profiles.coder</code> binding instead, which is the other way to point a runner at a seat. A name that matches no defined profile <strong>refuses the launch</strong> and lists what is defined — it is not resolved to your default profile, because a cloud seat quietly demoted to the local default looks identical in the graph and in every flow record. The dry run is where a runner's typo surfaces. Three endpoint profiles, all OpenAI-compatible — there is no dialect field, because there is only one dialect. <code>endpoint.url</code> is the base up to <code>/chat/completions</code>, and <code>auth.keychain</code> names a macOS Keychain item, never a key:</p>
-    <pre><code>{ "profiles": {
-    "grok-mod-seat":   { "models": [ { "id": "&lt;grok-model-id&gt;",   "n_ctx": 128000,
-        "endpoint": { "url": "https://api.x.ai/v1",
-                      "auth": { "type": "bearer", "keychain": "darkmux-grok" } } } ] },
-    "gemini-mod-seat": { "models": [ { "id": "&lt;gemini-model-id&gt;", "n_ctx": 128000,
-        "endpoint": { "url": "https://generativelanguage.googleapis.com/v1beta/openai",
-                      "auth": { "type": "bearer", "keychain": "darkmux-gemini" } } } ] },
-    "openai-mod-seat": { "models": [ { "id": "&lt;openai-model-id&gt;", "n_ctx": 128000,
-        "endpoint": { "url": "https://api.openai.com/v1",
-                      "auth": { "type": "bearer", "keychain": "darkmux-openai" } } } ] } } }</code></pre>
+    <p><code>mod_seat_profile</code> names a profile in <code>~/.darkmux/profiles.json</code>; leave it unset and the dispatch resolves <code>coder</code> through the machine's own <code>role_profiles.coder</code> binding instead, which is the other way to point a runner at a seat. A name that matches no defined profile <strong>refuses the launch</strong> and lists what is defined — it is not resolved to your default profile, because a cloud seat quietly demoted to the local default looks identical in the graph and in every flow record. The dry run is where a runner's typo surfaces. Three endpoint profiles, all OpenAI-compatible. Each endpoint is declared once under the registry's top-level <code>endpoints</code> map and named by id from the model. <code>url</code> is the base up to <code>/chat/completions</code>, and <code>auth.keychain</code> names a macOS Keychain item, never a key:</p>
+    <pre><code>{ "endpoints": {
+    "grok":   { "url": "https://api.x.ai/v1",
+                "auth": { "type": "bearer", "keychain": "darkmux-grok" } },
+    "gemini": { "url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "auth": { "type": "bearer", "keychain": "darkmux-gemini" } },
+    "openai": { "url": "https://api.openai.com/v1",
+                "auth": { "type": "bearer", "keychain": "darkmux-openai" },
+                "limits": { "tokens_per_dispatch": 500000 } } },
+  "profiles": {
+    "grok-mod-seat":   { "models": [ { "id": "&lt;grok-model-id&gt;",   "n_ctx": 128000, "endpoint": "grok" } ] },
+    "gemini-mod-seat": { "models": [ { "id": "&lt;gemini-model-id&gt;", "n_ctx": 128000, "endpoint": "gemini" } ] },
+    "openai-mod-seat": { "models": [ { "id": "&lt;openai-model-id&gt;", "n_ctx": 128000, "endpoint": "openai" } ] } } }</code></pre>
+    <p>An endpoint with a <code>url</code> is one darkmux only sends requests to: it never loads or unloads anything there, and it knows the model it asked for and whatever the reply reports, nothing more. A model with no <code>endpoint</code> runs on the machine's own LM Studio, which darkmux manages (<code>"managed": "lmstudio"</code> says the same thing explicitly; a managed endpoint takes no <code>url</code>, its address is <code>lmstudio_url</code>). The request shape defaults to <code>max_completion_tokens</code>, which hosted reasoning models require; a server that only accepts <code>max_tokens</code> declares <code>"dialect": "chat-completions-max-tokens"</code>. <code>limits</code> (<code>tokens_per_dispatch</code>, <code>concurrent_calls</code>, and a <code>window</code> with a <code>period</code> such as <code>"1d"</code> and <code>tokens</code> or <code>calls</code>) is read and shown by <code>darkmux doctor</code> but <strong>not enforced yet</strong>; until it is, <code>remote.max_tokens_per_execution</code> below is the bound that applies. An endpoint written inline on a model (<code>"endpoint": { "url": … }</code>, the pre-4.0 spelling) still works, and <code>darkmux doctor</code> names the move to an id.</p>
     <p>On a runner with no login keychain to unlock, declare <code>"key_env": "&lt;VAR NAME&gt;"</code> instead — only the variable's name lives in the profile, and a present env var wins over the Keychain item.</p>
     <p><strong>Data boundary.</strong> This seat sends the finding and the source lines it names to a third party. Use it on public repositories only. Work under a client or employer boundary stays on a local seat or on that organization's own endpoint — the attended hook path exists for exactly that case.</p>
 

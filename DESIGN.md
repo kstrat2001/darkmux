@@ -519,6 +519,21 @@ Three choices shape it:
 
 The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI. Loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
 
+## Endpoints: what darkmux does there, not where they are
+
+darkmux records what it invoked, the endpoint and the model, and never classifies an endpoint by location or cost. The one distinction it draws is its own action (#2902):
+
+| Kind | What darkmux does | What it knows |
+|---|---|---|
+| **Managed** (`"managed": "lmstudio"`, or no endpoint at all) | loads and unloads models with `lms`, dispatches to its own `darkmux:` instance (#2240), plans residency under the RAM budget | the loaded model and window, because it loaded them |
+| **Unmanaged** (an endpoint with a `url`) | only sends requests | the model it requested and whatever the reply reports; what serves the endpoint can change without darkmux seeing it |
+
+The kind is an enum so a third one is additive (a fleet machine, #2916); every consumer matches on it with no catch-all.
+
+**One resolver, one set of rules.** Endpoints are declared once in `profiles.json`'s `endpoints` map (url, `managed`, `dialect`, `auth` naming where the credential lives, `limits`) and named by id from a profile model; an inline object on the model is the pre-4.0 spelling, still read. Every path that turns (role, profile) into a request goes through `crew::target::resolve_in`, which returns the SELECTED model together with its own endpoint, dialect, chat URL and window. The endpoint rules themselves (classification, the chat URL, the host a label may show, the credential order) live on `darkmux_types::ModelEndpoint`. Before this there were three resolvers, three "is this remote?" tests, two URL builders, three body builders, three host extractions and the credential order twice, and fixes landed in one copy only (#2904, #2905); the compaction window even came from the profile's default model while selection had picked another. `step_kinds::endpoint_conformance` walks the workspace and fails when a new call site decides any of these on its own.
+
+**Limits are declared before they are enforced.** Each endpoint's `limits` is parsed, validated and shown by `darkmux doctor` today; enforcement is a separate step that replaces the `remote.*` knobs with one per-endpoint regime. A value that changes nothing is labeled as such wherever it is shown.
+
 ## Seat classes: every step says what it consumes
 
 A mission is a graph of steps, and the scheduler has to decide, for each one, how many of its siblings may run alongside it. That decision needs one fact: what does this step consume?

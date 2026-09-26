@@ -1087,6 +1087,14 @@ mod tests {
             Some(darkmux_types::PROFILES_SCHEMA_VERSION),
             "profiles.example.json schema_version must match PROFILES_SCHEMA_VERSION"
         );
+        // (#2902 step 4) The shipped example is clean under the ONE registry
+        // validation, advice included: its hosted endpoint is declared once
+        // under `endpoints` and named by id, the spelling doctor asks for.
+        let issues = loaded.registry.validate();
+        assert!(issues.is_empty(), "the example registry must validate clean: {issues:?}");
+        let hosted = &loaded.registry.profiles["hosted-frontier"].models[0];
+        assert_eq!(hosted.endpoint.as_ref().and_then(|e| e.named_id()), Some("hosted"));
+        assert_eq!(hosted.endpoint_kind().unwrap(), darkmux_types::EndpointKind::Unmanaged);
     }
 
     #[test]

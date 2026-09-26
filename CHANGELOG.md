@@ -64,6 +64,23 @@ darkmux release.
 
 ### Added
 
+- **Endpoints are declared once and named by id** (#2902 step 4).
+  `profiles.json` gains a top-level `endpoints` map; each entry has a
+  `url`, `managed` (`"lmstudio"`, or absent for an endpoint darkmux only
+  sends requests to), `dialect` (`chat-completions`, the default for an
+  unmanaged endpoint, or `chat-completions-max-tokens` for a server that
+  only accepts `max_tokens`), `auth` (a Keychain item or env-var NAME, never
+  the secret) and `limits` (`tokens_per_dispatch`, `concurrent_calls`, and a
+  `window` with a `period` and `tokens`/`calls`). A profile model names one
+  with `"endpoint": "<id>"`. **Limits are parsed, validated and shown by
+  `darkmux doctor` but not enforced yet** (#2902 step 5); the `remote.*`
+  knobs still apply. Inline `endpoint` objects keep working, and doctor's
+  new `endpoints` check names the move to an id. An id that `endpoints`
+  does not define is refused when used, never sent to LM Studio on a guess.
+  `profiles.example.json` (what `darkmux init` writes) uses the id form.
+  PROFILES schema stays 2.0: the string form joins that unreleased major
+  (a binary from before it quarantines a profile that uses it).
+
 - **`/machine-status` is a built-in advertised command** (#2918). "Which
   models are loaded on this machine right now?" was refused: the catalog
   radio's router (and the editor panel) route over had no machine command
@@ -74,6 +91,21 @@ darkmux release.
   `machine eject` stays un-advertised.
 
 ### Fixed
+
+- **The compaction window is the selected model's own** (#2902 step 3).
+  With several models in a profile, a dispatch compacted at the profile's
+  DEFAULT model's `n_ctx` even when capability selection picked another
+  model. One resolver now returns the selected model with its own endpoint
+  and window, and every path (dispatch, the container path, seat placement,
+  radio's boundary and busy checks, `mission config show`, the crawl's
+  provenance stamp) goes through it. Single-model profiles, and every
+  profile shape `profiles.example.json` and the guide ship, resolve to the
+  same URL, model id, credential source and window as before (pinned by a
+  table-driven test). Two edge shapes change: a step `config.endpoint`
+  object with no `url` (`{}`) now runs on the managed LM Studio instead of
+  posting to `lmstudio_url` without its `/v1` path, and a seat whose
+  requested profile is quarantined is reported as unplaced instead of
+  being placed on the default profile's model.
 
 - **radio says the model is busy instead of queueing behind it** (#2917).
   One LM Studio instance serves one request at a time, and darkmux caps

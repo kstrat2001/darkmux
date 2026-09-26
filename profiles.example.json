@@ -1,5 +1,5 @@
 {
-  "_comment": "darkmux profile registry — example. Three worker profiles in increasing capacity order (fast → balanced → deep), plus one hosted-endpoint example. A profile's `models[]` are WORKER models; the machine's one utility model (compaction, radio routing) lives once in the top-level `internal.utility` with its own `n_ctx`, and is never selectable for a task. `n_ctx` is required for LOCAL models (it is the load parameter) and omitted for endpoint-bearing models. `darkmux init` fills the `<your-worker-model-id>` slots from a model you have downloaded; run `lms ls` to see them, and `darkmux config set role_profiles.<role> <profile>` to staff a mission seat. Profiles for the review mission's `reviewer` seat are in the guide, not here.",
+  "_comment": "darkmux profile registry — example. Three worker profiles in increasing capacity order (fast → balanced → deep), plus one hosted-endpoint example. A profile's `models[]` are WORKER models; the machine's one utility model (compaction, radio routing) lives once in the top-level `internal.utility` with its own `n_ctx`, and is never selectable for a task. `n_ctx` is required for models darkmux loads (it is the load parameter) and omitted for models on an endpoint darkmux does not manage. Endpoints are declared once under `endpoints` (url, `managed`, `dialect`, `auth` naming where the credential lives, and `limits`, which darkmux shows but does not enforce yet) and named by id from a model; a model with no `endpoint` runs on the machine's LM Studio. `darkmux init` fills the `<your-worker-model-id>` slots from a model you have downloaded; run `lms ls` to see them, and `darkmux config set role_profiles.<role> <profile>` to staff a mission seat. Profiles for the review mission's `reviewer` seat are in the guide, not here.",
 
   "schema_version": "2.0",
 
@@ -26,16 +26,17 @@
     },
 
     "hosted-frontier": {
-      "description": "A hosted model instead of a local one — no n_ctx (the provider owns the context window). Add an `auth` block when your endpoint needs credentials; see the guide. Delete this profile if you only run local models.",
+      "description": "A model on an endpoint darkmux only sends requests to (declared under `endpoints` below and named by id) — no n_ctx: whatever serves the endpoint owns the context window. Delete this profile, and the `hosted` endpoint, if you only run local models.",
       "models": [
-        {
-          "id": "gpt-5.1",
-          "endpoint": {
-            "url": "https://<your-resource>.cognitiveservices.azure.com/openai/deployments/<your-deployment>",
-            "api_version": "2025-01-01-preview"
-          }
-        }
+        { "id": "gpt-5.1", "endpoint": "hosted" }
       ]
+    }
+  },
+
+  "endpoints": {
+    "hosted": {
+      "url": "https://<your-resource>.cognitiveservices.azure.com/openai/deployments/<your-deployment>",
+      "api_version": "2025-01-01-preview"
     }
   },
 
