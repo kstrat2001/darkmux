@@ -1686,14 +1686,16 @@ fn unreachable_residents_status(
         String::new()
     } else {
         format!(
-            " Note: {} profile entr{} in this registry {} currently quarantined (failed to parse — see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, it may simply be waiting on that profile to be fixed, not genuinely orphaned.",
+            " Note: {} registry entr{} {} currently quarantined (failed to parse — see the profile-registry check): {}. If one of the residents above was loaded from a quarantined profile, or a profile naming a quarantined endpoint, it may simply be waiting on that entry to be fixed, not genuinely orphaned.",
             registry.quarantined.len(),
             if registry.quarantined.len() == 1 { "y" } else { "ies" },
             if registry.quarantined.len() == 1 { "is" } else { "are" },
+            // (#2902 re-review C2) Profiles and endpoints both quarantine;
+            // each is named with its kind.
             registry
                 .quarantined
                 .iter()
-                .map(|q| q.name.as_str())
+                .map(|q| format!("{} \"{}\"", q.kind, q.name))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -13884,6 +13886,24 @@ mod tests {
             hint.contains("broken-profile") && hint.contains("quarantined"),
             "hint names the quarantined profile so the operator doesn't assume a genuine orphan: {hint}"
         );
+    }
+
+    /// (#2902 re-review C2) An endpoint quarantine is named as one, never
+    /// counted as a "profile entry".
+    #[test]
+    fn unreachable_residents_hint_names_each_quarantine_by_kind() {
+        let mut registry = registry_with(&[("balanced", &[("qwen/qwen3.8-27b", None)])]);
+        for (kind, name) in [
+            (darkmux_types::QuarantinedEntryKind::Profile, "broken-profile"),
+            (darkmux_types::QuarantinedEntryKind::Endpoint, "broken-endpoint"),
+        ] {
+            registry.quarantined.push(darkmux_types::QuarantinedEntry { kind, name: name.into(), error: "x".into() });
+        }
+        let c = super::unreachable_residents_status(&[lm("darkmux:orphan", "orphan")], &registry);
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(hint.contains("2 registry entries are currently quarantined"), "{hint}");
+        assert!(hint.contains("profile \"broken-profile\"") && hint.contains("endpoint \"broken-endpoint\""), "{hint}");
+        assert!(!hint.contains("profile entr"), "{hint}");
     }
 
     // ─── role_profiles coherence (#1475 packet 1, #1547) ─────────────────
