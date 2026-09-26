@@ -29,6 +29,13 @@ vi.mock("../../components/TokenScope", () => ({
   TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
 }));
 
+// (#2928) A pass-through spy on the activity timeline's build, so a test can
+// pin that live samples re-render the cards without rebuilding it.
+vi.mock("./timeline", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./timeline")>();
+  return { ...real, buildActivityTimeline: vi.fn(real.buildActivityTimeline) };
+});
+
 // (#2911) A pass-through spy: every behavior is the real `tokensOffMeter`;
 // the tick tests read its call count to pin that a tick does not make the
 // hero recompute its token sums.
@@ -2486,7 +2493,31 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
     mockFleetFetch({ flowToday: records() });
     const { container } = renderFleetLens();
     await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("200 tok/s"));
+    expect(container.querySelector('[data-testid="fleet-token-scope"]')?.getAttribute("title")).toBeNull();
     store.reset();
+  });
+
+  it("live samples re-render the cards without rebuilding the activity timeline within the second", async () => {
+    const { buildActivityTimeline } = await import("./timeline");
+    const { liveStore } = await import("../../lib/liveChannel");
+    liveStore.reset();
+    mockFleetFetch({ flowToday: records() });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("10 tok/s"));
+    const builds = vi.mocked(buildActivityTimeline).mock.calls.length;
+    // The wall clock moves on inside the same second, as it does between
+    // samples.
+    vi.setSystemTime(new Date(Date.parse(FROZEN_NOW) + 300));
+    act(() => {
+      for (const [t, gen] of [["10:01:59.000", 220], ["10:01:59.250", 420]] as const) {
+        const ms = Date.parse(at(t));
+        liveStore.ingest(JSON.stringify({ v: 1, kind: "model", session_id: "s1", at_ms: ms, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: ms, generated_chars: gen, cumulative_chars: gen } }), ms);
+      }
+    });
+    await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("200 tok/s"));
+    // Still inside one wall second: the cards moved, the timeline did not rebuild.
+    expect(vi.mocked(buildActivityTimeline).mock.calls.length).toBe(builds);
+    liveStore.reset();
   });
 
   it("replay: the same samples in the store change nothing (the durable 10 tok/s)", async () => {
@@ -2497,6 +2528,7 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
     await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("tok/s"));
     expect(container.querySelector(".mach")!.textContent).toContain("10 tok/s");
     expect(container.querySelector(".mach")!.textContent).not.toContain("200 tok/s");
+    expect(container.querySelector('[data-testid="fleet-token-scope"]')?.getAttribute("title")).toContain("one every 2 s");
     store.reset();
   });
 });

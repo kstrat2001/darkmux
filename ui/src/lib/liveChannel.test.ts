@@ -2,7 +2,7 @@
 // shapes the derivations already read, merge by the live-over-durable
 // precedence, fall back to durable heartbeats when they stop, and never
 // reach playback.
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 import type { FlowRecord } from "../types/handwritten";
 import { EMPTY_OVERLAY, LiveStore, MAX_LIVE_PER_SESSION, LIVE_SESSION_TTL_MS, liveSampleToRecord, mergeLive, useLiveOverlay } from "./liveChannel";
@@ -221,5 +221,28 @@ describe("useLiveOverlay", () => {
       store.ingest(wireModel(T0, 1, 1), T0);
     });
     expect(result.current.bySession.get(SID)).toHaveLength(1);
+  });
+});
+
+describe("LiveStore render pacing", () => {
+  test("at most one notification per cadence; every sample still lands in the snapshot", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const store = new LiveStore();
+    let notified = 0;
+    store.subscribe(() => notified++);
+    // Three executions' samples inside one 250 ms window.
+    for (const [sid, gen] of [["a", 1], ["b", 2], ["c", 3]] as const) {
+      store.ingest(JSON.stringify({ v: 1, kind: "model", session_id: sid, at_ms: T0, cadence_ms: 250, fields: { generated_chars: gen } }), T0);
+    }
+    expect(notified, "the leading edge is immediate").toBe(1);
+    expect(store.snapshot().bySession.size, "nothing is dropped or delayed in the data").toBe(3);
+    vi.advanceTimersByTime(249);
+    expect(notified).toBe(1);
+    vi.advanceTimersByTime(1);
+    expect(notified, "the trailing edge carries the rest").toBe(2);
+    vi.advanceTimersByTime(1000);
+    expect(notified, "and nothing more without new samples").toBe(2);
+    vi.useRealTimers();
   });
 });

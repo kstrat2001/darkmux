@@ -7,7 +7,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useNowMs } from "../../lib/clock";
-import { useLiveOverlay } from "../../lib/liveChannel";
+import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
@@ -697,13 +697,22 @@ export function FleetLens({
   // replay), so playback and a scrubbed view derive from durable records
   // alone. Subscribing re-renders this lens on each live sample.
   const liveOverlay = useLiveOverlay(livePolling && playhead == null);
+  // (#2928) What moves at the 1 s clock's pace, not at the live channel's:
+  // live samples re-render this lens up to 4 times a second per execution,
+  // and only the cards read them. At the live edge the running set and the
+  // activity timeline are recomputed when the wall second changes (or their
+  // inputs do), exactly as often as before the live channel existed.
+  // Measured on the busy-day fixture, recomputing both on every sample was
+  // most of the feed's cost. A replay keys on the playhead itself.
+  const liveEdgeClock = playhead == null ? Math.floor(playheadT / 1000) : playheadT;
   const liveSet = useMemo(
     // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
     // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
     // would route around the disabled presence hooks above and re-derive
     // "running" from the day's own records — presence-agnostic in name only.
     () => liveSessionSet(flowWindow.data, liveSessionIds, playheadT, liveMode),
-    [flowWindow.data, liveSessionIds, playheadT, liveMode],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
+    [flowWindow.data, liveSessionIds, liveEdgeClock, liveMode],
   );
   // (#2814) SELF IS NEVER UNKNOWN — and before this, self could be ABSENT.
   //
@@ -846,7 +855,8 @@ export function FleetLens({
         specs,
         roster,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, playheadT, fixedRange?.[0], fixedRange?.[1], specs, roster],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, windowMinutesNum, liveMode, tMin, liveEdgeClock, fixedRange?.[0], fixedRange?.[1], specs, roster],
   );
 
   return (
@@ -1200,7 +1210,12 @@ export function FleetLens({
                 );
               })()}
               {card.liveTokRate !== null && selectedExec && (
-                <div className="mach-scope" data-testid="fleet-token-scope">
+                <div
+                  className="mach-scope"
+                  data-testid="fleet-token-scope"
+                  // (#2928) Replay has only the 2 s heartbeats; said on hover.
+                  title={playhead != null || !livePolling ? REPLAY_GRANULARITY_NOTE : undefined}
+                >
                   <TokenScope
                     // Same rule as the run page's tile — a stale rate from
                     // the last generating stretch must not still drive the

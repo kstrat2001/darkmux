@@ -1655,6 +1655,7 @@ describe("(#2928) the live overlay on the run page", () => {
     renderReplay("s-lv");
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     expect(latestTokenScopeProps().tokensPerSec).toBeCloseTo(200, 5);
+    expect(document.querySelector('[data-testid="run-token-scope"]')?.getAttribute("title")).toBeNull();
     store.reset();
     vi.useRealTimers();
   });
@@ -1672,6 +1673,8 @@ describe("(#2928) the live overlay on the run page", () => {
     );
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     expect(latestTokenScopeProps().tokensPerSec).toBeCloseTo(10, 5);
+    // Playback says what it is drawn from.
+    expect(document.querySelector('[data-testid="run-token-scope"]')?.getAttribute("title")).toContain("one every 2 s");
     store.reset();
     vi.useRealTimers();
   });

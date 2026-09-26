@@ -60,6 +60,11 @@ export interface LiveOverlay {
   readonly utility: readonly FlowRecord[];
 }
 
+/** (#2928) What a replayed scope says on hover: playback has only the
+ *  durable heartbeats, so fast transitions between them are not in it. */
+export const REPLAY_GRANULARITY_NOTE =
+  "Replayed from the recorded heartbeats, one every 2 s. Live, this scope follows the live channel's samples (every 250 ms by default), so short bursts show there and not here.";
+
 export const EMPTY_OVERLAY: LiveOverlay = { version: 0, bySession: new Map(), utility: [] };
 
 /** Samples kept per execution: the newest 64 (16 s at 250 ms). Rate and
@@ -190,6 +195,14 @@ export class LiveStore {
   private snap: LiveOverlay = EMPTY_OVERLAY;
   private listeners = new Set<() => void>();
   private version = 0;
+  /** Render pacing: at most one notification per cadence (the samples' own
+   *  `cadence_ms`), leading edge immediate, trailing edge scheduled. Every
+   *  sample is kept in the snapshot either way; only how often subscribers
+   *  are told is bounded, so a page watching several executions renders at
+   *  the channel's cadence rather than once per sample per execution. */
+  private cadenceMs = 250;
+  private lastNotifyMs = -Infinity;
+  private pending: ReturnType<typeof setTimeout> | null = null;
 
   /** Ingest one SSE `live` frame's data. Returns whether it was used. */
   ingest(data: string, nowMs: number = Date.now()): boolean {
@@ -201,6 +214,8 @@ export class LiveStore {
     }
     const rec = liveSampleToRecord(parsed);
     if (!rec) return false;
+    const cadence = (parsed as { cadence_ms?: unknown }).cadence_ms;
+    if (typeof cadence === "number" && Number.isFinite(cadence)) this.cadenceMs = Math.min(1000, Math.max(50, cadence));
     const sid = rec.session_id;
     if (rec.action === "dispatch.turn.heartbeat" && sid) {
       const list = [...(this.bySession.get(sid) ?? []), rec];
@@ -230,6 +245,20 @@ export class LiveStore {
   private publish(): void {
     this.version += 1;
     this.snap = { version: this.version, bySession: new Map(this.bySession), utility: this.utility };
+    if (this.pending !== null) return;
+    const wait = this.lastNotifyMs + this.cadenceMs - Date.now();
+    if (wait <= 0) {
+      this.notify();
+    } else {
+      this.pending = setTimeout(() => {
+        this.pending = null;
+        this.notify();
+      }, wait);
+    }
+  }
+
+  private notify(): void {
+    this.lastNotifyMs = Date.now();
     for (const l of this.listeners) l();
   }
 
@@ -242,6 +271,9 @@ export class LiveStore {
 
   /** Test seam: forget everything. */
   reset(): void {
+    if (this.pending !== null) clearTimeout(this.pending);
+    this.pending = null;
+    this.lastNotifyMs = -Infinity;
     this.bySession.clear();
     this.lastSeen.clear();
     this.utility = [];

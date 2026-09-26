@@ -24,7 +24,7 @@ export const STALE_AFTER_MS = 600_000;
 import { livenessState } from "../../components/LivenessPulse";
 import { TokenScope } from "../../components/TokenScope";
 import { liveStateLabel, type LiveStateReading } from "../../lib/tokenRate";
-import { useLiveOverlay } from "../../lib/liveChannel";
+import { REPLAY_GRANULARITY_NOTE, useLiveOverlay } from "../../lib/liveChannel";
 import { scopeStateOf, type ScopeState } from "../../lib/scopeMorph";
 import { CLEAN_DETECTORS, runRegions } from "../session/sessionRun";
 import type { BriefEntry, SessionRunView } from "../session/sessionRun";
@@ -806,7 +806,15 @@ export function SessionReplay({
             {(view.metricScope.model.length > 0 || scopeHero) && (
               <div className="modelbox__main">
                 {scopeHero && (
-                  <div className="modelbox__hero" data-testid="run-token-scope">
+                  <div
+                    className="modelbox__hero"
+                    data-testid="run-token-scope"
+                    // (#2928) A replayed, still-running instant is drawn from
+                    // the durable heartbeats, one every 2 s; the live edge
+                    // follows the live channel. Said on hover, never by
+                    // changing the box.
+                    title={!ticking && view.liveTokScope ? REPLAY_GRANULARITY_NOTE : undefined}
+                  >
                     <TokenScope
                       state={scopeHero.state}
                       // A stale reading from the LAST generating stretch must
