@@ -87,6 +87,9 @@ fn is_darkmux_runtime_image(tag: &str) -> bool {
 /// own progress to stderr so a multi-second first-dispatch pull isn't a silent
 /// hang. Bails with an actionable message (auth / network / build-locally) on
 /// failure.
+/// The two effects image resolution needs: inspecting, and pulling.
+type ImageSeams<'a> = (&'a dyn crate::runtime_image::ImageInspector, &'a dyn Fn(&str) -> Result<()>);
+
 #[cfg_attr(test, allow(dead_code))]
 fn pull_runtime_image(image: &str) -> Result<()> {
     eprintln!("darkmux dispatch: pulling the version-pinned runtime image `{image}` from GHCR (one-time, #759)…");
@@ -128,13 +131,12 @@ fn ensure_darkmux_image_present(
     // in `runtime_image`; the wired binary is tested with a fake `docker` on
     // PATH (`tests/cli.rs`). Release builds only ever see `DockerImageInspector`.
     #[cfg(test)]
-    let (inspector, pull): (&dyn crate::runtime_image::ImageInspector, &dyn Fn(&str) -> Result<()>) = (
+    let (inspector, pull): ImageSeams = (
         &crate::runtime_image::UnitTestMatchingLatest,
         &|image| bail!("unit tests never pull `{image}`"),
     );
     #[cfg(not(test))]
-    let (inspector, pull): (&dyn crate::runtime_image::ImageInspector, &dyn Fn(&str) -> Result<()>) =
-        (&DockerImageInspector::default(), &pull_runtime_image);
+    let (inspector, pull): ImageSeams = (&DockerImageInspector::default(), &pull_runtime_image);
     match explicit {
         Some(image) => resolve_explicit_image(inspector, image, host, pull),
         None => resolve_default_image(
