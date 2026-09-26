@@ -351,9 +351,9 @@ pub struct DispatchOpts {
     pub image: Option<String>,
     /// Mock-model harness: override the container's `--base-url` — the
     /// LMStudio-compatible chat-completions host the runtime dials for a
-    /// LOCAL-brain dispatch. `None` (the default) leaves the runtime's
-    /// baked-in `http://host.docker.internal:1234/v1` default in place
-    /// (real LMStudio on the host). Point this at a mock chat-completions
+    /// LOCAL-brain dispatch. `None` (the default) uses the configured
+    /// `lmstudio_url`, translated for the container (#2904,
+    /// `dispatch_internal::container_lmstudio_base_url`). Point this at a mock chat-completions
     /// server (e.g. `http://host.docker.internal:<port>/v1`) to run the
     /// real container-based dispatch machinery — real `docker run`, real
     /// agent loop, real flow records — against a scripted/deterministic

@@ -1860,14 +1860,15 @@ pub struct DockerRunConfig {
     /// `write_remote_auth_header_stdin`) — never via a file or env var. This
     /// flag carries no secret material itself.
     pub remote_needs_auth: bool,
-    /// Override the container's `--base-url` (the LMStudio-compatible
+    /// The container's `--base-url` (the LMStudio-compatible
     /// chat-completions host it dials for a LOCAL-brain dispatch — see
-    /// `runtime/src/lmstudio.rs::DEFAULT_BASE_URL`). `None` leaves the flag
-    /// omitted, so the runtime falls back to its baked-in
-    /// `http://host.docker.internal:1234/v1` default (real LMStudio on the
-    /// host). Set this to point the container at a mock chat-completions
-    /// server instead — the mock-model harness's mechanism for exercising
-    /// the real dispatch path with zero LMStudio/GPU involvement. Distinct
+    /// `runtime/src/lmstudio.rs::DEFAULT_BASE_URL`). `dispatch()` always
+    /// sets it from `container_lmstudio_base_url` (#2904): the configured
+    /// `lmstudio_url` translated for the container, or the mock-model
+    /// harness's override verbatim (the harness's mechanism for exercising
+    /// the real dispatch path with zero LMStudio/GPU involvement). `None`
+    /// leaves the flag omitted, so the runtime falls back to its baked-in
+    /// `http://host.docker.internal:1234/v1` default. Distinct
     /// from `remote_chat_url`: that field marks an agentic-REMOTE (hosted
     /// endpoint) brain and takes precedence when both are set, since
     /// `LmStudioClient::with_chat_url` overrides request routing outright
@@ -1905,6 +1906,61 @@ pub struct DockerRunConfig {
 ///
 /// Order: program, `run`, OPTIONS (--rm, --name, hardening flags, mounts,
 /// injection), then `--` + image + runtime CLI args.
+/// (#2904) The LMStudio base URL the dispatch container dials, as the
+/// runtime's `--base-url` (an OpenAI-compat `/v1` root; the runtime appends
+/// `/chat/completions`).
+///
+/// An explicit override (the mock-model harness) wins, verbatim. Otherwise
+/// it is the SAME resolved `lmstudio_url` the host-side single-shot path
+/// reads (`config_access::lmstudio_url`, env > config.json > default),
+/// normalized to `/v1` by the shared `single_shot::lmstudio_v1_base`, then
+/// rewritten for the container's view of the network: a loopback host
+/// names the container itself inside Docker, so it becomes
+/// `host.docker.internal` (Docker Desktop's name for the host, which the
+/// runtime's baked-in default already relies on). Any other host, the port,
+/// and the path pass through unchanged. This is a networking translation
+/// only; it says nothing about where the endpoint is.
+///
+/// Before #2904 the flag was emitted only for the override, so an operator
+/// on a non-default port had it honored by single-shot calls but not by
+/// agentic dispatches, which kept dialing the runtime's `:1234` default.
+pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<String> {
+    if let Some(url) = override_url {
+        return Some(url.to_string());
+    }
+    let base = crate::single_shot::lmstudio_v1_base(&darkmux_types::config_access::lmstudio_url());
+    Some(loopback_to_docker_host(&base))
+}
+
+/// Rewrite a loopback host (`localhost`, `127.0.0.1`, `[::1]`, any case) in
+/// `url` to `host.docker.internal`, keeping scheme, port, and path. Any
+/// other URL is returned unchanged.
+fn loopback_to_docker_host(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    // `[::1]:port` keeps its colon inside the brackets; split the port off
+    // after the closing bracket, else at the last `:`.
+    let (host, port) = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(i) => authority.split_at(i + 1),
+            None => (authority, ""),
+        }
+    } else {
+        match authority.rfind(':') {
+            Some(i) => authority.split_at(i),
+            None => (authority, ""),
+        }
+    };
+    let is_loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]";
+    if !is_loopback {
+        return url.to_string();
+    }
+    format!("{scheme}://host.docker.internal{port}{path}")
+}
+
 pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -2081,8 +2137,9 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
         args.push(RESUME_CHECKPOINT_CONTAINER_PATH.to_string());
     }
 
-    // Host-side override of the container's local-brain base URL (mock-model
-    // harness). Emitted whenever set — even alongside `remote_chat_url` below,
+    // The container's local-brain base URL (#2904: the configured
+    // `lmstudio_url` translated for Docker, or the mock-model harness's
+    // override). Emitted whenever set — even alongside `remote_chat_url` below,
     // since `--chat-url` (when present) wins request routing in the runtime's
     // client construction (`with_chat_url` overrides `base_url` outright), so
     // there's no ordering hazard in also passing `--base-url` for the
@@ -5667,7 +5724,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .and_then(|pm| pm.endpoint.as_ref())
             .map(remote_chat_url),
         remote_needs_auth,
-        base_url_override: opts.model_base_url_override.clone(),
+        base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
         workspace_read_only: opts.workspace_read_only,
     };
 

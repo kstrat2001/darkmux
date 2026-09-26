@@ -173,8 +173,19 @@ fn local_chat_url(base_url: Option<&str>) -> String {
     let base = base_url
         .map(str::to_string)
         .unwrap_or_else(darkmux_types::config_access::lmstudio_url);
+    format!("{}/chat/completions", lmstudio_v1_base(&base))
+}
+
+/// Normalize an operator's LMStudio base URL to its OpenAI-compat `/v1`
+/// root: a trailing `/` and a trailing `/v1` are both tolerated, so
+/// `http://h:1234`, `http://h:1234/`, and `http://h:1234/v1` all yield
+/// `http://h:1234/v1`. Shared by `local_chat_url` (host-side single-shot)
+/// and the agentic container's `--base-url` (#2904,
+/// `dispatch_internal::container_lmstudio_base_url`), so both paths read a
+/// configured URL the same way.
+pub(crate) fn lmstudio_v1_base(base: &str) -> String {
     let base = base.trim_end_matches('/').trim_end_matches("/v1");
-    format!("{base}/v1/chat/completions")
+    format!("{base}/v1")
 }
 
 /// Container-free single-shot chat call against a local LMStudio endpoint.
