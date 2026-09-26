@@ -154,7 +154,7 @@ pub fn image_verdict(image: &str, version_label: Option<&str>, host_version: &st
 
 /// "was built for darkmux X" / "carries no version label …" — the clause
 /// every message about a non-matching image uses.
-fn describe_non_match(image: &str, verdict: &ImageVerdict) -> String {
+pub fn describe_non_match(image: &str, verdict: &ImageVerdict) -> String {
     match verdict {
         ImageVerdict::Mismatch { built_for } => {
             format!("`{image}` was built for darkmux {built_for}")
@@ -169,7 +169,7 @@ fn describe_non_match(image: &str, verdict: &ImageVerdict) -> String {
 /// The exact rebuild command for a local tag. A GHCR ref is never rebuilt
 /// locally, and a digest ref has no tag to rebuild under, so both fall back
 /// to the dev tag.
-fn rebuild_command(image: &str, host_version: &str) -> String {
+pub fn rebuild_command(image: &str, host_version: &str) -> String {
     let (repo, tag) = repository_and_tag(image);
     let target = match tag {
         Some(t) if repo == RUNTIME_IMAGE_REPO => format!("{repo}:{t}"),
@@ -184,7 +184,7 @@ fn rebuild_command(image: &str, host_version: &str) -> String {
 pub fn mismatch_refusal(image: &str, verdict: &ImageVerdict, host_version: &str) -> String {
     let pinned = pinned_runtime_image(host_version);
     format!(
-        "refusing to dispatch: runtime image {}, but this darkmux is {host_version}. A runtime \
+        "refusing to dispatch: runtime image {}; this darkmux is {host_version}. A runtime \
          built for another darkmux fails mid-dispatch (`unknown flag: …`) or behaves \
          differently, so it is not run (#2923).\n\
          Fix, one of:\n  \
@@ -199,7 +199,7 @@ pub fn mismatch_refusal(image: &str, verdict: &ImageVerdict, host_version: &str)
 /// The stderr notice when the default path skips a local `:latest`.
 pub fn skipped_latest_notice(verdict: &ImageVerdict, host_version: &str) -> String {
     format!(
-        "darkmux dispatch: local {}, and this darkmux is {host_version} — not using it; \
+        "darkmux dispatch: local {}; this darkmux is {host_version} — not using it; \
          running the version-pinned `{}` instead (#2923). Rebuild it with `{}`, or remove it \
          with `docker rmi {RUNTIME_IMAGE}`.",
         describe_non_match(RUNTIME_IMAGE, verdict),

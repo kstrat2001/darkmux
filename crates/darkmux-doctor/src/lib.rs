@@ -5538,81 +5538,151 @@ fn classify_binary_vs_source(built: Option<&str>, head: Option<&str>) -> Check {
 
 // ─── C. runtime image freshness ───────────────────────────────────────────
 
-/// What doctor could learn about the local `darkmux-runtime:latest` image.
+/// One local tag of the `darkmux-runtime` repository and its version label.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RuntimeImageProbe {
-    /// Docker absent, wedged, daemon down, or no such image. Never a warning:
-    /// docker is not a hard dependency of doctor, and plenty of users have none.
-    NotApplicable(String),
-    /// The image carries `org.opencontainers.image.version`.
-    Labeled(String),
-    /// The image exists but carries no version label — built before the label
-    /// shipped, or built without the build-arg. Nothing to compare.
-    Unlabeled,
+struct LocalRuntimeTag {
+    tag: String,
+    label: Option<String>,
 }
 
-/// The OCI label the runtime image stamps its darkmux version into.
-const RUNTIME_IMAGE_VERSION_LABEL: &str = "org.opencontainers.image.version";
+/// What doctor could learn about the local `darkmux-runtime` images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeImageProbe {
+    /// Docker absent, wedged, daemon down, or no local `darkmux-runtime` tag.
+    /// Never a warning: docker is not a hard dependency of doctor, and plenty
+    /// of users have none.
+    NotApplicable(String),
+    /// Every local `darkmux-runtime:<tag>` with its version label.
+    Tags(Vec<LocalRuntimeTag>),
+}
 
 fn probe_runtime_image() -> RuntimeImageProbe {
-    use darkmux_crew::dispatch_internal::RUNTIME_IMAGE;
-    let format = format!("{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
-    let Some(out) = bounded_output(
-        Command::new("docker").args(["image", "inspect", RUNTIME_IMAGE, "--format", &format]),
-        std::time::Duration::from_secs(5),
+    use darkmux_crew::runtime_image::{RUNTIME_IMAGE_REPO, RUNTIME_IMAGE_VERSION_LABEL};
+    let timeout = std::time::Duration::from_secs(5);
+    let Some(list) = bounded_output(
+        Command::new("docker").args(["images", RUNTIME_IMAGE_REPO, "--format", "{{.Repository}}:{{.Tag}}"]),
+        timeout,
     ) else {
         return RuntimeImageProbe::NotApplicable("`docker` not available".into());
     };
-    if !out.status.success() {
-        // Covers both "no such image" and "daemon not reachable". Neither is a
-        // staleness finding, and `docker runtime` already reports daemon health.
-        return RuntimeImageProbe::NotApplicable(format!("no local `{RUNTIME_IMAGE}` image"));
+    if !list.status.success() {
+        // Daemon not reachable; `docker runtime` already reports daemon health.
+        return RuntimeImageProbe::NotApplicable("the Docker daemon did not answer".into());
     }
-    let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // Docker renders a missing map key as `<no value>`.
-    if label.is_empty() || label == "<no value>" {
-        return RuntimeImageProbe::Unlabeled;
+    let tags = parse_runtime_image_tags(&String::from_utf8_lossy(&list.stdout));
+    if tags.is_empty() {
+        return RuntimeImageProbe::NotApplicable(format!("no local `{RUNTIME_IMAGE_REPO}` image"));
     }
-    RuntimeImageProbe::Labeled(label)
+    // One inspect for every tag: one output line per ref, in order.
+    let format = format!("{{{{index .Config.Labels \"{RUNTIME_IMAGE_VERSION_LABEL}\"}}}}");
+    let Some(out) = bounded_output(
+        Command::new("docker")
+            .args(["image", "inspect", "--format", &format, "--"])
+            .args(&tags),
+        timeout,
+    ) else {
+        return RuntimeImageProbe::NotApplicable("`docker image inspect` did not answer".into());
+    };
+    match pair_runtime_image_labels(&tags, &String::from_utf8_lossy(&out.stdout)) {
+        Some(paired) if out.status.success() => RuntimeImageProbe::Tags(paired),
+        _ => RuntimeImageProbe::NotApplicable("could not read the local images' labels".into()),
+    }
+}
+
+/// `docker images <repo> --format '{{.Repository}}:{{.Tag}}'` → the tagged refs.
+/// Dangling `<none>` entries have no tag to run and are dropped.
+fn parse_runtime_image_tags(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains("<none>"))
+        .map(String::from)
+        .collect()
+}
+
+/// Pair each tag with its line of the batched inspect output. `None` when the
+/// line count does not match, so a partial answer is never misattributed.
+fn pair_runtime_image_labels(tags: &[String], inspect_stdout: &str) -> Option<Vec<LocalRuntimeTag>> {
+    let lines: Vec<&str> = inspect_stdout.lines().collect();
+    (lines.len() == tags.len()).then(|| {
+        tags.iter()
+            .zip(lines)
+            .map(|(tag, line)| LocalRuntimeTag {
+                tag: tag.clone(),
+                label: darkmux_crew::runtime_image::parse_version_label(line),
+            })
+            .collect()
+    })
 }
 
 fn check_runtime_image_freshness() -> Check {
     classify_runtime_image_freshness(probe_runtime_image(), env!("CARGO_PKG_VERSION"))
 }
 
-/// Pure classifier — compares the image's stamped version against this binary's
-/// package version.
+/// Pure classifier (#1461, #2923). Only `:latest` can be picked without being
+/// named, so only a `:latest` that does not match this binary is a warning:
+/// this darkmux skips it, but a pre-#2923 darkmux on the same machine (a
+/// side-by-side install) still runs it, and naming it is refused. Other
+/// unlabeled tags are listed, not warned about: they run only when named, and
+/// naming one is refused with the fix.
 fn classify_runtime_image_freshness(probe: RuntimeImageProbe, installed: &str) -> Check {
-    use darkmux_crew::dispatch_internal::RUNTIME_IMAGE;
-    match probe {
+    use darkmux_crew::runtime_image::{
+        describe_non_match, image_verdict, pinned_runtime_image, rebuild_command, ImageVerdict,
+        RUNTIME_IMAGE,
+    };
+    let tags = match probe {
         RuntimeImageProbe::NotApplicable(reason) => {
-            not_applicable(RUNTIME_IMAGE_CHECK_NAME, &reason)
+            return not_applicable(RUNTIME_IMAGE_CHECK_NAME, &reason);
         }
-        RuntimeImageProbe::Unlabeled => Check {
+        RuntimeImageProbe::Tags(tags) => tags,
+    };
+    let pinned = pinned_runtime_image(installed);
+    let unlabeled_others: Vec<&str> = tags
+        .iter()
+        .filter(|t| t.tag != RUNTIME_IMAGE && t.label.is_none())
+        .map(|t| t.tag.as_str())
+        .collect();
+    let others_note = match unlabeled_others.len() {
+        0 => String::new(),
+        n => {
+            let shown: Vec<&str> = unlabeled_others.iter().take(3).copied().collect();
+            format!(
+                " · {n} other local tag(s) carry no version label ({}{}); `--image` naming one \
+                 is refused",
+                shown.join(", "),
+                if n > 3 { ", …" } else { "" }
+            )
+        }
+    };
+    let latest = tags.iter().find(|t| t.tag == RUNTIME_IMAGE);
+    match latest.map(|t| image_verdict(RUNTIME_IMAGE, t.label.as_deref(), installed)) {
+        None => Check {
             name: RUNTIME_IMAGE_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!(
-                "local `{RUNTIME_IMAGE}` carries no version label — nothing to compare"
+                "no local `{RUNTIME_IMAGE}` — dispatch uses the version-pinned `{pinned}`{others_note}"
             ),
             hint: None,
         },
-        RuntimeImageProbe::Labeled(version) if version == installed => Check {
+        Some(ImageVerdict::Matches) => Check {
             name: RUNTIME_IMAGE_CHECK_NAME.into(),
             status: Status::Pass,
-            message: format!("local `{RUNTIME_IMAGE}` matches this binary ({installed})"),
+            message: format!("local `{RUNTIME_IMAGE}` matches this binary ({installed}){others_note}"),
             hint: None,
         },
-        RuntimeImageProbe::Labeled(version) => Check {
+        Some(verdict) => Check {
             name: RUNTIME_IMAGE_CHECK_NAME.into(),
             status: Status::Warn,
             message: format!(
-                "local `{RUNTIME_IMAGE}` was built for darkmux {version}, but this binary is \
-                 {installed} — dispatches prefer the local image, so they run the OLD runtime"
+                "local {}; this binary is {installed} — dispatch skips it and runs \
+                 `{pinned}` (pulling it if absent); a darkmux older than this fix still runs it, \
+                 and `--image {RUNTIME_IMAGE}` is refused{others_note}",
+                describe_non_match(RUNTIME_IMAGE, &verdict)
             ),
             hint: Some(format!(
-                "rebuild it from a source checkout: `docker build --build-arg \
-                 DARKMUX_VERSION={installed} -t {RUNTIME_IMAGE} runtime/` — or drop the local tag \
-                 (`docker rmi {RUNTIME_IMAGE}`) to let darkmux pull the version-pinned image"
+                "rebuild it from a darkmux {installed} source checkout: `{}` — or remove it \
+                 (`docker rmi {RUNTIME_IMAGE}`) so nothing can pick it up",
+                rebuild_command(RUNTIME_IMAGE, installed)
             )),
         },
     }
@@ -6465,15 +6535,18 @@ fn docker_status_to_check(status: darkmux_crew::dispatch_internal::DockerRuntime
         S::ImageMissing => Check {
             name,
             status: Status::Warn,
-            message: "Docker is up; no local runtime image — darkmux will pull it on the first \
-                      dispatch"
-                .to_string(),
+            message: format!(
+                "Docker is up; no local runtime image built for this darkmux ({}) — darkmux \
+                 will pull it on the first dispatch",
+                env!("CARGO_PKG_VERSION")
+            ),
             hint: Some(format!(
                 "darkmux pulls `{}` from GHCR on demand (#759). Pre-pull now with \
-                 `docker pull {}`, or build locally from a source checkout: \
-                 `docker build -t {RUNTIME_IMAGE} runtime/`.",
+                 `docker pull {}`, or build locally from a darkmux {version} source checkout: \
+                 `docker build --build-arg DARKMUX_VERSION={version} -t {RUNTIME_IMAGE} runtime/`.",
                 ghcr_runtime_image(),
-                ghcr_runtime_image()
+                ghcr_runtime_image(),
+                version = env!("CARGO_PKG_VERSION"),
             )),
         },
         S::ProbeError(e) => Check {
@@ -11779,10 +11852,22 @@ mod tests {
         assert!(find_darkmux_source_root(root).is_none());
     }
 
+    fn tags(entries: &[(&str, Option<&str>)]) -> RuntimeImageProbe {
+        RuntimeImageProbe::Tags(
+            entries
+                .iter()
+                .map(|(tag, label)| LocalRuntimeTag {
+                    tag: tag.to_string(),
+                    label: label.map(String::from),
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn runtime_image_passes_when_the_label_matches_the_binary() {
         let c = classify_runtime_image_freshness(
-            RuntimeImageProbe::Labeled("2.0.0".into()),
+            tags(&[("darkmux-runtime:latest", Some("2.0.0"))]),
             "2.0.0",
         );
         assert_eq!(c.status, Status::Pass, "{}", c.message);
@@ -11792,7 +11877,7 @@ mod tests {
     #[test]
     fn runtime_image_warns_naming_both_versions_when_the_label_is_older() {
         let c = classify_runtime_image_freshness(
-            RuntimeImageProbe::Labeled("1.18.5".into()),
+            tags(&[("darkmux-runtime:latest", Some("1.18.5"))]),
             "2.0.0",
         );
         assert_eq!(c.status, Status::Warn, "{}", c.message);
@@ -11802,6 +11887,7 @@ mod tests {
         assert!(hint.contains("docker build"), "build fix: {hint}");
         // The hint must name a version the operator can paste, not a placeholder.
         assert!(hint.contains("DARKMUX_VERSION=2.0.0"), "{hint}");
+        assert!(hint.contains("docker rmi darkmux-runtime:latest"), "{hint}");
     }
 
     #[test]
@@ -11817,11 +11903,61 @@ mod tests {
     }
 
     #[test]
-    fn runtime_image_unlabeled_is_informational_not_a_warning() {
-        // An image built before the label shipped has nothing to compare.
-        let c = classify_runtime_image_freshness(RuntimeImageProbe::Unlabeled, "2.0.0");
-        assert_eq!(c.status, Status::Pass, "{}", c.message);
+    fn runtime_image_unlabeled_latest_warns_with_the_fix() {
+        // (#2923) The Studio's shape: a weeks-old `docker build` with no
+        // build-arg. It used to read "nothing to compare" and pass, while
+        // every dispatch ran it. Unknown is not "fine".
+        let c = classify_runtime_image_freshness(
+            tags(&[("darkmux-runtime:latest", None)]),
+            "3.13.0",
+        );
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
         assert!(c.message.contains("no version label"), "{}", c.message);
+        assert!(
+            c.message.contains("ghcr.io/kstrat2001/darkmux-runtime:3.13.0"),
+            "names what runs instead: {}",
+            c.message
+        );
+        let hint = c.hint.as_deref().unwrap();
+        assert!(
+            hint.contains(
+                "docker build --build-arg DARKMUX_VERSION=3.13.0 -t darkmux-runtime:latest runtime/"
+            ),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn runtime_image_other_unlabeled_tags_are_listed_not_warned() {
+        // A renamed stale image (`:stale-pre-3.13`) runs only when named, and
+        // naming it is refused — so it is reported, not a warning.
+        let c = classify_runtime_image_freshness(
+            tags(&[
+                ("darkmux-runtime:stale-pre-3.13", None),
+                ("darkmux-runtime:4.0-rc", Some("4.0.0")),
+            ]),
+            "3.13.0",
+        );
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("darkmux-runtime:stale-pre-3.13"), "{}", c.message);
+        assert!(
+            !c.message.contains("4.0-rc"),
+            "a labeled side-by-side tag is not noise: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn runtime_image_probe_parses_listing_and_pairs_labels_in_order() {
+        let tags = parse_runtime_image_tags(
+            "darkmux-runtime:latest\ndarkmux-runtime:<none>\ndarkmux-runtime:4.0-rc\n",
+        );
+        assert_eq!(tags, vec!["darkmux-runtime:latest", "darkmux-runtime:4.0-rc"]);
+        let paired = pair_runtime_image_labels(&tags, "\n3.13.0\n").unwrap();
+        assert_eq!(paired[0].label, None);
+        assert_eq!(paired[1].label.as_deref(), Some("3.13.0"));
+        // A short answer is never misattributed.
+        assert!(pair_runtime_image_labels(&tags, "3.13.0\n").is_none());
     }
 
     // ─── (#2386 review) the injected runtime binary's own cache ─────────
@@ -11893,7 +12029,7 @@ mod tests {
             classify_daemon_freshness(modern("same", 1000), "same", Some(2000)),
             classify_daemon_freshness(Some(DaemonBuild::Legacy("1.18.5".into())), "new", Some(1000)),
             classify_binary_vs_source(Some("0ldc0de"), Some("a1b2c3d")),
-            classify_runtime_image_freshness(RuntimeImageProbe::Labeled("1.0.0".into()), "2.0.0"),
+            classify_runtime_image_freshness(tags(&[("darkmux-runtime:latest", Some("1.0.0"))]), "2.0.0"),
             classify_runtime_binary_cache(true, Some(cache_stamp("1.0.0", None)), "2.0.0"),
         ];
         for c in all {
@@ -12096,11 +12232,11 @@ mod tests {
         use darkmux_crew::dispatch_internal::DockerRuntimeStatus;
         let c = docker_status_to_check(DockerRuntimeStatus::ImageMissing);
         assert_eq!(c.status, Status::Warn);
-        assert!(
-            c.hint
-                .unwrap()
-                .contains("docker build -t darkmux-runtime:latest runtime/")
-        );
+        // (#2923) The build fix stamps the label, or dispatch skips the image.
+        assert!(c.hint.unwrap().contains(&format!(
+            "docker build --build-arg DARKMUX_VERSION={} -t darkmux-runtime:latest runtime/",
+            env!("CARGO_PKG_VERSION")
+        )));
     }
 
     #[test]

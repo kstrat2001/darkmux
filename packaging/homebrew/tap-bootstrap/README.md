@@ -67,7 +67,7 @@ the bundled skills.
 
 **Not included:** the `darkmux-runtime` Docker image that `darkmux
 dispatch` and `darkmux lab run` need — that requires a source checkout
-of darkmux + `docker build -t darkmux-runtime:latest runtime/`. A
+of darkmux + `docker build --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`. A
 published image is tracked in
 [darkmux#618](https://github.com/kstrat2001/darkmux/issues/618).
 
