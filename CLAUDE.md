@@ -217,10 +217,22 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 1. **Profile uniformity** — a profile means the same thing to every consumer (swap, dispatch,
    crews, benches). A consumer may not legislate which profiles are legal; it routes on what
    the profile declares (local vs endpoint → dialect, cycling, token accounting).
-2. **Dispatch liveness** — any production code path that performs model work emits
+2. **Dispatch liveness** — any production code path that performs a WORK execution emits
    `dispatch.start` and a terminal `dispatch.complete`/`dispatch.error` (RAII-guarded on all
    exit paths), regardless of what richer vocabulary it also emits. Liveness surfaces key on
    these bookends plus presence (#857); new vocabularies supplement, never replace.
+   **Amended by #2914 (4.0): darkmux's own UTILITY jobs are exempt, and run lean.** The
+   utility jobs are defined once, by `darkmux_crew::usage::call_purpose` (every runtime
+   compactor call, and every call by the radio routing role); they run on the machine's one
+   utility model (`internal.utility`), and each emits its `telemetry.tokens` usage record
+   (`purpose: utility`) and nothing else: no session, no bookends, no presence, no run. They
+   are ACCOUNTED (the fleet hero sums them under their own chip) but not LISTED (the runs
+   board, the fleet card's activity and the status line's last dispatch key on bookends and
+   therefore show work only, which is the intent). Their visibility is #2915's utility state,
+   emitted at the one chokepoint each half passes through (`darkmux_crew::utility::
+   run_utility_single_shot` on the host; the runtime's `compaction.*` trajectory events,
+   through the tailer), never a bookend. Radio's ANSWERING seat (`radio-host`) is work and
+   keeps its bookends and its run.
 3. **Lab/fleet sink boundary** — lab runs write per-run-local artifacts; the fleet flow
    stream carries engagement work only. No crossings in either direction.
 4. **Namespace convention** — darkmux-owned state in shared systems carries the darkmux

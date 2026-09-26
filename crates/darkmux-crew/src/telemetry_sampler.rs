@@ -101,15 +101,20 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
 /// the viewer's `jit-model-swap` detector can tell "the primary changed"
 /// from "the compactor/utility went resident, exactly as staffed."
 ///
-/// `"primary"` when `model_id` is the dispatch's own model; `"compactor"` /
-/// `"utility"` when it matches the profile's declared compactor / utility
-/// model id (either may be absent — a short dispatch may run no
-/// compaction, and utility-model resolution can come back empty);
-/// `"resident"` otherwise — a model this dispatch did not declare at all
-/// (a leftover from an earlier session, or the operator's own unrelated
-/// LMStudio use). Checked in that order, so a profile that (unusually)
-/// reuses the SAME model id for two seats still gets one unambiguous
-/// answer rather than a tag that depends on iteration order.
+/// `"primary"` when `model_id` is the dispatch's own model; `"utility"`
+/// when it matches the machine's utility model (`internal.utility`, the
+/// ONE seat darkmux's own jobs run on: compaction and radio routing, #2914;
+/// absent when no binding is registered); `"resident"` otherwise — a model
+/// this dispatch did not declare at all (a leftover from an earlier
+/// session, or the operator's own unrelated LMStudio use). Checked in that
+/// order, so a dispatch that (unusually) runs on the same model id as the
+/// utility seat still gets one unambiguous answer rather than a tag that
+/// depends on iteration order.
+///
+/// (#2914) Before 4.0 this tagged two seats, `"compactor"` and
+/// `"utility"`, for what was always one model declared two ways. There is
+/// one utility model now, so there is one tag; records from before carry
+/// `"compactor"`, and the viewer reads both as the utility seat.
 ///
 /// **Every operand is [`crate::dispatch_internal::bare_model_key`]-normalized
 /// before comparison, on BOTH sides.** An earlier revision of this function
@@ -123,7 +128,7 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
 ///   JIT-reloading. `lms ps` still reports `modelKey=<key>`, bare. So the
 ///   run's own primary classified as `"resident"`, and every mid-run
 ///   re-observation of it read as a swap.
-/// - **Compactor / utility.** `internal.utility` explicitly accepts a
+/// - **Utility.** `internal.utility` explicitly accepts a
 ///   namespaced IDENTIFIER where a key belongs (#1615) — this crate's own
 ///   regression test fixture is literally `"darkmux:util-4b"`. A namespaced
 ///   utility binding tagged its JIT load `"resident"`, which neither the
@@ -141,18 +146,11 @@ pub fn lms_diff(prev: &[LoadedModel], cur: &[LoadedModel]) -> Vec<serde_json::Va
 /// size — the 4B/35B split here is a coincidence of this staffing, not a
 /// rule."* The only signal honored is which id THIS dispatch actually
 /// declared for which seat.
-pub fn role_for_load(
-    model_id: &str,
-    primary: &str,
-    compactor: Option<&str>,
-    utility: Option<&str>,
-) -> &'static str {
+pub fn role_for_load(model_id: &str, primary: &str, utility: Option<&str>) -> &'static str {
     let bare = crate::dispatch_internal::bare_model_key;
     let key = bare(model_id);
     if key == bare(primary) {
         "primary"
-    } else if compactor.is_some_and(|c| bare(c) == key) {
-        "compactor"
     } else if utility.is_some_and(|u| bare(u) == key) {
         "utility"
     } else {
@@ -509,45 +507,43 @@ mod tests {
     #[test]
     fn role_for_load_tags_the_primary() {
         assert_eq!(
-            role_for_load("qwen3.6-35b-a3b", "qwen3.6-35b-a3b", Some("qwen3-4b"), None),
+            role_for_load("qwen3.6-35b-a3b", "qwen3.6-35b-a3b", Some("qwen3-4b")),
             "primary"
         );
     }
 
     #[test]
-    fn role_for_load_tags_the_compactor_not_a_swap() {
+    fn role_for_load_tags_the_compactor_as_the_utility_seat_not_a_swap() {
         // The exact shape of the live #1934 report: primary is one model,
-        // the DEFAULT_COMPACTOR_MODEL another. The compactor's own load
-        // must never read as "primary".
+        // the compactor another. The compactor's own load must never read
+        // as "primary". (#2914) The compactor IS the utility model, so the
+        // one tag is `utility`.
         assert_eq!(
-            role_for_load("qwen3-4b-instruct-2507", "qwen3.6-35b-a3b-turboquant-mlx", Some("qwen3-4b-instruct-2507"), None),
-            "compactor"
+            role_for_load("qwen3-4b-instruct-2507", "qwen3.6-35b-a3b-turboquant-mlx", Some("qwen3-4b-instruct-2507")),
+            "utility"
         );
     }
 
     #[test]
     fn role_for_load_tags_the_utility_model() {
-        assert_eq!(role_for_load("util-4b", "primary-35b", None, Some("util-4b")), "utility");
+        assert_eq!(role_for_load("util-4b", "primary-35b", Some("util-4b")), "utility");
     }
 
     #[test]
     fn role_for_load_tags_an_unstaffed_resident() {
-        // Not the primary, not the compactor, not the utility model — a
-        // model this dispatch never declared (a leftover from an earlier
-        // session, or the operator's own unrelated LMStudio use).
-        assert_eq!(
-            role_for_load("leftover-from-earlier-session", "primary-35b", Some("compactor-4b"), Some("util-4b")),
-            "resident"
-        );
+        // Not the primary, not the utility model — a model this dispatch
+        // never declared (a leftover from an earlier session, or the
+        // operator's own unrelated LMStudio use).
+        assert_eq!(role_for_load("leftover-from-earlier-session", "primary-35b", Some("util-4b")), "resident");
     }
 
     #[test]
     fn role_for_load_resolves_a_shared_id_to_primary_first() {
-        // An unusual profile that reuses the SAME model id for two seats
-        // still gets one unambiguous answer — primary wins over compactor
-        // and utility, checked in that fixed order, rather than depending
-        // on which branch happens to run first.
-        assert_eq!(role_for_load("shared", "shared", Some("shared"), Some("shared")), "primary");
+        // An unusual staffing that runs the dispatch on the utility model's
+        // own id still gets one unambiguous answer — primary wins over
+        // utility, checked in that fixed order, rather than depending on
+        // which branch happens to run first.
+        assert_eq!(role_for_load("shared", "shared", Some("shared")), "primary");
     }
 
     #[test]
@@ -556,13 +552,13 @@ mod tests {
         // this staffing, not a rule." A model whose NAME looks like a small
         // utility model, but was never declared as one, is still "resident"
         // — the classifier reads the declared ids, never the string shape.
-        assert_eq!(role_for_load("qwen3-4b-lookalike", "primary-35b", None, None), "resident");
+        assert_eq!(role_for_load("qwen3-4b-lookalike", "primary-35b", None), "resident");
     }
 
     // (#1934, review round 2) The NAMESPACE half, one case per seat. `lms ps`
     // reports `modelKey` bare; the ids this dispatch declares can each arrive
     // carrying `darkmux:` — the primary ALWAYS does since #2240 (the wire id
-    // is the darkmux identifier), and the compactor/utility can because
+    // is the darkmux identifier), and the utility model can because
     // `internal.utility` accepts either spelling (#1615). A plain `==` here
     // reproduced #1934 verbatim for those configurations, so each seat gets
     // its own case rather than one combined smoke.
@@ -574,7 +570,7 @@ mod tests {
         // from `lms ps`'s bare `modelKey`. Without normalization this returned
         // "resident" — the run's own primary, unrecognized.
         assert_eq!(
-            role_for_load("qwen3.6-35b-a3b", "darkmux:qwen3.6-35b-a3b", Some("qwen3-4b"), None),
+            role_for_load("qwen3.6-35b-a3b", "darkmux:qwen3.6-35b-a3b", Some("qwen3-4b")),
             "primary"
         );
     }
@@ -582,8 +578,8 @@ mod tests {
     #[test]
     fn role_for_load_matches_a_namespaced_compactor_against_a_bare_lms_key() {
         assert_eq!(
-            role_for_load("qwen3-4b-instruct-2507", "primary-35b", Some("darkmux:qwen3-4b-instruct-2507"), None),
-            "compactor"
+            role_for_load("qwen3-4b-instruct-2507", "primary-35b", Some("darkmux:qwen3-4b-instruct-2507")),
+            "utility"
         );
     }
 
@@ -593,7 +589,7 @@ mod tests {
         // belongs — the regression this crate already documents in
         // `dispatch_internal_tests.rs`, arriving here through a second door.
         assert_eq!(
-            role_for_load("qwen3-4b-instruct-2507", "primary-35b", None, Some("darkmux:qwen3-4b-instruct-2507")),
+            role_for_load("qwen3-4b-instruct-2507", "primary-35b", Some("darkmux:qwen3-4b-instruct-2507")),
             "utility"
         );
     }
@@ -605,7 +601,7 @@ mod tests {
         // declarations that are bare. Normalizing only one side would leave
         // this half broken.
         assert_eq!(
-            role_for_load("darkmux:util-4b", "primary-35b", None, Some("util-4b")),
+            role_for_load("darkmux:util-4b", "primary-35b", Some("util-4b")),
             "utility"
         );
     }

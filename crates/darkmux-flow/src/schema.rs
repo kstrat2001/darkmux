@@ -77,8 +77,34 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.59.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.60.0";
 // Version history:
+//   1.60.0 (#2914, the machine utility model, darkmux 4.0): additive, two
+//           readings.
+//
+//           Utility jobs run LEAN. darkmux's own jobs (radio routing on the
+//           host, `darkmux_crew::utility`; compaction inside the runtime)
+//           emit their `telemetry.tokens` usage record (`purpose:
+//           "utility"`, `handle` = the job: `radio-router` / `compactor`)
+//           and NOTHING else: no `dispatch start`/`dispatch complete`
+//           bookends, no session, no presence beat. A routing record's
+//           `session_id` is ABSENT (a compaction record keeps its parent
+//           execution's, as 1.58.0 says). CLAUDE.md contract 2 (dispatch
+//           liveness) is amended in the same change: bookends are required
+//           for WORK executions; utility jobs are accounted by usage
+//           records, and their visibility is #2915's utility state. A
+//           reader keyed on dispatch bookends (the runs board, the fleet
+//           card's activity, the status line's last dispatch) therefore
+//           lists work only, which is the intent (54 `radio-router` runs a
+//           day were the defect); a reader summing usage records (the fleet
+//           hero) still counts utility, under its own chip.
+//
+//           `telemetry.lms` `role`: ONE utility seat. The tag `"compactor"`
+//           is no longer emitted; a load of the machine's utility model is
+//           `"utility"` whichever job it serves (the seat says WHICH MODEL,
+//           a usage record's `handle` says WHICH JOB). Records from before
+//           carry `"compactor"`; readers treat both as the utility seat (the
+//           viewer already does, `isUtilitySeat`).
 //   1.59.0 (#2902 step 2a, #2914): additive. Every `telemetry.tokens` usage
 //           record gains `purpose`: `"work"` or `"utility"`
 //           (`darkmux_crew::usage::UsagePurpose`), WHOSE job the call was.

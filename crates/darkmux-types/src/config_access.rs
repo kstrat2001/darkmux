@@ -214,7 +214,7 @@ pub(crate) fn env_str(key: &str) -> Option<String> {
 /// from the global) so precedence is unit-tested without the load-once
 /// `CONFIG`. An **empty/whitespace config string is treated as unset** (falls
 /// through), mirroring `env_str` — so a visible-but-blank field like
-/// `"radio": { "router_profile": "" }` the operator hasn't filled in defers
+/// `"radio": { "answerer_profile": "" }` the operator hasn't filled in defers
 /// to the env/built-in tier rather than stamping an empty value.
 fn pick_string(env_key: &str, cfg: Option<&str>, default: Option<&str>) -> Option<String> {
     env_str(env_key)
@@ -1015,19 +1015,14 @@ pub fn remote_concurrent_cap() -> u32 {
     pick_parsed("DARKMUX_REMOTE_CONCURRENT_CAP", cfg, Some(1)).unwrap()
 }
 // ── Radio interpreter (#1698 Packet B2) ──
-/// The ROUTING seat's explicit profile override. Resolves
-/// `env(DARKMUX_RADIO_ROUTER_PROFILE) > config.radio.router_profile >
-/// unset`, the standard tier order. `None` when unset — callers pass that
-/// straight through as `DispatchOpts.profile_name: None`, which preserves
-/// the existing `role_profiles.radio-router` precedence (see
-/// `RadioConfig::router_profile`'s own doc).
-pub fn radio_router_profile() -> Option<String> {
-    pick_string("DARKMUX_RADIO_ROUTER_PROFILE", config().radio.as_ref().and_then(|r| r.router_profile.as_deref()), None)
-}
+// (#2914) `radio_router_profile` / `DARKMUX_RADIO_ROUTER_PROFILE` are gone:
+// the ROUTING seat runs on the machine's utility model (`internal.utility`),
+// never on a profile. `darkmux doctor` names a leftover env var or key.
 /// The ANSWERING seat's explicit profile override. Resolves
 /// `env(DARKMUX_RADIO_ANSWERER_PROFILE) > config.radio.answerer_profile >
-/// unset`. `None` when unset, same pass-through contract as
-/// [`radio_router_profile`].
+/// unset`. `None` when unset — callers pass that straight through as
+/// `DispatchOpts.profile_name: None`, which preserves the ordinary
+/// `role_profiles.radio-host` > `default_profile` precedence.
 pub fn radio_answerer_profile() -> Option<String> {
     pick_string("DARKMUX_RADIO_ANSWERER_PROFILE", config().radio.as_ref().and_then(|r| r.answerer_profile.as_deref()), None)
 }
@@ -2488,7 +2483,7 @@ mod tests {
         assert_eq!(pick_string(k, Some("c"), Some("d")), Some("c".to_string()));
         unsafe { std::env::remove_var(k); }
         // empty/whitespace cfg is treated as unset (falls through) — a
-        // "visible but blank" field (e.g. `"radio": { "router_profile": "" }`)
+        // "visible but blank" field (e.g. `"radio": { "answerer_profile": "" }`)
         // defers to default.
         assert_eq!(pick_string(k, Some("   "), Some("d")), Some("d".to_string()));
         assert_eq!(pick_string(k, Some(""), None), None);

@@ -181,6 +181,38 @@ pub fn usage_payload(facts: &CallFacts<'_>, counts: &UsageCounts) -> serde_json:
     payload
 }
 
+/// (#2914) The flow record for a host-side UTILITY job's usage: the same
+/// `telemetry.tokens` shape every producer writes, minus the session. A
+/// utility job mints no session and writes no bookends (the amended
+/// contract 2), so `session_id` is `None` and `handle` is the JOB's role
+/// id (`radio-router`), the way a compactor call's record is attributed to
+/// `compactor`. Built here, beside the payload writer, so the record and
+/// its payload cannot drift apart.
+pub fn utility_usage_record(job_role_id: &str, model: &str, payload: serde_json::Value) -> darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: darkmux_flow::Level::Info,
+        category: darkmux_flow::Category::Telemetry,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: USAGE_ACTION.to_string(),
+        handle: job_role_id.to_string(),
+        phase_id: None,
+        session_id: None,
+        source: Some(USAGE_SOURCE.to_string()),
+        model: Some(model.to_string()),
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
 /// The `endpoint` fact for a call to LMStudio: the resolved LMStudio base
 /// (`base_override`, else the configured `lmstudio_url`), normalized to its
 /// `/v1` root the same way the chat URL is built. The HOST-side address, so

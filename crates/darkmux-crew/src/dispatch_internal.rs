@@ -3676,8 +3676,10 @@ fn dispatch_remote(
 /// substitution seam #1509 built for `dispatch_as_crew_of_one` — see that
 /// function's own doc: "Every caller ... passes the raw `crew::dispatch::
 /// dispatch` primitive ... the CLI verb passes `dispatch_as_crew_of_one`
-/// ... which runs the SAME primitive wrapped in a ... graph"). `src/
-/// radio.rs::dispatch_router_call` is this function's first caller.
+/// ... which runs the SAME primitive wrapped in a ... graph"). Radio's
+/// ANSWERING seat (`src/radio_answer.rs`) is this function's caller;
+/// (#2914) the ROUTING seat, its first caller, moved to the lean utility
+/// path (`crate::utility::run_utility_single_shot`).
 ///
 /// Mirrors [`dispatch_remote`]'s shape — bookended `dispatch start`/
 /// `dispatch complete`/`dispatch error` flow records (contract 2, dispatch
@@ -3700,8 +3702,8 @@ fn dispatch_remote(
 /// (`role_wants_agentic_remote`) — this primitive has no agent loop and no
 /// container, so a tool-bearing role could never actually use its tools
 /// here; the caller should use the ordinary [`dispatch`] for those.
-/// `radio-router`'s own manifest declares an empty `tool_palette.allow`
-/// (see `src/radio.rs`'s own doc on `dispatch_router_call`), so this
+/// `radio-host`'s own manifest declares an empty `tool_palette.allow`
+/// (see `src/radio_answer.rs`), so this
 /// refusal is not expected to fire for its own caller in practice — it's a
 /// safety rail for any FUTURE caller of this primitive with a tool-bearing
 /// role, not a live code path today.
@@ -3898,9 +3900,11 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
     );
 
     // (#2344) Session-liveness heartbeat — see the hosted path above for the
-    // full reasoning. This is the primitive `darkmux acp`'s radio router and
-    // answering seats run on (`src/radio.rs::dispatch_router_call` via
-    // `darkmux_fleet::routing::dispatch_routed_via`), so before this the
+    // full reasoning. This is the primitive `darkmux acp`'s radio answering
+    // seat runs on (`src/radio_answer.rs` via
+    // `darkmux_fleet::routing::dispatch_routed_via`; #2914 moved the
+    // routing seat to the lean utility path, which beats no presence), so
+    // before this the
     // ONLY interactive local-AI surface darkmux ships was also the one the
     // live fleet view could never show as running.
     let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
@@ -8282,12 +8286,11 @@ fn tier5_eject_on_critical(host_out: &Path, trip_wall: SystemTime, emit: &dyn Fn
 fn tag_lms_role(
     mut payload: serde_json::Value,
     primary: &str,
-    compactor: Option<&str>,
     utility: Option<&str>,
     baseline: bool,
 ) -> serde_json::Value {
     if let Some(model_id) = payload.get("model").and_then(|v| v.as_str()) {
-        let role = crate::telemetry_sampler::role_for_load(model_id, primary, compactor, utility);
+        let role = crate::telemetry_sampler::role_for_load(model_id, primary, utility);
         payload["role"] = serde_json::json!(role);
     }
     if baseline {
@@ -8323,7 +8326,8 @@ struct LmsTelemetryTracker {
     /// This dispatch's own wire model id (namespaced since #2240 —
     /// `role_for_load` normalizes, so it is stored as given).
     primary: String,
-    compactor: Option<String>,
+    /// (#2914) The machine's one utility model: the compactor's wire id when
+    /// this dispatch bound one, else the binding itself.
     utility: Option<String>,
     /// The previous SUCCESSFUL `list_loaded` snapshot. A failed probe leaves
     /// this intact so a transient `lms` hiccup can't emit a flurry of
@@ -8335,8 +8339,8 @@ struct LmsTelemetryTracker {
 }
 
 impl LmsTelemetryTracker {
-    fn new(primary: String, compactor: Option<String>, utility: Option<String>) -> Self {
-        Self { primary, compactor, utility, prev: Vec::new(), seeded: false }
+    fn new(primary: String, utility: Option<String>) -> Self {
+        Self { primary, utility, prev: Vec::new(), seeded: false }
     }
 
     /// One sampler tick. Probes via `list_loaded`, emits one tagged
@@ -8362,13 +8366,7 @@ impl LmsTelemetryTracker {
             crate::telemetry_sampler::lms_diff(prev, &cur)
         };
         for payload in payloads {
-            emit(tag_lms_role(
-                payload,
-                &self.primary,
-                self.compactor.as_deref(),
-                self.utility.as_deref(),
-                baseline,
-            ));
+            emit(tag_lms_role(payload, &self.primary, self.utility.as_deref(), baseline));
         }
         self.prev = cur;
         self.seeded = true;
@@ -8635,7 +8633,9 @@ fn run_telemetry_sampler(
     // (#1934, review round 2) `prev`/`seeded` and the role/baseline tagging
     // all moved into `LmsTelemetryTracker` — see its doc for why the state
     // machine lives behind an injected-effect seam instead of inline here.
-    let mut lms_tracker = LmsTelemetryTracker::new(model.clone(), compactor_model.clone(), utility_model.clone());
+    // (#2914) One utility seat: the compactor IS the utility model, so its
+    // resolved wire id names the seat when bound, the binding otherwise.
+    let mut lms_tracker = LmsTelemetryTracker::new(model.clone(), compactor_model.clone().or_else(|| utility_model.clone()));
     // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
     // last thermal sample — NOT a hardcoded per-tick constant. A tick can
     // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
@@ -10573,9 +10573,12 @@ fn compaction_call_tokens_payload(
 }
 
 /// The role label a compactor call's usage record is attributed to: the
-/// SEAT name `telemetry_sampler::role_for_load` already gives the compactor
-/// on `telemetry.lms` records. No role manifest names the compactor; the
-/// utility model bound to `internal.utility` fills this seat.
+/// JOB, the way a routing call's record is attributed to `radio-router`.
+/// No role manifest names the compactor; the machine's utility model
+/// (`internal.utility`) runs it. (#2914) Distinct from the model-load SEAT
+/// tag on `telemetry.lms` records, which is `utility` for every load of
+/// that model whichever job it serves: the seat says WHICH model, the
+/// handle says WHICH job.
 const COMPACTOR_ROLE: &str = "compactor";
 
 /// (#795, #2902 step 1a) The counts a `model.completed` event reported.
@@ -11755,7 +11758,7 @@ fn resolve_dispatch_model_with_hosts(
 /// the bare-string binding. Since #2914 this is the only source of the
 /// compactor's own window — never a profile's `models[]` entry, which
 /// would make the utility model a work model.
-fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {
+pub(crate) fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {
     let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
     let id = loaded.registry.utility_model_id()?.to_string();
     Some((id, loaded.registry.utility_model_n_ctx()))
@@ -12005,7 +12008,7 @@ fn ensure_context_window(
 /// CONTEXT WINDOW is its required `n_ctx` — a compaction payload is sized to
 /// that window, so the model must be loaded at least that large). Pure; the
 /// wiring's unit-test seam.
-fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::ProfileModel {
+pub(crate) fn utility_residency_pm(util_id: &str, context_window: u32) -> darkmux_types::ProfileModel {
     darkmux_types::ProfileModel {
         id: util_id.to_string(),
         n_ctx: Some(context_window),
@@ -12269,7 +12272,7 @@ pub(crate) fn identifier_already_resident(detail: &str) -> bool {
     detail.contains("identifier") && detail.contains("already exists")
 }
 
-fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
+pub(crate) fn ensure_model_loaded_at_ctx(pm: &darkmux_types::ProfileModel) -> Result<()> {
     use darkmux_profiles::lms;
     ensure_model_resident(
         pm,

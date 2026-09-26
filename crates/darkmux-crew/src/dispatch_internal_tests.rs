@@ -12510,7 +12510,7 @@ fn bare_model_key_strips_only_the_namespace() {
 #[test]
 fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
     let payload = serde_json::json!({"event": "load", "model": "primary-35b", "gb": 20});
-    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), None, true);
+    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), true);
     assert_eq!(tagged["role"], "primary");
     assert_eq!(tagged["baseline"], true);
 }
@@ -12521,8 +12521,8 @@ fn tag_lms_role_stamps_role_and_baseline_on_a_load() {
 #[test]
 fn tag_lms_role_omits_baseline_when_not_the_seed() {
     let payload = serde_json::json!({"event": "load", "model": "compactor-4b", "gb": 2});
-    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), None, false);
-    assert_eq!(tagged["role"], "compactor");
+    let tagged = super::tag_lms_role(payload, "primary-35b", Some("compactor-4b"), false);
+    assert_eq!(tagged["role"], "utility");
     assert!(tagged.get("baseline").is_none(), "baseline must be ABSENT, not `false`: {tagged:?}");
 }
 
@@ -12532,7 +12532,7 @@ fn tag_lms_role_omits_baseline_when_not_the_seed() {
 #[test]
 fn tag_lms_role_tags_an_unload_by_the_same_rule_as_a_load() {
     let payload = serde_json::json!({"event": "unload", "model": "utility-4b"});
-    let tagged = super::tag_lms_role(payload, "primary-35b", None, Some("utility-4b"), false);
+    let tagged = super::tag_lms_role(payload, "primary-35b", Some("utility-4b"), false);
     assert_eq!(tagged["role"], "utility");
 }
 
@@ -12552,17 +12552,12 @@ fn tag_lms_role_tags_an_unload_by_the_same_rule_as_a_load() {
 /// per snapshot in `ticks` and return every payload emitted, in order.
 fn drive_lms_tracker(
     primary: &str,
-    compactor: Option<&str>,
     utility: Option<&str>,
     ticks: Vec<Vec<darkmux_types::LoadedModel>>,
 ) -> Vec<serde_json::Value> {
     use std::cell::RefCell;
     let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
-    let mut tracker = super::LmsTelemetryTracker::new(
-        primary.to_string(),
-        compactor.map(str::to_string),
-        utility.map(str::to_string),
-    );
+    let mut tracker = super::LmsTelemetryTracker::new(primary.to_string(), utility.map(str::to_string));
     for snapshot in ticks {
         let snapshot = RefCell::new(Some(snapshot));
         tracker.tick(
@@ -12590,7 +12585,6 @@ fn lms_tracker_seed_tick_tags_every_resident_as_a_baseline_load() {
     let emitted = drive_lms_tracker(
         "darkmux:primary-35b",
         Some("compactor-4b"),
-        None,
         vec![vec![loaded("primary-35b", "20.00"), loaded("compactor-4b", "2.00")]],
     );
     assert_eq!(emitted.len(), 2, "one payload per resident model: {emitted:?}");
@@ -12599,7 +12593,7 @@ fn lms_tracker_seed_tick_tags_every_resident_as_a_baseline_load() {
     // primary against `lms ps`'s bare `modelKey`.
     assert_eq!(by_model("primary-35b")["role"], "primary");
     assert_eq!(by_model("primary-35b")["baseline"], true);
-    assert_eq!(by_model("compactor-4b")["role"], "compactor");
+    assert_eq!(by_model("compactor-4b")["role"], "utility");
     assert_eq!(by_model("compactor-4b")["baseline"], true);
 }
 
@@ -12611,7 +12605,6 @@ fn lms_tracker_seed_tick_tags_every_resident_as_a_baseline_load() {
 fn lms_tracker_later_loads_are_not_baseline() {
     let emitted = drive_lms_tracker(
         "primary-35b",
-        None,
         None,
         vec![
             vec![loaded("primary-35b", "20.00")],
@@ -12637,7 +12630,6 @@ fn lms_tracker_tags_an_unload_with_its_seat() {
     let emitted = drive_lms_tracker(
         "primary-35b",
         Some("compactor-4b"),
-        None,
         vec![
             vec![loaded("primary-35b", "20.00"), loaded("compactor-4b", "2.00")],
             vec![loaded("primary-35b", "20.00")],
@@ -12646,7 +12638,7 @@ fn lms_tracker_tags_an_unload_with_its_seat() {
     assert_eq!(emitted.len(), 3, "two seed loads + one unload: {emitted:?}");
     let unload = emitted.iter().find(|p| p["event"] == "unload").unwrap_or_else(|| panic!("no unload: {emitted:?}"));
     assert_eq!(unload["model"], "compactor-4b");
-    assert_eq!(unload["role"], "compactor");
+    assert_eq!(unload["role"], "utility");
     assert!(unload.get("baseline").is_none(), "an unload is never the baseline: {unload:?}");
 }
 
@@ -12658,7 +12650,7 @@ fn lms_tracker_tags_an_unload_with_its_seat() {
 fn lms_tracker_skips_a_failed_probe_without_consuming_the_seed() {
     use std::cell::RefCell;
     let emitted: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
-    let mut tracker = super::LmsTelemetryTracker::new("primary-35b".to_string(), None, None);
+    let mut tracker = super::LmsTelemetryTracker::new("primary-35b".to_string(), None);
     tracker.tick(&|| anyhow::bail!("lms ps timed out"), &|p| emitted.borrow_mut().push(p));
     assert!(emitted.borrow().is_empty(), "a failed probe emits nothing: {:?}", emitted.borrow());
     let snapshot = RefCell::new(Some(vec![loaded("primary-35b", "20.00")]));

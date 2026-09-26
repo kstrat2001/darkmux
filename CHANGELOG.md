@@ -12,6 +12,53 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [Unreleased]
+
+### Removed (breaking, 4.0)
+
+- **`radio.router_profile`, `DARKMUX_RADIO_ROUTER_PROFILE`, and the
+  `role_profiles.radio-router` binding** (#2914). The radio routing seat
+  now runs on the machine's one utility model (below), so there is no
+  profile to bind it to. Removed outright, no deprecation release, no
+  compatibility read: `darkmux config set radio.router_profile` rejects the
+  key, `config set role_profiles.radio-router` is refused with the fix, and
+  `darkmux doctor` names whichever of the three is still set. CONFIG 1.28.
+  **Migration:** delete `radio.router_profile` from `config.json` (and the
+  `radio-router` entry from `role_profiles`, and the env var from your
+  shell); a profile that existed only for the router (a 16K `radio`
+  profile, typically) can be deleted. `radio.answerer_profile` and
+  `role_profiles.radio-host` stay: answering the user is work.
+- **The compactor's window is no longer read from a profile's `models[]`**
+  (#2914). It comes from `internal.utility` alone (below). A profile entry
+  for the utility model is inert: `darkmux doctor` names each such profile
+  with the window it declared and the binding to move it into.
+
+### Changed (breaking, 4.0)
+
+- **One machine utility model, declared once with its window, never a
+  task's model** (#2914; finishes #590, supersedes the open parts of #70).
+  `internal.utility` in `profiles.json` now also accepts
+  `{ "id": "<model>", "n_ctx": <window> }` (a bare id still reads);
+  `darkmux init` ships the object form. That binding is where compaction
+  and radio routing run, and it is set aside by every task/step selection
+  path: a profile that still lists it puts work on its other model, a
+  profile that lists only it is a loud error naming the fix, and
+  `darkmux mission launch` refuses, before minting anything, a task whose
+  staffing (or a `dispatch.single_shot`/`dispatch.map` step's `config.model`)
+  resolves to it. Profiles hold work models only. The lab keeps benchmarking
+  a candidate utility model through a profile that lists it. PROFILES
+  schema 2.0 (an older binary cannot read the object form).
+- **Utility jobs run lean** (#2914). Compaction and radio routing emit their
+  `telemetry.tokens` usage record (`purpose: utility`) and nothing else: no
+  session, no `dispatch start`/`complete` bookends, no run. The runs board
+  lists work only (it listed dozens of `radio-router` runs a day); the fleet
+  total still counts utility under its own chip. CLAUDE.md contract 2
+  (dispatch liveness) is amended to cover work executions; a busy utility
+  instance makes a routing call wait behind a compaction, by decision, and
+  #2915 will show why. One model-load seat tag, `utility`, replaces the
+  `compactor`/`utility` pair on `telemetry.lms` records. FLOW schema
+  1.60.0.
+
 ## [3.13.0] - 2026-09-25
 
 ### Added

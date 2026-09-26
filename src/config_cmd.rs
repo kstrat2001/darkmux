@@ -207,7 +207,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (#1230 Packet 5) `mission status`'s stale-active drift threshold.
     ("mission.stale_active_days", Ty::Uint),
     // (#1698 Packet B2) The radio interpreter's staffing + persona knobs.
-    ("radio.router_profile", Ty::Str),
+    // (#2914) `radio.router_profile` is gone: the routing seat runs on the
+    // machine's utility model, never on a profile.
     ("radio.answerer_profile", Ty::Str),
     ("radio.humor", Ty::Uint),
     ("dirs.flows", Ty::Str),
@@ -315,6 +316,17 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
         bail!(
             "`{key}` is a secret and never lives in config.json — store it in the macOS Keychain:\n  \
              security add-generic-password -U -a \"$USER\" -s {item} -w <value>"
+        );
+    }
+    // (#2914) The one role id the dynamic map refuses: radio routing runs on
+    // the machine's utility model (`internal.utility`), not on a profile, so
+    // a binding for it could never be honored and would only look like one.
+    if key == "role_profiles.radio-router" {
+        bail!(
+            "`role_profiles.radio-router` has no effect: radio routing runs on the machine's \
+             utility model, declared once as `internal.utility` in ~/.darkmux/profiles.json, \
+             never on a profile. Set that binding instead (`darkmux doctor` shows it). The \
+             answering seat is still a profile binding: `role_profiles.radio-host`. (#2914)"
         );
     }
     let Some(ty) = key_type(key) else {
@@ -816,6 +828,23 @@ mod tests {
     /// retired along with the funnel, #2310 P4d, and re-using retired
     /// vocabulary as a "real role" example would just be the same trap
     /// again).
+    /// (#2914) Radio routing runs on the machine's utility model, not on a
+    /// profile: `radio.router_profile` is no longer a key, and
+    /// `role_profiles.radio-router` is refused (the one role id the dynamic
+    /// map does not accept), each with the fix named.
+    #[test]
+    fn radio_router_staffing_keys_are_refused_with_the_fix() {
+        let f = tmp();
+        let p = f.path();
+        let err = set_at(p, "radio.router_profile", "radio").unwrap_err().to_string();
+        assert!(err.contains("unknown config key"), "{err}");
+        let err = set_at(p, "role_profiles.radio-router", "radio").unwrap_err().to_string();
+        assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
+        // The answering seat is still ordinary work, still a profile binding.
+        set_at(p, "role_profiles.radio-host", "deep").unwrap();
+        set_at(p, "radio.answerer_profile", "deep").unwrap();
+    }
+
     #[test]
     fn role_profiles_dynamic_key_round_trips() {
         let f = tmp();
