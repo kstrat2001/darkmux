@@ -1839,6 +1839,12 @@ describe("(#2921) machine route chrome names a uid-only machine", () => {
     // Rewritten in place: the title still names the same machine.
     expect(document.getElementById("logscope")?.textContent).toBe("unnamed machine");
   });
+  it("(#2929 C3) a machine key naming no machine titles the route 'machine not found'", async () => {
+    mount([]);
+    window.location.hash = "#lens=machine&machine=no-such-machine";
+    await waitFor(() => expect(document.getElementById("logscope")?.textContent).toBe("machine not found"));
+    expect(document.body.textContent).not.toMatch(/unnamed machine/);
+  });
   it("(#2929) an old #lens=runs&machine=<uid> link is rewritten to the key through the app's own routing", async () => {
     mount([{ id: "studio", address: "a:1", added_unix_ms: 1, machine_uid: FAKE_UID }]);
     window.location.hash = `#lens=runs&machine=${FAKE_UID}`;
