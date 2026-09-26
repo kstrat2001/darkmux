@@ -2598,7 +2598,12 @@ not json — tolerated
     #[test]
     fn the_reported_role_is_the_dispatched_role() {
         for (extras, want) in [(serde_json::json!({ "chainDepths": [2] }), "tool-bench"), (serde_json::json!({ "chainDepths": [2], "role": "coder" }), "coder")] {
-            let loaded = loaded_workload(extras);
+            let mut loaded = loaded_workload(extras);
+            if want == "tool-bench" {
+                // The helper's manifest names `tool-bench`; clear it so the
+                // provider's OWN default is what is reported and dispatched.
+                loaded.manifest.workload.role = None;
+            }
             let reported = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result())).dispatch_role(&loaded);
             assert_eq!(reported.as_deref(), Some(want));
             let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

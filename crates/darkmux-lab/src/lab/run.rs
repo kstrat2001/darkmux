@@ -661,6 +661,57 @@ fn run_profile_name(
 
 #[cfg(test)]
 mod tests {
+    /// (#2902 re-review C3) `lab run` picks the profile for the role the
+    /// PROVIDER reports it dispatches, not the manifest role or
+    /// `runtime.default_role` guessed on its behalf.
+    #[test]
+    fn the_run_role_is_the_providers_dispatch_role() {
+        use crate::workloads::types::{InspectionReport, LoadedWorkload, RunResult, WorkloadProvider};
+        struct RoleStub2902;
+        impl WorkloadProvider for RoleStub2902 {
+            fn id(&self) -> &'static str {
+                "stub-2902-role"
+            }
+            fn description(&self) -> &'static str {
+                "stub for #2902's run-role proof"
+            }
+            fn setup(&self, _: &LoadedWorkload, _: &std::path::Path, _: &std::path::Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn dispatch_role(&self, _: &LoadedWorkload) -> Option<String> {
+                Some("provider-role".to_string())
+            }
+            fn run(
+                &self,
+                _: &LoadedWorkload,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: &darkmux_types::Profile,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&crate::lab::loop_report::LoopCompactionOverride>,
+                _: &mut dyn FnMut(&str),
+            ) -> anyhow::Result<RunResult> {
+                unreachable!("never run")
+            }
+            fn inspect(&self, _: &LoadedWorkload, _: &std::path::Path) -> anyhow::Result<InspectionReport> {
+                Ok(InspectionReport::default())
+            }
+        }
+        let _ = crate::workloads::registry::register(Box::new(RoleStub2902));
+        let manifest: crate::workloads::types::WorkloadManifest = serde_json::from_str(
+            r#"{"workload":{"id":"w","provider":"stub-2902-role","role":"manifest-role","prompt":"hi"}}"#,
+        )
+        .unwrap();
+        let loaded = LoadedWorkload {
+            manifest,
+            manifest_path: std::path::PathBuf::new(),
+            base_dir: std::path::PathBuf::new(),
+            source: crate::workloads::types::WorkloadSource::Embedded,
+        };
+        assert_eq!(super::workload_role(&loaded).as_deref(), Some("provider-role"));
+    }
+
     /// (#2902) A lab run with no `--profile` is stamped (and run) on the
     /// profile its role is bound to, like `darkmux dispatch <role>`; an
     /// explicit `--profile` still wins; unbound falls to `default_profile`;
