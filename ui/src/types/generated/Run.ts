@@ -123,4 +123,16 @@ session_id?: string,
  * server already computes (`terminal_was_abort` / `MissionStatus::Aborted`)
  * instead of dropping it on the wire. Absent for every other status.
  */
-abandoned_reason?: AbandonReason, };
+abandoned_reason?: AbandonReason, 
+/**
+ * (#2902 step 2b) ALL tokens of this run: the plain sum of every usage
+ * record (`telemetry.tokens`) carrying its `mission_id` or one of its
+ * sessions, utility calls included, through `crate::usage_sum` — the
+ * same fold `darkmux run list`'s TOKENS column and `--usage` read, and
+ * the same rule the viewer's `sumUsage` applies (the legacy fallback
+ * for a run with no usage record included). Absent when nothing was
+ * measured: no record matched, or none reported a count. It is never
+ * `0` for "unknown". Bounded by the same scan window as everything
+ * else on the row.
+ */
+tokens?: number, };

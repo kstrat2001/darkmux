@@ -5018,6 +5018,7 @@ mod tests {
             tracked: false,
             session_id: None,
             abandoned_reason: None,
+            tokens: None,
         };
         let payload = board_json(&[], std::slice::from_ref(&peer_run), &SourceState::Ok);
         assert_eq!(payload["peer_missions"][0]["id"], "review-peer-3");

@@ -90,7 +90,16 @@ describe("resolveOpts", () => {
     expect(resolved).toEqual([
       { name: "kind", value: "all", argv: [], isDefault: true },
       { name: "all", value: "recent", argv: [], isDefault: true },
+      // (#2902) The usage toggle, off by default.
+      { name: "usage", value: "off", argv: [], isDefault: true },
     ]);
+  });
+
+  it("(#2902) the usage toggle contributes --usage last, after --kind and --all", () => {
+    expect(composeArgv("run-list", { usage: "on" })).toEqual(["run", "list", "--usage"]);
+    expect(composeArgv("run-list", { usage: "on", all: "all", kind: "lab" })).toEqual(["run", "list", "--kind", "lab", "--all", "--usage"]);
+    expect(variantKey("run-list", { usage: "on" })).toBe("run-list?usage=on");
+    expect(variantKey("run-list", { usage: "off" })).toBe("run-list");
   });
 
   it("picks the named value", () => {
@@ -105,7 +114,7 @@ describe("resolveOpts", () => {
 
   it("an unknown option name is ignored entirely", () => {
     const resolved = resolveOpts("run-list", { machine: "studio" });
-    expect(resolved.map((r) => r.name)).toEqual(["kind", "all"]);
+    expect(resolved.map((r) => r.name)).toEqual(["kind", "all", "usage"]);
   });
 
   it("a panel with no declared opts resolves to an empty list regardless of what's requested", () => {

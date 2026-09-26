@@ -347,6 +347,18 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub abandoned_reason: Option<AbandonReason>,
+    /// (#2902 step 2b) ALL tokens of this run: the plain sum of every usage
+    /// record (`telemetry.tokens`) carrying its `mission_id` or one of its
+    /// sessions, utility calls included, through `crate::usage_sum` — the
+    /// same fold `darkmux run list`'s TOKENS column and `--usage` read, and
+    /// the same rule the viewer's `sumUsage` applies (the legacy fallback
+    /// for a run with no usage record included). Absent when nothing was
+    /// measured: no record matched, or none reported a count. It is never
+    /// `0` for "unknown". Bounded by the same scan window as everything
+    /// else on the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "number"))]
+    pub tokens: Option<u64>,
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -357,18 +369,63 @@ pub struct Run {
 /// missing/malformed source: `load_missions`/`load_phases` degrade to empty
 /// via `unwrap_or_default` (matching `missions_handler`'s own posture), and
 /// `crate::scan_lab_runs` is already resilient (best-effort scan, #1247).
+/// (#2902 step 2b) The run union plus the usage breakdown over the same
+/// window — see [`build_runs_with_usage`].
+pub struct RunsWithUsage {
+    pub runs: Vec<Run>,
+    pub usage: crate::usage_sum::UsageBreakdown,
+    /// The inclusive bound the usage fold covered, in the flow schema's
+    /// own `ts` spelling: the caller's `since`, else the default window's
+    /// first day at midnight UTC.
+    pub since: String,
+    /// True when no `since` was given and the bound is the default window.
+    pub default_window: bool,
+}
+
+/// (#2902 step 2b) [`build_runs`] plus the token breakdown `darkmux run
+/// list --usage` prints, both from ONE scan: the usage fold rides the same
+/// record pass the session index makes (`build_flow_session_index_in`), so
+/// a row's `tokens` and the breakdown are two readings of one record set.
+/// `since_secs` (`--since`, a Unix epoch second) bounds the fold to records
+/// stamped at or after it and widens the day-file walk when it reaches
+/// past [`RUNS_FLOW_SCAN_WINDOW_DAYS`]; `None` is the default window.
+pub fn build_runs_with_usage(
+    flows_dir: &StdPath,
+    lab_dir: Option<&StdPath>,
+    fleet: &[serde_json::Value],
+    since_secs: Option<u64>,
+) -> RunsWithUsage {
+    let window = match since_secs {
+        Some(secs) => ScanWindow::since(secs),
+        None => ScanWindow::default_window(),
+    };
+    build_runs_in(flows_dir, lab_dir, fleet, &window)
+}
+
 pub fn build_runs(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
     fleet: &[serde_json::Value],
 ) -> Vec<Run> {
-    let flow_index = build_flow_session_index(flows_dir, fleet);
+    build_runs_in(flows_dir, lab_dir, fleet, &ScanWindow::default_window()).runs
+}
+
+fn build_runs_in(
+    flows_dir: &StdPath,
+    lab_dir: Option<&StdPath>,
+    fleet: &[serde_json::Value],
+    window: &ScanWindow,
+) -> RunsWithUsage {
+    // (#2902 step 2b) The usage fold shares the session index's one pass.
+    let mut usage_fold = crate::usage_sum::UsageFold::new(window.since_iso.clone());
+    let flow_index = build_flow_session_index_in(flows_dir, fleet, window, Some(&mut usage_fold));
+    let usage = usage_fold.finish();
     // (#1705) Mission-level rollup over the SAME merged record set. A
     // mission owned by another machine has no durable record here — its
     // `Mission` JSON lives on the machine that ran it — so without this it
     // could only ever appear as a scatter of per-session ghosts. One
     // review = one row, wherever it ran.
-    let flow_missions = build_flow_mission_index(flows_dir, fleet);
+    let flow_missions = build_flow_mission_index_in(flows_dir, fleet, window);
     // (#1523 gate CONSIDER 2) Pre-group flow sessions by `mission_id` ONCE
     // — an O(sessions) pass — rather than filtering the whole `flow_index`
     // per mission (O(missions × sessions), the shape a Studio-scale flow
@@ -411,7 +468,7 @@ pub fn build_runs(
         // mission_id gap crew-of-one dispatches do (see module doc, gap 2).
         let step_sessions = collect_mission_step_sessions(mission);
         known_session_ids.extend(step_sessions.iter().cloned());
-        let run = mission_to_run(
+        let mut run = mission_to_run(
             mission,
             kind,
             shape.as_ref(),
@@ -420,6 +477,9 @@ pub fn build_runs(
             &flow_index,
             now_ms,
         );
+        // (#2902 step 2b) Its records carry its `mission_id`, or (the
+        // scheduler's own shape) only one of its step sessions.
+        run.tokens = usage.tokens_for(Some(&mission.id), step_sessions.iter().map(String::as_str));
         runs.push(run);
     }
 
@@ -452,26 +512,42 @@ pub fn build_runs(
                 .as_deref()
                 .and_then(|sid| flow_index.get(sid))
                 .map(|agg| session_is_live(agg, now_ms));
-            runs.push(lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live));
+            let mut run = lab_summary_to_run(&summary, lab_machine.clone(), now_ms, session_live);
+            run.tokens = summary.session_id.as_deref().and_then(|sid| usage.tokens_for_session(sid));
+            runs.push(run);
         }
     }
 
     // (#1705) Missions seen only in the record stream — i.e. executing on a
     // peer. Emitted BEFORE ghosts so their sessions are claimed and don't
     // also surface as loose dispatch rows.
-    let (peer_runs, remote_mission_ids) =
+    let (mut peer_runs, remote_mission_ids) =
         peer_runs_from_index(&flow_missions, &known_mission_ids, &flow_index, now_ms);
+    for run in &mut peer_runs {
+        let sessions = flow_missions.get(&run.id).map(|a| a.session_ids.as_slice()).unwrap_or(&[]);
+        run.tokens = usage.tokens_for(Some(&run.id), sessions.iter().map(String::as_str));
+    }
     runs.extend(peer_runs);
 
-    runs.extend(ghost_runs(
+    let mut ghosts = ghost_runs(
         &flow_index,
         &known_mission_ids,
         &known_session_ids,
         &remote_mission_ids,
         now_ms,
-    ));
+    );
+    // A ghost's `id` IS its session id (see `ghost_runs`).
+    for run in &mut ghosts {
+        run.tokens = usage.tokens_for_session(&run.id);
+    }
+    runs.extend(ghosts);
 
-    runs
+    RunsWithUsage {
+        runs,
+        usage: usage.breakdown,
+        since: window.since_label(),
+        default_window: window.since_iso.is_none(),
+    }
 }
 
 /// (#1711) Every `flow_missions` entry NOT in `known_mission_ids` — i.e. a
@@ -625,6 +701,17 @@ fn build_flow_mission_index(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
 ) -> HashMap<String, FlowMissionAgg> {
+    build_flow_mission_index_in(flows_dir, fleet, &ScanWindow::default_window())
+}
+
+/// [`build_flow_mission_index`] over an explicit [`ScanWindow`] (#2902
+/// step 2b) — the same window the session index and the usage fold use,
+/// so a `--since` that widens one widens all three.
+fn build_flow_mission_index_in(
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+    window: &ScanWindow,
+) -> HashMap<String, FlowMissionAgg> {
     let mut idx: HashMap<String, FlowMissionAgg> = HashMap::new();
     // (#1707 gate MUST FIX 2) The fleet half obeys the SAME
     // `RUNS_FLOW_SCAN_WINDOW_DAYS` bound the local walk does. Without this
@@ -634,17 +721,7 @@ fn build_flow_mission_index(
     // which would resurface dead missions and un-terminated sessions as
     // Abandoned rows that never age out. This bites the single-machine
     // redis-enabled operator too, not just a fleet.
-    let fleet_cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
-    let within_window = |v: &serde_json::Value| -> bool {
-        match v.get("ts").and_then(|t| t.as_str()) {
-            // Lexical compare on the `YYYY-MM-DD` prefix — the same trick
-            // `for_each_recent_flow_record` uses on day-file names.
-            Some(ts) if ts.len() >= 10 => ts[..10] >= fleet_cutoff[..],
-            // No parseable ts: keep it. Dropping an unattributable record
-            // would silently narrow the view, which is this issue's own bug.
-            _ => true,
-        }
-    };
+    let within_window = |v: &serde_json::Value| -> bool { window.holds(v) };
 
     let fleet_seen: std::collections::HashSet<String> =
         fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
@@ -693,7 +770,7 @@ fn build_flow_mission_index(
     for v in fleet.iter().filter(|v| within_window(v)) {
         fold(&mut idx, v);
     }
-    for_each_recent_flow_record(flows_dir, |v| {
+    for_each_flow_record_from(flows_dir, &window.cutoff_date, |v| {
         if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
             return std::ops::ControlFlow::Continue(());
         }
@@ -791,6 +868,7 @@ fn flow_mission_to_run(
         tracked: false,
         session_id,
         abandoned_reason,
+        tokens: None,
     }
 }
 
@@ -1282,6 +1360,7 @@ fn mission_to_run(
         tracked: true,
         session_id,
         abandoned_reason,
+        tokens: None,
     }
 }
 
@@ -1823,6 +1902,7 @@ fn lab_summary_to_run(
         // scores page; every other lab run opens the shared session view.
         session_id: if summary.finished { None } else { summary.session_id.clone() },
         abandoned_reason,
+        tokens: None,
     }
 }
 
@@ -2072,6 +2152,54 @@ fn lab_staffing_role_model_route(
 /// "cadence is a recorded knob" observability doctrine.
 const RUNS_FLOW_SCAN_WINDOW_DAYS: i64 = 14;
 
+/// (#2902 step 2b) The window one `/runs`-shaped scan covers. The default
+/// is [`RUNS_FLOW_SCAN_WINDOW_DAYS`], the bound every reader of this
+/// module has always had; `darkmux run list --since` widens it when the
+/// operator asks for a bound older than that (a request for 30 days must
+/// not be silently capped at 14) and narrows the USAGE fold to the exact
+/// second either way. The day-file cutoff is the WIDER of the two, so the
+/// runs union itself never shrinks below its documented window.
+#[derive(Debug, Clone)]
+pub(crate) struct ScanWindow {
+    /// `YYYY-MM-DD`: day files dated before this are not opened, and fleet
+    /// records stamped before it are skipped.
+    cutoff_date: String,
+    /// The usage fold's inclusive bound, in the flow schema's own `ts`
+    /// spelling, when the caller gave one.
+    since_iso: Option<String>,
+}
+
+impl ScanWindow {
+    pub(crate) fn default_window() -> Self {
+        Self { cutoff_date: cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS), since_iso: None }
+    }
+
+    /// The default window, widened to reach `since_secs` (a Unix epoch
+    /// second) when that is older than the default cutoff.
+    pub(crate) fn since(since_secs: u64) -> Self {
+        let since_iso = crate::usage_sum::iso_from_epoch(since_secs);
+        let default_cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
+        let since_day = since_iso[..10].to_string();
+        Self { cutoff_date: since_day.min(default_cutoff), since_iso: Some(since_iso) }
+    }
+
+    /// Lexical compare on the `YYYY-MM-DD` prefix of a record `ts` — the
+    /// same trick the day-file walk uses on file names. No parseable ts:
+    /// keep it; dropping an unattributable record would silently narrow
+    /// the view (#1707 gate MUST FIX 2).
+    /// The bound this window's usage fold covers, as an inclusive `ts`.
+    fn since_label(&self) -> String {
+        self.since_iso.clone().unwrap_or_else(|| format!("{}T00:00:00Z", self.cutoff_date))
+    }
+
+    fn holds(&self, v: &serde_json::Value) -> bool {
+        match v.get("ts").and_then(|t| t.as_str()) {
+            Some(ts) if ts.len() >= 10 => ts[..10] >= self.cutoff_date[..],
+            _ => true,
+        }
+    }
+}
+
 /// Per-session_id rollup built by ONE pass over the flow stream
 /// ([`build_flow_session_index`]) — the shared substrate both the
 /// tracked-run route/role/model resolution (above) and the untracked-ghost
@@ -2165,6 +2293,20 @@ fn build_flow_session_index(
     flows_dir: &StdPath,
     fleet: &[serde_json::Value],
 ) -> HashMap<String, SessionAgg> {
+    build_flow_session_index_in(flows_dir, fleet, &ScanWindow::default_window(), None)
+}
+
+/// [`build_flow_session_index`] over an explicit [`ScanWindow`], optionally
+/// feeding every record the SAME pass visits (fleet first, then the local
+/// day files minus what the fleet already supplied) to a usage fold
+/// (#2902 step 2b) — one walk, not a second one, is what keeps `/runs`'s
+/// cost flat and the two answers over one record set.
+fn build_flow_session_index_in(
+    flows_dir: &StdPath,
+    fleet: &[serde_json::Value],
+    window: &ScanWindow,
+    mut usage: Option<&mut crate::usage_sum::UsageFold>,
+) -> HashMap<String, SessionAgg> {
     let mut idx: HashMap<String, SessionAgg> = HashMap::new();
 
     // (#1705) Fleet first, then the local day-files minus anything the
@@ -2179,17 +2321,7 @@ fn build_flow_session_index(
     // which would resurface dead missions and un-terminated sessions as
     // Abandoned rows that never age out. This bites the single-machine
     // redis-enabled operator too, not just a fleet.
-    let fleet_cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
-    let within_window = |v: &serde_json::Value| -> bool {
-        match v.get("ts").and_then(|t| t.as_str()) {
-            // Lexical compare on the `YYYY-MM-DD` prefix — the same trick
-            // `for_each_recent_flow_record` uses on day-file names.
-            Some(ts) if ts.len() >= 10 => ts[..10] >= fleet_cutoff[..],
-            // No parseable ts: keep it. Dropping an unattributable record
-            // would silently narrow the view, which is this issue's own bug.
-            _ => true,
-        }
-    };
+    let within_window = |v: &serde_json::Value| -> bool { window.holds(v) };
 
     let fleet_seen: std::collections::HashSet<String> =
         fleet.iter().filter(|v| within_window(v)).map(crate::flow_record_identity).collect();
@@ -2302,12 +2434,18 @@ fn build_flow_session_index(
 
     for v in fleet.iter().filter(|v| within_window(v)) {
         fold(&mut idx, v);
+        if let Some(u) = usage.as_deref_mut() {
+            u.add(v);
+        }
     }
-    for_each_recent_flow_record(flows_dir, |v| {
+    for_each_flow_record_from(flows_dir, &window.cutoff_date, |v| {
         if !fleet_seen.is_empty() && fleet_seen.contains(&crate::flow_record_identity(v)) {
             return std::ops::ControlFlow::Continue(());
         }
         fold(&mut idx, v);
+        if let Some(u) = usage.as_deref_mut() {
+            u.add(v);
+        }
         std::ops::ControlFlow::Continue(())
     });
     idx
@@ -2468,6 +2606,7 @@ fn ghost_runs(
             // silence.
             session_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
             abandoned_reason,
+            tokens: None,
         });
     }
     out
@@ -2476,22 +2615,24 @@ fn ghost_runs(
 // ─── Bounded day-file scan (#1523 gate scale-cap) ──────────────────────────
 
 /// Like `crate::for_each_flow_record_across_days`, but bounded to day files
-/// whose date is within [`RUNS_FLOW_SCAN_WINDOW_DAYS`] of now. A SEPARATE,
+/// dated at or after `cutoff` (`YYYY-MM-DD`) — a [`ScanWindow`]'s, which is
+/// [`RUNS_FLOW_SCAN_WINDOW_DAYS`] before now unless `--since` pushed it
+/// earlier (#2902 step 2b). A SEPARATE,
 /// smaller day-file walk rather than extending the shared primitive —
 /// that primitive's OTHER callers (`/flow-mission/:id`, `/flow-session/:id`,
 /// the full-history catalog endpoints) must keep seeing a run's COMPLETE
 /// history; bounding is specific to THIS module's route-resolution/
 /// ghost-synthesis use, not a general flow-reading behavior change that
 /// would ripple into those unrelated endpoints.
-fn for_each_recent_flow_record(
+fn for_each_flow_record_from(
     flows_dir: &StdPath,
+    cutoff: &str,
     mut visit: impl FnMut(&serde_json::Value) -> std::ops::ControlFlow<()>,
 ) {
     use std::io::BufRead;
     let Ok(entries) = std::fs::read_dir(flows_dir) else {
         return;
     };
-    let cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
     let mut day_files: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -2505,7 +2646,7 @@ fn for_each_recent_flow_record(
         // name that happens to compare >= cutoff just gets read (harmless,
         // same as any other unreadable/malformed file below) while one
         // that doesn't compare is skipped either way.
-        if date.len() != 10 || date < cutoff.as_str() {
+        if date.len() != 10 || date < cutoff {
             continue;
         }
         day_files.push(entry.path());
@@ -2535,7 +2676,7 @@ fn for_each_recent_flow_record(
 }
 
 /// `YYYY-MM-DD` for `window_days` before today (UTC) — the day-file-name
-/// cutoff [`for_each_recent_flow_record`] filters on.
+/// cutoff [`for_each_flow_record_from`] filters on.
 fn cutoff_date_string(window_days: i64) -> String {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2603,7 +2744,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// [`cutoff_date_string`] to format the scan-window boundary as a
 /// `YYYY-MM-DD` day-file-name prefix, and by [`day_string_from_epoch_ms`]
 /// below for the same purpose from an arbitrary record timestamp.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
     let doe = z - era * 146_097; // [0, 146096]
@@ -5232,7 +5373,7 @@ mod tests {
     /// None` even though the mission record and the (still-on-disk, just
     /// out-of-window) day-file both had the fact.
     ///
-    /// The day-file here is dated 2020-01-01 — `for_each_recent_flow_record`
+    /// The day-file here is dated 2020-01-01 — `for_each_flow_record_from`
     /// bounds its walk to day-FILE NAMES within the window, so this file is
     /// never even opened, which is exactly the "still on disk, unreachable"
     /// shape the issue measured (a real 2026-06-12 day-file, 84 days old,
@@ -6861,6 +7002,150 @@ mod tests {
             .expect("ghost run present");
         assert!(!ghost.tracked);
         assert_eq!(ghost.status, RunStatus::Running);
+    }
+
+    // ── #2902 step 2b: every row carries its usage-record token sum ──────
+
+    fn usage_record(ts: &str, session_id: &str, mission_id: Option<&str>, payload: serde_json::Value) -> serde_json::Value {
+        let mut r = serde_json::json!({
+            "ts": ts,
+            "action": "telemetry.tokens",
+            "category": "telemetry",
+            "source": "tokens",
+            "session_id": session_id,
+            "payload": payload,
+        });
+        if let Some(m) = mission_id {
+            r["mission_id"] = serde_json::json!(m);
+        }
+        r
+    }
+
+    /// (#2902 step 2b) A tracked mission, a ghost dispatch and a fleet-only
+    /// peer mission each read `tokens` from ONE fold: the plain sum of the
+    /// usage records carrying the row's `mission_id` or one of its
+    /// sessions, utility calls included. A row whose only record reported
+    /// no count stays absent, never `0`.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_rows_carry_their_usage_record_token_sums() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mission = minimal_mission(
+            "dispatch-coder-2",
+            vec!["p-2".to_string()],
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp2".to_string(), origin: None }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-2", "dispatch-coder-2", vec!["t-2".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-2", "p-2", vec!["s-2".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("dispatch-coder-2", &task).unwrap();
+        let step = minimal_step("s-2", "t-2", Some("crew-dispatch-coder-known"));
+        darkmux_crew::lifecycle::save_step("dispatch-coder-2", "p-2", &step).unwrap();
+
+        let now = darkmux_flow::ts_utc_now();
+        let provider = |kind: &str, total: u64| {
+            serde_json::json!({ "call_kind": kind, "token_source": "provider", "total_tokens": total, "prompt_tokens": total - 10, "completion_tokens": 10 })
+        };
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // The tracked mission's step session: records carry the
+                // session only (the scheduler's own shape), no mission_id.
+                serde_json::json!({ "ts": "2026-07-24T09:00:00Z", "action": "dispatch start", "session_id": "crew-dispatch-coder-known" }),
+                usage_record("2026-07-24T09:01:00Z", "crew-dispatch-coder-known", None, provider("turn", 120)),
+                usage_record("2026-07-24T09:02:00Z", "crew-dispatch-coder-known", None, provider("turn", 180)),
+                // Its complete must NOT be read: the run has usage records.
+                serde_json::json!({ "ts": "2026-07-24T09:03:00Z", "action": "dispatch complete", "session_id": "crew-dispatch-coder-known", "payload": { "total_tokens": 999 } }),
+                // A ghost with a work turn and a compactor sub-execution.
+                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "crew-dispatch-reviewer-orphan", "handle": "reviewer" }),
+                usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("turn", 60)),
+                usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("compaction", 90)),
+                // A ghost whose only record reported nothing.
+                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
+                usage_record(&now, "crew-dispatch-silent", None, serde_json::json!({ "call_kind": "turn", "token_source": "absent" })),
+                // A legacy ghost: no usage record at all, tokens on its complete.
+                serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
+                serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
+            ],
+        );
+        // A peer mission, seen only in the fleet stream.
+        let mut peer_usage = peer_record("telemetry.tokens", &now);
+        peer_usage["category"] = serde_json::json!("telemetry");
+        peer_usage["source"] = serde_json::json!("tokens");
+        peer_usage["payload"] = provider("single_shot", 500);
+        let fleet = vec![peer_record("mission start", &now), peer_usage];
+
+        let runs = build_runs(flows.path(), None, &fleet);
+        let tokens = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} in {runs:?}")).tokens;
+        assert_eq!(tokens("dispatch-coder-2"), Some(300), "tracked mission: its step session's records, not its complete");
+        assert_eq!(tokens("crew-dispatch-reviewer-orphan"), Some(150), "ghost: work + utility, all tokens");
+        assert_eq!(tokens("crew-dispatch-silent"), None, "nothing measured is absent, never 0");
+        assert_eq!(tokens("crew-dispatch-legacy"), Some(700), "the legacy fallback: a run with no usage record reads its complete");
+        assert_eq!(tokens("review-on-the-hub"), Some(500), "peer mission: fleet records fold the same way");
+        // The wire drops the field entirely when absent.
+        let silent = serde_json::to_value(runs.iter().find(|r| r.id == "crew-dispatch-silent").unwrap()).unwrap();
+        assert!(silent.get("tokens").is_none(), "{silent}");
+    }
+
+    /// (#2902 step 2b) `build_runs_with_usage`'s breakdown is the same fold
+    /// over the same window, and `--since` both bounds it and WIDENS the
+    /// day-file walk past `RUNS_FLOW_SCAN_WINDOW_DAYS` when asked: a bound
+    /// older than the default window must not be silently capped at it.
+    /// Day-file names and the bound are both derived from the same clock
+    /// read, so nothing here mixes a fixed stamp with a relative one.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_with_usage_since_widens_the_scan_past_the_default_window() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let old_day = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS + 6);
+        let provider = |total: u64| {
+            serde_json::json!({ "call_kind": "turn", "purpose": "work", "token_source": "provider", "total_tokens": total, "prompt_tokens": total - 10, "completion_tokens": 10, "requested_model": "old-m", "endpoint": "http://h/v1" })
+        };
+        write_day_file(
+            flows.path(),
+            &old_day,
+            &[
+                serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch start", "session_id": "old-session", "handle": "coder" }),
+                usage_record(&format!("{old_day}T12:01:00Z"), "old-session", None, provider(1000)),
+            ],
+        );
+        let now = darkmux_flow::ts_utc_now();
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "new-session", "handle": "coder" }),
+                usage_record(&now, "new-session", None, provider(40)),
+            ],
+        );
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        // The default window: only today's session and its 40 tokens.
+        let default = build_runs_with_usage(flows.path(), None, &[], None);
+        assert_eq!(default.usage.overall.total, 40);
+        assert!(default.runs.iter().all(|r| r.id != "old-session"), "{:?}", default.runs);
+        assert_eq!(build_runs(flows.path(), None, &[]).len(), default.runs.len(), "build_runs is the same union");
+
+        // A bound past the default window reaches the old day file: both
+        // the breakdown and the row list now include the old session.
+        let since = now_secs - (RUNS_FLOW_SCAN_WINDOW_DAYS as u64 + 7) * 86_400;
+        let widened = build_runs_with_usage(flows.path(), None, &[], Some(since));
+        assert_eq!(widened.usage.overall.total, 1040, "{:?}", widened.usage);
+        assert_eq!(widened.usage.groups.len(), 1);
+        assert_eq!(widened.usage.groups[0].requested_model.as_deref(), Some("old-m"));
+        let old = widened.runs.iter().find(|r| r.id == "old-session").expect("the old session is a row now");
+        assert_eq!(old.tokens, Some(1000));
+
+        // A bound INSIDE the default window narrows the breakdown to the
+        // records stamped at or after it (the old file is still not opened).
+        let recent = build_runs_with_usage(flows.path(), None, &[], Some(now_secs - 60));
+        assert_eq!(recent.usage.overall.total, 40);
+        assert_eq!(recent.usage.overall.usage_records, 1);
     }
 
     // ── #1705: the fleet half — records this machine never wrote ─────────

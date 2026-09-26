@@ -54,10 +54,13 @@ mod panel;
 mod peer_graph;
 mod runs;
 pub use runs::{
-    build_runs, local_dispatch_status, peer_mission_runs, AbandonReason, DispatchSessionEvidence,
-    Run, RunKind, RunStatus,
+    build_runs, build_runs_with_usage, local_dispatch_status, peer_mission_runs, AbandonReason,
+    DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
+/// (#2902 step 2b) The one token sum, shared by `run list` and `/runs` —
+/// see the module's own doc.
+pub mod usage_sum;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
 // server actually emits.
