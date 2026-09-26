@@ -667,6 +667,76 @@ export function sessionRecords(data: readonly FlowRecord[], sid: string): readon
   return index.get(sid) ?? NO_RECORDS;
 }
 
+/** (#2911) The window's latest timestamp, once per window ARRAY (same
+ * identity contract as `sessionRecords`' index). A record whose `ts` does not
+ * parse makes this `Infinity`: the filter in `recordsAsOf` excludes such a
+ * record (`NaN <= now` is false), so the "nothing is ahead of now" fast path
+ * must never apply to a window holding one. */
+const latestTsCache = new WeakMap<readonly FlowRecord[], number>();
+function latestTs(data: readonly FlowRecord[]): number {
+  let latest = latestTsCache.get(data);
+  if (latest === undefined) {
+    latest = -Infinity;
+    for (const r of data) {
+      const t = T(r.ts);
+      if (Number.isNaN(t)) {
+        latest = Infinity;
+        break;
+      }
+      if (t > latest) latest = t;
+    }
+    latestTsCache.set(data, latest);
+  }
+  return latest;
+}
+
+/** The last filtered result per window array, with the range of `now` it
+ * stays exact for: `now >= lo` (the latest record it includes) and
+ * `now < hi` (the earliest record it excludes). */
+const asOfCache = new WeakMap<readonly FlowRecord[], { out: FlowRecord[]; lo: number; hi: number }>();
+let asOfFilterRuns = 0;
+
+/** Test-only: how many times `recordsAsOf` has actually filtered a window. */
+export function __asOfFilterRuns(): number {
+  return asOfFilterRuns;
+}
+
+/** (#2911) `data.filter((r) => T(r.ts) <= now)`, without paying for it on
+ * every clock tick. The live fleet hero reads the window "as of now" (a
+ * record stamped after the viewer's own clock is not counted yet, matching
+ * the fleet cards), and the lens re-renders every second while an execution
+ * is live, so a plain filter re-ran over the whole window each second and
+ * handed the hero a new array, recomputing its token sums and note too.
+ *
+ * - Nothing in the window is later than `now` (the normal case): returns
+ *   `data` itself, the same reference on every tick. No filter runs.
+ * - Something is: filters once, and returns that same result on later calls
+ *   until the window array changes or `now` crosses the next excluded
+ *   record's timestamp.
+ *
+ * Same contract as `sessionRecords`: a window array is never mutated after
+ * it is first read. */
+export function recordsAsOf(data: FlowRecord[], now: number): FlowRecord[] {
+  if (latestTs(data) <= now) return data;
+  const cached = asOfCache.get(data);
+  if (cached && now >= cached.lo && now < cached.hi) return cached.out;
+  asOfFilterRuns++;
+  const out: FlowRecord[] = [];
+  let lo = -Infinity;
+  let hi = Infinity;
+  for (const r of data) {
+    const t = T(r.ts);
+    if (t <= now) {
+      out.push(r);
+      if (t > lo) lo = t;
+    } else if (t < hi) {
+      hi = t;
+    }
+  }
+  asOfCache.set(data, { out, lo, hi });
+  return out;
+}
+
 /** `dispatch()` — viewer.html:1125. `missionId` (#2125), when given, scopes
  * the match to records naming that mission — see `sessionRunsOn`'s own doc
  * for why a bare `session_id` match is unsafe for a review-shaped session.

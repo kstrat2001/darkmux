@@ -10,7 +10,7 @@ import { useCountUp } from "../../hooks/useCountUp";
 import { useFleetRoster, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
 import { getSource, runsSrc, runsReachable } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, machineNames, LIVE_WINDOW_MS, T } from "../../lib/flow";
+import { machineUids, machPresent, liveSessionSet, machineNames, recordsAsOf, LIVE_WINDOW_MS, T } from "../../lib/flow";
 import type { FlowRecord, RunsResponse } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
@@ -669,15 +669,20 @@ export function FleetLens({
   // line reads up to `App`, which threads it into `EventLogColumn`. See
   // `App.tsx`'s own `eventLogRecords` doc for that half.
   //
-  // (#2911) Live, it IS the window, by reference: the filter only ever
-  // removed a record stamped after the viewer's own clock (a peer's clock
-  // running ahead), and running it on the live clock made the hero's token
-  // sums and note recompute every second while an execution ticks the lens.
-  // A record the daemon has already delivered is counted; the playhead gate
-  // stays exactly as it was in a replay, where it is the point.
+  // (#2911) Live, the gate is "as of now" (`wallNow`): a record stamped after
+  // the viewer's own clock (a peer whose clock runs ahead) is not counted
+  // until the clock reaches it, the same rule the fleet cards apply
+  // (`cards.ts`). `recordsAsOf` keeps that from costing a whole-window filter
+  // on every 1 Hz tick: with nothing ahead of now it returns the window
+  // itself, the same reference each tick, so the hero's token sums and note
+  // do not recompute; with a record ahead, it filters once and re-filters
+  // only when the window changes or now crosses that record. A replay keeps
+  // its plain playhead filter, which runs only when the playhead moves.
   const scopedData = useMemo(
-    () => (playhead == null ? flowWindow.data : flowWindow.data.filter((r) => T(r.ts) <= playhead)),
-    [flowWindow.data, playhead],
+    () => (playhead == null
+      ? recordsAsOf(flowWindow.data, wallNow)
+      : flowWindow.data.filter((r) => T(r.ts) <= playhead)),
+    [flowWindow.data, playhead, wallNow],
   );
   const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
   const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);

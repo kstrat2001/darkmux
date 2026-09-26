@@ -17,6 +17,8 @@ import {
   sessionRunning,
   dispatchEnd,
   __sessionIndexBuilds,
+  recordsAsOf,
+  __asOfFilterRuns,
 } from "./flow";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import type { FlowRecord } from "../types/handwritten";
@@ -529,5 +531,60 @@ describe("(#2911) sessionRecords — the per-window session index", () => {
     const next = [...win, rec("a", "dispatch.turn", "2026-09-26T10:00:04Z")];
     expect(sessionRecords(next, "a")).toHaveLength(4);
     expect(__sessionIndexBuilds()).toBe(before + 2);
+  });
+});
+
+describe("(#2911) recordsAsOf: the window as of now, without a filter per tick", () => {
+  const at = (ts: string, handle: string) => ({ ts, action: "note", handle }) as FlowRecord;
+  const t = (ts: string) => Date.parse(ts);
+
+  it("matches filter(ts <= now) at every now, including a ts that does not parse", () => {
+    const win = [
+      at("2026-09-26T10:00:00Z", "a"),
+      at("2026-09-26T10:00:05Z", "b"),
+      at("not a date", "bad"),
+      at("2026-09-26T10:00:05Z", "b2"),
+      at("2026-09-26T10:00:09Z", "c"),
+    ];
+    for (let s = -1; s <= 11; s++) {
+      const now = t("2026-09-26T10:00:00Z") + s * 1000;
+      expect(recordsAsOf(win, now)).toEqual(win.filter((r) => Date.parse(r.ts) <= now));
+    }
+  });
+
+  it("with nothing ahead of now, returns the window itself on every tick, filtering nothing", () => {
+    const win = [at("2026-09-26T10:00:00Z", "a"), at("2026-09-26T10:00:05Z", "b")];
+    const runs = __asOfFilterRuns();
+    for (let s = 5; s < 10; s++) {
+      expect(recordsAsOf(win, t("2026-09-26T10:00:00Z") + s * 1000)).toBe(win);
+    }
+    expect(__asOfFilterRuns()).toBe(runs);
+  });
+
+  it("with records ahead, filters once, reuses it until now crosses the next one, then re-filters", () => {
+    const win = [
+      at("2026-09-26T10:00:00Z", "a"),
+      at("2026-09-26T10:00:05Z", "b"),
+      at("2026-09-26T10:00:09Z", "c"),
+    ];
+    const runs = __asOfFilterRuns();
+    const first = recordsAsOf(win, t("2026-09-26T10:00:01Z"));
+    expect(first.map((r) => r.handle)).toEqual(["a"]);
+    expect(__asOfFilterRuns()).toBe(runs + 1);
+    // Ticks that cross nothing: same array, no filter.
+    expect(recordsAsOf(win, t("2026-09-26T10:00:02Z"))).toBe(first);
+    expect(recordsAsOf(win, t("2026-09-26T10:00:04.999Z"))).toBe(first);
+    expect(__asOfFilterRuns()).toBe(runs + 1);
+    // Crossing b: one re-filter, then stable again.
+    const second = recordsAsOf(win, t("2026-09-26T10:00:05Z"));
+    expect(second.map((r) => r.handle)).toEqual(["a", "b"]);
+    expect(recordsAsOf(win, t("2026-09-26T10:00:08Z"))).toBe(second);
+    expect(__asOfFilterRuns()).toBe(runs + 2);
+    // Crossing the last one: the window itself.
+    expect(recordsAsOf(win, t("2026-09-26T10:00:09Z"))).toBe(win);
+    // A clock that steps back below an included record re-filters rather
+    // than serving a result that still holds it.
+    expect(recordsAsOf(win, t("2026-09-26T10:00:04Z")).map((r) => r.handle)).toEqual(["a"]);
+    expect(__asOfFilterRuns()).toBe(runs + 3);
   });
 });

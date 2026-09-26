@@ -6,7 +6,8 @@ import { render, screen, waitFor, fireEvent, act } from "@testing-library/react"
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 import type { FlowRecord } from "../../types/handwritten";
-import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds } from "../../lib/flow";
+import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS, __sessionIndexBuilds, __asOfFilterRuns } from "../../lib/flow";
+import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
 import { queryKeys } from "../../lib/queryKeys";
 import { __clockDebug } from "../../lib/clock";
@@ -25,6 +26,14 @@ import { __clockDebug } from "../../lib/clock";
 vi.mock("../../components/TokenScope", () => ({
   TokenScope: (props: Record<string, unknown>) => <div data-testid="token-scope-probe" data-props={JSON.stringify(props)} />,
 }));
+
+// (#2911) A pass-through spy: every behavior is the real `tokensOffMeter`;
+// the tick tests read its call count to pin that a tick does not make the
+// hero recompute its token sums.
+vi.mock("./savings", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./savings")>();
+  return { ...real, tokensOffMeter: vi.fn(real.tokensOffMeter) };
+});
 
 function latestTokenScopeProps(): Record<string, unknown> {
   const nodes = document.querySelectorAll('[data-testid="token-scope-probe"]');
@@ -2055,11 +2064,12 @@ describe("(#2911) fleet card wording", () => {
   });
 });
 
-// (#2911) Live, the hero reads the window by reference: a record the daemon
-// already delivered counts even when it is stamped ahead of the viewer's own
-// clock (a peer whose clock runs fast). That matches the live event log and
-// `/runs`, which never filtered on the viewer's clock. A replay keeps the
-// playhead gate, where excluding what has not happened yet is the point.
+// (#2911) Live, the hero counts records as of the viewer's clock, as it did
+// before #2911 and as the fleet cards do: a record stamped ahead of now (a
+// peer whose clock runs fast) is left out until the clock reaches it. A
+// replay gates on the playhead instead. The gate must not cost a
+// whole-window filter per 1 Hz tick; `recordsAsOf` (flow.ts) is what keeps
+// it off that path, and the last two tests pin that from the lens.
 describe("(#2911) a record stamped ahead of the viewer's clock", () => {
   const records = () => {
     const today = todayUTC();
@@ -2072,10 +2082,20 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     ];
   };
 
-  it("counts in the live hero", async () => {
+  it("is excluded from the live hero while ahead of now, and counted once now passes it", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
     expect(Date.now()).toBeLessThan(Date.parse(`${todayUTC()}T10:04:00.000Z`));
     mockFleetFetch({ flowToday: records() });
     renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
+    expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
+    // The dispatch is running (its completion is still ahead), so the lens
+    // ticks; 2m05s of ticks carry the clock past 10:04.
+    act(() => {
+      vi.advanceTimersByTime(125_000);
+    });
     await waitFor(() => expect(document.querySelector(".savings .savnum")?.textContent).toBe("600"));
     expect(screen.getByText(/the future-stamped note/)).toBeInTheDocument();
   });
@@ -2096,5 +2116,51 @@ describe("(#2911) a record stamped ahead of the viewer's clock", () => {
     await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
     expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
     expect(screen.queryByText(/the future-stamped note/)).not.toBeInTheDocument();
+  });
+
+  it("with nothing ahead of now, a tick hands the hero the window itself: no filter, no token recompute", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s-rest", action: "dispatch.start", handle: "darkmux/coder" },
+        { ts: `${today}T10:01:50.000Z`, machine_uid: "u1", session_id: "s-rest", action: "dispatch.rest", payload: { ms: 30_000 } },
+      ],
+    });
+    const filters = __asOfFilterRuns();
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach-scope__rate")?.textContent).toBe("rest 20s"));
+    const calls = vi.mocked(tokensOffMeter).mock.calls.length;
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+    }
+    // The lens DID re-render on each tick: the countdown moved.
+    expect(document.querySelector(".mach-scope__rate")!.textContent).toBe("rest 17s");
+    // Nothing is ahead of now, so the hero was never handed a filtered copy.
+    expect(__asOfFilterRuns()).toBe(filters);
+    expect(vi.mocked(tokensOffMeter).mock.calls.length).toBe(calls);
+  });
+
+  it("with a record ahead of now, a tick that crosses nothing does not re-filter", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    vi.setSystemTime(new Date(FROZEN_NOW));
+    mockFleetFetch({ flowToday: records() });
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/the earlier note/)).toBeInTheDocument());
+    const filters = __asOfFilterRuns();
+    const calls = vi.mocked(tokensOffMeter).mock.calls.length;
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+    }
+    // Still ahead: three ticks re-rendered the lens and filtered nothing.
+    expect(__clockDebug().running).toBe(true);
+    expect(__asOfFilterRuns()).toBe(filters);
+    expect(vi.mocked(tokensOffMeter).mock.calls.length).toBe(calls);
+    expect(document.querySelector(".savings .savnum")?.textContent).toBe("0");
   });
 });
