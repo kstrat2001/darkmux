@@ -36,9 +36,12 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// (#2782 C10, superseded by #2924) The one case this reasoning used not to
 /// cover was a loopback SELF entry (`machine add <me> --address
 /// 127.0.0.1:8765`, the old documented recipe), where the port was this
-/// machine's. #2924 retired that recipe: `machine add` refuses a loopback
-/// address, and every entry, this machine's own included, names a
-/// tailnet-reachable address — so the rule above now holds uniformly.
+/// machine's. #2924 retired that recipe (`machine add` refuses loopback
+/// unless `--allow-loopback`), and this machine's own entry is no longer
+/// dialed at its roster address at all: `machine list`/`status`/`resources`
+/// reach it at the local daemon (`serve_client_addr`). So this constant only
+/// ever fills in the port of an address that names ANOTHER machine, or a
+/// deliberate same-host `--allow-loopback` entry, which names its port.
 pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
 
 /// Hard cap on DNS resolution time inside `parse_address` (Wave-E.10
@@ -103,6 +106,15 @@ pub struct MachineEntry {
     /// one with no resolved identity, never an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_uid: Option<String>,
+
+    /// (#2924) True when the operator added this entry with `machine add
+    /// --allow-loopback`: a same-host test fleet, where a loopback address
+    /// really does reach the peer. `darkmux doctor`'s `roster addresses` row
+    /// reports such an entry as intentional instead of warning about it
+    /// forever. Reset by any later `machine add` without the flag. Absent
+    /// (false) on every entry written before #2924.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback_intended: bool,
 }
 
 /// The full roster — operator's declared fleet topology. Lives at
@@ -389,6 +401,7 @@ pub fn add_machine(
         description: description.map(String::from),
         added_unix_ms: existing_added_at.unwrap_or(now),
         machine_uid: uid.map(String::from).or(existing_uid),
+        loopback_intended: false,
     };
     roster.machines.insert(id.to_string(), entry);
     Ok(())
@@ -521,10 +534,14 @@ pub fn address_host_is_loopback(address: &str) -> bool {
         .unwrap_or(without_scheme);
     let unbracketed = unbracketed.strip_suffix('.').unwrap_or(unbracketed);
     if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
-        return ip.is_loopback();
+        return ip_reaches_only_reader(ip);
     }
     let host_is_local = |host: &str| {
-        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if short_ipv4_reaches_only_reader(host) {
+            return true;
+        }
+        let host = host.to_ascii_lowercase();
         host == "localhost" || host.ends_with(".localhost")
     };
     match without_scheme.rsplit_once(':') {
@@ -535,11 +552,41 @@ pub fn address_host_is_loopback(address: &str) -> bool {
                 .unwrap_or(host);
             let host = host.strip_suffix('.').unwrap_or(host);
             host.parse::<std::net::IpAddr>()
-                .map(|ip| ip.is_loopback())
+                .map(ip_reaches_only_reader)
                 .unwrap_or_else(|_| host_is_local(host))
         }
         None => host_is_local(without_scheme),
     }
+}
+
+/// (#2924 C-6) An IP literal that a client on the reading machine would
+/// reach itself through: loopback, the unspecified address (a bind
+/// directive; dialing it reaches the local host), or either one written
+/// v4-mapped in v6 form (`::ffff:127.0.0.1`).
+fn ip_reaches_only_reader(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
+/// (#2924 C-6) The shortened IPv4 forms the system resolver accepts without
+/// DNS (`127.1`, `127.0.1`, `0`): all-numeric dotted parts, reaching only the
+/// reading machine when the first part is 127 (two or more parts) or every
+/// part is zero. Literal parsing only; no lookup.
+fn short_ipv4_reaches_only_reader(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 4 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    let Ok(nums) = parts.iter().map(|p| p.parse::<u32>()).collect::<Result<Vec<_>, _>>() else {
+        return false;
+    };
+    (nums.len() >= 2 && nums[0] == 127) || nums.iter().all(|n| *n == 0)
 }
 
 /// Parse an `address` string into a `SocketAddr`. Accepts:
@@ -842,6 +889,25 @@ mod address_host_is_loopback_tests {
         assert!(address_host_is_loopback("http://LocalHost:8765/"));
         assert!(address_host_is_loopback("localhost."));
         assert!(address_host_is_loopback("studio.localhost:8765"));
+    }
+
+    // (#2924 C-6) Literal forms that reach only the reading machine: the
+    // unspecified address (a bind directive, dialed as loopback), v4-mapped
+    // v6 loopback, and the shortened `127.x` forms the resolver accepts.
+    // Literal parsing only: no DNS lookup.
+    #[test]
+    fn unspecified_mapped_and_short_loopback_literals_are_loopback() {
+        for a in [
+            "0.0.0.0", "0.0.0.0:8765", "[::]:8765", "::",
+            "::ffff:127.0.0.1", "[::ffff:127.0.0.1]:8765", "[::ffff:0.0.0.0]:8765",
+            "127.1", "127.1:8765", "127.0.1", "http://127.1:8765/",
+            "0", "0:8765",
+        ] {
+            assert!(address_host_is_loopback(a), "{a} must read as loopback");
+        }
+        for a in ["::ffff:100.64.0.2", "[::ffff:100.64.0.2]:8765", "128.1", "10.1", "1270.0.0.1", "127.example.com", "127", "0.1", "0.0.0.1:8765"] {
+            assert!(!address_host_is_loopback(a), "{a} must not read as loopback");
+        }
     }
 
     #[test]

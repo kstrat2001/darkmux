@@ -464,6 +464,7 @@ mod tests {
                 description: None,
                 added_unix_ms: 0,
                 machine_uid: None,
+                loopback_intended: false,
             },
         );
         roster

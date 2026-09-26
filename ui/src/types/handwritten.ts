@@ -69,15 +69,19 @@ export interface FleetSessionsLiveResponse {
  *
  * (#2768) `machine_uid` is the roster's own copy of the same stable hardware
  * identity flow records carry (`FlowRecord.machine_uid`) — resolved at
- * `machine add` time for a SELF-registered entry (loopback address), absent
- * for a remote peer (this host cannot probe a peer's hardware) and for every
- * entry saved before this field existed. `undefined`/`null` means *unknown
+ * `machine add` time for this machine's OWN entry (its id equals this
+ * machine's `machine_id`, #2924; before that, a loopback address decided
+ * it), absent for a remote peer (this host cannot probe a peer's hardware)
+ * and for every entry saved before this field existed. `undefined`/`null` means *unknown
  * identity*, never "same as no other machine" — a consumer joining on this
  * field must never fall back to comparing `id` against a flow-derived name
  * when it's absent (see `cards.ts::rosterOnlyEntries`'s own doc for where
  * that name-based fallback already exists, on purpose, for entries WITHOUT a
  * uid, and why the two don't contradict each other). */
 export interface RosterMachineEntry {
+  /** (#2924) Added with `machine add --allow-loopback` (a same-host test
+   * fleet): the loopback address is intentional. Omitted when false. */
+  loopback_intended?: boolean;
   id: string;
   address: string;
   description?: string | null;

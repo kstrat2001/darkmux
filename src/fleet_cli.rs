@@ -46,9 +46,13 @@ pub(crate) fn cmd_machine_add(
     } else {
         None
     };
+    let loopback_intended = allow_loopback && fleet::address_host_is_loopback(address);
     let was_present = fleet::mutate_roster(|roster| {
         let was_present = roster.machines.contains_key(id);
         fleet::add_machine(roster, id, address, description, uid)?;
+        if let Some(entry) = roster.machines.get_mut(id) {
+            entry.loopback_intended = loopback_intended;
+        }
         Ok(was_present)
     })?;
     let verb = if was_present { "updated" } else { "added" };
@@ -106,26 +110,54 @@ pub(crate) fn roster_doctor_checks() -> Vec<crate::doctor::Check> {
     if roster.machines.is_empty() {
         return Vec::new();
     }
-    let local = darkmux_hardware::machine_uid().zip(flow::resolve_machine_id());
-    let beats: Vec<(String, String)> = darkmux_flow::redis_url()
-        .and_then(|url| redis::Client::open(url.expose_for_probe()).ok())
-        .and_then(|client| darkmux_flow::presence::read_live(&client).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|b| (b.machine_uid, b.display_name))
-        .collect();
-    let local = local.as_ref().map(|(u, n)| (*u, n.as_str()));
+    let (beats, presence) = match darkmux_flow::redis_url() {
+        None => (Vec::new(), crate::doctor::PresenceState::NotConfigured),
+        Some(url) => match redis::Client::open(url.expose_for_probe())
+            .ok()
+            .and_then(|client| darkmux_flow::presence::read_live(&client).ok())
+        {
+            Some(beats) => (
+                beats.into_iter().map(|b| (b.machine_uid, b.display_name)).collect(),
+                crate::doctor::PresenceState::Read,
+            ),
+            None => (Vec::new(), crate::doctor::PresenceState::Unreadable),
+        },
+    };
+    let live = LiveIdentity {
+        beats,
+        local_uid: darkmux_hardware::machine_uid().map(str::to_string),
+        local_name: flow::resolve_machine_id(),
+        presence,
+    };
     // Flow history is read only when this machine and the live beats cannot
     // settle every entry on their own — the normal, healthy fleet never pays
     // for the scan.
-    let live = gather_identity_knowledge(None, &beats, local);
-    let known = if roster_needs_history(&roster, &live) {
-        gather_identity_knowledge(Some(&darkmux_types::config_access::flows_dir()), &beats, local)
+    let live_only = gather_identity_knowledge(None, &live);
+    let known = if roster_needs_history(&roster, &live_only) {
+        gather_identity_knowledge(Some(&darkmux_types::config_access::flows_dir()), &live)
     } else {
-        live
+        live_only
     };
     roster_checks(&roster, &known)
 }
+
+/// What this doctor run learned without reading flow history.
+struct LiveIdentity {
+    /// Presence beats as `(uid, display_name)`.
+    beats: Vec<(String, String)>,
+    /// This machine's hardware uid, when readable.
+    local_uid: Option<String>,
+    /// This machine's resolved machine_id.
+    local_name: Option<String>,
+    presence: crate::doctor::PresenceState,
+}
+
+/// (#2924 C-5) How many of the most recent flow day-files the roster
+/// identity check reads. Bounds doctor's cost as history is retained without
+/// limit (the laptop holds ~130 days, ~300 MB). 120 covers the live rename
+/// this check was written for; a rename older than the window is reported as
+/// a note ("matches no machine_id this machine can see"), never a warning.
+const ROSTER_HISTORY_DAYS: usize = 120;
 
 /// True when some roster entry cannot be settled from live knowledge alone:
 /// it declares no uid and is not a current name, or declares a uid nobody
@@ -133,7 +165,7 @@ pub(crate) fn roster_doctor_checks() -> Vec<crate::doctor::Check> {
 fn roster_needs_history(roster: &fleet::FleetRoster, live: &crate::doctor::FleetIdentityKnowledge) -> bool {
     roster.machines.values().any(|m| match &m.machine_uid {
         Some(uid) => !live.current_name_by_uid.contains_key(uid),
-        None => !live.current_name_by_uid.values().any(|n| *n == m.id),
+        None => !live.is_current_name(&m.id),
     })
 }
 
@@ -193,26 +225,27 @@ fn roster_checks(
             machine_uid: m.machine_uid.clone(),
             address: m.address.clone(),
             address_is_loopback: fleet::address_host_is_loopback(&m.address),
+            loopback_intended: m.loopback_intended,
         })
         .collect();
     vec![
-        crate::doctor::check_roster_addresses(&views),
+        crate::doctor::check_roster_addresses(&views, known),
         crate::doctor::check_roster_identity(&views, known),
     ]
 }
 
-/// Build [`crate::doctor::FleetIdentityKnowledge`] from local flow history,
-/// presence beats `(uid, display_name)`, and this machine's own `(uid,
-/// machine_id)`. Later sources override earlier ones for a uid's CURRENT
-/// name; every name ever seen stays traceable to its uid.
+/// Build [`crate::doctor::FleetIdentityKnowledge`] from the last
+/// [`ROSTER_HISTORY_DAYS`] flow day-files, presence beats, and this
+/// machine's own resolution. Later sources override earlier ones for a uid's
+/// CURRENT name. Every uid a name was ever seen under is kept (a set, never
+/// last-writer-wins), because one machine collects throwaway session names
+/// and two machines can once have shared a hostname-derived id.
 ///
 /// Flow files are read in name (date) order so the last name a uid wrote is
-/// its current one by history. Each line is deserialized into just the two
-/// identity fields rather than a full record.
+/// its current one by history.
 fn gather_identity_knowledge(
     flows_dir: Option<&std::path::Path>,
-    beats: &[(String, String)],
-    local: Option<(&str, &str)>,
+    live: &LiveIdentity,
 ) -> crate::doctor::FleetIdentityKnowledge {
     use std::io::BufRead;
     let mut known = crate::doctor::FleetIdentityKnowledge::default();
@@ -226,13 +259,14 @@ fn gather_identity_knowledge(
         })
         .unwrap_or_default();
     files.sort();
-    for path in files {
+    let skip = files.len().saturating_sub(ROSTER_HISTORY_DAYS);
+    for path in files.into_iter().skip(skip) {
         let Ok(file) = std::fs::File::open(&path) else { continue };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
             let Some((name, uid)) = record_identity(&line) else { continue };
             match uid {
                 Some(uid) => {
-                    known.uid_by_name.insert(name.clone(), uid.clone());
+                    known.uids_by_name.entry(name.clone()).or_default().insert(uid.clone());
                     known.current_name_by_uid.insert(uid, name);
                 }
                 None => {
@@ -241,14 +275,17 @@ fn gather_identity_knowledge(
             }
         }
     }
-    let overlays = beats
+    let overlays = live
+        .beats
         .iter()
         .map(|(u, n)| (u.as_str(), n.as_str()))
-        .chain(local);
+        .chain(live.local_uid.as_deref().zip(live.local_name.as_deref()));
     for (uid, name) in overlays {
-        known.uid_by_name.insert(name.to_string(), uid.to_string());
+        known.uids_by_name.entry(name.to_string()).or_default().insert(uid.to_string());
         known.current_name_by_uid.insert(uid.to_string(), name.to_string());
     }
+    known.local_name = live.local_name.clone();
+    known.presence = live.presence;
     known
 }
 
@@ -280,7 +317,9 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
              or omit the id to read this host"
         )
     })?;
-    let base = normalize_daemon_base(&entry.address);
+    let local_id = flow::resolve_machine_id();
+    let dialed = dial_address(entry, local_id.as_deref(), &darkmux_types::config_access::serve_client_addr());
+    let base = normalize_daemon_base(&dialed);
     let url = format!("{base}{path}");
     let token = darkmux_flow::serve_token();
     let token_str = token.as_ref().map(|t| t.expose_for_compare());
@@ -306,10 +345,47 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
         // A 404 means the peer IS reachable — its daemon just doesn't serve
         // this route. "Could not reach" would be the wrong vocabulary.
         Err(ureq::Error::Status(404, _)) => {
-            anyhow::bail!(route_missing_message(id, path, &entry.address))
+            anyhow::bail!(route_missing_message(id, path, &dialed))
         }
         Err(e) => anyhow::bail!("could not reach `{id}` ({url}): {e}"),
     }
+}
+
+/// (#2924 MF-3) The address to dial for a roster entry. This machine's own
+/// entry (its id is this machine's machine_id) dials the local daemon at
+/// `local_addr` (`serve_client_addr()`); every other entry dials its roster
+/// address.
+///
+/// The roster address is the PEER-facing name: in the hub guide's default
+/// topology the daemon binds `127.0.0.1:8765` and reaches the tailnet only
+/// through `tailscale serve` on :443, so the hub's own tailnet DNS name
+/// normalizes to `:8765`, where nothing listens on the tailnet. Dialing it
+/// from the hub itself would show the hub unreachable from the one machine
+/// that can always reach it.
+fn dial_address(entry: &fleet::MachineEntry, local_id: Option<&str>, local_addr: &str) -> String {
+    if local_id == Some(entry.id.as_str()) {
+        local_addr.to_string()
+    } else {
+        entry.address.clone()
+    }
+}
+
+/// Reachability probe for every roster entry, dialing each at
+/// [`dial_address`]. Returns `(entry, dialed address, probe)`.
+fn list_probes(
+    roster: &fleet::FleetRoster,
+    local_id: Option<&str>,
+) -> Vec<(fleet::MachineEntry, String, fleet::ReachabilityResult)> {
+    let local_addr = darkmux_types::config_access::serve_client_addr();
+    roster
+        .machines
+        .values()
+        .map(|m| {
+            let dialed = dial_address(m, local_id, &local_addr);
+            let probe = fleet::probe_reachability(&dialed);
+            (m.clone(), dialed, probe)
+        })
+        .collect()
 }
 
 /// Build the message for a peer that answered but has no `path` route
@@ -360,15 +436,10 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
 
     // Probe each machine's reachability (TCP connect to its daemon port).
     // Done sequentially — the roster is small and the budget per probe
-    // is 300ms; total wall is bounded.
-    let probes: Vec<(fleet::MachineEntry, fleet::ReachabilityResult)> = roster
-        .machines
-        .values()
-        .map(|m| {
-            let probe = fleet::probe_reachability(&m.address);
-            (m.clone(), probe)
-        })
-        .collect();
+    // is 300ms; total wall is bounded. This machine's own entry is dialed at
+    // the local daemon (#2924, `dial_address`).
+    let local_id = flow::resolve_machine_id();
+    let probes = list_probes(&roster, local_id.as_deref());
 
     // When --deep, fetch /machine/specs from each reachable peer. One
     // HTTP GET per peer; ~1s budget each. Failures are surfaced per-row
@@ -386,9 +457,9 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
     let specs_by_id: std::collections::BTreeMap<String, Option<serde_json::Value>> = if deep {
         probes
             .iter()
-            .map(|(m, p)| {
+            .map(|(m, dialed, p)| {
                 let value = if p.reachable {
-                    match fetch_machine_specs(&m.address, token_str) {
+                    match fetch_machine_specs(dialed, token_str) {
                         SpecsProbe::Ok(v) => Some(v),
                         SpecsProbe::AuthRequired => {
                             auth_required.push(m.id.clone());
@@ -421,9 +492,13 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
             "local_machine_id": local_id,
             "machines": probes
                 .iter()
-                .map(|(m, p)| serde_json::json!({
+                .map(|(m, dialed, p)| serde_json::json!({
                     "id": m.id,
                     "address": m.address,
+                    // (#2924) Where the probe went: the roster address, or the
+                    // local daemon for this machine's own entry.
+                    "dialed_address": dialed,
+                    "is_this_machine": local_id.as_deref() == Some(m.id.as_str()),
                     "description": m.description,
                     "added_unix_ms": m.added_unix_ms,
                     // (#2768) `null` for a remote peer or a pre-#2768 entry —
@@ -492,7 +567,16 @@ pub(crate) fn cmd_machine_list(emit_json: bool, deep: bool) -> Result<i32> {
             ))
         );
     }
-    for (m, p) in &probes {
+    if let Some((m, dialed, _)) = probes.iter().find(|(m, _, _)| local_id.as_deref() == Some(m.id.as_str())) {
+        println!(
+            "{}",
+            style::dim(&format!(
+                "  `{}` is this machine: probed at its local daemon {dialed}; the address below is what peers dial.",
+                m.id
+            ))
+        );
+    }
+    for (m, _dialed, p) in &probes {
         let status = if p.reachable {
             format!("✓ {}ms", p.elapsed_ms)
         } else {
@@ -600,10 +684,10 @@ running an older darkmux (route not found). Upgrade darkmux on those peer(s) and
         );
         let bare_ip_peers: Vec<&str> = probes
             .iter()
-            .filter(|(m, _)| {
-                route_missing.contains(&m.id) && fleet::address_host_is_bare_ip(&m.address)
+            .filter(|(m, dialed, _)| {
+                route_missing.contains(&m.id) && fleet::address_host_is_bare_ip(dialed)
             })
-            .map(|(m, _)| m.id.as_str())
+            .map(|(m, _, _)| m.id.as_str())
             .collect();
         if !bare_ip_peers.is_empty() {
             println!(
@@ -776,6 +860,7 @@ mod tests {
         assert_eq!(code, 0);
         let entry = roster.machines.get("peer-a").unwrap();
         assert_eq!(entry.address, "127.0.0.1:18765");
+        assert!(entry.loopback_intended, "the entry records that loopback was asked for (#2924 C-6)");
         // Loopback no longer means "self": a same-host peer under another
         // name must not be stamped with this host's identity.
         assert_eq!(entry.machine_uid, None);
@@ -829,27 +914,65 @@ mod tests {
         std::fs::write(dir.join(file), lines.join("\n") + "\n").unwrap();
     }
 
+    fn live(beats: &[(&str, &str)], local_uid: Option<&str>, local_name: Option<&str>) -> LiveIdentity {
+        LiveIdentity {
+            beats: beats.iter().map(|(u, n)| (u.to_string(), n.to_string())).collect(),
+            local_uid: local_uid.map(str::to_string),
+            local_name: local_name.map(str::to_string),
+            presence: crate::doctor::PresenceState::Read,
+        }
+    }
+
+    #[serial_test::serial]
     #[test]
-    fn gather_identity_knowledge_takes_each_uids_latest_name_and_keeps_old_ones() {
+    fn a_later_add_without_allow_loopback_clears_the_intent() {
+        let _tmp = isolated_add_env("viewer");
+        cmd_machine_add("peer-a", "127.0.0.1:18765", None, true).unwrap();
+        cmd_machine_add("peer-a", "peer-a.tailnet.example", None, false).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        clear_add_env();
+        assert!(!roster.machines.get("peer-a").unwrap().loopback_intended);
+    }
+
+    #[test]
+    fn gather_identity_knowledge_takes_each_uids_latest_name_and_keeps_every_uid_per_name() {
         let tmp = tempfile::tempdir().unwrap();
         write_flow(tmp.path(), "2026-06-01.jsonl", &[
             r#"{"ts":"2026-06-01T00:00:00Z","machine_id":"laptop","machine_uid":"UID-A"}"#,
             r#"{"ts":"2026-06-01T00:00:01Z","machine_id":"old-box"}"#,
+            r#"{"ts":"2026-06-01T00:00:02Z","machine_id":"MacBook-Pro-shared","machine_uid":"UID-B"}"#,
             "not json at all",
         ]);
         write_flow(tmp.path(), "2026-09-01.jsonl", &[
-            r#"{"ts":"2026-09-01T00:00:00Z","machine_id":"MacBook-Pro","machine_uid":"UID-A"}"#,
+            r#"{"ts":"2026-09-01T00:00:00Z","machine_id":"MacBook-Pro-shared","machine_uid":"UID-A"}"#,
+            r#"{"ts":"2026-09-01T00:00:01Z","machine_id":"MacBook-Pro","machine_uid":"UID-A"}"#,
         ]);
         std::fs::write(tmp.path().join("notes.txt"), r#"{"machine_id":"ignored","machine_uid":"UID-Z"}"#).unwrap();
-        let k = gather_identity_knowledge(Some(tmp.path()), &[], None);
+        let k = gather_identity_knowledge(Some(tmp.path()), &live(&[], None, None));
         assert_eq!(k.current_name_by_uid.get("UID-A").map(String::as_str), Some("MacBook-Pro"));
-        assert_eq!(k.uid_by_name.get("laptop").map(String::as_str), Some("UID-A"));
+        assert_eq!(k.uids_by_name.get("laptop").map(|s| s.len()), Some(1));
+        assert_eq!(k.uids_by_name.get("MacBook-Pro-shared").map(|s| s.len()), Some(2), "a shared name keeps both uids");
         assert!(k.uidless_names.contains("old-box"));
         assert!(!k.current_name_by_uid.contains_key("UID-Z"), "only .jsonl flow files are read");
     }
 
-    /// Presence outranks history, and this machine's own resolution
-    /// outranks presence, for what a uid goes by NOW.
+    /// C-5: only the most recent `ROSTER_HISTORY_DAYS` day files are read.
+    #[test]
+    fn gather_identity_knowledge_reads_a_bounded_window_of_day_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_flow(tmp.path(), "2000-01-01.jsonl", &[r#"{"machine_id":"ancient","machine_uid":"UID-OLD"}"#]);
+        for i in 0..ROSTER_HISTORY_DAYS {
+            write_flow(tmp.path(), &format!("2026-{:02}-{:02}.jsonl", 1 + i / 28, 1 + i % 28), &[
+                r#"{"machine_id":"recent","machine_uid":"UID-R"}"#,
+            ]);
+        }
+        let k = gather_identity_knowledge(Some(tmp.path()), &live(&[], None, None));
+        assert!(k.uids_by_name.contains_key("recent"));
+        assert!(!k.uids_by_name.contains_key("ancient"), "a file older than the window is not read");
+    }
+
+    /// Presence outranks history, and this machine's own resolution outranks
+    /// presence; this machine's name counts even with no readable uid (C-3).
     #[test]
     fn gather_identity_knowledge_lets_presence_and_self_override_history() {
         let tmp = tempfile::tempdir().unwrap();
@@ -857,16 +980,16 @@ mod tests {
             r#"{"machine_id":"laptop","machine_uid":"UID-A"}"#,
             r#"{"machine_id":"studio-old","machine_uid":"UID-B"}"#,
         ]);
-        let beats = vec![("UID-A".to_string(), "MacBook-Pro".to_string())];
-        let k = gather_identity_knowledge(Some(tmp.path()), &beats, Some(("UID-B", "studio")));
+        let k = gather_identity_knowledge(Some(tmp.path()), &live(&[("UID-A", "MacBook-Pro")], Some("UID-B"), Some("studio")));
         assert_eq!(k.current_name_by_uid.get("UID-A").map(String::as_str), Some("MacBook-Pro"));
         assert_eq!(k.current_name_by_uid.get("UID-B").map(String::as_str), Some("studio"));
-        assert_eq!(k.uid_by_name.get("MacBook-Pro").map(String::as_str), Some("UID-A"));
+        assert_eq!(k.local_name.as_deref(), Some("studio"));
+        let no_uid = gather_identity_knowledge(None, &live(&[], None, Some("studio")));
+        assert_eq!(no_uid.local_name.as_deref(), Some("studio"), "C-3: the name without a uid");
     }
 
-    /// The live fleet from #2924, end to end through the row builder: the
-    /// Studio's self entry at loopback, and the laptop rostered under a name
-    /// it no longer goes by.
+    /// The live fleet from #2924 through the row builder: the Studio's self
+    /// entry at loopback, the laptop rostered under a name it no longer uses.
     #[test]
     fn roster_checks_report_the_studio_loopback_and_the_laptop_rename() {
         let mut roster = fleet::FleetRoster::default();
@@ -874,8 +997,7 @@ mod tests {
         fleet::add_machine(&mut roster, "laptop", "laptop.tailnet.example", None, None).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         write_flow(tmp.path(), "2026-06-10.jsonl", &[r#"{"machine_id":"laptop","machine_uid":"UID-A"}"#]);
-        let beats = vec![("UID-A".to_string(), "MacBook-Pro".to_string())];
-        let known = gather_identity_knowledge(Some(tmp.path()), &beats, Some(("UID-B", "studio")));
+        let known = gather_identity_knowledge(Some(tmp.path()), &live(&[("UID-A", "MacBook-Pro")], Some("UID-B"), Some("studio")));
         let checks = roster_checks(&roster, &known);
         let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
         let addr = by_name("roster addresses");
@@ -883,9 +1005,21 @@ mod tests {
         assert!(addr.message.contains("`studio` at 127.0.0.1:8765"), "{}", addr.message);
         let ident = by_name("roster identity");
         assert_eq!(ident.status, crate::doctor::Status::Warn, "{}", ident.message);
-        assert!(ident.message.contains("`laptop` is the machine whose machine_id is now `MacBook-Pro`"), "{}", ident.message);
-        assert!(!ident.message.contains("`studio`"), "the studio entry is correctly named: {}", ident.message);
+        assert!(ident.message.contains("`laptop` was last used"), "{}", ident.message);
+        assert!(ident.message.contains("now called `MacBook-Pro`"), "{}", ident.message);
     }
+
+    /// An entry added with --allow-loopback reaches the row as intentional.
+    #[test]
+    fn roster_checks_carry_the_loopback_intent() {
+        let mut roster = fleet::FleetRoster::default();
+        fleet::add_machine(&mut roster, "peer-a", "127.0.0.1:18765", None, None).unwrap();
+        roster.machines.get_mut("peer-a").unwrap().loopback_intended = true;
+        let checks = roster_checks(&roster, &crate::doctor::FleetIdentityKnowledge::default());
+        let addr = checks.iter().find(|c| c.name == "roster addresses").unwrap();
+        assert_eq!(addr.status, crate::doctor::Status::Pass, "{}", addr.message);
+    }
+
 
     #[test]
     fn record_identity_reads_top_level_fields_and_falls_back_on_anything_else() {
@@ -911,9 +1045,10 @@ mod tests {
     }
 
     /// The scan is skipped only when live knowledge settles every entry.
+
     #[test]
     fn roster_needs_history_only_for_entries_live_knowledge_cannot_settle() {
-        let live = gather_identity_knowledge(None, &[("UID-A".into(), "MacBook-Pro".into())], Some(("UID-B", "studio")));
+        let live = gather_identity_knowledge(None, &live(&[("UID-A", "MacBook-Pro")], Some("UID-B"), Some("studio")));
         let mut healthy = fleet::FleetRoster::default();
         fleet::add_machine(&mut healthy, "studio", "studio.tailnet.example", None, Some("UID-B")).unwrap();
         fleet::add_machine(&mut healthy, "MacBook-Pro", "mbp.tailnet.example", None, None).unwrap();
@@ -928,6 +1063,37 @@ mod tests {
         assert!(roster_needs_history(&offline, &live), "a uid nobody live answers to needs history");
     }
 
+    /// C-2: pin the history gate at its real call site. The laptop shape (a
+    /// uid-less entry known only from history) must read as renamed through
+    /// `roster_doctor_checks` itself, with no Redis configured.
+    #[serial_test::serial]
+    #[test]
+    fn roster_doctor_checks_read_history_for_the_laptop_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flows = tmp.path().join("flows");
+        std::fs::create_dir_all(&flows).unwrap();
+        write_flow(&flows, "2026-06-10.jsonl", &[r#"{"machine_id":"laptop","machine_uid":"UID-HIST-A"}"#]);
+        write_flow(&flows, "2026-09-20.jsonl", &[r#"{"machine_id":"renamed-now","machine_uid":"UID-HIST-A"}"#]);
+        let fleet_file = tmp.path().join("fleet.json");
+        unsafe {
+            std::env::set_var("DARKMUX_FLEET_FILE", &fleet_file);
+            std::env::set_var("DARKMUX_FLOWS_DIR", &flows);
+            std::env::set_var("DARKMUX_MACHINE_ID", "this-test-host");
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        fleet::mutate_roster(|r| fleet::add_machine(r, "laptop", "laptop.tailnet.example", None, None)).unwrap();
+        let checks = roster_doctor_checks();
+        unsafe {
+            std::env::remove_var("DARKMUX_FLEET_FILE");
+            std::env::remove_var("DARKMUX_FLOWS_DIR");
+            std::env::remove_var("DARKMUX_MACHINE_ID");
+        }
+        let ident = checks.iter().find(|c| c.name == "roster identity").unwrap();
+        assert_eq!(ident.status, crate::doctor::Status::Warn, "{}", ident.message);
+        assert!(ident.message.contains("now called `renamed-now`"), "{}", ident.message);
+        assert!(ident.message.contains("no Redis configured"), "{}", ident.message);
+    }
+
     #[serial_test::serial]
     #[test]
     fn roster_doctor_checks_are_silent_without_a_roster() {
@@ -936,6 +1102,67 @@ mod tests {
         let checks = roster_doctor_checks();
         unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
         assert!(checks.is_empty(), "{:?}", checks.iter().map(|c| &c.name).collect::<Vec<_>>());
+    }
+
+    // ── this machine's own entry dials the local daemon (#2924 MF-3) ────
+
+    #[test]
+    fn dial_address_uses_the_local_daemon_for_this_machines_entry_only() {
+        let mut roster = fleet::FleetRoster::default();
+        fleet::add_machine(&mut roster, "studio", "studio.tailnet.example", None, None).unwrap();
+        fleet::add_machine(&mut roster, "laptop", "laptop.tailnet.example", None, None).unwrap();
+        let studio = roster.machines.get("studio").unwrap();
+        let laptop = roster.machines.get("laptop").unwrap();
+        assert_eq!(dial_address(studio, Some("studio"), "127.0.0.1:8799"), "127.0.0.1:8799");
+        assert_eq!(dial_address(laptop, Some("studio"), "127.0.0.1:8799"), "laptop.tailnet.example");
+        assert_eq!(dial_address(studio, None, "127.0.0.1:8799"), "studio.tailnet.example");
+    }
+
+    /// Through the real `machine status <id>` path: this machine's entry
+    /// names an address nothing answers on (the hub guide's default topology,
+    /// where the tailnet name only serves :443), yet the read reaches the
+    /// local daemon.
+    #[serial_test::serial]
+    #[test]
+    fn fetch_peer_json_for_this_machines_entry_reaches_the_local_daemon() {
+        let addr = one_shot_http("200 OK", r#"{"ok":true}"#);
+        let port = addr.rsplit_once(':').unwrap().1.to_string();
+        let _tmp = isolated_roster(&[("self-host", "self-host.invalid")]);
+        unsafe {
+            std::env::set_var("DARKMUX_MACHINE_ID", "self-host");
+            std::env::set_var("DARKMUX_SERVE_PORT", &port);
+            std::env::set_var("DARKMUX_SERVE_BIND", "127.0.0.1");
+        }
+        let got = fetch_peer_json("self-host", "/machine/status");
+        unsafe {
+            std::env::remove_var("DARKMUX_MACHINE_ID");
+            std::env::remove_var("DARKMUX_SERVE_PORT");
+            std::env::remove_var("DARKMUX_SERVE_BIND");
+            std::env::remove_var("DARKMUX_FLEET_FILE");
+        }
+        assert_eq!(got.unwrap()["ok"], true);
+    }
+
+    /// `machine list` probes this machine's entry at the local daemon.
+    #[serial_test::serial]
+    #[test]
+    fn list_probes_probe_this_machines_entry_at_the_local_daemon() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut roster = fleet::FleetRoster::default();
+        fleet::add_machine(&mut roster, "self-host", "self-host.invalid", None, None).unwrap();
+        unsafe {
+            std::env::set_var("DARKMUX_SERVE_PORT", port.to_string());
+            std::env::set_var("DARKMUX_SERVE_BIND", "127.0.0.1");
+        }
+        let probes = list_probes(&roster, Some("self-host"));
+        unsafe {
+            std::env::remove_var("DARKMUX_SERVE_PORT");
+            std::env::remove_var("DARKMUX_SERVE_BIND");
+        }
+        let (_, dialed, probe) = &probes[0];
+        assert_eq!(dialed, &format!("127.0.0.1:{port}"));
+        assert!(probe.reachable, "{:?}", probe.error);
     }
 
     // ── fetch_peer_json error shapes (#1426) ────────────────────────────

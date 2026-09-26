@@ -1859,6 +1859,41 @@ fn machine_add_refuses_a_loopback_address_unless_allowed() {
     assert!(roster.contains("127.0.0.1:8765"), "{roster}");
 }
 
+/// (#2924 MF-3) `machine list` probes this machine's own entry at the local
+/// daemon, not at its roster address. The roster address is the peer-facing
+/// DNS name, which in the hub guide's default topology (daemon on loopback
+/// behind `tailscale serve --https=443`) answers nothing at :8765, so the
+/// hub's own row used to read unreachable. Runs the real verb: the probe
+/// target here is an unresolvable name, and only the local listener answers.
+#[test]
+fn machine_list_probes_this_machines_entry_at_the_local_daemon() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = tmp.path().join("fleet.json");
+    std::fs::write(
+        &fleet_file,
+        r#"{"version":"2","machines":{"self-host":{"id":"self-host","address":"self-host.invalid","added_unix_ms":1}}}"#,
+    )
+    .unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .env("DARKMUX_MACHINE_ID", "self-host")
+        .env("DARKMUX_SERVE_BIND", "127.0.0.1")
+        .env("DARKMUX_SERVE_PORT", port.to_string())
+        .args(["machine", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = &v["machines"][0];
+    assert_eq!(row["address"], "self-host.invalid", "the roster keeps the peer-facing name");
+    assert_eq!(row["dialed_address"], format!("127.0.0.1:{port}"));
+    assert_eq!(row["is_this_machine"], true);
+    assert_eq!(row["reachable"], true, "{row}");
+    drop(listener);
+}
+
 /// (#2924) `darkmux doctor` actually appends the fleet-roster rows. The
 /// evaluators and the row builder are tested as pure functions; deleting the
 /// one `report.checks.extend(fleet_cli::roster_doctor_checks())` line in
@@ -1878,7 +1913,9 @@ fn doctor_reports_a_loopback_roster_entry() {
         .env_remove("DARKMUX_REDIS_URL")
         .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
         .env("DARKMUX_LMS_BIN", "/nonexistent/lms")
-        .args(["doctor"])
+        // The identity row is a note here (nothing is known against
+        // `studio`), and a passing row prints only under --verbose.
+        .args(["doctor", "--verbose"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();

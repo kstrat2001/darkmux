@@ -101,16 +101,23 @@ darkmux release.
   --address 127.0.0.1:8765`, which put an address in the roster that no
   peer can use: other machines read the roster (the daemon serves it to
   every viewer), and a loopback address reaches whichever machine reads it.
-  `machine add` now exits 2 on a loopback or `localhost` address and names
-  the fix; `--allow-loopback` keeps it for several daemons on one host (a
-  same-host test fleet). Whether an entry is THIS machine (and so gets its
-  hardware identity recorded) is now decided by its id matching this
-  machine's `machine_id`, not by a loopback address. The hub guide and the
+  `machine add` now exits 2 on an address that reaches only the reading
+  machine (`127.x` including short forms like `127.1`, `::1`, `0.0.0.0`,
+  `::`, their v4-mapped forms, `localhost`) and names the fix;
+  `--allow-loopback` keeps it for several daemons on one host (a same-host
+  test fleet), and the entry records that it was intended. Whether an entry
+  is THIS machine (and so gets its hardware identity recorded) is now
+  decided by its id matching this machine's `machine_id`, not by a loopback
+  address. `machine list`, `machine status <id>` and `machine resources
+  <id>` reach this machine's own entry at the local daemon, so the roster
+  address stays the name peers dial. The hub guide and the
   `darkmux-add-machine` skill register every machine, the hub included,
   under its `machine_id` at its tailnet DNS name. **Migration:** for an
   existing loopback entry, re-add it with the DNS name (`darkmux machine
-  add <id> --address <tailnet-dns-name>`, which keeps its added time);
-  `darkmux doctor` lists each one.
+  add <id> --address <tailnet-dns-name>`, which keeps its added time; if
+  `darkmux doctor` also reports the entry renamed, remove it and add it
+  under the machine's current name instead, as that row says). `darkmux
+  doctor` lists each one.
 
 ### Added
 
@@ -139,25 +146,21 @@ darkmux release.
   (a binary from before it quarantines a profile that uses it).
 - **`darkmux doctor` checks the fleet roster against the fleet** (#2924).
   Two rows, shown when a roster exists. `roster addresses` flags an entry
-  with a loopback address. `roster identity` flags an entry not named by
-  the `machine_id` of the machine it describes, which is the one name flow
-  records, presence beats and the viewer already use: an entry whose
-  machine now goes by another name (traced by the hardware identity it
-  declares, or by flow history) gets both repairs, rename the entry or set
-  that machine's `machine_id` to the entry's name; an entry no machine
-  this one can see has ever gone by gets pointed at `darkmux doctor` on the
-  machine it means. A peer that is merely offline is not flagged. Nothing
-  in the roster or config is rewritten. The flow-history read runs only
-  when live knowledge (this machine and presence) cannot settle an entry.
-
-- **`/machine-status` is a built-in advertised command** (#2918). "Which
-  models are loaded on this machine right now?" was refused: the catalog
-  radio's router (and the editor panel) route over had no machine command
-  in it, so the question fell through to the answering seat. The read-only
-  `darkmux machine status` verb now ships as a built-in mission config with
-  a `panel` block, advertised exactly the way an operator's own commands
-  are, so the router routes to it and the panel lists it. Read-only only:
-  `machine eject` stays un-advertised.
+  whose address reaches only the reading machine (an entry added with
+  `--allow-loopback` is reported as intentional). `roster identity` checks
+  each entry against the `machine_id` of the machine it describes, the one
+  name flow records, presence beats and the viewer already use. It warns
+  only on evidence: the entry's own hardware identity now goes by another
+  name (both repairs offered, rename the entry or set that machine's
+  `machine_id`, never the second when another machine already holds the
+  name), or flow history links the name to exactly one machine that now
+  goes by another name (a conservative repair: no address reuse and no
+  `machine_id` change, since session-only names land in history too). A
+  name several machines have used, or one nothing is known about (the
+  normal state of a peer that is off), is a note, not a warning, and the
+  row says when presence could not be read. Nothing in the roster or
+  config is rewritten. Flow history is read only when this machine and
+  presence cannot settle an entry, and only the last 120 day-files.
 
 ### Fixed
 
