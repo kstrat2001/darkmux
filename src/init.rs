@@ -1093,7 +1093,7 @@ mod tests {
         let issues = loaded.registry.validate();
         assert!(issues.is_empty(), "the example registry must validate clean: {issues:?}");
         let hosted = &loaded.registry.profiles["hosted-frontier"].models[0];
-        assert_eq!(hosted.endpoint.as_ref().and_then(|e| e.named_id()), Some("hosted"));
+        assert_eq!(hosted.endpoint.as_ref().and_then(|e| e.named_id()), Some("azure-openai"));
         assert_eq!(hosted.endpoint_kind().unwrap(), darkmux_types::EndpointKind::Unmanaged);
     }
 
