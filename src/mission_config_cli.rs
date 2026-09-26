@@ -1230,6 +1230,25 @@ mod tests {
         assert!(unknown_role.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", unknown_role.error);
     }
 
+    /// (#2902 review C1) When the SELECTED model's endpoint cannot be
+    /// resolved but the profile's default model is fine, the seat still
+    /// shows the error: the default is not what the dispatch would run.
+    #[test]
+    fn show_does_not_fall_back_to_the_default_when_the_selection_errs() {
+        let mut registry: ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","capabilities":{"code":1.0},"endpoint":"nope"}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        registry.materialize_endpoints();
+        let pctx = ctx(registry);
+        let r = resolve_role("coder", Ok(&pctx), &|_| RoleBinding::Unmapped, Ok(&[]));
+        assert!(r.model.is_none(), "{:?}", r.model);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("nope")), "{:?}", r.error);
+    }
+
     #[test]
     fn show_names_the_selected_model_not_simply_the_profile_default() {
         let model = |id: &str, cap: &str| {
