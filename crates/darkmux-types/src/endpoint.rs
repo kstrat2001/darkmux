@@ -187,6 +187,34 @@ fn is_period(p: &str) -> bool {
     matches!(unit, 'm' | 'h' | 'd') && p[..p.len() - 1].parse::<u32>().is_ok_and(|n| n >= 1)
 }
 
+/// (#2902 review M1) A value read leniently: the known shape, or whatever was
+/// written when it does not match (a newer darkmux's value, a typo). An
+/// unknown value never fails the registry parse (contract 7); the consumer
+/// that needs the value refuses it by name, and `darkmux doctor` reports it.
+/// It serializes back exactly as read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Lenient<T> {
+    Known(T),
+    Unrecognized(serde_json::Value),
+}
+
+impl<T> From<T> for Lenient<T> {
+    fn from(v: T) -> Self {
+        Lenient::Known(v)
+    }
+}
+
+impl<T> Lenient<T> {
+    /// The known value, or the raw one as a compact string for a message.
+    pub fn known(&self) -> Result<&T, String> {
+        match self {
+            Lenient::Known(v) => Ok(v),
+            Lenient::Unrecognized(raw) => Err(raw.to_string()),
+        }
+    }
+}
+
 /// How a profile model's endpoint was written. Runtime-only: set by the
 /// deserializer and the registry loader, never serialized itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -235,15 +263,15 @@ pub struct ModelEndpoint {
     /// What darkmux manages here: `"lmstudio"`, or absent for none (see
     /// [`EndpointKind`] and the legacy rule on `url`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed: Option<ManagedBackend>,
+    pub managed: Option<Lenient<ManagedBackend>>,
     /// The request shape, when it differs from the kind's default
     /// ([`EndpointKind::default_dialect`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dialect: Option<Dialect>,
+    pub dialect: Option<Lenient<Dialect>>,
     /// Standard usage limits (the shape only; not enforced yet, see
     /// [`UsageLimits`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limits: Option<UsageLimits>,
+    pub limits: Option<Lenient<UsageLimits>>,
     /// How this value was written. Runtime-only.
     #[serde(skip)]
     pub source: EndpointSource,
@@ -287,21 +315,80 @@ impl ModelEndpoint {
         if let EndpointSource::Unresolved(id) = &self.source {
             return Err(EndpointError(format!(
                 "darkmux: endpoint `{id}` is named by id but the profile registry's `endpoints` map \
-                 does not define it. Add `\"endpoints\": {{ \"{id}\": {{ ... }} }}` to profiles.json \
-                 (or fix the id); `darkmux doctor` lists every dangling reference. (#2902)"
+                 does not define it, or its entry failed to parse and was quarantined. Add or fix \
+                 `\"endpoints\": {{ \"{id}\": {{ ... }} }}` in profiles.json (or fix the id); \
+                 `darkmux doctor` names which. (#2902)"
             )));
         }
-        Ok(match (self.managed, &self.url) {
-            (Some(backend), _) => EndpointKind::Managed(backend),
+        let kind = match (&self.managed, &self.url) {
+            (Some(Lenient::Known(backend)), _) => EndpointKind::Managed(*backend),
+            (Some(Lenient::Unrecognized(raw)), _) => {
+                return Err(EndpointError(format!(
+                    "darkmux: endpoint `managed` is {raw}, which this darkmux does not know (it knows \
+                     \"lmstudio\", or no `managed` for an endpoint darkmux only sends requests to). \
+                     A newer darkmux may have written it; `darkmux doctor` names the entry. (#2902)"
+                )))
+            }
             (None, None) => EndpointKind::Managed(ManagedBackend::Lmstudio),
             (None, Some(_)) => EndpointKind::Unmanaged,
-        })
+        };
+        // (#2902 review M3, C5) A managed endpoint's address is the machine's
+        // `lmstudio_url` and its request shape is LM Studio's. Declaring
+        // either otherwise is refused here, at use, rather than silently
+        // sent to the local LM Studio. Only an EXPLICIT `managed` refuses a
+        // `url`/`api_version` (without one, a `url` means unmanaged, and the
+        // pre-4.0 inline `{api_version}` shape keeps reading as before; doctor
+        // names it); a declared `dialect` is new in 4.0, so no config predates
+        // the refusal.
+        if kind.is_managed() {
+            let explicit = self.managed.is_some();
+            if explicit && self.url.is_some() {
+                return Err(EndpointError(format!(
+                    "darkmux: a managed endpoint has no `url` of its own; darkmux sends to the \
+                     machine's LM Studio at `lmstudio_url`. Drop `url` (and set \
+                     `darkmux config set lmstudio_url <url>` if the server moved), or drop `managed` \
+                     if darkmux should only send requests to {}. (#2902)",
+                    self.url.as_deref().unwrap_or_default()
+                )));
+            }
+            if explicit && self.api_version.is_some() {
+                return Err(EndpointError(
+                    "darkmux: `api_version` belongs to an unmanaged endpoint's URL; a managed \
+                     endpoint never sends it. Drop `api_version`, or drop `managed`. (#2902)"
+                        .to_string(),
+                ));
+            }
+            match &self.dialect {
+                None | Some(Lenient::Known(Dialect::ChatCompletionsMaxTokens)) => {}
+                Some(d) => {
+                    let named = match d {
+                        Lenient::Known(k) => format!("\"{}\"", k.as_str()),
+                        Lenient::Unrecognized(raw) => raw.to_string(),
+                    };
+                    return Err(EndpointError(format!(
+                        "darkmux: a managed (LM Studio) endpoint speaks \"{}\"; its declared \
+                         `dialect` {named} would not be honored. Drop `dialect`. (#2902)",
+                        Dialect::ChatCompletionsMaxTokens.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(kind)
     }
 
     /// The request shape: declared, else the kind's default.
     pub fn resolved_dialect(&self) -> Result<Dialect, EndpointError> {
         let kind = self.kind()?;
-        Ok(self.dialect.unwrap_or_else(|| kind.default_dialect()))
+        match &self.dialect {
+            None => Ok(kind.default_dialect()),
+            Some(Lenient::Known(d)) => Ok(*d),
+            Some(Lenient::Unrecognized(raw)) => Err(EndpointError(format!(
+                "darkmux: endpoint `dialect` is {raw}, which this darkmux does not know (it knows \
+                 \"{}\" and \"{}\"). (#2902)",
+                Dialect::ChatCompletions.as_str(),
+                Dialect::ChatCompletionsMaxTokens.as_str()
+            ))),
+        }
     }
 
     /// THE chat-completions URL builder. Managed: the configured LM Studio
@@ -323,6 +410,16 @@ impl ModelEndpoint {
         }
     }
 
+    /// The limits line for doctor: the summary, `(unreadable)` when the
+    /// value did not parse, empty when none are set.
+    pub fn limits_summary(&self) -> String {
+        match &self.limits {
+            None => String::new(),
+            Some(Lenient::Known(l)) => l.summary(),
+            Some(Lenient::Unrecognized(_)) => "(unreadable)".to_string(),
+        }
+    }
+
     /// The host (authority, userinfo stripped) of an unmanaged endpoint's
     /// URL, for labels and debug lines. `None` for a managed endpoint. Never
     /// the path (an Azure deployment URL embeds the deployment name) and
@@ -338,25 +435,16 @@ impl ModelEndpoint {
     /// presence is `darkmux doctor`'s live check). Returns the reason.
     pub fn validate(&self) -> Result<(), String> {
         let kind = self.kind().map_err(|e| e.0)?;
+        let dialect = self.resolved_dialect().map_err(|e| e.0)?;
         if let Some(u) = &self.url {
             if !(u.starts_with("http://") || u.starts_with("https://")) {
                 return Err(format!("endpoint.url must start with http:// or https:// (got {u:?})"));
-            }
-            if kind.is_managed() {
-                return Err(format!(
-                    "a managed endpoint has no `url` of its own: darkmux dispatches to the machine's \
-                     LM Studio at `lmstudio_url` (`darkmux config set lmstudio_url {u}`). Drop `url`, \
-                     or drop `managed` if darkmux should only send requests there"
-                ));
             }
         }
         if self.api_version.is_some() && kind.is_managed() {
             return Err("`api_version` applies to an unmanaged endpoint's URL; a managed endpoint never sends it".to_string());
         }
-        if self.reasoning_effort.is_some()
-            && self.resolved_dialect().map_err(|e| e.0)? == Dialect::ChatCompletionsMaxTokens
-            && self.dialect.is_some()
-        {
+        if self.reasoning_effort.is_some() && dialect == Dialect::ChatCompletionsMaxTokens && self.dialect.is_some() {
             return Err(format!(
                 "`reasoning_effort` is never sent in the `{}` dialect; drop one of the two",
                 Dialect::ChatCompletionsMaxTokens.as_str()
@@ -375,8 +463,15 @@ impl ModelEndpoint {
                     .to_string());
             }
         }
-        if let Some(limits) = &self.limits {
-            limits.validate()?;
+        match &self.limits {
+            None => {}
+            Some(Lenient::Known(limits)) => limits.validate()?,
+            Some(Lenient::Unrecognized(raw)) => {
+                return Err(format!(
+                    "`limits` could not be read ({raw}): expect `tokens_per_dispatch` and \
+                     `concurrent_calls` as numbers and a `window` object"
+                ))
+            }
         }
         Ok(())
     }
@@ -580,7 +675,7 @@ mod tests {
         assert_eq!(hosted.resolved_dialect().unwrap(), Dialect::ChatCompletions);
         let declared = ModelEndpoint {
             url: Some("https://h/v1".into()),
-            dialect: Some(Dialect::ChatCompletionsMaxTokens),
+            dialect: Some(Dialect::ChatCompletionsMaxTokens.into()),
             ..Default::default()
         };
         assert_eq!(declared.resolved_dialect().unwrap(), Dialect::ChatCompletionsMaxTokens);
@@ -626,13 +721,13 @@ mod tests {
         assert!(bad.validate().unwrap_err().contains("http://"));
         let managed_with_url = ModelEndpoint {
             url: Some("http://localhost:1234".into()),
-            managed: Some(ManagedBackend::Lmstudio),
+            managed: Some(ManagedBackend::Lmstudio.into()),
             ..Default::default()
         };
         assert!(managed_with_url.validate().unwrap_err().contains("lmstudio_url"));
         let effort_ignored = ModelEndpoint {
             url: Some("https://h/v1".into()),
-            dialect: Some(Dialect::ChatCompletionsMaxTokens),
+            dialect: Some(Dialect::ChatCompletionsMaxTokens.into()),
             reasoning_effort: Some("high".into()),
             ..Default::default()
         };
@@ -645,10 +740,13 @@ mod tests {
         assert!(no_source.validate().is_err());
         let bad_limits = ModelEndpoint {
             url: Some("https://h/v1".into()),
-            limits: Some(UsageLimits {
-                window: Some(UsageWindow { period: Some("weekly".into()), tokens: Some(1), ..Default::default() }),
-                ..Default::default()
-            }),
+            limits: Some(
+                UsageLimits {
+                    window: Some(UsageWindow { period: Some("weekly".into()), tokens: Some(1), ..Default::default() }),
+                    ..Default::default()
+                }
+                .into(),
+            ),
             ..Default::default()
         };
         assert!(bad_limits.validate().unwrap_err().contains("period"));
@@ -660,7 +758,7 @@ mod tests {
                 keychain: Some("item".into()),
                 ..Default::default()
             }),
-            limits: Some(UsageLimits { tokens_per_dispatch: Some(5), ..Default::default() }),
+            limits: Some(UsageLimits { tokens_per_dispatch: Some(5), ..Default::default() }.into()),
             ..Default::default()
         };
         assert_eq!(ok.validate(), Ok(()));
@@ -706,7 +804,7 @@ mod tests {
         assert_eq!(ep.source, EndpointSource::Named("azure".into()));
         assert_eq!(ep.url.as_deref(), Some("https://h.example/v1"));
         assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
-        assert_eq!(ep.limits.as_ref().unwrap().tokens_per_dispatch, Some(5));
+        assert_eq!(ep.limits.as_ref().unwrap().known().unwrap().tokens_per_dispatch, Some(5));
         let out = serde_json::to_value(&r).unwrap();
         assert_eq!(out["profiles"]["p"]["models"][0]["endpoint"], "azure", "written back as the id");
         assert_eq!(out["endpoints"]["azure"]["url"], "https://h.example/v1");
@@ -740,6 +838,58 @@ mod tests {
         assert!(!errors.iter().any(|m| m.contains("model \"a\"") && m.contains("n_ctx")), "an unresolved endpoint is not a managed model missing n_ctx");
         assert_eq!(advice.len(), 1, "{advice:?}");
         assert!(advice[0].contains("model \"b\"") && advice[0].contains("endpoints.\"inline.example\""), "{advice:?}");
+    }
+
+    /// (#2902 review M1) The three new fields read leniently: a value this
+    /// binary does not know (a NEWER darkmux's `"managed": "machine"`, a
+    /// typo'd dialect, a limit written as a string) never fails the parse,
+    /// round-trips as written, and is refused where it matters: at use for
+    /// `managed`/`dialect` (they decide routing), in `validate` for all three.
+    #[test]
+    fn unknown_values_in_the_new_fields_read_leniently_and_are_refused_at_use() {
+        let dialect = pm(r#"{"id":"m","endpoint":{"url":"https://h/v1","dialect":"responses"}}"#);
+        let ep = dialect.endpoint.as_ref().unwrap();
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged);
+        assert!(ep.resolved_dialect().unwrap_err().to_string().contains("responses"));
+        assert!(ep.validate().unwrap_err().contains("responses"));
+        assert_eq!(serde_json::to_value(&dialect).unwrap()["endpoint"]["dialect"], "responses", "written back as read");
+
+        let managed = pm(r#"{"id":"m","n_ctx":1,"endpoint":{"managed":"machine"}}"#);
+        let err = managed.endpoint_kind().unwrap_err().to_string();
+        assert!(err.contains("machine") && err.contains("lmstudio"), "{err}");
+        assert!(!managed.is_managed(), "an unknown kind is never loaded on a guess");
+
+        let limits = pm(r#"{"id":"m","endpoint":{"url":"https://h/v1","limits":{"tokens_per_dispatch":"500k"}}}"#);
+        let ep = limits.endpoint.as_ref().unwrap();
+        assert_eq!(ep.kind().unwrap(), EndpointKind::Unmanaged, "limits are not enforced, so they never block a call");
+        assert!(ep.validate().unwrap_err().contains("limits"), "{:?}", ep.validate());
+        assert_eq!(ep.limits_summary(), "(unreadable)");
+    }
+
+    /// (#2902 review M3, C5) A managed endpoint's address is `lmstudio_url`
+    /// and its request shape is LM Studio's: an explicit `managed` that also
+    /// declares a `url`, an `api_version` or another dialect is refused at
+    /// use (never silently sent to the local LM Studio). The pre-4.0 inline
+    /// shape (no `managed`, no `url`) keeps reading as before; validate()
+    /// still names what it ignores.
+    #[test]
+    fn a_managed_endpoint_that_declares_an_address_or_dialect_is_refused_at_use() {
+        for (json, needle) in [
+            (r#"{"managed":"lmstudio","url":"http://h:1234"}"#, "lmstudio_url"),
+            (r#"{"managed":"lmstudio","api_version":"v1"}"#, "api_version"),
+            (r#"{"managed":"lmstudio","dialect":"chat-completions"}"#, "dialect"),
+            (r#"{"dialect":"chat-completions"}"#, "dialect"),
+        ] {
+            let ep: ModelEndpoint = serde_json::from_str(json).unwrap();
+            let err = ep.kind().unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+            assert!(ep.chat_url().is_err(), "{json}");
+        }
+        let ok: ModelEndpoint = serde_json::from_str(r#"{"managed":"lmstudio","dialect":"chat-completions-max-tokens"}"#).unwrap();
+        assert_eq!(ok.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio));
+        let legacy: ModelEndpoint = serde_json::from_str(r#"{"api_version":"v1"}"#).unwrap();
+        assert_eq!(legacy.kind().unwrap(), EndpointKind::Managed(ManagedBackend::Lmstudio), "pre-4.0 shape unchanged");
+        assert!(legacy.validate().unwrap_err().contains("api_version"));
     }
 
     #[test]

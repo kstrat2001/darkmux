@@ -4217,10 +4217,7 @@ fn endpoints_status(registry: &darkmux_types::ProfileRegistry) -> Check {
             Some(darkmux_types::CredentialSource::Keychain(k)) => format!("credential from Keychain `{k}`"),
             Some(darkmux_types::CredentialSource::Missing { .. }) => "credential unresolved".to_string(),
         };
-        let limits = ep
-            .limits
-            .as_ref()
-            .map(|l| l.summary())
+        let limits = Some(ep.limits_summary())
             .filter(|s| !s.is_empty())
             .map(|s| format!("; limits {s} (not enforced yet, #2902 step 5)"))
             .unwrap_or_default();

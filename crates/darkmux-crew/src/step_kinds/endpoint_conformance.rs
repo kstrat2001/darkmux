@@ -49,6 +49,7 @@ const FORBIDDEN: &[Idiom] = &[
 /// The homes: `(workspace-relative file, pattern, count, why)`.
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("crates/darkmux-types/src/endpoint.rs", "/chat/completions", 3, "THE chat-URL builder: the unmanaged form with and without api-version, and the LM Studio form"),
+    ("crates/darkmux-types/src/endpoint.rs", ".url.is_some()", 1, "THE classification (kind): an explicit managed endpoint that also declares a url is refused"),
     ("crates/darkmux-types/src/endpoint.rs", ".key_env", 3, "THE credential order (credential_source), and validate()'s source check with its message"),
     ("crates/darkmux-crew/src/dispatch_internal.rs", ".key_env", 2, "resolve_endpoint_secret's Keychain-read hint naming the variable to export (message text), downstream of credential_source"),
     ("crates/darkmux-doctor/src/lib.rs", ".key_env", 1, "a message naming the field `endpoint.auth.key_env`"),

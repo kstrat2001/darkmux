@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use endpoint::{
-    CredentialSource, Dialect, EndpointAuth, EndpointAuthType, EndpointError, EndpointKind, EndpointSource,
+    CredentialSource, Dialect, Lenient, EndpointAuth, EndpointAuthType, EndpointError, EndpointKind, EndpointSource,
     ManagedBackend, ModelEndpoint, UsageLimits, UsageWindow,
 };
 
@@ -606,12 +606,16 @@ pub struct QuarantinedEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuarantinedEntryKind {
     Profile,
+    /// (#2902 review M1) An `endpoints` entry: a model naming it reads as an
+    /// unresolved reference, refused at use.
+    Endpoint,
 }
 
 impl std::fmt::Display for QuarantinedEntryKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QuarantinedEntryKind::Profile => write!(f, "profile"),
+            QuarantinedEntryKind::Endpoint => write!(f, "endpoint"),
         }
     }
 }
@@ -740,16 +744,24 @@ impl ProfileRegistry {
     /// loader; a registry parsed some other way reads id references as
     /// unresolved, never as the managed default.
     pub fn materialize_endpoints(&mut self) {
+        let endpoints = std::mem::take(&mut self.endpoints);
         for profile in self.profiles.values_mut() {
             for model in &mut profile.models {
                 let Some(ep) = model.endpoint.as_mut() else { continue };
                 let Some(id) = ep.named_id().map(str::to_string) else { continue };
-                *ep = match self.endpoints.get(&id) {
-                    Some(def) => ModelEndpoint { source: EndpointSource::Named(id), ..def.clone() },
-                    None => ModelEndpoint::reference(id),
-                };
+                *ep = named_endpoint(&endpoints, &id);
             }
         }
+        self.endpoints = endpoints;
+    }
+
+    /// (#2902) THE id lookup: `endpoints.<id>` as a named endpoint carrying
+    /// the definition's fields, or an unresolved reference when the map does
+    /// not define it (or its entry was quarantined). Shared by
+    /// [`Self::materialize_endpoints`] and a mission step's `config.endpoint`
+    /// id (`darkmux_crew::target::step_unmanaged_endpoint`).
+    pub fn endpoint_named(&self, id: &str) -> ModelEndpoint {
+        named_endpoint(&self.endpoints, id)
     }
 
     /// (#2902 step 4) THE registry validation: every rule about endpoints and
@@ -767,11 +779,20 @@ impl ProfileRegistry {
             for m in &profile.models {
                 if let Some(ep) = &m.endpoint {
                     match &ep.source {
-                        EndpointSource::Unresolved(id) => out.push(RegistryIssue::error(format!(
-                            "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", which `endpoints` \
-                             does not define",
-                            m.id
-                        ))),
+                        EndpointSource::Unresolved(id) => {
+                            let why = match self
+                                .quarantined
+                                .iter()
+                                .find(|q| q.kind == QuarantinedEntryKind::Endpoint && &q.name == id)
+                            {
+                                Some(q) => format!("whose `endpoints` entry is quarantined ({})", q.error),
+                                None => "which `endpoints` does not define".to_string(),
+                            };
+                            out.push(RegistryIssue::error(format!(
+                                "profile \"{pname}\" model \"{}\" names endpoint \"{id}\", {why}",
+                                m.id
+                            )))
+                        }
                         EndpointSource::Inline => {
                             if let Err(reason) = ep.validate() {
                                 out.push(RegistryIssue::error(format!(
@@ -813,6 +834,13 @@ impl ProfileRegistry {
                     name, q.error
                 )
             })
+    }
+}
+
+fn named_endpoint(endpoints: &BTreeMap<String, ModelEndpoint>, id: &str) -> ModelEndpoint {
+    match endpoints.get(id) {
+        Some(def) => ModelEndpoint { source: EndpointSource::Named(id.to_string()), ..def.clone() },
+        None => ModelEndpoint::reference(id),
     }
 }
 

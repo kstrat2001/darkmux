@@ -220,16 +220,8 @@ pub fn step_unmanaged_endpoint(
 ) -> Result<Option<ModelEndpoint>> {
     let Some(v) = config.get("endpoint") else { return Ok(None) };
     let ep: ModelEndpoint = match v {
-        serde_json::Value::String(id) => {
-            let loaded = darkmux_profiles::profiles::load_registry(config_path)?;
-            match loaded.registry.endpoints.get(id) {
-                Some(def) => ModelEndpoint {
-                    source: darkmux_types::EndpointSource::Named(id.clone()),
-                    ..def.clone()
-                },
-                None => ModelEndpoint::reference(id.clone()),
-            }
-        }
+        // The registry's own id lookup, the one `materialize_endpoints` uses.
+        serde_json::Value::String(id) => darkmux_profiles::profiles::load_registry(config_path)?.registry.endpoint_named(id),
         other => serde_json::from_value(other.clone())?,
     };
     Ok(match ep.kind()? {

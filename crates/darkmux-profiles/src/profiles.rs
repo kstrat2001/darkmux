@@ -166,6 +166,28 @@ fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
             map.remove(&q.name);
         }
     }
+    // (#2902 review M1) The `endpoints` map, one entry at a time, the same
+    // way: a structurally broken entry is quarantined alone, so one typo
+    // never stops every dispatch. A model naming it reads as unresolved
+    // (refused at use; `validate` names the quarantine). Unknown VALUES in
+    // `managed`/`dialect`/`limits` never reach here: those fields read
+    // leniently and are refused at use.
+    if let Some(map) = root.get_mut("endpoints").and_then(|v| v.as_object_mut()) {
+        let bad: Vec<QuarantinedEntry> = map
+            .iter()
+            .filter_map(|(name, entry)| {
+                serde_json::from_value::<darkmux_types::ModelEndpoint>(entry.clone()).err().map(|e| QuarantinedEntry {
+                    kind: QuarantinedEntryKind::Endpoint,
+                    name: name.clone(),
+                    error: e.to_string(),
+                })
+            })
+            .collect();
+        for q in &bad {
+            map.remove(&q.name);
+        }
+        quarantined.extend(bad);
+    }
 
     let mut registry: ProfileRegistry = serde_json::from_value(root)?;
     registry.quarantined = quarantined;
@@ -697,6 +719,44 @@ mod tests {
         assert_eq!(named.endpoint_kind().unwrap(), darkmux_types::EndpointKind::Unmanaged);
         let dangling = &get_profile(&loaded.registry, "dangling").unwrap().models[0];
         assert!(dangling.endpoint_kind().unwrap_err().to_string().contains("nope"));
+    }
+
+    /// (#2902 review M1) One bad `endpoints` entry never stops the registry
+    /// loading (contract 7): it is quarantined alone, like a profile entry;
+    /// a model naming it reads as unresolved (refused at use) and
+    /// `validate` names the quarantine. An entry with an unknown value in a
+    /// new field loads (read leniently) and is refused at use instead.
+    #[test]
+    fn a_bad_endpoints_entry_is_quarantined_alone() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("profiles.json");
+        write(
+            &p,
+            r#"{"profiles":{
+                    "local":{"models":[{"id":"m","n_ctx":1000}]},
+                    "on-bad":{"models":[{"id":"gpt","endpoint":"bad"}]},
+                    "on-good":{"models":[{"id":"gpt","endpoint":"good"}]}},
+                "endpoints":{
+                    "bad":{"url":5},
+                    "good":{"url":"https://h.example/v1"},
+                    "newer":{"managed":"machine"},
+                    "typo":{"url":"https://h.example/v1","dialect":"responses","limits":{"tokens_per_dispatch":"500k"}}},
+                "default_profile":"local"}"#,
+        );
+        let loaded = load_registry(Some(p.to_str().unwrap())).expect("one bad endpoint never fails the file");
+        let q: Vec<(String, String)> =
+            loaded.registry.quarantined.iter().map(|q| (q.kind.to_string(), q.name.clone())).collect();
+        assert_eq!(q, vec![("endpoint".to_string(), "bad".to_string())]);
+        assert!(loaded.registry.endpoints.contains_key("newer") && loaded.registry.endpoints.contains_key("typo"));
+        let on_bad = &get_profile(&loaded.registry, "on-bad").unwrap().models[0];
+        assert!(on_bad.endpoint_kind().unwrap_err().to_string().contains("bad"));
+        let on_good = &get_profile(&loaded.registry, "on-good").unwrap().models[0];
+        assert!(on_good.endpoint_kind().is_ok());
+        let issues: Vec<String> = loaded.registry.validate().into_iter().map(|i| i.message).collect();
+        assert!(
+            issues.iter().any(|m| m.contains("\"bad\"") && m.contains("quarantined")),
+            "the reference names the quarantine: {issues:?}"
+        );
     }
 
     /// A LOCAL model without `n_ctx` is also legal AT PARSE (lenient-on-read
