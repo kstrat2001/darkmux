@@ -2207,6 +2207,8 @@ fn run_with_sleeper(
             // dispatch there discards the work the checkpoint existed to
             // preserve.
             let attempted_generation = compactions.saturating_add(1);
+            // (#2915) Announce the attempt before the compactor is called.
+            trajectory.append_compaction_start(attempted_generation, compaction_cfg.compactor_model.as_deref());
             // (#2902 step 1b) Same accounting as the main loop's site.
             let mut compactor_calls = Vec::new();
             let summary_chars = match compaction_cfg.strategy {
@@ -4148,6 +4150,10 @@ fn run_with_sleeper(
                     // success the parsed output is persisted to
                     // `<RUNTIME_OUT_BASE>/.darkmux-runtime/compaction-<gen>.json`
                     // per #352 Step 5 "persistence falls out for free."
+                    // (#2915) Announce the attempt before the compactor is
+                    // called: the host shows "compacting" from this marker
+                    // until the calls' usage records land.
+                    trajectory.append_compaction_start(attempted_generation, compaction_cfg.compactor_model.as_deref());
                     // (#2902 step 1b) Every compactor call that got a reply,
                     // installed or refused, drained below into one
                     // `compaction.call` event each.
@@ -10411,6 +10417,26 @@ mod tests {
             raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         let calls: Vec<&serde_json::Value> =
             events.iter().filter(|v| v["type"] == "compaction.call").collect();
+        // (#2915) Every compaction attempt is announced BEFORE its calls:
+        // each `compaction.call` is preceded, since the previous call of a
+        // different generation, by a `compaction.start` of its own
+        // generation naming the compactor.
+        let mut open_generation: Option<u64> = None;
+        let mut starts = 0;
+        for e in &events {
+            if e["type"] == "compaction.start" {
+                starts += 1;
+                assert_eq!(e["requested_model"], "test-compactor", "{e}");
+                open_generation = e["generation"].as_u64();
+            } else if e["type"] == "compaction.call" {
+                assert_eq!(
+                    open_generation,
+                    e["generation"].as_u64(),
+                    "a compactor call must follow its own generation's `compaction.start`: {e}"
+                );
+            }
+        }
+        assert!(starts >= 2, "one start per compaction attempt");
         assert!(compactor_mock.hits() >= 2, "the scenario must compact more than once");
         assert_eq!(
             calls.len(),

@@ -77,8 +77,36 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.60.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.61.0";
 // Version history:
+//   1.61.0 (#2915, utility work is lean but VISIBLE): additive, three
+//           actions and one field.
+//
+//           `utility.start` (category `telemetry`, source `utility`): a
+//           utility job is starting. Payload: `job` (the
+//           `darkmux_crew::usage::UtilityJobKind` enum, `"compaction"` ·
+//           `"radio_routing"`), `model` (the wire id), `serves` (the session
+//           id of the execution the job serves; ABSENT when it serves none,
+//           as routing does) and `stall_after_seconds` (the job's own bound:
+//           the dispatch's inactivity window for a compaction, the call
+//           timeout for routing). `handle` is the job's role (`compactor` /
+//           `radio-router`), as on its usage record. Still lean: a routing
+//           start has no `session_id`; a compaction start keeps the session
+//           of the execution it serves, as its usage records do. No
+//           bookends, no run, no presence. Its usage record marks the end.
+//
+//           `utility.error` (same family, `Level::Warn`): a started job's
+//           model call failed. Payload `job`, `model`. The end of a job that
+//           has no usage record.
+//
+//           `telemetry.tokens` `job`: a `purpose: "utility"` usage record
+//           names its `UtilityJobKind`; work records carry no `job` key.
+//
+//           The compaction start comes from a new runtime trajectory event,
+//           `compaction.start`, written BEFORE the compactor call (every
+//           other compaction event is written after it), mapped by the
+//           host's trajectory tailer. Readers ignoring the new actions see
+//           1.60.0 unchanged.
 //   1.60.0 (#2914, the machine utility model, darkmux 4.0): additive, two
 //           readings.
 //

@@ -16801,6 +16801,60 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         );
     }
 
+    /// (#2915) The runtime's `compaction.start` (written BEFORE the
+    /// compactor call) becomes one `utility.start`: job `compaction`,
+    /// attributed to the compactor (handle + model), inside the execution it
+    /// serves (its session, and `serves` naming it), bounded by the
+    /// dispatch's inactivity window. No usage record (nothing was called
+    /// yet), no turn, and the specialist's totals are untouched. The later
+    /// `compaction.call`'s usage record then names the same job.
+    #[test]
+    #[serial]
+    fn compaction_start_becomes_one_utility_start_for_the_served_execution() {
+        let (records, summary) = tail_events_for_usage(
+            "sess-utility-start",
+            &[
+                r#"{"type":"compaction.start","generation":3,"requested_model":"darkmux:compactor-4b"}"#,
+                r#"{"type":"compaction.call","generation":3,"requested_model":"darkmux:compactor-4b","usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}"#,
+            ],
+        );
+        let starts: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["action"] == crate::usage::UTILITY_START_ACTION)
+            .collect();
+        assert_eq!(starts.len(), 1, "{records:#?}");
+        let st = starts[0];
+        assert_eq!(st["handle"], "compactor", "{st}");
+        assert_eq!(st["model"], "darkmux:compactor-4b", "{st}");
+        assert_eq!(st["session_id"], "sess-utility-start", "a compaction serves its execution: {st}");
+        assert_eq!(st["source"], crate::usage::UTILITY_SOURCE, "{st}");
+        let p = &st["payload"];
+        assert_eq!(p["job"], "compaction", "{p}");
+        assert_eq!(p["model"], "darkmux:compactor-4b", "{p}");
+        assert_eq!(p["serves"], "sess-utility-start", "{p}");
+        assert_eq!(p["stall_after_seconds"], 600, "the dispatch's inactivity window: {p}");
+        assert_eq!(p["generation"], 3, "{p}");
+        let start_at = records.iter().position(|r| r["action"] == crate::usage::UTILITY_START_ACTION).unwrap();
+        let usage_at = records.iter().position(|r| r["action"] == crate::usage::USAGE_ACTION).unwrap();
+        assert!(start_at < usage_at, "the start precedes the call's usage record");
+        assert_eq!(records[usage_at]["payload"]["job"], "compaction", "the end names the same job");
+        assert_eq!(summary.turns, 0);
+        assert_eq!(summary.compactions, 0, "a start is not an installed compaction");
+    }
+
+    /// (#2915) A `compaction.start` with no model (an older host that gave
+    /// the runtime none) takes the tailer's own compactor id.
+    #[test]
+    #[serial]
+    fn compaction_start_without_a_model_falls_back_to_the_tailers_compactor() {
+        let (records, _) = tail_events_for_usage(
+            "sess-utility-start-bare",
+            &[r#"{"type":"compaction.start","generation":1}"#],
+        );
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0]["payload"]["model"], "darkmux:compactor-4b");
+    }
+
     /// (#2902 step 1b) A compactor reply with no usage block is still one
     /// record, `token_source: "absent"`, no counts.
     #[test]

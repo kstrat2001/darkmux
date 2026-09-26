@@ -277,6 +277,28 @@ impl Trajectory {
         self.write_event(&event);
     }
 
+    /// (#2915) `compaction.start` — written BEFORE a compaction calls its
+    /// compactor, once per attempt. Every other compaction event
+    /// (`compaction.call`, `compaction`, `compaction.skipped`) is written
+    /// after the calls return, so without this the host had nothing to show
+    /// while a compaction ran and the viewer kept reading "processing
+    /// prompt". The host maps it to a `utility.start` flow record (job
+    /// `compaction`); the compactor calls' usage records mark the end.
+    ///
+    /// `requested_model` is the compactor model id the host resolved, ABSENT
+    /// (never null) when the runtime was given none.
+    pub fn append_compaction_start(&mut self, generation: u32, requested_model: Option<&str>) {
+        let mut event = serde_json::json!({
+            "type": "compaction.start",
+            "generation": generation,
+            "ts": unix_ms(),
+        });
+        if let Some(m) = requested_model {
+            event["requested_model"] = serde_json::json!(m);
+        }
+        self.write_event(&event);
+    }
+
     /// (#2902 step 1b) `compaction.call` — one per compactor model call that
     /// got a reply, whether or not the compaction it served was installed.
     ///
@@ -1938,6 +1960,29 @@ mod tests {
             body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines[0]["reported_model"], "served-a");
         assert!(lines[1].get("reported_model").is_none(), "{}", lines[1]);
+    }
+
+    /// (#2915) `compaction.start`: written BEFORE the compactor is called,
+    /// carrying the generation it serves and the compactor model. It is the
+    /// only compaction event written before the call; the host maps it to a
+    /// `utility.start` flow record.
+    #[test]
+    fn compaction_start_event_names_generation_and_model() {
+        let ws = tempfile::Builder::new().prefix("traj-compaction-start").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_compaction_start(4, Some("darkmux:compactor-4b"));
+        t.append_compaction_start(5, None);
+        drop(t);
+        let body =
+            fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> =
+            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "compaction.start");
+        assert_eq!(lines[0]["generation"], 4);
+        assert_eq!(lines[0]["requested_model"], "darkmux:compactor-4b");
+        assert!(lines[0]["ts"].is_number());
+        assert!(lines[1].get("requested_model").is_none(), "absent, never null: {}", lines[1]);
     }
 
     /// (#2902 step 1b) One `compaction.call` event per compactor model call:
