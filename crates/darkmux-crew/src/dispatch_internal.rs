@@ -2479,11 +2479,7 @@ fn resolve_role_aware_profile<'a>(
     profile_override: Option<&str>,
     registry: &'a darkmux_types::ProfileRegistry,
 ) -> Result<Option<(String, &'a darkmux_types::Profile)>> {
-    let mapped = if profile_override.is_none() {
-        darkmux_types::config_access::role_profile(role_id)
-    } else {
-        None
-    };
+    let mapped = role_profile_binding(Some(role_id), profile_override);
     resolve_role_aware_profile_with(role_id, profile_override, mapped, registry)
 }
 
@@ -5518,14 +5514,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     };
 
     // Resolve compaction (role override + utility model + context window).
-    let mut compaction = opts.compaction.clone();
-    compaction.apply_role_override(role);
-    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
-    compaction.apply_utility_model(utility_model.as_deref());
-    ensure_context_window(
-        &mut compaction,
-        resolve_context_window_internal(opts.profile_name.as_deref(), opts.config_path.as_deref())?,
-    );
+    // (#2905) One call over the dispatch's own inputs, so the role-aware
+    // window resolution is exercised by tests exactly as it runs here.
+    let DispatchCompaction { mut compaction, compactor_n_ctx, utility_model } =
+        resolve_dispatch_compaction(role, &opts)?;
 
     // (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
     // CONTEXT — namespaced — before the container starts, exactly as the
@@ -5545,8 +5537,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // TRIGGER formula). Passing that same number as the LOAD ctx for a
     // DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
     // compactor silently loaded at the primary's 262144-token window instead
-    // of its own declared 120000. `resolve_compactor_n_ctx_internal` looks the
-    // compactor's id up in the active profile's own `models[]`; the primary's
+    // of its own declared 120000. `resolve_dispatch_windows_with` looks the
+    // compactor's id up in the resolved profile's own `models[]`; the primary's
     // window is used ONLY when the compactor declares none there, and that
     // fallback is named in the load message (operator sovereignty, #44) —
     // never silently substituted.
@@ -5561,11 +5553,6 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // `ensure_utility_resident`'s doc.
     if opts.model_base_url_override.is_none() {
         if let Some(compactor_id) = compaction.compactor_model.clone() {
-            let compactor_n_ctx = resolve_compactor_n_ctx_internal(
-                opts.profile_name.as_deref(),
-                opts.config_path.as_deref(),
-                &compactor_id,
-            )?;
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
             if let Some(window) = load_window {
@@ -11521,38 +11508,110 @@ fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
         .and_then(|l| l.registry.utility_model_id().map(str::to_string))
 }
 
+/// (#2905) What `dispatch()` resolves about compaction before the container
+/// starts: the args (role override, utility model, primary window applied),
+/// the compactor's own declared `n_ctx`, and the utility model binding.
+#[derive(Debug)]
+struct DispatchCompaction {
+    compaction: crate::dispatch::CompactionDispatchArgs,
+    compactor_n_ctx: Option<u32>,
+    utility_model: Option<String>,
+}
+
+/// (#2905) `dispatch()`'s compaction resolution, extracted so a test drives
+/// it with the SAME inputs `dispatch()` has (the role and the opts) and the
+/// live `role_profiles` binding read from config. ONE role-aware profile
+/// resolution feeds both the primary's compaction-trigger window and the
+/// compactor's own `n_ctx`, with the same precedence model selection uses:
+/// `--profile` > `role_profiles.<role>` > `default_profile`.
+fn resolve_dispatch_compaction(
+    role: &crate::types::Role,
+    opts: &crate::dispatch::DispatchOpts,
+) -> Result<DispatchCompaction> {
+    let mut compaction = opts.compaction.clone();
+    compaction.apply_role_override(role);
+    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
+    compaction.apply_utility_model(utility_model.as_deref());
+    let (primary_window, compactor_n_ctx) = resolve_dispatch_windows_with(
+        &role.id,
+        opts.profile_name.as_deref(),
+        role_profile_binding(Some(&role.id), opts.profile_name.as_deref()),
+        opts.config_path.as_deref(),
+        compaction.compactor_model.as_deref(),
+    )?;
+    ensure_context_window(&mut compaction, primary_window);
+    Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model })
+}
+
 /// (#632) Resolve the context window the runtime needs to compute its
-/// compaction threshold, from the active profile's default model.
-/// Mirrors the profile resolution in `resolve_dispatch_model_internal` (CLI
-/// `--profile` override > registry `default_profile`) and delegates the
-/// derivation to `CompactionDispatchArgs::from_profile` so the
+/// compaction threshold, from the resolved profile's default model.
+/// Delegates the derivation to `CompactionDispatchArgs::from_profile` so the
 /// default-model → `n_ctx` rule has a single source of truth. Returns
 /// `Ok(None)` when the registry/profile can't be resolved — the same edge
 /// cases that send model selection to `probe_loaded_model()` — and `Err`
 /// when the requested (or default) profile is QUARANTINED (#1282): the
 /// window must never silently come from a DIFFERENT profile than the one
 /// the dispatch names.
+///
+/// (#2905) `role_id` makes the resolution role-aware, with the SAME
+/// precedence model selection uses (`resolve_role_aware_profile`): an
+/// explicit `--profile` wins, then `role_profiles.<role>`, then
+/// `default_profile`. Pre-#2905 this read only `--profile` / default, so a
+/// role mapped to profile X ran X's model but compacted at the default
+/// profile's window. `None` is for a caller with no role in hand (the lab
+/// A/B brief sizing, where the workload manifest picks the role later).
 // `pub` so the mission-run brief path can size its proportional injected-context
 // budget (#1011) from the SAME profile resolver the runtime uses for its
 // compaction window. They share the resolver; a profile that declares no
 // `context_window` falls back independently on each side (the budget to its own
 // default), so they agree whenever the profile actually declares a window.
 pub fn resolve_context_window_internal(
+    role_id: Option<&str>,
     profile_override: Option<&str>,
     config_path: Option<&str>,
 ) -> Result<Option<u32>> {
-    let profile = resolve_active_profile_internal(profile_override, config_path)?;
-    Ok(profile.and_then(|p| crate::dispatch::CompactionDispatchArgs::from_profile(&p).context_window))
+    let profile = resolve_active_profile_internal(role_id, profile_override, config_path)?;
+    Ok(profile.as_ref().and_then(profile_context_window))
+}
+
+/// (#2905) The `role_profiles.<role>` binding a resolution should honor:
+/// read live from `config_access`, and only when no explicit `--profile`
+/// override was given (the override always wins, so the map is not even
+/// consulted). One place for this read, shared by `resolve_role_aware_profile`
+/// (model selection) and `resolve_active_profile_internal` (window + compactor
+/// `n_ctx`), so the two cannot consult the map under different conditions.
+fn role_profile_binding(role_id: Option<&str>, profile_override: Option<&str>) -> Option<String> {
+    match (role_id, profile_override) {
+        (Some(role_id), None) => darkmux_types::config_access::role_profile(role_id),
+        _ => None,
+    }
 }
 
 /// (#1616) The registry-resolution half of `resolve_context_window_internal`,
-/// extracted so a second caller — `resolve_compactor_n_ctx_internal` — can
-/// read the SAME active profile's `models[]` for a DIFFERENT model's `n_ctx`
-/// without duplicating the quarantine/fallback logic (and risking the two
-/// callers disagreeing about which profile is "active"). Owned `Profile`
-/// (not a borrow of `loaded`) since `loaded` doesn't outlive this call.
+/// extracted so the dispatch path can read the SAME resolved profile's
+/// `models[]` for a DIFFERENT model's `n_ctx` (the compactor's) without
+/// resolving twice. Owned `Profile` (not a borrow of `loaded`) since `loaded`
+/// doesn't outlive this call. Impure wrapper over
+/// [`resolve_active_profile_with`]: supplies the live `role_profiles` binding.
 fn resolve_active_profile_internal(
+    role_id: Option<&str>,
     profile_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Result<Option<darkmux_types::Profile>> {
+    let mapped = role_profile_binding(role_id, profile_override);
+    resolve_active_profile_with(role_id, profile_override, mapped, config_path)
+}
+
+/// (#2905) Pure-binding core of [`resolve_active_profile_internal`]: the
+/// `role_profiles` binding is supplied (`mapped`) rather than read live, so
+/// the mapped arm is unit-testable (`config_access` is hard-empty under test
+/// builds, #811). Precedence is `resolve_role_aware_profile_with`'s own — the
+/// function model selection chains through — so the window and the model can
+/// only come from different profiles if the registry changes mid-dispatch.
+fn resolve_active_profile_with(
+    role_id: Option<&str>,
+    profile_override: Option<&str>,
+    mapped: Option<String>,
     config_path: Option<&str>,
 ) -> Result<Option<darkmux_types::Profile>> {
     let Ok(loaded) = darkmux_profiles::profiles::load_registry(config_path) else {
@@ -11567,9 +11626,16 @@ fn resolve_active_profile_internal(
         }
     }
     // (#1054) Same graceful resolution as model selection — a requested profile
-    // undefined here falls back to default_profile, so the context window comes
-    // from the SAME profile the model does.
-    let Some((_active_name, profile)) = loaded.registry.resolve_active(profile_override) else {
+    // undefined here falls back to default_profile. (#2905) Through the SAME
+    // role-aware core model selection uses, so the context window comes from
+    // the same profile the model does, `role_profiles` mapping included.
+    let resolved = resolve_role_aware_profile_with(
+        role_id.unwrap_or_default(),
+        profile_override,
+        mapped,
+        &loaded.registry,
+    )?;
+    let Some((_active_name, profile)) = resolved else {
         // (#1282) A quarantined `default_profile` hard-fails rather than
         // reporting "no window" for a profile that IS in the file, broken.
         if let Some(default_name) = loaded.registry.default_profile.as_deref() {
@@ -11582,29 +11648,50 @@ fn resolve_active_profile_internal(
     Ok(Some(profile.clone()))
 }
 
+/// (#632) The compaction-trigger window of a resolved profile: its default
+/// model's declared `n_ctx`, via `CompactionDispatchArgs::from_profile`.
+fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
+    crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
+}
+
 /// (#1616) The compactor/utility model's OWN declared `n_ctx`, looked up by
-/// id in the ACTIVE profile's `models[]` — never the primary/default model's
-/// context window `resolve_context_window_internal` returns (that value
-/// feeds the compaction TRIGGER formula and belongs to a DIFFERENT model).
-/// `None` when the active profile carries no entry for this model id, or an
-/// entry with no `n_ctx` declared — the caller (`resolve_compactor_load_
-/// window`) then falls back to the primary's window and must say so.
+/// id in the resolved profile's `models[]` — never the primary/default model's
+/// context window (that value feeds the compaction TRIGGER formula and
+/// belongs to a DIFFERENT model). `None` when the profile carries no entry for
+/// this model id, or an entry with no `n_ctx` declared — the caller
+/// (`resolve_compactor_load_window`) then falls back to the primary's window
+/// and must say so.
 ///
 /// `bare_model_key`-normalized on both sides: a profile entry may name the
 /// model as either the bare key or the `darkmux:`-namespaced identifier (the
 /// same tolerance `ensure_model_loaded_at_ctx` already applies), and the
 /// machine-level `internal.utility` binding this id comes from is typically
 /// namespaced.
-fn resolve_compactor_n_ctx_internal(
+fn profile_model_n_ctx(profile: &darkmux_types::Profile, model_id: &str) -> Option<u32> {
+    let want = bare_model_key(model_id);
+    profile.models.iter().find(|m| bare_model_key(&m.id) == want).and_then(|m| m.n_ctx)
+}
+
+/// (#2905) The dispatch's two compaction windows from ONE profile resolution:
+/// the primary's compaction-trigger window and the compactor's own declared
+/// `n_ctx` (`None` when no compactor is bound). Both are read off the same
+/// role-aware profile model selection resolved, so neither can come from
+/// `default_profile` while the model came from a `role_profiles` mapping.
+/// Takes the binding explicitly (`mapped`) so a test can drive the mapped arm.
+fn resolve_dispatch_windows_with(
+    role_id: &str,
     profile_override: Option<&str>,
+    mapped: Option<String>,
     config_path: Option<&str>,
-    compactor_model_id: &str,
-) -> Result<Option<u32>> {
-    let profile = resolve_active_profile_internal(profile_override, config_path)?;
-    let want = bare_model_key(compactor_model_id);
-    Ok(profile.and_then(|p| {
-        p.models.iter().find(|m| bare_model_key(&m.id) == want).and_then(|m| m.n_ctx)
-    }))
+    compactor_model_id: Option<&str>,
+) -> Result<(Option<u32>, Option<u32>)> {
+    let profile = resolve_active_profile_with(Some(role_id), profile_override, mapped, config_path)?;
+    let Some(profile) = profile else {
+        return Ok((None, None));
+    };
+    let window = profile_context_window(&profile);
+    let compactor_n_ctx = compactor_model_id.and_then(|id| profile_model_n_ctx(&profile, id));
+    Ok((window, compactor_n_ctx))
 }
 
 /// (#1616) Pick the window the compactor loads at: its OWN declared `n_ctx`

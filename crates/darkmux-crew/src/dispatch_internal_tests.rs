@@ -1591,7 +1591,7 @@
         let prev = std::env::var("DARKMUX_PROFILES").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        let from_flag = resolve_context_window_internal(None, pf.to_str()).unwrap();
+        let from_flag = resolve_context_window_internal(None, None, pf.to_str()).unwrap();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
@@ -1668,7 +1668,7 @@
         let prev = std::env::var("DARKMUX_PROFILES").ok();
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        let window = resolve_context_window_internal(None, pf.to_str()).unwrap();
+        let window = resolve_context_window_internal(None, None, pf.to_str()).unwrap();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
@@ -1772,12 +1772,12 @@
                 "default_profile":"fast"}"#,
         )
         .unwrap();
-        let err = resolve_context_window_internal(Some("review"), pf.to_str()).unwrap_err();
+        let err = resolve_context_window_internal(None, Some("review"), pf.to_str()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("quarantined") && msg.contains("\"review\""), "got: {msg}");
 
         // A healthy requested profile on the same registry still resolves.
-        let window = resolve_context_window_internal(Some("fast"), pf.to_str()).unwrap();
+        let window = resolve_context_window_internal(None, Some("fast"), pf.to_str()).unwrap();
         assert_eq!(window, Some(32000));
     }
 
@@ -1856,6 +1856,160 @@
             msg.contains("config set role_profiles.coder"),
             "hint names the fix: {msg}"
         );
+    }
+
+    // ─── #2905: the compaction windows come from the role-aware profile ───
+    // Model selection honors `role_profiles.<role>`; the compaction window and
+    // the compactor's `n_ctx` must come from that SAME profile, not from
+    // `default_profile`. The registry: `default_profile` = `fast` (primary
+    // 32000, compactor 16000); `big` (primary 128000, compactor 64000).
+    fn role_windows_registry(state: &darkmux_types::test_isolation::IsolatedState) -> std::path::PathBuf {
+        let pf = state.join("profiles-2905.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"default_model":"model-fast","models":[
+                        {"id":"model-fast","n_ctx":32000},
+                        {"id":"util-4b","n_ctx":16000}
+                    ]},
+                    "big":{"default_model":"model-big","models":[
+                        {"id":"model-big","n_ctx":128000},
+                        {"id":"util-4b","n_ctx":64000}
+                    ]}
+                },
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        pf
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_windows_follow_the_role_profiles_mapping() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = role_windows_registry(&state);
+        // The model side: role_profiles.coder=big resolves the `big` profile.
+        let reg = darkmux_profiles::profiles::load_registry(pf.to_str()).unwrap().registry;
+        let (model_profile, _) =
+            resolve_role_aware_profile_with("coder", None, Some("big".to_string()), &reg).unwrap().unwrap();
+        assert_eq!(model_profile, "big", "precondition: the model comes from the mapped profile");
+        // The window side must agree: `big`'s 128000, not `fast`'s 32000.
+        let (window, compactor_n_ctx) = resolve_dispatch_windows_with(
+            "coder",
+            None,
+            Some("big".to_string()),
+            pf.to_str(),
+            Some("darkmux:util-4b"),
+        )
+        .unwrap();
+        assert_eq!(window, Some(128_000), "a role mapped to `big` must compact at `big`'s window, not default_profile's");
+        assert_eq!(compactor_n_ctx, Some(64_000), "the compactor's n_ctx must come from the mapped profile too");
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_windows_explicit_profile_wins_over_the_role_mapping() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = role_windows_registry(&state);
+        let (window, compactor_n_ctx) = resolve_dispatch_windows_with(
+            "coder",
+            Some("fast"),
+            Some("big".to_string()),
+            pf.to_str(),
+            Some("util-4b"),
+        )
+        .unwrap();
+        assert_eq!(window, Some(32_000), "an explicit --profile still wins over role_profiles");
+        assert_eq!(compactor_n_ctx, Some(16_000));
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_windows_unmapped_role_uses_default_profile() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = role_windows_registry(&state);
+        let (window, compactor_n_ctx) =
+            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("util-4b")).unwrap();
+        assert_eq!(window, Some(32_000), "no mapping, no override: default_profile's window");
+        assert_eq!(compactor_n_ctx, Some(16_000));
+        // No compactor bound: the window still resolves, the compactor n_ctx is None.
+        let (window, compactor_n_ctx) =
+            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), None).unwrap();
+        assert_eq!((window, compactor_n_ctx), (Some(32_000), None));
+    }
+
+    /// (#2905 review) The CALL-SITE test. Every `resolve_dispatch_windows_with`
+    /// test above supplies the binding by hand, so replacing the live
+    /// `role_profile_binding(..)` read with `None` left the crate green. This
+    /// drives `resolve_dispatch_compaction` — the function `dispatch()` calls
+    /// with its own role and opts — with `role_profiles` set through the
+    /// config tier, the way production reads it.
+    #[test]
+    #[serial]
+    fn dispatch_compaction_reads_role_profiles_from_config() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2905-live.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"default_model":"model-fast","models":[
+                        {"id":"model-fast","n_ctx":32000},
+                        {"id":"util-4b","n_ctx":16000}
+                    ]},
+                    "big":{"default_model":"model-big","models":[
+                        {"id":"model-big","n_ctx":128000},
+                        {"id":"util-4b","n_ctx":64000}
+                    ]}
+                },
+                "internal":{"utility":"util-4b"},
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        let role: crate::types::Role = serde_json::from_str(
+            r#"{"id":"coder","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+
+        // Unmapped (no config override installed): default_profile's windows.
+        let unmapped = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(unmapped.compaction.context_window, Some(32_000));
+        assert_eq!(unmapped.compactor_n_ctx, Some(16_000));
+
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            role_profiles: Some([("coder".to_string(), "big".to_string())].into_iter().collect()),
+            ..Default::default()
+        };
+        let _guard = darkmux_types::config_access::set_config_for_test(cfg);
+
+        let mapped = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(
+            mapped.compaction.context_window,
+            Some(128_000),
+            "role_profiles.coder=big (from config) must size the compaction window from `big`"
+        );
+        assert_eq!(mapped.compactor_n_ctx, Some(64_000), "and the compactor n_ctx from `big` too");
+        assert_eq!(mapped.utility_model.as_deref(), Some("util-4b"));
+
+        // An explicit --profile still wins over the configured mapping.
+        opts.profile_name = Some("fast".to_string());
+        let explicit = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(explicit.compaction.context_window, Some(32_000));
+        assert_eq!(explicit.compactor_n_ctx, Some(16_000));
+    }
+
+    #[test]
+    #[serial]
+    fn dispatch_windows_dangling_role_mapping_is_a_loud_error() {
+        // Same posture as model selection (contract 7): a binding to a profile
+        // the registry lacks errs rather than sizing from default_profile.
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = role_windows_registry(&state);
+        let err = resolve_dispatch_windows_with("coder", None, Some("ghost".to_string()), pf.to_str(), None)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("ghost"), "got: {err:#}");
     }
 
     // ─── #1616: the compactor loads at ITS OWN declared n_ctx ──────────
@@ -1957,8 +2111,8 @@
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
         let compactor_n_ctx =
-            resolve_compactor_n_ctx_internal(None, pf.to_str(), "darkmux:util-4b").unwrap();
-        let primary_window = resolve_context_window_internal(None, pf.to_str()).unwrap();
+            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("darkmux:util-4b")).unwrap().1;
+        let primary_window = resolve_context_window_internal(None, None, pf.to_str()).unwrap();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
@@ -1995,7 +2149,7 @@
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
         // Ask with the NAMESPACED form; the registry entry is bare.
         let compactor_n_ctx =
-            resolve_compactor_n_ctx_internal(None, pf.to_str(), "darkmux:util-4b").unwrap();
+            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("darkmux:util-4b")).unwrap().1;
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
@@ -2025,7 +2179,7 @@
         // SAFETY: serialized via #[serial]; restored below.
         unsafe { std::env::remove_var("DARKMUX_PROFILES") };
         let compactor_n_ctx =
-            resolve_compactor_n_ctx_internal(None, pf.to_str(), "darkmux:util-4b").unwrap();
+            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("darkmux:util-4b")).unwrap().1;
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
