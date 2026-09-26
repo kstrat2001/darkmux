@@ -1858,11 +1858,13 @@
         );
     }
 
-    // ─── #2905: the compaction windows come from the role-aware profile ───
-    // Model selection honors `role_profiles.<role>`; the compaction window and
-    // the compactor's `n_ctx` must come from that SAME profile, not from
-    // `default_profile`. The registry: `default_profile` = `fast` (primary
-    // 32000, compactor 16000); `big` (primary 128000, compactor 64000).
+    // ─── #2905: the compaction window comes from the role-aware profile ───
+    // Model selection honors `role_profiles.<role>`; the compaction TRIGGER
+    // window must come from that SAME profile, not from `default_profile`.
+    // The registry: `default_profile` = `fast` (primary 32000); `big`
+    // (primary 128000). (#2914) Both profiles still list `util-4b` at a
+    // window of their own, a pre-4.0 leftover: the compactor's window must
+    // come from `internal.utility` (120000) and never from those entries.
     fn role_windows_registry(state: &darkmux_types::test_isolation::IsolatedState) -> std::path::PathBuf {
         let pf = state.join("profiles-2905.json");
         std::fs::write(
@@ -1877,6 +1879,7 @@
                         {"id":"util-4b","n_ctx":64000}
                     ]}
                 },
+                "internal":{"utility":{"id":"util-4b","n_ctx":120000}},
                 "default_profile":"fast"}"#,
         )
         .unwrap();
@@ -1894,16 +1897,8 @@
             resolve_role_aware_profile_with("coder", None, Some("big".to_string()), &reg).unwrap().unwrap();
         assert_eq!(model_profile, "big", "precondition: the model comes from the mapped profile");
         // The window side must agree: `big`'s 128000, not `fast`'s 32000.
-        let (window, compactor_n_ctx) = resolve_dispatch_windows_with(
-            "coder",
-            None,
-            Some("big".to_string()),
-            pf.to_str(),
-            Some("darkmux:util-4b"),
-        )
-        .unwrap();
+        let window = resolve_dispatch_windows_with("coder", None, Some("big".to_string()), pf.to_str()).unwrap();
         assert_eq!(window, Some(128_000), "a role mapped to `big` must compact at `big`'s window, not default_profile's");
-        assert_eq!(compactor_n_ctx, Some(64_000), "the compactor's n_ctx must come from the mapped profile too");
     }
 
     #[test]
@@ -1911,16 +1906,8 @@
     fn dispatch_windows_explicit_profile_wins_over_the_role_mapping() {
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let pf = role_windows_registry(&state);
-        let (window, compactor_n_ctx) = resolve_dispatch_windows_with(
-            "coder",
-            Some("fast"),
-            Some("big".to_string()),
-            pf.to_str(),
-            Some("util-4b"),
-        )
-        .unwrap();
+        let window = resolve_dispatch_windows_with("coder", Some("fast"), Some("big".to_string()), pf.to_str()).unwrap();
         assert_eq!(window, Some(32_000), "an explicit --profile still wins over role_profiles");
-        assert_eq!(compactor_n_ctx, Some(16_000));
     }
 
     #[test]
@@ -1928,14 +1915,76 @@
     fn dispatch_windows_unmapped_role_uses_default_profile() {
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let pf = role_windows_registry(&state);
-        let (window, compactor_n_ctx) =
-            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("util-4b")).unwrap();
+        let window = resolve_dispatch_windows_with("coder", None, None, pf.to_str()).unwrap();
         assert_eq!(window, Some(32_000), "no mapping, no override: default_profile's window");
-        assert_eq!(compactor_n_ctx, Some(16_000));
-        // No compactor bound: the window still resolves, the compactor n_ctx is None.
-        let (window, compactor_n_ctx) =
-            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), None).unwrap();
-        assert_eq!((window, compactor_n_ctx), (Some(32_000), None));
+    }
+
+    /// (#2914) The compactor's OWN window comes from `internal.utility`,
+    /// never from a profile's `models[]` entry for the same model. The
+    /// fixture lists `util-4b` in both profiles at 16000/64000 (a pre-4.0
+    /// leftover): every arm must read 120000, the binding's declaration.
+    #[test]
+    #[serial]
+    fn compactor_window_comes_from_internal_utility_never_from_a_profile_entry() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = role_windows_registry(&state);
+        let role: crate::types::Role = serde_json::from_str(
+            r#"{"id":"coder","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+
+        let unmapped = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(unmapped.compaction.context_window, Some(32_000), "the trigger window is still the profile's");
+        assert_eq!(
+            unmapped.compactor_n_ctx,
+            Some(120_000),
+            "the compactor loads at internal.utility's n_ctx, not the profile's 16000 leftover"
+        );
+        assert_eq!(unmapped.utility_model.as_deref(), Some("util-4b"));
+
+        opts.profile_name = Some("big".to_string());
+        let explicit = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(explicit.compaction.context_window, Some(128_000));
+        assert_eq!(explicit.compactor_n_ctx, Some(120_000), "switching profiles never changes the compactor's window");
+    }
+
+    /// (#2914) A bare-string binding declares no window: the compactor's
+    /// n_ctx is `None` (the caller then falls back to the primary's window
+    /// and SAYS so), even when a profile still lists the model with one.
+    #[test]
+    #[serial]
+    fn compactor_window_is_undeclared_for_a_bare_binding_even_when_a_profile_lists_the_model() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2914-bare.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"default_model":"model-fast","models":[
+                        {"id":"model-fast","n_ctx":32000},
+                        {"id":"util-4b","n_ctx":16000}
+                    ]}
+                },
+                "internal":{"utility":"darkmux:util-4b"},
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        let role: crate::types::Role = serde_json::from_str(
+            r#"{"id":"coder","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+        let resolved = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(resolved.compaction.context_window, Some(32_000));
+        assert_eq!(resolved.compactor_n_ctx, None, "a profile entry is not a source for the compactor's window");
+        // The fallback the caller then applies is the primary's window, reported.
+        let mut compaction = resolved.compaction;
+        let (window, used_fallback) = apply_compactor_window(&mut compaction, resolved.compactor_n_ctx);
+        assert_eq!((window, used_fallback), (Some(32_000), true));
     }
 
     /// (#2905 review) The CALL-SITE test. Every `resolve_dispatch_windows_with`
@@ -1961,7 +2010,7 @@
                         {"id":"util-4b","n_ctx":64000}
                     ]}
                 },
-                "internal":{"utility":"util-4b"},
+                "internal":{"utility":{"id":"util-4b","n_ctx":120000}},
                 "default_profile":"fast"}"#,
         )
         .unwrap();
@@ -1973,10 +2022,11 @@
         opts.role_id = "coder".to_string();
         opts.config_path = Some(pf.to_str().unwrap().to_string());
 
-        // Unmapped (no config override installed): default_profile's windows.
+        // Unmapped (no config override installed): default_profile's window;
+        // (#2914) the compactor's n_ctx is the binding's, in every arm.
         let unmapped = resolve_dispatch_compaction(&role, &opts).unwrap();
         assert_eq!(unmapped.compaction.context_window, Some(32_000));
-        assert_eq!(unmapped.compactor_n_ctx, Some(16_000));
+        assert_eq!(unmapped.compactor_n_ctx, Some(120_000));
 
         let cfg = darkmux_types::config::DarkmuxConfig {
             role_profiles: Some([("coder".to_string(), "big".to_string())].into_iter().collect()),
@@ -1990,14 +2040,14 @@
             Some(128_000),
             "role_profiles.coder=big (from config) must size the compaction window from `big`"
         );
-        assert_eq!(mapped.compactor_n_ctx, Some(64_000), "and the compactor n_ctx from `big` too");
+        assert_eq!(mapped.compactor_n_ctx, Some(120_000), "the compactor's n_ctx never follows the profile (#2914)");
         assert_eq!(mapped.utility_model.as_deref(), Some("util-4b"));
 
         // An explicit --profile still wins over the configured mapping.
         opts.profile_name = Some("fast".to_string());
         let explicit = resolve_dispatch_compaction(&role, &opts).unwrap();
         assert_eq!(explicit.compaction.context_window, Some(32_000));
-        assert_eq!(explicit.compactor_n_ctx, Some(16_000));
+        assert_eq!(explicit.compactor_n_ctx, Some(120_000));
     }
 
     #[test]
@@ -2007,8 +2057,7 @@
         // the registry lacks errs rather than sizing from default_profile.
         let state = darkmux_types::test_isolation::IsolatedState::new();
         let pf = role_windows_registry(&state);
-        let err = resolve_dispatch_windows_with("coder", None, Some("ghost".to_string()), pf.to_str(), None)
-            .unwrap_err();
+        let err = resolve_dispatch_windows_with("coder", None, Some("ghost".to_string()), pf.to_str()).unwrap_err();
         assert!(format!("{err:#}").contains("ghost"), "got: {err:#}");
     }
 
@@ -2086,108 +2135,14 @@
         assert!(used_fallback, "still a fallback attempt, even though it resolved to nothing");
     }
 
-    #[test]
-    #[serial]
-    fn resolve_compactor_n_ctx_internal_reads_the_compactor_s_own_registry_entry() {
-        // (#1616 reproduction) The `deep`-shaped profile: a big-context
-        // primary PLUS a small-context compactor, both declared in the same
-        // profile's `models[]`. Pre-fix, `resolve_context_window_internal`
-        // (the primary's window) was reused as the compactor's LOAD ctx —
-        // this resolver must instead find the compactor's OWN entry.
-        let tmp = TempDir::new().unwrap();
-        let pf = tmp.path().join("profiles.json");
-        std::fs::write(
-            &pf,
-            r#"{"profiles":{
-                    "deep":{"default_model":"primary-big","models":[
-                        {"id":"primary-big","n_ctx":262144},
-                        {"id":"darkmux:util-4b","n_ctx":120000}
-                    ]}
-                },
-                "default_profile":"deep"}"#,
-        )
-        .unwrap();
-        let prev = std::env::var("DARKMUX_PROFILES").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        let compactor_n_ctx =
-            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("darkmux:util-4b")).unwrap().1;
-        let primary_window = resolve_context_window_internal(None, None, pf.to_str()).unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
-                None => std::env::remove_var("DARKMUX_PROFILES"),
-            }
-        }
-        assert_eq!(compactor_n_ctx, Some(120_000), "must read the compactor's OWN entry, not the primary's");
-        assert_eq!(primary_window, Some(262_144), "the primary's own resolver must be untouched by the fix");
-        assert_ne!(compactor_n_ctx, primary_window, "precondition: the two models declare different sizes");
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_compactor_n_ctx_internal_matches_across_the_darkmux_namespace() {
-        // The machine-level `internal.utility` binding is typically
-        // namespaced (`darkmux:qwen3-4b-instruct-2507`), but an operator's
-        // profile entry may name the model either way — both must resolve
-        // to the same declared n_ctx.
-        let tmp = TempDir::new().unwrap();
-        let pf = tmp.path().join("profiles.json");
-        std::fs::write(
-            &pf,
-            r#"{"profiles":{
-                    "deep":{"default_model":"primary-big","models":[
-                        {"id":"primary-big","n_ctx":262144},
-                        {"id":"util-4b","n_ctx":120000}
-                    ]}
-                },
-                "default_profile":"deep"}"#,
-        )
-        .unwrap();
-        let prev = std::env::var("DARKMUX_PROFILES").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        // Ask with the NAMESPACED form; the registry entry is bare.
-        let compactor_n_ctx =
-            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("darkmux:util-4b")).unwrap().1;
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
-                None => std::env::remove_var("DARKMUX_PROFILES"),
-            }
-        }
-        assert_eq!(compactor_n_ctx, Some(120_000));
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_compactor_n_ctx_internal_is_none_when_the_profile_has_no_entry_for_it() {
-        // The compactor is a machine-wide binding, decoupled from any
-        // profile — a profile that never lists it must resolve `None`, not
-        // an error, so the caller falls back to the primary's window.
-        let tmp = TempDir::new().unwrap();
-        let pf = tmp.path().join("profiles.json");
-        std::fs::write(
-            &pf,
-            r#"{"profiles":{
-                    "fast":{"models":[{"id":"model-a","n_ctx":32000}]}
-                },
-                "default_profile":"fast"}"#,
-        )
-        .unwrap();
-        let prev = std::env::var("DARKMUX_PROFILES").ok();
-        // SAFETY: serialized via #[serial]; restored below.
-        unsafe { std::env::remove_var("DARKMUX_PROFILES") };
-        let compactor_n_ctx =
-            resolve_dispatch_windows_with("coder", None, None, pf.to_str(), Some("darkmux:util-4b")).unwrap().1;
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_PROFILES", v),
-                None => std::env::remove_var("DARKMUX_PROFILES"),
-            }
-        }
-        assert_eq!(compactor_n_ctx, None);
-    }
+    // (#2914) The three #1616 tests that used to sit here
+    // (`resolve_compactor_n_ctx_internal_*`) asserted that the compactor's
+    // window is read from the resolved profile's own `models[]` entry for it.
+    // That premise is what #2914 removes: the window comes from
+    // `internal.utility` alone. Their replacements are
+    // `compactor_window_comes_from_internal_utility_never_from_a_profile_entry`
+    // and `compactor_window_is_undeclared_for_a_bare_binding_even_when_a_profile_lists_the_model`
+    // above.
 
     #[test]
     fn apply_volume_mounts_emits_workspace_and_out_dir() {

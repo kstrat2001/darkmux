@@ -5599,11 +5599,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // TRIGGER formula). Passing that same number as the LOAD ctx for a
     // DIFFERENT model — the compactor — was the bug: a `deep` profile's 4B
     // compactor silently loaded at the primary's 262144-token window instead
-    // of its own declared 120000. `resolve_dispatch_windows_with` looks the
-    // compactor's id up in the resolved profile's own `models[]`; the primary's
-    // window is used ONLY when the compactor declares none there, and that
-    // fallback is named in the load message (operator sovereignty, #44) —
-    // never silently substituted.
+    // of its own declared 120000. (#2914) The compactor's own window is
+    // `internal.utility.n_ctx` (`resolve_utility_model_internal`), declared
+    // once for the machine; the primary's window is used ONLY when the
+    // binding declares none, and that fallback is named in the load message
+    // (operator sovereignty, #44) — never silently substituted.
     //
     // Warns rather than aborting; skipped for the mock-model harness (no real
     // LMStudio to load into, same gate as the dispatch model's residency).
@@ -5620,9 +5620,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             if let Some(window) = load_window {
                 if used_fallback {
                     eprintln!(
-                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in the \
-                         active profile; loading it at the primary model's context window \
-                         ({window}) as a fallback. (#1616)"
+                        "darkmux dispatch: compactor `{compactor_id}` declares no `n_ctx` in \
+                         `internal.utility`; loading it at the primary model's context window \
+                         ({window}) as a fallback. Declare it once, for every profile: \
+                         `\"internal\": {{ \"utility\": {{ \"id\": \"{compactor_id}\", \"n_ctx\": N }} }}` \
+                         in ~/.darkmux/profiles.json. (#1616, #2914)"
                     );
                 }
                 // (#2536) `apply_compactor_residency` both ensures residency
@@ -11723,26 +11725,33 @@ fn resolve_dispatch_model_with_hosts(
 }
 
 /// (#590) Best-effort: the machine's registered utility model
-/// (`internal.utility`), for overlaying onto the compactor. `None` if the
-/// registry isn't loadable or no utility model is registered — (#2571) NOT
-/// a case where the runtime keeps a built-in default compactor; there is no
-/// runtime default any more. This `None` flows straight through
-/// `apply_utility_model` into `compaction.compactor_model`, which stays
-/// `None`, which means compaction is OFF outright for the dispatch
-/// (disclosed loudly by `unset_compactor_warning` at the call site above).
-/// Mirrors the loud-but-soft posture of `resolve_dispatch_model_internal`: a
-/// missing binding is not an error, just an absent overlay — but "absent
-/// overlay" is a genuinely different, disclosed degraded mode now, not a
-/// silent substitution.
-fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
-    darkmux_profiles::profiles::load_registry(config_path)
-        .ok()
-        .and_then(|l| l.registry.utility_model_id().map(str::to_string))
+/// (`internal.utility`) and (#2914) its declared window, for overlaying onto
+/// the compactor. `None` if the registry isn't loadable or no utility model
+/// is registered — (#2571) NOT a case where the runtime keeps a built-in
+/// default compactor; there is no runtime default any more. This `None`
+/// flows straight through `apply_utility_model` into
+/// `compaction.compactor_model`, which stays `None`, which means compaction
+/// is OFF outright for the dispatch (disclosed loudly by
+/// `unset_compactor_warning` at the call site above). Mirrors the
+/// loud-but-soft posture of `resolve_dispatch_model_internal`: a missing
+/// binding is not an error, just an absent overlay — but "absent overlay"
+/// is a genuinely different, disclosed degraded mode now, not a silent
+/// substitution.
+///
+/// The window is the SECOND element: `internal.utility.n_ctx`, `None` for
+/// the bare-string binding. Since #2914 this is the only source of the
+/// compactor's own window — never a profile's `models[]` entry, which
+/// would make the utility model a work model.
+fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<(String, Option<u32>)> {
+    let loaded = darkmux_profiles::profiles::load_registry(config_path).ok()?;
+    let id = loaded.registry.utility_model_id()?.to_string();
+    Some((id, loaded.registry.utility_model_n_ctx()))
 }
 
 /// (#2905) What `dispatch()` resolves about compaction before the container
 /// starts: the args (role override, utility model, primary window applied),
-/// the compactor's own declared `n_ctx`, and the utility model binding.
+/// the compactor's own declared `n_ctx` (#2914: `internal.utility.n_ctx`),
+/// and the utility model binding.
 #[derive(Debug)]
 struct DispatchCompaction {
     compaction: crate::dispatch::CompactionDispatchArgs,
@@ -11753,23 +11762,33 @@ struct DispatchCompaction {
 /// (#2905) `dispatch()`'s compaction resolution, extracted so a test drives
 /// it with the SAME inputs `dispatch()` has (the role and the opts) and the
 /// live `role_profiles` binding read from config. ONE role-aware profile
-/// resolution feeds both the primary's compaction-trigger window and the
-/// compactor's own `n_ctx`, with the same precedence model selection uses:
-/// `--profile` > `role_profiles.<role>` > `default_profile`.
+/// resolution feeds the primary's compaction-trigger window, with the same
+/// precedence model selection uses: `--profile` > `role_profiles.<role>` >
+/// `default_profile`. (#2914) The compactor's own `n_ctx` does NOT come
+/// from that profile: it is `internal.utility`'s declaration, the same for
+/// every profile, so switching profiles never reloads the utility model.
 fn resolve_dispatch_compaction(
     role: &crate::types::Role,
     opts: &crate::dispatch::DispatchOpts,
 ) -> Result<DispatchCompaction> {
     let mut compaction = opts.compaction.clone();
     compaction.apply_role_override(role);
-    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
+    let utility = resolve_utility_model_internal(opts.config_path.as_deref());
+    let utility_model = utility.as_ref().map(|(id, _)| id.clone());
     compaction.apply_utility_model(utility_model.as_deref());
-    let (primary_window, compactor_n_ctx) = resolve_dispatch_windows_with(
+    // The binding's window applies only when the binding IS the compactor
+    // (the common case). A caller that pinned a different compactor on
+    // `opts.compaction` gets no window from the binding; the primary's
+    // window is then the named fallback, as before.
+    let compactor_n_ctx = match (&compaction.compactor_model, &utility) {
+        (Some(compactor), Some((id, n_ctx))) if bare_model_key(compactor) == bare_model_key(id) => *n_ctx,
+        _ => None,
+    };
+    let primary_window = resolve_dispatch_windows_with(
         &role.id,
         opts.profile_name.as_deref(),
         role_profile_binding(Some(&role.id), opts.profile_name.as_deref()),
         opts.config_path.as_deref(),
-        compaction.compactor_model.as_deref(),
     )?;
     ensure_context_window(&mut compaction, primary_window);
     Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model })
@@ -11886,44 +11905,25 @@ fn profile_context_window(profile: &darkmux_types::Profile) -> Option<u32> {
     crate::dispatch::CompactionDispatchArgs::from_profile(profile).context_window
 }
 
-/// (#1616) The compactor/utility model's OWN declared `n_ctx`, looked up by
-/// id in the resolved profile's `models[]` — never the primary/default model's
-/// context window (that value feeds the compaction TRIGGER formula and
-/// belongs to a DIFFERENT model). `None` when the profile carries no entry for
-/// this model id, or an entry with no `n_ctx` declared — the caller
-/// (`resolve_compactor_load_window`) then falls back to the primary's window
-/// and must say so.
-///
-/// `bare_model_key`-normalized on both sides: a profile entry may name the
-/// model as either the bare key or the `darkmux:`-namespaced identifier (the
-/// same tolerance `ensure_model_loaded_at_ctx` already applies), and the
-/// machine-level `internal.utility` binding this id comes from is typically
-/// namespaced.
-fn profile_model_n_ctx(profile: &darkmux_types::Profile, model_id: &str) -> Option<u32> {
-    let want = bare_model_key(model_id);
-    profile.models.iter().find(|m| bare_model_key(&m.id) == want).and_then(|m| m.n_ctx)
-}
+// (#2914) `profile_model_n_ctx` — the #1616 lookup of the compactor's `n_ctx`
+// by id in the resolved profile's `models[]` — is gone. The compactor's own
+// window is `internal.utility.n_ctx` (`resolve_utility_model_internal`); a
+// profile entry for the utility model is a leftover `darkmux doctor` flags,
+// never a source.
 
-/// (#2905) The dispatch's two compaction windows from ONE profile resolution:
-/// the primary's compaction-trigger window and the compactor's own declared
-/// `n_ctx` (`None` when no compactor is bound). Both are read off the same
-/// role-aware profile model selection resolved, so neither can come from
-/// `default_profile` while the model came from a `role_profiles` mapping.
-/// Takes the binding explicitly (`mapped`) so a test can drive the mapped arm.
+/// (#2905) The dispatch's compaction-trigger window from ONE role-aware
+/// profile resolution: the primary's declared `n_ctx`. Read off the same
+/// profile model selection resolved, so it cannot come from `default_profile`
+/// while the model came from a `role_profiles` mapping. Takes the binding
+/// explicitly (`mapped`) so a test can drive the mapped arm.
 fn resolve_dispatch_windows_with(
     role_id: &str,
     profile_override: Option<&str>,
     mapped: Option<String>,
     config_path: Option<&str>,
-    compactor_model_id: Option<&str>,
-) -> Result<(Option<u32>, Option<u32>)> {
+) -> Result<Option<u32>> {
     let profile = resolve_active_profile_with(Some(role_id), profile_override, mapped, config_path)?;
-    let Some(profile) = profile else {
-        return Ok((None, None));
-    };
-    let window = profile_context_window(&profile);
-    let compactor_n_ctx = compactor_model_id.and_then(|id| profile_model_n_ctx(&profile, id));
-    Ok((window, compactor_n_ctx))
+    Ok(profile.as_ref().and_then(profile_context_window))
 }
 
 /// (#1616) Pick the window the compactor loads at: its OWN declared `n_ctx`
