@@ -362,8 +362,13 @@ pub(crate) fn fetch_peer_json(id: &str, path: &str) -> Result<serde_json::Value>
 /// normalizes to `:8765`, where nothing listens on the tailnet. Dialing it
 /// from the hub itself would show the hub unreachable from the one machine
 /// that can always reach it.
+///
+/// An explicit loopback roster address (a same-host `--allow-loopback`
+/// fleet) is kept as written: it already names this host, with the port
+/// that node's daemon listens on, which the CLI's own serve config need not
+/// know.
 fn dial_address(entry: &fleet::MachineEntry, local_id: Option<&str>, local_addr: &str) -> String {
-    if local_id == Some(entry.id.as_str()) {
+    if local_id == Some(entry.id.as_str()) && !fleet::address_host_is_loopback(&entry.address) {
         local_addr.to_string()
     } else {
         entry.address.clone()
@@ -1116,6 +1121,40 @@ mod tests {
         assert_eq!(dial_address(studio, Some("studio"), "127.0.0.1:8799"), "127.0.0.1:8799");
         assert_eq!(dial_address(laptop, Some("studio"), "127.0.0.1:8799"), "laptop.tailnet.example");
         assert_eq!(dial_address(studio, None, "127.0.0.1:8799"), "studio.tailnet.example");
+    }
+
+    /// (#2924 re-review MUST 1) A same-host `--allow-loopback` fleet: the
+    /// entry names an explicit loopback address with its own port, which is
+    /// exactly where that node's daemon is. Substituting the CLI's
+    /// `serve_client_addr()` (8765 with no serve config) broke it.
+    #[test]
+    fn dial_address_keeps_an_explicit_loopback_self_entry() {
+        let mut roster = fleet::FleetRoster::default();
+        fleet::add_machine(&mut roster, "node-a", "127.0.0.1:18881", None, None).unwrap();
+        let node_a = roster.machines.get("node-a").unwrap();
+        assert_eq!(dial_address(node_a, Some("node-a"), "127.0.0.1:8765"), "127.0.0.1:18881");
+    }
+
+    /// The e2e harness shape through `list_probes`: two fake daemons on
+    /// loopback, the CLI running as node-a with no serve port configured.
+    #[serial_test::serial]
+    #[test]
+    fn list_probes_dial_each_same_host_node_at_its_own_loopback_port() {
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (pa, pb) = (a.local_addr().unwrap().port(), b.local_addr().unwrap().port());
+        let mut roster = fleet::FleetRoster::default();
+        fleet::add_machine(&mut roster, "node-a", &format!("127.0.0.1:{pa}"), None, None).unwrap();
+        fleet::add_machine(&mut roster, "node-b", &format!("127.0.0.1:{pb}"), None, None).unwrap();
+        unsafe {
+            std::env::remove_var("DARKMUX_SERVE_PORT");
+            std::env::remove_var("DARKMUX_SERVE_BIND");
+        }
+        let probes = list_probes(&roster, Some("node-a"));
+        for (m, dialed, probe) in &probes {
+            assert_eq!(dialed, &m.address, "{} must be dialed at its own address", m.id);
+            assert!(probe.reachable, "{}: {:?}", m.id, probe.error);
+        }
     }
 
     /// Through the real `machine status <id>` path: this machine's entry
