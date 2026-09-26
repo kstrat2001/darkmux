@@ -44,6 +44,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 type AllowList = BTreeMap<String, AcceptWorkEntry>;
+type ResolveProfile = dyn Fn(&str, Option<&str>) -> ProfileResolution + Send + Sync;
+type ExecuteJob = dyn Fn(WorkJob, String) -> anyhow::Result<DispatchResult> + Send + Sync;
 
 /// Everything the listener needs, injectable so tests drive the real router
 /// over a real socket with a fake provider and a fake executor.
@@ -57,9 +59,9 @@ pub(crate) struct FleetListenerState {
     /// The allow-list, read per request. An error refuses everything.
     pub allow_list: Arc<dyn Fn() -> Result<AllowList, String> + Send + Sync>,
     /// (role, requested profile) → what this machine would run.
-    pub resolve_profile: Arc<dyn Fn(&str, Option<&str>) -> ProfileResolution + Send + Sync>,
+    pub resolve_profile: Arc<ResolveProfile>,
     /// Runs an admitted, in-scope job on the resolved profile. Blocking.
-    pub execute: Arc<dyn Fn(WorkJob, String) -> anyhow::Result<DispatchResult> + Send + Sync>,
+    pub execute: Arc<ExecuteJob>,
     /// The one submitted job running now, by session id.
     pub busy: Arc<Mutex<Option<String>>>,
 }

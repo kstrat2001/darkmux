@@ -981,14 +981,11 @@ pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// `dispatch.start` and no terminal record at all (measured 89.42s against a
 /// peer that eventually closed; unbounded against a genuinely silent one).
 ///
-/// STILL UNBOUNDED: `darkmux-fleet`'s queue (`queue.rs` — `publish_job`,
-/// `init_consumer_group`, `claim_job`, `ack_job`) opens plain
-/// `get_connection()` and is not bounded at either phase. Deliberately left
-/// out of #2227's scope: `claim_job` issues `XREADGROUP ... BLOCK <block_ms>`,
-/// an INTENTIONALLY long-blocking read that a 1s socket deadline would break,
-/// so bounding that queue needs a per-call-site decision rather than this
-/// constant. `darkmux-fleet`'s `routing.rs` (`wait_for_completion`) was
-/// unbounded too and is BOUNDED AGAINST A SILENT PEER as of #2243 — its `--wait`
+/// (Historical: `darkmux-fleet`'s Redis work queue and its `--wait` poller,
+/// `wait_for_completion`, were the other Redis call sites this paragraph
+/// used to discuss. Both were deleted in #2916, when fleet work moved to
+/// direct machine-to-machine submission.) `wait_for_completion` was
+/// unbounded and BOUNDED AGAINST A SILENT PEER as of #2243 — its `--wait`
 /// timeout was checked only at the top of the loop, which an unbounded read
 /// never returned to, so the operator's declared timeout could never fire.
 ///

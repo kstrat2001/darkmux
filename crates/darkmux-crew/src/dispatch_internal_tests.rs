@@ -14306,10 +14306,9 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         // `dispatch()`. A panic unwinding through the lines between a
         // flag's creation and those stores skips all of them, and the
         // thread each flag gates — a SEPARATE OS thread — survives the
-        // panic in any process that catches it (the fleet runner's
-        // `run_with_panic_guard`, which the serve daemon spawns via
-        // `darkmux_fleet::spawn_runner_thread()`, does exactly this on
-        // purpose, so one bad dispatch can't take the whole long-lived
+        // panic in any process that catches it (`darkmux_fleet::execute_job`,
+        // which the serve daemon's fleet listener runs every submitted job
+        // through, does exactly this on purpose, so one bad dispatch can't take the whole long-lived
         // process down). Left unguarded, the tailer polls `trajectory.jsonl`
         // every 250ms forever, the sampler keeps sampling + governing
         // thermals every 2s forever, and the watchdog polls to its full

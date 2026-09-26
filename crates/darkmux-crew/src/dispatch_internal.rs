@@ -4104,10 +4104,9 @@ impl Drop for PidRegistration {
 /// stores skips every one of them. The flag stays false, and the thread
 /// it gates — a SEPARATE OS thread that does NOT die with a caught panic
 /// — keeps running forever in any process that survives the panic, which
-/// is the common case, not the rare one: the fleet runner's
-/// `run_with_panic_guard` (`darkmux-fleet::runner`, spawned by the serve
-/// daemon via `darkmux_fleet::spawn_runner_thread()` — ONE `catch_unwind`,
-/// not two independent ones) wraps a dispatch in `catch_unwind` for
+/// is the common case, not the rare one: `darkmux_fleet::execute_job` (the
+/// serve daemon's fleet listener runs every submitted job through it — ONE
+/// `catch_unwind`, not two independent ones) wraps a dispatch in `catch_unwind` for
 /// exactly this reason, so one bad dispatch doesn't take the whole
 /// long-lived process down. Catching the panic kills only the panicking
 /// thread; each of these three threads is separate and survives it. Left

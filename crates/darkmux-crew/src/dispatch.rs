@@ -282,16 +282,12 @@ pub struct DispatchOpts {
     /// `coder_brief()` is the mechanism that carries context between
     /// phases now). When `None`, records carry no mission/phase fields.
     pub phase_id: Option<String>,
-    /// Target machine for the dispatch (#246 PR-C.3). When `Some(<id>)`
-    /// and `<id>` differs from the local `DARKMUX_MACHINE_ID`, the
-    /// dispatch is published to the single global `darkmux:work` stream
-    /// via `fleet::publish_job` instead of running locally; the first
-    /// available runner picks it up. The id is an **advisory hint**
-    /// (#590): any runner may claim the job; a non-target runner logs a
-    /// soft warning and proceeds (no NACK/requeue). When `None`, the
-    /// dispatch runs locally — there is no implicit tier auto-route
-    /// (retired in #590; capability-based auto-routing is the #590
-    /// successor work).
+    /// Target machine for the dispatch (#246 PR-C.3, #2916). When
+    /// `Some(<id>)` and `<id>` differs from the local machine_id, the
+    /// dispatch is SUBMITTED to that machine's fleet listener
+    /// (`darkmux_fleet::submit_work`), which runs it only if its allow-list
+    /// trusts this machine; the named machine runs it or refuses it, never
+    /// another one. When `None`, the dispatch runs locally.
     pub machine: Option<String>,
     /// Whether to block on completion when the dispatch routes to a
     /// remote machine (#246 PR-C.3). `true` — the default for
