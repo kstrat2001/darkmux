@@ -100,19 +100,28 @@
 //! stamped with its writer's process START TIME (`started`, an opaque
 //! per-OS value from [`process_start_stamp`]) and every read compares it
 //! against the live pid's: a mismatch is a different process under a
-//! reused pid, swept like a dead one. A lease with no stamp (written by an
-//! older binary) or a pid whose start time cannot be read keeps the old
-//! fail-safe for PINNING (it still pins), but is not VERIFIED, and
+//! reused pid, swept like a dead one. The start time is read with a call
+//! that answers for a process owned by ANY user (`sysctl KERN_PROC_PID` on
+//! macOS, `/proc/<pid>/stat` on Linux), so an orphan whose pid now belongs
+//! to launchd (pid 1) or a root daemon is swept on the next read; an
+//! earlier revision's `proc_pidinfo` read answered nothing across users
+//! and left exactly those orphans in place (#2917 re-review M-A). A lease
+//! with no stamp (written by an older binary) or a pid whose start time
+//! cannot be read keeps the old fail-safe for PINNING (it still pins), but
+//! is not VERIFIED, and
 //! [`live_loaded_models_by_process`] — the read that backs a user-visible
 //! busy claim — returns only verified leases.
 //!
 //! # The crash-orphan sweep rides the read path
 //!
 //! [`live_leased_models`] best-effort removes any lease file whose pid is
-//! no longer alive as it scans — there is no separate sweep verb. A dead
-//! process's lease is therefore reclaimed by the very next call any live
-//! darkmux command makes to reconcile residency, with no cron/daemon
-//! needed.
+//! no longer alive, or is alive under a different start time, as it scans
+//! — there is no separate sweep verb. A dead process's lease is therefore
+//! reclaimed by the very next call any live darkmux command makes to
+//! reconcile residency, with no cron/daemon needed. The removal is
+//! compare-and-delete (`sweep_stale_lease`): a lease a new process wrote
+//! for the reused pid after the reader judged the old one stale is put
+//! back, never deleted.
 
 use crate::paths::expand_tilde;
 use anyhow::{Context, Result};
@@ -503,7 +512,7 @@ fn live_foreign_leases(own_pid: u32) -> Vec<ForeignLease> {
             continue; // malformed — skip, never panic
         };
         if !process_alive(pid) {
-            let _ = fs::remove_file(&path); // best-effort crash-orphan sweep
+            sweep_stale_lease(&path, &contents); // best-effort crash-orphan sweep
             continue;
         }
         let verified = match (lease.started, process_start_stamp(pid)) {
@@ -511,7 +520,7 @@ fn live_foreign_leases(own_pid: u32) -> Vec<ForeignLease> {
             // this lease: a crash orphan under a reused pid. Swept exactly
             // like a dead pid's.
             (Some(stamped), Some(now)) if stamped != now => {
-                let _ = fs::remove_file(&path);
+                sweep_stale_lease(&path, &contents);
                 continue;
             }
             (Some(_), Some(_)) => true,
@@ -523,6 +532,53 @@ fn live_foreign_leases(own_pid: u32) -> Vec<ForeignLease> {
         out.push(ForeignLease { lease, verified });
     }
     out
+}
+
+/// Remove the lease at `path` that this reader judged stale from its
+/// contents `judged` — but only if the file still holds exactly those
+/// contents (#2917 re-review C-4). Between the read and the removal a NEW
+/// process that reused the pid can atomically write its own lease to the
+/// same path (`write_lease_file` renames into place); a bare
+/// `remove_file` would delete that live holder's lease.
+///
+/// So the file is first renamed aside to a tombstone (atomic: whatever is
+/// at `path` at that instant moves), and the tombstone is compared with
+/// what was judged. The same bytes: it was the stale lease, and it is
+/// deleted. Different bytes: a live writer's lease was moved aside, and it
+/// is put back with `hard_link`, which refuses to overwrite, so an even
+/// newer lease written in the meantime is never replaced by an older one.
+/// Either way the tombstone is removed. What remains: during the restore
+/// window the live holder's file is briefly absent, so a concurrent reader
+/// can miss that pin for one read; it is never lost.
+fn sweep_stale_lease(path: &Path, judged: &str) {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_SWEEP.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        hook(path);
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return };
+    let tomb = path.with_file_name(format!("{name}.sweep-{}", std::process::id()));
+    if fs::rename(path, &tomb).is_err() {
+        return; // already gone (another reader swept it), or unreadable dir
+    }
+    let still_judged = fs::read_to_string(&tomb).is_ok_and(|now| now == judged);
+    if !still_judged {
+        // A live writer's lease was moved aside: put it back unless an even
+        // newer one has already taken the path.
+        let _ = fs::hard_link(&tomb, path);
+    }
+    let _ = fs::remove_file(&tomb);
+}
+
+/// Test-only hook run in the gap between judging a lease stale and
+/// removing it, so the race with a live writer is testable
+/// deterministically (#2917 re-review C-4).
+#[cfg(test)]
+type SweepHook = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static BEFORE_SWEEP: Mutex<Option<SweepHook>> = Mutex::new(None);
+#[cfg(test)]
+fn set_before_sweep_hook(hook: Option<SweepHook>) {
+    *BEFORE_SWEEP.lock().unwrap_or_else(|p| p.into_inner()) = hook;
 }
 
 /// One [`live_foreign_leases`] result: the lease, and whether its pid was
@@ -618,25 +674,58 @@ fn process_alive(pid: u32) -> bool {
 
 /// (#2917) An opaque, per-OS stamp of when `pid` started, or `None` when it
 /// cannot be read. Compared only for EQUALITY against a stamp this same
-/// function produced for the lease's writer on this same machine, so the
-/// unit never matters. macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`'s start
-/// time in microseconds since the epoch. Linux: `/proc/<pid>/stat` field
-/// 22 (start time in clock ticks since boot). Elsewhere: `None`.
+/// function produced for the lease's writer on this same machine.
+///
+/// macOS: `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`'s
+/// `kinfo_proc.kp_proc.p_starttime`, in microseconds since the epoch. This
+/// read works for a process owned by ANY user, which is the point: a
+/// reused pid after a reboot lands on launchd (pid 1) or a root daemon.
+/// (#2917 re-review M-A: the previous read, `proc_pidinfo(PROC_PIDTBSDINFO)`,
+/// answers nothing for another user's process, so an orphan on such a pid
+/// was never swept. Both read the kernel's same `p_start`, in the same
+/// unit, so a lease stamped by the older binary still compares; a test
+/// pins that equality.) Linux: `/proc/<pid>/stat` field 22 (start time in
+/// clock ticks since boot), world-readable unless `/proc` is mounted with
+/// `hidepid`. Elsewhere: `None`.
 #[cfg(target_os = "macos")]
 pub fn process_start_stamp(pid: u32) -> Option<u64> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is a correctly sized, writable buffer for
-    // `PROC_PIDTBSDINFO`; the return value is checked before it is read.
-    let n = unsafe {
-        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size)
+    // `struct kinfo_proc` begins with `struct extern_proc kp_proc`, whose
+    // first member is the union `p_un`; `p_starttime` is that union's
+    // `struct timeval` arm, so it sits at offset 0 of the whole record:
+    // `tv_sec` (i64) at 0, `tv_usec` (i32 on Darwin) at 8. The libc crate
+    // does not declare `kinfo_proc` for Apple targets, so the buffer is
+    // sized by the kernel's own size probe and read at those offsets.
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut len: libc::size_t = 0;
+    // SAFETY: a null destination with a valid `len` pointer is sysctl's
+    // documented "how big is it" probe.
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0)
     };
-    if n != size {
+    if rc != 0 || len < 16 {
         return None;
     }
-    // SAFETY: `proc_pidinfo` filled all `size` bytes.
-    let info = unsafe { info.assume_init() };
-    Some(info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec))
+    // u64 words so the i64 at offset 0 is aligned.
+    let mut buf = vec![0u64; len.div_ceil(8)];
+    let mut got = buf.len() * 8;
+    // SAFETY: `buf` is at least `len` bytes (rounded up to whole words) and
+    // `got` says exactly that; the return value and filled length are
+    // checked before anything is read.
+    let rc = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, buf.as_mut_ptr().cast(), &mut got, std::ptr::null_mut(), 0)
+    };
+    // A pid with no process answers rc 0 with nothing filled in.
+    if rc != 0 || got < 16 {
+        return None;
+    }
+    let head: Vec<u8> = buf[..2].iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let sec = i64::from_ne_bytes(head[0..8].try_into().ok()?);
+    let usec = i32::from_ne_bytes(head[8..12].try_into().ok()?);
+    if sec <= 0 || usec < 0 {
+        return None;
+    }
+    Some((sec as u64).saturating_mul(1_000_000).saturating_add(usec as u64))
 }
 
 #[cfg(target_os = "linux")]
@@ -844,6 +933,163 @@ mod tests {
             vec![(std::process::id(), vec!["darkmux:in-use".to_string()])]
         );
         assert!(live_loaded_models_by_process(std::process::id()).is_empty(), "never its own lease");
+    }
+
+    /// (#2917 re-review M-A) The start time of a process owned by ANOTHER
+    /// user must be readable: that is exactly where a reused pid lands
+    /// after a reboot (pid 1, root daemons). An earlier revision read it
+    /// with `proc_pidinfo`, which answers nothing across users, so a
+    /// stamped orphan on pid 1 read as `(Some, None)` and was never swept.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_start_time_of_pid_1_is_readable_from_an_unprivileged_process() {
+        let a = process_start_stamp(1).expect("pid 1's start time must be readable across users");
+        assert!(a > 0);
+        assert_eq!(process_start_stamp(1), Some(a), "stable across reads");
+    }
+
+    /// (#2917 re-review M-A) The case the doc promises: a crash-orphaned
+    /// lease whose pid now belongs to launchd/init (pid 1, never darkmux),
+    /// stamped with the start time of the process that wrote it, is swept
+    /// on read and pins nothing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[serial_test::serial]
+    #[test]
+    fn a_lease_stamped_with_a_wrong_start_time_for_pid_1_is_swept() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let dir = residency_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let real = process_start_stamp(1).expect("pid 1's start time is readable");
+        let lease = LeaseFile {
+            pid: 1,
+            models: vec!["darkmux:m".to_string()],
+            loaded: vec!["darkmux:m".to_string()],
+            started: Some(real.wrapping_add(1)),
+        };
+        let path = lease_path(&dir, 1);
+        fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+        assert!(live_leased_models(std::process::id()).is_empty(), "a reused pid 1 pins nothing");
+        assert!(live_loaded_models_by_process(std::process::id()).is_empty());
+        assert!(!path.exists(), "the orphan on pid 1 is swept on read");
+    }
+
+    /// (#2917 re-review M-A) The inverted case: a live same-user holder
+    /// stamped by the same mechanism the read checks against is never
+    /// swept, however many times it is read.
+    #[serial_test::serial]
+    #[test]
+    fn a_live_same_user_holder_is_never_swept() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let dir = residency_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let mut holder = std::process::Command::new("sleep").arg("30").spawn().expect("spawning a live pid");
+        let pid = holder.id();
+        let lease = LeaseFile {
+            pid,
+            models: vec!["darkmux:m".to_string()],
+            loaded: vec!["darkmux:m".to_string()],
+            started: process_start_stamp(pid),
+        };
+        assert!(lease.started.is_some(), "a same-user pid's start time is readable");
+        let path = lease_path(&dir, pid);
+        fs::write(&path, serde_json::to_string(&lease).unwrap()).unwrap();
+        for _ in 0..3 {
+            assert_eq!(live_loaded_models_by_process(std::process::id()), vec![(pid, vec!["darkmux:m".to_string()])]);
+            assert!(path.exists(), "a live holder's lease is never swept");
+        }
+        let _ = holder.kill();
+        let _ = holder.wait();
+    }
+
+    /// (#2917 re-review M-A) Leases written before the sysctl read carry a
+    /// `proc_pidinfo` stamp (microseconds since the epoch). The new read
+    /// must produce the SAME value for the same process, or every live
+    /// holder written by the previous binary would be swept on upgrade.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sysctl_stamp_equals_the_proc_pidinfo_stamp_older_leases_carry() {
+        fn proc_pidinfo_stamp(pid: u32) -> Option<u64> {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            // SAFETY: correctly sized writable buffer; return value checked.
+            let n = unsafe {
+                libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size)
+            };
+            if n != size {
+                return None;
+            }
+            // SAFETY: filled by the call above.
+            let info = unsafe { info.assume_init() };
+            Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+        }
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        for pid in [std::process::id(), child.id()] {
+            assert!(process_start_stamp(pid).is_some());
+            assert_eq!(process_start_stamp(pid), proc_pidinfo_stamp(pid), "pid {pid}");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// (#2917 re-review C-4) The sweep must not delete a lease a NEW
+    /// process wrote for the same pid between the moment the reader judged
+    /// the old one stale and the moment it removes it. The hook runs in
+    /// exactly that gap and writes the new holder's correctly stamped
+    /// lease; it must survive the read.
+    #[serial_test::serial]
+    #[test]
+    fn the_sweep_never_deletes_a_lease_a_live_writer_put_in_place_after_the_stale_read() {
+        let tmp = TempDir::new().unwrap();
+        let _env = EnvGuard::set(tmp.path());
+        let dir = residency_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let mut holder = std::process::Command::new("sleep").arg("30").spawn().expect("spawning a live pid");
+        let pid = holder.id();
+        let now = process_start_stamp(pid).expect("readable");
+        let path = lease_path(&dir, pid);
+        let stale = LeaseFile {
+            pid,
+            models: vec!["darkmux:old".to_string()],
+            loaded: vec!["darkmux:old".to_string()],
+            started: Some(now.wrapping_add(1)),
+        };
+        fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
+        let fresh = LeaseFile {
+            pid,
+            models: vec!["darkmux:new".to_string()],
+            loaded: vec!["darkmux:new".to_string()],
+            started: Some(now),
+        };
+        let fresh_json = serde_json::to_string(&fresh).unwrap();
+        let hook_path = path.clone();
+        let hook_json = fresh_json.clone();
+        set_before_sweep_hook(Some(Box::new(move |p: &Path| {
+            assert_eq!(p, hook_path.as_path());
+            fs::write(p, &hook_json).unwrap();
+        })));
+        let _ = live_leased_models(std::process::id());
+        set_before_sweep_hook(None);
+        assert_eq!(
+            fs::read_to_string(&path).ok().as_deref(),
+            Some(fresh_json.as_str()),
+            "the live writer's lease survives the sweep of the stale one it replaced"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != &format!("{pid}.lease"))
+            .collect();
+        assert!(leftovers.is_empty(), "no tombstone is left behind: {leftovers:?}");
+
+        // Without a racing writer the same stale lease IS swept.
+        fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
+        let _ = live_leased_models(std::process::id());
+        assert!(!path.exists(), "the stale lease is swept when nothing replaced it");
+        let _ = holder.kill();
+        let _ = holder.wait();
     }
 
     #[serial_test::serial]

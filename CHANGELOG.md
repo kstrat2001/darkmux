@@ -100,6 +100,16 @@ darkmux release.
   start time; a lease whose pid is alive but started at a different time
   (a reboot, then a reused pid) is swept like a dead one, and only a
   verified lease can make radio say a darkmux process is using a model.
+  The start time is read in a way that works for a process owned by any
+  user (on macOS, `sysctl`'s process record rather than `proc_pidinfo`,
+  which answers nothing across users), so an orphan whose pid now belongs
+  to launchd (pid 1) or a root daemon is swept too; the value and its unit
+  are unchanged, so leases written by the previous build still compare.
+  A lease that cannot be verified (no stamp, from an older build, or a
+  start time the platform will not report) still keeps its model pinned
+  but never backs a busy claim. The sweep deletes only the lease it
+  judged stale: if a new process wrote its own lease for the reused pid in
+  between, that lease is put back.
 
 ## [3.13.0] - 2026-09-25
 
