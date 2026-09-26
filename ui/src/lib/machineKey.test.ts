@@ -125,6 +125,25 @@ describe("(#2929) machine keys — what the URL hash carries instead of the hard
       const after = ctx([rec(UID_B, "2026-09-27T02:00:00Z"), rec(UID_C, "2026-09-27T03:00:00Z")]);
       expect(decodeMachineKey(after, ka)).toEqual(NOT_FOUND);
     });
+    // Two FAKE uids whose hashes share their first 6 hex digits (found by
+    // search): the page lengthens the hash to tell them apart, and a 6-hex
+    // key minted while only one was known no longer names exactly one.
+    const COLL_1 = "FAC0FFEE-0000-4000-8000-000000000399";
+    const COLL_2 = "FAC0FFEE-0000-4000-8000-000000000B83";
+    it("two machines whose short hashes collide get distinct, longer keys", () => {
+      expect(h(COLL_1)).toBe(h(COLL_2));
+      const c = ctx([rec(COLL_1, "2026-09-27T01:00:00Z"), rec(COLL_2, "2026-09-27T02:00:00Z")]);
+      const [k1, k2] = [encodeMachineKey(c, COLL_1), encodeMachineKey(c, COLL_2)];
+      expect(k1).not.toBe(k2);
+      expect(decodeMachineKey(c, k1).uid).toBe(COLL_1);
+      expect(decodeMachineKey(c, k2).uid).toBe(COLL_2);
+    });
+    it("a short key that now matches two machines' hashes: not-found, not the first match", () => {
+      const k = encodeMachineKey(ctx([rec(COLL_1, "2026-09-27T01:00:00Z")]), COLL_1);
+      expect(k).toBe(`unnamed-${h(COLL_1)}`);
+      const after = ctx([rec(COLL_2, "2026-09-27T00:00:00Z"), rec(COLL_1, "2026-09-27T01:00:00Z")]);
+      expect(decodeMachineKey(after, k)).toEqual(NOT_FOUND);
+    });
     it("a uniquely-named key whose name another machine now shares: not-found", () => {
       const ka = encodeMachineKey(ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac")]), UID_A);
       const after = ctx([rec(UID_A, "2026-09-27T01:00:00Z", "mac"), rec(UID_D, "2026-09-27T00:00:00Z", "mac")]);
