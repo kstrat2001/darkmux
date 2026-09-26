@@ -16738,6 +16738,74 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     }
 
     /// `dispatch_remote` (hosted `darkmux dispatch`), `"single_shot"`.
+    /// (#2902) An unmanaged endpoint that declares
+    /// `chat-completions-max-tokens` is sent `max_tokens`, on both hosted
+    /// single-shot paths: `dispatch_remote` (the target's dialect) and a
+    /// crew seat's `single_shot_chat_hosted` (the endpoint's dialect).
+    #[test]
+    #[serial]
+    fn a_declared_max_tokens_dialect_reaches_the_wire_on_both_hosted_paths() {
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":3}}"#,
+        );
+        let ep: darkmux_types::ModelEndpoint =
+            serde_json::from_value(serde_json::json!({ "url": base_url, "dialect": "chat-completions-max-tokens" })).unwrap();
+        crate::single_shot::single_shot_chat_hosted(&crate::single_shot::HostedSingleShotRequest {
+            endpoint: &ep,
+            model: "vllm-model",
+            system: "s",
+            user: "u",
+            max_tokens: 77,
+            timeout_seconds: 15,
+        })
+        .expect("mock answers");
+        let request = rx.recv().unwrap();
+        assert!(request.contains("\"max_tokens\":77"), "{request}");
+        assert!(!request.contains("max_completion_tokens"), "{request}");
+
+        let (base_url, rx) = one_shot_http_mock(
+            r#"{"model":"m","choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":3}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(format!("dialect-2902-{}", std::process::id()));
+        opts.phase_id = None;
+        opts.json = false;
+        opts.max_completion_tokens = Some(55);
+        let pm: darkmux_types::ProfileModel = serde_json::from_value(serde_json::json!({
+            "id": "vllm-model", "endpoint": { "url": base_url, "dialect": "chat-completions-max-tokens" }
+        }))
+        .unwrap();
+        let result = dispatch_remote(
+            &opts,
+            &quarantine_test_role(),
+            "system prompt",
+            &crate::target::target_for("p".into(), Default::default(), pm).unwrap(),
+        );
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        result.expect("dispatch_remote must succeed against the mock server");
+        let request = rx.recv().unwrap();
+        assert!(request.contains("\"max_tokens\":55"), "{request}");
+        assert!(!request.contains("max_completion_tokens"), "{request}");
+    }
+
     #[test]
     #[serial]
     fn usage_conformance_dispatch_remote() {

@@ -7270,6 +7270,45 @@ mod tests {
         assert!(err.contains("utility model") && err.contains("internal.utility"), "names the fix: {err}");
     }
 
+    /// (#2902 step 3) A seat whose selected model is on an UNMANAGED
+    /// endpoint is the silent `Remote` miss (no local residency to plan),
+    /// named by id or inline; an undefined id is a loud resolution failure.
+    #[serial_test::serial]
+    #[test]
+    fn placement_classifies_through_the_one_resolver() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = dir.path().join("profiles.json");
+        std::fs::write(
+            &reg,
+            serde_json::json!({
+                "default_profile": "local",
+                "endpoints": { "hosted": { "url": "https://h.example/v1" } },
+                "profiles": {
+                    "local": {"models": [{"id": "m-local", "n_ctx": 4096}]},
+                    "named": {"models": [{"id": "gpt", "endpoint": "hosted"}]},
+                    "inline": {"models": [{"id": "gpt", "endpoint": {"url": "https://i.example/v1"}}]},
+                    "dangling": {"models": [{"id": "gpt", "endpoint": "nope"}]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = reg.to_str().unwrap();
+        let pick = |name: &str| {
+            resolve_local_placement_inner_with("coder", Some(name), None, Some(cfg), "step:s")
+                .map(|p| p.model_key)
+                .map_err(|e| match e {
+                    PlacementMiss::Remote => "remote".to_string(),
+                    PlacementMiss::ResolutionFailed(r) => r,
+                })
+        };
+        assert_eq!(pick("local"), Ok("m-local".into()));
+        assert_eq!(pick("named"), Err("remote".into()));
+        assert_eq!(pick("inline"), Err("remote".into()));
+        let err = pick("dangling").unwrap_err();
+        assert!(err.contains("nope") && err != "remote", "{err}");
+    }
+
     // ─── (#2902 step 1a) usage conformance: one record per model call ──
 
     /// The mock chat server every usage-conformance test below answers from.

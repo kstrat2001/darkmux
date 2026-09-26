@@ -272,6 +272,29 @@ mod step_endpoint_tests {
 }
 
 #[cfg(test)]
+mod resolve_tests {
+    fn role() -> crate::types::Role {
+        serde_json::from_str(
+            r#"{"id":"r","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap()
+    }
+
+    /// A selected model whose endpoint id is undefined is an ERROR naming
+    /// the id, never a target (which would send to the managed default).
+    #[test]
+    fn resolve_in_refuses_a_model_on_an_undefined_endpoint() {
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"p":{"models":[{"id":"gpt","endpoint":"nope"}]}},"default_profile":"p"}"#,
+        )
+        .unwrap();
+        reg.materialize_endpoints();
+        let err = super::resolve_in(&reg, &role(), None, None, false).unwrap_err();
+        assert!(format!("{err:#}").contains("nope"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
 mod equivalence_tests {
 
     /// One profile model shape, and what a dispatch against it puts on the
