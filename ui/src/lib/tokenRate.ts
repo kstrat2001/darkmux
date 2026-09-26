@@ -1,4 +1,5 @@
 import type { FlowRecord } from "../types/handwritten";
+import { isTurnUsage } from "./usageRecords";
 
 /** (#2877) Live token-rate scope — pure derivation from flow records
  * already fetched for a session; zero model work, matches CLAUDE.md's "the
@@ -120,7 +121,9 @@ export function measuredCharsPerToken(records: FlowRecord[]): number {
     if (r.action === "dispatch.turn.heartbeat") {
       const c = num(f.generated_chars) ?? num(f.cumulative_chars);
       if (c !== null) charsByTurn.set(f.turn_seq, Math.max(charsByTurn.get(f.turn_seq) ?? 0, c));
-    } else if (r.action === "telemetry.tokens") {
+    } else if (r.action === "telemetry.tokens" && isTurnUsage(f)) {
+      // (#2902 step 1a) Turn records only: a single-shot or map-item call
+      // has no heartbeats to pair with and must not skew the calibration.
       const t = num(f.completion_tokens);
       if (t !== null) tokensByTurn.set(f.turn_seq, (tokensByTurn.get(f.turn_seq) ?? 0) + t);
     }
@@ -231,7 +234,8 @@ export function averageGenerationRate(recordSets: FlowRecord[][]): GenerationRat
       if (r.action === "dispatch.turn") {
         const g = num(f.generation_ms);
         if (g !== null && g > 0) genMs.set(f.turn_seq, g);
-      } else if (r.action === "telemetry.tokens") {
+      } else if (r.action === "telemetry.tokens" && isTurnUsage(f)) {
+        // (#2902 step 1a) Turn records only, as in `measuredCharsPerToken`.
         const t = num(f.completion_tokens);
         if (t !== null) tok.set(f.turn_seq, (tok.get(f.turn_seq) ?? 0) + t);
       }

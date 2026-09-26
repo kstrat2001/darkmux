@@ -77,8 +77,52 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.56.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.57.0";
 // Version history:
+//   1.57.0 (#2902 step 1a, one usage record per model call): additive.
+//           The MODEL CALL is the unit of accounting: every call darkmux
+//           makes to a model endpoint emits exactly one `telemetry.tokens`
+//           record (category `telemetry`, source `tokens`) when its reply
+//           returns, built by ONE writer (`darkmux_crew::usage::usage_payload`).
+//
+//           New producers: `dispatch_remote` (hosted `darkmux dispatch`),
+//           `dispatch_local_single_shot` (the radio's seats), and the
+//           `dispatch.single_shot` step kind (both arms). Before this their
+//           tokens reached only the `dispatch complete` payload, which keeps
+//           carrying them unchanged. Existing producers (the container
+//           path's per-turn tailer, `dispatch.map`) now go through the same
+//           writer. `dispatch.map` now emits one record per model CALL, not
+//           per item: an item that retries (`retry_on_empty` /
+//           `retry_on_error`) emits one record per attempt that got a reply,
+//           each with that attempt's own counts and `reported_model`, all
+//           carrying the item's `index`; they sum to the item's totals.
+//           An attempt with no reply (transport error, budget skip) made no
+//           completed call and emits none.
+//
+//           New payload keys on every `telemetry.tokens`:
+//           `call_kind` (`"turn"` | `"single_shot"` | `"map_item"`;
+//           `"compaction"` is reserved for step 1b), `requested_model` (the
+//           model id darkmux sent), `reported_model` (the response's own
+//           `model`, ABSENT when it had none; absent on turns until the
+//           runtime forwards it, step 1b), `endpoint` (what darkmux called,
+//           as a fact: the bookends' hosted label, or the resolved LMStudio
+//           base URL; never a local/cloud classification, never a vendor)
+//           and `token_source` (`"provider"` when the reply carried a usage
+//           block, else `"absent"`).
+//
+//           Behavior change inside the family: a call whose reply carried no
+//           usage now EMITS a record (`token_source: "absent"`, no count
+//           keys) where the container tailer and `dispatch.map` used to emit
+//           none, so the family is one-per-call. Unreported counts are
+//           omitted, never zero: the turn records' `reasoning_tokens` /
+//           `cached_tokens` are now absent rather than explicit null when
+//           unreported (both readings meant "the provider did not say").
+//           A `telemetry.tokens` `endpoint` is NOT the dispatch vocabulary's
+//           hosted marker: a reader classifying a step or run by `endpoint`
+//           must read it from bookends only (the mission-graph fold now
+//           does). MINOR: an older reader ignores the unknown keys; a reader
+//           summing counts must treat a missing count as zero.
+//
 //   1.56.0 (#2889, the model writing a tool call): additive payload keys on
 //           `dispatch.turn.heartbeat` — `phase`, `tool_name`, `prompt_chars`.
 //

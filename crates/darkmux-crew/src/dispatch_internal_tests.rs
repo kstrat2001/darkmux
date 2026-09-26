@@ -7279,6 +7279,7 @@
                 None,
                 None, // (#2794) compactor_model
                 None,
+                None, // (#2902) endpoint
             )
         });
 
@@ -9885,7 +9886,7 @@
             "finish_reason": "tool_calls",
             "usage": { "prompt_tokens": 24000, "completion_tokens": 850 },
         });
-        let payload = turn_tokens_payload(&event).expect("maps usage");
+        let payload = turn_tokens_payload(&event, "m", "ep");
         assert_eq!(payload["turn_seq"], 12);
         assert_eq!(payload["prompt_tokens"], 24000);
         assert_eq!(payload["completion_tokens"], 850);
@@ -9914,7 +9915,7 @@
                 "reasoning_tokens": 1024, "cached_tokens": 64,
             },
         });
-        let payload = turn_tokens_payload(&event).expect("maps usage");
+        let payload = turn_tokens_payload(&event, "m", "ep");
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         assert!(payload["reasoning_tokens"].as_u64().unwrap() <= payload["completion_tokens"].as_u64().unwrap());
@@ -9939,7 +9940,7 @@
             "seq": 4,
             "usage": { "prompt_tokens": 9970, "completion_tokens": 128, "total_tokens": 11598 },
         });
-        let payload = turn_tokens_payload(&event).expect("maps usage");
+        let payload = turn_tokens_payload(&event, "m", "ep");
         assert_eq!(
             payload["total_tokens"], 11598,
             "the provider's own total must win; prompt + completion (10098) understates by 1500"
@@ -9959,7 +9960,7 @@
             "seq": 5,
             "usage": { "prompt_tokens": 300, "completion_tokens": 45 },
         });
-        let payload = turn_tokens_payload(&event).expect("maps usage");
+        let payload = turn_tokens_payload(&event, "m", "ep");
         assert_eq!(payload["total_tokens"], 345, "no reported total → derive from the split");
     }
 
@@ -10187,18 +10188,18 @@
         assert!(local["reasoning_tokens"].is_null());
     }
 
-    /// (#795) No `usage` (or JSON-null usage — upstream omitted it) emits
-    /// NOTHING. Such turns also don't accumulate into the runtime's
-    /// metrics totals, so skipping preserves the records-sum-to-total
-    /// invariant rather than injecting a zero-noise record.
+    /// (#795, #2902 step 1a) No `usage` (or JSON-null usage — upstream
+    /// omitted it) still emits ONE record per call, `token_source: "absent"`
+    /// with no counts — so records still sum to the runtime's totals (an
+    /// absent record adds nothing) without silently dropping the call.
     #[test]
-    fn turn_tokens_payload_skips_absent_or_null_usage() {
+    fn turn_tokens_payload_marks_absent_or_null_usage_absent() {
         let absent = serde_json::json!({ "type": "model.completed", "seq": 3 });
-        assert!(turn_tokens_payload(&absent).is_none(), "absent usage → no record");
+        assert_eq!(turn_tokens_payload(&absent, "m", "ep")["token_source"], "absent", "absent usage → an absent record, no counts");
         let null = serde_json::json!({
             "type": "model.completed", "seq": 3, "usage": serde_json::Value::Null,
         });
-        assert!(turn_tokens_payload(&null).is_none(), "null usage → no record");
+        assert_eq!(turn_tokens_payload(&null, "m", "ep")["token_source"], "absent", "null usage → an absent record, no counts");
     }
 
     /// (#795) Defensive: a `usage` object missing a count degrades that
@@ -10211,7 +10212,7 @@
             "seq": 1,
             "usage": { "completion_tokens": 500 },
         });
-        let payload = turn_tokens_payload(&event).expect("partial usage still maps");
+        let payload = turn_tokens_payload(&event, "m", "ep");
         assert_eq!(payload["prompt_tokens"], 0);
         assert_eq!(payload["completion_tokens"], 500);
         assert_eq!(payload["total_tokens"], 500);
@@ -10880,7 +10881,8 @@
         state.handle_event(
             r#"{"type":"model.completed","seq":5,"finish_reason":"tool_calls","usage":{"prompt_tokens":31000,"completion_tokens":1200}}"#,
         );
-        // A no-usage turn must emit dispatch.turn but NO tokens record.
+        // (#2902 step 1a) A no-usage turn still made a call: it emits ONE
+        // tokens record marked `token_source: "absent"`, with no counts.
         state.handle_event(r#"{"type":"model.completed","seq":6,"finish_reason":"stop"}"#);
 
         unsafe {
@@ -10899,11 +10901,10 @@
             .iter()
             .filter(|v| v["category"] == "telemetry" && v["source"] == "tokens")
             .collect();
-        assert_eq!(
-            tokens.len(),
-            1,
-            "exactly one tokens record (the no-usage turn must not emit one); got {tokens:?}"
-        );
+        assert_eq!(tokens.len(), 2, "one tokens record per call; got {tokens:?}");
+        assert_eq!(tokens[1]["payload"]["token_source"], "absent");
+        assert_eq!(tokens[1]["payload"]["turn_seq"], 6);
+        assert!(tokens[1]["payload"].get("total_tokens").is_none(), "no fabricated count");
         let rec = tokens[0];
         assert_eq!(rec["action"], "telemetry.tokens");
         assert_eq!(rec["handle"], "coder");
@@ -13771,6 +13772,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None, // (#2794) compactor_model
             None,
             None,
+            None, // (#2902) endpoint
         );
         let elapsed = started.elapsed();
 
@@ -14125,6 +14127,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 None, // (#2794) compactor_model
                 None,
+                None, // (#2902) endpoint
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");
@@ -15793,7 +15796,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             .iter()
             .map(|e| {
                 let ev: serde_json::Value = serde_json::from_str(e).unwrap();
-                super::turn_tokens_payload(&ev).unwrap()["total_tokens"].as_u64().unwrap()
+                super::turn_tokens_payload(&ev, "m", "ep")["total_tokens"].as_u64().unwrap()
             })
             .sum();
         assert_eq!(per_turn_sum, 11598 + 150);
@@ -16398,4 +16401,101 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
             ],
             "got {times:?}"
         );
+    }
+
+    // ─── (#2902 step 1a) usage conformance: one record per model call ──
+
+    /// Container path, `"turn"`: one `model.completed` event, one record.
+    /// `reported_model` is ABSENT here until the runtime forwards the served
+    /// model (#2902 step 1b).
+    #[test]
+    #[serial]
+    fn usage_conformance_container_turn() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+        let mut state = TailerState::new_for_test(
+            tmp.path().join("trajectory.jsonl"),
+            "sess-usage-turn".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        .with_endpoint(Some("http://h:1234/v1".into()));
+        state.handle_event(
+            r#"{"type":"model.completed","seq":2,"finish_reason":"stop","usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":130}}"#,
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+        let records = drain_flow_records_for_session(tmp.path(), "sess-usage-turn");
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::Turn, "container turn");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "darkmux:qwen3.6");
+        assert_eq!(p["endpoint"], "http://h:1234/v1");
+        assert_eq!(p["turn_seq"], 2);
+        assert_eq!(p["total_tokens"], 130);
+        assert_eq!(p["token_source"], "provider");
+        assert!(p.get("reported_model").is_none(), "step 1b: {p}");
+    }
+
+    /// `dispatch_remote` (hosted `darkmux dispatch`), `"single_shot"`.
+    #[test]
+    #[serial]
+    fn usage_conformance_dispatch_remote() {
+        let (base_url, _rx) = one_shot_http_mock(
+            r#"{"model":"served-by-mock","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":9}}"#,
+        );
+        let home = TempDir::new().unwrap();
+        let flows_dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+        }
+        let session_id = format!("usage-conformance-remote-{}", std::process::id());
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session_id = Some(session_id.clone());
+        opts.phase_id = None;
+        opts.json = false;
+        let pm: darkmux_types::ProfileModel = serde_json::from_str(&format!(
+            r#"{{"id":"gpt-remote","n_ctx":100000,"endpoint":{{"url":"{base_url}"}}}}"#
+        ))
+        .unwrap();
+        let result = dispatch_remote(&opts, &quarantine_test_role(), "system prompt", &pm);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        result.expect("dispatch_remote must succeed against the mock server");
+        let records = drain_flow_records_for_session(flows_dir.path(), &session_id);
+        let rec = crate::usage::assert_one_usage_record(&records, crate::usage::CallKind::SingleShot, "dispatch_remote");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "gpt-remote");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        assert_eq!(p["endpoint"], remote_endpoint_label(pm.endpoint.as_ref().unwrap(), "gpt-remote"));
+        assert_eq!(p["total_tokens"], 9, "provider total wins over 4+2");
+        // The complete record keeps its own counts: the telemetry record is
+        // additive, it does not move them.
+        let complete = records.iter().find(|r| r["action"] == "dispatch complete").unwrap();
+        assert_eq!(complete["payload"]["total_tokens"], 9);
+        assert_eq!(rec["mission_id"], complete["mission_id"], "same run key as the terminal");
     }

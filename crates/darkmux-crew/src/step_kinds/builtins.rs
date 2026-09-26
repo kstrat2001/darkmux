@@ -1158,6 +1158,29 @@ impl DispatchSingleShotStepKind {
                 .with_context(|| format!("step `{}` dispatch.single_shot (local)", step.id))?
         };
 
+        // (#2902 step 1a) The one usage record for this one model call, from
+        // the shared reply seam, under the SAME handle/session/mission as
+        // this step's bookends (so it joins their run). Live through the
+        // scheduler's seam when streaming, like `dispatch.map`'s per-item
+        // record; batched into the outcome otherwise.
+        let usage_endpoint =
+            endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
+        let usage_record = crate::dispatch::build_telemetry_record(
+            darkmux_flow::Level::Info,
+            crate::usage::USAGE_ACTION,
+            crate::usage::USAGE_SOURCE,
+            &step.id,
+            &darkmux_types::session_id::task(&step.task_id),
+            Some(wire_model.as_ref()),
+            None,
+            None,
+            reply.usage_payload(crate::usage::CallKind::SingleShot, wire_model.as_ref(), &usage_endpoint),
+        );
+        match ctx {
+            Some(c) => c.emit(usage_record),
+            None => flow_records.push(usage_record),
+        }
+
         // (#2344) The one call is over — no model work is in flight for this
         // step — so stop the heartbeat before the terminal record, the same
         // ordering `dispatch.map` and the container path both use.
@@ -1278,7 +1301,7 @@ pub struct MapItemResult {
     ///
     /// Still `Option`, with the same honesty rule as every sibling: a
     /// provider that never named the field leaves it `None`, and
-    /// [`map_item_token_payload`] omits the key rather than inventing a
+    /// the usage writer omits the key rather than inventing a
     /// zero. Tracked with flags INDEPENDENT of `any_split` — see
     /// [`accumulate_details`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1867,6 +1890,11 @@ impl DispatchMapStepKind {
         let endpoint_label: Option<String> = endpoint
             .as_ref()
             .map(|ep| crate::dispatch_internal::remote_endpoint_label(ep, wire_model.as_ref()));
+        // (#2902 step 1a) The endpoint fact on each item's usage record: the
+        // bookends' own label for a hosted step, else the LMStudio base the
+        // local items call (`base_url: None` below, so the configured one).
+        let usage_endpoint =
+            endpoint_label.clone().unwrap_or_else(|| crate::usage::lmstudio_endpoint(None));
         let mut bookend = StepBookend::new(
             ctx,
             Self::bookend_record(
@@ -1979,20 +2007,21 @@ impl DispatchMapStepKind {
             let (item_system_override, payload) = item_system_and_payload(item);
             let item_system = item_system_override.unwrap_or(system);
             let user = user_template.replace("{item}", &map_item_text(payload));
+            let mut calls: Vec<MapCall> = Vec::new();
             let res = match &endpoint {
                 Some(ep) => map_hosted_item(
                     index, &bucket, ep, wire_model.as_ref(), item_system, &user, max_tokens,
-                    timeout_seconds, retry_on_empty, retry_on_error, ovr,
+                    timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls,
                 ),
                 None => map_local_item(
                     index, wire_model.as_ref(), item_system, &user, temperature, max_tokens,
-                    timeout_seconds, retry_on_empty, retry_on_error, ovr,
+                    timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls,
                 ),
             };
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
-            // (#1442 ship-2b, #1361 continuity) One `telemetry.tokens`
-            // record per item that actually reported usage, so the fleet
+            // (#1442 ship-2b, #1361 continuity) `telemetry.tokens` records
+            // for this item's calls (see #2902 below), so the fleet
             // dashboard's off-meter token sum (`category: telemetry,
             // source: tokens` records ONLY) stays sighted on map-dispatched
             // work — the review pipeline's probe/verify stages ride this
@@ -2008,18 +2037,30 @@ impl DispatchMapStepKind {
             // landed in no bucket. Still never FABRICATED: a provider that
             // reported no split leaves both fields `None`, and the payload
             // omits them entirely rather than claiming a zero.
-            if let Some(payload) = map_item_token_payload(&res, endpoint.is_some()) {
+            //
+            // (#2902 step 1a) One record per model CALL: an item that retried
+            // made several, and each one's own counts and reported model are
+            // accounted separately (they sum to the item's totals above). An
+            // attempt that replied without usage emits `absent`; an attempt
+            // with no reply made no completed call and emits nothing.
+            for call in &calls {
                 push(
                     crate::dispatch::build_telemetry_record(
                         darkmux_flow::Level::Info,
-                        "telemetry.tokens",
-                        "tokens",
+                        crate::usage::USAGE_ACTION,
+                        crate::usage::USAGE_SOURCE,
                         &step.id,
                         &darkmux_types::session_id::task(&step.task_id),
                         Some(wire_model.as_ref()),
                         None,
                         None,
-                        payload,
+                        map_call_token_payload(
+                            call,
+                            res.index,
+                            endpoint.is_some(),
+                            wire_model.as_ref(),
+                            &usage_endpoint,
+                        ),
                     ),
                     &mut batched,
                 );
@@ -2200,9 +2241,29 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
     any_split.then_some(sum)
 }
 
-/// (#1530 dogfood) Pure: one map item's `telemetry.tokens` payload, or
-/// `None` when the item reported no usage at all (no record is emitted then
-/// — pre-existing behavior). Split out from the emitter so the payload SHAPE
+/// (#2902 step 1a) What one `dispatch.map` model call reported, captured the
+/// moment its reply returns — one per ATTEMPT, so an item that retries
+/// (`retry_on_empty` / `retry_on_error`) accounts every call it made, and an
+/// attempt that replied with no usage is still accounted (`absent`) even when
+/// a later attempt errors. An attempt that got no reply (a transport error,
+/// a budget skip) made no completed call and pushes nothing.
+#[derive(Debug, Clone)]
+pub(crate) struct MapCall {
+    pub counts: crate::usage::UsageCounts,
+    /// The response's own `model` field, local and hosted alike.
+    pub reported_model: Option<String>,
+}
+
+impl MapCall {
+    fn from_reply(reply: &crate::single_shot::SingleShotReply) -> Self {
+        Self { counts: reply.usage_counts(), reported_model: reply.model.clone() }
+    }
+}
+
+/// (#1530 dogfood, #2902 step 1a) Pure: one map model CALL's
+/// `telemetry.tokens` payload, through the one usage writer. Every call that
+/// got a reply emits one (`token_source: "absent"` when it carried no usage);
+/// see [`MapCall`]. Split out from the emitter so the payload SHAPE
 /// is unit-testable without a flow sink, the same pure-payload/emitter
 /// division `turn_tokens_payload` and `review_token_telemetry_payload` use.
 ///
@@ -2262,50 +2323,66 @@ fn item_split_tokens(any_split: bool, sum: u64) -> Option<u64> {
 /// `telemetry.tokens` record. The DEFECT's population is narrower: only a
 /// record under a seat-SHARING session id can be misattributed, and
 /// `session_id::task` is minted by exactly two step kinds
-/// (`dispatch.single_shot` and `dispatch.map`), of which only THIS one emits
-/// `telemetry.tokens` at all — `dispatch.single_shot`'s tokens ride its own
-/// `dispatch complete` bookend, which the hero already classifies per
-/// completion. The other live producer, the container path's per-turn tailer
+/// (`dispatch.single_shot` and `dispatch.map`). (#2902 step 1a: the
+/// single-shot kind now emits `telemetry.tokens` too, `call_kind:
+/// "single_shot"`; the hero still counts that kind from its own `dispatch
+/// complete` bookend, classified per completion, and skips its usage
+/// records, `ui/src/lib/usageRecords.ts`.) The other live producer, the container path's per-turn tailer
 /// (`dispatch_internal.rs`'s `emit_telemetry`), runs under
 /// `session_id::step(&step.id)` (`dispatch_opts_for`, this file) — unique per
 /// step — and `crawl.unit` mints `crawl-<mission>-<rule>-<unit>` plus a
 /// per-draw suffix. Neither can share a key with another seat. So this one
 /// emitter is the whole live population.
-fn map_item_token_payload(res: &MapItemResult, remote: bool) -> Option<serde_json::Value> {
-    let total = res.total_tokens.or_else(|| match (res.prompt_tokens, res.completion_tokens) {
-        (None, None) => None,
-        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
-    })?;
-    // Unconditional, unlike every `Option` field below: these two are facts
-    // about THIS emitter's own call, never something a provider did or did
-    // not report, so the omit-never-zero rule that governs the token fields
-    // does not apply to them. A consumer can therefore treat an ABSENT
-    // `remote` as "not this producer" rather than "this producer had nothing
-    // to say", which is what lets the viewer keep its pre-#2690 fallback for
-    // every other `telemetry.tokens` lineage without a version check.
-    let mut payload = serde_json::json!({ "total_tokens": total, "remote": remote, "index": res.index });
-    let obj = payload.as_object_mut().expect("json! built an object");
-    if let Some(p) = res.prompt_tokens {
-        obj.insert("prompt_tokens".into(), serde_json::json!(p));
-    }
-    if let Some(c) = res.completion_tokens {
-        obj.insert("completion_tokens".into(), serde_json::json!(c));
-    }
-    // (#1444 review) Same omit-never-zero rule as the split above. NOTE the
-    // deliberate divergence from the runtime-side `telemetry.tokens`
-    // producers (`turn_tokens_payload`, `dispatch_remote`), which emit these
-    // keys as explicit JSON `null` when unreported: this emitter's whole
-    // convention is omission, and mixing the two inside one payload would be
-    // worse than either. Both readings mean "the provider didn't say"; the
-    // family-wide reconciliation this function's own doc already flags for
-    // `review_token_telemetry_payload` covers these two as well.
-    if let Some(r) = res.reasoning_tokens {
-        obj.insert("reasoning_tokens".into(), serde_json::json!(r));
-    }
-    if let Some(c) = res.cached_tokens {
-        obj.insert("cached_tokens".into(), serde_json::json!(c));
-    }
-    Some(payload)
+fn map_call_token_payload(
+    call: &MapCall,
+    index: usize,
+    remote: bool,
+    requested_model: &str,
+    endpoint: &str,
+) -> serde_json::Value {
+    let mut payload = crate::usage::usage_payload(
+        &crate::usage::CallFacts {
+            call_kind: crate::usage::CallKind::MapItem,
+            requested_model,
+            reported_model: call.reported_model.as_deref(),
+            endpoint,
+        },
+        &call.counts,
+    );
+    // Unconditional, unlike every count: these two are facts about THIS
+    // emitter's own call, never something a provider did or did not report.
+    // A consumer can therefore treat an ABSENT `remote` as "not this
+    // producer", which is what lets the viewer keep its pre-#2690 fallback
+    // for every other `telemetry.tokens` lineage without a version check.
+    // `index` is the ITEM's position; an item that retried emits one record
+    // per attempt, all carrying the same index.
+    let obj = payload.as_object_mut().expect("usage_payload builds an object");
+    obj.insert("remote".into(), serde_json::json!(remote));
+    obj.insert("index".into(), serde_json::json!(index));
+    payload
+}
+
+/// (tests) The payload one call with `res`'s counts would carry — the
+/// payload-shape tests below predate per-attempt records and read an item's
+/// accumulated counts as if they were one call's.
+#[cfg(test)]
+fn map_item_token_payload(
+    res: &MapItemResult,
+    remote: bool,
+    requested_model: &str,
+    endpoint: &str,
+) -> Option<serde_json::Value> {
+    let call = MapCall {
+        counts: crate::usage::UsageCounts {
+            prompt: res.prompt_tokens,
+            completion: res.completion_tokens,
+            total: res.total_tokens,
+            reasoning: res.reasoning_tokens,
+            cached: res.cached_tokens,
+        },
+        reported_model: res.served_model.clone(),
+    };
+    Some(map_call_token_payload(&call, res.index, remote, requested_model, endpoint))
 }
 
 /// (#1530 dogfood) Fold one reply's usage split into the running per-item
@@ -2395,6 +2472,7 @@ fn map_local_item(
     retry_on_empty: u32,
     retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
+    calls: &mut Vec<MapCall>,
 ) -> MapItemResult {
     use crate::single_shot::{single_shot_chat, SingleShotRequest};
     let mut sum = 0u64;
@@ -2442,6 +2520,7 @@ fn map_local_item(
         wall_ms += t0.elapsed().as_millis() as u64;
         match dispatch {
             Ok(reply) => {
+                calls.push(MapCall::from_reply(&reply));
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
@@ -2560,6 +2639,7 @@ fn map_hosted_item(
     retry_on_empty: u32,
     retry_on_error: u32,
     ovr: Option<&MapDispatchOverride>,
+    calls: &mut Vec<MapCall>,
 ) -> MapItemResult {
     use crate::single_shot::HostedSingleShotRequest;
     let mut sum = 0u64;
@@ -2652,6 +2732,7 @@ fn map_hosted_item(
         wall_ms += t0.elapsed().as_millis() as u64;
         match dispatch {
             Ok(reply) => {
+                calls.push(MapCall::from_reply(&reply));
                 bucket
                     .lock()
                     .expect("map remote bucket mutex poisoned")
@@ -4909,6 +4990,7 @@ mod tests {
 
         let out = map_hosted_item(
             0, &bucket, &endpoint, "gpt-5.1", "sys", "user", 1_000, 1, 0, 1, Some(&ovr),
+            &mut Vec::new(),
         );
 
         assert!(
@@ -5157,7 +5239,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("a reply with usage emits a record");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a reply with usage emits a record");
         assert_eq!(payload["total_tokens"], 4547);
         assert_eq!(payload["prompt_tokens"], 2490, "GENERATED/fresh/re-read read the split");
         assert_eq!(payload["completion_tokens"], 2057);
@@ -5192,11 +5274,11 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&local, false).expect("emits");
+        let payload = map_item_token_payload(&local, false, "m", "ep").expect("emits");
         assert_eq!(payload["remote"], false, "a local seat's own tier, on its own token record");
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
 
-        let hosted = map_item_token_payload(&local, true).expect("emits");
+        let hosted = map_item_token_payload(&local, true, "m", "ep").expect("emits");
         assert_eq!(hosted["remote"], true);
         assert_eq!(hosted["index"], 3);
     }
@@ -5222,7 +5304,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("emits");
         let obj = payload.as_object().expect("object");
         assert!(obj.contains_key("remote"), "the key is present even when the seat is local");
         assert_eq!(obj["remote"], serde_json::Value::Bool(false));
@@ -5254,7 +5336,7 @@ mod tests {
             retried: 0,
         };
         for remote in [false, true] {
-            let tok = map_item_token_payload(&res, remote).expect("emits");
+            let tok = map_item_token_payload(&res, remote, "m", "ep").expect("emits");
             let item = DispatchMapStepKind::item_record(&step, "m", remote, &res);
             let item_payload = item.payload.as_ref().expect("payload");
             assert_eq!(tok["remote"], item_payload["remote"], "one seat, one verdict");
@@ -5286,7 +5368,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, true).expect("a reply with usage emits a record");
+        let payload = map_item_token_payload(&res, true, "m", "ep").expect("a reply with usage emits a record");
         assert_eq!(payload["reasoning_tokens"], 1024);
         assert_eq!(payload["cached_tokens"], 64);
         // The neighbors must still land where they belong.
@@ -5315,7 +5397,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("emits");
         assert_eq!(payload["reasoning_tokens"], 300);
         assert!(
             payload.get("cached_tokens").is_none(),
@@ -5324,7 +5406,7 @@ mod tests {
         );
 
         let neither = MapItemResult { reasoning_tokens: None, cached_tokens: None, ..res };
-        let payload = map_item_token_payload(&neither, false).expect("emits");
+        let payload = map_item_token_payload(&neither, false, "m", "ep").expect("emits");
         assert!(payload.get("reasoning_tokens").is_none());
         assert!(payload.get("cached_tokens").is_none());
     }
@@ -5383,7 +5465,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("a total alone still emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a total alone still emits");
         assert_eq!(payload["total_tokens"], 1521);
         assert!(payload.get("prompt_tokens").is_none(), "never fabricate a split");
         assert!(payload.get("completion_tokens").is_none());
@@ -5410,32 +5492,12 @@ mod tests {
             wall_ms: 0,
             retried: 0,
         };
-        let payload = map_item_token_payload(&res, false).expect("a split alone still emits");
+        let payload = map_item_token_payload(&res, false, "m", "ep").expect("a split alone still emits");
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
         assert_eq!(payload["prompt_tokens"], 30);
         assert_eq!(payload["completion_tokens"], 12);
     }
 
-    /// An item that reported no usage at all emits NO record (pre-existing
-    /// behavior, pinned here so the payload refactor didn't change it).
-    #[test]
-    fn map_item_with_no_usage_emits_no_token_record() {
-        let res = MapItemResult {
-            index: 0,
-            ok: false,
-            content: String::new(),
-            error: Some("boom".to_string()),
-            total_tokens: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            reasoning_tokens: None,
-            cached_tokens: None,
-            served_model: None,
-            wall_ms: 0,
-            retried: 0,
-        };
-        assert!(map_item_token_payload(&res, false).is_none());
-    }
 
     /// The accumulator folds multi-attempt usage and keeps `None` honest.
     #[test]
@@ -7185,5 +7247,276 @@ mod tests {
         assert_eq!(pick(Some("p"), Some("q")), Ok("m-default".into()), "an explicit profile wins over the binding");
         let err = pick(None, Some("nope")).unwrap_err();
         assert!(err.contains("nope"), "a binding to an undefined profile is a loud error naming it, never a silent fallback: {err}");
+    }
+
+    // ─── (#2902 step 1a) usage conformance: one record per model call ──
+
+    /// The mock chat server every usage-conformance test below answers from.
+    /// `model` in the reply differs from the requested one on purpose, so
+    /// `reported_model` is provably the RESPONSE's field, not an echo.
+    fn usage_mock(server: &httpmock::MockServer, usage: bool) -> httpmock::Mock<'_> {
+        use httpmock::prelude::*;
+        let mut body = json!({
+            "id": "mock-usage",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "served-by-mock",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+        });
+        if usage {
+            body["usage"] = json!({ "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 12 });
+        }
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).header("content-type", "application/json").json_body(body);
+        })
+    }
+
+    fn as_values(recs: &[darkmux_flow::FlowRecord]) -> Vec<serde_json::Value> {
+        recs.iter().map(|r| serde_json::to_value(r).unwrap()).collect()
+    }
+
+    /// Runs `f` with `DARKMUX_LMSTUDIO_URL` pointed at `url`, restoring it after.
+    fn with_lmstudio_url<T>(url: &str, f: impl FnOnce() -> T) -> T {
+        let key = "DARKMUX_LMSTUDIO_URL";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, url) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_single_shot_step_local() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (local)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "darkmux:qwen3-4b");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+        assert_eq!(p["token_source"], "provider");
+        assert_eq!(p["total_tokens"], 12, "provider total wins over 7+3");
+        assert_eq!(rec["session_id"], darkmux_types::session_id::task(&s.task_id));
+        assert_eq!(rec["handle"], "s1");
+    }
+
+    #[test]
+    fn usage_conformance_single_shot_step_hosted() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let s = step(
+            "s1",
+            "dispatch.single_shot",
+            json!({ "model": "gpt-5.1", "user": "hi", "endpoint": { "url": format!("{}/v1", server.base_url()) } }),
+        );
+        let out = DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new()).expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (hosted)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "gpt-5.1");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        let ep: darkmux_types::ModelEndpoint =
+            serde_json::from_value(json!({ "url": format!("{}/v1", server.base_url()) })).unwrap();
+        assert_eq!(
+            p["endpoint"],
+            crate::dispatch_internal::remote_endpoint_label(&ep, "gpt-5.1"),
+            "the same label the bookends carry"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_single_shot_step_without_usage_is_absent() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, false);
+        let s = step("s1", "dispatch.single_shot", json!({ "model": "qwen3-4b", "user": "hi" }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchSingleShotStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::SingleShot, "dispatch.single_shot (no usage)");
+        assert_eq!(rec["payload"]["token_source"], "absent");
+        assert!(rec["payload"].get("total_tokens").is_none(), "no fabricated count: {rec}");
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_map_item_local() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let s = map_step(json!({ "model": "qwen3-4b", "user_template": "check {item}", "collection": ["a"] }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (local)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "darkmux:qwen3-4b");
+        // The response's own `model`, local items included (#2902 review).
+        assert_eq!(p["reported_model"], "served-by-mock");
+        assert_eq!(p["endpoint"], format!("{}/v1", server.base_url()));
+        assert_eq!(p["total_tokens"], 12);
+        assert_eq!(p["remote"], false, "#2690's seat field is kept");
+        assert_eq!(p["index"], 0);
+    }
+
+    /// Runs a LOCAL `dispatch.map` over `items` through the override seam,
+    /// returning `(transport hits, usage records)`.
+    fn map_usage_via_override(
+        config: serde_json::Value,
+        ovr: MapDispatchOverride,
+        hits: Arc<Mutex<usize>>,
+    ) -> (usize, Vec<serde_json::Value>) {
+        let s = map_step(config);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(Some(tx), None, Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let _ = DispatchMapStepKind.run_streaming(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+        let recs: Vec<serde_json::Value> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(serde_json::to_value(r).unwrap()),
+                _ => None,
+            })
+            .filter(|r| r["action"] == crate::usage::USAGE_ACTION)
+            .collect();
+        let n = *hits.lock().unwrap();
+        (n, recs)
+    }
+
+    fn scripted_reply(content: &str, total: Option<u64>) -> crate::single_shot::SingleShotReply {
+        crate::single_shot::SingleShotReply {
+            content: content.to_string(),
+            total_tokens: total,
+            prompt_tokens: total.map(|t| t - 2),
+            completion_tokens: total.map(|_| 2),
+            reasoning_tokens: None,
+            cached_tokens: None,
+            model: Some("served-by-script".to_string()),
+        }
+    }
+
+    /// (#2902 review) An item that retries makes N model calls and must
+    /// account N records, each with its own counts, summing to the item's
+    /// total. The reviewer's probe shape: 3 hits, 10 tokens each.
+    #[test]
+    fn usage_conformance_map_item_retries_emit_one_record_per_call() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&hits);
+        let ovr: MapDispatchOverride = Arc::new(move |_c: &OverrideDispatchCall<'_>| {
+            *seen.lock().unwrap() += 1;
+            Ok(scripted_reply("", Some(10))) // empty content: retry_on_empty fires
+        });
+        let (n, recs) = map_usage_via_override(
+            json!({ "model": "qwen3-4b", "user_template": "x {item}", "collection": ["a"], "retry_on_empty": 2 }),
+            ovr,
+            hits,
+        );
+        assert_eq!(n, 3, "three attempts hit the transport");
+        assert_eq!(recs.len(), 3, "one usage record per call: {recs:#?}");
+        let sum: u64 = recs.iter().map(|r| r["payload"]["total_tokens"].as_u64().unwrap()).sum();
+        assert_eq!(sum, 30);
+        for r in &recs {
+            assert_eq!(r["payload"]["call_kind"], "map_item");
+            assert_eq!(r["payload"]["reported_model"], "served-by-script");
+            assert_eq!(r["payload"]["index"], 0);
+        }
+    }
+
+    /// (#2902 review, finding 3) An attempt that replied WITHOUT usage, then a
+    /// later attempt that errored: the replied call still leaves an `absent`
+    /// record; the errored attempt (no reply) leaves none.
+    #[test]
+    fn usage_conformance_map_item_replied_then_errored_keeps_the_absent_record() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&hits);
+        let ovr: MapDispatchOverride = Arc::new(move |_c: &OverrideDispatchCall<'_>| {
+            let mut h = seen.lock().unwrap();
+            *h += 1;
+            if *h == 1 {
+                Ok(scripted_reply("", None))
+            } else {
+                anyhow::bail!("endpoint went away")
+            }
+        });
+        let (n, recs) = map_usage_via_override(
+            json!({ "model": "qwen3-4b", "user_template": "x {item}", "collection": ["a"], "retry_on_empty": 1 }),
+            ovr,
+            hits,
+        );
+        assert_eq!(n, 2);
+        assert_eq!(recs.len(), 1, "{recs:#?}");
+        assert_eq!(recs[0]["payload"]["token_source"], "absent");
+    }
+
+    /// An item whose only attempt errored made no completed call: no record.
+    #[test]
+    fn usage_conformance_map_item_with_no_reply_emits_no_record() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&hits);
+        let ovr: MapDispatchOverride = Arc::new(move |_c: &OverrideDispatchCall<'_>| {
+            *seen.lock().unwrap() += 1;
+            anyhow::bail!("boom")
+        });
+        let (n, recs) = map_usage_via_override(
+            json!({ "model": "qwen3-4b", "user_template": "x {item}", "collection": ["a"] }),
+            ovr,
+            hits,
+        );
+        assert_eq!(n, 1);
+        assert!(recs.is_empty(), "{recs:#?}");
+    }
+
+    #[test]
+    fn usage_conformance_map_item_hosted() {
+        let server = httpmock::MockServer::start();
+        let mock = usage_mock(&server, true);
+        let ep_json = json!({ "url": format!("{}/v1", server.base_url()) });
+        let s = map_step(json!({
+            "model": "gpt-5.1", "user_template": "check {item}", "collection": ["a"], "endpoint": ep_json,
+        }));
+        let out = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new()).expect("mock answers");
+        mock.assert_hits(1);
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (hosted)");
+        let p = &rec["payload"];
+        assert_eq!(p["requested_model"], "gpt-5.1");
+        assert_eq!(p["reported_model"], "served-by-mock");
+        let ep: darkmux_types::ModelEndpoint = serde_json::from_value(ep_json).unwrap();
+        assert_eq!(p["endpoint"], crate::dispatch_internal::remote_endpoint_label(&ep, "gpt-5.1"));
+        assert_eq!(p["remote"], true);
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_LMSTUDIO_URL
+    fn usage_conformance_map_item_without_usage_is_absent() {
+        let server = httpmock::MockServer::start();
+        let _mock = usage_mock(&server, false);
+        let s = map_step(json!({ "model": "qwen3-4b", "user_template": "check {item}", "collection": ["a"] }));
+        let out = with_lmstudio_url(&server.base_url(), || {
+            DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new())
+        })
+        .expect("mock answers");
+        let recs = as_values(&out.flow_records);
+        let rec = crate::usage::assert_one_usage_record(&recs, crate::usage::CallKind::MapItem, "dispatch.map item (no usage)");
+        assert_eq!(rec["payload"]["token_source"], "absent");
     }
 }

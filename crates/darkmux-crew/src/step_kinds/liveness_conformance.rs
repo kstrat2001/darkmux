@@ -145,7 +145,7 @@ const ENTRY_POINTS: &[Site] = &[
     },
 ];
 
-fn read_src(file: &str) -> String {
+pub(super) fn read_src(file: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {} for liveness conformance: {e}", path.display()))
@@ -161,10 +161,17 @@ fn read_src(file: &str) -> String {
 /// indentation levels (free functions at column 0, step-kind methods inside
 /// an `impl`), and a line-based rule that handles both is a rule that
 /// handles neither reliably.
-fn fn_body(src: &str, func: &str) -> String {
-    let decl = format!("fn {func}(");
+pub(super) fn fn_body(src: &str, func: &str) -> String {
+    block_from(src, &format!("fn {func}("))
+}
+
+/// The brace-balanced block that follows the first `decl` in `src` (the
+/// lexer [`fn_body`] uses; also reached by `usage_conformance` to cut a
+/// `mod tests { … }` block out of a file).
+pub(super) fn block_from(src: &str, decl: &str) -> String {
+    let func = decl;
     let start = src
-        .find(&decl)
+        .find(decl)
         .unwrap_or_else(|| panic!("no `{decl}` in source — did the function get renamed?"));
     let cs: Vec<char> = src[start..].chars().collect();
     let mut i = 0usize;

@@ -1,4 +1,5 @@
 import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../lib/flow";
+import { countsInLegacyTokenSums } from "../../lib/usageRecords";
 /**
  * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
  * savings hero's summing logic: tokens kept off the (frontier) meter, split
@@ -569,14 +570,19 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   for (const r of data) {
     if (r.category === "telemetry" && r.source === "tokens") {
       const p = (r.payload as TokenPayload) || {};
+      // (#2902 step 1a) Only the records this sum read before per-call usage
+      // records existed. A single-shot run's tokens keep coming from its
+      // `dispatch complete` (the fallback below), and a count-less
+      // `token_source: "absent"` record must not register its run in `sess`
+      // (that would suppress the fallback and drop the run's total).
+      if (!countsInLegacyTokenSums(p as Record<string, unknown>)) continue;
       total += p.total_tokens || 0;
       prompt += p.prompt_tokens || 0;
       completion += p.completion_tokens || 0;
-      // A `telemetry.tokens` record carries no `endpoint` of its own on any
-      // producer (the only emitter is the container path's per-turn tailer,
-      // `crates/darkmux-crew/src/dispatch_internal.rs:8539`, whose payload
-      // is `{turn_seq, prompt_tokens, completion_tokens, total_tokens}`), so
-      // this split can never be per-seat — the finest grain available to it
+      // A `telemetry.tokens` record's `endpoint` (#2902 step 1a) names what
+      // was CALLED, an LMStudio base URL included; it is not the hosted
+      // marker the bookends carry, so this split never reads it. Without a
+      // seat verdict of its own (`remote`, below) the finest grain available
       // is the RUN the record itself belongs to. Which is precisely why the
       // key has to be `runKey` and not a bare session id: this record names
       // its own `mission_id`, so joining on `(session_id, mission_id)` reads
@@ -842,10 +848,11 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // (`dispatch_internal.rs:8539`, used by `emit` and `emit_telemetry`
   // alike), and the map-item emitter (`builtins.rs:2011`, which passes
   // `None` for BOTH, so both land under the same empty mission).
-  // `dispatch_remote` builds telemetry records but none with
-  // `source: "tokens"`, so it is not a producer of this kind — an
-  // enumeration is only worth its exhaustiveness claim if every entry
-  // in it is real. And on the corpora:
+  // (#2902 step 1a) The single-shot producers (`dispatch_remote`,
+  // `dispatch_local_single_shot`, the `dispatch.single_shot` step) now emit
+  // `source: "tokens"` too, stamped with the same mission id as their own
+  // bookends; this sum skips them (`countsInLegacyTokenSums`) and keeps
+  // counting those runs from their `dispatch.complete`. And on the corpora:
   // ZERO sessions where a telemetry mission id matches no completion
   // mission id of the same session, in either the two-day corpus or the
   // demo replay.
