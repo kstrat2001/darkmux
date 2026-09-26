@@ -27,3 +27,11 @@ describe("scopeCenter", () => {
     expect(scopeCenter({ state: "stalled", tokensPerSec: 0, restSecondsLeft: 5, writing: true })).toEqual({ centerLabel: null, centerUnit: null, centerCarried: false });
   });
 });
+
+describe("(#2911) a run in flight with no model working", () => {
+  it("says so in the center, the run page's own phrase, instead of contradicting 'dispatch in flight' with 'idle'", () => {
+    expect(scopeCenter({ state: "idle", tokensPerSec: 0, inFlight: true })).toEqual({ centerLabel: null, centerUnit: "no model working", centerCarried: false });
+    // A machine with nothing running at all is still idle.
+    expect(scopeCenter({ state: "idle", tokensPerSec: 0, inFlight: false })).toEqual({ centerLabel: null, centerUnit: "idle", centerCarried: false });
+  });
+});

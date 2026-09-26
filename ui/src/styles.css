@@ -8751,6 +8751,13 @@ body {
 .token-scope-center:not(.token-scope-center--icon):not(:has(.token-scope-n)) .token-scope-u {
   top: 50%;
   transform: translateY(-50%);
+  /* (#2911) "no model working" (a run in flight between model steps) is
+     too wide for the card's ring on one line: this unit may wrap, kept to
+     the ring's inner width (the ring sits at 40% of the screen's radius). */
+  left: 19%;
+  right: 19%;
+  white-space: normal;
+  line-height: 1.3;
 }
 /* (#2890) The card's tube shows the same center as the run page's, unit
    included; the larger tube and ring leave the unit clear of the trace. */

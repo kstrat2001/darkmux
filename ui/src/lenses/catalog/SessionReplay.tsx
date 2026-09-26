@@ -77,7 +77,10 @@ const SCOPE_LAMPS: Array<{ state: LiveStateReading["state"]; label: string }> = 
   { state: "prompt", label: "prompt" },
   { state: "tools", label: "tools" },
   { state: "rest", label: "rest" },
-  { state: "stalled", label: "stall" },
+  // (#2911) "stalled", the word the fleet card's line and this row's own
+  // status text (`liveStateLabel`) already use; the lamp was the one place
+  // that said "stall".
+  { state: "stalled", label: "stalled" },
 ];
 export function ScopeLamps({
   reading,
@@ -179,6 +182,10 @@ export function modelScopeHero(view: Pick<SessionRunView, "liveTokScope" | "fini
         writing,
         writingSeconds: live.writingSeconds,
         thinking: live.thinking === true,
+        // (#2911) A live scope means the run is in flight: `state: null`
+        // (a mission between model steps) reads "no model working" in the
+        // tube, the same phrase the lamps' status gives it.
+        inFlight: true,
       }),
       lamps: {
         state: live.state,

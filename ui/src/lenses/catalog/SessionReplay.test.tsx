@@ -1481,3 +1481,44 @@ describe("modelScopeHero (#2890)", () => {
     expect(modelScopeHero({ liveTokScope: null, finishedTokRate: null })).toBeNull();
   });
 });
+
+describe("(#2911) the MODEL section, ticking and wording", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  const probe = () => JSON.parse(document.querySelector('[data-testid="run-token-scope"] [data-testid="token-scope-probe"]')!.getAttribute("data-props")!);
+
+  it("the REST countdown counts down every second with no new records", async () => {
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 30_000).toISOString(), action: "dispatch.start", session_id: "s-rest", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 12_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-rest", machine_id: "M", payload: { sampled_at_ms: t0 - 12_000, generated_chars: 400 } },
+      { ts: new Date(t0 - 10_000).toISOString(), action: "dispatch.rest", session_id: "s-rest", machine_id: "M", payload: { ms: 30_000 } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-rest");
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="run-token-scope"]')).toBeInTheDocument());
+    expect(probe()).toMatchObject({ state: "rest", centerLabel: "20s", centerUnit: "resting" });
+    expect(screen.getByRole("status", { name: /run state/ }).getAttribute("aria-label")).toBe("run state: rest 20s");
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(probe()).toMatchObject({ centerLabel: "15s" });
+    expect(screen.getByRole("status", { name: /run state/ }).getAttribute("aria-label")).toBe("run state: rest 15s");
+  });
+
+  it("no model working (a mission between steps): the tube says so, the same phrase as the lamps' status", () => {
+    const live = { tokensPerSec: null, state: null, stalled: false, carried: false, noSignal: false } as unknown as NonNullable<Parameters<typeof modelScopeHero>[0]["liveTokScope"]>;
+    expect(modelScopeHero({ liveTokScope: live, finishedTokRate: null })).toMatchObject({ state: "idle", centerLabel: null, centerUnit: "no model working" });
+    const { container } = render(<ScopeLamps reading={{ state: null }} />);
+    expect(container.querySelector(".scope-lamps")!.getAttribute("aria-label")).toBe("run state: no model working");
+  });
+
+  it("the lit lamp says 'stalled', the same word as the fleet card's line", () => {
+    const { container } = render(<ScopeLamps reading={{ state: "stalled" }} />);
+    expect(container.querySelector('.scope-lamp[data-on="true"] .scope-lamp__label')!.textContent).toBe("stalled");
+    expect(container.querySelector(".scope-lamps")!.getAttribute("aria-label")).toBe("run state: stalled");
+  });
+});

@@ -16,7 +16,8 @@ import type { ScopeState } from "./scopeMorph";
  *  - PROMPT: nothing; `TokenScope` draws the brain for the whole phase
  *    (#2890, operator: a size estimate in the center made one phase look
  *    like two; the size is in the event detail and the run page);
- *  - IDLE: the word "idle" on its own, centered;
+ *  - IDLE: the word "idle" on its own, centered; or, while a run is in
+ *    flight with no model working (#2911, `inFlight`), that phrase;
  *  - everything else: nothing. */
 export interface ScopeCenterInput {
   state: ScopeState;
@@ -26,6 +27,12 @@ export interface ScopeCenterInput {
   writing?: boolean;
   writingSeconds?: number;
   thinking?: boolean;
+  /** (#2911) A run is in flight on this surface (a mission between model
+   *  steps, a lab run with no execution yet). Read only for `idle`: the
+   *  center then says "no model working", the run page's own phrase for
+   *  that state, where a bare "idle" contradicted "dispatch in flight" on
+   *  the same card. A machine with nothing running keeps "idle". */
+  inFlight?: boolean;
 }
 
 export interface ScopeCenter {
@@ -56,7 +63,9 @@ export function scopeCenter(r: ScopeCenterInput): ScopeCenter {
         : writing
           ? "tool gen"
           : r.state === "idle"
-            ? "idle"
+            ? r.inFlight
+              ? "no model working"
+              : "idle"
             : null,
     centerCarried: generating && r.carried === true,
   };

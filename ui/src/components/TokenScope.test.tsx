@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, act } from "@testing-library/react";
-import { TokenScope } from "./TokenScope";
+import { TokenScope, waveAt } from "./TokenScope";
 
 // (#2890) What the operator SEES inside the tube, per state. The canvas
 // itself cannot draw under jsdom (no 2D context), so these assert on the
@@ -268,5 +268,85 @@ describe("(#2890) a unit on its own", () => {
     const { container } = render(<TokenScope tokensPerSec={0} size="tile" state="idle" centerUnit="idle" />);
     expect(container.querySelector(".token-scope-n")).toBeNull();
     expect(container.querySelector(".token-scope-u")?.textContent).toBe("idle");
+  });
+});
+
+describe("(#2911) waveAt: the harmonic shimmer, stated", () => {
+  /** Each lobe's peak height, for a settled `n`-lobe wave at `phase`. */
+  function lobePeaks(n: number, phase: number, harmonic: boolean): number[] {
+    const peaks: number[] = [];
+    for (let j = 0; j < n; j++) {
+      // The base wave peaks at k·t − phase = π/2 + 2πj; look ±half a lobe
+      // around it.
+      const center = (Math.PI / 2 + phase + 2 * Math.PI * j) / n;
+      let peak = -Infinity;
+      for (let s = -200; s <= 200; s++) peak = Math.max(peak, waveAt(center + (s / 200) * (Math.PI / n), n, n, 1, phase, harmonic));
+      peaks.push(peak);
+    }
+    return peaks;
+  }
+  it("without the harmonic every lobe is the same height (the symmetry the other tests prove)", () => {
+    for (const p of lobePeaks(5, 0.7, false)) expect(p).toBeCloseTo(1, 6);
+  });
+  it("with the harmonic the lobes vary in height by up to ±12% (the intended shimmer), and are not all equal", () => {
+    for (const phase of [0, 0.7, 2.9]) {
+      const peaks = lobePeaks(5, phase, true);
+      for (const p of peaks) {
+        expect(p).toBeGreaterThanOrEqual(1 - 0.12 - 1e-6);
+        expect(p).toBeLessThanOrEqual(1 + 0.12 + 1e-6);
+      }
+      expect(Math.max(...peaks) - Math.min(...peaks)).toBeGreaterThan(0.05);
+    }
+  });
+});
+
+describe("(#2911) reduced motion is followed at runtime, not read once at mount", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+  it("a runtime switch to reduced motion stops the loop and draws one static frame; switching back restarts it", () => {
+    const calls: string[] = [];
+    const ctx: unknown = new Proxy({} as Record<string | symbol, unknown>, {
+      get: (t, k) => (k in t ? t[k] : (...args: unknown[]) => { if (k === "fillRect" && args.length === 4) calls.push("fillRect"); return ctx; }),
+      set: (t, k, v) => { t[k] = v; return true; },
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(ctx as CanvasRenderingContext2D);
+    let matches = false;
+    const listeners = new Set<() => void>();
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (q: string) =>
+        ({
+          get matches() { return matches; },
+          media: q,
+          addEventListener: (_: string, cb: () => void) => listeners.add(cb),
+          removeEventListener: (_: string, cb: () => void) => listeners.delete(cb),
+        }) as unknown as MediaQueryList,
+    );
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextId = 0;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => { nextId += 1; frames.set(nextId, cb); return nextId; });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => { frames.delete(id); });
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} unobserve() {} });
+    Object.defineProperties(HTMLCanvasElement.prototype, {
+      clientWidth: { configurable: true, get: () => 200 },
+      clientHeight: { configurable: true, get: () => 200 },
+    });
+    try {
+      render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+      expect(frames.size).toBe(1);
+      const drawsBefore = calls.length;
+      matches = true;
+      act(() => { for (const l of listeners) l(); });
+      // The loop is gone and exactly one settled frame was painted.
+      expect(frames.size).toBe(0);
+      expect(calls.length).toBe(drawsBefore + 1);
+      matches = false;
+      act(() => { for (const l of listeners) l(); });
+      expect(frames.size).toBe(1);
+    } finally {
+      delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientWidth;
+      delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientHeight;
+    }
   });
 });
