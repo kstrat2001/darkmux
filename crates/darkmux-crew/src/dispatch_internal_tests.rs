@@ -12812,6 +12812,41 @@ fn wire_id_test_role() -> crate::types::Role {
     .unwrap()
 }
 
+/// (#2914) Both dispatch resolvers set the machine's utility model aside,
+/// and only the lab's opt-in leaves it selectable. The registry lists the
+/// utility model FIRST in the default profile (a pre-4.0 leftover), so a
+/// resolver that forgot the set-aside would put a task on it.
+#[test]
+#[serial]
+fn resolvers_set_the_utility_model_aside_unless_the_lab_opts_in() {
+    let tmp = TempDir::new().unwrap();
+    let pf = tmp.path().join("profiles.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{
+                "leftover":{"models":[{"id":"util-4b","n_ctx":16000},{"id":"worker-35b","n_ctx":65536}]}
+            },
+            "internal":{"utility":{"id":"darkmux:util-4b","n_ctx":120000}},
+            "default_profile":"leftover"}"#,
+    )
+    .unwrap();
+    let no_load = |_: &darkmux_types::ProfileModel| Ok(());
+    let nothing_loaded = || Ok(Vec::new());
+    // The container/single-shot resolver, residency skipped so the bare
+    // selection is what comes back.
+    let picked = super::resolve_dispatch_model_with_hosts(&wire_id_test_role(), None, pf.to_str(), true, false, &no_load, &nothing_loaded)
+        .unwrap();
+    assert_eq!(picked, "worker-35b", "work never runs on the utility model");
+    let lab = super::resolve_dispatch_model_with_hosts(&wire_id_test_role(), None, pf.to_str(), true, true, &no_load, &nothing_loaded)
+        .unwrap();
+    assert_eq!(lab, "util-4b", "the lab benchmarks a candidate utility model through a profile that lists it");
+    // The remote-target resolver takes the same set-aside.
+    let pm = super::resolve_selected_profile_model(&wire_id_test_role(), None, pf.to_str(), false).unwrap().unwrap();
+    assert_eq!(pm.id, "worker-35b");
+    let pm = super::resolve_selected_profile_model(&wire_id_test_role(), None, pf.to_str(), true).unwrap().unwrap();
+    assert_eq!(pm.id, "util-4b");
+}
+
 /// RED on the "delete the assignment" mutation. A real LMStudio dispatch
 /// must hand its caller the darkmux-NAMESPACED identifier — the same one
 /// the residency preflight just loaded the model under — because that
