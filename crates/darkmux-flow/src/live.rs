@@ -141,45 +141,78 @@ impl LiveSample {
 /// samples, and a dispatch sends to the daemon its own config names.
 ///
 /// A unix socket path is limited to ~104 bytes. When the home-based path is
-/// longer (a deep test or scratch home), the socket moves to a private
-/// directory `darkmux-live-<hash of home>/` under `$XDG_RUNTIME_DIR` when set,
-/// else the system temp dir (shared `/tmp` on Linux). That directory is
-/// created 0700 and, when it already exists, used only if it is a real
-/// directory (not a symlink), 0700, and owned by the home's owner; otherwise
-/// `None` (no channel), never a socket another user could plant or read.
-/// Both ends compute the same path.
+/// longer (a deep test or scratch home), the socket lives in a private
+/// directory [`fallback_dir`] instead. Pure: nothing is created here (only
+/// the daemon's [`bind_ingest`] creates a directory, 0700). An EXISTING
+/// fallback directory is used only if it is a real directory (not a
+/// symlink), 0700, and owned by the home's owner; otherwise `None` (no
+/// channel), never a socket another user could plant or read. Both ends
+/// compute the same path.
 pub fn socket_path_for(home: &Path, port: u16) -> Option<PathBuf> {
     let primary = home.join("run").join(format!("live-{port}.sock"));
     if primary.as_os_str().len() <= 100 {
         return Some(primary);
     }
+    let dir = fallback_dir(home);
+    if std::fs::symlink_metadata(&dir).is_ok() && !is_private_dir(&dir, home) {
+        return None;
+    }
+    Some(dir.join(format!("live-{port}.sock"))).filter(|p| p.as_os_str().len() <= 103)
+}
+
+/// The private directory a long home's socket lives in:
+/// `darkmux-live-<hash of home>/` under `$XDG_RUNTIME_DIR` when set, else the
+/// system temp dir (shared `/tmp` on Linux, hence the privacy checks).
+pub fn fallback_dir(home: &Path) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!(
+    base.join(format!(
         "darkmux-live-{:016x}",
         fnv64(home.as_os_str().as_encoded_bytes())
-    ));
-    private_dir(&dir, home)?;
-    Some(dir.join(format!("live-{port}.sock")))
+    ))
 }
 
-/// Create `dir` 0700, or accept an existing one only if it is a real
-/// directory, 0700, owned by `home`'s owner (the user darkmux runs as).
-fn private_dir(dir: &Path, home: &Path) -> Option<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => return Some(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return None,
+/// A real directory (not a symlink), 0700, owned by `home`'s owner (the
+/// user darkmux runs as).
+fn is_private_dir(dir: &Path, home: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (Ok(meta), Ok(owner)) = (
+        std::fs::symlink_metadata(dir),
+        std::fs::metadata(home).map(|m| m.uid()),
+    ) else {
+        return false;
+    };
+    meta.file_type().is_dir() && meta.permissions().mode() & 0o777 == 0o700 && meta.uid() == owner
+}
+
+/// (#2928 review, MF-B) Every live socket a daemon on this machine could
+/// have bound for `home`, whatever port it was started on: `(port, path)`
+/// for each `live-<port>.sock` in the home's `run/` and in its fallback
+/// directory. `darkmux doctor` probes each, so a daemon started with a
+/// `--port` that differs from `serve.port` is found.
+pub fn sockets_for_home(home: &Path) -> Vec<(u16, PathBuf)> {
+    let mut out = Vec::new();
+    for dir in [home.join("run"), fallback_dir(home)] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(port) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("live-"))
+                .and_then(|n| n.strip_suffix(".sock"))
+                .and_then(|n| n.parse::<u16>().ok())
+            else {
+                continue;
+            };
+            out.push((port, e.path()));
+        }
     }
-    let meta = std::fs::symlink_metadata(dir).ok()?;
-    let owner = std::fs::metadata(home).ok()?.uid();
-    let ok = meta.file_type().is_dir()
-        && meta.permissions().mode() & 0o777 == 0o700
-        && meta.uid() == owner;
-    ok.then_some(())
+    out.sort();
+    out
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
@@ -361,9 +394,13 @@ impl LiveSender {
 /// replaced can only be a dead daemon's (a live one would still hold the
 /// port). Owner-only permissions.
 pub fn bind_ingest(path: &Path) -> std::io::Result<std::os::unix::net::UnixDatagram> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        // Owner-only: the fallback directory may sit in a shared /tmp.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -437,14 +474,19 @@ mod tests {
             short,
             Some(PathBuf::from("/Users/x/.darkmux/run/live-8765.sock"))
         );
-        let base = tempfile::tempdir().unwrap();
+        // A short base, as a real runtime or temp dir is (a socket path is
+        // limited to ~104 bytes).
+        let base = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let home_root = tempfile::tempdir().unwrap();
         let deep = home_root.path().join("d".repeat(120));
         std::fs::create_dir_all(&deep).unwrap();
         let prev = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", base.path()) };
         let a = socket_path_for(&deep, 8765).expect("a private path");
+        let created_early = a.parent().unwrap().exists();
+        let _bound = bind_ingest(&a).expect("the daemon creates the private dir");
         let again = socket_path_for(&deep, 8765);
+        let listed = sockets_for_home(&deep);
         let other_port = socket_path_for(&deep, 8766);
         // A directory someone else prepared at the name a second home hashes
         // to: world-readable, so refused.
@@ -475,6 +517,12 @@ mod tests {
                 None => std::env::remove_var("XDG_RUNTIME_DIR"),
             }
         }
+        assert!(!created_early, "computing the path creates nothing");
+        assert_eq!(
+            listed,
+            vec![(8765, a.clone())],
+            "the daemon's socket is found by listing"
+        );
         assert!(a.starts_with(base.path()), "under XDG_RUNTIME_DIR: {a:?}");
         let dir_mode = std::fs::metadata(a.parent().unwrap())
             .unwrap()

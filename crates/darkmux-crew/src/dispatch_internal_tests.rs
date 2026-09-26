@@ -10664,7 +10664,7 @@
         }
         drop(f);
         state.poll_and_emit();
-        state.live_flush(u64::MAX);
+        state.live_flush_final();
         state.finish_live();
         (record_actions_in(&isolated.path().join("flows")), state.summary)
     }
@@ -10717,7 +10717,7 @@
         let live = &summary.live;
         assert_eq!(live.samples_sent as usize, samples.len(), "the summary counts what was sent");
         assert_eq!((live.dropped_no_receiver, live.dropped_full), (0, 0));
-        assert_eq!(live.cadence_ms, 250);
+        assert_eq!((live.enabled, live.cadence_ms), (true, 250));
         assert!(live.bytes > 0);
         // (#2928 review, C7) The stamped cost covers the sampler's work on
         // every chunk, not only the sends.
@@ -10758,11 +10758,19 @@
         let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
         while let Ok(n) = rx.recv(&mut buf) {
             let s = darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).unwrap();
-            if s.fields.get("phase").is_some() && s.at_ms > t + 50 {
-                refreshed.push(s.at_ms - t);
+            if let Some(r) = s.fields.get("refreshed_at_ms").and_then(|v| v.as_u64()) {
+                assert_eq!(s.fields["sampled_at_ms"], t + 50, "a refresh keeps the state's own time");
+                refreshed.push(r - t);
             }
+            // (#2928 re-review, C-6) Every sample is stamped with the host's
+            // clock at send time, whatever the runtime's clock said.
+            assert!(s.at_ms > t + 10_000_000, "a host send time, not the fixture's runtime time");
         }
         assert_eq!(refreshed, vec![300, 600, 900, 1_200], "one refresh per cadence, stamped with the host's clock");
+        // (#2928 re-review, MF-A) The final flush never refreshes (it once
+        // emitted a u64::MAX-stamped sample).
+        st.live_flush_final();
+        assert!(rx.recv(&mut buf).is_err(), "no refresh from the final flush");
         // The stream ends: no more refreshes.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&traj).unwrap();
@@ -10780,6 +10788,12 @@
     fn tailer_live_channel_with_no_daemon_drops_and_carries_on() {
         let (without, _) = run_live_fixture(None);
         let dir = TempDir::new().unwrap();
+        let (off, off_summary) = run_live_fixture(None);
+        // (#2928 re-review, C-5) A dispatch with no channel (the lab) says so,
+        // rather than a cadence it never sampled at.
+        assert_eq!((off_summary.live.enabled, off_summary.live.cadence_ms, off_summary.live.samples_sent), (false, 0, 0));
+        assert_eq!(off_summary.live.to_json()["enabled"], false);
+        assert_eq!(off, without);
         let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(dir.path().join("absent.sock"))));
         assert_eq!(with, without);
         assert_eq!(summary.live.samples_sent, 0);

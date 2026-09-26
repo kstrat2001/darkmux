@@ -626,6 +626,46 @@ export function buildFleetCard(
    *  strip. */
   live: LiveOverlay | null = null,
 ): FleetCard {
+  return withLiveReadings(
+    buildFleetCardBase(data, liveMachines, specs, liveSet, machAbsent, m, _liveMode, t, specBeats, machineRuns, roster),
+    t,
+    connected,
+    lastContactMs,
+    live,
+  );
+}
+
+/** (#2928 re-review, C-1) Everything on a card that reads the WINDOW of
+ *  durable records (activity, running sessions, names, hardware, counts),
+ *  plus the per-session record sets its live readings start from. The fleet
+ *  lens builds this once per data change and per wall second, never per live
+ *  sample: a live sample changes only the readings `withLiveReadings`
+ *  derives, over the running sessions alone. */
+export interface FleetCardBase extends Omit<FleetCard, "liveTokRate" | "liveTokStalled" | "liveTokState" | "liveTokRestSecondsLeft" | "liveTokCarried" | "executions" | "defaultExecutionSessionId" | "utility"> {
+  /** @internal The inputs the live readings need. */
+  liveInputs: {
+    data: FlowRecord[];
+    runningSids: string[];
+    /** Each running session's durable records, cut at the base's `t`. */
+    durableSets: FlowRecord[][];
+    self: boolean;
+    binding: { id: string; loaded: boolean } | null;
+  };
+}
+
+export function buildFleetCardBase(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  specs: MachineSpecs | null,
+  liveSet: Set<string>,
+  machAbsent: boolean,
+  m: string,
+  _liveMode: boolean,
+  t: number,
+  specBeats: Map<string, PresenceBeat> = liveMachines,
+  machineRuns: Run[] = [],
+  roster: readonly RosterName[] = [],
+): FleetCardBase {
   const flowActive = machActive(data, liveSet, m, t);
   const labRunning = runningLabRunCount(machineRuns);
   const active = flowActive || labRunning > 0;
@@ -701,9 +741,58 @@ export function buildFleetCard(
   // would read heartbeats from AFTER the playhead too, inflating/changing
   // the rate a live viewer actually saw at `t` (measured: 122 tok/s off a
   // heartbeat 6h in the day's future vs the correct 95 tok/s as of `t`).
-  const liveTokRecordSets = runningSids.map((sid) =>
-    mergeLive(sessionRecords(data, sid), live?.bySession.get(sid)).filter((r) => T(r.ts) <= t),
-  );
+  const durableSets = runningSids.map((sid) => sessionRecords(data, sid).filter((r) => T(r.ts) <= t));
+  const spec = specOf(data, liveMachines, specs, m, specBeats);
+  // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
+  // machine's hardware line, so "was there anything to read" is exactly
+  // "does that map hold an entry for this uid" — not a second, parallel
+  // notion of presence that could disagree with the one the spec came from.
+  const specUnknown: SpecUnknownReason | null = spec ? null : specBeats.has(m) ? "not-reported" : "not-seen";
+  // (#2814) `nameOf` plus the self-identity floor — see `displayNameOf`'s own
+  // doc for why a card titled with a raw 36-character UUID is the display
+  // half of "self is unknown", and why the floor can never outvote a name the
+  // window actually observed.
+  const name = displayNameOf(data, liveMachines, specs, m, roster);
+  // (#2915) `/machine/specs` answers for THIS machine only; a peer's model is
+  // read off its own utility records and its residency is unknown.
+  const self = specs != null && isSelfMachine(data, liveMachines, specs, m);
+  return {
+    uid: m,
+    name,
+    spec,
+    specUnknown,
+    active,
+    absent: machAbsent,
+    stat,
+    runsCount,
+    // (Playback parity, Change A, finding #3) Always "running" now — a
+    // replayed instant with genuinely running sessions reads the same word
+    // a live viewer would have seen. `liveMode` no longer changes this, and
+    // "running" (a gerund, not a count noun) never pluralizes.
+    runsLabel: "running",
+    runningSessionIds,
+    liveInputs: { data, runningSids, durableSets, self, binding: self ? (specs?.utility_model ?? null) : null },
+  };
+}
+
+/** (#2928 re-review, C-1) A card's live readings (the scope's rate and
+ *  state, the per-execution pages, the utility strip) from its base, the
+ *  page clock `t`, and the live overlay. Touches only the running sessions'
+ *  records and the overlay. */
+export function withLiveReadings(
+  base: FleetCardBase,
+  t: number,
+  connected = true,
+  lastContactMs: number | null = null,
+  live: LiveOverlay | null = null,
+): FleetCard {
+  const { data, runningSids, durableSets, self, binding } = base.liveInputs;
+  const active = base.active;
+  const m = base.uid;
+  const liveTokRecordSets = runningSids.map((sid, i) => {
+    const liveRecs = live?.bySession.get(sid);
+    return liveRecs ? mergeLive(durableSets[i], liveRecs.filter((r) => T(r.ts) <= t)) : durableSets[i];
+  });
   // (#2877 dogfood finding) A session can be `active` (no terminal record
   // yet — a mission genuinely stuck open, observed live: `status: "running"`
   // hours after its last real heartbeat) while its heartbeat stream has long
@@ -790,36 +879,10 @@ export function buildFleetCard(
     )
     .sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
   const defaultExecutionSessionId = busiestExecution(executions)?.sessionId ?? null;
-  const spec = specOf(data, liveMachines, specs, m, specBeats);
-  // (#1855) `specBeats` is the SAME map `specOf` falls back to for a remote
-  // machine's hardware line, so "was there anything to read" is exactly
-  // "does that map hold an entry for this uid" — not a second, parallel
-  // notion of presence that could disagree with the one the spec came from.
-  const specUnknown: SpecUnknownReason | null = spec ? null : specBeats.has(m) ? "not-reported" : "not-seen";
-  // (#2814) `nameOf` plus the self-identity floor — see `displayNameOf`'s own
-  // doc for why a card titled with a raw 36-character UUID is the display
-  // half of "self is unknown", and why the floor can never outvote a name the
-  // window actually observed.
-  const name = displayNameOf(data, liveMachines, specs, m, roster);
-  // (#2915) `/machine/specs` answers for THIS machine only; a peer's model is
-  // read off its own utility records and its residency is unknown.
-  const self = specs != null && isSelfMachine(data, liveMachines, specs, m);
-  const utility = utilityStrip(data, m, t, self ? (specs?.utility_model ?? null) : null, self && live ? live.utility : []);
+  const utility = utilityStrip(data, m, t, binding, self && live ? live.utility : []);
+  const { liveInputs: _inputs, ...rest } = base;
   return {
-    uid: m,
-    name,
-    spec,
-    specUnknown,
-    active,
-    absent: machAbsent,
-    stat,
-    runsCount,
-    // (Playback parity, Change A, finding #3) Always "running" now — a
-    // replayed instant with genuinely running sessions reads the same word
-    // a live viewer would have seen. `liveMode` no longer changes this, and
-    // "running" (a gerund, not a count noun) never pluralizes.
-    runsLabel: "running",
-    runningSessionIds,
+    ...rest,
     liveTokRate,
     liveTokStalled,
     liveTokState,

@@ -7799,7 +7799,7 @@ fn run_tailer(
             // Final flush — pick up anything written between the last
             // sleep tick and the container's exit signal.
             state.poll_and_emit();
-            state.live_flush(u64::MAX);
+            state.live_flush_final();
             break;
         }
         // (#2131 review round 2, MUST-FIX 2) This is the ONE poll point
@@ -9373,6 +9373,10 @@ struct LiveChannel {
 /// socket nobody reads) and `dropped_full` (a daemon too slow to drain).
 #[derive(Debug, Default, Clone, PartialEq)]
 struct LiveSummary {
+    /// (#2928 re-review, C-5) Whether this execution fed the channel at
+    /// all. `false` (the lab, or `runtime.live_sample_ms: 0`) reads cadence
+    /// 0 and zeros throughout.
+    enabled: bool,
     cadence_ms: u64,
     samples_sent: u64,
     dropped_no_receiver: u64,
@@ -9385,6 +9389,7 @@ struct LiveSummary {
 impl LiveSummary {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
+            "enabled": self.enabled,
             "cadence_ms": self.cadence_ms,
             "samples_sent": self.samples_sent,
             "dropped_no_receiver": self.dropped_no_receiver,
@@ -9506,7 +9511,8 @@ impl TailerState {
     /// (#2928) Open this execution's live channel: `sender` to the local
     /// daemon, sampled at `cadence_ms`. `None` leaves it off.
     fn with_live(mut self, sender: Option<darkmux_flow::live::LiveSender>, cadence_ms: u64) -> Self {
-        self.summary.live.cadence_ms = cadence_ms;
+        self.summary.live.enabled = sender.is_some();
+        self.summary.live.cadence_ms = if sender.is_some() { cadence_ms } else { 0 };
         self.live = sender.map(|sender| LiveChannel {
             sender,
             gate: crate::live_gate::LiveGate::new(cadence_ms),
@@ -9527,7 +9533,7 @@ impl TailerState {
         let ts = event.get("ts").and_then(|v| v.as_u64()).unwrap_or_else(crate::usage::unix_ms_now);
         let released = self.live.as_mut().map(|l| l.gate.offer(ts, build(event))).unwrap_or_default();
         for p in released {
-            let sample = self.model_sample(p, ts);
+            let sample = self.model_sample(p);
             if let Some(live) = self.live.as_mut() {
                 live.sender.send(&sample);
             }
@@ -9551,8 +9557,7 @@ impl TailerState {
         let t0 = Instant::now();
         let due = self.live.as_mut().and_then(|l| l.gate.flush_due(now_ms).or_else(|| l.gate.refresh_due(now_ms)));
         if let Some(p) = due {
-            let at = p.get("sampled_at_ms").and_then(|v| v.as_u64()).unwrap_or(now_ms);
-            let sample = self.model_sample(p, at);
+            let sample = self.model_sample(p);
             if let Some(live) = self.live.as_mut() {
                 live.sender.send(&sample);
             }
@@ -9560,10 +9565,30 @@ impl TailerState {
         self.add_sampler_time(t0);
     }
 
-    fn model_sample(&self, payload: serde_json::Value, fallback_ms: u64) -> darkmux_flow::live::LiveSample {
+    /// (#2928 re-review, MF-A) The last flush, after the container exited:
+    /// the held sample only, never a refresh (a stream that is over has no
+    /// silence to keep fresh).
+    fn live_flush_final(&mut self) {
+        if self.live.is_none() {
+            return;
+        }
+        let t0 = Instant::now();
+        if let Some(p) = self.live.as_mut().and_then(|l| l.gate.flush_due(u64::MAX)) {
+            let sample = self.model_sample(p);
+            if let Some(live) = self.live.as_mut() {
+                live.sender.send(&sample);
+            }
+        }
+        self.add_sampler_time(t0);
+    }
+
+    /// (#2928 re-review, C-6) `at_ms` is the HOST's clock at send time: the
+    /// daemon's skew check and every ordering use one clock, even if the
+    /// container's drifts. The runtime's own time stays in the payload's
+    /// `sampled_at_ms`, which is what rates are measured on.
+    fn model_sample(&self, payload: serde_json::Value) -> darkmux_flow::live::LiveSample {
         let cadence = self.live.as_ref().map(|l| l.cadence_ms).unwrap_or(0);
-        let at = payload.get("sampled_at_ms").and_then(|v| v.as_u64()).unwrap_or(fallback_ms);
-        let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, at, cadence);
+        let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, crate::usage::unix_ms_now(), cadence);
         s.session_id = Some(self.session_id.clone());
         s.role = Some(self.role_id.clone());
         s.model = Some(self.model.clone());
@@ -9575,9 +9600,11 @@ impl TailerState {
 
     /// (#2928) A utility job's start or end on the live channel, sent at
     /// once (never gated: a job's two edges are the whole signal).
-    fn live_utility(&mut self, fields: serde_json::Value, at_ms: u64, model: Option<&str>) {
+    /// `at_ms` is the host's send time (C-6); the job's own times ride in
+    /// `started_at_ms` / `ended_at_ms`.
+    fn live_utility(&mut self, fields: serde_json::Value, model: Option<&str>) {
         let Some(live) = self.live.as_mut() else { return };
-        let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, at_ms, live.cadence_ms);
+        let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, crate::usage::unix_ms_now(), live.cadence_ms);
         s.session_id = Some(self.session_id.clone());
         s.role = Some(COMPACTOR_ROLE.to_string());
         s.model = model.filter(|m| !m.is_empty()).map(str::to_string);
@@ -10027,7 +10054,7 @@ impl TailerState {
                 let mut live = payload.clone();
                 live["event"] = serde_json::json!("start");
                 live["serves"] = serde_json::json!(self.session_id);
-                self.live_utility(live, started_at_ms, Some(&model));
+                self.live_utility(live, Some(&model));
                 self.emit_telemetry_as(
                     COMPACTOR_ROLE,
                     Some(&model).filter(|m| !m.is_empty()).map(String::as_str),
@@ -10067,7 +10094,7 @@ impl TailerState {
                         "duration_ms": ended_at_ms.saturating_sub(started_at_ms),
                     });
                     let m = payload["requested_model"].as_str().map(str::to_string);
-                    self.live_utility(live, ended_at_ms, m.as_deref());
+                    self.live_utility(live, m.as_deref());
                 }
                 let model = payload["requested_model"].as_str().map(str::to_string);
                 self.emit_telemetry_as(

@@ -152,8 +152,8 @@ impl LiveGate {
     }
 
     /// (#2928 review, MF1) Through a silence, the current state again, once
-    /// per cadence on the HOST's clock `now_ms` (its `sampled_at_ms` is
-    /// restamped to `now_ms`; nothing else changes). This is what keeps the
+    /// per cadence on the HOST's clock `now_ms` (stamped as `refreshed_at_ms`;
+    /// the state, `sampled_at_ms` included, is unchanged). This is what keeps the
     /// live view fresh while the endpoint sends nothing, without the runtime
     /// writing a single extra trajectory line.
     ///
@@ -174,7 +174,10 @@ impl LiveGate {
             return None;
         }
         let mut again = self.last.clone()?;
-        again["sampled_at_ms"] = Value::from(now_ms);
+        // (#2928 re-review, MF-A) The state's own `sampled_at_ms` is kept, so
+        // a refresh can never pair into a rate or reorder the stream; the
+        // host's clock rides in `refreshed_at_ms`, read only for freshness.
+        again["refreshed_at_ms"] = Value::from(now_ms);
         self.window_start = Some(now_ms);
         self.window_sends = 1;
         Some(again)
@@ -346,16 +349,23 @@ mod tests {
     #[test]
     fn a_silent_tool_call_write_is_refreshed_at_the_cadence_on_the_host_clock() {
         let mut g = LiveGate::new(250);
-        let w = json!({ "turn_seq": 1, "generated_chars": 10, "cumulative_chars": 10, "phase": "writing_tool_call", "tool_name": "bash" });
+        let w = json!({ "turn_seq": 1, "generated_chars": 10, "cumulative_chars": 10, "phase": "writing_tool_call", "tool_name": "bash", "sampled_at_ms": 1_000 });
         assert_eq!(g.offer(1_000, w.clone()).len(), 1);
         assert_eq!(g.flush_due(1_300), None, "nothing held");
         assert_eq!(g.refresh_due(1_100), None, "inside the window");
         let r = g
             .refresh_due(1_250)
             .expect("refreshed once the window closes");
+        // (#2928 re-review, MF-A) A refresh never looks like a new sample:
+        // the state's own time is kept, and the host's clock rides in a
+        // separate field used only for freshness.
         assert_eq!(
-            r["sampled_at_ms"], 1_250,
-            "the host's clock, not the runtime's"
+            r["sampled_at_ms"], 1_000,
+            "the repeated state keeps its own time"
+        );
+        assert_eq!(
+            r["refreshed_at_ms"], 1_250,
+            "the host's clock, for freshness only"
         );
         assert_eq!(r["tool_name"], "bash");
         assert_eq!(

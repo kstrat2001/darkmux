@@ -53,6 +53,12 @@ export interface HeartbeatSample {
   /** (#2889) The request's size in chars, carried only by a turn's opening
    *  heartbeat (flow schema 1.56.0). */
   promptChars?: number;
+  /** (#2928) The latest moment this sample's state was known to still hold:
+   *  a live-channel refresh (the host re-sending a silent state, stamped
+   *  `refreshed_at_ms`) moves it forward. Read for freshness (stall) only;
+   *  a refresh is never a sample of its own, so it never pairs into a rate
+   *  or reorders the stream. */
+  freshMs?: number;
 }
 
 /** (#2889) The `phase` value a heartbeat carries while the model writes a
@@ -70,9 +76,18 @@ export const WRITING_TOOL_CALL_PHASE = "writing_tool_call";
  * heartbeat missing every usable field is simply skipped. */
 export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
   const out: HeartbeatSample[] = [];
+  const refreshes: { turn: unknown; stateAt: number; at: number }[] = [];
   for (const r of records) {
     if (r.action !== "dispatch.turn.heartbeat") continue;
     const f = fields(r);
+    // (#2928) A live refresh repeats a state; it only says the state still
+    // holds. Collected apart and folded into `freshMs` below.
+    const refreshedAt = num(f.refreshed_at_ms);
+    if (refreshedAt !== null) {
+      const stateAt = num(f.sampled_at_ms);
+      if (stateAt !== null) refreshes.push({ turn: f.turn_seq, stateAt, at: refreshedAt });
+      continue;
+    }
     const chars = num(f.generated_chars) ?? num(f.cumulative_chars);
     if (chars === null) continue;
     const atMs = num(f.sampled_at_ms) ?? Date.parse(r.ts);
@@ -86,7 +101,22 @@ export function heartbeatSamples(records: FlowRecord[]): HeartbeatSample[] {
     out.push(sample);
   }
   out.sort((a, b) => a.atMs - b.atMs);
+  for (const x of refreshes) {
+    // The newest real sample of that turn at or before the repeated state.
+    for (let i = out.length - 1; i >= 0; i--) {
+      const smp = out[i];
+      if (smp.atMs <= x.stateAt && (smp.turn === undefined || x.turn === undefined || smp.turn === x.turn)) {
+        smp.freshMs = Math.max(smp.freshMs ?? smp.atMs, x.at);
+        break;
+      }
+    }
+  }
   return out;
+}
+
+/** (#2928) When a sample's state was last known to hold. */
+function freshOf(s: HeartbeatSample): number {
+  return s.freshMs ?? s.atMs;
 }
 
 /** Δchars/Δms between two samples, as chars/sec. `null` on a non-positive
@@ -417,7 +447,7 @@ export const STALL_AFTER_MS = 30_000;
 export function isStalled(records: FlowRecord[], nowMs: number): boolean {
   const samples = heartbeatSamples(records);
   if (samples.length === 0) return false;
-  return nowMs - samples[samples.length - 1].atMs > STALL_AFTER_MS;
+  return nowMs - freshOf(samples[samples.length - 1]) > STALL_AFTER_MS;
 }
 
 /** (#2877 pass 2, "is this resting? can't tell") The legible word a stopped
@@ -846,7 +876,7 @@ export function lastHeartbeatMs(perExecutionRecords: FlowRecord[][]): number | n
   for (const recs of perExecutionRecords) {
     const samples = heartbeatSamples(recs);
     if (!samples.length) continue;
-    const at = samples[samples.length - 1].atMs;
+    const at = freshOf(samples[samples.length - 1]);
     if (latest === null || at > latest) latest = at;
   }
   return latest;

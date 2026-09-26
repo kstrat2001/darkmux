@@ -64,7 +64,7 @@ export function useCountUp(
   target: number | null,
   format: (n: number | null) => string,
   durationMs: number = DEFAULT_DURATION_MS,
-  opts: { upOnly?: boolean } = {},
+  opts: { upOnly?: boolean; snapWithinMs?: number } = {},
 ): string {
   const prevTarget = useRef<number | null | typeof UNSET>(UNSET);
   const [display, setDisplay] = useState<number | null>(target);
@@ -75,6 +75,8 @@ export function useCountUp(
   const reduced = usePrefersReducedMotion();
   const seekGen = useSeekGeneration();
   const prevSeekGen = useRef(seekGen);
+  const lastChangeAt = useRef<number>(-Infinity);
+  const snapWithinMs = opts.snapWithinMs ?? 0;
 
   useEffect(() => {
     const isSeek = seekGen !== prevSeekGen.current;
@@ -94,7 +96,15 @@ export function useCountUp(
     // not a live value changing over time, and animating BETWEEN two
     // unrelated instants would show a number that was never true at either
     // point in time.
-    if (from === null || target === null || reduced || isSeek || durationMs <= 0 || (upOnly && target < from)) {
+    // (#2928 re-review, C-1) A value that changes again within
+    // `snapWithinMs` of its last change (the live channel's cadence, not a
+    // 2 s heartbeat's) is shown as it is: a tween that is always running
+    // re-renders and repaints every frame, and draws numbers between
+    // samples that were never measured.
+    const nowT = performance.now();
+    const frequent = nowT - lastChangeAt.current < snapWithinMs;
+    lastChangeAt.current = nowT;
+    if (from === null || target === null || reduced || isSeek || frequent || durationMs <= 0 || (upOnly && target < from)) {
       setDisplay(target);
       return;
     }
@@ -105,7 +115,14 @@ export function useCountUp(
     const start = performance.now();
     const tick = (now: number) => {
       const t = Math.min(1, (now - start) / durationMs);
-      setDisplay(startVal + (endVal - startVal) * easeOutCubic(t));
+      const next = startVal + (endVal - startVal) * easeOutCubic(t);
+      // (#2928 re-review, C-1) Render only when what is SHOWN changes: a
+      // frame that moves the value inside one displayed digit re-rendered
+      // the component for nothing, and with live samples several times a
+      // second a tween is running most of the time. The last frame always
+      // lands, so the settled value is exact.
+      if (t >= 1 || format(next) !== format(shown.current)) setDisplay(next);
+      else shown.current = next;
       rafRef.current = t < 1 ? requestAnimationFrame(tick) : null;
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -113,7 +130,7 @@ export function useCountUp(
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [target, reduced, durationMs, upOnly, seekGen]);
+  }, [target, reduced, durationMs, upOnly, seekGen, snapWithinMs]);
 
   // Absence renders on THIS render, not one effect later: `display` still
   // holds the old number until the effect runs, and a caller whose formatter

@@ -81,7 +81,8 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
 // Version history:
 //   1.62.0 (#2928, the live channel): additive, one payload block.
 //           `dispatch complete.payload.live`: the live channel's own cost for
-//           the execution — `cadence_ms` (0 when the channel was off),
+//           the execution — `enabled` (false for a dispatch that did not
+//           feed it: the lab, or the channel off), `cadence_ms` (0 then),
 //           `samples_sent`, `dropped_no_receiver` (no daemon, or a stale
 //           socket) and `dropped_full` (a daemon too slow to drain),
 //           `sampler_us` (all the channel's time on this execution: building

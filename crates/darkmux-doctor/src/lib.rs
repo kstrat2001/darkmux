@@ -2978,10 +2978,19 @@ fn check_live_channel() -> Check {
     let state = socket.as_deref().map(darkmux_flow::live::probe_socket);
     let addr = darkmux_types::config_access::serve_client_addr();
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
-    let daemon = loopback_http_body(&host, darkmux_types::config_access::serve_port(), "/health")
+    let port = darkmux_types::config_access::serve_port();
+    let daemon = loopback_http_body(&host, port, "/health")
         .as_deref()
         .and_then(parse_daemon_live_socket);
-    classify_live_channel(c, socket.as_deref(), state, daemon.as_ref(), darkmux_types::config_access::serve_port())
+    // (#2928 re-review, MF-B) A daemon started with `--port X` binds a socket
+    // keyed to X, which `/health` on `serve.port` never sees: list the
+    // home's sockets and probe each.
+    let elsewhere: Vec<u16> = darkmux_flow::live::sockets_for_home(&darkmux_flow::live::live_home())
+        .into_iter()
+        .filter(|(p, path)| *p != port && darkmux_flow::live::probe_socket(path) == darkmux_flow::live::SocketState::Listening)
+        .map(|(p, _)| p)
+        .collect();
+    classify_live_channel(c, socket.as_deref(), state, daemon.as_ref(), port, &elsewhere)
 }
 
 fn classify_live_channel(
@@ -2990,6 +2999,8 @@ fn classify_live_channel(
     state: Option<darkmux_flow::live::SocketState>,
     daemon: Option<&DaemonLiveSocket>,
     dispatch_port: u16,
+    // Ports of OTHER sockets in this home a daemon is receiving on.
+    elsewhere: &[u16],
 ) -> Check {
     use darkmux_flow::live::SocketState;
     let name = "live channel";
@@ -3034,14 +3045,28 @@ fn classify_live_channel(
             "start `darkmux serve` (it replaces the stale socket), or delete the socket file named above".into(),
         );
     }
+    if state != Some(SocketState::Listening) {
+        if let Some(other) = elsewhere.first() {
+            return warn(
+                format!(
+                    "{base}. A daemon IS receiving live samples, on a socket keyed to port {other} (it was started with `--port {other}`), but dispatches send to port {dispatch_port} (`serve.port`): its viewers get no live samples"
+                ),
+                format!(
+                    "start the daemon without `--port` (it then uses serve.port {dispatch_port}), or make {other} the configured port: `darkmux config set serve.port {other}`"
+                ),
+            );
+        }
+    }
     if let Some(d) = daemon {
+        // Same port (that is where doctor asked), different socket: the
+        // daemon resolves a different darkmux home than this shell.
         if d.socket_id != darkmux_flow::live::socket_fingerprint(socket) {
             return warn(
                 format!(
-                    "{base}. The running daemon bound a DIFFERENT socket (keyed by port {}) than dispatches send to (port {dispatch_port}): its viewers get no live samples",
+                    "{base}. The daemon on port {} bound a DIFFERENT socket: it runs with a different darkmux home (DARKMUX_HOME) than this shell, so dispatches from here reach no viewer",
                     d.socket_port
                 ),
-                format!("run the daemon on the configured port, or set it: `darkmux config set serve.port {}`", d.socket_port),
+                "run the daemon and your dispatches with the same DARKMUX_HOME".into(),
             );
         }
         if !d.bound {
@@ -9960,20 +9985,27 @@ mod tests {
         let c = LiveCadence { configured_ms: 250, effective_ms: 250, source: Source::BuiltIn };
         let sock = std::path::Path::new("/h/run/live-8765.sock");
         let ours = DaemonLiveSocket { socket_id: socket_fingerprint(sock), socket_port: 8765, bound: true };
-        let ok = classify_live_channel(c, Some(sock), Some(SocketState::Listening), Some(&ours), 8765);
+        let ok = classify_live_channel(c, Some(sock), Some(SocketState::Listening), Some(&ours), 8765, &[19491]);
         assert_eq!(ok.status, Status::Pass, "{}", ok.message);
         assert!(ok.message.contains("a daemon is receiving"));
-        let stale = classify_live_channel(c, Some(sock), Some(SocketState::Stale), None, 8765);
+        let stale = classify_live_channel(c, Some(sock), Some(SocketState::Stale), None, 8765, &[]);
         assert_eq!(stale.status, Status::Warn);
         assert!(stale.message.contains("killed without removing its socket"), "{}", stale.message);
-        let other = DaemonLiveSocket { socket_id: socket_fingerprint(std::path::Path::new("/h/run/live-19491.sock")), socket_port: 19491, bound: true };
-        let mm = classify_live_channel(c, Some(sock), Some(SocketState::Absent), Some(&other), 8765);
+        // (#2928 re-review, MF-B) A daemon started with `--port 19491` while
+        // serve.port is 8765: found by listing the home's sockets.
+        let port = classify_live_channel(c, Some(sock), Some(SocketState::Absent), None, 8765, &[19491]);
+        assert_eq!(port.status, Status::Warn);
+        assert!(port.message.contains("port 19491") && port.message.contains("port 8765"), "{}", port.message);
+        assert!(port.hint.as_deref().unwrap_or("").contains("serve.port 19491"), "{:?}", port.hint);
+        // A daemon on the configured port answering for a different home.
+        let other_home = DaemonLiveSocket { socket_id: socket_fingerprint(std::path::Path::new("/other/run/live-8765.sock")), socket_port: 8765, bound: true };
+        let mm = classify_live_channel(c, Some(sock), Some(SocketState::Absent), Some(&other_home), 8765, &[]);
         assert_eq!(mm.status, Status::Warn);
-        assert!(mm.message.contains("port 19491") && mm.message.contains("port 8765"), "{}", mm.message);
+        assert!(mm.message.contains("DARKMUX_HOME"), "{}", mm.message);
         let lost = DaemonLiveSocket { bound: false, ..ours.clone() };
-        let l = classify_live_channel(c, Some(sock), Some(SocketState::Listening), Some(&lost), 8765);
+        let l = classify_live_channel(c, Some(sock), Some(SocketState::Listening), Some(&lost), 8765, &[]);
         assert!(l.message.contains("lost its socket"), "{}", l.message);
-        let none = classify_live_channel(c, None, None, None, 8765);
+        let none = classify_live_channel(c, None, None, None, 8765, &[]);
         assert!(none.message.contains("no private socket path"), "{}", none.message);
         assert_eq!(
             parse_daemon_live_socket(r#"{"live":{"ingest":{"socket_id":"ab","socket_port":8765,"bound":true}}}"#),

@@ -235,8 +235,9 @@ darkmux release.
   history grows. A slow or absent daemon never slows a dispatch. Local
   only: another machine's cards stay at 2 s. Lab benchmark runs don't feed
   it. The cadence is `runtime.live_sample_ms` (`0` off, clamped
-  100..=1000); `darkmux doctor` shows it and names a stale or mismatched
-  socket, and every `dispatch complete` carries the channel's own cost as
+  100..=1000); `darkmux doctor` shows it and names a stale socket or a
+  daemon the dispatches can't reach (started with another `--port`, or
+  another `DARKMUX_HOME`), and every `dispatch complete` carries the channel's own cost as
   `payload.live`. A replayed scope says on hover that it is drawn from 2 s
   heartbeats. No layout changes. FLOW schema 1.62.0, CONFIG 1.29.
 

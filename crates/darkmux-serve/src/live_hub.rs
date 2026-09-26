@@ -90,8 +90,9 @@ pub(crate) fn accept_at(bytes: &[u8], now_ms: u64) -> bool {
 pub(crate) struct IngestState {
     path: PathBuf,
     port: u16,
-    /// The bound socket file's inode: how "is it still ours?" is answered.
-    ino: u64,
+    /// The bound socket file's identity: how "is it still ours?" is
+    /// answered.
+    id: FileId,
     bound: AtomicBool,
 }
 
@@ -109,9 +110,8 @@ impl IngestState {
     }
 
     fn still_ours(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(&self.path)
-            .map(|m| m.ino() == self.ino)
+            .map(|m| FileId::of(&m) == self.id)
             .unwrap_or(false)
     }
 
@@ -120,6 +120,30 @@ impl IngestState {
     pub(crate) fn remove_socket_if_ours(&self) {
         if self.still_ours() {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// (#2928 re-review, C-3) A file's identity for "is this still the socket
+/// this daemon bound": device, inode AND change time. An inode alone is
+/// reused by some filesystems (ext4) the moment a file is deleted, so a
+/// replacement socket could share it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl FileId {
+    pub(crate) fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        FileId {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
         }
     }
 }
@@ -153,7 +177,6 @@ pub(crate) fn spawn_ingest_checking(
     port: u16,
     check_every: std::time::Duration,
 ) -> Option<(std::thread::JoinHandle<()>, Arc<IngestState>)> {
-    use std::os::unix::fs::MetadataExt;
     let sock = match darkmux_flow::live::bind_ingest(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -164,13 +187,17 @@ pub(crate) fn spawn_ingest_checking(
             return None;
         }
     };
-    let ino = std::fs::symlink_metadata(&path)
-        .map(|m| m.ino())
-        .unwrap_or(0);
+    let id = match std::fs::symlink_metadata(&path) {
+        Ok(m) => FileId::of(&m),
+        Err(e) => {
+            eprintln!("darkmux serve: live channel off: could not read its socket ({e}). (#2928)");
+            return None;
+        }
+    };
     let state = Arc::new(IngestState {
         path,
         port,
-        ino,
+        id,
         bound: AtomicBool::new(true),
     });
     let _ = sock.set_read_timeout(Some(check_every));
@@ -228,4 +255,48 @@ pub(crate) fn live_events(
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (#2928 re-review, C-3) Same inode, different change time: not the
+    /// same file (ext4 hands a freed inode to the next file created).
+    #[test]
+    fn a_reused_inode_with_a_new_change_time_is_not_ours() {
+        let a = FileId {
+            dev: 1,
+            ino: 42,
+            ctime: 100,
+            ctime_nsec: 5,
+        };
+        assert_eq!(a, a);
+        assert_ne!(a, FileId { ctime_nsec: 6, ..a });
+        assert_ne!(a, FileId { ctime: 101, ..a });
+        assert_ne!(a, FileId { dev: 2, ..a });
+        // Read from a real file: a change to its inode (here a chmod, which
+        // is what a replaced-in-place socket also shows) changes the identity
+        // even though the inode number is the same.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x");
+        std::fs::write(&f, b"").unwrap();
+        let before = FileId::of(&std::fs::symlink_metadata(&f).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let after = FileId::of(&std::fs::symlink_metadata(&f).unwrap());
+        assert_eq!(before.ino, after.ino);
+        assert_ne!(
+            before, after,
+            "same inode, new change time: a different identity"
+        );
+        // Every field is read from the file, none defaulted.
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&f).unwrap();
+        assert_eq!(
+            FileId::of(&m),
+            FileId { dev: m.dev(), ino: m.ino(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec() }
+        );
+    }
 }

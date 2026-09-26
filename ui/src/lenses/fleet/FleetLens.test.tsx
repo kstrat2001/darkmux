@@ -36,6 +36,13 @@ vi.mock("./timeline", async (importOriginal) => {
   return { ...real, buildActivityTimeline: vi.fn(real.buildActivityTimeline) };
 });
 
+// (#2928 re-review, C-1) A pass-through spy on the card BASE builder: a live
+// sample must re-derive the cards' readings without rebuilding their bases.
+vi.mock("./cards", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./cards")>();
+  return { ...real, buildFleetCardBase: vi.fn(real.buildFleetCardBase) };
+});
+
 // (#2911) A pass-through spy: every behavior is the real `tokensOffMeter`;
 // the tick tests read its call count to pin that a tick does not make the
 // hero recompute its token sums.
@@ -2504,7 +2511,14 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
     mockFleetFetch({ flowToday: records() });
     const { container } = renderFleetLens();
     await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("10 tok/s"));
+    // Let every query the lens fires settle first (a late `/runs` answer is
+    // a real input change and rightly rebuilds).
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
     const builds = vi.mocked(buildActivityTimeline).mock.calls.length;
+    const { buildFleetCardBase } = await import("./cards");
+    const bases = vi.mocked(buildFleetCardBase).mock.calls.length;
     // The wall clock moves on inside the same second, as it does between
     // samples.
     vi.setSystemTime(new Date(Date.parse(FROZEN_NOW) + 300));
@@ -2517,6 +2531,7 @@ describe("(#2928) the live overlay on the rendered fleet card", () => {
     await waitFor(() => expect(container.querySelector(".mach")?.textContent ?? "").toContain("200 tok/s"));
     // Still inside one wall second: the cards moved, the timeline did not rebuild.
     expect(vi.mocked(buildActivityTimeline).mock.calls.length).toBe(builds);
+    expect(vi.mocked(buildFleetCardBase).mock.calls.length, "the card bases were not rebuilt for a live sample").toBe(bases);
     liveStore.reset();
   });
 

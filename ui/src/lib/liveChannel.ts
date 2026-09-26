@@ -212,9 +212,13 @@ type Mode = "opening" | "thinking" | "visible" | "writing";
 /** How long a frame drawn for a state that came and went between renders
  *  (C2) stays up before the next one: about two frames at 60 Hz. */
 export const TRANSIENT_FRAME_MS = 32;
-/** At most this many such frames per notification: a flapping stream never
- *  queues an animation of its own. */
-const MAX_TRANSIENT_FRAMES = 4;
+/** At most this many such frames per session per notification, and this
+ *  many in one train overall: a flapping stream never queues an animation
+ *  of its own, one busy session never crowds out another's, and a train
+ *  always ends in the latest state. What the caps drop is counted
+ *  (`debugStats`). */
+export const MAX_TRANSIENT_FRAMES_PER_SESSION = 4;
+export const MAX_TRANSIENT_TRAIN = 12;
 /** How often idle entries are pruned while the store holds any (C9). */
 export const LIVE_PRUNE_EVERY_MS = 5_000;
 
@@ -256,6 +260,10 @@ export class LiveStore {
   private utility: FlowRecord[] = [];
   private latest: LiveOverlay = EMPTY_OVERLAY;
   private frames: LiveOverlay[] = [];
+  /** Frames kept per session in the current train, and the train's length. */
+  private framesPerSession = new Map<string, number>();
+  private trainLength = 0;
+  private stats = { framesKept: 0, framesDropped: 0, longestTrain: 0 };
   private listeners = new Set<() => void>();
   private version = 0;
   private cadenceMs = 250;
@@ -286,7 +294,7 @@ export class LiveStore {
     if (rec.action === "dispatch.turn.heartbeat" && sid) {
       const prev = this.modes.get(sid);
       const mode = modeAfter(prev, f);
-      if (prev && prev.mode !== mode && this.unrenderedMode.has(sid)) this.keepFrame();
+      if (prev && prev.mode !== mode && this.unrenderedMode.has(sid)) this.keepFrame(sid);
       if (!prev || prev.mode !== mode) this.unrenderedMode.add(sid);
       this.modes.set(sid, {
         mode,
@@ -294,12 +302,20 @@ export class LiveStore {
         gen: typeof f.generated_chars === "number" ? f.generated_chars : 0,
         vis: typeof f.cumulative_chars === "number" ? f.cumulative_chars : 0,
       });
-      const list = [...(this.bySession.get(sid) ?? []), rec];
+      // (#2928 re-review) A refresh replaces the previous refresh of the
+      // same state instead of piling up: a minute of silence would
+      // otherwise push the very sample it refreshes out of the capped list.
+      const prevList = this.bySession.get(sid) ?? [];
+      const tail = prevList[prevList.length - 1];
+      const isRefresh = typeof f.refreshed_at_ms === "number";
+      const sameState = (r: FlowRecord | undefined) =>
+        r !== undefined && typeof fieldsOf(r).refreshed_at_ms === "number" && fieldsOf(r).sampled_at_ms === f.sampled_at_ms && fieldsOf(r).turn_seq === f.turn_seq;
+      const list = isRefresh && sameState(tail) ? [...prevList.slice(0, -1), rec] : [...prevList, rec];
       this.bySession.set(sid, list.length > MAX_LIVE_PER_SESSION ? list.slice(-MAX_LIVE_PER_SESSION) : list);
       this.lastSeen.set(sid, nowMs);
     } else {
       const jobId = typeof f.job_id === "string" ? f.job_id : null;
-      if (rec.action === LIVE_UTILITY_END_ACTION && jobId !== null && this.unrenderedStart.has(jobId)) this.keepFrame();
+      if (rec.action === LIVE_UTILITY_END_ACTION && jobId !== null && this.unrenderedStart.has(jobId)) this.keepFrame(`utility:${jobId}`);
       if (rec.action === UTILITY_START_ACTION && jobId !== null) this.unrenderedStart.add(jobId);
       this.utility = [...this.utility, rec].filter((r) => nowMs - Date.parse(r.ts) <= LIVE_UTILITY_TTL_MS).slice(-MAX_LIVE_PER_SESSION);
       if (sid) {
@@ -314,10 +330,29 @@ export class LiveStore {
   }
 
   /** Keep the state as it is now (before this sample) as a frame to draw. */
-  private keepFrame(): void {
-    if (this.frames.length >= MAX_TRANSIENT_FRAMES) return;
+  private keepFrame(key: string): void {
+    const n = this.framesPerSession.get(key) ?? 0;
+    if (n >= MAX_TRANSIENT_FRAMES_PER_SESSION || this.trainLength >= MAX_TRANSIENT_TRAIN) {
+      this.stats.framesDropped += 1;
+      return;
+    }
+    this.framesPerSession.set(key, n + 1);
+    this.trainLength += 1;
+    this.stats.framesKept += 1;
+    this.stats.longestTrain = Math.max(this.stats.longestTrain, this.trainLength);
     this.frames.push({ version: ++this.version, bySession: new Map(this.bySession), utility: this.utility });
     this.showFrames();
+  }
+
+  /** (#2928 re-review, C-2) Transient-frame counters, for debugging (the
+   *  dev build exposes them as `window.__darkmuxLive`); never in the UI. */
+  debugStats(): { framesKept: number; framesDropped: number; longestTrain: number } {
+    return { ...this.stats };
+  }
+
+  /** Test seam: the latest state, whatever frame is up. */
+  latestForTest(): LiveOverlay {
+    return this.latest;
   }
 
   private showFrames(): void {
@@ -385,6 +420,8 @@ export class LiveStore {
     this.lastNotifyMs = Date.now();
     this.unrenderedMode.clear();
     this.unrenderedStart.clear();
+    this.framesPerSession.clear();
+    this.trainLength = 0;
     for (const l of this.listeners) l();
   }
 
@@ -410,12 +447,19 @@ export class LiveStore {
     this.unrenderedMode.clear();
     this.unrenderedStart.clear();
     this.frames = [];
+    this.framesPerSession.clear();
+    this.trainLength = 0;
     this.utility = [];
     this.latest = EMPTY_OVERLAY;
   }
 }
 
 export const liveStore = new LiveStore();
+
+// (#2928 re-review, C-2) Debug counters in a dev build only.
+if (import.meta.env?.DEV && typeof window !== "undefined") {
+  (window as unknown as { __darkmuxLive?: () => unknown }).__darkmuxLive = () => liveStore.debugStats();
+}
 
 const emptySubscribe = () => () => {};
 const emptySnapshot = () => EMPTY_OVERLAY;

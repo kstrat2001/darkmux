@@ -543,7 +543,9 @@ export function TokenScope({
   }, [state, rate, rgb, writing, thinking]);
 
   const whole = parseWhole(centerLabel);
-  const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))));
+  // (#2928 re-review) Live readings arrive several times a second: those
+  // snap; a reading changing at the durable 2 s cadence still tweens.
+  const eased = useCountUp(whole, (n) => (n === null ? "" : String(Math.round(n))), undefined, { snapWithinMs: 1_000 });
   const shownLabel = whole !== null ? eased : centerLabel;
   const showIcon = state === "tools";
   // (#2889, #2890) While the model generates the call: a wrench over the

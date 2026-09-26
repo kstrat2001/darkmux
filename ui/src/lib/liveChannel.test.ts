@@ -5,8 +5,8 @@
 import { describe, expect, test, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 import type { FlowRecord } from "../types/handwritten";
-import { EMPTY_OVERLAY, LiveStore, MAX_LIVE_PER_SESSION, LIVE_SESSION_TTL_MS, liveSampleToRecord, mergeLive, useLiveOverlay } from "./liveChannel";
-import { deriveLiveState, currentTokenRate } from "./tokenRate";
+import { EMPTY_OVERLAY, LiveStore, MAX_LIVE_PER_SESSION, LIVE_SESSION_TTL_MS, MAX_TRANSIENT_FRAMES_PER_SESSION, MAX_TRANSIENT_TRAIN, TRANSIENT_FRAME_MS, liveSampleToRecord, mergeLive, useLiveOverlay } from "./liveChannel";
+import { deriveLiveState, currentTokenRate, heartbeatSamples } from "./tokenRate";
 import { LIVE_UTILITY_END_ACTION, UTILITY_JOB, UTILITY_START_ACTION, utilityStrip } from "./utilityJobs";
 
 const T0 = Date.UTC(2026, 8, 27, 12, 0, 0);
@@ -317,6 +317,99 @@ describe("(#2928 review, C9) idle entries leave on a timer", () => {
     vi.advanceTimersByTime(LIVE_SESSION_TTL_MS + 10_000);
     expect(store.snapshot().bySession.has(SID)).toBe(false);
     expect(notified, "subscribers are told").toBeGreaterThan(before);
+    vi.useRealTimers();
+  });
+});
+
+describe("(#2928 re-review, MF-A) a host refresh never enters rate math, only freshness", () => {
+  // The opener at T, refreshed by the host at +250/+500/+750 (its own
+  // `sampled_at_ms` kept, `refreshed_at_ms` the host's clock), then the
+  // first real chunk, runtime-stamped EARLIER than the last refresh.
+  const opener = (at: number) =>
+    JSON.stringify({ v: 1, kind: "model", session_id: SID, at_ms: at, cadence_ms: 250, fields: { turn_seq: 2, sampled_at_ms: T0, generated_chars: 0, cumulative_chars: 0, prompt_chars: 9_000, ...(at > T0 ? { refreshed_at_ms: at } : {}) } });
+  const recs = () => {
+    const store = new LiveStore();
+    for (const at of [T0, T0 + 250, T0 + 500, T0 + 750]) store.ingest(opener(at), at);
+    store.ingest(wireModel(T0 + 700, 120, 120, 2), T0 + 760);
+    store.ingest(wireModel(T0 + 1_200, 240, 240, 2), T0 + 1_210);
+    return mergeLive([start()], store.snapshot().bySession.get(SID));
+  };
+
+  test("the first chunk pairs with the real opener, not a refresh: no spike", () => {
+    const withRefreshes = currentTokenRate(recs());
+    // Without the refreshes: the same two real samples decide.
+    const store = new LiveStore();
+    store.ingest(opener(T0), T0);
+    store.ingest(wireModel(T0 + 700, 120, 120, 2), T0 + 760);
+    store.ingest(wireModel(T0 + 1_200, 240, 240, 2), T0 + 1_210);
+    const without = currentTokenRate(mergeLive([start()], store.snapshot().bySession.get(SID)));
+    expect(withRefreshes?.tokensPerSec).toBeCloseTo(without!.tokensPerSec, 6);
+    expect(withRefreshes!.tokensPerSec).toBeLessThan(100);
+  });
+
+  test("a refresh is never a sample of its own", () => {
+    const samples = heartbeatSamples(recs());
+    expect(samples.map((x) => x.chars)).toEqual([0, 120, 240]);
+    expect(samples[0].freshMs, "the opener's state held until the last refresh").toBe(T0 + 750);
+  });
+
+  test("generation started: GEN, never PROMPT from a later-stamped refresh", () => {
+    expect(deriveLiveState(recs(), T0 + 1_300).state).toBe("generating");
+  });
+
+  test("a long prompt kept fresh by refreshes is PROMPT, not STALL", () => {
+    const store = new LiveStore();
+    for (let at = T0; at <= T0 + 40_000; at += 250) store.ingest(opener(at), at);
+    const held = store.snapshot().bySession.get(SID)!;
+    expect(held, "the opener and ONE latest refresh, not 160 refreshes").toHaveLength(2);
+    const merged = mergeLive([start()], held);
+    expect(heartbeatSamples(merged)[0]?.freshMs).toBe(T0 + 40_000);
+    const s = deriveLiveState(merged, T0 + 40_100);
+    expect(s.state).toBe("prompt");
+  });
+});
+
+describe("(#2928 re-review, C-2) transient frames are bounded per session, counted, and a train ends", () => {
+  const flap = (store: LiveStore, sid: string, n: number, base: number) => {
+    let gen = 0;
+    let vis = 0;
+    for (let i = 0; i < n; i++) {
+      gen += 10;
+      if (i % 2 === 0) vis += 10;
+      store.ingest(JSON.stringify({ v: 1, kind: "model", session_id: sid, at_ms: base + i, cadence_ms: 250, fields: { turn_seq: 1, sampled_at_ms: base + i, generated_chars: gen, cumulative_chars: vis } }), T0);
+    }
+  };
+
+  test("the cap is per session, and what it drops is counted", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const store = new LiveStore();
+    store.ingest(wireModel(T0, 1, 1), T0); // takes the leading edge
+    flap(store, "a", 12, T0 + 10);
+    flap(store, "b", 3, T0 + 10);
+    const st = store.debugStats();
+    expect(st.framesKept, "session b's frames are not crowded out by a").toBeGreaterThanOrEqual(MAX_TRANSIENT_FRAMES_PER_SESSION + 1);
+    expect(st.framesDropped).toBeGreaterThan(0);
+    vi.useRealTimers();
+  });
+
+  test("sustained flapping never keeps a frame train running: the latest state is drawn", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const store = new LiveStore();
+    let latestShown = 0;
+    store.subscribe(() => {
+      if (store.snapshot() === store.latestForTest()) latestShown++;
+    });
+    store.ingest(wireModel(T0, 1, 1), T0);
+    for (let k = 0; k < 40; k++) {
+      flap(store, "a", 4, T0 + 100 + k * 10);
+      vi.advanceTimersByTime(TRANSIENT_FRAME_MS);
+    }
+    expect(latestShown, "the latest state was drawn between trains, while flapping went on").toBeGreaterThan(1);
+    vi.advanceTimersByTime(5_000);
+    expect(store.snapshot()).toBe(store.latestForTest());
+    expect(store.debugStats().longestTrain).toBeLessThanOrEqual(MAX_TRANSIENT_TRAIN);
     vi.useRealTimers();
   });
 });

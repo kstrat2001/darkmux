@@ -400,6 +400,10 @@ fn a_utility_job_sends_its_start_and_end_on_the_live_channel() {
         samples.push(darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).expect("well-formed"));
     }
     let _ = std::fs::remove_file(&sock);
+    // (#2928 review, C-7) Leave no empty fallback directory behind.
+    if let Some(dir) = sock.parent().filter(|d| d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("darkmux-live-"))) {
+        let _ = std::fs::remove_dir(dir);
+    }
     assert_eq!(samples.len(), 2, "one start, one end: {samples:?}");
     assert_eq!(samples[0].fields["event"], "start");
     assert_eq!(samples[1].fields["event"], "end");
