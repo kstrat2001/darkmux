@@ -349,4 +349,42 @@ describe("(#2911) reduced motion is followed at runtime, not read once at mount"
       delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientHeight;
     }
   });
+
+  it("under reduced motion a change of state or rate redraws the static frame once, and nothing else does", () => {
+    const calls: string[] = [];
+    const ctx: unknown = new Proxy({} as Record<string | symbol, unknown>, {
+      get: (t, k) => (k in t ? t[k] : (...args: unknown[]) => { if (k === "fillRect" && args.length === 4) calls.push("fillRect"); return ctx; }),
+      set: (t, k, v) => { t[k] = v; return true; },
+    });
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(ctx as CanvasRenderingContext2D);
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (q: string) =>
+        ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} }) as unknown as MediaQueryList,
+    );
+    const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => 1);
+    vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} unobserve() {} });
+    Object.defineProperties(HTMLCanvasElement.prototype, {
+      clientWidth: { configurable: true, get: () => 200 },
+      clientHeight: { configurable: true, get: () => 200 },
+    });
+    try {
+      const r = render(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+      const afterMount = calls.length;
+      expect(afterMount).toBeGreaterThan(0);
+      // Same props: no repaint.
+      r.rerender(<TokenScope tokensPerSec={50} size="tile" state="generating" />);
+      expect(calls.length).toBe(afterMount);
+      // A new rate: one repaint.
+      r.rerender(<TokenScope tokensPerSec={20} size="tile" state="generating" />);
+      expect(calls.length).toBe(afterMount + 1);
+      // A new state: one more.
+      r.rerender(<TokenScope tokensPerSec={0} size="tile" state="stalled" />);
+      expect(calls.length).toBe(afterMount + 2);
+      // And never a loop.
+      expect(raf).not.toHaveBeenCalled();
+    } finally {
+      delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientWidth;
+      delete (HTMLCanvasElement.prototype as unknown as Record<string, unknown>).clientHeight;
+    }
+  });
 });

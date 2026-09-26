@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { LOBE_FADE_SEC, SWEEP_PER_PHASE, lobeTarget, stepLobes, wavePhaseStep, type LobeBlend } from "./scopeWave";
+import { LOBE_FADE_SEC, PHASE_STEP_CAP, SWEEP_PER_PHASE, lobeTarget, stepLobes, wavePhaseStep, type LobeBlend } from "./scopeWave";
 import { waveAt } from "../components/TokenScope";
 import { advanceMorph, createMorph } from "./scopeMorph";
 import type { Rgb } from "./scopeTone";
@@ -45,6 +45,19 @@ describe("(#2911) wavePhaseStep: the GEN wave's visible speed follows the rate a
     expect(wavePhaseStep(30, 0, 1)).toBe(0);
     expect(wavePhaseStep(30, 1 / 60, 0)).toBe(0);
     expect(wavePhaseStep(Number.NaN, 1 / 60, 1)).toBe(0);
+  });
+
+  it("a non-finite input never yields NaN, which would poison the phase for good", () => {
+    // An infinite rate or tempo is the most motion there is: the cap.
+    expect(wavePhaseStep(Number.POSITIVE_INFINITY, 1 / 60, 1)).toBe(PHASE_STEP_CAP);
+    expect(wavePhaseStep(30, 1 / 60, Number.POSITIVE_INFINITY)).toBe(PHASE_STEP_CAP);
+    expect(wavePhaseStep(30, Number.POSITIVE_INFINITY, 1)).toBe(PHASE_STEP_CAP);
+    // Anything without a direction is no motion.
+    expect(wavePhaseStep(Number.NEGATIVE_INFINITY, 1 / 60, 1)).toBe(0);
+    expect(wavePhaseStep(30, 1 / 60, Number.NaN)).toBe(0);
+    expect(wavePhaseStep(30, Number.NaN, 1)).toBe(0);
+    expect(wavePhaseStep(-50, 1 / 60, 1)).toBe(0);
+    expect(wavePhaseStep(Number.POSITIVE_INFINITY, 0, 1)).toBe(0);
   });
 });
 

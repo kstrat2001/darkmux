@@ -36,12 +36,24 @@ export const SWEEP_PER_PHASE = 0.5;
  *  what keeps that step short of half a lobe. Strictly increasing in the
  *  rate, so "speed follows the rate" holds on either display.
  *
+ *  Frame-rate independence holds only below the knee: up to 17.8 tok/s at
+ *  60 Hz and 42.2 tok/s at 120 Hz the wave turns at the same speed on
+ *  either. Above it each display still shows speed following the rate, but
+ *  the same rate looks faster on a 120 Hz display, whose per-frame step is
+ *  compressed less. By design: the cap is a per-frame bound, and a 60 Hz
+ *  display reaches it at a lower rate.
+ *
  *  Note the harmonic term in `TokenScope`'s `waveAt` runs at 1.7x the phase,
  *  so it crosses its own Nyquist earlier (a step of `π / 1.7`); this bound
  *  is for the base wave, which carries the motion the eye follows. */
 export function wavePhaseStep(tps: number, dt: number, tempo: number): number {
   const raw = (PHASE_BASE + PHASE_PER_TPS * tps) * dt * 60 * tempo;
+  // NaN, zero and negative are no motion. The phase accumulates this step
+  // every frame, so one NaN would stop the wave for good.
   if (!(raw > 0)) return 0;
+  // +Infinity (an infinite rate, dt or tempo) is the most motion allowed;
+  // the soft clip below would compute `Infinity / Infinity`, NaN.
+  if (raw === Number.POSITIVE_INFINITY) return PHASE_STEP_CAP;
   if (raw <= PHASE_STEP_KNEE) return raw;
   // A rational soft clip, `u / (1 + u)`: slope 1 at the knee (no kink) and
   // strictly increasing all the way, where `tanh` would saturate exactly in
