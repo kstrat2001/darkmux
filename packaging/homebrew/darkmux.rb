@@ -86,10 +86,8 @@ class Darkmux < Formula
       but you don't build it by hand: on the first dispatch with no local
       image, darkmux pulls the version-pinned image from GHCR on demand
       (ghcr.io/kstrat2001/darkmux-runtime:<version>, #759) — you just need
-      Docker running. (`docker build --build-arg DARKMUX_VERSION=<version>
-      -t darkmux-runtime:latest runtime/` from a source checkout at the same
-      version is the offline/dev alternative; an image built for another
-      version, or with no version label, is not used.) So brew is a complete
+      Docker running. (`docker build -t darkmux-runtime:latest runtime/` from
+      a source checkout is the offline/dev alternative.) So brew is a complete
       install end to end: `dispatch` / `mission` / `machine` / `profile` /
       `flow` / `serve` / `doctor`, the hub coordinator role, AND local
       dispatches.

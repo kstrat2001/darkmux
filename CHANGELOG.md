@@ -95,6 +95,15 @@ darkmux release.
   warns on an unlabeled `:latest` (it used to pass) and lists other
   unlabeled local tags.
 
+  Release notes: update the formula caveat. In
+  `packaging/homebrew/darkmux.rb`, in the pin PR after the tag exists,
+  replace "(`docker build -t darkmux-runtime:latest runtime/` from a source
+  checkout is the offline/dev alternative.)" with "(`docker build
+  --build-arg DARKMUX_VERSION=<version> -t darkmux-runtime:latest runtime/`
+  from a source checkout at the same version is the offline/dev
+  alternative; an image built for another version, or with no version
+  label, is not used.)".
+
 - **radio says the model is busy instead of queueing behind it** (#2917).
   One LM Studio instance serves one request at a time, and darkmux caps
   concurrency only within one process, so `darkmux radio` fired while a
