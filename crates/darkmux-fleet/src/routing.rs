@@ -1,383 +1,40 @@
-//! Fleet dispatch routing — local-vs-`--machine` selection, queue dispatch, and completion waiting.
+//! Fleet dispatch routing — local vs `--machine`, and direct work submission
+//! to the target machine (#2916).
+//!
+//! `--machine <id>` sends the dispatch STRAIGHT to that machine's
+//! work-submission listener (`submission.rs`), which checks the fleet token
+//! and the connecting node before it runs anything, and answers at once with
+//! a refusal or (with `--wait`, the default) the finished dispatch's result.
+//! Until 4.0 the dispatch was published to the Redis work queue
+//! (`darkmux:work`) and waited on through the flow stream; the queue is
+//! retired because it could not say who wrote an entry, and any runner
+//! claimed any job.
 
-use crate::queue::extract_field;
-use crate::{publish_job, WorkJob};
-use anyhow::{anyhow, Context, Result};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::WorkJob;
+use anyhow::{anyhow, Result};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// ─── Client-side --wait wrapper (PR-C.3) ──────────────────────────────
-//
-// After `publish_job` returns, the dispatching client can either return
-// immediately (fire-and-forget; the operator polls flow stream from
-// elsewhere) OR block until the runner's `dispatch.complete` flow
-// record lands for the matching `session_id`. The `--wait` wrapper
-// implements the blocking form by **polling the Redis flow stream**
-// (`darkmux:flow`) — NOT the local file, because in a cross-machine
-// dispatch the completion record lands on the RUNNER's local file,
-// not the publisher's. The Redis stream is the only substrate both
-// machines write to (via the shared TeeSink → RedisSink composition).
-//
-// This is the architectural pivot that makes cross-machine `--wait`
-// actually work — a CRITICAL fix surfaced in PR-C.3 review where the
-// initial local-file-polling implementation would always time out.
-
-/// Poll interval for the `wait_for_completion` Redis polling. (#246 PR-C.3)
-const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Cap on XRANGE entries scanned per poll iteration. Matches the typical
-/// Redis stream MAXLEN of 10000 (set via `DARKMUX_REDIS_MAXLEN`); covers
-/// a full re-scan per poll without pagination. If the stream legitimately
-/// exceeds this in a single poll window the caller will see a delayed
-/// completion (corrects on the next iteration). (#246 PR-C.3)
-const WAIT_XRANGE_COUNT: usize = 10000;
-
-/// (#2243) The read deadline for the next `wait_for_completion` poll: what is
-/// LEFT of the declared wait budget, or `None` once the budget is spent.
-///
-/// Extracted from the loop so its one dangerous property is ASSERTABLE rather
-/// than argued: **a returned `Some` is never `Duration::ZERO`.** A zero
-/// `timeval` means BLOCK FOREVER in several socket APIs, and this value is
-/// handed to `set_read_timeout` at the exact instant the wait's timeout is
-/// supposed to fire — getting it wrong reintroduces the original #2243 hang
-/// precisely when the operator is owed the timeout. `std` happens to reject a
-/// zero duration outright (executed: `Err(InvalidInput, "cannot set a 0
-/// duration timeout")`, leaving the previous deadline in force), but a
-/// swallowed set on a platform that instead honored zero would hang, so the
-/// invariant is enforced HERE and not left to the socket layer.
-///
-/// `checked_sub` covers `elapsed > timeout`; the `is_zero` filter covers the
-/// exact-equality instant that `saturating_sub` would hand back as zero.
-fn remaining_read_deadline(timeout: Duration, elapsed: Duration) -> Option<Duration> {
-    timeout.checked_sub(elapsed).filter(|r| !r.is_zero())
-}
-
-/// Result of `wait_for_completion`. Outcome is the dispatch's
-/// `result_class` from the flow record's payload — typically `"ok"` or
-/// `"error"` (see `crew::dispatch::dispatch` for the canonical values).
-/// `wall_ms` is from the same payload.
-#[derive(Debug, Clone)]
-pub struct CompletionResult {
-    pub session_id: String,
-    pub result_class: String,
-    pub wall_ms: Option<u64>,
-    /// Raw payload JSON for downstream consumers that want richer
-    /// fields (e.g. `exit_code`, `total_turns`, `result_class`).
-    /// Currently surfaced via `--json` only (PR-D mission dispatch
-    /// reads this for phase-level aggregation).
-    #[allow(dead_code)] // consumed by PR-D mission dispatch fan-out aggregator
-    pub payload: Option<serde_json::Value>,
-}
-
-/// Block until a `dispatch.complete` flow record for `session_id` lands
-/// in the Redis flow stream, or `timeout` elapses. Returns the
-/// completion result on success; bails when the timeout fires (the job
-/// may still be running on the remote runner — the operator can re-tail
-/// via `darkmux flow tail --session <id>` to keep watching).
-///
-/// Polls the Redis stream (default `darkmux:flow`; override via
-/// `DARKMUX_REDIS_STREAM`) every `WAIT_POLL_INTERVAL` (250ms). Each
-/// poll runs `XRANGE - + COUNT 10000` and scans for an entry whose
-/// `record` field matches both the target `session_id` AND a
-/// `dispatch complete` action. The full-scan-per-poll trades CPU for
-/// correctness — the stream is bounded by `DARKMUX_REDIS_MAXLEN`
-/// (typically 10000), so the worst-case scan is bounded too. v1 cost
-/// model is fine; PR-E may add last-id tracking for efficiency.
-///
-/// **Why poll Redis, not the local file:** in a cross-machine dispatch
-/// the runner writes the `dispatch.complete` record to its OWN local
-/// `~/.darkmux/flows/<day>.jsonl`, not the publisher's. The Redis
-/// stream is the only substrate both machines write to (the shared
-/// `darkmux:flow` stream via the TeeSink → RedisSink composition).
-/// (CRITICAL fix from PR-C.3 review)
-pub fn wait_for_completion(
-    redis_url: &darkmux_flow::RawRedisUrl,
-    session_id: &str,
-    timeout: Duration,
-) -> Result<CompletionResult> {
-    let client = redis::Client::open(redis_url.expose_for_probe())
-        .with_context(|| format!("opening Redis to wait for completion of {session_id}"))?;
-    // (#2243) Bound BOTH phases, reusing darkmux-flow's connect definition
-    // rather than re-deriving it here. Before this, a peer that accepts TCP and
-    // never answers (measured live 2026-07-29, a Tailscale peer) blocked the
-    // poll below forever, control never returned to the elapsed check at the top
-    // of the loop, and the operator's declared `--wait` timeout could never fire.
-    //
-    // This bounded connect is paid BEFORE `start` is taken, so its own ceiling
-    // (`REDIS_CONNECT_TIMEOUT * 2` = 1s) sits OUTSIDE the declared wait budget —
-    // see the overshoot arithmetic at the read-deadline site below.
-    let mut conn = darkmux_flow::open_redis_connection_bounded(
-        &client,
-        darkmux_flow::REDIS_CONNECT_TIMEOUT,
-    )
-    .with_context(|| format!("connecting to Redis to wait for completion of {session_id}"))?;
-    // Bounds the WRITE side (and seeds a read deadline that the loop below
-    // immediately replaces with the remaining wait budget, per-poll).
-    darkmux_flow::bound_redis_response(&conn);
-
-    // (#875) env > config.redis.stream > default, via config_access.
-    let stream = darkmux_types::config_access::redis_stream();
-
-    // (#2243) The one operator-facing timeout message, produced from BOTH
-    // budget-exhaustion paths (the top-of-loop check and a read that hit the
-    // deadline) so they cannot drift apart.
-    let budget_exhausted = || {
-        anyhow!(
-            "wait_for_completion: no dispatch.complete for session_id={session_id} \
-             within {}s in Redis stream {stream}. The job may still be running on the \
-             runner — tail `darkmux flow tail --session {session_id}` to keep watching.",
-            timeout.as_secs()
-        )
-    };
-
-    let start = std::time::Instant::now();
-    loop {
-        // (#2243) Budget check and the ZERO-DURATION GUARD in one call:
-        // `remaining_read_deadline` yields `None` once the budget is spent, and
-        // its `Some` is guaranteed strictly positive (that guarantee is asserted
-        // by `remaining_read_deadline_never_yields_a_zero_duration`). So
-        // `remaining` is safe to hand to `set_read_timeout` below.
-        let Some(remaining) = remaining_read_deadline(timeout, start.elapsed()) else {
-            return Err(budget_exhausted());
-        };
-
-        // (#2243) The read deadline for THIS poll is the REMAINING WAIT BUDGET,
-        // not a fixed constant. That is the difference between a bug and a fix:
-        //
-        // A fixed deadline shorter than a healthy peer's latency makes every
-        // poll time out, and redis-rs makes that permanent. In redis-0.27.6
-        // `connection.rs`, `Connection::read` responds to a read error that is
-        // an IoError and is NOT `UnexpectedEof` by doing `messages_to_skip += 1`
-        // for a RESPONSE read; the next `read()` then DISCARDS that many
-        // successfully-parsed replies before returning one. Re-issuing the
-        // command without draining the backlog creates and consumes the deficit
-        // at the same rate, so it never closes — the client stays permanently
-        // one reply behind and throws away every reply it receives. Measured
-        // against a peer that answered every `XREVRANGE` correctly, in order,
-        // with the completion record present: at 100ms latency `Ok` in 109ms;
-        // at 1200ms latency against a 1000ms deadline, "no dispatch.complete"
-        // after the full budget. Only the latency changed. That trades a loud
-        // hang for a SILENT WRONG ANSWER — `mission dispatch --wait` reporting a
-        // completed job as still running, which `src/main.rs` counts as a
-        // failure. (Rebuilding the connection on timeout does NOT fix it; that
-        // remedy was measured and disproved.)
-        //
-        // With the deadline equal to the remaining budget: a slow-but-healthy
-        // poll completes normally, and a timeout can only mean the budget is
-        // spent — so it ENDS the wait (below) rather than continuing it, and the
-        // skip deficit is structurally unable to accumulate.
-        //
-        // ZERO-DURATION SAFETY. `Some(Duration::ZERO)` is the trap here: in
-        // several socket APIs a zero `timeval` means BLOCK FOREVER, which would
-        // reintroduce the original hang at the exact instant the timeout should
-        // fire. redis-rs delegates straight to `std`'s socket
-        // `set_read_timeout`, and `std` rejects it — executed on this platform:
-        // `Err(InvalidInput, "cannot set a 0 duration timeout")`, with the
-        // PREVIOUS deadline left in force (this call ignores the result, so a
-        // zero would be a silent no-op, not a hang). We do not lean on that:
-        // `remaining` is strictly positive by construction above. `std` also
-        // clamps a sub-microsecond positive duration UP to 1µs rather than down
-        // to zero, so the nanosecond tail is safe too.
-        //
-        // WHAT THIS DEADLINE IS NOT. `set_read_timeout` is `SO_RCVTIMEO`, a
-        // per-`recv` deadline, not a per-command one: it fires on ZERO BYTES for
-        // `remaining`, and any byte that arrives restarts the clock. So it bounds
-        // a peer that goes SILENT (the #2243 failure mode) and does NOT bound a
-        // peer that DRIBBLES — one byte every 400ms into a reply that never
-        // terminates blocked 12s against a declared 2s wait when measured. Call
-        // this bounded against silence, not bounded outright.
-        //
-        // AND IT IS NOT THE WHOLE OPERATOR SYMPTOM. `mission dispatch` publishes
-        // every phase BEFORE it waits on any of them (`src/main.rs`), and
-        // `queue.rs`'s `publish_job` still opens a plain unbounded
-        // `get_connection()` — as does the `init_consumer_group` it calls first,
-        // which is the actual first unbounded touch. That queue is deliberately
-        // out of scope here: its `claim_job` issues `XREADGROUP ... BLOCK`, an
-        // intentionally long-blocking read that a blanket socket deadline would
-        // break, so it needs a per-call-site decision. Against the silent peer
-        // #2243 describes, `--wait` therefore STILL hangs — earlier, in the
-        // publish loop, before this function is ever reached. Fixing the wait
-        // fixes the wait, not the end-to-end operator symptom.
-        let _ = conn.set_read_timeout(Some(remaining));
-
-        // (#809) XREVRANGE (newest-first) — the completion record we're
-        // waiting for is by definition RECENT. The old oldest-first XRANGE
-        // dropped the newest entries once the stream rode at its `MAXLEN ~`
-        // cap (XLEN floats above the cap; trimming is lazy), so a saturated
-        // stream made this wait MISS the completion entirely and time out.
-        // Scan order doesn't matter for a find; newest-first also returns
-        // the match in the first entries scanned.
-        let polled: redis::RedisResult<redis::Value> = redis::cmd("XREVRANGE")
-            .arg(&stream)
-            .arg("+")
-            .arg("-")
-            .arg("COUNT")
-            .arg(WAIT_XRANGE_COUNT)
-            .query(&mut conn);
-
-        let raw = match polled {
-            Ok(raw) => raw,
-            // (#2243) A poll that hits the deadline ENDS the wait with the
-            // canonical timeout message, because a READ that hits it hit the
-            // remaining budget. (Strictly, `bound_redis_response` above also
-            // installed a FIXED 1s write deadline that this loop never
-            // re-derives, and `is_timeout()` matches `TimedOut`/`WouldBlock`
-            // on either side — so a WRITE expiry would claim the declared
-            // budget was spent at ~1s. The arm is deliberately left wide
-            // rather than narrowed to reads: no reachable path constructs
-            // one, since a write expiry needs ~100KB+ of send-buffer backlog
-            // and this loop issues a single ~50-byte command per poll.)
-            // `continue` was round 1's answer and is wrong
-            // here for two reasons: the budget is spent, so continuing only
-            // re-derives the same message one loop later; and continuing after
-            // a timed-out read is precisely what lets redis-rs's
-            // `messages_to_skip` deficit persist (see the deadline site above).
-            // Returning here means the deficit can never be created twice on
-            // one connection, whatever the deadline actually was.
-            //
-            // `RedisError::is_timeout()` is the predicate: it is true exactly
-            // for an `IoError` of kind `TimedOut`/`WouldBlock`, which is what
-            // a `set_read_timeout` expiry surfaces as (verified against a live
-            // silent peer in this module's tests, not assumed from the docs).
-            // Every OTHER error — a connection reset, a protocol error, a
-            // wrong-type reply — still propagates with today's diagnostics.
-            // The disjointness matters: `ConnectionReset`/`BrokenPipe`/
-            // `UnexpectedEof` belong to `is_connection_dropped()`, so nothing
-            // fatal is swallowed as a timeout.
-            //
-            // The connection is deliberately NOT rebuilt on a timeout, and the
-            // reason is NOT that a late reply gets picked up later — it does
-            // not. redis-rs DISCARDS it, permanently, as a `messages_to_skip`
-            // skip. The reason is simply that this connection has no next poll:
-            // the wait is over on this line, and the connection is dropped.
-            //
-            // OVERSHOOT CEILING for a peer that returns whole replies promptly:
-            //   `REDIS_CONNECT_TIMEOUT * 2` (1s, the bounded connect, paid
-            //   BEFORE `start` and so outside the declared budget)
-            //   + `timeout`
-            //   + `WAIT_POLL_INTERVAL` (250ms — a poll can answer just under the
-            //     budget and still sleep a full interval before the loop-top
-            //     check fires).
-            // That is PER CALL, and `src/main.rs`'s fan-out loops it over N
-            // sessions serially, so the operator-visible ceiling is N times it.
-            // A dribbling peer is NOT covered by it — see the deadline site's
-            // `set_read_timeout` note and #2243's S1: `SO_RCVTIMEO` is a
-            // per-`recv` deadline, not a per-command one.
-            Err(e) if e.is_timeout() => return Err(budget_exhausted()),
-            Err(e) => {
-                return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("XREVRANGE on flow stream {stream}"))
-            }
-        };
-
-        if let Some(result) = scan_flow_entries_for_completion(&raw, session_id)? {
-            return Ok(result);
-        }
-
-        std::thread::sleep(WAIT_POLL_INTERVAL);
-    }
-}
-
-/// Walk XRANGE's nested-array response, scanning each entry's `record`
-/// field for a `dispatch.complete` event matching `session_id`. Returns
-/// the first match's CompletionResult, or `None` if no entry matches.
-/// Pure function; unit-testable independent of live Redis.
-pub(crate) fn scan_flow_entries_for_completion(
-    raw: &redis::Value,
-    session_id: &str,
-) -> Result<Option<CompletionResult>> {
-    use redis::Value as V;
-    // Expected shape: Array([Array([id, Array([k, v, k, v, ...])])])
-    let entries = match raw {
-        V::Array(a) => a,
-        V::Nil => return Ok(None),
-        other => return Err(anyhow!("XRANGE: unexpected outer shape: {other:?}")),
-    };
-    for entry in entries {
-        let parts = match entry {
-            V::Array(p) => p,
-            _ => continue,
-        };
-        if parts.len() < 2 {
-            continue;
-        }
-        let fields = match &parts[1] {
-            V::Array(f) => f,
-            _ => continue,
-        };
-        let Some(record_str) = extract_field(fields, "record") else {
-            continue;
-        };
-        if let Some(result) = match_completion(&record_str, session_id) {
-            return Ok(Some(result));
-        }
-    }
-    Ok(None)
-}
-
-/// Parse one record JSON; return `Some(CompletionResult)` when it's a
-/// dispatch-completion event for the target `session_id`. Pure function;
-/// unit-testable without live Redis.
-///
-/// Canonical action shape is `"dispatch complete"` (space, NOT dot) —
-/// that's what every production emit site uses today
-/// (`dispatch_internal::dispatch`, the internal-runtime path). The
-/// dotted form `"dispatch.complete"` is
-/// accepted as forward-compat in case a future cleanup migrates the
-/// emitters to match the dotted-per-action-type convention of
-/// `dispatch.turn` / `dispatch.tool` / etc. (PR-C.3 review HIGH-2)
-pub(crate) fn match_completion(line: &str, target_session_id: &str) -> Option<CompletionResult> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let action = value.get("action").and_then(|v| v.as_str())?;
-    if action != "dispatch complete" && action != "dispatch.complete" {
-        return None;
-    }
-    let session = value.get("session_id").and_then(|v| v.as_str())?;
-    if session != target_session_id {
-        return None;
-    }
-    let payload = value.get("payload").cloned();
-    let result_class = payload
-        .as_ref()
-        .and_then(|p| p.get("result_class"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let wall_ms = payload
-        .as_ref()
-        .and_then(|p| p.get("wall_ms"))
-        .and_then(|v| v.as_u64());
-    Some(CompletionResult {
-        session_id: target_session_id.to_string(),
-        result_class,
-        wall_ms,
-        payload,
-    })
-}
-
-/// Convenience constructor — build a WorkJob from the components the
-/// dispatching client has on hand. Centralizes the "always set X to Y"
-/// defaults (attempt=1, published_at=now, etc.) so PR-C.3 doesn't
-/// duplicate the shape.
+/// Build a [`WorkJob`] from what the sending side has on hand. Centralizes
+/// the stamped defaults (`published_at_unix_ms` = now).
 #[allow(clippy::too_many_arguments)]
 pub fn build_work_job(
-    target_machine: Option<String>,
+    target_machine: String,
     role_id: String,
     message: String,
     session_id: String,
+    profile: Option<String>,
     workdir: Option<String>,
     phase_id: Option<String>,
     image: Option<String>,
     timeout_seconds: u32,
     published_by_machine: Option<String>,
-    published_by_orchestrator: Option<String>,
 ) -> WorkJob {
     let published_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_else(|_| {
-            // (#906) A pre-epoch / badly-NTP-skewed clock makes 0 (also the
-            // "unset" sentinel) the stamp. Surface it rather than silently
-            // mislabeling the record's publish time.
+            // (#906) A pre-epoch / badly-NTP-skewed clock makes 0 the stamp.
+            // Surface it rather than silently mislabeling the job.
             eprintln!("darkmux: system clock is before the Unix epoch — stamping published_at_unix_ms=0");
             0
         });
@@ -386,77 +43,47 @@ pub fn build_work_job(
         role_id,
         message,
         session_id,
+        profile,
         workdir,
         phase_id,
         image,
         timeout_seconds,
         published_at_unix_ms,
         published_by_machine,
-        published_by_orchestrator,
-        attempt: 1,
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Dispatch routing (#463 cycle-break)
 //
-// The local-vs-remote routing decision + the work-queue publish path moved
-// here from `crew::dispatch` so `crew` no longer depends on `fleet` (the
-// edge that made `crew` un-extractable as a crate). `crew::dispatch::dispatch`
-// is now purely local; `dispatch_routed` is the front door for user-facing
-// dispatch callers (main / phase_cli). The
-// fleet runner calls `crew::dispatch::dispatch` directly — it's already on
-// the chosen machine, so it must run locally and never re-route.
+// The local-vs-remote routing decision moved here from `crew::dispatch` so
+// `crew` no longer depends on `fleet`. `crew::dispatch::dispatch` is purely
+// local; `dispatch_routed` is the front door for user-facing dispatch
+// callers. The receiving machine runs a submitted job through
+// `runner::execute_job`, which never re-routes.
 // ─────────────────────────────────────────────────────────────────────────
 
 use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision};
 
 /// Route a dispatch local-vs-remote, then run it locally via the raw
-/// `crew::dispatch::dispatch` primitive — the pre-#1509, pre-#2628
-/// behavior. This is the THIN WRAPPER's own default and stays the raw
-/// primitive for every caller that reaches it: `phase_cli`'s QA-gate
-/// dispatch is reached only from `MissionVerifyStepKind::run()`, an
-/// already-wave-protected `StepKind` whose `seat()` has already resolved
-/// residency for the WHOLE wave via `resolve_local_seat` — routing it
-/// through `darkmux_crew::dispatch_reconciled::dispatch_reconciled`
-/// instead would independently Exclusive-reconcile against a single
-/// placement the scheduler already reconciled as part of a larger wave,
-/// evicting concurrent wave siblings this call can't see (see that
-/// module's own doc for the full hazard). The retired `mission_propose` and `notebook
-/// draft` are standalone (non-wave, non-`StepKind`) callers that DO want
-/// #2628's Exclusive-reconcile + #1487 lease protection — they call
-/// [`dispatch_routed_via`] directly with `dispatch_reconciled` as the
-/// injected `local_dispatch`, rather than through this wrapper. Thin
-/// wrapper over [`dispatch_routed_via`]; see that function's doc for the
-/// full routing contract.
+/// `crew::dispatch::dispatch` primitive. `phase_cli`'s QA-gate dispatch is
+/// the one caller: it is reached only from an already-wave-protected
+/// `StepKind` whose `seat()` resolved residency for the whole wave, so it must
+/// not independently Exclusive-reconcile (see `dispatch_reconciled`'s own
+/// doc). Thin wrapper over [`dispatch_routed_via`].
 pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
     dispatch_routed_via(opts, dispatch::dispatch)
 }
 
-/// Route a dispatch local-vs-remote, then run it. When `--machine` is set
-/// (and isn't the local machine), publish to the single global work queue
-/// and (if `--wait`) block on the runner's `dispatch.complete` flow
-/// record. Otherwise fall through to `local_dispatch` — a caller-injected
-/// LOCAL execution primitive (#1509). `phase_cli`'s QA-gate dispatch passes
-/// the raw `crew::dispatch::dispatch` primitive via the [`dispatch_routed`]
-/// thin wrapper (unchanged pre-#1509 behavior — see that wrapper's doc for
-/// why it stays raw); the retired `mission_propose`/`notebook draft` (#2912/#2913) called this
-/// function directly with `darkmux_crew::dispatch_reconciled::
-/// dispatch_reconciled` (#2628 — Exclusive-reconcile + a #1487 lease for a
-/// standalone, non-wave dispatch); the CLI verb passes
-/// `darkmux_crew::dispatch_as_crew_of_one::
-/// dispatch_as_crew_of_one`, which runs the SAME primitive wrapped in a
-/// crew-of-one Mission/Phase/Task/Step graph through `run_step_graph` — a
-/// first-class run whose residency participates in the #1487 lease/
-/// reconcile regime. Only the LOCAL fall-through switches; the `--machine`
-/// routing decision, the queue-publish path, and every warning/route-record
-/// emission below are unchanged for every caller (a `--machine` dispatch's
-/// residency lives on the REMOTE runner machine, out of #1509's scope — see
-/// its own module doc). After #590 there is no tier auto-route: the only
-/// fleet-queue path is explicit `--machine`, and it's advisory (any runner
-/// may claim; a non-target runner logs a soft warning and proceeds). (#246
-/// PR-C.3; relocated from `crew::dispatch::dispatch` in #463; tier
-/// auto-route retired in #590; `local_dispatch` injection added in #1509.)
+/// Route a dispatch local-vs-remote, then run it. When `--machine` names
+/// another machine, the dispatch is SUBMITTED to that machine's fleet
+/// listener (`submission::submit_work`): its roster host on the fleet's
+/// submission port, with the fleet token. The receiver answers at once with a
+/// refusal ("studio does not accept work from macbook-pro"), or runs it and
+/// (with `--wait`) replies with the result. Otherwise the dispatch falls
+/// through to `local_dispatch`, a caller-injected LOCAL execution primitive
+/// (#1509): the CLI verb passes `dispatch_as_crew_of_one`, radio passes its
+/// single-shot primitive, `phase_cli` the raw one via [`dispatch_routed`].
 pub fn dispatch_routed_via(
     opts: DispatchOpts,
     local_dispatch: impl FnOnce(DispatchOpts) -> Result<DispatchResult>,
@@ -477,74 +104,60 @@ pub fn dispatch_routed_via(
                 local_unknown: true,
             } => {
                 // (#2584, same class as #2561/#2580) `WorkJob` carries no
-                // `resume_from` field at all, and the peer-side runner
-                // (`runner.rs`) hardcodes it absent when it reconstructs
-                // `DispatchOpts` — so a queued dispatch starts fresh on
-                // the peer and exits 0 under a name the operator chose
-                // because it looked like a resume. Refuse HERE, before
-                // the route record is emitted or the queue is touched at
-                // all: no flow record, no Redis connection, no WorkJob.
-                // Carrying the checkpoint through the wire was considered
-                // and rejected — a checkpoint is a directory on THIS
-                // machine's filesystem, and the peer has no access to it,
-                // so "resume on the peer" has no meaning to build toward
-                // without a checkpoint-transfer feature this issue does
-                // not ask for. Refusal is the correct behavior, not a
-                // smaller compromise.
+                // `resume_from` field, and the receiver runs the job with
+                // `resume_from: None` — so a submitted dispatch would start
+                // fresh on the other machine and exit 0 under a name the
+                // operator chose because it looked like a resume. Refuse
+                // HERE, before the route record is emitted or anything is
+                // sent. A checkpoint is a directory on THIS machine; the
+                // other machine has no access to it.
                 if opts.resume_from.is_some() {
                     return Err(anyhow!(
                         "darkmux dispatch: --resume-from is not supported with \
-                         --machine={target} (role `{}`): a queued dispatch runs on the \
-                         PEER machine via the fleet work queue, which carries no \
-                         checkpoint — the peer would start fresh and report success \
-                         regardless. darkmux never silently starts a dispatch fresh under \
-                         a name that looked like a resume: resume on THIS machine (drop \
-                         --machine) or start this role fresh on the peer on purpose (drop \
-                         --resume-from).",
+                         --machine={target} (role `{}`): a submitted dispatch runs on the \
+                         OTHER machine, which has no access to this machine's checkpoint — it \
+                         would start fresh and report success regardless. darkmux never silently \
+                         starts a dispatch fresh under a name that looked like a resume: resume \
+                         on THIS machine (drop --machine) or start this role fresh there on \
+                         purpose (drop --resume-from).",
                         opts.role_id
                     ));
                 }
                 // PR-C.3 review MEDIUM (Wave-E.7): local machine_id is
-                // unresolvable (no DARKMUX_MACHINE_ID, hostname failed).
-                // Routing via queue is the only option — surface the
-                // ambiguity loudly so the operator sees what happened.
+                // unresolvable. The receiver still checks who is calling by
+                // the network, not by this name; say what happened.
                 eprintln!(
                     "{}",
                     darkmux_types::style::warn(&format!(
-                        "darkmux dispatch: WARNING — local DARKMUX_MACHINE_ID is unresolvable. \
-                         --machine={target} routes via the queue regardless. \
-                         If you intended a local dispatch, set DARKMUX_MACHINE_ID to make \
-                         tier-routing decisions deterministic."
+                        "darkmux dispatch: WARNING — this machine's machine_id is unresolvable. \
+                         --machine={target} is submitted to {target} regardless. \
+                         Set DARKMUX_MACHINE_ID (or `darkmux config set machine_id`) so the \
+                         local-vs-remote decision is deterministic."
                     ))
                 );
-                // #290 — emit the pinned route record so the audit
-                // trail + topology UI see the operator-pinned routing
-                // decision. Validation runs BEFORE the emit so a
-                // role-load failure doesn't leave a misleading "pinned"
-                // record in the audit chain.
+                // #290 — the pinned route record, so the audit trail and
+                // topology UI see the operator-pinned routing decision.
                 let session_id =
                     dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
                 let mut opts = opts;
                 opts.session_id = Some(session_id);
-                return dispatch_via_queue(opts, Some(&target));
+                return dispatch_via_submission(opts, &target);
             }
             RoutingDecision::Remote {
                 target,
                 local_unknown: false,
             } => {
                 // (#2584) Same refusal as the `local_unknown: true` arm
-                // above — see its comment for the full mechanism and why
-                // carrying the checkpoint through the wire is not the fix.
+                // above — see its comment for the mechanism.
                 if opts.resume_from.is_some() {
                     return Err(anyhow!(
                         "darkmux dispatch: --resume-from is not supported with \
-                         --machine={target} (role `{}`): a queued dispatch runs on the \
-                         PEER machine via the fleet work queue, which carries no \
-                         checkpoint — the peer would start fresh and report success \
-                         regardless. darkmux never silently starts a dispatch fresh under \
-                         a name that looked like a resume: resume on THIS machine (drop \
-                         --machine) or start this role fresh on the peer on purpose (drop \
-                         --resume-from).",
+                         --machine={target} (role `{}`): a submitted dispatch runs on the \
+                         OTHER machine, which has no access to this machine's checkpoint — it \
+                         would start fresh and report success regardless. darkmux never silently \
+                         starts a dispatch fresh under a name that looked like a resume: resume \
+                         on THIS machine (drop --machine) or start this role fresh there on \
+                         purpose (drop --resume-from).",
                         opts.role_id
                     ));
                 }
@@ -552,7 +165,7 @@ pub fn dispatch_routed_via(
                     dispatch::emit_route_record_and_resolve_session(&opts, Some(&target));
                 let mut opts = opts;
                 opts.session_id = Some(session_id);
-                return dispatch_via_queue(opts, Some(&target));
+                return dispatch_via_submission(opts, &target);
             }
             RoutingDecision::Local {
                 matches_was_explicit: false,
@@ -563,330 +176,136 @@ pub fn dispatch_routed_via(
         }
     }
 
-    // Local fall-through — no `--machine` means run on this machine
-    // (#590: the tier auto-route arm was removed; there's no tier to
-    // trigger auto-routing). `local_dispatch` is the caller-injected LOCAL
-    // execution primitive (#1509) — see this function's own doc.
+    // Local fall-through — no `--machine` means run on this machine.
     local_dispatch(opts)
 }
 
-/// Publish a dispatch to the single global fleet work queue instead of
-/// running it locally (#246 PR-C.3). Called from `dispatch_routed` when
-/// `opts.machine` is set to a non-local id. If `opts.wait` is true (the
-/// default for `dispatch`), blocks on the runner's
-/// `dispatch.complete` flow record before returning; otherwise returns
-/// immediately with a fire-and-forget synthetic result.
-/// `target_machine: Some(id)` stamps the WorkJob's advisory hint field so
-/// the audit trail and topology view see the operator-pinned target (#590:
-/// advisory only — any runner may claim).
-fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Result<DispatchResult> {
-    // (#703 Slice 4) `--image` now rides the WorkJob (`build_work_job` below)
-    // and the runner injects into it — cross-machine dispatch honors it, so no
-    // silent-drop warning here anymore.
-    // The Redis URL is required for cross-machine dispatch. If it's
-    // unset, the operator hasn't configured the fleet substrate — bail
-    // loud with the fix-it pointer.
-    // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let raw_url = darkmux_flow::redis_url().ok_or_else(|| {
-        let context = match target_machine {
-            Some(m) => format!("--machine={m}"),
-            None => "fleet-queue dispatch".to_string(),
-        };
-        anyhow!(
-            "{context} requires Redis (DARKMUX_REDIS_URL or config.redis.enabled) \
-             — the fleet work queue lives on Redis. \
-             Single-machine fleets shouldn't dispatch to the queue."
-        )
-    })?;
-
-    // Resolve session_id up front — the runner needs it to stamp on
-    // the dispatch.complete record, and --wait needs it as the join key.
+/// Submit a dispatch to `target`'s fleet listener instead of running it
+/// here (#2916). With `opts.wait` (the default) this returns when the other
+/// machine's dispatch finishes, with its exit code and output; with
+/// `--no-wait` it returns once the job is accepted. A refusal is an `Err`
+/// carrying the receiver's own reason.
+///
+/// What crosses: role, message, session id, `--profile`, `--workdir` (a
+/// path on the RECEIVER, and only if its allow-list entry grants
+/// `workspace`), `--phase-id`, `--image`, `timeout_seconds`. What does not:
+/// `--timeout`'s inactivity override, `--max-completion-tokens`, compaction
+/// flags, `--json` (the receiver's human output is returned as stdout).
+fn dispatch_via_submission(opts: DispatchOpts, target: &str) -> Result<DispatchResult> {
     let session_id = opts
         .session_id
         .clone()
         .unwrap_or_else(|| dispatch::fresh_session_id(&opts.role_id));
-
-    // Build the WorkJob from DispatchOpts. The shape mirrors what the
-    // runner side reconstructs via `WorkJob::into_dispatch_opts` —
-    // round-trip parity matters for cross-machine dispatch.
     let job = build_work_job(
-        target_machine.map(|s| s.to_string()),
+        target.to_string(),
         opts.role_id.clone(),
         opts.message.clone(),
         session_id.clone(),
+        opts.profile_name.clone(),
         opts.workdir.as_ref().map(|p| p.display().to_string()),
         opts.phase_id.clone(),
         opts.image.clone(),
         opts.timeout_seconds,
         darkmux_flow::resolve_machine_id(),
-        // (#1758) `resolve_orchestrator()` was removed — it was write-only,
-        // machine-scoped provenance for an invocation-scoped fact, and
-        // nothing read `WorkJob.published_by_orchestrator` either (grepped:
-        // producers + test fixtures only). Passing `None` here rather than
-        // removing the field/param keeps `WorkJob`'s `deny_unknown_fields`
-        // wire shape (`WORK_JOB_SCHEMA_VERSION`) unchanged — that field's
-        // own removal is a separate, harder (hard-break, not lenient-read)
-        // follow-up if it's ever worth doing.
-        None,
     );
-
-    // Open the Redis client lazily here (not at darkmux startup) so the
-    // local-dispatch path doesn't pay any connection cost. The same
-    // `raw_url` (already resolved above) is reused by `wait_for_completion` below.
-    let client = redis::Client::open(raw_url.expose_for_probe())
-        .with_context(|| format!("opening Redis client {raw_url} for --machine dispatch"))?;
-
-    // Publish — `publish_job` runs validate() before XADD, so a
-    // malformed job bails before crossing the network.
-    let work_id = publish_job(&client, &job).context("publishing WorkJob to fleet queue")?;
-
     eprintln!(
-        "darkmux dispatch: published work_id={work_id} \
-         target_machine={} session={session_id}",
-        target_machine.unwrap_or("<any>"),
+        "darkmux dispatch: submitting to {target} (session={session_id}{})…",
+        if opts.wait { ", waiting for the result" } else { "" }
     );
-
-    if !opts.wait {
-        // Fire-and-forget. Return a synthetic success result; the
-        // operator polls via `darkmux flow tail --session <id>`.
-        return Ok(DispatchResult {
-            exit_code: 0,
-            stdout: format!("published; not waiting (session_id={session_id})\n"),
-            stderr: String::new(),
-            session_id,
-            // Remote/queue path: the runtime's bookkeeping lands on the
-            // runner, not on this dispatching host.
-            out_dir: None,
-        });
-    }
-
-    // Block on the runner's dispatch.complete. Timeout = the job's own
-    // timeout + a small slack (the runner's clock starts at claim, so
-    // the dispatching client's wait must outlast the runner's budget).
-    let wait_timeout =
-        std::time::Duration::from_secs((opts.timeout_seconds as u64).saturating_add(30));
-    eprintln!(
-        "darkmux dispatch: waiting for dispatch.complete (session={session_id}, \
-         timeout={}s)…",
-        wait_timeout.as_secs()
-    );
-    let completion = wait_for_completion(&raw_url, &session_id, wait_timeout)
-        .context("waiting for remote dispatch completion")?;
-
-    eprintln!(
-        "darkmux dispatch: completed session={} result={} wall_ms={:?}",
-        completion.session_id, completion.result_class, completion.wall_ms
-    );
-
-    // Translate completion → DispatchResult. We don't have stdout from
-    // the runner side (it lives in the runner's flow records, not the
-    // dispatching CLI's stdout); surface the result_class + wall_ms in
-    // the synthetic stdout so the operator sees something useful.
-    Ok(completion_to_dispatch_result(completion))
+    let reply = crate::submission::submit_work(job, opts.wait)?;
+    Ok(reply_to_dispatch_result(reply, &session_id, target))
 }
 
-/// Translate a queue completion (from `wait_for_completion`) into the
-/// `DispatchResult` shape the CLI returns. Pulls the actual `exit_code`
-/// out of the dispatch.complete payload when present; falls back to a
-/// binary 0/1 derived from `result_class` only when the payload lacks an
-/// explicit exit_code. (#255 Wave-E.6)
-pub(crate) fn completion_to_dispatch_result(c: CompletionResult) -> DispatchResult {
-    let payload_exit_code = c
-        .payload
-        .as_ref()
-        .and_then(|p| p.get("exit_code"))
-        .and_then(|v| v.as_i64())
-        .map(|n| n as i32);
-    let exit_code = payload_exit_code.unwrap_or(if c.result_class == "ok" { 0 } else { 1 });
-    let stdout = format!(
-        "remote dispatch complete; result_class={} exit_code={exit_code} wall_ms={:?} session={}\n\
-         (full output in runner's flow records — \
-          tail `~/.darkmux/flows/<date>.jsonl` for session={})\n",
-        c.result_class, c.wall_ms, c.session_id, c.session_id,
-    );
+/// Translate an accepted or completed [`crate::SubmissionReply`] into the
+/// `DispatchResult` the CLI prints.
+pub(crate) fn reply_to_dispatch_result(
+    reply: crate::SubmissionReply,
+    session_id: &str,
+    target: &str,
+) -> DispatchResult {
+    let session_id = reply.session_id.clone().unwrap_or_else(|| session_id.to_string());
+    if reply.status == "accepted" {
+        return DispatchResult {
+            exit_code: 0,
+            stdout: format!(
+                "submitted to {target}; not waiting (session_id={session_id}). Follow it with \
+                 `darkmux flow tail --session {session_id}` or in the viewer.\n"
+            ),
+            stderr: String::new(),
+            session_id,
+            // The run's bookkeeping lands on the receiving machine.
+            out_dir: None,
+        };
+    }
     DispatchResult {
-        exit_code,
-        stdout,
-        stderr: String::new(),
-        session_id: c.session_id,
-        // Remote/queue path: the runtime's bookkeeping lands on the
-        // runner, not on this dispatching host.
+        exit_code: reply.exit_code.unwrap_or(1),
+        stdout: reply.stdout.unwrap_or_default(),
+        stderr: reply.stderr.unwrap_or_default(),
+        session_id,
         out_dir: None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
-
-    // (#842) `build_work_job` is the single constructor for every WorkJob that
-    // crosses the fleet wire, and had ZERO tests. A field-swap (workdir landing
-    // in image), or `attempt` defaulting to something other than 1 (which the
-    // re-publish logic relies on, PR-C.1), corrupts every cross-machine dispatch
-    // and passes green CI.
+    use std::time::Duration;
 
     /// All distinct values so a field-swap (X landing where Y belongs) fails.
     fn sample_job() -> WorkJob {
         build_work_job(
-            Some("studio".to_string()),       // target_machine
+            "studio".to_string(),              // target_machine
             "coder".to_string(),               // role_id
             "do the thing".to_string(),        // message
             "sess-42".to_string(),             // session_id
+            Some("coder-studio".to_string()),  // profile
             Some("/work/repo".to_string()),    // workdir
-            Some("phase-7".to_string()),      // phase_id
+            Some("phase-7".to_string()),       // phase_id
             Some("rust:slim".to_string()),     // image
-            900,                                // timeout_seconds
+            900,                               // timeout_seconds
             Some("laptop".to_string()),        // published_by_machine
-            Some("claude-code".to_string()),   // published_by_orchestrator
         )
-    }
-
-    #[test]
-    fn build_work_job_sets_attempt_one() {
-        // PR-C.1 invariant: a freshly-built job is attempt 1 (re-publish bumps
-        // to 2+). A non-1 default would break re-dispatch accounting.
-        assert_eq!(sample_job().attempt, 1);
     }
 
     #[test]
     fn build_work_job_passes_fields_through_without_swap() {
         let j = sample_job();
-        assert_eq!(j.target_machine.as_deref(), Some("studio"));
+        assert_eq!(j.target_machine, "studio");
         assert_eq!(j.role_id, "coder");
         assert_eq!(j.message, "do the thing");
         assert_eq!(j.session_id, "sess-42");
+        assert_eq!(j.profile.as_deref(), Some("coder-studio"));
         assert_eq!(j.workdir.as_deref(), Some("/work/repo"));
         assert_eq!(j.phase_id.as_deref(), Some("phase-7"));
         assert_eq!(j.image.as_deref(), Some("rust:slim"));
         assert_eq!(j.timeout_seconds, 900);
         assert_eq!(j.published_by_machine.as_deref(), Some("laptop"));
-        assert_eq!(j.published_by_orchestrator.as_deref(), Some("claude-code"));
+        assert!(j.published_at_unix_ms > 0);
+        j.validate().expect("a built job is valid");
     }
 
     #[test]
-    fn build_work_job_preserves_none_optionals() {
-        // The all-None shape must round-trip too — no field gets a spurious
-        // default substituted for an absent optional.
-        let j = build_work_job(
-            None,
-            "reviewer".to_string(),
-            "m".to_string(),
-            "s".to_string(),
-            None,
-            None,
-            None,
-            60,
-            None,
-            None,
-        );
-        assert!(j.target_machine.is_none());
-        assert!(j.workdir.is_none());
-        assert!(j.phase_id.is_none());
-        assert!(j.image.is_none());
-        assert!(j.published_by_machine.is_none());
-        assert!(j.published_by_orchestrator.is_none());
-        assert_eq!(j.attempt, 1);
-    }
-
-    #[test]
-    fn build_work_job_stamps_published_at() {
-        // The #906 clock stamp: non-zero (0 is the pre-epoch sentinel) and
-        // stamped DURING the build. Bracket the call between two clock reads so
-        // the assertion can't flake on an NTP step or a suspended-VM resume —
-        // the stamp must land in [before, after], which holds by construction.
-        let now = || {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
+    fn a_completed_reply_carries_the_remote_exit_code_and_output() {
+        let reply = crate::SubmissionReply {
+            status: "completed".into(),
+            session_id: Some("s-remote".into()),
+            exit_code: Some(42),
+            stdout: Some("out".into()),
+            stderr: Some("err".into()),
+            ..Default::default()
         };
-        let before = now();
-        let stamped = sample_job().published_at_unix_ms;
-        let after = now();
-        assert!(stamped > 0, "published_at should be stamped, not the 0 sentinel");
-        assert!(
-            stamped >= before && stamped <= after,
-            "stamp {stamped} must fall within the call window [{before}, {after}]"
-        );
-    }
-
-    // (#842) `match_completion` is the no-redispatch invariant: a waiting client
-    // resolves when (and only when) its OWN session's terminal record lands.
-    // Matching the wrong session (false-complete on a sibling) or missing the
-    // canonical action shape (hang forever / re-dispatch) both corrupt fleet
-    // routing and pass green CI without these.
-
-    #[test]
-    fn match_completion_matches_target_session_canonical_action() {
-        let line = r#"{"action":"dispatch complete","session_id":"s-1","payload":{"result_class":"ok","wall_ms":1234,"exit_code":0}}"#;
-        let c = match_completion(line, "s-1").expect("matches the canonical 'dispatch complete'");
-        assert_eq!(c.session_id, "s-1");
-        assert_eq!(c.result_class, "ok");
-        assert_eq!(c.wall_ms, Some(1234));
-    }
-
-    #[test]
-    fn match_completion_accepts_dotted_action_forwardcompat() {
-        let line = r#"{"action":"dispatch.complete","session_id":"s-1","payload":{"result_class":"error"}}"#;
-        let c = match_completion(line, "s-1").expect("dotted form accepted (forward-compat)");
-        assert_eq!(c.result_class, "error");
-        assert_eq!(c.wall_ms, None, "absent wall_ms → None");
-    }
-
-    #[test]
-    fn match_completion_ignores_other_sessions_and_non_completions() {
-        let complete = r#"{"action":"dispatch complete","session_id":"OTHER","payload":{}}"#;
-        assert!(match_completion(complete, "s-1").is_none(), "a sibling session must NOT false-complete us");
-        let turn = r#"{"action":"dispatch.turn","session_id":"s-1","payload":{}}"#;
-        assert!(match_completion(turn, "s-1").is_none(), "a non-completion action is not a completion");
-        assert!(match_completion("not json", "s-1").is_none(), "malformed line → None, never panic");
-        let no_class = r#"{"action":"dispatch complete","session_id":"s-1"}"#;
-        assert_eq!(
-            match_completion(no_class, "s-1").unwrap().result_class,
-            "unknown",
-            "missing result_class defaults to 'unknown'"
-        );
-    }
-
-    #[test]
-    fn completion_to_dispatch_result_maps_exit_code_and_defaults() {
-        // exit_code taken from payload when present.
-        let c = CompletionResult {
-            session_id: "s-1".into(),
-            result_class: "error".into(),
-            wall_ms: Some(9),
-            payload: Some(serde_json::json!({"exit_code": 137})),
-        };
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 137, "payload exit_code wins");
-        assert!(r.stdout.contains("result_class=error") && r.stdout.contains("session=s-1"));
-        assert!(r.out_dir.is_none(), "remote path: no local bookkeeping");
-
-        // No payload exit_code → derived from result_class (ok→0, else→1).
-        let ok = CompletionResult {
-            session_id: "s-2".into(),
-            result_class: "ok".into(),
-            wall_ms: None,
-            payload: None,
-        };
-        assert_eq!(completion_to_dispatch_result(ok).exit_code, 0, "ok → 0");
-        let bad = CompletionResult {
-            session_id: "s-3".into(),
-            result_class: "error".into(),
-            wall_ms: None,
-            payload: None,
-        };
-        assert_eq!(completion_to_dispatch_result(bad).exit_code, 1, "non-ok → 1");
+        let r = reply_to_dispatch_result(reply, "s-local", "studio");
+        assert_eq!((r.exit_code, r.stdout.as_str(), r.stderr.as_str(), r.session_id.as_str()), (42, "out", "err", "s-remote"));
+        let accepted = crate::SubmissionReply { status: "accepted".into(), ..Default::default() };
+        let r = reply_to_dispatch_result(accepted, "s-local", "studio");
+        assert_eq!(r.exit_code, 0);
+        assert!(r.stdout.contains("submitted to studio; not waiting (session_id=s-local)"), "{}", r.stdout);
     }
 
     // (#1509) `dispatch_routed_via`'s local-dispatch injection seam. No
     // `opts.machine` means the local fall-through runs — never touches
-    // Redis/the queue, so this is a fast, hermetic unit test even though
+    // the network, so this is a fast, hermetic unit test even though
     // `dispatch_routed_via` is the same function a live `--machine` dispatch
     // uses.
 
@@ -953,38 +372,24 @@ mod tests {
         assert!(err.to_string().contains("injected failure"), "{err}");
     }
 
-    // ─── #2584: `--resume-from` routed to a peer via `--machine` must
-    //     refuse BEFORE the fleet queue is ever touched ─────────────────
+    // ─── #2584: `--resume-from` routed to another machine via `--machine`
+    //     must refuse BEFORE anything is sent ──────────────────────────
     //
-    // `dispatch_via_queue` publishes a `WorkJob` that carries no
-    // `resume_from` field at all (`queue.rs`'s `WorkJob` struct has none),
-    // and the runner reconstructs `DispatchOpts` on the peer with
-    // `resume_from: None` hardcoded (`runner.rs`). Before this fix, a
-    // dispatch with `--machine <peer> --resume-from <dir>` sailed straight
-    // past `dispatch()`'s own #2561/#2580 checkpoint refusals (which live
-    // deep inside `crew::dispatch::dispatch`, never reached here) and
-    // published a job that would start FRESH on the peer and exit 0 — the
-    // exact promise-break #2561/#2580 closed on the other two routes,
-    // reachable a third way.
+    // `dispatch_via_submission` sends a `WorkJob` that carries no
+    // `resume_from` field at all, and the receiver runs it with
+    // `resume_from: None`. A dispatch with `--machine <peer> --resume-from
+    // <dir>` would start FRESH on the other machine and exit 0 — the
+    // promise-break #2561/#2580 closed on the other two routes.
     //
-    // Same ORDER discipline as `dispatch_remote_refuses_resume_from_
-    // before_the_http_call` (#2580, `darkmux-crew`): asserting only that
-    // `dispatch_routed_via` returns an `Err` whose text mentions "resume"
-    // cannot tell "refused before the queue was touched" apart from "the
-    // queue rejected the job for an unrelated reason" — both produce an
-    // `Err`. So this proves ORDER directly: a real loopback TCP listener
-    // stands in for the fleet's Redis, and it must NEVER accept a
-    // connection — `dispatch_via_queue`'s `redis::Client::open` +
-    // `publish_job` is the only thing in this path that would ever dial
-    // it.
+    // ORDER, not just an `Err`: a real loopback listener stands in for the
+    // peer's fleet listener (the roster points `peer-b` at it, on the fleet
+    // port), and it must NEVER accept a connection. The positive control
+    // below proves the same setup DOES dial it when there is no resume, so
+    // the refusal test cannot pass vacuously.
 
-    /// Spawn a bare TCP listener that records every accepted connection on
-    /// `tx` and answers nothing (no Redis handshake, no protocol at all —
-    /// it doesn't need to LOOK like Redis, it only needs to prove whether
-    /// anything tried to connect). Deliberately simpler than
-    /// `spawn_silent_redis_peer` above: this test's claim is "zero
-    /// connections", not "the connection succeeds and then stalls", so
-    /// there is nothing to gain from completing a real Redis handshake.
+    /// A bare TCP listener that records every accepted connection on `tx`
+    /// and closes it at once (so a sender that dials it fails fast instead
+    /// of waiting on a read).
     fn spawn_connection_counting_peer() -> (u16, std::sync::mpsc::Receiver<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
@@ -995,128 +400,120 @@ mod tests {
                 let _ = tx.send(());
             }
         });
-        // Small settling margin only — `bind` already puts the socket in LISTEN.
         std::thread::sleep(Duration::from_millis(50));
         (port, rx)
     }
 
+    /// Env for a `--machine=peer-b` dispatch whose submission would dial
+    /// the counting peer: a roster naming `peer-b` at 127.0.0.1, the fleet
+    /// port pointed at the peer, a fleet token, a private flows dir.
+    /// Restores everything on drop.
+    struct PeerEnv {
+        _roster_dir: tempfile::TempDir,
+        flows_dir: tempfile::TempDir,
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl PeerEnv {
+        fn new(port: u16) -> Self {
+            let keys = [
+                "DARKMUX_MACHINE_ID",
+                "DARKMUX_FLEET_FILE",
+                "DARKMUX_FLEET_LISTENER_PORT",
+                "DARKMUX_SERVE_TOKEN",
+                "DARKMUX_FLOWS_DIR",
+            ];
+            let prev = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            let roster_dir = tempfile::TempDir::new().unwrap();
+            let roster = roster_dir.path().join("fleet.json");
+            std::fs::write(
+                &roster,
+                r#"{"version":"2","machines":{"peer-b":{"id":"peer-b","address":"127.0.0.1","added_unix_ms":1}}}"#,
+            )
+            .unwrap();
+            let flows_dir = tempfile::TempDir::new().unwrap();
+            unsafe {
+                // Local differs from the target, so `routing_decision`
+                // resolves `Remote { local_unknown: false }`. The
+                // `local_unknown: true` arm runs in its own process in
+                // `tests/resume_from_local_unknown_arm.rs` (the machine-id
+                // `OnceLock` is already set in this shared binary).
+                std::env::set_var("DARKMUX_MACHINE_ID", "local-a");
+                std::env::set_var("DARKMUX_FLEET_FILE", &roster);
+                std::env::set_var("DARKMUX_FLEET_LISTENER_PORT", port.to_string());
+                std::env::set_var("DARKMUX_SERVE_TOKEN", "test-fleet-token");
+                // `local_sink_dir()` re-resolves this LIVE per write, so an
+                // empty dir afterwards proves no record was emitted.
+                std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            }
+            Self { _roster_dir: roster_dir, flows_dir, prev }
+        }
+    }
+
+    impl Drop for PeerEnv {
+        fn drop(&mut self) {
+            unsafe {
+                for (k, v) in &self.prev {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
-    fn dispatch_routed_via_refuses_resume_from_before_the_queue_is_touched() {
+    fn dispatch_routed_via_refuses_resume_from_before_anything_is_sent() {
         let (port, rx) = spawn_connection_counting_peer();
-        let flows_dir = tempfile::TempDir::new().unwrap();
-
-        let prev_machine = std::env::var("DARKMUX_MACHINE_ID").ok();
-        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
-        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
-        unsafe {
-            // Local machine differs from the `--machine` target below, so
-            // `routing_decision` resolves `Remote { local_unknown: false }`
-            // — the ordinary cross-machine case, not the unresolvable-local
-            // warning arm. That sibling arm can't be forced into
-            // `local_unknown: true` from THIS shared unit-test binary (it
-            // requires BOTH `DARKMUX_MACHINE_ID` unset AND the `hostname`
-            // shell-out to fail — the latter is only forceable before
-            // `darkmux_flow::resolve_machine_id()`'s process-wide
-            // `OnceLock` caches a real hostname, which some earlier test in
-            // this same binary has already done by the time this one runs).
-            // It IS reachable from a dispatch, and is exercised end-to-end
-            // in its own process by `resume_from_local_unknown_arm.rs`
-            // (a separate integration-test binary in this crate's `tests/`).
-            // Its guard is also proven by the structural conformance test
-            // below, `every_dispatch_via_queue_call_site_is_guarded_against_
-            // resume_from`, which reads this file's own source rather than
-            // running it.
-            std::env::set_var("DARKMUX_MACHINE_ID", "local-a");
-            // Points the fleet queue's Redis client at the counting peer.
-            // If the refusal did NOT run first, `dispatch_via_queue` would
-            // dial this exact address.
-            std::env::set_var("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{port}"));
-            // Points the flow crate's LocalFileSink at a private, empty
-            // directory. `local_sink_dir()` re-resolves this env var LIVE
-            // on every `write()` (see its own doc — deliberately not
-            // baked in at sink-construction time), so this reliably
-            // targets THIS call's record, not whatever directory an
-            // earlier test in this binary happened to freeze into the
-            // process-wide sink singleton.
-            std::env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
-        }
+        let env = PeerEnv::new(port);
 
         let mut opts = local_opts("pr-reviewer");
         opts.machine = Some("peer-b".to_string());
         opts.resume_from = Some(std::path::PathBuf::from("/tmp/darkmux-2584-checkpoint"));
 
         let err = dispatch_routed_via(opts, |_opts| {
-            panic!(
-                "local_dispatch must never be invoked for a --machine=peer-b dispatch \
-                 (this closure is the LOCAL fall-through seam; a remote target must never \
-                 reach it regardless of resume_from)"
-            );
+            panic!("local_dispatch must never be invoked for a --machine=peer-b dispatch");
         })
-        .expect_err("--resume-from with --machine=<peer> must refuse, not route to the queue");
+        .expect_err("--resume-from with --machine=<peer> must refuse, not submit");
         let msg = format!("{err:#}");
 
-        unsafe {
-            match prev_machine {
-                Some(v) => std::env::set_var("DARKMUX_MACHINE_ID", v),
-                None => std::env::remove_var("DARKMUX_MACHINE_ID"),
-            }
-            match prev_redis {
-                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
-                None => std::env::remove_var("DARKMUX_REDIS_URL"),
-            }
-            match prev_flows {
-                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
-                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
-            }
-        }
-
-        // POSITIVE: names the routed path and carries the same promise the
-        // other two #2561/#2580 guards state — this makes it true here too.
-        assert!(
-            msg.contains("--machine=peer-b"),
-            "must name the pinned target machine as the reason: {msg}"
-        );
+        assert!(msg.contains("--machine=peer-b"), "must name the pinned target machine: {msg}");
         assert!(
             msg.contains(
-                "darkmux never silently starts a dispatch fresh under a name that looked \
-                 like a resume"
+                "darkmux never silently \
+                 starts a dispatch fresh under a name that looked like a resume"
             ),
             "must carry the same promise the other two guards state: {msg}"
         );
-
-        // ORDER — no queue write, no job enqueued: the counting peer must
-        // never have been dialed. A regression that deleted the check, or
-        // moved it to run only after `dispatch_via_queue`'s
-        // `redis::Client::open`/`publish_job`, would let this connect.
         match rx.recv_timeout(Duration::from_millis(300)) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(()) => panic!(
-                "dispatch_via_queue must never run for a refused resume, but the mock \
-                 fleet-queue peer accepted a connection"
-            ),
+            Ok(()) => panic!("dispatch_via_submission must never run for a refused resume, but the peer was dialed"),
             Err(e) => panic!("unexpected mock channel state: {e:?}"),
         }
-
-        // ORDER — no records emitted: `emit_route_record_and_resolve_
-        // session` (the "dispatch route" flow record) must never have run
-        // either. It writes through the LocalFileSink, which re-resolves
-        // `DARKMUX_FLOWS_DIR` live per write (see the env-var comment
-        // above) — so finding this private directory still empty proves
-        // the emit call was never reached, not merely that a write to it
-        // failed or landed elsewhere.
-        let files: Vec<_> = std::fs::read_dir(flows_dir.path())
+        let files: Vec<_> = std::fs::read_dir(env.flows_dir.path())
             .map(|rd| rd.filter_map(|e| e.ok()).collect())
             .unwrap_or_default();
-        assert!(
-            files.is_empty(),
-            "no flow record may be written before the resume-from refusal fires; \
-             found in {}: {files:?}",
-            flows_dir.path().display()
-        );
+        assert!(files.is_empty(), "no flow record may be written before the refusal: {files:?}");
     }
 
-    // ─── #2584 conformance: every call site of `dispatch_via_queue` must be
+    /// Positive control for the test above: the same setup WITHOUT a resume
+    /// does dial the peer (and fails loudly, since the peer answers
+    /// nothing), so "never dialed" above means refused, not misconfigured.
+    #[test]
+    #[serial]
+    fn without_a_resume_the_same_setup_does_submit_to_the_peer() {
+        let (port, rx) = spawn_connection_counting_peer();
+        let _env = PeerEnv::new(port);
+        let mut opts = local_opts("pr-reviewer");
+        opts.machine = Some("peer-b".to_string());
+        let err = dispatch_routed_via(opts, |_opts| panic!("never local")).unwrap_err();
+        rx.recv_timeout(Duration::from_secs(5)).expect("the submission must have dialed the peer");
+        assert!(format!("{err:#}").contains("no answer from http://127.0.0.1:"), "{err:#}");
+    }
+
+    // ─── #2584 conformance: every call site of `dispatch_via_submission` must be
     //     guarded against `resume_from` ─────────────────────────────────
     //
     // The test above pins the `local_unknown: false` arm (the ordinary
@@ -1176,7 +573,7 @@ mod tests {
     //
     // **Which layer is authoritative, for a maintainer facing one red and
     // one green:** the runtime test
-    // (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_touched`
+    // (`dispatch_routed_via_refuses_resume_from_before_anything_is_sent`
     // below, plus its `local_unknown: true` sibling in
     // `resume_from_local_unknown_arm.rs`) is GROUND TRUTH — it runs the
     // real function against a real fake peer and observes whether a
@@ -1193,7 +590,7 @@ mod tests {
     // is_guarded_against_resume_from` (#2580), NOT an extension of it.**
     // That check is hard-pinned to one file (`dispatch_internal.rs`) and
     // one identifier (`dispatch_remote`) in a DIFFERENT crate; generalizing
-    // it to also cover `dispatch_via_queue` here would mean a
+    // it to also cover `dispatch_via_submission` here would mean a
     // crate-or-workspace-wide scan — exactly the redesign its own doc
     // comment says a genuine visibility change would require, not
     // something worth building for a second, unrelated chokepoint. The
@@ -1207,22 +604,18 @@ mod tests {
     //
     // **What this cannot see, named plainly (same limits as #2580's
     // check, for the same reasons):**
-    // - A `pub`/`pub(crate)` widening of `dispatch_via_queue`, or a new
+    // - A `pub`/`pub(crate)` widening of `dispatch_via_submission`, or a new
     //   descendant module — both are pinned by the assertions below, so
-    //   either fails LOUD rather than silently, but if `dispatch_via_queue`
+    //   either fails LOUD rather than silently, but if `dispatch_via_submission`
     //   genuinely needs wider visibility this scan's premise is gone.
-    // - A reimplementation of "publish this dispatch to the fleet queue"
-    //   that never calls `dispatch_via_queue` itself. Not hypothetical: one
-    //   already exists — `darkmux mission dispatch`'s per-phase fan-out
-    //   loop (`src/main.rs`, around the `fleet::publish_job(&client, job)`
-    //   call inside the `for (phase_id, session_id, job) in &jobs` loop)
-    //   builds its own `WorkJob`s via `fleet::build_work_job` and calls
-    //   `publish_job` directly, entirely outside this file. It is NOT a
-    //   live bypass today only because `mission dispatch` has no
-    //   `--resume-from` flag at all (only the single-dispatch `dispatch`
-    //   verb does) — there is no checkpoint surface to silently drop. If
-    //   `mission dispatch` ever grows one, it needs this same guard BEFORE
-    //   its own publish loop, and this check will not notice either way.
+    // - A reimplementation of "submit this dispatch to another machine"
+    //   that never calls `dispatch_via_submission` itself. Not hypothetical:
+    //   `darkmux mission dispatch` (`src/main.rs`) builds its own
+    //   `WorkJob`s via `fleet::build_work_job` and calls
+    //   `fleet::submit_work` directly. It is NOT a live bypass only because
+    //   `mission dispatch` has no `--resume-from` flag at all. If it ever
+    //   grows one, it needs this same guard BEFORE it submits, and this
+    //   check will not notice either way.
     // - A call reached only through a function-pointer alias.
     // - A call inside an `impl` block method or a macro body (the function
     //   extractor only indexes column-0 `fn`/`pub fn` items) — this FAILS
@@ -1335,7 +728,7 @@ mod tests {
     /// completion`, `match_completion`, `completion_to_dispatch_result`)
     /// silently dropped out of the function index — invisible to every
     /// consumer of `top_level_function_spans`, including the guard-search
-    /// used by `every_dispatch_via_queue_call_site_is_guarded_against_
+    /// used by `every_dispatch_via_submission_call_site_is_guarded_against_
     /// resume_from` above, with no failure signal pointing at the real
     /// cause. Recognizing the restricted forms here closes that gap.
     fn fn_decl_prefix_len(cs: &[char], i: usize) -> Option<usize> {
@@ -1458,7 +851,7 @@ mod tests {
     /// Every top-level `mod`/`pub mod`/`pub(crate) mod` DECLARATION line in
     /// `src` (comment/string-aware). Every module declared here is a
     /// DESCENDANT module, and Rust makes this file's private items
-    /// (including `dispatch_via_queue`) visible to every descendant.
+    /// (including `dispatch_via_submission`) visible to every descendant.
     fn top_level_mod_declarations(src: &str) -> Vec<String> {
         let cs: Vec<char> = src.chars().collect();
         let byte_offsets: Vec<usize> = src.char_indices().map(|(b, _)| b).collect();
@@ -1796,12 +1189,12 @@ mod tests {
     /// untouched, earlier in the SAME outer arm) scoped to the inner
     /// match's own arm instead — cutting the outer guard out of the
     /// search and producing a false accusation against provably-correct
-    /// code. Red-proven: wrapping `dispatch_via_queue(opts, Some(&target))`
-    /// in `match true { true => return dispatch_via_queue(...), false =>
+    /// code. Red-proven: wrapping `dispatch_via_submission(opts, Some(&target))`
+    /// in `match true { true => return dispatch_via_submission(...), false =>
     /// {} }` inside the `local_unknown: false` arm, guard left in place,
     /// made the structural scan below FAIL while the runtime test
-    /// (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_
-    /// touched`) stayed GREEN — ground truth says the guard fires, the
+    /// (`dispatch_routed_via_refuses_resume_from_before_anything_is_
+    /// sent`) stayed GREEN — ground truth says the guard fires, the
     /// scan accused it anyway.
     ///
     /// Fixed by not stopping at the first match: the walk now keeps going
@@ -1863,11 +1256,11 @@ mod tests {
     /// arms are mutually exclusive at runtime and the call's own arm has
     /// no guard at all. Red-proven: wrapping the call in
     /// `match true { true => { <the real guard, moved here> } false => {
-    /// dispatch_via_queue(...) } }`, with the guard genuinely absent from
+    /// dispatch_via_submission(...) } }`, with the guard genuinely absent from
     /// the `false` arm the call lives in, made the structural scan below
     /// PASS while the runtime test
-    /// (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_
-    /// touched`, dialed against a real queue) FAILED — a live bypass the
+    /// (`dispatch_routed_via_refuses_resume_from_before_anything_is_
+    /// sent`, dialed against a real peer) FAILED — a live bypass the
     /// scan certified as safe.
     ///
     /// Fixed not by narrowing `guard_search_scope`'s scope (that would
@@ -1953,7 +1346,7 @@ mod tests {
     /// (#2584 review MUST-FIX; scoping mechanism replaced #2609 review
     /// round 2 — see `guard_search_scope`'s doc for why plain
     /// `nearest_enclosing_block` is itself insufficient) Both
-    /// `dispatch_via_queue` call sites live in the same function
+    /// `dispatch_via_submission` call sites live in the same function
     /// (`dispatch_routed_via`'s two `Remote` match arms), and this function
     /// only checks "some guard occurs before this call ANYWHERE in `body`" —
     /// it has no notion of match-arm exclusivity. Called with the whole
@@ -2030,8 +1423,8 @@ mod tests {
     }
 
     #[test]
-    fn every_dispatch_via_queue_call_site_is_guarded_against_resume_from() {
-        const DEFINITION_MARKER: &str = "fn dispatch_via_queue(";
+    fn every_dispatch_via_submission_call_site_is_guarded_against_resume_from() {
+        const DEFINITION_MARKER: &str = "fn dispatch_via_submission(";
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routing.rs");
         let src = std::fs::read_to_string(&path)
@@ -2052,9 +1445,9 @@ mod tests {
         // that names BOTH possibilities, keeps a genuine extractor
         // regression loud without turning an honest refactor into one.
         assert!(
-            functions.len() > 5,
-            "found only {} top-level fns in routing.rs (expected several more — this file \
-             currently declares 9). Two different things produce this: (a) the extractor \
+            functions.len() > 3,
+            "found only {} top-level fns in routing.rs (expected more — this file \
+             currently declares 5, after #2916 removed the Redis wait path). Two different things produce this: (a) the extractor \
              regressed on a shape it should recognize (`fn_decl_prefix_len` — plain `fn`, \
              `pub fn`, or a restricted-visibility `pub(...) fn`), or (b) a function that used \
              to live at top-level in this file was genuinely moved or deleted, which means \
@@ -2063,7 +1456,7 @@ mod tests {
             functions.len()
         );
 
-        // ── pin: `dispatch_via_queue` stays module-PRIVATE ──────────────
+        // ── pin: `dispatch_via_submission` stays module-PRIVATE ──────────────
         let definitions = find_code_substring_occurrences(&src, DEFINITION_MARKER);
         assert_eq!(
             definitions.len(),
@@ -2075,8 +1468,8 @@ mod tests {
         let line_prefix = src[..def_at].rsplit('\n').next().unwrap_or("");
         assert_eq!(
             line_prefix, "",
-            "`dispatch_via_queue` must stay module-PRIVATE for this scan's premise to hold — \
-             found `{line_prefix}fn dispatch_via_queue(`, which reads as widened visibility. \
+            "`dispatch_via_submission` must stay module-PRIVATE for this scan's premise to hold — \
+             found `{line_prefix}fn dispatch_via_submission(`, which reads as widened visibility. \
              If it genuinely needs wider visibility, this scan's premise is gone and it needs a \
              real redesign (a crate-or-workspace-wide scan), not a bigger pin."
         );
@@ -2089,13 +1482,13 @@ mod tests {
             vec!["mod tests {".to_string()],
             "this scan's premise requires this file to declare NO descendant module other than \
              its own `#[cfg(test)] mod tests` — found: {mod_decls:?}. A new `mod` here is a \
-             place a call to `dispatch_via_queue(` could live that this scan cannot see."
+             place a call to `dispatch_via_submission(` could live that this scan cannot see."
         );
 
-        let call_offsets = find_calls(&src, "dispatch_via_queue");
+        let call_offsets = find_calls(&src, "dispatch_via_submission");
         assert!(
             !call_offsets.is_empty(),
-            "found zero calls to `dispatch_via_queue(` — either the extractor regressed or the \
+            "found zero calls to `dispatch_via_submission(` — either the extractor regressed or the \
              function was deleted; either way this test's premise no longer holds"
         );
         // (#2584 review — Also-fix 2) This is a bare count assertion, and
@@ -2106,8 +1499,8 @@ mod tests {
         // constant once that guard is in place). FEWER than 2 is the
         // dangerous direction — it can mean a call site was hidden from
         // this scan rather than removed, e.g. a function-pointer alias
-        // (`let f = dispatch_via_queue; ...; f(opts, ...)` — `find_calls`
-        // only matches the identifier `dispatch_via_queue` immediately
+        // (`let f = dispatch_via_submission; ...; f(opts, ...)` — `find_calls`
+        // only matches the identifier `dispatch_via_submission` immediately
         // followed by `(`, so an alias call never counts here at all).
         // Blindly lowering this constant to match a drop makes that
         // exact bypass permanent and silent.
@@ -2119,7 +1512,7 @@ mod tests {
              the same guard this test enforces on the existing two before you bump this \
              constant. If this went DOWN: do not just lower the constant — find out where the \
              missing call went first (a function-pointer alias is the known way a real call to \
-             `dispatch_via_queue` can go invisible to this text scan).",
+             `dispatch_via_submission` can go invisible to this text scan).",
             call_offsets.len()
         );
 
@@ -2129,7 +1522,7 @@ mod tests {
                 .find(|(_, start, end)| *start <= call_at && call_at < *end)
                 .unwrap_or_else(|| {
                     panic!(
-                        "a `dispatch_via_queue(` call at byte offset {call_at} is not inside any \
+                        "a `dispatch_via_submission(` call at byte offset {call_at} is not inside any \
                          top-level (column-0 `fn`/`pub fn`) function this scan indexes — extend \
                          `top_level_function_spans` before this test can vouch for it."
                     )
@@ -2167,7 +1560,7 @@ mod tests {
 
             assert!(
                 resume_from_guard_precedes(scoped_body, call_at_in_scoped, &excluded_in_scoped),
-                "`{fn_name}` calls `dispatch_via_queue(` at file offset {call_at} without a \
+                "`{fn_name}` calls `dispatch_via_submission(` at file offset {call_at} without a \
                  `resume_from`-conditioned guard preceding it IN ITS OWN ENCLOSING SCOPE — the \
                  same match arm when the call sits in one, its own enclosing block otherwise. \
                  This is the #2561/#2580/#2584 bypass class: a caller can silently spend real \
@@ -2176,7 +1569,7 @@ mod tests {
                  before the call, and contains both {RESUME_FROM_GUARD_ANCHOR:?} and a diverging \
                  bail!/return Err/panic! — all within that scope, not a sibling arm's or an \
                  unrelated block's. If this assertion is RED but the runtime tests \
-                 (`dispatch_routed_via_refuses_resume_from_before_the_queue_is_touched` and \
+                 (`dispatch_routed_via_refuses_resume_from_before_anything_is_sent` and \
                  `resume_from_local_unknown_arm.rs`) are GREEN: the runtime tests are ground \
                  truth (they run the real function against a real fake peer), this scan is a \
                  cheap proxy for them — investigate before assuming this scan is wrong, but a \
@@ -2184,539 +1577,4 @@ mod tests {
             );
         }
     }
-
-    // ─── `wait_for_completion` against an accepts-but-never-answers peer (#2243) ───
-    //
-    // The failure mode measured live on 2026-07-29 (a Tailscale peer): the TCP
-    // port accepts, the Redis handshake completes, and the command is never
-    // answered. `wait_for_completion` checked its `--wait` deadline only at the
-    // TOP of the loop and then blocked in an unbounded `XREVRANGE` read, so
-    // control never returned to the check and the declared timeout could never
-    // fire. `darkmux mission dispatch --wait 60` hung indefinitely.
-
-    /// How long the fake peer below holds an accepted socket before dropping it.
-    ///
-    /// Deliberately LONGER than every wall-clock ceiling asserted here, and
-    /// that is the whole point: when the peer CLOSES the socket the pending
-    /// read returns EOF, which bounds the call *for free* and would make these
-    /// tests pass with the response deadline removed. Same reasoning (and same
-    /// vacuity trap) as `SILENT_PEER_HOLD` in `darkmux-flow`. (#2243)
-    const SILENT_PEER_HOLD: Duration =
-        Duration::from_millis(darkmux_flow::REDIS_RESPONSE_TIMEOUT.as_millis() as u64 * 10);
-
-    /// Spawn a fake Redis peer that COMPLETES redis-rs's connection-setup
-    /// handshake and then answers nothing. Copied in shape from
-    /// `darkmux_flow::spawn_silent_redis_peer` (`#[cfg(test)]` there, so not
-    /// reachable from this crate's test build).
-    ///
-    /// The two `+OK` replies are load-bearing: redis-rs 0.27 pipelines two
-    /// ignored `CLIENT SETINFO` commands in `connection_setup_pipeline`. A peer
-    /// that merely accepts TCP wedges at the HANDSHAKE, so every command-phase
-    /// assertion written against it would pass vacuously against the connect
-    /// phase instead. (#2243)
-    fn spawn_silent_redis_peer(max_connections: usize) -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(max_connections) {
-                let Ok(mut stream) = stream else { continue };
-                std::thread::spawn(move || {
-                    use std::io::Write;
-                    let _ = stream.write_all(b"+OK\r\n+OK\r\n");
-                    let _ = stream.flush();
-                    std::thread::sleep(SILENT_PEER_HOLD);
-                    drop(stream);
-                });
-            }
-        });
-        // Small settling margin only — `bind` already puts the socket in LISTEN.
-        std::thread::sleep(Duration::from_millis(50));
-        port
-    }
-
-    /// Anti-vacuity guard: prove the peer reaches the COMMAND phase, i.e. the
-    /// connect SUCCEEDS and a command against it then times out. Costs one
-    /// connection from the peer's budget. (#2243)
-    fn assert_silent_peer_reaches_command_phase(port: u16) {
-        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
-            .expect("open client against the fake peer");
-        let mut conn = darkmux_flow::open_redis_connection_bounded(
-            &client,
-            darkmux_flow::REDIS_CONNECT_TIMEOUT,
-        )
-        .expect(
-            "the fake peer must COMPLETE redis-rs's connection-setup pipeline — if the \
-             connect fails, every wall-clock assertion here passes vacuously against the \
-             CONNECT phase rather than the command phase #2243 is about",
-        );
-        darkmux_flow::bound_redis_response(&conn);
-        let res: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
-        let err = res.expect_err("the fake peer answered a command; it must go silent");
-        assert!(
-            err.is_timeout(),
-            "the response-deadline expiry must classify as `RedisError::is_timeout()` — \
-             that predicate is what `wait_for_completion` keys on to END the wait with \
-             its canonical timeout message. Got kind={:?} err={err:?}",
-            err.kind()
-        );
-    }
-
-    /// The predicate the fix turns on, verified against a REAL timing-out call
-    /// rather than assumed from the docs. (#2243)
-    #[test]
-    fn response_deadline_expiry_classifies_as_a_redis_timeout_error() {
-        let port = spawn_silent_redis_peer(2);
-        assert_silent_peer_reaches_command_phase(port);
-    }
-
-    #[test]
-    fn wait_for_completion_returns_within_a_bounded_wall_clock_against_a_silent_peer() {
-        let port = spawn_silent_redis_peer(4);
-        assert_silent_peer_reaches_command_phase(port);
-
-        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
-        let declared = Duration::from_secs(2);
-        let started = std::time::Instant::now();
-        let err = wait_for_completion(&url, "sess-never-completes", declared)
-            .expect_err("no completion record can ever arrive from a silent peer");
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < Duration::from_secs(6),
-            "wait_for_completion must honor its declared --wait timeout even when the peer \
-             accepts TCP and never answers; took {elapsed:?} for a {declared:?} wait. \
-             Unbounded before #2243 (the read never returned to the elapsed check). \
-             err={err:#}"
-        );
-    }
-
-    #[test]
-    fn wait_for_completion_ends_on_its_own_declared_timeout_not_a_per_poll_read_error() {
-        // The bad trade this guards against: bounding the read makes a stalled
-        // poll return `Err`, and surfacing that raw `Err` would tell the operator
-        // "XREVRANGE on flow stream ...: Resource temporarily unavailable" —
-        // losing the one message that says the job may still be running on the
-        // runner and how to keep watching it.
-        //
-        // A read that hits the deadline now means the BUDGET is spent (the
-        // deadline is the remaining budget), so it must produce that canonical
-        // message and must not die early. Both halves are asserted below: the
-        // wall clock reaches the declared wait, and the message is ours. (#2243)
-        let port = spawn_silent_redis_peer(4);
-        assert_silent_peer_reaches_command_phase(port);
-
-        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
-        let declared = Duration::from_secs(2);
-        let started = std::time::Instant::now();
-        let err = wait_for_completion(&url, "sess-never-completes", declared).unwrap_err();
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= declared,
-            "the wait died at {elapsed:?}, BEFORE its declared {declared:?} — the read \
-             deadline was shorter than the remaining budget, so a poll aborted the wait \
-             early instead of the budget ending it. err={err:#}"
-        );
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("no dispatch.complete"),
-            "the wait must end on ITS OWN timeout error (which tells the operator the job \
-             may still be running on the runner), not on a propagated per-poll read error. \
-             Got: {msg}"
-        );
-    }
-
-    // ─── `wait_for_completion` against a SLOW-BUT-HEALTHY peer (#2243) ───
-    //
-    // The three tests above all use a permanently SILENT peer, so every one of
-    // them asserts on the failure path. The dangerous direction is the other
-    // one: a peer that answers every command correctly and in order, just
-    // slowly. Bounding the read with a FIXED deadline turns that peer's healthy
-    // reply into a per-poll `Err`, and redis-rs then makes the damage permanent:
-    //
-    //   redis-0.27.6 `connection.rs` `Connection::read` — on a read error that
-    //   is an IoError and is NOT `UnexpectedEof`, a RESPONSE read does
-    //   `self.messages_to_skip += 1`. The next `read()` then DISCARDS that many
-    //   successfully-parsed replies before returning one.
-    //
-    // A `continue` that re-issues the command without draining the backlog
-    // creates and consumes the deficit at the same rate, so it never closes:
-    // the client stays permanently one reply behind and throws every reply it
-    // receives away as a skip. The wait then NEVER succeeds against a peer whose
-    // completion record is right there — a loud hang traded for a silent wrong
-    // answer, which `src/main.rs` counts as `failures += 1`.
-    //
-    // The fix derives the read deadline from the REMAINING wait budget, so a
-    // healthy-but-slow poll completes normally and a timeout coincides with
-    // budget exhaustion (ending the wait rather than continuing it, which is
-    // what makes the deficit structurally unable to accumulate).
-
-    /// The zero-duration guard, asserted rather than argued. `set_read_timeout`
-    /// is handed this value at the exact instant the wait budget runs out; a
-    /// zero would mean BLOCK FOREVER on a socket API that honors it, which is
-    /// the original #2243 hang reappearing precisely when the operator is owed
-    /// their timeout.
-    ///
-    /// The `elapsed == timeout` case is the one that matters and the one a
-    /// `saturating_sub` gets wrong — it hands back `Duration::ZERO` where this
-    /// must hand back `None`. (#2243)
-    #[test]
-    fn remaining_read_deadline_never_yields_a_zero_duration() {
-        let budget = Duration::from_secs(5);
-
-        // Budget spent: no deadline at all, so the caller ends the wait.
-        assert_eq!(
-            remaining_read_deadline(budget, budget),
-            None,
-            "elapsed EXACTLY equal to the budget must yield None, not \
-             Some(Duration::ZERO) — this is the case `saturating_sub` gets wrong"
-        );
-        assert_eq!(remaining_read_deadline(budget, budget + Duration::from_secs(1)), None);
-
-        // Budget left: a usable, strictly positive deadline.
-        assert_eq!(
-            remaining_read_deadline(budget, Duration::from_secs(2)),
-            Some(Duration::from_secs(3))
-        );
-
-        // Sweep the whole boundary neighborhood at nanosecond grain: whatever
-        // comes back must never be zero.
-        for ns in 0..2_000u32 {
-            let elapsed = budget - Duration::from_nanos(1_000) + Duration::from_nanos(ns as u64);
-            if let Some(d) = remaining_read_deadline(budget, elapsed) {
-                assert!(
-                    !d.is_zero(),
-                    "yielded a ZERO read deadline at elapsed={elapsed:?} of budget={budget:?} \
-                     — `set_read_timeout(Some(Duration::ZERO))` means block-forever on socket \
-                     APIs that honor it, which is #2243's hang at the worst possible moment"
-                );
-            }
-        }
-
-        // A zero-length wait can never produce a deadline either.
-        assert_eq!(remaining_read_deadline(Duration::ZERO, Duration::ZERO), None);
-    }
-
-    /// The platform fact the guard above exists to not depend on, executed
-    /// rather than quoted: `std` REJECTS a zero read deadline (it does not
-    /// install a block-forever one), and the rejection is silently dropped by
-    /// the `let _ =` at every call site — leaving whatever deadline was already
-    /// in force. If this ever starts passing `Ok`, the guard in
-    /// `remaining_read_deadline` is the only thing between #2243 and a hang.
-    /// (#2243)
-    #[test]
-    fn std_rejects_a_zero_read_deadline_rather_than_blocking_forever() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                std::thread::sleep(Duration::from_secs(2));
-                drop(stream);
-            }
-        });
-        let sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to self");
-
-        sock.set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("a positive deadline installs");
-        let err = sock
-            .set_read_timeout(Some(Duration::ZERO))
-            .expect_err("std must REJECT a zero read deadline");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
-        assert_eq!(
-            sock.read_timeout().unwrap(),
-            Some(Duration::from_secs(1)),
-            "a rejected zero must leave the PREVIOUS deadline in force — which is \
-             why the swallowed `let _ =` at the call site is not itself a hang"
-        );
-    }
-
-    /// A real RESP2 `XREVRANGE` reply carrying one entry whose `record` field
-    /// is a `dispatch complete` for `session_id` — the exact shape
-    /// `scan_flow_entries_for_completion` walks. (#2243)
-    fn xrevrange_reply_with_completion(session_id: &str) -> Vec<u8> {
-        let record = serde_json::json!({
-            "action": "dispatch complete",
-            "session_id": session_id,
-            "payload": { "result_class": "ok", "wall_ms": 42 },
-        })
-        .to_string();
-        let mut out = Vec::new();
-        out.extend_from_slice(b"*1\r\n"); // one entry
-        out.extend_from_slice(b"*2\r\n"); // entry = [id, fields]
-        out.extend_from_slice(b"$3\r\n1-0\r\n"); // id
-        out.extend_from_slice(b"*2\r\n"); // fields = [k, v]
-        out.extend_from_slice(b"$6\r\nrecord\r\n");
-        out.extend_from_slice(format!("${}\r\n{record}\r\n", record.len()).as_bytes());
-        out
-    }
-
-    /// Spawn a fake Redis peer that completes redis-rs's connection-setup
-    /// handshake and then answers EVERY command correctly and in order — with a
-    /// real completion-bearing `XREVRANGE` reply — after `latency`.
-    ///
-    /// This peer is HEALTHY. The only variable under test is how long its first
-    /// byte takes relative to the read deadline. (#2243)
-    fn spawn_slow_but_healthy_redis_peer(session_id: &str, latency: Duration) -> u16 {
-        let reply = xrevrange_reply_with_completion(session_id);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let reply = reply.clone();
-                std::thread::spawn(move || {
-                    use std::io::{Read, Write};
-                    // The two `+OK`s redis-rs's `connection_setup_pipeline`
-                    // expects for its two ignored `CLIENT SETINFO` commands
-                    // (RESP2, no password, db 0 — verified in the crate source).
-                    if stream.write_all(b"+OK\r\n+OK\r\n").is_err() {
-                        return;
-                    }
-                    let _ = stream.flush();
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(0) | Err(_) => return,
-                            Ok(_) => {
-                                std::thread::sleep(latency);
-                                if stream.write_all(&reply).is_err() {
-                                    return;
-                                }
-                                let _ = stream.flush();
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        // Small settling margin only — `bind` already puts the socket in LISTEN.
-        std::thread::sleep(Duration::from_millis(50));
-        port
-    }
-
-    /// CONTROL, and the anti-vacuity guard for the regression below: the same
-    /// peer, the same reply bytes, at a latency well INSIDE any plausible read
-    /// deadline. This proves the fake peer's reply actually parses into a
-    /// `CompletionResult`, so a failure of the slow test is attributable to
-    /// LATENCY alone rather than to a malformed fixture. (#2243)
-    #[test]
-    fn wait_for_completion_succeeds_against_a_fast_healthy_peer() {
-        let session_id = "sess-fast-control";
-        let port = spawn_slow_but_healthy_redis_peer(session_id, Duration::from_millis(100));
-
-        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
-        let got = wait_for_completion(&url, session_id, Duration::from_secs(5))
-            .expect("a fast healthy peer's completion record must be found");
-
-        assert_eq!(got.session_id, session_id);
-        assert_eq!(got.result_class, "ok");
-        assert_eq!(got.wall_ms, Some(42));
-    }
-
-    /// THE regression test for #2243's blocker. Same peer, same bytes, same
-    /// completion record as the control above — only the latency changes, and
-    /// it straddles the fixed per-command deadline round 1 used.
-    ///
-    /// With a fixed `REDIS_RESPONSE_TIMEOUT` deadline plus `continue`, this
-    /// runs the full declared wait and returns the "no dispatch.complete"
-    /// error for a job that completed. With the deadline derived from the
-    /// remaining budget, the poll simply succeeds. (#2243)
-    #[test]
-    fn wait_for_completion_succeeds_against_a_slow_but_healthy_peer() {
-        let session_id = "sess-slow-but-healthy";
-        // Straddles the fixed deadline: longer than `REDIS_RESPONSE_TIMEOUT`,
-        // far shorter than the declared wait budget below.
-        let latency = darkmux_flow::REDIS_RESPONSE_TIMEOUT + Duration::from_millis(200);
-        let port = spawn_slow_but_healthy_redis_peer(session_id, latency);
-
-        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
-        let declared = Duration::from_secs(5);
-        let started = std::time::Instant::now();
-        let got = wait_for_completion(&url, session_id, declared);
-        let elapsed = started.elapsed();
-
-        let got = got.unwrap_or_else(|e| {
-            panic!(
-                "a HEALTHY peer answered every XREVRANGE correctly and in order at {latency:?} \
-                 with the completion record present, and the wait still failed after \
-                 {elapsed:?} of its {declared:?} budget. This is the #2243 blocker: a fixed \
-                 read deadline shorter than the peer's latency makes redis-rs bump \
-                 `messages_to_skip` on every timed-out poll, and a `continue` that re-issues \
-                 the command never drains that backlog — so every correct reply is discarded \
-                 and the wait reports a completed job as still running. err={e:#}"
-            )
-        });
-
-        assert_eq!(got.session_id, session_id);
-        assert_eq!(got.result_class, "ok");
-        assert_eq!(got.wall_ms, Some(42));
-        assert!(
-            elapsed < declared,
-            "the wait must return as soon as the slow poll answers ({latency:?} plus connect), \
-             not burn its whole {declared:?} budget; took {elapsed:?}"
-        );
-    }
-
-    // ─── `wait_for_completion` against a HEALTHY peer with an EMPTY stream ───
-    //
-    // Every other fixture in this module is PATHOLOGICAL: permanently silent
-    // (which exits through the inner `Err(e) if e.is_timeout()` arm) or
-    // completion-bearing (which exits through `Ok`). Neither ever reaches the
-    // LOOP-TOP budget check — the `let Some(remaining) = ... else { return
-    // Err(budget_exhausted()) }` arm — so that arm had zero behavioral
-    // coverage even though it is the arm #2243's operator symptom runs through.
-    //
-    // The path that reaches it is the ORDINARY one: Redis is fine, answers
-    // every poll promptly, and the job simply has not finished yet, so the
-    // stream holds no `dispatch.complete` and the wait must end when the
-    // DECLARED BUDGET runs out. Break only the call site —
-    //
-    //     let remaining = remaining_read_deadline(timeout, start.elapsed())
-    //         .unwrap_or(timeout);
-    //
-    // — and every read still succeeds, no timeout is ever raised, and the loop
-    // spins forever: `--wait 60` never fires, which is #2243 verbatim. The pure
-    // `remaining_read_deadline` unit test above stays green through that
-    // mutation, which is exactly why this behavioral one has to exist.
-
-    /// Spawn a fake Redis peer that completes redis-rs's connection-setup
-    /// handshake and then answers EVERY command PROMPTLY with an empty RESP
-    /// array (`*0\r\n`) — a healthy Redis whose stream holds no matching
-    /// completion record yet. (#2243)
-    fn spawn_healthy_empty_redis_peer() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                std::thread::spawn(move || {
-                    use std::io::{Read, Write};
-                    // The two `+OK`s redis-rs's `connection_setup_pipeline`
-                    // expects for its two ignored `CLIENT SETINFO` commands.
-                    if stream.write_all(b"+OK\r\n+OK\r\n").is_err() {
-                        return;
-                    }
-                    let _ = stream.flush();
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(0) | Err(_) => return,
-                            // Empty array: a well-formed XREVRANGE reply that
-                            // simply carries no entries. No latency at all —
-                            // the read deadline must never be what ends this
-                            // wait.
-                            Ok(_) => {
-                                if stream.write_all(b"*0\r\n").is_err() {
-                                    return;
-                                }
-                                let _ = stream.flush();
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        // Small settling margin only — `bind` already puts the socket in LISTEN.
-        std::thread::sleep(Duration::from_millis(50));
-        port
-    }
-
-    /// Anti-vacuity guard for the test below: prove the peer ANSWERS, promptly
-    /// and well-formed. If it went silent instead, the wait would exit through
-    /// the read-timeout arm and the loop-top budget check would go untested
-    /// again — the test would pass while covering nothing new. (#2243)
-    fn assert_healthy_empty_peer_answers_promptly(port: u16) {
-        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
-            .expect("open client against the fake peer");
-        let mut conn = darkmux_flow::open_redis_connection_bounded(
-            &client,
-            darkmux_flow::REDIS_CONNECT_TIMEOUT,
-        )
-        .expect("the fake peer must COMPLETE redis-rs's connection-setup pipeline");
-        darkmux_flow::bound_redis_response(&conn);
-
-        let started = std::time::Instant::now();
-        let got: redis::Value = redis::cmd("XREVRANGE")
-            .arg("darkmux:flow")
-            .arg("+")
-            .arg("-")
-            .arg("COUNT")
-            .arg(WAIT_XRANGE_COUNT)
-            .query(&mut conn)
-            .expect(
-                "the fake peer must ANSWER the command phase — a peer that times out here is a \
-                 SILENT peer, and the wait below would then end through the read-timeout arm \
-                 rather than the loop-top budget check this test exists to cover",
-            );
-        assert!(
-            matches!(&got, redis::Value::Array(a) if a.is_empty()),
-            "the peer must answer with an EMPTY stream (so no completion is ever found and the \
-             budget is the only thing that can end the wait). Got {got:?}"
-        );
-        assert!(
-            started.elapsed() < darkmux_flow::REDIS_RESPONSE_TIMEOUT,
-            "the peer answered in {:?} — it must be PROMPT, so a read deadline can never be \
-             what ends the wait below",
-            started.elapsed()
-        );
-    }
-
-    /// THE coverage for the loop-top budget check. A healthy peer answering
-    /// every poll promptly with an empty stream is the single most common real
-    /// `--wait` timeout: Redis is fine, the job is still running. The wait must
-    /// end on the DECLARED budget.
-    ///
-    /// Run on a worker thread and collected with `recv_timeout` DELIBERATELY:
-    /// the failure this guards against is an infinite loop, and a bare call
-    /// would wedge the test binary (and CI) instead of going red. (#2243)
-    #[test]
-    fn wait_for_completion_ends_on_the_loop_top_budget_check_against_a_healthy_empty_peer() {
-        let port = spawn_healthy_empty_redis_peer();
-        assert_healthy_empty_peer_answers_promptly(port);
-
-        let declared = Duration::from_secs(2);
-        // Covers the documented overshoot ceiling (bounded connect 1s +
-        // `declared` + one `WAIT_POLL_INTERVAL`) with room to spare, while
-        // staying far below any plausible healthy return.
-        let slack = Duration::from_secs(6);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
-            let started = std::time::Instant::now();
-            let res = wait_for_completion(&url, "sess-still-running", declared);
-            let _ = tx.send((res.map(|_| ()).map_err(|e| format!("{e:#}")), started.elapsed()));
-        });
-
-        let (res, elapsed) = rx.recv_timeout(declared + slack).unwrap_or_else(|_| {
-            panic!(
-                "wait_for_completion NEVER RETURNED within {:?} for a declared {declared:?}, \
-                 against a HEALTHY peer answering every poll promptly with an empty stream. \
-                 The loop-top budget check is the ONLY thing that can end this wait — no read \
-                 ever times out and no completion is ever found — so this is #2243's original \
-                 symptom: `--wait` that never fires.",
-                declared + slack
-            )
-        });
-
-        let err = res.expect_err("an empty stream can never yield a completion record");
-        assert!(
-            err.contains("no dispatch.complete"),
-            "the wait must end with the canonical operator-facing timeout message (which names \
-             the session and how to keep watching), not some propagated internal error. \
-             Got: {err}"
-        );
-        assert!(
-            elapsed >= declared,
-            "the wait ended at {elapsed:?}, BEFORE its declared {declared:?} — a healthy peer's \
-             prompt reply must never cut the budget short. err={err}"
-        );
-        assert!(
-            elapsed < declared + slack,
-            "the wait ran {elapsed:?} against a declared {declared:?}; the overshoot ceiling is \
-             the bounded connect plus one poll interval, not this. err={err}"
-        );
-    }
 }
-

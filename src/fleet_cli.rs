@@ -791,6 +791,218 @@ fn human_gb(bytes: u64) -> String {
     format!("{:.0} GB", gb.round())
 }
 
+// ─── Fleet work submission: the receiver's allow-list (#2916) ──────────
+
+/// Whether `profile` may be granted to a peer: it must exist in this
+/// machine's registry and resolve to a WORK model (a profile whose only model
+/// is the machine's utility model is utility work, never addressable from
+/// another machine, #2914). `Err` says why not.
+fn grantable_profile(registry: &darkmux_types::ProfileRegistry, profile: &str) -> std::result::Result<(), String> {
+    let Some(p) = registry.profiles.get(profile) else {
+        return Err(format!("profile `{profile}` is not defined in this machine's registry"));
+    };
+    let utility = registry.utility_model_id();
+    if utility.is_some() && !p.models.is_empty() && p.models.iter().all(|m| Some(m.id.as_str()) == utility) {
+        return Err(format!(
+            "profile `{profile}` lists only this machine's utility model; utility work is never taken \
+             from another machine (#2914)"
+        ));
+    }
+    Ok(())
+}
+
+/// Find the one node `name` refers to. The lookup names, in order: `--node`
+/// (only that), else the host of `name`'s roster address, then `name`.
+fn resolve_trust_node(
+    provider: &dyn fleet::IdentityProvider,
+    name: &str,
+    node_hint: Option<&str>,
+    roster_host: Option<&str>,
+) -> Result<fleet::NodeIdentity> {
+    let nodes = provider.nodes().map_err(|e| {
+        anyhow::anyhow!(
+            "the identity provider `{}` could not list the network's nodes: {e:#}",
+            provider.provider_name()
+        )
+    })?;
+    let queries: Vec<&str> = match node_hint {
+        Some(n) => vec![n],
+        None => roster_host.into_iter().chain(std::iter::once(name)).collect(),
+    };
+    for q in &queries {
+        let hits: Vec<&fleet::NodeIdentity> = nodes.iter().filter(|n| n.answers_to(q)).collect();
+        match hits.as_slice() {
+            [] => continue,
+            [one] => return Ok((*one).clone()),
+            many => anyhow::bail!(
+                "`{q}` names {} nodes on the {} network ({}); pass `--node <name>` with the one you mean",
+                many.len(),
+                provider.provider_name(),
+                many.iter().map(|n| n.dns_name.clone().unwrap_or_else(|| n.name.clone())).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+    let mut seen: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+    seen.sort();
+    anyhow::bail!(
+        "no node on the {} network answers to {} (nodes it reports: {}). Pass `--node <name>` with \
+         the peer's name on the network.",
+        provider.provider_name(),
+        queries.iter().map(|q| format!("`{q}`")).collect::<Vec<_>>().join(" or "),
+        if seen.is_empty() { "none".to_string() } else { seen.join(", ") }
+    )
+}
+
+/// The pure-ish core of `machine trust`: resolve the node, check the
+/// profiles, write `fleet.accept_work.<name>` into the config.json at
+/// `config_path`. Returns the confirmation text. Touches nothing but that
+/// one key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trust_at(
+    config_path: &std::path::Path,
+    name: &str,
+    node_hint: Option<&str>,
+    profiles: &[String],
+    workspace: Option<bool>,
+    provider: &dyn fleet::IdentityProvider,
+    registry: &darkmux_types::ProfileRegistry,
+    roster_host: Option<&str>,
+) -> Result<String> {
+    fleet::validate_identifier("machine name", name)?;
+    let mut root = crate::config_cmd::load_object(config_path)?;
+    let existing = root
+        .get("fleet")
+        .and_then(|f| f.get("accept_work"))
+        .and_then(|a| a.get(name))
+        .cloned();
+    let profiles: Vec<String> = if profiles.is_empty() {
+        existing
+            .as_ref()
+            .and_then(|e| e.get("profiles"))
+            .and_then(|p| serde_json::from_value::<Vec<String>>(p.clone()).ok())
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "name the profiles `{name}` may run on this machine: `darkmux machine trust {name} \
+                     --profiles <profile>[,<profile>...]` (`darkmux profile list` shows them)"
+                )
+            })?
+    } else {
+        let mut v: Vec<String> = profiles.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+        v.dedup();
+        v
+    };
+    let problems: Vec<String> = profiles.iter().filter_map(|p| grantable_profile(registry, p).err()).collect();
+    if !problems.is_empty() {
+        anyhow::bail!("not trusting `{name}`: {}", problems.join("; "));
+    }
+    let node = resolve_trust_node(provider, name, node_hint, roster_host)?;
+    let workspace = workspace
+        .or_else(|| existing.as_ref().and_then(|e| e.get("workspace")).and_then(|w| w.as_bool()))
+        .unwrap_or(false);
+
+    // Keep any field on the entry this binary does not know.
+    let mut entry = existing.and_then(|e| e.as_object().cloned()).unwrap_or_default();
+    entry.insert("node_id".into(), serde_json::Value::String(node.node_id.clone()));
+    entry.insert("profiles".into(), serde_json::json!(profiles));
+    entry.insert("workspace".into(), serde_json::Value::Bool(workspace));
+    {
+        let obj = root.as_object_mut().expect("load_object returns an object");
+        let fleet_v = obj.entry("fleet").or_insert_with(|| serde_json::json!({}));
+        if !fleet_v.is_object() {
+            *fleet_v = serde_json::json!({});
+        }
+        let aw = fleet_v.as_object_mut().unwrap().entry("accept_work").or_insert_with(|| serde_json::json!({}));
+        if !aw.is_object() {
+            *aw = serde_json::json!({});
+        }
+        aw.as_object_mut().unwrap().insert(name.to_string(), serde_json::Value::Object(entry));
+    }
+    serde_json::from_value::<darkmux_types::config::DarkmuxConfig>(root.clone())
+        .map_err(|e| anyhow::anyhow!("the resulting config.json would not parse ({e}); nothing written"))?;
+    std::fs::write(config_path, serde_json::to_string_pretty(&root)? + "\n")
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", config_path.display()))?;
+    Ok(format!(
+        "machine: this machine now accepts work from `{name}` (the {} node `{}`)\n  \
+         may run: {}\n  workspace: {}\n  \
+         written to {} (fleet.accept_work.{name}); the daemon reads it per request, no restart",
+        provider.provider_name(),
+        node.dns_name.as_deref().unwrap_or(&node.name),
+        profiles.join(", "),
+        if workspace { "yes" } else { "no" },
+        config_path.display(),
+    ))
+}
+
+/// The core of `machine untrust`: remove `fleet.accept_work.<name>` and
+/// nothing else. `Ok(false)` when there was no such entry.
+pub(crate) fn untrust_at(config_path: &std::path::Path, name: &str) -> Result<bool> {
+    let mut root = crate::config_cmd::load_object(config_path)?;
+    let removed = root
+        .get_mut("fleet")
+        .and_then(|f| f.get_mut("accept_work"))
+        .and_then(|a| a.as_object_mut())
+        .and_then(|a| a.remove(name))
+        .is_some();
+    if removed {
+        std::fs::write(config_path, serde_json::to_string_pretty(&root)? + "\n")
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", config_path.display()))?;
+    }
+    Ok(removed)
+}
+
+fn user_config_path() -> std::path::PathBuf {
+    darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
+}
+
+/// `darkmux machine trust <name>` (#2916).
+pub(crate) fn cmd_machine_trust(
+    name: &str,
+    node: Option<&str>,
+    profiles: &[String],
+    workspace: Option<bool>,
+) -> Result<i32> {
+    let provider = fleet::configured_provider()?;
+    let loaded = darkmux_profiles::profiles::load_registry(None)?;
+    let roster_host = fleet::load_roster()
+        .ok()
+        .and_then(|r| r.machines.get(name).and_then(|e| fleet::address_host(&e.address)));
+    let msg = trust_at(
+        &user_config_path(),
+        name,
+        node,
+        profiles,
+        workspace,
+        provider.as_ref(),
+        &loaded.registry,
+        roster_host.as_deref(),
+    )?;
+    println!("{msg}");
+    if !darkmux_types::config_access::fleet_listener_enabled() {
+        println!(
+            "  note: this machine's fleet listener is off, so it takes no work yet: \
+             `darkmux config set fleet.listener.enabled true`, then restart `darkmux serve`"
+        );
+    }
+    Ok(0)
+}
+
+/// `darkmux machine untrust <name>` (#2916).
+pub(crate) fn cmd_machine_untrust(name: &str) -> Result<i32> {
+    let path = user_config_path();
+    if untrust_at(&path, name)? {
+        println!(
+            "machine: this machine no longer accepts work from `{name}` (removed fleet.accept_work.{name} \
+             from {}); effective on the next request",
+            path.display()
+        );
+        Ok(0)
+    } else {
+        eprintln!("machine: `{name}` is not on this machine's allow-list (fleet.accept_work); nothing changed");
+        Ok(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,3 +1728,110 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use darkmux_fleet::{test_node, StaticIdentityProvider};
+
+    fn provider() -> StaticIdentityProvider {
+        StaticIdentityProvider {
+            local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+            peers: vec![test_node("nLAPTOP", "laptop", "100.64.0.7"), test_node("nPHONE", "peer", "100.64.0.9")],
+            down: None,
+        }
+    }
+
+    fn registry() -> darkmux_types::ProfileRegistry {
+        serde_json::from_str(
+            r#"{"profiles":{"host":{"models":[{"id":"big","n_ctx":32000}]},
+                "coder-studio":{"models":[{"id":"big","n_ctx":64000}]},
+                "utility":{"models":[{"id":"small","n_ctx":8000}]}},
+              "internal":{"utility":"small"}}"#,
+        )
+        .unwrap()
+    }
+
+    fn cfg(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn entry(p: &std::path::Path, name: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        v["fleet"]["accept_work"][name].clone()
+    }
+
+    #[test]
+    fn trust_resolves_the_node_through_the_provider_and_touches_only_its_key() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, r#"{"machine_id":"studio","fleet":{"mode":"hub","accept_work":{"mini":{"node_id":"nMINI","profiles":["host"]}}},"redis":{"enabled":true}}"#);
+        let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        // The roster names the laptop `laptop` at its tailnet DNS name; the
+        // node is found by that host, never typed.
+        let out = trust_at(&p, "workbook", None, &["host".into()], None, &provider(), &registry(), Some("laptop.tailnet-example.ts.net")).unwrap();
+        assert!(out.contains("accepts work from `workbook`"), "{out}");
+        assert!(!out.contains("nLAPTOP"), "the node id is never printed: {out}");
+        let e = entry(&p, "workbook");
+        assert_eq!(e["node_id"], "nLAPTOP");
+        assert_eq!(e["profiles"], serde_json::json!(["host"]));
+        assert_eq!(e["workspace"], false);
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let mut after_minus = after.clone();
+        after_minus["fleet"]["accept_work"].as_object_mut().unwrap().remove("workbook");
+        assert_eq!(after_minus, before, "nothing but fleet.accept_work.workbook changed");
+    }
+
+    #[test]
+    fn trust_refuses_utility_and_unknown_profiles_and_requires_a_scope() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, "{}");
+        let err = trust_at(&p, "laptop", None, &["utility".into()], None, &provider(), &registry(), None).unwrap_err();
+        assert!(err.to_string().contains("utility model"), "{err}");
+        let err = trust_at(&p, "laptop", None, &["nope".into()], None, &provider(), &registry(), None).unwrap_err();
+        assert!(err.to_string().contains("not defined"), "{err}");
+        let err = trust_at(&p, "laptop", None, &[], None, &provider(), &registry(), None).unwrap_err();
+        assert!(err.to_string().contains("name the profiles"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}", "a refused trust writes nothing");
+    }
+
+    #[test]
+    fn trust_refuses_a_name_the_network_does_not_know_and_names_what_it_does() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, "{}");
+        let err = trust_at(&p, "ghost", None, &["host".into()], None, &provider(), &registry(), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no node") && msg.contains("laptop") && msg.contains("peer"), "{msg}");
+        // --node overrides the name.
+        trust_at(&p, "ghost", Some("peer"), &["host".into()], None, &provider(), &registry(), None).unwrap();
+        assert_eq!(entry(&p, "ghost")["node_id"], "nPHONE");
+    }
+
+    #[test]
+    fn trust_refuses_when_the_provider_is_down() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, "{}");
+        let mut down = provider();
+        down.down = Some("daemon not running".into());
+        let err = trust_at(&p, "laptop", None, &["host".into()], None, &down, &registry(), None).unwrap_err();
+        assert!(err.to_string().contains("could not list"), "{err}");
+    }
+
+    #[test]
+    fn retrust_keeps_the_scope_unless_given_and_untrust_removes_only_that_entry() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = cfg(&d, "{}");
+        trust_at(&p, "laptop", None, &["host".into(), "coder-studio".into()], Some(true), &provider(), &registry(), None).unwrap();
+        trust_at(&p, "peer", None, &["host".into()], None, &provider(), &registry(), None).unwrap();
+        trust_at(&p, "laptop", None, &[], None, &provider(), &registry(), None).unwrap();
+        let e = entry(&p, "laptop");
+        assert_eq!(e["profiles"], serde_json::json!(["host", "coder-studio"]));
+        assert_eq!(e["workspace"], true);
+        assert!(untrust_at(&p, "laptop").unwrap());
+        assert!(entry(&p, "laptop").is_null());
+        assert_eq!(entry(&p, "peer")["node_id"], "nPHONE", "the other entry stays");
+        assert!(!untrust_at(&p, "laptop").unwrap(), "a second untrust changes nothing");
+    }
+}
+

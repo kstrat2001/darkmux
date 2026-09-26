@@ -69,3 +69,5 @@ darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
 # only, so the release binary never pulls `ts-rs` through these crates.
 darkmux-crew = { path = "../darkmux-crew", features = ["ts-export", "test-support"] }
 darkmux-lab = { path = "../darkmux-lab", features = ["ts-export"] }
+# (#2916) The fake identity provider the fleet listener's HTTP tests use.
+darkmux-fleet = { path = "../darkmux-fleet", features = ["test-support"] }

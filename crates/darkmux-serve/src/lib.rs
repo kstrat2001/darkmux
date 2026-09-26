@@ -47,6 +47,7 @@ pub mod mission_graph;
 /// rendering needs it too, not just the wire response.
 /// (#2107, #1833) The daemon-side continuous host sampler feeding the
 /// machine stats drawer's live `load` block — see the module's own doc.
+mod fleet_listener;
 mod host_sampler;
 mod panel;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
@@ -1317,16 +1318,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             println!("{line}");
         }
 
-        // Spawn the fleet work-queue runner thread (#246 PR-C.2, renamed #595).
-        // Runs on a dedicated std::thread (not a tokio task) so the sync
-        // redis client + sync crew::dispatch::dispatch don't saturate
-        // the tokio executor. The runner self-disables when its prerequisite
-        // (DARKMUX_REDIS_URL) isn't declared — single-machine fleets
-        // continue to work unchanged (#590: Redis presence is the
-        // participation gate; tier declaration is no longer required).
-        // The thread runs for the daemon's lifetime; the process
-        // force-exit in the SHUTDOWN_GRACE_SECS path kills it cleanly.
-        let _runner_handle = darkmux_fleet::spawn_runner_thread();
+        // (#2916) The Redis work-queue runner that used to start here is
+        // retired: `darkmux:work` could not say who wrote an entry, so any
+        // node that could write Redis could make this machine run work.
+        // Work now arrives on the fleet listener (below), which checks the
+        // fleet token and the connecting node first.
 
         // (#638) Spawn the fleet-presence heartbeat emitter. Same dedicated-
         // std::thread shape + DARKMUX_REDIS_URL self-disable as the runner
@@ -1369,6 +1365,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // `watch::channel` is the right shape — both consumers wait_for
         // the same latch flip.
         let (shutdown_tx, mut shutdown_rx_axum) = tokio::sync::watch::channel(false);
+
+        // (#2916) The work-submission listener, when `fleet.listener.enabled`:
+        // its own socket on this machine's overlay address, gated by the
+        // fleet token + the network-verified allow-list.
+        fleet_listener::spawn_if_enabled(shutdown_rx_axum.clone());
 
         tokio::spawn(async move {
             shutdown_signal().await;

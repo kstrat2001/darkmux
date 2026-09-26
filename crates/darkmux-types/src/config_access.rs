@@ -349,6 +349,70 @@ pub fn fleet_mode() -> crate::config::FleetMode {
     crate::config::FleetMode::parse(&fleet_mode_raw()).unwrap_or_default()
 }
 
+// ── Fleet work submission (#2916) ──
+/// The identity provider `init` writes and an absent `fleet.identity.provider`
+/// resolves to.
+pub const FLEET_IDENTITY_PROVIDER_DEFAULT: &str = "tailscale";
+/// The work-submission listener's built-in port: one above the viewer's
+/// 8765, which `tailscale serve` owns on the overlay side of a hub.
+pub const FLEET_LISTENER_PORT_DEFAULT: u16 = 8766;
+
+/// The identity provider VALUE, `config.fleet.identity.provider >
+/// "tailscale"`. Deliberately NO env tier: which network vouches for a
+/// connecting machine is security-bearing, and a per-shell override of it
+/// would be one more way to change the check without a trace in the file.
+/// An unrecognized value passes through; the provider factory refuses it,
+/// and no provider means every submission is refused.
+pub fn fleet_identity_provider() -> String {
+    config()
+        .fleet
+        .as_ref()
+        .and_then(|f| f.identity.as_ref())
+        .and_then(|i| i.provider.clone())
+        .unwrap_or_else(|| FLEET_IDENTITY_PROVIDER_DEFAULT.to_string())
+}
+
+/// The provider's command-line tool, `config.fleet.identity.bin`, when set.
+pub fn fleet_identity_bin() -> Option<String> {
+    config()
+        .fleet
+        .as_ref()
+        .and_then(|f| f.identity.as_ref())
+        .and_then(|i| i.bin.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Whether `darkmux serve` opens the work-submission listener,
+/// `env(DARKMUX_FLEET_LISTENER_ENABLED) > config.fleet.listener.enabled > false`.
+pub fn fleet_listener_enabled() -> bool {
+    fleet_listener_enabled_with_source().0
+}
+
+/// [`fleet_listener_enabled`] plus WHICH tier resolved it.
+pub fn fleet_listener_enabled_with_source() -> (bool, Source) {
+    if let Some(s) = env_str("DARKMUX_FLEET_LISTENER_ENABLED") {
+        return (parse_bool_token(&s).unwrap_or(false), Source::Env);
+    }
+    match config().fleet.as_ref().and_then(|f| f.listener.as_ref()).and_then(|l| l.enabled) {
+        Some(v) => (v, Source::Config),
+        None => (false, Source::BuiltIn),
+    }
+}
+
+/// The work-submission port, `env(DARKMUX_FLEET_LISTENER_PORT) >
+/// config.fleet.listener.port > 8766`. A SENDER dials the target's roster
+/// host on this same resolved port: the fleet uses one port.
+pub fn fleet_listener_port() -> u16 {
+    fleet_listener_port_with_source().0
+}
+
+/// [`fleet_listener_port`] plus WHICH tier resolved it.
+pub fn fleet_listener_port_with_source() -> (u16, Source) {
+    let cfg = config().fleet.as_ref().and_then(|f| f.listener.as_ref()).and_then(|l| l.port);
+    let (v, src) = pick_parsed_with_source("DARKMUX_FLEET_LISTENER_PORT", cfg, Some(FLEET_LISTENER_PORT_DEFAULT));
+    (v.unwrap_or(FLEET_LISTENER_PORT_DEFAULT), src)
+}
+
 // ── External tooling ──
 pub fn lms_bin() -> String {
     lms_bin_with_source().0

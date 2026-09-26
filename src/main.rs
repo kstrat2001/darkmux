@@ -975,9 +975,17 @@ fn cmd_mission_dispatch(
     //    value. Rejects path-traversal, special chars, over-long ids.
     fleet::validate_identifier("mission_id", mission_id)?;
     fleet::validate_identifier("role_id", role_id)?;
-    if let Some(m) = machine {
-        fleet::validate_identifier("--machine", m)?;
-    }
+    // (#2916) The queue that let ANY runner claim a phase is retired; work
+    // now goes to one named machine, which checks who is asking. Required,
+    // and checked before any phase changes state.
+    let Some(machine) = machine else {
+        anyhow::bail!(
+            "mission dispatch needs --machine <id>: the fleet work queue any machine could claim \
+             from is retired (#2916), so a phase is submitted to one named machine. To run the \
+             phase here, `darkmux dispatch <role> <message> --phase-id <phase>`."
+        );
+    };
+    fleet::validate_identifier("--machine", machine)?;
 
     // 1. Validate the mission exists.
     let missions = load_missions()?;
@@ -997,10 +1005,7 @@ fn cmd_mission_dispatch(
         );
     }
 
-    // 2. Confirm the role exists before fanning out phases. After #590
-    //    there is no tier requirement — phases fan onto the single
-    //    global `darkmux:work` stream and the first available runner
-    //    claims each one.
+    // 2. Confirm the role exists before submitting any phase.
     let roles = load_roles()?;
     if !roles.iter().any(|r| r.id == role_id) {
         anyhow::bail!("role `{role_id}` not found");
@@ -1076,20 +1081,9 @@ fn cmd_mission_dispatch(
         return Ok(2);
     }
 
-    // 4. Redis required for cross-machine fan-out. env(DARKMUX_REDIS_URL) >
-    //    config-assembled (#661 Slice 5).
-    let raw_url = flow::redis_url().ok_or_else(|| anyhow::anyhow!(
-        "mission dispatch requires Redis (DARKMUX_REDIS_URL or config.redis.enabled) — the fleet work queue lives on Redis."
-    ))?;
-    let client = redis::Client::open(raw_url.expose_for_probe())
-        .with_context(|| format!("opening Redis client {raw_url} for mission dispatch"))?;
-
-    // 5. Build + pre-validate all WorkJobs BEFORE publishing any
-    //    (HIGH-2 from review). All-or-nothing semantics: if any phase
-    //    would trip validate() (oversize description, etc.), the
-    //    operator finds out before ANY orphan job lands on Redis.
-    //    Loop-index suffix on session_id defeats microsecond collisions
-    //    under sub-microsecond loop iterations (review M-session-id).
+    // 4. (#2916) Build + pre-validate every job BEFORE submitting any
+    //    (all-or-nothing, HIGH-2 from the PR-D.1 review): an oversize
+    //    description is found before anything leaves this machine.
     let local_machine = flow::resolve_machine_id();
     let dispatch_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1100,220 +1094,57 @@ fn cmd_mission_dispatch(
         let session_id =
             darkmux_types::session_id::mission_phase_dispatch(mission_id, &phase.id, dispatch_micros, idx);
         let job = fleet::build_work_job(
-            machine.map(String::from),
+            machine.to_string(),
             role_id.to_string(),
             phase.description.clone(),
             session_id.clone(),
+            None, // profile: the receiver resolves the role's binding
             None,
             Some(phase.id.clone()),
-            None, // image (#703 Slice 4) — mission dispatch uses the runner's default
+            None, // image (#703 Slice 4) — the receiver's default
             timeout_seconds,
             local_machine.clone(),
-            // (#1758) `resolve_orchestrator()` removed — see routing.rs's
-            // `dispatch_routed` for why `None` (not field removal) is the
-            // right fix at this call site.
-            None,
         );
-        // Pre-validate. Surfaces oversize/charset failures BEFORE any
-        // partial publish lands on the queue.
         job.validate()
-            .with_context(|| format!("pre-publish validation failed for phase `{}`", phase.id))?;
+            .with_context(|| format!("pre-submit validation failed for phase `{}`", phase.id))?;
         jobs.push((phase.id.clone(), session_id, job));
     }
 
-    // 6. Publish. Capture sessions for wait-aggregation. If a mid-loop
-    //    publish fails (Redis network blip), the operator gets the
-    //    list of already-published (phase_id, session_id, work_id)
-    //    triples on stderr so they can dedup / clean up via flow tail.
+    // 5. Submit, one phase at a time: the receiver runs one submitted job at
+    //    a time (a second is answered "busy"), so there is no fan-out to a
+    //    single machine. A refusal comes back at once with its reason.
     eprintln!(
-        "darkmux mission dispatch: mission={mission_id} role={role_id} \
-         phases={} target_machine={}",
-        jobs.len(),
-        machine.unwrap_or("<any>")
-    );
-    let mut sessions: Vec<(String, String, String)> = Vec::new(); // (phase_id, session_id, work_id)
-    for (phase_id, session_id, job) in &jobs {
-        match fleet::publish_job(&client, job) {
-            Ok(work_id) => {
-                eprintln!("  phase={phase_id} work_id={work_id} session={session_id}");
-                sessions.push((phase_id.clone(), session_id.clone(), work_id));
-            }
-            Err(e) => {
-                eprintln!(
-                    "\ndarkmux mission dispatch: ERROR — publish failed for phase `{phase_id}` \
-                     after {} successful publishes. Already-published jobs are in flight on runners:",
-                    sessions.len()
-                );
-                for (sid, sess, wid) in &sessions {
-                    eprintln!("  ORPHAN phase={sid} session={sess} work_id={wid}");
-                }
-                eprintln!(
-                    "Tail each via `darkmux flow tail --session <id>` OR \
-                     XRANGE darkmux:flow against the published session_ids to track completion. \
-                     Do NOT re-run mission dispatch without checking — re-publish would \
-                     double-fire the orphans."
-                );
-                return Err(e)
-                    .with_context(|| format!("publishing phase `{phase_id}` as WorkJob"));
-            }
-        }
-    }
-
-    if !wait {
-        println!(
-            "Published {} phase job(s); operator polls for completion via flow stream.",
-            sessions.len()
-        );
-        for (phase_id, session_id, work_id) in &sessions {
-            println!("  phase={phase_id} session_id={session_id} work_id={work_id}");
-        }
-        return Ok(0);
-    }
-
-    // 6. Wait for each completion. Sequential polling is correct (XRANGE
-    //    full-scan returns ALL records; finding session A doesn't preclude
-    //    finding session B in the same pass). Net wall-clock is bounded by
-    //    the slowest phase's completion.
-    let wait_timeout = std::time::Duration::from_secs((timeout_seconds as u64).saturating_add(60));
-    eprintln!(
-        "\n{}",
-        worst_case_wait_banner(sessions.len(), timeout_seconds, wait_timeout.as_secs())
+        "darkmux mission dispatch: mission={mission_id} role={role_id} phases={} machine={machine}",
+        jobs.len()
     );
     let mut completed: usize = 0;
     let mut failures: usize = 0;
-    let mission_start = std::time::Instant::now();
-    let mut sum_phase_wall_ms: u64 = 0;
-    for (phase_id, session_id, _work_id) in &sessions {
-        match fleet::wait_for_completion(&raw_url, session_id, wait_timeout) {
-            Ok(c) => {
+    for (phase_id, session_id, job) in jobs {
+        match fleet::submit_work(job, wait) {
+            Ok(reply) if reply.status == "accepted" => {
+                println!("  phase={phase_id} session_id={session_id} submitted to {machine} (not waiting)");
+            }
+            Ok(reply) => {
                 completed += 1;
-                if c.result_class != "ok" {
+                let code = reply.exit_code.unwrap_or(1);
+                if code != 0 {
                     failures += 1;
                 }
-                if let Some(ms) = c.wall_ms {
-                    sum_phase_wall_ms += ms;
-                }
-                eprintln!(
-                    "  ✓ phase={phase_id} result={} wall_ms={:?}",
-                    c.result_class, c.wall_ms
-                );
+                eprintln!("  {} phase={phase_id} exit_code={code} session={session_id}", if code == 0 { "✓" } else { "✗" });
             }
             Err(e) => {
                 failures += 1;
-                eprintln!("  ✗ phase={phase_id} wait error: {e:#}");
+                eprintln!(
+                    "  ✗ phase={phase_id} not run: {e:#}\n    The phase was marked Running before \
+                     submitting; `darkmux mission abort {mission_id} --phase {phase_id}` resets it."
+                );
             }
         }
     }
-    let mission_wall_ms = mission_start.elapsed().as_millis() as u64;
-
-    // Empirical parallelism check (#246 Q3 risk #3): if total wall-clock
-    // is meaningfully less than sum of phase wall-clocks, dispatches
-    // ran in parallel. Otherwise they were serial under the hood.
-    println!(
-        "\nmission dispatch: completed={completed}/{} failures={failures} \
-         wall_ms={mission_wall_ms} sum_phase_wall_ms={sum_phase_wall_ms}",
-        sessions.len()
-    );
-    match speedup_verdict(sum_phase_wall_ms, mission_wall_ms, sessions.len()) {
-        SpeedupVerdict::ParallelConfirmed { speedup } => println!(
-            "  → wall-clock indicates parallel execution: {speedup:.2}× speedup vs the \
-             sum of per-phase wall_ms (runner self-reported; not authenticated)."
-        ),
-        SpeedupVerdict::SeriallySuspect { speedup } => println!(
-            "  ⚠ wall_ms ≈ sum of phase wall_ms ({speedup:.2}×) — phases may have run \
-             serially. Check fleet roster + runner reachability."
-        ),
-        SpeedupVerdict::Inconclusive => {}
+    if wait {
+        println!("\nmission dispatch: completed={completed} failures={failures} (on {machine})");
     }
-
-    if failures > 0 {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
-}
-
-/// Render the operator-facing "waiting for N completion(s)" banner with
-/// the worst-case wall-clock bound named up front (Wave-E.9 #255). The
-/// wait loop is sequential-per-phase, so worst case is
-/// `N × (per_phase_timeout + slack)`. Surfacing this lets the operator
-/// decide whether to SIGINT before the second per-phase timeout if the
-/// first phase hangs — closes the PR-D.1 review MEDIUM where the
-/// unbounded total wait could quietly run hours.
-pub fn worst_case_wait_banner(
-    n_sessions: usize,
-    per_phase_timeout_seconds: u32,
-    wait_timeout_seconds: u64,
-) -> String {
-    let worst_case_secs = (n_sessions as u64).saturating_mul(wait_timeout_seconds);
-    format!(
-        "darkmux mission dispatch: waiting for {n_sessions} completion(s) \
-         (per-phase timeout {per_phase_timeout_seconds}s + 60s slack; \
-         worst-case total wall ≈ {worst_case_secs}s = {worst_case_min}min). \
-         SIGINT cleanly aborts.",
-        worst_case_min = worst_case_secs / 60,
-    )
-}
-
-/// Minimum speedup ratio (sum_phase_wall_ms / mission_wall_ms) at which
-/// the mission-dispatch summary asserts "parallel execution." Below this,
-/// the metric is reported with a serially-suspect warning OR nothing
-/// (n=1 case). 1.5 is a conservative threshold for 2-machine fleets —
-/// noise and per-phase setup overhead can push a truly-parallel run
-/// below 2.0× speedup. Adjust upward if false-positives appear.
-const PARALLELISM_CONFIRMED_THRESHOLD: f64 = 1.5;
-
-/// Verdict from the empirical parallelism metric computed at the end of
-/// `mission dispatch --wait`. Extracted as a pure function (#255 Wave-E.4)
-/// so the math + thresholding are unit-testable independent of the rest
-/// of the dispatch handler.
-#[derive(Debug, PartialEq)]
-pub enum SpeedupVerdict {
-    /// Wall-clock indicates parallel execution: speedup ≥
-    /// `PARALLELISM_CONFIRMED_THRESHOLD` AND more than one phase
-    /// completed. Caller renders an operator-facing
-    /// "parallel execution: Nx speedup" line.
-    ParallelConfirmed { speedup: f64 },
-    /// Wall-clock ≈ sum-of-phases (`speedup < threshold`) with multiple
-    /// phases — phases may have run serially under the hood. Caller
-    /// renders the operator-warning line pointing at fleet roster +
-    /// runner reachability.
-    SeriallySuspect { speedup: f64 },
-    /// Insufficient data to assert parallel vs serial: either zero
-    /// phases completed (`sum_phase_wall_ms == 0`) OR exactly one
-    /// phase (parallelism is undefined for n=1). Caller stays silent.
-    Inconclusive,
-}
-
-/// Pure-function speedup verdict computation. Inputs are the metric
-/// summaries collected during `mission dispatch --wait`:
-///
-/// - `sum_phase_wall_ms` — sum of `wall_ms` from each
-///   `dispatch.complete` flow record. Runner self-reported.
-/// - `mission_wall_ms` — wall time from `mission dispatch` invocation
-///   to the last completion seen, measured by the publisher.
-/// - `n_phases` — number of phases dispatched (sessions.len()).
-pub fn speedup_verdict(
-    sum_phase_wall_ms: u64,
-    mission_wall_ms: u64,
-    n_phases: usize,
-) -> SpeedupVerdict {
-    if sum_phase_wall_ms == 0 || n_phases == 0 {
-        return SpeedupVerdict::Inconclusive;
-    }
-    // Avoid divide-by-zero on instantaneous missions; the `.max(1.0)`
-    // floor doesn't materially change any non-degenerate case.
-    let speedup = (sum_phase_wall_ms as f64) / (mission_wall_ms as f64).max(1.0);
-    if n_phases > 1 && speedup >= PARALLELISM_CONFIRMED_THRESHOLD {
-        SpeedupVerdict::ParallelConfirmed { speedup }
-    } else if n_phases > 1 {
-        SpeedupVerdict::SeriallySuspect { speedup }
-    } else {
-        // n == 1: parallelism is undefined for a single phase. Stay
-        // silent even if the math says speedup >= threshold (which can
-        // only happen via clock skew or wall_ms misreporting).
-        SpeedupVerdict::Inconclusive
-    }
+    Ok(if failures > 0 { 1 } else { 0 })
 }
 
 /// (#1426) Owned fields of the top-level `dispatch` verb — a plain carrier so
@@ -1460,8 +1291,8 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
                 crew::dispatch::RoutingDecision::Remote { .. }
             ) {
                 anyhow::bail!(
-                    "--finding / --mod cannot be routed to another machine yet: the work \
-                     queue's job shape carries no record refs, and {target}'s own finding / \
+                    "--finding / --mod cannot be routed to another machine yet: a submitted \
+                     job carries no record refs, and {target}'s own finding / \
                      mod stores are its own. Run it on this machine (drop --machine), or \
                      paste the record's content into the message."
                 );
@@ -1641,6 +1472,10 @@ fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
             allow_loopback,
         }) => fleet_cli::cmd_machine_add(&id, &address, description.as_deref(), allow_loopback),
         Some(MachineCmd::Remove { id }) => fleet_cli::cmd_machine_remove(&id),
+        Some(MachineCmd::Trust { name, node, profiles, workspace }) => {
+            fleet_cli::cmd_machine_trust(&name, node.as_deref(), &profiles, workspace)
+        }
+        Some(MachineCmd::Untrust { name }) => fleet_cli::cmd_machine_untrust(&name),
     }
 }
 
@@ -2407,120 +2242,6 @@ mod tests {
         assert!(!profile_matches(&profile, &[]));
         // Local model loaded at the wrong context → no match.
         assert!(!profile_matches(&profile, &[loaded_model("worker", 4096)]));
-    }
-
-    // ─── worst_case_wait_banner (Wave-E.9 #255) ──────────────────────
-
-    #[test]
-    fn worst_case_wait_banner_names_total_bound() {
-        let s = worst_case_wait_banner(3, 600, 660);
-        assert!(s.contains("3 completion(s)"));
-        assert!(s.contains("worst-case total wall ≈ 1980s"));
-        assert!(s.contains("33min")); // 1980 / 60
-        assert!(s.contains("SIGINT"));
-    }
-
-    #[test]
-    fn worst_case_wait_banner_handles_single_phase() {
-        let s = worst_case_wait_banner(1, 60, 120);
-        assert!(s.contains("1 completion(s)"));
-        assert!(s.contains("worst-case total wall ≈ 120s"));
-        assert!(s.contains("2min"));
-    }
-
-    #[test]
-    fn worst_case_wait_banner_handles_zero_sessions_gracefully() {
-        // Defensive: should NOT panic on degenerate inputs even if the
-        // caller's flow normally guards against this.
-        let s = worst_case_wait_banner(0, 600, 660);
-        assert!(s.contains("0 completion(s)"));
-        assert!(s.contains("worst-case total wall ≈ 0s"));
-    }
-
-    #[test]
-    fn worst_case_wait_banner_uses_saturating_arithmetic() {
-        // u64 overflow check: large N × large wait_timeout shouldn't panic.
-        let s = worst_case_wait_banner(u64::MAX as usize, 3600, 3660);
-        assert!(s.contains("worst-case"));
-    }
-
-    // ─── speedup_verdict (Wave-E.4 #255) ──────────────────────────────
-
-    #[test]
-    fn speedup_verdict_confirms_parallel_when_speedup_above_threshold() {
-        // 2 phases, each 5000ms, mission wall 5000ms → speedup = 2.0
-        let v = speedup_verdict(10_000, 5_000, 2);
-        match v {
-            SpeedupVerdict::ParallelConfirmed { speedup } => {
-                assert!((speedup - 2.0).abs() < 0.01, "speedup ≈ 2.0; got {speedup}");
-            }
-            other => panic!("expected ParallelConfirmed; got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn speedup_verdict_warns_serial_when_speedup_below_threshold() {
-        // 2 phases, sum 10000ms, mission wall 8500ms → speedup ≈ 1.18 (< 1.5)
-        let v = speedup_verdict(10_000, 8_500, 2);
-        match v {
-            SpeedupVerdict::SeriallySuspect { speedup } => {
-                assert!(
-                    (speedup - 1.18).abs() < 0.05,
-                    "speedup ≈ 1.18; got {speedup}"
-                );
-            }
-            other => panic!("expected SeriallySuspect; got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn speedup_verdict_inconclusive_when_no_phases_completed() {
-        assert_eq!(
-            speedup_verdict(0, 100, 2),
-            SpeedupVerdict::Inconclusive,
-            "zero sum (e.g. all dispatch errors) → Inconclusive"
-        );
-    }
-
-    #[test]
-    fn speedup_verdict_inconclusive_when_single_phase() {
-        // Parallelism is undefined for a single phase — stay silent
-        // even if the math would otherwise say "confirmed".
-        let v = speedup_verdict(10_000, 5_000, 1);
-        assert_eq!(v, SpeedupVerdict::Inconclusive);
-    }
-
-    #[test]
-    fn speedup_verdict_inconclusive_when_zero_sessions() {
-        let v = speedup_verdict(10_000, 5_000, 0);
-        assert_eq!(v, SpeedupVerdict::Inconclusive);
-    }
-
-    #[test]
-    fn speedup_verdict_handles_zero_wall_ms_safely() {
-        // Instantaneous mission (clock granularity). Math floor at 1ms
-        // prevents divide-by-zero; verdict is still computed.
-        let v = speedup_verdict(5_000, 0, 2);
-        match v {
-            SpeedupVerdict::ParallelConfirmed { speedup } => {
-                assert!(speedup >= PARALLELISM_CONFIRMED_THRESHOLD);
-            }
-            other => panic!("expected ParallelConfirmed (degenerate); got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn speedup_verdict_threshold_boundary_exact_match_confirms() {
-        // 1.5× exactly → ParallelConfirmed (boundary inclusive). Sum=1500, wall=1000.
-        let v = speedup_verdict(1_500, 1_000, 2);
-        assert!(matches!(v, SpeedupVerdict::ParallelConfirmed { .. }));
-    }
-
-    #[test]
-    fn speedup_verdict_threshold_boundary_just_below_warns() {
-        // 1.49× → SeriallySuspect (just below the inclusive threshold).
-        let v = speedup_verdict(1_490, 1_000, 2);
-        assert!(matches!(v, SpeedupVerdict::SeriallySuspect { .. }));
     }
 
     #[test]

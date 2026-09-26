@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.28",
+  "schema_version": "1.29",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -50,7 +50,15 @@
     "liveness_retention_hours": 168
   },
   "fleet": {
-    "mode": "standalone"
+    "mode": "standalone",
+    "identity": {
+      "provider": "tailscale"
+    },
+    "listener": {
+      "enabled": false,
+      "port": 8766
+    },
+    "accept_work": {}
   },
   "remote": {
     "max_tokens_per_execution": 500000,

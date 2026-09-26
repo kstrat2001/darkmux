@@ -599,6 +599,28 @@ fn short_ipv4_reaches_only_reader(host: &str) -> bool {
     (nums.len() >= 2 && nums[0] == 127) || nums.iter().all(|n| *n == 0)
 }
 
+/// (#2916) The HOST a roster address names, without scheme, port, brackets,
+/// path or trailing dot. This is what a roster address MEANS to fleet work
+/// submission: the machine's name on the network (#2924: its tailnet DNS
+/// name). The viewer daemon's port (or the `https://` a `tailscale serve`
+/// front puts on it) is not part of it; the work-submission listener is that
+/// host on `fleet.listener.port`. `None` for an empty address.
+pub fn address_host(address: &str) -> Option<String> {
+    let trimmed = address.trim();
+    let rest = trimmed.split_once("://").map(|(_, r)| r).unwrap_or(trimmed);
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(inner) = rest.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else if rest.parse::<std::net::IpAddr>().is_ok() {
+        // A bare v6 literal contains colons that are not a port separator.
+        rest
+    } else {
+        rest.rsplit_once(':').map(|(h, _)| h).unwrap_or(rest)
+    };
+    let host = host.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 /// Parse an `address` string into a `SocketAddr`. Accepts:
 /// - bare IPs: `100.64.0.2` (port defaults to `DEFAULT_DAEMON_PORT`)
 /// - host:port: `100.64.0.2:8765` or `studio.tailnet:9999`

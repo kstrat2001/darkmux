@@ -4050,10 +4050,8 @@ fn acp_sigterm_reaps_children_and_exits_130() {
     );
 }
 
-/// True if `redis-server` is on PATH — `darkmux serve`'s fleet runner
-/// thread (the thing that actually gets a dispatch child registered for
-/// `serve_sigterm_reaps_the_fleet_runners_curl_child` below to reap) only
-/// activates with a real Redis to point it at. Mirrors
+/// True if `redis-server` is on PATH, for
+/// `serve_no_longer_takes_work_off_the_redis_queue` below. Mirrors
 /// `tests/e2e/harness.rs`'s own `redis_available` gate (that file's own
 /// doc explains why a missing dependency must not silently read as
 /// "passed" — this test opts into the SAME discipline, but stays inside
@@ -4142,75 +4140,94 @@ fn wait_for_serve_health(port: u16, timeout: std::time::Duration) {
 /// shutdown();` inside `run()`) leaves every existing `darkmux-serve`
 /// unit test green.
 ///
-/// This spawns a real `darkmux serve` daemon pointed at a throwaway
-/// Redis + a `DARKMUX_PROFILES` registry naming a HANGING endpoint (the
-/// same `HangingStubServer` + `hanging_endpoint_profiles_json` fixture
-/// the SIGTERM-mid-dispatch tests above use — no model dispatch
-/// required), publishes one `WorkJob` for a tool-less role onto the
-/// fleet queue so the daemon's OWN fleet-runner thread claims it and
-/// blocks on a real `curl` to the hanging stub — a REAL in-flight
-/// dispatch child registered in `child_registry`, exactly the shape
-/// `reap_dispatch_children_on_shutdown`'s own doc describes — then sends
-/// a real SIGTERM and asserts: the daemon exits within a bound, and the
-/// `curl` child is torn down rather than orphaned past the parent's
-/// exit.
+/// This spawns a real `darkmux serve` daemon with a `DARKMUX_PROFILES`
+/// registry naming a HANGING endpoint (the same `HangingStubServer` +
+/// `hanging_endpoint_profiles_json` fixture the SIGTERM-mid-dispatch tests
+/// above use — no model dispatch required), SUBMITS one job for a tool-less
+/// role to the daemon's fleet listener (#2916: the Redis work queue this
+/// test used to publish onto is retired) so the daemon runs it and blocks
+/// on a real `curl` to the hanging stub — a REAL in-flight dispatch child
+/// registered in `child_registry` — then sends a real SIGTERM and asserts:
+/// the daemon exits within a bound, and the `curl` child is torn down
+/// rather than orphaned past the parent's exit.
+///
+/// The submission goes through the production gate end to end: the fleet
+/// token, then the identity provider's real command-line adapter (a fake
+/// `tailscale` script first on `PATH`, answering `status`/`whois` for this
+/// machine's own non-loopback address, which is what the listener binds),
+/// then the allow-list read from `config.json`.
 ///
 /// **Scope, stated honestly.** The hosted/curl path (a tool-less role,
 /// which this test uses) needs only `kill_all`'s SIGKILL to reap
-/// cleanly — `dispatch_internal.rs`'s hosted-call path has no extra
-/// post-wait cleanup step the way the DOCKER container path does (see
-/// `docker_kill_by_name`'s own call sites). So this test proves the
-/// production wiring is exercised and that a real curl child does not
-/// orphan past `darkmux serve`'s exit — it does NOT reach the
-/// container-specific race MUST FIX 3 also fixed (the `docker kill
-/// <container>` window), which needs Docker + the runtime image,
-/// unavailable in this test environment — the same documented
-/// limitation `mission_launch_generic_sigterm_mid_dispatch_finalizes_
-/// and_reaps_curl`'s own module comment names for crawl's container
-/// path, above.
+/// cleanly. So this test proves the production wiring is exercised and
+/// that a real curl child does not orphan past `darkmux serve`'s exit — it
+/// does NOT reach the container-specific `docker kill <container>` window,
+/// which needs Docker + the runtime image.
 ///
 /// RED-PROVED by hand: commenting out the `reap_dispatch_children_on_
 /// shutdown();` call inside `darkmux-serve/src/lib.rs`'s `run()` makes
-/// this test fail — the fleet-runner thread's `curl` child is never
-/// signaled, so it keeps running (holding the stub connection open)
-/// past the daemon's own exit, and `assert_no_surviving_remote_curl`
-/// catches the orphan.
+/// this test fail — the job's `curl` child is never signaled.
 #[test]
 fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
-    if !redis_available_for_serve_test() {
-        eprintln!("skipping: redis-server not on PATH");
+    // The listener binds only a specific, non-loopback address; use this
+    // machine's own outbound one (a UDP `connect` sends nothing).
+    let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip())
+        .ok()
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    let Some(lan_ip) = lan_ip else {
+        eprintln!("skipping: this machine has no non-loopback address to bind the fleet listener to");
         return;
-    }
+    };
 
     let stub = HangingStubServer::start();
     let (home, darkmux_home) = isolated_roots();
-    let redis_workdir = home.parent().unwrap().join("redis");
-    let (redis_child_raw, redis_url) = spawn_ephemeral_redis(&redis_workdir);
-    // (#2476 review round 2 — cleanup gap caught during development) RAII,
-    // not a plain `redis_child.kill()` at the bottom of this function: an
-    // assertion panicking anywhere ABOVE that point (any of `wait_for_
-    // serve_health`, the stub-connection wait, the post-SIGTERM exit wait,
-    // or the final close/no-orphan checks) unwinds past that bare call —
-    // Rust does not run ordinary statements during an unwind, only `Drop`
-    // impls — and leaks a real `redis-server` process. Measured live: a
-    // red-prove run against this exact test left one running for hours.
-    // `DirectChildGuard` fires on every exit path, panic included.
-    let _redis_child = DirectChildGuard(redis_child_raw);
 
     let profiles_path = darkmux_home.join("profiles.json");
     fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
     let flows_dir = darkmux_home.join("flows");
     fs::create_dir_all(&flows_dir).unwrap();
+    // The allow-list trusts the fake provider's node for the `hang` profile.
+    fs::write(
+        darkmux_home.join("config.json"),
+        r#"{"fleet":{"accept_work":{"self-test":{"node_id":"nSELFTEST","profiles":["hang"]}}}}"#,
+    )
+    .unwrap();
+    // A fake provider tool: `status` reports this machine at `lan_ip`,
+    // `whois <lan_ip>` names the trusted node.
+    let fake_bin = darkmux_home.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let tool = fake_bin.join("tailscale");
+    fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  status) echo '{{\"BackendState\":\"Running\",\"Self\":{{\"ID\":\"nSELFTEST\",\"DNSName\":\"studio.tailnet-example.ts.net.\",\"TailscaleIPs\":[\"{lan_ip}\"]}},\"Peer\":{{}}}}' ;;\n  whois) case \"$3\" in {lan_ip}*) echo '{{\"Node\":{{\"StableID\":\"nSELFTEST\",\"Name\":\"studio.tailnet-example.ts.net.\",\"Addresses\":[\"{lan_ip}/32\"]}}}}' ;; *) echo 'peer not found' >&2; exit 1 ;; esac ;;\n  *) exit 2 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap_or_default());
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral serve port");
-    let serve_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let free_port = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        l.local_addr().unwrap().port()
+    };
+    let serve_port = free_port();
+    let fleet_port = free_port();
 
     let serve_child_raw = darkmux_std_cmd()
         .env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
+        .env("PATH", &path)
         .env("DARKMUX_MACHINE_ID", "cli-test-serve-node")
-        .env("DARKMUX_REDIS_URL", &redis_url)
+        .env("DARKMUX_SERVE_TOKEN", "cli-test-fleet-token")
+        .env("DARKMUX_FLEET_LISTENER_ENABLED", "true")
+        .env("DARKMUX_FLEET_LISTENER_PORT", fleet_port.to_string())
         .env("DARKMUX_PROFILES", &profiles_path)
         .env("DARKMUX_FLOWS_DIR", &flows_dir)
         .args(["serve", "--bind", "127.0.0.1", "--port", &serve_port.to_string()])
@@ -4218,47 +4235,47 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawning darkmux serve");
-    // Same reasoning as `redis_child` above — a panicked assertion before
-    // this test's own explicit SIGTERM+wait would otherwise leak a live
-    // `darkmux serve` daemon too.
+    // A panicked assertion before this test's own explicit SIGTERM+wait
+    // would otherwise leak a live `darkmux serve` daemon.
     let mut serve_child = DirectChildGuard(serve_child_raw);
     let serve_pid = serve_child.id();
 
     wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
+    let fleet_addr = std::net::SocketAddr::new(lan_ip, fleet_port);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::net::TcpStream::connect_timeout(&fleet_addr, std::time::Duration::from_millis(200)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "the fleet listener never came up on {fleet_addr}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
-    // Publish directly onto the same Redis the daemon's fleet-runner
-    // thread is polling — the runner claims it, converts it via
-    // `into_dispatch_opts`, and calls the SAME synchronous
-    // `crew::dispatch::dispatch` the CLI's own `dispatch` verb uses; a
-    // tool-less role routes that to the light single-shot HOSTED path (a
-    // plain host `curl`), which is what actually reaches the stub.
-    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis::Client::open for publish");
-    let job = darkmux_fleet::WorkJob {
-        target_machine: None,
-        role_id: "dialectic-judge".to_string(),
-        message: "hang please".to_string(),
-        session_id: "cli-test-serve-sigterm-session".to_string(),
-        workdir: None,
-        phase_id: None,
-        image: None,
-        timeout_seconds: 60,
-        published_at_unix_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
-        published_by_machine: None,
-        published_by_orchestrator: None,
-        attempt: 1,
-    };
-    darkmux_fleet::publish_job(&redis_client, &job).expect("publishing the WorkJob onto the fleet queue");
+    let job = darkmux_fleet::build_work_job(
+        "cli-test-serve-node".to_string(),
+        "dialectic-judge".to_string(),
+        "hang please".to_string(),
+        "cli-test-serve-sigterm-session".to_string(),
+        None,
+        None,
+        None,
+        None,
+        60,
+        None,
+    );
+    let url = format!("http://{fleet_addr}{}", darkmux_fleet::SUBMISSION_PATH);
+    let (code, reply) = darkmux_fleet::post_submission(
+        &url,
+        "cli-test-fleet-token",
+        &darkmux_fleet::WorkSubmission::new(job, false),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("submitting the job to the fleet listener");
+    assert_eq!(code, 202, "the listener must accept the job: {reply:?}");
+    assert_eq!(reply.profile.as_deref(), Some("hang"));
 
-    // A REAL observable readiness signal, not a fixed sleep: the runner
-    // thread has claimed the job and its dispatch's `curl` has actually
-    // reached the hanging stub.
+    // A REAL observable readiness signal, not a fixed sleep: the job's
+    // dispatch `curl` has actually reached the hanging stub.
     assert!(
         stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
-        "the fleet runner never reached a dispatch call to the stub server within 20s — either \
-         it never claimed the published job, or dispatch never got as far as the curl call"
+        "the submitted job never reached a dispatch call to the stub server within 20s"
     );
 
     let kill_status = std::process::Command::new("kill")
@@ -4282,13 +4299,78 @@ fn serve_sigterm_reaps_the_fleet_runners_curl_child() {
 
     assert!(
         stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(5)),
-        "no curl connection to the stub server was ever torn down — the fleet runner's dispatch \
+        "no curl connection to the stub server was ever torn down — the submitted job's dispatch \
          child survived the daemon's own exit (#2476 review round 2 regression)"
     );
     assert_no_surviving_remote_curl(serve_pid, "serve");
+}
 
-    // Both children are cleaned up by `DirectChildGuard`'s `Drop`, at the
-    // end of this function's scope — see that struct's own doc.
+/// (#2916) The Redis work queue is retired: a running daemon with Redis
+/// configured must neither create the old consumer group nor run a job
+/// XADDed onto `darkmux:work`. Before 4.0 any node that could write the
+/// hub's Redis could make it run work this way (the Studio survey,
+/// 2026-09-26: its daemon was an active consumer of that stream).
+#[test]
+fn serve_no_longer_takes_work_off_the_redis_queue() {
+    if !redis_available_for_serve_test() {
+        if std::env::var("DARKMUX_E2E_REQUIRED").is_ok() {
+            panic!("redis-server is not on PATH but DARKMUX_E2E_REQUIRED is set");
+        }
+        eprintln!("skipping: redis-server not on PATH");
+        return;
+    }
+    let stub = HangingStubServer::start();
+    let (home, darkmux_home) = isolated_roots();
+    let (redis_child_raw, redis_url) = spawn_ephemeral_redis(&home.parent().unwrap().join("redis"));
+    let _redis_child = DirectChildGuard(redis_child_raw);
+    let profiles_path = darkmux_home.join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+    let flows_dir = darkmux_home.join("flows");
+    fs::create_dir_all(&flows_dir).unwrap();
+    let serve_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let serve = darkmux_std_cmd()
+        .env("HOME", &home)
+        .env("DARKMUX_HOME", &darkmux_home)
+        .env("DARKMUX_MACHINE_ID", "cli-test-queue-node")
+        .env("DARKMUX_REDIS_URL", &redis_url)
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_FLOWS_DIR", &flows_dir)
+        .args(["serve", "--bind", "127.0.0.1", "--port", &serve_port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux serve");
+    let _serve = DirectChildGuard(serve);
+    wait_for_serve_health(serve_port, std::time::Duration::from_secs(15));
+
+    // A job in the last queue shape (v4), exactly what a pre-4.0 peer, or
+    // anything else on the network, would XADD.
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut conn = client.get_connection().unwrap();
+    let record = r#"{"role_id":"dialectic-judge","message":"hang please","session_id":"s-queue","timeout_seconds":60,"published_at_unix_ms":1,"attempt":1}"#;
+    let _: String = redis::cmd("XADD")
+        .arg("darkmux:work")
+        .arg("*")
+        .arg("schema")
+        .arg("4")
+        .arg("record")
+        .arg(record)
+        .query(&mut conn)
+        .unwrap();
+    // The old runner blocked in 2 s rounds; give a live consumer every
+    // chance to claim and dispatch it.
+    assert!(
+        !stub.wait_for_a_connection(std::time::Duration::from_secs(6)),
+        "a job XADDed onto darkmux:work reached a dispatch: the daemon still consumes the queue"
+    );
+    let groups: redis::Value = redis::cmd("XINFO").arg("GROUPS").arg("darkmux:work").query(&mut conn).unwrap();
+    assert!(
+        !format!("{groups:?}").contains("darkmux-runners"),
+        "the daemon created the retired consumer group: {groups:?}"
+    );
 }
 
 /// Best-effort cleanup for a `Child` this test spawned and holds

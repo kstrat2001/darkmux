@@ -1,16 +1,20 @@
-//! darkmux-fleet — fleet topology, the Redis work queue, the runner loop,
-//! and dispatch routing. Split by concern into the `roster`, `queue`,
-//! `runner`, and `routing` submodules (#508); this file is the crate facade.
+//! darkmux-fleet — fleet topology (the roster), secure work submission
+//! between machines (#2916), running a received job, and dispatch routing.
+//! Split by concern into submodules (#508); this file is the crate facade.
 
-mod queue;
+mod identity;
+mod job;
 mod roster;
 mod routing;
 mod runner;
+mod submission;
 
-pub use queue::*;
+pub use identity::*;
+pub use job::*;
 pub use roster::*;
 pub use routing::*;
 pub use runner::*;
+pub use submission::*;
 
 #[cfg(test)]
 mod tests {
@@ -18,101 +22,7 @@ mod tests {
     use serial_test::serial;
     use std::path::PathBuf;
 
-    // Module-private helpers under test, reached explicitly across the
-    // post-#508 submodule split (they are pub(crate), not part of the
-    // crate's public re-export surface).
-    use crate::queue::{extract_field, parse_xreadgroup_response, WORK_JOB_SCHEMA_VERSION};
     use crate::roster::parse_address;
-    use crate::routing::{
-        completion_to_dispatch_result, match_completion, scan_flow_entries_for_completion,
-    };
-
-    // ─── completion_to_dispatch_result (Wave-E.6 #255) ────────────────
-
-    fn completion(
-        result_class: &str,
-        payload: Option<serde_json::Value>,
-    ) -> CompletionResult {
-        CompletionResult {
-            session_id: "test-sess".to_string(),
-            result_class: result_class.to_string(),
-            wall_ms: Some(1234),
-            payload,
-        }
-    }
-
-    #[test]
-    fn completion_extracts_explicit_exit_code_from_payload() {
-        // Runner emitted exit_code=42 (e.g. a build script's exit
-        // code). Translation must surface it verbatim, NOT squash
-        // to 1 via result_class.
-        let c = completion(
-            "error",
-            Some(serde_json::json!({"result_class": "error", "exit_code": 42})),
-        );
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(
-            r.exit_code, 42,
-            "operator-facing exit code must match runner's"
-        );
-        assert!(
-            r.stdout.contains("exit_code=42"),
-            "stdout includes exit code"
-        );
-    }
-
-    #[test]
-    fn completion_extracts_zero_exit_code_even_on_ok() {
-        let c = completion(
-            "ok",
-            Some(serde_json::json!({"result_class": "ok", "exit_code": 0})),
-        );
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 0);
-    }
-
-    #[test]
-    fn completion_falls_back_to_zero_on_ok_without_exit_code() {
-        // Payload present but no exit_code field; result_class=ok →
-        // fallback 0.
-        let c = completion("ok", Some(serde_json::json!({"result_class": "ok"})));
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 0);
-    }
-
-    #[test]
-    fn completion_falls_back_to_one_on_error_without_exit_code() {
-        let c = completion("error", Some(serde_json::json!({"result_class": "error"})));
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 1);
-    }
-
-    #[test]
-    fn completion_falls_back_when_payload_absent() {
-        let c = completion("error", None);
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, 1);
-    }
-
-    #[test]
-    fn completion_passes_session_id_through() {
-        let mut c = completion("ok", None);
-        c.session_id = "mission-foo-phase-bar-12345-0".to_string();
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.session_id, "mission-foo-phase-bar-12345-0");
-        assert!(r.stdout.contains("mission-foo-phase-bar-12345-0"));
-    }
-
-    #[test]
-    fn completion_handles_negative_exit_code() {
-        // SIGKILL-style exit codes can be negative (per std::process::ExitStatus).
-        let c = completion(
-            "error",
-            Some(serde_json::json!({"result_class": "error", "exit_code": -9})),
-        );
-        let r = completion_to_dispatch_result(c);
-        assert_eq!(r.exit_code, -9);
-    }
 
     use tempfile::TempDir;
 
@@ -385,434 +295,19 @@ mod tests {
         });
     }
 
-    // ─── Work queue (PR-C.1) ──────────────────────────────────────────
-
-    #[test]
-    fn work_stream_is_single_global_stream() {
-        // #590 — the per-tier stream prefix is gone; all fleet work
-        // routes onto one stream.
-        assert_eq!(crate::queue::WORK_STREAM, "darkmux:work");
-    }
-
-    #[test]
-    fn work_job_serde_round_trips() {
-        let job = build_work_job(
-            Some("laptop".to_string()),
-            "coder".to_string(),
-            "implement the feature".to_string(),
-            "session-2026-05-20-abc".to_string(),
-            Some("/tmp/workspace".to_string()),
-            None,
-            None, // image (#703 Slice 4)
-            600,
-            Some("studio".to_string()),
-            Some("claude-code".to_string()),
-        );
-        let json = serde_json::to_string(&job).unwrap();
-        let parsed: WorkJob = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, job);
-        assert_eq!(parsed.attempt, 1, "new jobs publish with attempt=1");
-        assert!(parsed.published_at_unix_ms > 0);
-        // (#1426 ship-3) The retired fields never appear on the v4 wire form.
-        assert!(!json.contains("deliver"), "deliver retired in v4: {json}");
-        assert!(!json.contains("runtime"), "runtime retired in v4: {json}");
-    }
-
-    #[test]
-    fn work_job_omits_none_fields_from_serialized() {
-        // None-valued optional fields must be omitted from the wire form
-        // so older runners (future-proof case) don't trip on
-        // unexpected null values.
-        let job = build_work_job(
-            None, // target_machine None
-            "crawler".to_string(),
-            "draft a note".to_string(),
-            "s-1".to_string(),
-            None, // workdir None
-            None, // phase_id None
-            None, // image (#703 Slice 4)
-            300,
-            None, // published_by_machine None
-            None, // published_by_orchestrator None
-        );
-        let json = serde_json::to_string(&job).unwrap();
-        assert!(
-            !json.contains("target_machine"),
-            "None target_machine must be omitted: {json}"
-        );
-        assert!(
-            !json.contains("workdir"),
-            "None workdir must be omitted: {json}"
-        );
-        assert!(
-            !json.contains("phase_id"),
-            "None phase_id must be omitted: {json}"
-        );
-        assert!(
-            !json.contains("published_by_machine"),
-            "None published_by_machine must be omitted: {json}"
-        );
-        assert!(
-            !json.contains("published_by_orchestrator"),
-            "None published_by_orchestrator must be omitted: {json}"
-        );
-    }
-
-    /// (#1426 ship-3) A v4 `WorkJob` round-trips through serde with the
-    /// retired fields gone. This is the current-shape happy path that the
-    /// old `work_job_default_runtime_is_internal` / `runtime_enum_serdes_*`
-    /// tests (removed with the `Runtime` enum) used to cover in fragments.
-    #[test]
-    fn work_job_v4_shape_round_trips_without_retired_fields() {
-        let json = r#"{
-            "role_id": "crawler",
-            "message": "hi",
-            "session_id": "s-1",
-            "timeout_seconds": 300,
-            "published_at_unix_ms": 0,
-            "attempt": 1
-        }"#;
-        let parsed: WorkJob = serde_json::from_str(json).unwrap();
-        let reser = serde_json::to_string(&parsed).unwrap();
-        // deny_unknown_fields tolerates the ABSENCE of the retired keys (they
-        // are simply gone), and the re-serialized form never re-introduces
-        // them.
-        assert!(!reser.contains("deliver"), "no deliver in v4: {reser}");
-        assert!(!reser.contains("runtime"), "no runtime in v4: {reser}");
-        assert_eq!(parsed.role_id, "crawler");
-    }
-
-    /// (#1426 ship-3) The retired `deliver` key on an old-peer record is a
-    /// deny_unknown_fields wire break at the pure-serde boundary, the
-    /// second line of defense behind the version-first claim gate (which is
-    /// exercised in `parse_xreadgroup_response_*` below). A v4 runner will
-    /// not silently accept a pre-4 job that still carries it.
-    #[test]
-    fn work_job_retired_deliver_key_rejected_at_deserialize() {
-        let json = r#"{
-            "role_id": "crawler",
-            "message": "hi",
-            "session_id": "s-1",
-            "deliver": "discord:123",
-            "timeout_seconds": 300,
-            "published_at_unix_ms": 0,
-            "attempt": 1
-        }"#;
-        let err = serde_json::from_str::<WorkJob>(json)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("deliver") || err.contains("unknown field"),
-            "expected deny_unknown_fields to name `deliver`; got: {err}"
-        );
-    }
-
-    /// (#1426 ship-3) Same for the retired `runtime` key, the single-variant
-    /// enum removed in this bump. A pre-4 peer's `"runtime": "internal"`
-    /// (or the even-older `"openclaw"`) is now an unknown field.
-    #[test]
-    fn work_job_retired_runtime_key_rejected_at_deserialize() {
-        let json = r#"{
-            "role_id": "crawler",
-            "message": "hi",
-            "session_id": "s-1",
-            "runtime": "internal",
-            "timeout_seconds": 300,
-            "published_at_unix_ms": 0,
-            "attempt": 1
-        }"#;
-        let err = serde_json::from_str::<WorkJob>(json)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("runtime") || err.contains("unknown field"),
-            "expected deny_unknown_fields to name `runtime`; got: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_xreadgroup_handles_nil() {
-        // Timeout / no work case — Redis returns Nil.
-        let result = parse_xreadgroup_response(&redis::Value::Nil).unwrap();
-        assert!(matches!(result, ClaimOutcome::Empty));
-    }
-
-    #[test]
-    fn parse_xreadgroup_handles_empty_bulk() {
-        // Some redis-rs versions return Bulk(vec![]) for empty.
-        let result = parse_xreadgroup_response(&redis::Value::Array(vec![])).unwrap();
-        assert!(matches!(result, ClaimOutcome::Empty));
-    }
-
-    #[test]
-    fn parse_xreadgroup_extracts_entry() {
-        // Build the nested-array shape XREADGROUP returns:
-        // [[stream_name, [[id, [k, v, k, v]]]]]
-        use redis::Value as V;
-        let job = build_work_job(
-            None,
-            "coder".to_string(),
-            "do the thing".to_string(),
-            "s-test".to_string(),
-            None,
-            None,
-            None, // image (#703 Slice 4)
-            600,
-            None,
-            None,
-        );
-        let job_json = serde_json::to_string(&job).unwrap();
-        let entry_id = "1716192000000-0";
-        // (#1426 ship-3) The `schema` tag must match the runner's version or
-        // the version-first gate rejects the entry, a same-version happy path.
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(entry_id.as_bytes().to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"schema".to_vec()),
-                    V::BulkString(WORK_JOB_SCHEMA_VERSION.as_bytes().to_vec()),
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(job_json.as_bytes().to_vec()),
-                ]),
-            ])]),
-        ])]);
-
-        let ClaimOutcome::Job(claimed) = parse_xreadgroup_response(&response).unwrap() else {
-            panic!("expected ClaimOutcome::Job");
-        };
-        assert_eq!(claimed.work_id, entry_id);
-        assert_eq!(claimed.job, job);
-    }
-
-    #[test]
-    fn parse_xreadgroup_malformed_on_missing_record_field() {
-        use redis::Value as V;
-        // Entry has fields but no `record` key — claimed but unparseable.
-        // Uses a CURRENT `schema` tag so the version-first gate (#1426 ship-3)
-        // passes and we exercise the missing-record branch, not the version arm.
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(b"1716192000000-0".to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"schema".to_vec()),
-                    V::BulkString(WORK_JOB_SCHEMA_VERSION.as_bytes().to_vec()),
-                    // record field absent
-                ]),
-            ])]),
-        ])]);
-        // (#903) Malformed, NOT Err — the work_id is surfaced so the runner
-        // can XACK it out of the PEL instead of leaving it pending forever.
-        let ClaimOutcome::Malformed { work_id, reason } =
-            parse_xreadgroup_response(&response).unwrap()
-        else {
-            panic!("expected ClaimOutcome::Malformed");
-        };
-        assert_eq!(work_id, "1716192000000-0");
-        assert!(reason.contains("missing `record`"));
-    }
-
-    #[test]
-    fn parse_xreadgroup_malformed_on_invalid_record_json() {
-        use redis::Value as V;
-        // (#903) The `record` field is present but isn't valid WorkJob JSON —
-        // the other poison trigger. Must be Malformed (work_id surfaced for
-        // XACK), not Err.
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(b"1716192000000-7".to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(b"{ not valid json".to_vec()),
-                ]),
-            ])]),
-        ])]);
-        let ClaimOutcome::Malformed { work_id, reason } =
-            parse_xreadgroup_response(&response).unwrap()
-        else {
-            panic!("expected ClaimOutcome::Malformed");
-        };
-        assert_eq!(work_id, "1716192000000-7");
-        assert!(reason.contains("invalid WorkJob JSON"));
-    }
-
-    /// (#1426 ship-3) Version-first mismatch, one direction: a NEW runner
-    /// (v4) claims an OLD peer's job (`schema` tag v3, and the record still
-    /// carries the retired `deliver` / `runtime` keys). The version gate
-    /// reads the `schema` tag FIRST and routes to Malformed with a reason
-    /// that NAMES the version cause, so the operator sees the real problem
-    /// (a fleet on mixed schema versions) instead of a generic
-    /// deny_unknown_fields "unknown field `deliver`" parse error. The runner
-    /// XACKs it out of the PEL; it is never retried.
-    #[test]
-    fn parse_xreadgroup_version_mismatch_old_peer_job_names_the_version() {
-        use redis::Value as V;
-        // A pre-4 peer's record: retired keys present, tagged schema v3.
-        let record = br#"{
-            "role_id": "coder",
-            "message": "hi",
-            "session_id": "s-1",
-            "deliver": "discord:123",
-            "runtime": "openclaw",
-            "timeout_seconds": 300,
-            "published_at_unix_ms": 0,
-            "attempt": 1
-        }"#;
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(b"1716192000000-8".to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"schema".to_vec()),
-                    V::BulkString(b"3".to_vec()),
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(record.to_vec()),
-                ]),
-            ])]),
-        ])]);
-        let ClaimOutcome::Malformed { work_id, reason } =
-            parse_xreadgroup_response(&response).unwrap()
-        else {
-            panic!("expected ClaimOutcome::Malformed for a version-mismatched job");
-        };
-        assert_eq!(work_id, "1716192000000-8");
-        // The reason NAMES the version cause (v3) and the fix, not a generic
-        // unknown-field parse error.
-        assert!(reason.contains("schema v3"), "reason must name the version: {reason}");
-        assert!(
-            reason.contains("restart all fleet daemons"),
-            "reason must name the operational fix: {reason}"
-        );
-        assert!(
-            !reason.contains("unknown field"),
-            "version cause must WIN over the deny_unknown_fields parse error: {reason}"
-        );
-    }
-
-    /// (#1426 ship-3) Version-first also fires for a NEWER-than-us tag (an
-    /// old runner is not the only mismatch shape). Same Malformed routing,
-    /// same version-naming reason, the gate is a `!=`, not a `<`.
-    #[test]
-    fn parse_xreadgroup_version_mismatch_newer_peer_tag_also_rejected() {
-        use redis::Value as V;
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(b"1716192000000-11".to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"schema".to_vec()),
-                    V::BulkString(b"99".to_vec()),
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(b"{}".to_vec()),
-                ]),
-            ])]),
-        ])]);
-        let ClaimOutcome::Malformed { work_id, reason } =
-            parse_xreadgroup_response(&response).unwrap()
-        else {
-            panic!("expected ClaimOutcome::Malformed for a newer-tag job");
-        };
-        assert_eq!(work_id, "1716192000000-11");
-        assert!(reason.contains("schema v99"), "reason must name the version: {reason}");
-    }
-
-    /// (#1426 ship-3) An ABSENT `schema` tag (a hypothetical pre-versioning
-    /// job, no such shape ever shipped, but be defensive) is NOT
-    /// version-rejected. It falls through to the record parse and is handled
-    /// honestly there, here the record is invalid JSON, so it lands in
-    /// Malformed via the invalid-JSON arm, not the version arm.
-    #[test]
-    fn parse_xreadgroup_absent_schema_tag_falls_through_to_record_parse() {
-        use redis::Value as V;
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(b"1716192000000-12".to_vec()),
-                V::Array(vec![
-                    // no schema field at all
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(b"{ not valid json".to_vec()),
-                ]),
-            ])]),
-        ])]);
-        let ClaimOutcome::Malformed { work_id, reason } =
-            parse_xreadgroup_response(&response).unwrap()
-        else {
-            panic!("expected ClaimOutcome::Malformed");
-        };
-        assert_eq!(work_id, "1716192000000-12");
-        assert!(reason.contains("invalid WorkJob JSON"), "{reason}");
-        assert!(
-            !reason.contains("schema v"),
-            "absent tag must NOT trigger the version arm: {reason}"
-        );
-    }
-
-    #[test]
-    fn parse_xreadgroup_malformed_on_non_array_fields() {
-        use redis::Value as V;
-        // (#903) A valid entry-id but a non-array fields slot — the work_id is
-        // already known, so it's Malformed (XACK-able poison), not Err.
-        let response = V::Array(vec![V::Array(vec![
-            V::BulkString(b"darkmux:work".to_vec()),
-            V::Array(vec![V::Array(vec![
-                V::BulkString(b"1716192000000-9".to_vec()),
-                V::BulkString(b"not-a-fields-array".to_vec()),
-            ])]),
-        ])]);
-        let ClaimOutcome::Malformed { work_id, reason } =
-            parse_xreadgroup_response(&response).unwrap()
-        else {
-            panic!("expected ClaimOutcome::Malformed");
-        };
-        assert_eq!(work_id, "1716192000000-9");
-        assert!(reason.contains("fields list is not an array"));
-    }
-
-    #[test]
-    fn extract_field_finds_value_by_key() {
-        use redis::Value as V;
-        let fields = vec![
-            V::BulkString(b"schema".to_vec()),
-            V::BulkString(b"1".to_vec()),
-            V::BulkString(b"record".to_vec()),
-            V::BulkString(b"{\"k\":\"v\"}".to_vec()),
-        ];
-        assert_eq!(extract_field(&fields, "schema").as_deref(), Some("1"));
-        assert_eq!(
-            extract_field(&fields, "record").as_deref(),
-            Some("{\"k\":\"v\"}")
-        );
-        assert_eq!(extract_field(&fields, "absent"), None);
-    }
-
-    #[test]
-    fn extract_field_handles_status_values() {
-        // Some redis-rs versions return Status (SimpleString) for short
-        // ASCII values.
-        use redis::Value as V;
-        let fields = vec![
-            V::SimpleString("schema".to_string()),
-            V::SimpleString("1".to_string()),
-        ];
-        assert_eq!(extract_field(&fields, "schema").as_deref(), Some("1"));
-    }
-
     // ─── WorkJob::validate() (PR-C.2 boundary defense) ────────────────
 
     fn good_job() -> WorkJob {
         build_work_job(
-            None,
+            "studio".to_string(),
             "coder".to_string(),
             "do a thing".to_string(),
             "s-1".to_string(),
             None,
             None,
-            None, // image (#703 Slice 4)
-            600,
             None,
+            None,
+            600,
             None,
         )
     }
@@ -877,17 +372,11 @@ mod tests {
     #[test]
     fn validate_rejects_target_machine_with_special_chars() {
         let mut j = good_job();
-        j.target_machine = Some("studio$rm-rf".to_string());
+        j.target_machine = "studio$rm-rf".to_string();
         let err = j.validate().unwrap_err().to_string();
         assert!(err.contains("target_machine") || err.contains("invalid char"));
     }
 
-    #[test]
-    fn validate_accepts_target_machine_none() {
-        let mut j = good_job();
-        j.target_machine = None;
-        assert!(j.validate().is_ok());
-    }
 
     #[test]
     fn validate_rejects_zero_timeout() {
@@ -912,144 +401,6 @@ mod tests {
         assert!(j.validate().is_ok());
     }
 
-    // ─── match_completion (PR-C.3 --wait wrapper) ─────────────────────
-
-    #[test]
-    fn match_completion_matches_canonical_action() {
-        // Canonical form today is "dispatch complete" (space) — every
-        // production emit site uses this. PR-C.3 review HIGH-2 caught
-        // the labels swapped in an earlier draft of this file.
-        let line = r#"{
-            "action": "dispatch complete",
-            "session_id": "sess-A",
-            "payload": {"result_class": "ok", "wall_ms": 12345}
-        }"#;
-        let result = match_completion(line, "sess-A").expect("matches");
-        assert_eq!(result.session_id, "sess-A");
-        assert_eq!(result.result_class, "ok");
-        assert_eq!(result.wall_ms, Some(12345));
-    }
-
-    #[test]
-    fn match_completion_matches_dotted_action_forward_compat() {
-        // Forward-compat for a future emitter migration to the dotted
-        // convention used by `dispatch.turn` / `dispatch.tool` / etc.
-        // No production emit-site uses this today.
-        let line = r#"{
-            "action": "dispatch.complete",
-            "session_id": "sess-B",
-            "payload": {"result_class": "error"}
-        }"#;
-        let result = match_completion(line, "sess-B").expect("matches");
-        assert_eq!(result.result_class, "error");
-        assert_eq!(result.wall_ms, None);
-    }
-
-    #[test]
-    fn match_completion_rejects_unrelated_session() {
-        let line = r#"{
-            "action": "dispatch complete",
-            "session_id": "sess-A",
-            "payload": {"result_class": "ok"}
-        }"#;
-        assert!(match_completion(line, "sess-B").is_none());
-    }
-
-    #[test]
-    fn match_completion_rejects_dispatch_start() {
-        let line = r#"{
-            "action": "dispatch.start",
-            "session_id": "sess-A"
-        }"#;
-        assert!(match_completion(line, "sess-A").is_none());
-    }
-
-    #[test]
-    fn match_completion_handles_missing_payload() {
-        let line = r#"{
-            "action": "dispatch complete",
-            "session_id": "sess-A"
-        }"#;
-        let result = match_completion(line, "sess-A").expect("matches");
-        assert_eq!(result.result_class, "unknown");
-        assert_eq!(result.wall_ms, None);
-    }
-
-    #[test]
-    fn match_completion_ignores_malformed_line() {
-        assert!(match_completion("not json", "sess-A").is_none());
-        assert!(match_completion("{}", "sess-A").is_none());
-        assert!(match_completion(r#"{"action": "dispatch complete"}"#, "sess-A").is_none());
-    }
-
-    // ─── scan_flow_entries_for_completion (PR-C.3 Redis-poll path) ────
-
-    #[test]
-    fn scan_flow_entries_handles_empty_stream() {
-        // Empty XRANGE response = no entries yet, return None (not an error).
-        let resp = redis::Value::Array(vec![]);
-        let result = scan_flow_entries_for_completion(&resp, "sess-X").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn scan_flow_entries_handles_nil() {
-        // Nil response (some redis-rs versions) — same as empty.
-        let result = scan_flow_entries_for_completion(&redis::Value::Nil, "sess-X").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn scan_flow_entries_finds_completion_for_session() {
-        use redis::Value as V;
-        let record = r#"{
-            "action": "dispatch complete",
-            "session_id": "sess-target",
-            "payload": {"result_class": "ok", "wall_ms": 5000}
-        }"#;
-        // Mock XRANGE response: Array([Array([id, Array([k,v,k,v])])])
-        let resp = V::Array(vec![V::Array(vec![
-            V::BulkString(b"1716192000000-0".to_vec()),
-            V::Array(vec![
-                V::BulkString(b"schema".to_vec()),
-                V::BulkString(b"1.8.0".to_vec()),
-                V::BulkString(b"record".to_vec()),
-                V::BulkString(record.as_bytes().to_vec()),
-            ]),
-        ])]);
-        let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();
-        let c = result.expect("matches");
-        assert_eq!(c.session_id, "sess-target");
-        assert_eq!(c.result_class, "ok");
-        assert_eq!(c.wall_ms, Some(5000));
-    }
-
-    #[test]
-    fn scan_flow_entries_skips_non_matching_sessions() {
-        use redis::Value as V;
-        let record_a = r#"{"action":"dispatch complete","session_id":"sess-A","payload":{"result_class":"ok"}}"#;
-        let record_b = r#"{"action":"dispatch start","session_id":"sess-target"}"#;
-        let resp = V::Array(vec![
-            V::Array(vec![
-                V::BulkString(b"1-0".to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(record_a.as_bytes().to_vec()),
-                ]),
-            ]),
-            V::Array(vec![
-                V::BulkString(b"2-0".to_vec()),
-                V::Array(vec![
-                    V::BulkString(b"record".to_vec()),
-                    V::BulkString(record_b.as_bytes().to_vec()),
-                ]),
-            ]),
-        ]);
-        let result = scan_flow_entries_for_completion(&resp, "sess-target").unwrap();
-        // No `dispatch complete` for sess-target → None
-        assert!(result.is_none());
-    }
-
     // ─── #[serde(deny_unknown_fields)] (PR-C.2) ───────────────────────
 
     #[test]
@@ -1062,7 +413,7 @@ mod tests {
             "session_id": "s-1",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
-            "attempt": 1,
+            "target_machine": "studio",
             "future_priority_field": 999
         }"#;
         let result: Result<WorkJob, _> = serde_json::from_str(json);
@@ -1087,14 +438,14 @@ mod tests {
             "session_id": "s-1",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
-            "attempt": 1
+            "target_machine": "studio"
         }"#;
         let parsed: WorkJob = serde_json::from_str(json).expect("valid job parses");
         assert_eq!(parsed.role_id, "coder");
-        assert!(
-            parsed.target_machine.is_none(),
-            "advisory target_machine defaults to None when omitted"
-        );
+        assert_eq!(parsed.target_machine, "studio");
+        // (#2916) The job is addressed: `target_machine` is required.
+        let unaddressed = json.replace(r#","target_machine": "studio""#, "").replace(",\n            \"target_machine\": \"studio\"", "");
+        assert!(serde_json::from_str::<WorkJob>(&unaddressed).is_err(), "{unaddressed}");
     }
 
     #[test]
@@ -1110,7 +461,7 @@ mod tests {
             "session_id": "s-1",
             "timeout_seconds": 300,
             "published_at_unix_ms": 0,
-            "attempt": 1
+            "target_machine": "studio"
         }"#;
         let result: Result<WorkJob, _> = serde_json::from_str(json);
         assert!(

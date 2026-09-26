@@ -162,7 +162,7 @@ pub(crate) enum Cmd {
         /// blocking HTTP call.
         ///
         /// Local dispatch only: ignored on a cross-machine --machine
-        /// dispatch, which does not carry the value across the queue.
+        /// dispatch, which does not carry the value to the other machine.
         ///
         /// Omit to use each path's own default (600 either way; from
         /// env/config for the container path).
@@ -230,25 +230,24 @@ pub(crate) enum Cmd {
         /// Schema: `{ result, final_assistant, metrics, trajectory_path }`.
         #[arg(long)]
         json: bool,
-        /// Advisory target machine for the dispatch (#246 PR-C.3). When
-        /// set to an id that's NOT the local `DARKMUX_MACHINE_ID`, the
-        /// dispatch is published to the single global fleet work queue
-        /// (`darkmux:work`) and the first available runner picks it up.
-        /// The id is an advisory hint (#590): any runner may claim it;
-        /// a non-target runner logs a soft warning and proceeds. When
-        /// omitted, the dispatch runs locally. Requires
-        /// `DARKMUX_REDIS_URL` set on the dispatching machine +
-        /// `darkmux serve` running on the runner.
+        /// Run the dispatch on another fleet machine (#2916). The id is
+        /// that machine's `machine_id`, looked up in this machine's roster
+        /// (`darkmux machine add`); the dispatch is submitted straight to
+        /// its fleet listener (the roster host on `fleet.listener.port`)
+        /// with the fleet token (the serve token). The other machine runs
+        /// it only if its allow-list trusts this machine
+        /// (`darkmux machine trust <this-machine> --profiles ...` there) and
+        /// the resolved profile is in that scope; otherwise it answers at
+        /// once with the reason. `--profile` names a profile on THAT
+        /// machine; omitted, it resolves the role's binding there. The id
+        /// matching this machine runs locally.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
-        /// Return immediately after publishing to the queue instead of
-        /// blocking on the runner's `dispatch.complete` (#246 PR-C.3).
-        /// Default is `--wait` (block) so today's "spawn, see result"
-        /// ergonomics are preserved. With `--no-wait`, the CLI prints
-        /// the `session_id` and exits 0; the operator polls completion
-        /// via `darkmux flow tail --session <id>` (or `darkmux mission
-        /// dispatch` for fan-out — PR-D). Ignored for local
-        /// dispatches (those are always synchronous).
+        /// With --machine: return as soon as the other machine accepts the
+        /// job instead of waiting for its result. The CLI prints the
+        /// `session_id`; follow it with `darkmux flow tail --session <id>`
+        /// or in the viewer. Ignored for local dispatches (always
+        /// synchronous).
         #[arg(long)]
         no_wait: bool,
         /// (#703) Dispatch into a specific Docker image. Default: the
@@ -893,20 +892,16 @@ pub(crate) enum MissionCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Fan-out dispatch all initial-depends phases (depends_on=[]) of a
-    /// mission across the fleet in parallel (#247, PR-D.1). One role
-    /// applies to every dispatched phase — operator-explicit per the
-    /// CLAUDE.md doctrine that mission planning is judgment-bearing
+    /// Dispatch a mission's next runnable phase on a fleet machine (#247,
+    /// PR-D.1). One role applies to every dispatched phase — operator-explicit
+    /// per the CLAUDE.md doctrine that mission planning is judgment-bearing
     /// work the operator owns.
     ///
-    /// Each phase becomes a WorkJob published to the single global
-    /// `darkmux:work` stream (#590); the first available runner claims
-    /// and runs each one. Default `--wait` blocks until all phases emit
-    /// `dispatch.complete` (or timeout). `--no-wait` returns immediately
-    /// with the session_ids for later polling.
-    ///
-    /// This is the keystone for Article 4's "operator hands off a
-    /// mission and the fleet runs it" narrative.
+    /// (#2916) The next runnable phase is submitted to the machine named by
+    /// `--machine` (required: the queue any machine could claim from is
+    /// retired), which checks the fleet token and its allow-list before
+    /// running it. Default `--wait` blocks until the phase finishes;
+    /// `--no-wait` returns once the machine accepts it.
     Dispatch {
         /// Mission id to dispatch.
         mission_id: String,
@@ -914,17 +909,15 @@ pub(crate) enum MissionCmd {
         /// `code-reviewer`). One role applies to every dispatched phase.
         #[arg(long)]
         role: String,
-        /// Optional advisory target machine for every phase. When
-        /// omitted, jobs publish with no `target_machine` hint — the
-        /// first available runner claims each (pull semantics). The hint
-        /// is advisory (#590): any runner may claim regardless.
+        /// The machine to run the phase on (its `machine_id`, in this
+        /// machine's roster). Required.
         #[arg(long, value_name = "ID")]
         machine: Option<String>,
         /// Per-phase dispatch timeout (seconds). Default 600.
         #[arg(long, default_value = "600")]
         timeout: u32,
-        /// Return immediately after publishing all phase jobs instead
-        /// of blocking on each `dispatch.complete`. Default is `--wait`.
+        /// Return as soon as the machine accepts each phase instead of
+        /// waiting for its result. Default is `--wait`.
         #[arg(long)]
         no_wait: bool,
     },
@@ -1219,6 +1212,42 @@ pub(crate) enum MachineCmd {
     Remove {
         /// Logical machine id to remove.
         id: String,
+    },
+    /// Let another machine submit work to THIS machine (#2916). Adds (or
+    /// updates) `fleet.accept_work.<name>` in this machine's own
+    /// config.json and nothing else. The peer's node is looked up through
+    /// the identity provider (`fleet.identity.provider`) by the name the
+    /// network reports, and its stable node id is stored; you never type
+    /// it. The lookup name is `--node` if given, else the host of `<name>`'s
+    /// roster address, else `<name>`. Work from that node is then accepted
+    /// only with the fleet token, and only for the profiles listed here
+    /// (never one that resolves to the machine's utility model). The
+    /// daemon reads the allow-list per request: no restart needed.
+    Trust {
+        /// The peer's machine name (its `machine_id`). Refusals and doctor
+        /// name the peer by it.
+        name: String,
+        /// The peer's name on the overlay network, when it differs from
+        /// `<name>` and from its roster address (e.g. `macbook-pro`).
+        #[arg(long, value_name = "NODE")]
+        node: Option<String>,
+        /// Work-class profiles on THIS machine the peer may run
+        /// (comma-separated). Required when first trusting a machine;
+        /// given again, it replaces the list.
+        #[arg(long, value_delimiter = ',', value_name = "PROFILE,...")]
+        profiles: Vec<String>,
+        /// Whether the peer may name a working directory here (#755,
+        /// the workspace handoff). Default false; given again, it
+        /// replaces the setting.
+        #[arg(long, value_name = "true|false")]
+        workspace: Option<bool>,
+    },
+    /// Stop accepting work from a machine (#2916): removes
+    /// `fleet.accept_work.<name>` from this machine's config.json. Takes
+    /// effect on the next request, no restart.
+    Untrust {
+        /// The machine name, as `machine trust` recorded it.
+        name: String,
     },
 }
 
