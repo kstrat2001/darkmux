@@ -2068,7 +2068,9 @@ pub(crate) fn injected_context_for_lab(
         // dispatch itself hard-fails with this same error; here (bench-brief
         // sizing, a String-returning helper) degrade loudly to the
         // no-window budget default instead.
-        crew::dispatch_internal::resolve_context_window_internal(profile, profiles_file)
+        // (#2905) No role in hand: the lab workload's manifest names the
+        // role later, inside `lab run`, so this stays role-blind.
+        crew::dispatch_internal::resolve_context_window_internal(None, profile, profiles_file)
             .unwrap_or_else(|e| {
                 eprintln!("{e:#}");
                 None

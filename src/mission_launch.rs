@@ -3325,7 +3325,11 @@ fn register_coder_phase_kinds(
         // dispatch itself would hard-fail with the same error, so fail
         // loud here, at registration — the same point in the sequence the
         // retired eager call used to fail at.
-        crew::dispatch_internal::resolve_context_window_internal(None, None)?,
+        // (#2905) Role-aware: the coder step dispatches `role` with no
+        // `--profile`, so its window comes from `role_profiles.<role>` when
+        // mapped. Sizing from `default_profile` here would budget the brief
+        // for a different model than the one that reads it.
+        crew::dispatch_internal::resolve_context_window_internal(Some(&role), None, None)?,
     );
     let coder_step_id = format!("{real_phase_id}-coder-step");
     let coder_step = steps.get_mut(&coder_step_id).ok_or_else(|| {
