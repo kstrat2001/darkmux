@@ -106,10 +106,9 @@ fn second_mission_dispatch_finds_nothing_to_fan_out() {
         return;
     }
 
-    // The harness's crew root has no roles by default. Post-#590, mission
-    // dispatch only checks the role EXISTS before fanning phases onto the
-    // single `darkmux:work` stream (no tier requirement), so we register one
-    // role to reach the publish + phase_start path (vs. bailing at
+    // The harness's crew root has no roles by default. Mission dispatch
+    // checks the role EXISTS before starting a phase, so we register one
+    // role to reach the phase_start + submit path (vs. bailing at
     // role-not-found).
     let harness = FleetHarness::boot(vec![NodeSpec::new("node-a")])
         .expect("FleetHarness::boot");
@@ -136,25 +135,24 @@ fn second_mission_dispatch_finds_nothing_to_fan_out() {
     // Write the mission + 2 phase fixtures.
     write_mission_fixture(&node.crew_root, "m-test", &["phase-alpha", "phase-beta"]);
 
-    // First mission dispatch: --no-wait so we exit after publish.
+    // First mission dispatch (#2916: work goes to a named machine; the
+    // Redis queue is retired). `node-b` is not reachable here, so the
+    // submission fails, but only AFTER phase_start flipped the phase to
+    // Running, which is the state gate this test is about.
     let out1 = node
         .cmd()
         .args([
             "mission", "dispatch", "m-test",
             "--role", "tdd-coder",
+            "--machine", "node-b",
             "--no-wait",
         ])
         .output()
         .expect("first mission dispatch");
-    let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let stderr1 = String::from_utf8_lossy(&out1.stderr);
     assert!(
-        out1.status.success(),
-        "first mission dispatch should succeed; stdout={stdout1}\nstderr={stderr1}"
-    );
-    assert!(
-        stderr1.contains("phases=2") || stderr1.contains("phase=phase-alpha"),
-        "expected 2 phases published; stderr={stderr1}"
+        stderr1.contains("phase=phase-alpha"),
+        "expected phase-alpha to have been started and submitted; stderr={stderr1}"
     );
 
     // Second mission dispatch — should find NOTHING to fan out
@@ -164,6 +162,7 @@ fn second_mission_dispatch_finds_nothing_to_fan_out() {
         .args([
             "mission", "dispatch", "m-test",
             "--role", "tdd-coder",
+            "--machine", "node-b",
             "--no-wait",
         ])
         .output()

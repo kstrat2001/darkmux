@@ -645,9 +645,9 @@ impl FleetHarness {
     /// assertions depend on anything OTHER than the flow stream living on
     /// an isolated redis: presence beats (`darkmux:presence:<hw-uid>`,
     /// keyed on real hardware identity, not on anything this harness
-    /// controls) and the fleet work-queue (`darkmux:work`, a fixed name —
-    /// see `darkmux-fleet::queue::WORK_STREAM`) are NOT namespaced per
-    /// test, so two harnesses on the SAME redis would collide on them.
+    /// controls) are NOT namespaced per test, so two harnesses on the SAME
+    /// redis would collide on them. (The fleet work-queue `darkmux:work`
+    /// was a second such fixed name until #2916 retired it.)
     /// `boot_sharing_redis` is for the narrower case where neither is in
     /// play.
     pub fn boot(specs: Vec<NodeSpec>) -> Result<Self, String> {
@@ -667,9 +667,8 @@ impl FleetHarness {
     /// simplest thing that is guaranteed unique by the compiler (two
     /// `#[test] fn`s in one module cannot share a name).
     ///
-    /// **Only safe when the test's assertions never touch presence or the
-    /// fleet work-queue** — see `boot`'s doc for why those two are NOT
-    /// namespaced by stream. Every current call site of this constructor
+    /// **Only safe when the test's assertions never touch presence** — see
+    /// `boot`'s doc for why it is NOT namespaced by stream. Every current call site of this constructor
     /// is a validation-rejection or roster/`--deep` test that reaches
     /// neither (verified by reading, not assumed — see PR description).
     pub fn boot_sharing_redis(specs: Vec<NodeSpec>, stream: &str) -> Result<Self, String> {

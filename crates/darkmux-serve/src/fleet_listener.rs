@@ -74,7 +74,7 @@ impl FleetListenerState {
             receiver,
             provider,
             token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
-            allow_list: Arc::new(read_allow_list),
+            allow_list: Arc::new(darkmux_fleet::read_user_allow_list),
             resolve_profile: Arc::new(move |role, requested| {
                 darkmux_fleet::resolve_work_profile(role, requested, &resolve_receiver)
             }),
@@ -82,22 +82,6 @@ impl FleetListenerState {
             busy: Arc::new(Mutex::new(None)),
         }
     }
-}
-
-/// The allow-list as `config.json` holds it NOW (not the process-start
-/// snapshot every other setting uses), so trust changes apply at once. A
-/// file that exists but does not parse refuses everything: an unreadable
-/// allow-list is not an empty one by accident, it is fail closed on purpose.
-fn read_allow_list() -> Result<AllowList, String> {
-    let path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AllowList::new()),
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
-    };
-    let cfg: darkmux_types::config::DarkmuxConfig =
-        serde_json::from_str(&raw).map_err(|e| format!("{} does not parse: {e}", path.display()))?;
-    Ok(cfg.fleet.and_then(|f| f.accept_work).unwrap_or_default())
 }
 
 /// The listener's router: the one route, behind the gate.
@@ -153,6 +137,13 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
         );
     };
     let token = check_token(req.headers(), (state.token)());
+    // A caller without the token is answered before this machine reads its
+    // allow-list or runs the provider's tool (`admit` checks it again).
+    match token {
+        TokenCheck::Match => {}
+        TokenCheck::Mismatch => return refuse(&receiver, &Refusal::Token),
+        TokenCheck::NotConfigured => return refuse(&receiver, &Refusal::NoTokenConfigured),
+    }
     let allow = match (state.allow_list)() {
         Ok(a) => a,
         Err(e) => {

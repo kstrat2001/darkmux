@@ -273,6 +273,27 @@ pub fn admit(
     }
 }
 
+/// The allow-list as the config.json at `path` holds it NOW (not the
+/// process-start snapshot every other setting uses), so trust changes apply
+/// at once. A missing file is an empty list; a file that exists but does
+/// not parse is an error, and the listener refuses everything on it: an
+/// unreadable allow-list is fail closed, never "empty by accident".
+pub fn read_allow_list(path: &std::path::Path) -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    let cfg: darkmux_types::config::DarkmuxConfig =
+        serde_json::from_str(&raw).map_err(|e| format!("{} does not parse: {e}", path.display()))?;
+    Ok(cfg.fleet.and_then(|f| f.accept_work).unwrap_or_default())
+}
+
+/// [`read_allow_list`] at this machine's user-scope config.json.
+pub fn read_user_allow_list() -> std::result::Result<BTreeMap<String, AcceptWorkEntry>, String> {
+    read_allow_list(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
+}
+
 /// What the receiver's profile resolution made of a job's (role, profile).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileResolution {
@@ -640,6 +661,17 @@ mod tests {
         let reply = Refusal::Token.reply("studio");
         assert_eq!(reply.status, "refused");
         assert!(!serde_json::to_string(&reply).unwrap().contains("nLAPTOP"));
+    }
+
+    #[test]
+    fn an_unreadable_allow_list_is_an_error_not_an_empty_one() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("config.json");
+        assert!(read_allow_list(&p).unwrap().is_empty(), "no file: nothing trusted");
+        std::fs::write(&p, r#"{"fleet":{"accept_work":{"laptop":{"node_id":"n1","profiles":["host"]}}}}"#).unwrap();
+        assert_eq!(read_allow_list(&p).unwrap()["laptop"].node_id.as_deref(), Some("n1"));
+        std::fs::write(&p, "{ not json").unwrap();
+        assert!(read_allow_list(&p).is_err());
     }
 
     #[test]

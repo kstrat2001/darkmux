@@ -585,6 +585,9 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     // read the roster (darkmux-fleet), which the doctor crate does not depend
     // on — it evaluates, this layer gathers.
     report.checks.extend(fleet_cli::roster_doctor_checks());
+    // (#2916) Fleet work submission: token, identity provider, listener,
+    // allow-list, and the retired Redis queue if it is still there.
+    report.checks.extend(fleet_cli::fleet_submission_doctor_checks());
 
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any

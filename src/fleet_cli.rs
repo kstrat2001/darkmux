@@ -955,6 +955,118 @@ fn user_config_path() -> std::path::PathBuf {
     darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config
 }
 
+/// (#2916) The fleet work-submission rows `darkmux doctor` appends: fleet
+/// token, identity provider, listener, allow-list, and the retired Redis
+/// queue if it is still there. Gathers the facts; `darkmux-doctor`
+/// evaluates them. No row prints a node id or a token.
+pub(crate) fn fleet_submission_doctor_checks() -> Vec<crate::doctor::Check> {
+    use crate::doctor::{FleetSubmissionFacts, ProviderReport, TrustView};
+    let listener_enabled = darkmux_types::config_access::fleet_listener_enabled();
+    let port = darkmux_types::config_access::fleet_listener_port();
+    let value = darkmux_types::config_access::fleet_identity_provider();
+    let (provider_report, nodes, local_addr) = match fleet::configured_provider() {
+        Err(_) => (ProviderReport::Unknown { value: value.clone() }, None, None),
+        Ok(p) => match p.local_node() {
+            Err(e) => (ProviderReport::Down { value: value.clone(), detail: format!("{e:#}") }, None, None),
+            Ok(local) => {
+                let addr = local.addresses.iter().find(|a| a.is_ipv4()).or(local.addresses.first()).copied();
+                (
+                    ProviderReport::Up {
+                        value: value.clone(),
+                        local_name: local.name.clone(),
+                        local_addr: addr.map(|a| a.to_string()),
+                    },
+                    p.nodes().ok(),
+                    addr,
+                )
+            }
+        },
+    };
+    let listener_bound = if listener_enabled {
+        local_addr.map(|ip| {
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::new(ip, port),
+                std::time::Duration::from_millis(300),
+            )
+            .is_ok()
+        })
+    } else {
+        None
+    };
+    let registry = darkmux_profiles::profiles::load_registry(None).ok().map(|l| l.registry);
+    let trusted = fleet::read_user_allow_list().map(|allow| {
+        allow
+            .into_iter()
+            .map(|(name, e)| {
+                let node_id = e.node_id.clone().filter(|id| !id.is_empty());
+                let node = node_id
+                    .as_deref()
+                    .and_then(|id| nodes.as_ref().and_then(|ns| ns.iter().find(|n| n.node_id == id)));
+                let profiles = e.profiles.clone().unwrap_or_default();
+                let profile_problems = match &registry {
+                    Some(r) => profiles.iter().filter_map(|p| grantable_profile(r, p).err()).collect(),
+                    None => vec!["this machine's profile registry could not be read".to_string()],
+                };
+                TrustView {
+                    name,
+                    has_node_id: node_id.is_some(),
+                    network_name: node.map(|n| n.name.clone()),
+                    online: node.and_then(|n| n.online),
+                    // Only claim "gone" when the provider actually listed nodes.
+                    node_on_network: nodes.is_none() || node.is_some(),
+                    profiles,
+                    profile_problems,
+                    workspace: e.workspace.unwrap_or(false),
+                }
+            })
+            .collect()
+    });
+    let facts = FleetSubmissionFacts {
+        listener_enabled,
+        port,
+        token_present: darkmux_flow::serve_token_present(),
+        provider: provider_report,
+        listener_bound,
+        trusted,
+        retired_streams: retired_queue_streams(),
+    };
+    crate::doctor::fleet_submission_checks(&facts)
+}
+
+/// The retired work-queue streams (`darkmux:work`, `darkmux:work:<tier>`)
+/// still in Redis, when Redis is configured and answers within the usual
+/// bounded connect. Empty otherwise: this row only ever adds a cleanup hint.
+fn retired_queue_streams() -> Vec<String> {
+    let Some(url) = darkmux_flow::redis_url() else { return Vec::new() };
+    let Ok(client) = redis::Client::open(url.expose_for_probe()) else { return Vec::new() };
+    let Ok(mut conn) = darkmux_flow::open_redis_connection_bounded(&client, darkmux_flow::REDIS_CONNECT_TIMEOUT) else {
+        return Vec::new();
+    };
+    darkmux_flow::bound_redis_response(&conn);
+    let mut found = Vec::new();
+    let mut cursor: u64 = 0;
+    for _ in 0..50 {
+        let Ok((next, keys)): redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("darkmux:work*")
+            .arg("COUNT")
+            .arg(1000)
+            .query(&mut conn)
+        else {
+            break;
+        };
+        found.extend(keys.into_iter().filter(|k| k == "darkmux:work" || k.starts_with("darkmux:work:")));
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// `darkmux machine trust <name>` (#2916).
 pub(crate) fn cmd_machine_trust(
     name: &str,
@@ -1832,6 +1944,68 @@ mod trust_tests {
         assert!(entry(&p, "laptop").is_null());
         assert_eq!(entry(&p, "peer")["node_id"], "nPHONE", "the other entry stays");
         assert!(!untrust_at(&p, "laptop").unwrap(), "a second untrust changes nothing");
+    }
+
+    /// The doctor gatherer end to end, with a fake provider tool first on
+    /// PATH and an isolated home: the rows name who is trusted, flag a
+    /// profile that cannot run here, and print no node id.
+    #[serial_test::serial]
+    #[test]
+    fn doctor_rows_report_the_allow_list_through_the_provider() {
+        let d = tempfile::TempDir::new().unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("tailscale");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\n[ \"$1\" = status ] || exit 2\necho '{\"BackendState\":\"Running\",\"Self\":{\"ID\":\"nSTUDIO\",\"DNSName\":\"studio.tailnet-example.ts.net.\",\"TailscaleIPs\":[\"100.64.0.2\"]},\"Peer\":{\"k\":{\"ID\":\"nLAPTOP\",\"DNSName\":\"laptop.tailnet-example.ts.net.\",\"TailscaleIPs\":[\"100.64.0.7\"],\"Online\":true}}}'\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let home = d.path().join("dm");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"fleet":{"accept_work":{"workbook":{"node_id":"nLAPTOP","profiles":["host","nope"]},"gone":{"node_id":"nGONE","profiles":["host"]}}}}"#,
+        )
+        .unwrap();
+        let profiles = d.path().join("profiles.json");
+        std::fs::write(&profiles, r#"{"profiles":{"host":{"models":[{"id":"big","n_ctx":1000}]}}}"#).unwrap();
+        let keys = ["PATH", "DARKMUX_HOME", "DARKMUX_PROFILES", "DARKMUX_REDIS_URL", "DARKMUX_SERVE_TOKEN", "DARKMUX_FLEET_LISTENER_ENABLED"];
+        let prev: Vec<(&str, Option<String>)> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
+            std::env::set_var("DARKMUX_HOME", &home);
+            std::env::set_var("DARKMUX_PROFILES", &profiles);
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_SERVE_TOKEN", "t");
+            std::env::remove_var("DARKMUX_FLEET_LISTENER_ENABLED");
+        }
+        let rows = fleet_submission_doctor_checks();
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let find = |n: &str| rows.iter().find(|c| c.name == n).unwrap_or_else(|| panic!("no {n} in {rows:?}"));
+        assert_eq!(find("fleet token").status, crate::doctor::Status::Pass);
+        assert!(find("fleet identity").message.contains("this machine is `studio` at 100.64.0.2"), "{rows:?}");
+        assert!(find("fleet listener").message.starts_with("off"), "{rows:?}");
+        let t = find("fleet trust");
+        assert_eq!(t.status, crate::doctor::Status::Warn);
+        assert!(t.message.contains("workbook may run host, nope (workspace: no)"), "{}", t.message);
+        assert!(t.message.contains("node `laptop`, online"), "{}", t.message);
+        assert!(t.message.contains("`nope` is not defined"), "{}", t.message);
+        assert!(t.message.contains("gone may run host") && t.message.contains("no longer on the network"), "{}", t.message);
+        for c in &rows {
+            assert!(!c.message.contains("nLAPTOP") && !c.message.contains("nGONE"), "{}", c.message);
+        }
     }
 }
 

@@ -20,6 +20,8 @@ use anyhow::Result;
 // doctor check — see the module doc for why it shares `power_posture`'s
 // probe with the mission pre-flight rather than re-reading `pmset` itself.
 mod checks_power;
+mod fleet_submission;
+pub use fleet_submission::{fleet_submission_checks, FleetSubmissionFacts, ProviderReport, TrustView};
 use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
