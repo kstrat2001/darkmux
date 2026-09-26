@@ -96,19 +96,30 @@ const FIXTURE_START_ATTEMPTS: usize = 4;
 /// exited at once. Boot reported that as "fixture pid N was already gone
 /// when it was registered". Ports in this range are never assigned as a
 /// source port, so only another fixture choosing the same number can
-/// collide, and a startup death retries (see `FIXTURE_START_ATTEMPTS`).
+/// collide: within a process `pick_fixture_port` never hands a port out
+/// twice, and across processes `start_fixture` only accepts the answer of
+/// its OWN child, so the loser exits and retries (`FIXTURE_START_ATTEMPTS`).
 const FIXTURE_PORT_RANGE: std::ops::Range<u16> = 20_000..32_768;
 
 fn pick_fixture_port() -> Result<u16, String> {
     use std::hash::{BuildHasher, Hasher};
+    // (#2898 review) Every port this PROCESS has handed out, never handed
+    // out again: libtest runs a binary's tests as threads, and two of them
+    // must not pick the same number at the same moment. Collisions across
+    // processes (nextest runs each test as its own) are caught by
+    // `start_fixture`'s identity check instead.
+    static HANDED_OUT: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
     let span = u64::from(FIXTURE_PORT_RANGE.end - FIXTURE_PORT_RANGE.start);
+    let mut handed_out = HANDED_OUT.lock().unwrap_or_else(|e| e.into_inner());
+    let handed_out = handed_out.get_or_insert_with(Default::default);
     for _ in 0..64 {
         // `RandomState` is freshly keyed per instance, which is all the
         // randomness a port choice needs, with no new dependency.
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
         h.write_u32(std::process::id());
         let port = FIXTURE_PORT_RANGE.start + (h.finish() % span) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if !handed_out.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            handed_out.insert(port);
             return Ok(port);
         }
     }
@@ -131,6 +142,7 @@ enum StartFailure {
 /// else now owned.
 fn start_fixture(
     child: &mut Child,
+    port: u16,
     fixtures: &mut FixtureGroup,
     timeout: Duration,
     log: &std::path::Path,
@@ -161,7 +173,11 @@ fn start_fixture(
         if let Some(why) = exited(child) {
             return Err(died(child, why));
         }
-        if ready() {
+        // (#2898 review) Ready means THIS child answers: something answering
+        // on the port may be another fixture that took the same number, and
+        // this child is then about to exit on EADDRINUSE (the loop above
+        // catches that and the caller retries).
+        if ready() && listener_pids(port).contains(&child.id()) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -170,6 +186,18 @@ fn start_fixture(
         Some(why) => died(child, why),
         None => StartFailure::Other(format!("did not answer within {timeout:?}; {}", log_tail(log))),
     })
+}
+
+/// (#2898 review) The pids with a TCP listener on `port`, from the OS
+/// (`lsof`, present on macOS and on GitHub's ubuntu runners). Readiness uses
+/// it to confirm the process answering is the fixture it just spawned: an
+/// answer alone can come from ANOTHER fixture that took the same port.
+fn listener_pids(port: u16) -> Vec<u32> {
+    Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
 }
 
 /// The last few lines of a fixture's log, for an error message.
@@ -934,7 +962,7 @@ fn spawn_redis_on(
             format!("spawning redis-server (is `redis-server` on PATH? `brew install redis`): {e}")
         })?;
         let url = format!("redis://127.0.0.1:{port}");
-        match start_fixture(&mut child, fixtures, REDIS_READY_TIMEOUT, &log, || redis_answers(&url)) {
+        match start_fixture(&mut child, port, fixtures, REDIS_READY_TIMEOUT, &log, || redis_answers(&url)) {
             Ok(()) => return Ok((child, url)),
             Err(StartFailure::Exited(why)) => deaths.push(format!("port {port}: {why}")),
             Err(StartFailure::Other(why)) => return Err(format!("redis-server on port {port}: {why}")),
@@ -1047,7 +1075,7 @@ fn spawn_daemon(
         let mut daemon = daemon_cmd
             .spawn()
             .map_err(|e| format!("spawning darkmux serve for {}: {e}", spec.machine_id))?;
-        match start_fixture(&mut daemon, fixtures, DAEMON_READY_TIMEOUT, &log, || daemon_healthy(port)) {
+        match start_fixture(&mut daemon, port, fixtures, DAEMON_READY_TIMEOUT, &log, || daemon_healthy(port)) {
             Ok(()) => {
                 started = Some((daemon, port));
                 break;
@@ -1134,6 +1162,51 @@ mod fixture_port_tests {
         }
     }
 
+    /// (#2898 review) Readiness must confirm WHO answered. Two fixtures
+    /// that pick the same port: the loser exits on EADDRINUSE, the winner
+    /// answers on that port, and a readiness check that only asks "does
+    /// something answer here?" reported the dead loser as started (measured
+    /// 5 of 5 by the reviewer's probe). Here redis A holds the port first,
+    /// and B is handed that same port; B must come up on its OWN port.
+    #[test]
+    fn a_fixture_is_ready_only_when_its_own_process_answers() {
+        if !redis_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let mut fixtures = FixtureGroup::arm();
+        let (mut a, url_a) = spawn_redis(dir_a.path(), &mut fixtures).expect("redis A");
+        let port_a: u16 = url_a.rsplit(':').next().and_then(|p| p.parse().ok()).expect("A's port");
+        let mut handed_out = 0usize;
+        let mut ports = || -> Result<u16, String> {
+            handed_out += 1;
+            if handed_out == 1 { Ok(port_a) } else { pick_fixture_port() }
+        };
+        let result = spawn_redis_on(dir_b.path(), &mut fixtures, &mut ports);
+        let (mut b, url_b) = match result {
+            Ok(ok) => ok,
+            Err(e) => {
+                let _ = a.kill();
+                let _ = a.wait();
+                fixtures.stand_down();
+                panic!("B must start on a fresh port: {e}");
+            }
+        };
+        let b_alive = matches!(b.try_wait(), Ok(None));
+        let port_b: u16 = url_b.rsplit(':').next().and_then(|p| p.parse().ok()).expect("B's port");
+        let owner = listener_pids(port_b);
+        for child in [&mut a, &mut b] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        fixtures.stand_down();
+        assert_ne!(url_b, url_a, "B was reported ready on A's port: it answered for A, not itself");
+        assert!(b_alive, "B was reported ready while it had already exited");
+        assert!(owner.contains(&b.id()), "port {port_b} is not B's listener: owners {owner:?}");
+    }
+
     /// (#2898) The fleet e2e flake: a fixture's port is freed before the
     /// fixture binds it, and something else can take it in between (an
     /// outgoing connection's source port comes from the same ephemeral
@@ -1179,6 +1252,14 @@ mod fixture_port_tests {
             !url.ends_with(&format!(":{taken}")),
             "the redis that answered must be on a fresh port, not the taken {taken}: {url}"
         );
+        // (#2898 review) The dead first attempt's registry entry is gone;
+        // only the redis that started is recorded.
+        let recorded: Vec<u32> = crate::e2e::fixture_reaper::registry_entries(fixtures.registry_path())
+            .into_iter()
+            .filter(|(role, _)| role == "child")
+            .map(|(_, p)| p.pid)
+            .collect();
+        assert_eq!(recorded, vec![child.id()], "the registry must hold only the fixture that started");
         let _ = child.kill();
         let _ = child.wait();
         drop(holder);

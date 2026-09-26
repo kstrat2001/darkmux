@@ -733,10 +733,6 @@ impl FixtureGroup {
         })
     }
 
-    /// Orderly teardown: tell the watchdog NOT to signal the group (the
-    /// harness's own `Drop` has already killed, or is about to kill, each
-    /// child individually), wait for it to exit, and drop this run's
-    /// registry file so the next run has nothing to sweep.
     /// (#2898) Removes `pid`'s `child` entry from the registry. For a
     /// fixture that EXITED during startup and is being replaced on a fresh
     /// port: its entry names a process that no longer exists, so the sweep
@@ -760,6 +756,10 @@ impl FixtureGroup {
             .map_err(|e| format!("rewriting the fixture registry {}: {e}", self.registry.display()))
     }
 
+    /// Orderly teardown: tell the watchdog NOT to signal the group (the
+    /// harness's own `Drop` has already killed, or is about to kill, each
+    /// child individually), wait for it to exit, and drop this run's
+    /// registry file so the next run has nothing to sweep.
     pub fn stand_down(&mut self) {
         if self.stood_down {
             return;
