@@ -5368,7 +5368,9 @@ fn radio_answers_at_once_that_the_answering_model_is_busy_instead_of_queueing() 
     assert!(stdout.contains("darkmux:stub-worker"), "…naming the instance:\n{stdout}");
     assert!(stdout.contains("generating"), "…with what LM Studio reports:\n{stdout}");
     assert!(
-        stdout.contains("darkmux has no live run or process on record using it"),
+        stdout.contains(
+            "darkmux found no live run on it in the last day of its records, and no darkmux process it can verify holds it"
+        ),
         "no lease and no live run name the occupant, so the copy says exactly that — and never claims whose \
          work it is:\n{stdout}"
     );

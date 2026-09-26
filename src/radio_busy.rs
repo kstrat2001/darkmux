@@ -37,10 +37,12 @@
 //! When either says busy, the OCCUPANT is named from what darkmux knows: a
 //! live run on this machine's runs board whose model is that instance
 //! (`mission <id> (<role>)`), else the leasing darkmux process by pid, else
-//! nothing — the copy then says darkmux has no run or process on record
-//! using it, which is a fact about darkmux's records, not a claim about
-//! whose work it is (a compaction, for one, is darkmux's work that no
-//! ledger records).
+//! nothing — the copy then says what was checked and found empty: no live
+//! run on it in the last day of darkmux's records, and no darkmux process
+//! darkmux can verify holds it. That is a fact about what was read, not a
+//! claim about whose work it is (a compaction, for one, is darkmux's work
+//! that no ledger records), nor that no darkmux run is using it: a run live
+//! longer than the window can have its model outside it.
 //!
 //! # Two seats, two policies
 //!
@@ -56,9 +58,12 @@
 //!   reports ([`router_wait_notice_live`]) and keep waiting to the ceiling.
 //!   The notice is read WHILE radio's own routing call is in flight, so a
 //!   non-idle utility instance is expected to include that call: it is not
-//!   by itself "something ahead of you". Only `queued > 0` (a request
-//!   waiting on the instance) or a verified foreign lease on it says the
-//!   call is sharing the instance with other work.
+//!   by itself "something ahead of you". `queued > 0` (a request waiting on
+//!   the instance; `queued` excludes the one being served) says the call is
+//!   sharing the instance with other work. A verified foreign lease on it
+//!   says another darkmux process has it LOADED, not that a request of its
+//!   is in flight: it is named as context, and says "may be sharing" only
+//!   when LM Studio's queue count is not available.
 //!
 //! # Cost
 //!
@@ -121,10 +126,12 @@ pub enum Occupant {
     /// A darkmux process holds the instance but no live run names it (its
     /// records may not have reached the flow file yet).
     DarkmuxProcess { pid: u32 },
-    /// No live darkmux run and no verified darkmux lease names the
-    /// instance. A fact about darkmux's records only: it is NOT a claim
-    /// that the work is not darkmux's (a compaction is darkmux work that
-    /// no ledger records).
+    /// No live darkmux run in the last [`LIVE_RUN_WINDOW_DAYS`] of records
+    /// and no verified darkmux lease names the instance. A fact about what
+    /// was read only: it is NOT a claim that the work is not darkmux's (a
+    /// compaction is darkmux work that no ledger records), nor that no
+    /// darkmux run uses it (a run live longer than the window can have its
+    /// model outside it).
     NoneOnRecord,
 }
 
@@ -231,7 +238,13 @@ impl BusyReport {
                 BusySource::DarkmuxLease { .. } => String::new(),
                 BusySource::LmStudioStatus(_) => format!(" for darkmux process {pid}"),
             },
-            Occupant::NoneOnRecord => "; darkmux has no live run or process on record using it".to_string(),
+            // (#2917 re-review C-3) Say what was checked: the runs board is
+            // read over the last day only (`LIVE_RUN_WINDOW_DAYS`), so a run
+            // live longer than that can be missing its model there, and
+            // only a VERIFIED lease names a process.
+            Occupant::NoneOnRecord => "; darkmux found no live run on it in the last day of its records, and no \
+                                       darkmux process it can verify holds it"
+                .to_string(),
         }
     }
 
@@ -264,9 +277,10 @@ pub struct UtilityFacts {
 ///
 /// Read while radio's OWN routing call is in flight on the utility
 /// instance, so a non-idle status there is expected to include that call.
-/// "Sharing it with other work" is said only from `queued > 0` or a
-/// verified foreign lease; every other case says exactly what LM Studio
-/// reported, and what that does and does not tell.
+/// "Sharing it with other work" is said only from `queued > 0`, or "may be
+/// sharing" from a verified foreign lease when the queue count is unknown;
+/// every other case says exactly what LM Studio reported, and what that
+/// does and does not tell, with a foreign holder added as context.
 pub fn router_wait_notice(facts: Option<&UtilityFacts>, waited: Duration, ceiling: Duration) -> String {
     let waited = waited.as_secs();
     let ceiling = ceiling.as_secs();
@@ -275,49 +289,86 @@ pub fn router_wait_notice(facts: Option<&UtilityFacts>, waited: Duration, ceilin
         return format!("still routing after {waited}s (no utility model resolved to check). {tail}");
     };
     let id = &facts.target.identifier;
-    if let Some(pid) = facts.foreign_holder {
-        return format!(
-            "still routing after {waited}s: darkmux process {pid} also has the utility model `{id}` in use, so this \
-             call is sharing it. {tail}"
-        );
-    }
-    let body = match &facts.reading {
-        InstanceReading::ReadFailed => {
+    // What the queue says about other work: `Some(true)` requests are
+    // waiting, `Some(false)` none are (or the instance is idle), `None`
+    // darkmux cannot tell.
+    let (body, others_waiting): (String, Option<bool>) = match &facts.reading {
+        InstanceReading::ReadFailed => (
             "darkmux could not read LM Studio's model list (`lms ps`), so it cannot say what is ahead of this call"
-                .to_string()
-        }
-        InstanceReading::NotListed => format!(
-            "LM Studio does not list the utility model `{id}` as loaded, so darkmux cannot read what it is doing"
+                .to_string(),
+            None,
         ),
+        InstanceReading::NotListed => (
+            format!("LM Studio does not list the utility model `{id}` as loaded, so darkmux cannot read what it is doing"),
+            None,
+        ),
+        // `queued > 0` is the rule for "sharing", and `queued` EXCLUDES the
+        // request being served: measured 2026-09-26 against a real LM Studio
+        // (operator-attended), one request in flight reads `queued: 0` and
+        // two read `queued: 1` while the second waits. So radio's own routing
+        // call, the one being served, never counts itself as waiting, and
+        // `queued: 0` with a busy status is that call alone.
         InstanceReading::Listed { status, queued } => match (plain_status(status), queued) {
-            (Some(plain), Some(n)) if *n > 0 => format!(
-                "LM Studio reports the utility model `{id}` {plain} with {n} {} waiting, so this call is sharing it \
-                 with other work (for example a compaction)",
-                if *n == 1 { "request" } else { "requests" }
+            (Some(plain), Some(n)) if *n > 0 => (
+                format!(
+                    "LM Studio reports the utility model `{id}` {plain} with {n} {} waiting, so this call is sharing \
+                     it with other work (for example a compaction)",
+                    if *n == 1 { "request" } else { "requests" }
+                ),
+                Some(true),
             ),
             (Some(plain), queued) if is_busy_status(status) => match queued {
-                Some(_) => format!(
-                    "LM Studio reports the utility model `{id}` {plain} with nothing waiting, so no other request is \
-                     ahead of this call"
+                Some(_) => (
+                    format!(
+                        "LM Studio reports the utility model `{id}` {plain} with nothing waiting, so no other request \
+                         is ahead of this call"
+                    ),
+                    Some(false),
                 ),
-                None => format!(
-                    "LM Studio reports the utility model `{id}` {plain}, but not how many requests are waiting, so \
-                     darkmux cannot tell whether that is this call or other work (for example a compaction)"
+                None => (
+                    format!(
+                        "LM Studio reports the utility model `{id}` {plain}, but not how many requests are waiting, \
+                         so darkmux cannot tell whether that is this call or other work (for example a compaction)"
+                    ),
+                    None,
                 ),
             },
-            (Some(plain), _) => format!(
-                "LM Studio reports the utility model `{id}` {plain}, so no other request is being served ahead of \
-                 this call"
+            (Some(plain), _) => (
+                format!(
+                    "LM Studio reports the utility model `{id}` {plain}, so no other request is being served ahead \
+                     of this call"
+                ),
+                Some(false),
             ),
-            (None, _) if status.is_empty() => format!(
-                "LM Studio lists the utility model `{id}` without a status, so darkmux cannot say what is ahead of \
-                 this call"
+            (None, _) if status.is_empty() => (
+                format!(
+                    "LM Studio lists the utility model `{id}` without a status, so darkmux cannot say what is ahead \
+                     of this call"
+                ),
+                None,
             ),
-            (None, _) => format!(
-                "LM Studio reports the utility model `{id}` as `{status}`, which darkmux does not recognize, so it \
-                 cannot say what is ahead of this call"
+            (None, _) => (
+                format!(
+                    "LM Studio reports the utility model `{id}` as `{status}`, which darkmux does not recognize, so it \
+                     cannot say what is ahead of this call"
+                ),
+                None,
             ),
         },
+    };
+    // (#2917 re-review C-2) A verified foreign lease means that process has
+    // the model LOADED for a role execution, not that a request of its is
+    // in flight. It never overrides LM Studio's queue: it is context when
+    // the queue is known, and the only fact about other work when it is not.
+    let body = match (facts.foreign_holder, others_waiting) {
+        (None, _) => body,
+        (Some(pid), Some(true)) => format!("{body}; darkmux process {pid} also has it in use"),
+        (Some(pid), Some(false)) => {
+            format!("{body}; darkmux process {pid} also has it loaded, which by itself puts no request ahead of this call")
+        }
+        (Some(pid), None) => {
+            format!("{body}; darkmux process {pid} also has it in use, so this call may be sharing it with that process's work")
+        }
     };
     format!("still routing after {waited}s: {body}. {tail}")
 }
@@ -588,7 +639,10 @@ mod tests {
         let loaded = [resident("darkmux:qwen3.6-35b-a3b", "generating")];
         let msg = busy_report(&target(), &loaded, &[], &no_runs).expect("busy").answering_seat_message();
         assert!(
-            msg.contains("LM Studio reports it generating a reply; darkmux has no live run or process on record using it."),
+            msg.contains(
+                "LM Studio reports it generating a reply; darkmux found no live run on it in the last day of its \
+                 records, and no darkmux process it can verify holds it."
+            ),
             "{msg}"
         );
         assert!(!msg.contains("did not start"), "{msg}");
@@ -651,10 +705,53 @@ mod tests {
         assert!(!n.contains("sharing") && !n.contains("no other request is ahead"), "{n}");
     }
 
+    /// (#2917 re-review C-2) A verified foreign lease means that process
+    /// has the model LOADED for a role execution, not that a request of
+    /// its is in flight. With LM Studio reporting nothing waiting, its
+    /// reading stands and the holder is context, never "sharing".
     #[test]
-    fn a_verified_foreign_holder_on_the_utility_instance_says_the_call_is_sharing_it() {
+    fn a_foreign_holder_with_nothing_waiting_keeps_lm_studios_reading() {
         let n = notice(listed("generating", Some(0)), Some(4242));
-        assert!(n.contains("darkmux process 4242 also has the utility model `darkmux:qwen3-4b` in use"), "{n}");
+        assert_eq!(
+            n,
+            "still routing after 10s: LM Studio reports the utility model `darkmux:qwen3-4b` generating a reply with \
+             nothing waiting, so no other request is ahead of this call; darkmux process 4242 also has it loaded, \
+             which by itself puts no request ahead of this call. Routing keeps waiting, up to 300s."
+        );
+        let idle = notice(listed("idle", Some(0)), Some(4242));
+        assert!(idle.contains("idle, so no other request is being served ahead of this call; darkmux process 4242 also has it loaded"), "{idle}");
+        for n in [n, idle] {
+            assert!(!n.contains("sharing"), "{n}");
+        }
+    }
+
+    /// C-2: `queued > 0` is what says sharing; the holder is named too.
+    #[test]
+    fn a_foreign_holder_with_requests_waiting_says_sharing_and_names_the_holder() {
+        let n = notice(listed("generating", Some(2)), Some(4242));
+        assert!(n.contains("with 2 requests waiting, so this call is sharing it with other work"), "{n}");
+        assert!(n.contains("darkmux process 4242 also has it in use"), "{n}");
+    }
+
+    /// C-2: with the queue unknown (an older `lms`, the model not listed,
+    /// the listing unreadable, a status darkmux does not know), a foreign
+    /// holder is the only fact about other work, and it says the call may
+    /// be sharing the instance.
+    #[test]
+    fn a_foreign_holder_with_the_queue_unknown_says_the_call_may_be_sharing_it() {
+        for reading in [
+            listed("generating", None),
+            InstanceReading::NotListed,
+            InstanceReading::ReadFailed,
+            listed("warming", Some(0)),
+            listed("", None),
+        ] {
+            let n = notice(reading.clone(), Some(4242));
+            assert!(
+                n.contains("; darkmux process 4242 also has it in use, so this call may be sharing it with that process's work."),
+                "{reading:?}: {n}"
+            );
+        }
     }
 
     #[test]

@@ -4238,6 +4238,75 @@ mod tests {
         assert!(!narrow.iter().any(|i| i.contains("s-five-days-ago")), "outside the window is not read: {narrow:?}");
     }
 
+    /// (#2917 re-review C-3) The premise radio's busy copy is worded
+    /// around: a mission live longer than the narrow window (started three
+    /// days ago, its heartbeat today) is found by `build_runs_within(.., 1)`,
+    /// but the record that names its model sits in a day file outside the
+    /// window, so the row carries no model and radio cannot name it as the
+    /// occupant. The board's 14-day read still has it. radio's copy says
+    /// "no live run on it in the last day of its records" for exactly this.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_within_a_day_does_not_see_the_model_of_a_mission_started_three_days_ago() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+        let mission = minimal_mission(
+            "long-mission",
+            vec!["long-mission-phase".to_string()],
+            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        darkmux_crew::lifecycle::save_phase(&minimal_phase(
+            "long-mission-phase",
+            "long-mission",
+            vec!["long-mission-task".to_string()],
+        ))
+        .unwrap();
+        darkmux_crew::lifecycle::save_task(
+            "long-mission",
+            &minimal_task("long-mission-task", "long-mission-phase", vec!["long-mission-step".to_string()], Some("coder")),
+        )
+        .unwrap();
+        darkmux_crew::lifecycle::save_step(
+            "long-mission",
+            "long-mission-phase",
+            &minimal_step("long-mission-step", "long-mission-task", Some("crew-dispatch-coder-long")),
+        )
+        .unwrap();
+        let iso = |unix: u64| {
+            let (y, m, d) = civil_from_days((unix / 86_400) as i64);
+            let s = unix % 86_400;
+            format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, (s / 60) % 60, s % 60)
+        };
+        let now = now_unix();
+        write_day_file(
+            flows.path(),
+            &cutoff_date_string(3),
+            &[serde_json::json!({
+                "ts": iso(now - 3 * 86_400),
+                "action": "dispatch start",
+                "session_id": "crew-dispatch-coder-long",
+                "handle": "coder",
+                "model": "qwen3.6-35b-a3b",
+            })],
+        );
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[serde_json::json!({
+                "ts": iso(now),
+                "action": "dispatch.turn.heartbeat",
+                "session_id": "crew-dispatch-coder-long",
+            })],
+        );
+        let find = |runs: Vec<Run>| runs.into_iter().find(|r| r.id == "long-mission").expect("the mission is listed");
+        let board = find(build_runs(flows.path(), None, &[]));
+        assert_eq!(board.model.as_deref(), Some("qwen3.6-35b-a3b"), "the 14-day board names the model: {board:?}");
+        let narrow = find(build_runs_within(flows.path(), None, &[], 1));
+        assert_eq!(narrow.status, RunStatus::Running, "{narrow:?}");
+        assert_eq!(narrow.model, None, "the one-day read cannot see the record that names the model: {narrow:?}");
+    }
+
     // ── lab normalization ───────────────────────────────────────────────
 
     fn minimal_lab_summary(dir: &str, finished: bool, degenerate: bool) -> LabRunSummary {

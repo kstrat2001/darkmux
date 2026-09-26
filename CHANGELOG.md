@@ -84,17 +84,23 @@ darkmux release.
   embeddings, or another live darkmux process holds it loaded and in use
   (the residency-lease registry), radio answers at once that the model is
   busy and names the run when darkmux knows it (from the runs board), else
-  the darkmux process holding it by pid, else says darkmux has no run or
-  process on record using it. Facts only, never a guess about whose work
+  the darkmux process holding it by pid, else says what it checked: no
+  live run on it in the last day of darkmux's records, and no darkmux
+  process it can verify holding it (a run live for longer than a day may
+  not be named). Facts only, never a guess about whose work
   it is; a hosted seat is not checked. The check is made just before the
   send, so work that starts in between still queues the question. Same
   copy on the CLI (exit 1: no answer was given) and in the editor panel.
   The router still waits behind a compaction on the utility instance
   (#2914's decision), but after 10s both surfaces say what LM Studio
-  reports: requests waiting on the utility model (`lms ps`'s `queued`),
-  nothing ahead of the routing call, or that darkmux cannot tell (an older
-  `lms` with no queue count, the model not listed, or `lms ps`
-  unreadable). Then it keeps waiting to the ceiling.
+  reports: requests waiting on the utility model (`lms ps`'s `queued`,
+  which excludes the request being served), busy with nothing waiting (the
+  routing call itself), idle, or that darkmux cannot tell (an older `lms`
+  with no queue count, the model not listed, or `lms ps` unreadable). When
+  another darkmux process has the utility model loaded, it is named
+  alongside that reading; it says the call may be sharing the model only
+  when the queue count is unavailable. Then it keeps waiting to the
+  ceiling.
 - **A residency lease left by a crashed darkmux process no longer outlives
   its pid being reused** (#2917). Leases now carry their writer's process
   start time; a lease whose pid is alive but started at a different time
