@@ -210,6 +210,31 @@ describe("FleetLens", () => {
     expect(labels).not.toContain("utility");
   });
 
+  // (#2902 review) The inverse: with no utility spend and no record reporting
+  // `cached_tokens`, NO part line renders — not "0 utility", not "0 cached".
+  // Before this test only the parity golden guarded it; `{t.utility &&
+  // settled ?` mutated to `{settled ?` left vitest green.
+  it("(#2902) with utility 0 and no cached_tokens reported, no part line renders at all", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        {
+          ts: `${today}T10:00:05.000Z`, machine_uid: "u1", session_id: "s1", category: "telemetry", source: "tokens", action: "telemetry.tokens",
+          payload: { call_kind: "turn", purpose: "work", prompt_tokens: 1920, completion_tokens: 163, total_tokens: 2083 },
+        },
+        { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: {} },
+      ],
+    });
+    const { container } = renderFleetLens();
+    // Wait for the window to settle (the figures are silhouetted until then,
+    // and no part line renders while unsettled either — the assertion below
+    // must run against the SETTLED hero to mean anything).
+    await waitFor(() => expect(container.querySelector(".savings")?.getAttribute("data-settled")).toBe("true"));
+    expect(container.querySelector(".savc .scv")?.textContent).toBe("1.92k");
+    expect(container.querySelectorAll(".savpart")).toHaveLength(0);
+  });
+
   it("sums a locally-run session's telemetry into local tokens, and renders its machine card", async () => {
     const today = todayUTC();
     mockFleetFetch({

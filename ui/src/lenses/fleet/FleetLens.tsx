@@ -125,12 +125,14 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
  * hiding it made it pop in late on the legacy mobile client — see that
  * source's own comment).
  *
- * TOKENS ONLY — class labels, no rates, no currency, no savings formula.
- * The `unknown` chip is the honesty-about-incomplete-data surface: it
- * renders (with its explanatory `title`) only when `t.unknown` is nonzero,
- * and is EXCLUDED from `t.local` rather than folded into it — see
- * `savings.ts`'s module doc for why that exclusion is load-bearing, not
- * incidental.
+ * TOKENS ONLY — no rates, no currency, no savings formula. (#2902) Facts
+ * only, too: every figure is a plain sum of provider-reported counts from
+ * the window's usage records (`tokensOffMeter`). One lead figure (ALL
+ * TOKENS) with UTILITY as a part line under it, and three chips (INPUT with
+ * CACHED as its part line, GENERATED, DISPATCHES). Nothing here classifies
+ * where a token ran or what it cost, and no chip is invented to make the
+ * parts add up — see `savings.ts`'s module doc for what was withdrawn and
+ * why.
  */
 function SavingsHero({
   tokens: t,
@@ -149,8 +151,9 @@ function SavingsHero({
   data: FlowRecord[];
   nowMs: number;
   /** (#2817) False while the flow window is still loading. A zero is a
-   *  MEASUREMENT — "this fleet used no cloud tokens" — and rendering one
-   *  before the window has arrived states a fact nobody has established.
+   *  MEASUREMENT — "darkmux dispatched no tokens in this window" — and
+   *  rendering one before the window has arrived states a fact nobody has
+   *  established.
    *  The figures are silhouetted until this is true.
    *
    *  `settled && 0` stays a literal "0": a fresh fleet with no dispatches
@@ -238,13 +241,18 @@ function SavingsHero({
           {/* (#2902 step 2a) Every chip is a sum of provider-reported
               counts from the usage records (`tokensOffMeter`). CACHED is
               absent when no record in the window reports `cached_tokens`
-              (a 0 there would be an assumption, not a measurement), and
-              UTILITY (darkmux's own compaction and radio routing) is
-              hidden at 0 (the chip UNCLASSIFIED used, dim). CACHED and UTILITY are shares of
-              INPUT and ALL TOKENS, so each renders as a part line under the
-              figure it belongs to, never as a peer chip. INPUT + GENERATED equal
-              ALL TOKENS whenever providers report total = prompt +
-              completion; no filler chip covers a provider total above it. */}
+              (a 0 there would be an assumption, not a measurement); a
+              REPORTED 0 renders "0 cached" by design — hosted providers
+              report `cached_tokens: 0` on every reply, and that is a
+              measurement worth showing. UTILITY (darkmux's own jobs —
+              compaction and the radio router, `call_purpose`) is hidden at
+              0: it is a part line, not a chip, and a "0 utility" line under
+              the total would read as a third figure. CACHED and UTILITY are
+              shares of INPUT and ALL TOKENS, so each renders as a part line
+              under the figure it belongs to, never as a peer chip. INPUT +
+              GENERATED equal ALL TOKENS whenever providers report total =
+              prompt + completion; no filler chip covers a provider total
+              above it. */}
           <Chip value={fmtC(t.input)} loading={!settled} label="input" part={t.cached != null ? { value: fmtC(t.cached), label: "cached" } : null} />
           <Chip value={fmtC(t.generated)} loading={!settled} label="generated" cls="gen" />
           <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
