@@ -189,17 +189,37 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
     let job_kind = crate::usage::utility_job(crate::usage::CallKind::SingleShot, Some(job.role_id));
     let job_id = job_kind.map(crate::usage::mint_utility_job_id).unwrap_or_default();
     let started_at_ms = crate::usage::unix_ms_now();
+    // (#2928) The job's two edges also go out on the live channel, at once:
+    // a sub-second routing job's durable start and end otherwise reach the
+    // viewer in the same delivery and it is never drawn open.
+    let mut live = job_kind.and_then(|_| darkmux_flow::live::LiveSender::for_local_daemon());
     if let Some(kind) = job_kind {
+        let payload = crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds), started_at_ms);
+        if let Some(tx) = live.as_mut() {
+            tx.send(&live_utility_edge(&payload, "start", job.role_id, &wire_model, started_at_ms));
+        }
         let _ = darkmux_flow::record(crate::usage::utility_marker_record(
             crate::usage::UTILITY_START_ACTION,
             job.role_id,
             &wire_model,
-            crate::usage::utility_start_payload(kind, &job_id, &wire_model, None, u64::from(job.timeout_seconds), started_at_ms),
+            payload,
         ));
     }
+    let send_live_end = |live: &mut Option<darkmux_flow::live::LiveSender>, ended_at_ms: u64| {
+        if let (Some(tx), Some(kind)) = (live.as_mut(), job_kind) {
+            let fields = serde_json::json!({
+                "job": kind,
+                "job_id": job_id,
+                "ended_at_ms": ended_at_ms,
+                "duration_ms": ended_at_ms.saturating_sub(started_at_ms),
+            });
+            tx.send(&live_utility_edge(&fields, "end", job.role_id, &wire_model, ended_at_ms));
+        }
+    };
     let reply = match crate::single_shot::single_shot_chat(&req) {
         Ok(r) => r,
         Err(e) => {
+            send_live_end(&mut live, crate::usage::unix_ms_now());
             // (#2915) The end of a started job that has no usage record.
             if let Some(kind) = job_kind {
                 let mut payload = serde_json::json!({ "job": kind, "model": wire_model });
@@ -227,16 +247,56 @@ pub fn run_utility_single_shot(job: &UtilityJob<'_>) -> Result<UtilityReply> {
         &crate::usage::lmstudio_endpoint(job.base_url_override),
     );
     if job_kind.is_some() {
-        crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, crate::usage::unix_ms_now());
+        let ended_at_ms = crate::usage::unix_ms_now();
+        send_live_end(&mut live, ended_at_ms);
+        crate::usage::stamp_utility_end(&mut payload, &job_id, started_at_ms, ended_at_ms);
     }
     let _ = darkmux_flow::record(crate::usage::utility_usage_record(job.role_id, &wire_model, payload));
 
     Ok(UtilityReply { content: reply.content })
 }
 
+/// (#2928) One edge (`start` | `end`) of a host-side utility job as a live
+/// sample: the job's own fields plus `event`, attributed to the job's role
+/// and model, with no session (routing serves none).
+fn live_utility_edge(
+    fields: &serde_json::Value,
+    event: &str,
+    role_id: &str,
+    model: &str,
+    at_ms: u64,
+) -> darkmux_flow::live::LiveSample {
+    let mut s = darkmux_flow::live::LiveSample::new(
+        darkmux_flow::live::LiveKind::Utility,
+        at_ms,
+        darkmux_types::config_access::live_sample_ms(),
+    );
+    s.role = Some(role_id.to_string());
+    s.model = Some(model.to_string()).filter(|m| !m.is_empty());
+    if let Some(map) = fields.as_object() {
+        s.fields = map.clone();
+    }
+    s.fields.insert("event".into(), serde_json::json!(event));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2928) A routing job's live edges carry the job, its id and the
+    /// event, and no session.
+    #[test]
+    fn live_utility_edge_names_the_job_and_the_event() {
+        let start = crate::usage::utility_start_payload(crate::usage::UtilityJobKind::RadioRouting, "j-9", "u4b", None, 30, 1_000);
+        let s = live_utility_edge(&start, "start", "radio-router", "u4b", 1_000);
+        assert_eq!(s.kind, darkmux_flow::live::LiveKind::Utility);
+        assert_eq!((s.fields["event"].as_str(), s.fields["job"].as_str(), s.fields["job_id"].as_str()), (Some("start"), Some("radio_routing"), Some("j-9")));
+        assert_eq!(s.session_id, None, "routing serves no execution");
+        assert_eq!((s.role.as_deref(), s.model.as_deref(), s.at_ms), (Some("radio-router"), Some("u4b"), 1_000));
+        let bytes = s.to_bytes().unwrap();
+        assert!(darkmux_flow::live::LiveSample::from_datagram(&bytes).is_some(), "the daemon accepts it");
+    }
 
     /// (#2914 review, C7) The window a host-side utility job loads at: the
     /// binding's declared `n_ctx`, silently; else `UNDECLARED_UTILITY_WINDOW`

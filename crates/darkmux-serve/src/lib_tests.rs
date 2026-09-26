@@ -7323,4 +7323,150 @@ mod fleet_cache_wall_clock {
             "a name that never appeared with a uid stays unresolved rather than guessing"
         );
     }
+
 }
+
+    // ─── (#2928) the live channel: fan-out to SSE viewers, no persistence ───
+    mod live_channel {
+        use super::*;
+        use futures::StreamExt;
+        use serial_test::serial;
+
+        fn today_utc_date() -> String {
+            darkmux_flow::day_utc_now()
+        }
+
+        fn sample_bytes(session: &str, gen: u64) -> Vec<u8> {
+            let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, 1_758_700_000_000 + gen, 250);
+            s.session_id = Some(session.to_string());
+            s.fields.insert("generated_chars".into(), serde_json::json!(gen));
+            s.to_bytes().unwrap()
+        }
+
+        async fn open_viewer(app: Router, today: &str) -> axum::body::BodyDataStream {
+            let response = app
+                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().into_data_stream()
+        }
+
+        async fn read_until(body: &mut axum::body::BodyDataStream, needle: &str) -> String {
+            let fut = async {
+                let mut acc = Vec::new();
+                while let Some(Ok(chunk)) = body.next().await {
+                    acc.extend_from_slice(&chunk);
+                    if String::from_utf8_lossy(&acc).contains(needle) {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).into_owned()
+            };
+            tokio::time::timeout(Duration::from_secs(3), fut).await.unwrap_or_default()
+        }
+
+        fn files_under(dir: &std::path::Path) -> usize {
+            fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+        }
+
+        /// Two viewers on the existing SSE stream both receive a sample as a
+        /// named `live` event, and nothing is written anywhere: the flows dir
+        /// the router serves stays empty.
+        #[tokio::test]
+        #[serial]
+        async fn a_sample_fans_out_to_every_viewer_and_persists_nothing() {
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+            let tmp = TempDir::new().unwrap();
+            // Point the process's own flow sink at the same dir, so a record
+            // written anywhere on the live path would land where this test
+            // looks.
+            let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+            unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
+            let today = today_utc_date();
+            let mut a = open_viewer(build_router_local(tmp.path().to_path_buf()), &today).await;
+            let mut b = open_viewer(build_router_local(tmp.path().to_path_buf()), &today).await;
+            // Both subscriptions exist once the handler has run; give the
+            // streams a first poll.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(live_hub::accept(&sample_bytes("fan-out-sess", 42)));
+            let got_a = read_until(&mut a, "fan-out-sess").await;
+            let got_b = read_until(&mut b, "fan-out-sess").await;
+            for got in [&got_a, &got_b] {
+                assert!(got.contains("event: live"), "a named live event: {got:?}");
+                assert!(got.contains("\"generated_chars\":42"), "{got:?}");
+            }
+            let written = files_under(tmp.path());
+            unsafe {
+                match prev_flows {
+                    Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                    None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+                }
+            }
+            assert_eq!(written, 0, "the live channel wrote into the flows dir");
+        }
+
+        /// A malformed or unknown-kind datagram never reaches a viewer; the
+        /// next good one does.
+        #[tokio::test]
+        #[serial]
+        async fn a_malformed_datagram_never_reaches_a_viewer() {
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+            let tmp = TempDir::new().unwrap();
+            let today = today_utc_date();
+            let mut v = open_viewer(build_router_local(tmp.path().to_path_buf()), &today).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!live_hub::accept(b"{\"not\":\"a sample\"}"));
+            assert!(!live_hub::accept(br#"{"v":1,"kind":"shell","at_ms":1,"cadence_ms":250,"fields":{"cmd":"rm"}}"#));
+            assert!(live_hub::accept(&sample_bytes("good-after-bad", 1)));
+            let got = read_until(&mut v, "good-after-bad").await;
+            assert!(got.contains("good-after-bad"));
+            assert!(!got.contains("a sample") && !got.contains("shell"), "{got:?}");
+        }
+
+        /// The real path: a dispatch-side sender, the ingest socket and
+        /// thread, the hub, an SSE viewer.
+        #[tokio::test]
+        #[serial]
+        async fn a_sender_reaches_a_viewer_through_the_ingest_socket() {
+            unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+            let tmp = TempDir::new().unwrap();
+            let sock_dir = TempDir::new().unwrap();
+            let sock = sock_dir.path().join("live.sock");
+            assert!(live_hub::spawn_ingest(sock.clone()).is_some());
+            let today = today_utc_date();
+            let mut v = open_viewer(build_router_local(tmp.path().to_path_buf()), &today).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut tx = darkmux_flow::live::LiveSender::to_path(sock);
+            let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, 5, 250);
+            s.fields.insert("event".into(), serde_json::json!("start"));
+            s.fields.insert("job_id".into(), serde_json::json!("radio_routing-e2e"));
+            assert!(tx.send(&s));
+            let got = read_until(&mut v, "radio_routing-e2e").await;
+            assert!(got.contains("event: live") && got.contains("radio_routing-e2e"), "{got:?}");
+            assert_eq!(files_under(tmp.path()), 0);
+        }
+
+        /// A viewer that falls behind skips what it missed and keeps going:
+        /// the hub is bounded, never a growing queue.
+        #[tokio::test]
+        async fn a_lagging_viewer_skips_rather_than_queues() {
+            let mut events = live_hub::live_events();
+            for i in 0..(live_hub::HUB_CAPACITY as u64 + 50) {
+                live_hub::accept(&sample_bytes("lag-sess", i));
+            }
+            let first = tokio::time::timeout(Duration::from_secs(1), events.next()).await.unwrap();
+            assert!(first.is_some(), "a lagged viewer resumes rather than ending");
+            // The ring held only the newest HUB_CAPACITY: the viewer's next
+            // sample is past the 50 it missed, not the first ever sent.
+            assert!(live_hub::hub().len() <= live_hub::HUB_CAPACITY);
+            let mut rx = live_hub::hub().subscribe();
+            for i in 0..(live_hub::HUB_CAPACITY as u64 + 50) {
+                live_hub::accept(&sample_bytes("lag-sess-2", i));
+            }
+            match rx.try_recv() {
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => assert_eq!(n, 50),
+                other => panic!("expected the oldest 50 to be skipped, got {other:?}"),
+            }
+        }
+    }

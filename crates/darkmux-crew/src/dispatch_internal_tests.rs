@@ -4543,77 +4543,81 @@
         assert_eq!(argv[30], "-e");
         assert_eq!(argv[31], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
 
+        // 5f. (#2928) The live channel's resolved cadence, always forwarded.
+        assert_eq!(argv[32], "-e");
+        assert!(argv[33].starts_with("DARKMUX_LIVE_SAMPLE_MS="), "{}", argv[33]);
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[32], "-v");
+        assert_eq!(argv[34], "-v");
         assert_eq!(
-            argv[33],
+            argv[35],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[34], "--entrypoint");
-        assert_eq!(argv[35], "/darkmux-runtime");
+        assert_eq!(argv[36], "--entrypoint");
+        assert_eq!(argv[37], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[36], "--");
-        assert_eq!(argv[37], "rust:slim"); // image
-        assert_eq!(argv[38], "run"); // runtime subcommand
-        assert_eq!(argv[39], "--model");
-        assert_eq!(argv[40], "llama3-8b");
+        assert_eq!(argv[38], "--");
+        assert_eq!(argv[39], "rust:slim"); // image
+        assert_eq!(argv[40], "run"); // runtime subcommand
+        assert_eq!(argv[41], "--model");
+        assert_eq!(argv[42], "llama3-8b");
         // (Security audit, #2114 resume follow-up) Unconditional, every
         // dispatch — see `DockerRunConfig::role_id`'s own doc.
-        assert_eq!(argv[41], "--role-id");
-        assert_eq!(argv[42], "test-role");
+        assert_eq!(argv[43], "--role-id");
+        assert_eq!(argv[44], "test-role");
         // (#2386) Unconditional too — the runtime needs its finding-key
         // namespace on every dispatch. See `DockerRunConfig::session_id`.
-        assert_eq!(argv[43], "--session-id");
-        assert_eq!(argv[44], "sess-test");
-        assert_eq!(argv[45], "--system");
-        assert_eq!(argv[46], "You are a coding assistant.");
+        assert_eq!(argv[45], "--session-id");
+        assert_eq!(argv[46], "sess-test");
+        assert_eq!(argv[47], "--system");
+        assert_eq!(argv[48], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[47], "--prompt-file");
-        assert_eq!(argv[48], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[49], "--prompt-file");
+        assert_eq!(argv[50], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[49], "--json");
+        assert_eq!(argv[51], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[50], "--allowed-tools");
-        assert_eq!(argv[51], "exec,edit");
+        assert_eq!(argv[52], "--allowed-tools");
+        assert_eq!(argv[53], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[52], "--compact-threshold-tokens");
-        assert_eq!(argv[53], "4096");
-        assert_eq!(argv[54], "--compactor-model");
-        assert_eq!(argv[55], "util-model");
-        assert_eq!(argv[56], "--compact-threshold-ratio");
-        assert_eq!(argv[57], "0.75");
-        assert_eq!(argv[58], "--context-window");
-        assert_eq!(argv[59], "32000");
+        assert_eq!(argv[54], "--compact-threshold-tokens");
+        assert_eq!(argv[55], "4096");
+        assert_eq!(argv[56], "--compactor-model");
+        assert_eq!(argv[57], "util-model");
+        assert_eq!(argv[58], "--compact-threshold-ratio");
+        assert_eq!(argv[59], "0.75");
+        assert_eq!(argv[60], "--context-window");
+        assert_eq!(argv[61], "32000");
         // (#2808) The COMPACTOR's own window, and it must be DISTINCT from
         // the primary's 32,000 above — passing the primary's here would be
         // the defect, not the fix. Without this flag the runtime bounds its
         // compaction excerpt by nothing and posts a ~30,000-token excerpt to
         // a 16,000-token model, which LMStudio refuses with HTTP 400 every
         // time.
-        assert_eq!(argv[60], "--compactor-context-window");
-        assert_eq!(argv[61], "16000");
-        assert_eq!(argv[62], "--compact-strategy");
-        assert_eq!(argv[63], "structured-slot");
-        assert_eq!(argv[64], "--bail-after-compactions");
-        assert_eq!(argv[65], "10");
-        assert_eq!(argv[66], "--compactor-custom-instructions");
-        assert_eq!(argv[67], "Be terse.");
+        assert_eq!(argv[62], "--compactor-context-window");
+        assert_eq!(argv[63], "16000");
+        assert_eq!(argv[64], "--compact-strategy");
+        assert_eq!(argv[65], "structured-slot");
+        assert_eq!(argv[66], "--bail-after-compactions");
+        assert_eq!(argv[67], "10");
+        assert_eq!(argv[68], "--compactor-custom-instructions");
+        assert_eq!(argv[69], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[68], "--feedback-templates-json");
+        assert_eq!(argv[70], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[69].contains("error"));
-        assert!(argv[69].contains("An error occurred"));
+        assert!(argv[71].contains("error"));
+        assert!(argv[71].contains("An error occurred"));
 
         // Total arg count: 66 (0..=65) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
@@ -4623,7 +4627,7 @@
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
         // +2 for `--session-id <id>` (#2386). +1 for `--init` (#2481).
         // +2 for `--compactor-context-window <n>` (#2808).
-        assert_eq!(argv.len(), 70);
+        assert_eq!(argv.len(), 72);
     }
 
     // ─── #2904: the container's LMStudio base URL follows the configured one ───
@@ -5891,6 +5895,29 @@
             argv.windows(2).any(|w| w[0] == "-e" && w[1] == "DARKMUX_MAX_PAUSE_MS=120000"),
             "expected -e DARKMUX_MAX_PAUSE_MS=120000 in argv: {argv:?}"
         );
+    }
+
+    /// (#2928) The live cadence reaches the container as the RESOLVED value
+    /// (a non-default, so a hard-coded literal cannot pass), before the image.
+    #[test]
+    #[serial]
+    fn build_docker_run_argv_forwards_the_resolved_live_cadence() {
+        let k = "DARKMUX_LIVE_SAMPLE_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "500") };
+        let argv = build_docker_run_argv(&base_argv_config());
+        unsafe { std::env::set_var(k, "0") };
+        let off = build_docker_run_argv(&base_argv_config());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let at = argv.iter().position(|a| a == "DARKMUX_LIVE_SAMPLE_MS=500").expect("forwarded");
+        assert_eq!(argv[at - 1], "-e");
+        assert!(at < argv.iter().position(|a| a == "--").unwrap(), "a docker flag, not a runtime arg");
+        assert!(off.iter().any(|a| a == "DARKMUX_LIVE_SAMPLE_MS=0"), "off is forwarded too, never omitted");
     }
 
     // ─── N6 (final #2110/#2109 re-check): stale pace.json cleanup ───
@@ -10550,6 +10577,134 @@
             original_deadline,
             "a writing tick must not reset the inactivity deadline"
         );
+    }
+
+    /// (#2928) A simulated execution's trajectory: an opener, 1 s of steady
+    /// visible text, a 60 ms think burst, more text, then one compaction
+    /// start and its call. Event times are fixed, so the live sampler's
+    /// output is deterministic.
+    fn live_fixture_lines() -> Vec<String> {
+        let mut lines = vec![
+            r#"{"type":"model.streaming.start","seq":1,"ts":1758700000000,"system_chars":4000,"prompt_chars":9000}"#.to_string(),
+        ];
+        let (mut gen, mut vis) = (0u64, 0u64);
+        for i in 1..=60u64 {
+            gen += 12;
+            // chunks 20..=22 are reasoning only: the visible count holds.
+            if !(20..=22).contains(&i) {
+                vis += 12;
+            }
+            lines.push(format!(
+                r#"{{"type":"model.partial","seq":1,"partial_index":{i},"delta_chars":12,"cumulative_chars":{vis},"generated_chars":{gen},"ts":{}}}"#,
+                1_758_700_000_000u64 + i * 20
+            ));
+        }
+        lines.push(r#"{"type":"model.streaming.end","seq":1,"partial_count":60,"total_content_chars":684,"tool_calls_count":0,"observations":0,"idle_ticks":7,"idle_tick_us":91,"ts":1758700001300}"#.to_string());
+        lines.push(r#"{"type":"compaction.start","generation":1,"requested_model":"util-4b","ts":1758700001400}"#.to_string());
+        lines.push(r#"{"type":"compaction.call","generation":1,"requested_model":"util-4b","usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120},"ts":1758700001700}"#.to_string());
+        lines
+    }
+
+    /// (#2928) Every record the tailer wrote into the isolated flows dir,
+    /// reduced to its action (never a full record: those carry the host's
+    /// `machine_uid`).
+    fn record_actions_in(flows: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(flows) {
+            for e in entries.flatten() {
+                for line in std::fs::read_to_string(e.path()).unwrap_or_default().lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    if let Some(a) = v.get("action").and_then(|a| a.as_str()) {
+                        out.push(a.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn run_live_fixture(live: Option<darkmux_flow::live::LiveSender>) -> (Vec<String>, TrajectorySummary) {
+        let isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let shared = Arc::new(Mutex::new(Instant::now()));
+        let mut state = TailerState::new(traj_path.clone(), "live-sess".into(), "coder".into(), "work-35b".into(), shared, 600)
+            .with_compactor_model(Some("util-4b".into()))
+            .with_live(live, 250);
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        for l in live_fixture_lines() {
+            writeln!(f, "{l}").unwrap();
+        }
+        drop(f);
+        state.poll_and_emit();
+        state.live_flush(u64::MAX);
+        state.finish_live();
+        (record_actions_in(&isolated.path().join("flows")), state.summary)
+    }
+
+    /// (#2928) The live channel forwards samples to the daemon's socket and
+    /// adds NOTHING to the flow log: the same trajectory with and without it
+    /// writes the identical record sequence (same actions, same count).
+    #[test]
+    #[serial]
+    fn tailer_live_channel_forwards_samples_and_writes_no_record() {
+        let (without, _) = run_live_fixture(None);
+        let sock_dir = TempDir::new().unwrap();
+        let sock = sock_dir.path().join("live.sock");
+        let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(sock)));
+        assert!(!without.is_empty(), "the fixture writes durable records");
+        assert_eq!(with, without, "the live channel added or changed flow records");
+
+        let mut samples = Vec::new();
+        let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
+        while let Ok(n) = rx.recv(&mut buf) {
+            samples.push(darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).expect("a well-formed sample"));
+        }
+        let model: Vec<_> = samples.iter().filter(|s| s.kind == darkmux_flow::live::LiveKind::Model).collect();
+        let utility: Vec<_> = samples.iter().filter(|s| s.kind == darkmux_flow::live::LiveKind::Utility).collect();
+        // 1.2 s of chunks at a 250 ms cadence is ~5 steady samples, plus the
+        // opener and the four edges of the think burst; far below the 61
+        // events the runtime wrote.
+        assert!((7..=14).contains(&model.len()), "{} model samples", model.len());
+        assert!(model[0].fields.contains_key("prompt_chars"), "the opener goes first");
+        assert!(model.iter().all(|s| s.session_id.as_deref() == Some("live-sess") && s.cadence_ms == 250));
+        let gens: Vec<u64> = model.iter().filter_map(|s| s.fields["generated_chars"].as_u64()).collect();
+        // Both edges of the burst: the last visible chunk (19) and the first
+        // reasoning one (20), then the burst's last (22) and the first
+        // visible chunk after it (23).
+        for edge in [19 * 12, 20 * 12, 22 * 12, 23 * 12] {
+            assert!(gens.contains(&edge), "burst edge {edge} missing from {gens:?}");
+        }
+        // The stream's last state goes out when its window closes (the
+        // post-poll flush), not only when a newer chunk pushes it.
+        assert_eq!(gens.last(), Some(&(60 * 12)), "the final chunk was stranded: {gens:?}");
+        assert_eq!(utility.len(), 2, "the compaction's start and end");
+        assert_eq!(utility[0].fields["event"], "start");
+        assert_eq!(utility[1].fields["event"], "end");
+        assert_eq!(utility[0].fields["job_id"], utility[1].fields["job_id"]);
+        assert_eq!(utility[1].fields["duration_ms"], 300);
+        assert_eq!(utility[0].model.as_deref(), Some("util-4b"));
+
+        let live = &summary.live;
+        assert_eq!(live.samples_sent as usize, samples.len(), "the summary counts what was sent");
+        assert_eq!(live.samples_dropped, 0);
+        assert_eq!((live.cadence_ms, live.runtime_ticks, live.runtime_tick_us), (250, 7, 91));
+        assert!(live.bytes > 0);
+    }
+
+    /// (#2928) No daemon listening: the tailer carries on, every sample is a
+    /// counted drop, and the flow log is still untouched.
+    #[test]
+    #[serial]
+    fn tailer_live_channel_with_no_daemon_drops_and_carries_on() {
+        let (without, _) = run_live_fixture(None);
+        let dir = TempDir::new().unwrap();
+        let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(dir.path().join("absent.sock"))));
+        assert_eq!(with, without);
+        assert_eq!(summary.live.samples_sent, 0);
+        assert!(summary.live.samples_dropped > 0);
     }
 
     /// (#2889 review, M2) Two-event helper: write `lines` as one trajectory

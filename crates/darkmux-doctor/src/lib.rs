@@ -183,6 +183,7 @@ pub fn run() -> DoctorReport {
         check_reasoning_checkpoint_interval(),
         check_max_stall_recoveries(),
         check_host_sampler_interval(),
+        check_live_channel(),
         // (#2775) Immediately after the sampler cadence it depends on — the
         // one combination worth reporting is "rollup on, sampler off".
         check_machine_rollup(),
@@ -2941,6 +2942,55 @@ fn check_dispatch_free_concurrency() -> Check {
         ),
         hint: None,
     }
+}
+
+/// (#2928) Surface the live channel's resolved cadence with provenance, the
+/// clamp when one applied, and whether this machine's daemon is listening
+/// for samples. Cadence is a recorded knob, never adaptive-silent: a value
+/// outside 100..=1000 is clamped and this row says so (Warn), rather than
+/// the channel quietly running at a number nobody wrote.
+fn check_live_channel() -> Check {
+    let name = "live channel";
+    let c = darkmux_types::config_access::live_cadence();
+    let provenance = match c.source {
+        darkmux_types::config_access::Source::Env => "from DARKMUX_LIVE_SAMPLE_MS env",
+        darkmux_types::config_access::Source::Config => "from config.json",
+        darkmux_types::config_access::Source::BuiltIn => "default",
+    };
+    if !c.enabled() {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "off ({provenance}) — viewers see model state at the durable heartbeat \
+                 cadence (2 s); runtime.live_sample_ms 0 turns the channel off"
+            ),
+            hint: None,
+        };
+    }
+    let socket = darkmux_flow::live::local_socket_path();
+    let listening = if socket.exists() { "the daemon's socket is present" } else { "no daemon socket yet (start `darkmux serve`)" };
+    let base = format!(
+        "{} ms ({provenance}) — model state and utility jobs reach this machine's viewers at \
+         this cadence through the local daemon ({}, {listening}); never written to the flow \
+         log, Redis or the audit chain. Durable heartbeats stay at 2 s",
+        c.effective_ms,
+        socket.display()
+    );
+    if c.clamped() {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!("{base}. Configured {} ms was clamped to {} ms", c.configured_ms, c.effective_ms),
+            hint: Some(format!(
+                "set runtime.live_sample_ms between {} and {} (or 0 for off): \
+                 `darkmux config set runtime.live_sample_ms 250`",
+                darkmux_types::config_access::LIVE_SAMPLE_MS_MIN,
+                darkmux_types::config_access::LIVE_SAMPLE_MS_MAX
+            )),
+        };
+    }
+    Check { name: name.into(), status: Status::Pass, message: base, hint: None }
 }
 
 /// (#2094) Surface the resolved `runtime.turn_delay_ms` with provenance —
@@ -9790,6 +9840,45 @@ mod tests {
         assert!(!check.message.contains("env"), "the env tier is absent here: {}", check.message);
     }
 
+    // ─── (#2928) check_live_channel — cadence, provenance, clamp, off ─
+
+    fn live_channel_check_with(env: Option<&str>) -> Check {
+        let k = "DARKMUX_LIVE_SAMPLE_MS";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            match env {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let check = check_live_channel();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        check
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_live_channel_names_the_cadence_the_clamp_and_off() {
+        let d = live_channel_check_with(None);
+        assert_eq!(d.status, Status::Pass, "{}", d.message);
+        assert!(d.message.starts_with("250 ms (default)"), "{}", d.message);
+        assert!(d.message.contains("never written to the flow log"), "{}", d.message);
+        let e = live_channel_check_with(Some("500"));
+        assert!(e.message.starts_with("500 ms (from DARKMUX_LIVE_SAMPLE_MS env)"), "{}", e.message);
+        let clamped = live_channel_check_with(Some("20"));
+        assert_eq!(clamped.status, Status::Warn, "a clamp is reported, never silent");
+        assert!(clamped.message.contains("Configured 20 ms was clamped to 100 ms"), "{}", clamped.message);
+        assert!(clamped.hint.as_deref().unwrap_or("").contains("runtime.live_sample_ms"));
+        let off = live_channel_check_with(Some("0"));
+        assert_eq!(off.status, Status::Pass);
+        assert!(off.message.starts_with("off (from DARKMUX_LIVE_SAMPLE_MS env)"), "{}", off.message);
+    }
+
     // ─── (#2394) check_dispatch_free_concurrency — resolved state + provenance ─
 
     /// Scopes `DARKMUX_DISPATCH_FREE_CONCURRENCY` for one check and restores
@@ -13026,7 +13115,8 @@ mod tests {
         // 65 with #2902's endpoints check, plus three 4.0 retirement checks:
         // (#2913) `check_removed_notebook_settings`, and (#2912/#2913 review)
         // `check_retired_role_leftovers` and `check_role_skill_references`.
-        let expected = 68 + darkmux_eureka::all_rules().len();
+        // (#2928) 69: `check_live_channel` joined the static array.
+        let expected = 69 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

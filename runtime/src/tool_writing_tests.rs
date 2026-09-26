@@ -215,3 +215,79 @@ fn a_silence_after_the_arguments_arrived_writes_no_writing_events() {
         "a partial after the arguments landed names no writing phase"
     );
 }
+
+/// (#2928) The silence tick follows the host-forwarded live cadence, clamped
+/// like the host clamps it, and keeps the pre-#2928 1 s when the channel is
+/// off, the var is absent or it does not parse.
+#[test]
+fn the_silence_tick_follows_the_live_cadence() {
+    assert_eq!(silence_tick(Some("250")), Duration::from_millis(250));
+    assert_eq!(silence_tick(Some(" 500 ")), Duration::from_millis(500));
+    assert_eq!(silence_tick(Some("0")), STREAM_TICK, "off keeps the 1 s tick");
+    assert_eq!(silence_tick(None), STREAM_TICK, "an older host forwards nothing");
+    assert_eq!(silence_tick(Some("fast")), STREAM_TICK);
+    assert_eq!(silence_tick(Some("5")), Duration::from_millis(100), "never faster than 100 ms");
+    assert_eq!(silence_tick(Some("60000")), Duration::from_secs(1), "never slower than 1 s");
+}
+
+/// (#2928) The runtime stamps its own sampling cost: the stream's end event
+/// counts the silence ticks it woke for and the time spent on them.
+#[test]
+#[serial_test::serial]
+fn the_stream_end_stamps_its_silence_ticks_and_their_cost() {
+    let ws = tempfile::Builder::new().prefix("tool-writing-cost").tempdir().unwrap();
+    run(sse_server_scripted(probe_shaped_stream()), ws.path());
+    let evs = events(ws.path());
+    let end = evs.iter().find(|e| e["type"] == "model.streaming.end").expect("a stream end");
+    let writing = evs.iter().filter(|e| e["type"] == "model.tool_call.writing").count() as u64;
+    let ticks = end["idle_ticks"].as_u64().expect("idle_ticks stamped");
+    assert!(ticks >= writing && ticks >= 2, "every writing event is a tick: ticks={ticks} writing={writing}");
+    assert!(end["idle_tick_us"].as_u64().is_some(), "the cost is stamped: {end}");
+}
+
+/// (#2928) The full loop reads the host-forwarded cadence: with
+/// `DARKMUX_LIVE_SAMPLE_MS=100`, a 600 ms silence is ticked through at
+/// 100 ms, where the fixed 1 s tick would not wake once.
+#[test]
+#[serial_test::serial]
+fn the_loop_ticks_at_the_forwarded_live_cadence() {
+    let ws = tempfile::Builder::new().prefix("live-cadence-loop").tempdir().unwrap();
+    let script = vec![
+        (Duration::ZERO, chunk(serde_json::json!({"content": "one"}), None)),
+        (Duration::from_millis(600), chunk(serde_json::json!({"content": " two"}), None)),
+        (Duration::ZERO, chunk(serde_json::json!({}), Some("stop"))),
+    ];
+    let url = sse_server_scripted(script);
+    let prev = std::env::var("DARKMUX_LIVE_SAMPLE_MS").ok();
+    unsafe { std::env::set_var("DARKMUX_LIVE_SAMPLE_MS", "100") };
+    let client = LmStudioClient::with_base_url_and_read_timeout(url, Duration::from_secs(10));
+    let mut trajectory = Trajectory::open(ws.path());
+    let cfg = crate::compaction::CompactionConfig::never_compact();
+    let result = super::run(
+        &client,
+        &client,
+        "m",
+        vec![Message::user("say two words")],
+        &[],
+        &mut trajectory,
+        true,
+        &cfg,
+        Some(1),
+        None,
+        None,
+        None,
+        std::collections::BTreeMap::new(),
+        None,
+    );
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LIVE_SAMPLE_MS", v),
+            None => std::env::remove_var("DARKMUX_LIVE_SAMPLE_MS"),
+        }
+    }
+    result.expect("the loop completes");
+    let evs = events(ws.path());
+    let end = evs.iter().find(|e| e["type"] == "model.streaming.end").expect("a stream end");
+    let ticks = end["idle_ticks"].as_u64().unwrap();
+    assert!(ticks >= 3, "600 ms of silence at a 100 ms tick wakes several times, got {ticks}");
+}

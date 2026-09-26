@@ -77,8 +77,19 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.61.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
 // Version history:
+//   1.62.0 (#2928, the live channel): additive, one payload block.
+//           `dispatch complete.payload.live`: the live channel's own cost for
+//           the execution — `cadence_ms` (0 when the channel was off),
+//           `samples_sent`, `samples_dropped`, `forward_us` (time the
+//           dispatch spent handing samples to the local daemon), `bytes`,
+//           and the runtime's `runtime_ticks` / `runtime_tick_us` (its
+//           silence ticks and their handling cost). The live SAMPLES are
+//           never flow records: they travel dispatch -> local daemon ->
+//           SSE `event: live` and are dropped, so no action is added and
+//           nothing new reaches a day file, Redis or the audit chain.
+//           Readers ignoring the key see 1.61.0 unchanged.
 //   1.61.0 (#2915, utility work is lean but VISIBLE): additive, two
 //           actions and utility fields on the usage record.
 //

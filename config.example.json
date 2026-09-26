@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.29",
+  "schema_version": "1.30",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -29,6 +29,7 @@
     "acp_idle_exit_minutes": 30,
     "turn_delay_ms": 0,
     "host_sampler_interval_ms": 5000,
+    "live_sample_ms": 250,
     "thermal": {
       "enabled": true,
       "pause_at": "serious",

@@ -59,6 +59,8 @@ pub use runs::{
     AbandonReason, DispatchSessionEvidence, Run, RunKind, RunStatus, RunsWithUsage,
 };
 pub mod source_state;
+/// (#2928) The live channel's receive + SSE fan-out — see the module doc.
+mod live_hub;
 /// (#2902 step 2b) The one token sum, shared by `run list` and `/runs` —
 /// see the module's own doc.
 pub mod usage_sum;
@@ -1335,6 +1337,22 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // record".
         let _presence_handle = darkmux_flow::presence::spawn_emitter_thread();
 
+        // (#2928) The live channel's ingest socket, keyed by the port this
+        // daemon actually bound (so a preview daemon on another port never
+        // receives another's samples). Bound only AFTER the TCP bind above
+        // succeeded, which is what makes replacing a stale socket safe.
+        // Off when `runtime.live_sample_ms` is 0.
+        let live_socket = {
+            let liveness = darkmux_types::dispatch_liveness::liveness_dir();
+            let home = liveness.parent().map(std::path::Path::to_path_buf).unwrap_or(liveness);
+            darkmux_flow::live::socket_path_for(&home, addr.port())
+        };
+        let _live_handle = if darkmux_types::config_access::live_cadence().enabled() {
+            live_hub::spawn_ingest(live_socket.clone())
+        } else {
+            None
+        };
+
         // (#647) Presence edge-recording for playback. Self-emit this machine's
         // `machine.online` open-edge now (it's online), and spawn the reconciler
         // that records `machine.offline` close-edges when a peer's presence key
@@ -1376,6 +1394,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         tokio::spawn(async move {
             shutdown_signal().await;
             host_sampler_stop.store(true, Ordering::SeqCst);
+            live_hub::remove_socket(&live_socket);
             // (#2476, reordered in review round 2 — MUST FIX 3) Reap the
             // fleet runner's in-flight dispatch child, and give it a
             // bounded window to reach quiescence, BEFORE telling axum to
@@ -1503,6 +1522,16 @@ async fn health(peer: Option<ConnectInfo<SocketAddr>>) -> axum::Json<serde_json:
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
         "open_file_limit": if loopback_caller { current_open_file_limit() } else { None },
+        // (#2928) The live channel as this daemon runs it: the cadence knob
+        // and the ingest's own counters, so its cost and its traffic are
+        // readable without a debugger. Never a sample itself.
+        "live": {
+            "sample_ms": darkmux_types::config_access::live_sample_ms(),
+            "received": live_hub::stats().received.load(Ordering::Relaxed),
+            "rejected": live_hub::stats().rejected.load(Ordering::Relaxed),
+            "handle_us": live_hub::stats().handle_ns.load(Ordering::Relaxed) / 1_000,
+            "viewers": live_hub::hub().receiver_count(),
+        },
     }))
 }
 
@@ -3249,6 +3278,14 @@ async fn flow_stream_handler(
             let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
             Box::pin(build_tail_stream(path, start_offset))
         };
+
+    // (#2928) The live channel rides the same connection as named `live`
+    // events, so an older viewer (which listens only for unnamed `message`
+    // events) ignores them, and a viewer needs no second stream or slot.
+    // Local-daemon only: these are samples from THIS machine's dispatches,
+    // whichever path (Redis or file) the flow records above come from.
+    let event_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
+        Box::pin(futures::stream::select(event_stream, live_hub::live_events()));
 
     // (#925) Carry the SSE slot inside the stream so the open-count decrement
     // happens exactly when the connection ends or the client disconnects.

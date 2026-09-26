@@ -1410,6 +1410,7 @@ impl Trajectory {
     /// summary event for the same turn. Records totals collected during
     /// the stream so the operator sees a one-line summary in
     /// `trajectory.jsonl` even without parsing all the partials. (#205)
+    #[allow(clippy::too_many_arguments)]
     pub fn append_model_streaming_end(
         &mut self,
         seq: u32,
@@ -1418,6 +1419,10 @@ impl Trajectory {
         tool_calls_count: usize,
         observations: u32,
         chars_per_token: Option<f32>,
+        // (#2928) Silence ticks this stream woke for, and the microseconds
+        // spent handling them: the runtime's own live-sampling cost.
+        idle_ticks: u64,
+        idle_tick_us: u64,
     ) {
         // (#2836) `observations` is how many times the runtime looked at
         // this call's output WITHOUT touching it. Folded into the existing
@@ -1444,6 +1449,8 @@ impl Trajectory {
             "tool_calls_count": tool_calls_count,
             "observations": observations,
             "chars_per_token": chars_per_token,
+            "idle_ticks": idle_ticks,
+            "idle_tick_us": idle_tick_us,
             "ts": unix_ms(),
         }));
     }
