@@ -119,11 +119,21 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     apply_inject_context(&mut loaded_workload, opts.inject_context.as_deref());
 
     let registry_loaded = load_registry(opts.config_path.as_deref())?;
-    let profile_name = opts
-        .profile_name
+    // (#2902, operator decision 2026-09-26) With no `--profile`, the run is
+    // on the profile the workload's ROLE is bound to (`role_profiles`),
+    // else `default_profile`: the same precedence `darkmux dispatch <role>`
+    // resolves, so the run's `profile=` stamp names the profile that ran.
+    // The role is the manifest's, else `runtime.default_role`; a workload
+    // that names neither keeps the provider's own default role and the
+    // `default_profile` stamp, as before.
+    let run_role = loaded_workload
+        .manifest
+        .workload
+        .role
         .clone()
-        .or_else(|| registry_loaded.registry.default_profile.clone())
-        .ok_or_else(|| anyhow!("no profile specified and no default_profile in registry"))?;
+        .or_else(darkmux_types::config_access::default_role);
+    let mapped = run_role.as_deref().and_then(darkmux_types::config_access::role_profile);
+    let profile_name = run_profile_name(opts.profile_name.as_deref(), run_role.as_deref(), mapped, &registry_loaded.registry)?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
 
     // (#365/#544) Best-effort provenance guard: if the operator swapped a
@@ -614,8 +624,52 @@ pub(crate) fn resolve_source_sandbox(
     }
 }
 
+/// The profile a lab run is on (see the call site): an explicit
+/// `--profile`, else the role's `role_profiles` binding (`mapped`, which must
+/// name a defined profile: a loud error otherwise, contract 7), else
+/// `default_profile`. Pure over `mapped` so the bound arm is testable
+/// (`config_access` is empty under test builds, #811).
+fn run_profile_name(
+    requested: Option<&str>,
+    role: Option<&str>,
+    mapped: Option<String>,
+    registry: &darkmux_types::ProfileRegistry,
+) -> Result<String> {
+    if let Some(p) = requested {
+        return Ok(p.to_string());
+    }
+    if let (Some(role), Some(mapped)) = (role, mapped) {
+        let binding = darkmux_profiles::profiles::RoleBinding::Mapped(mapped);
+        return Ok(darkmux_profiles::profiles::resolve_role_profile_with(role, &binding, registry)?.profile_name);
+    }
+    registry
+        .default_profile
+        .clone()
+        .ok_or_else(|| anyhow!("no profile specified and no default_profile in registry"))
+}
+
 #[cfg(test)]
 mod tests {
+    /// (#2902) A lab run with no `--profile` is stamped (and run) on the
+    /// profile its role is bound to, like `darkmux dispatch <role>`; an
+    /// explicit `--profile` still wins; unbound falls to `default_profile`;
+    /// a binding to an undefined profile is loud.
+    #[test]
+    fn a_lab_run_honors_the_roles_profile_binding() {
+        let reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{"fast":{"models":[{"id":"a","n_ctx":1}]},"big":{"models":[{"id":"b","n_ctx":2}]}},
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        let name = |req: Option<&str>, mapped: Option<&str>| {
+            super::run_profile_name(req, Some("coder"), mapped.map(str::to_string), &reg)
+        };
+        assert_eq!(name(None, Some("big")).unwrap(), "big");
+        assert_eq!(name(Some("fast"), Some("big")).unwrap(), "fast");
+        assert_eq!(name(None, None).unwrap(), "fast");
+        assert!(format!("{:#}", name(None, Some("ghost")).unwrap_err()).contains("ghost"));
+    }
+
     use super::*;
     use tempfile::TempDir;
 
