@@ -3419,6 +3419,11 @@ body {
   margin-top: 2px;
   opacity: 0.8;
 }
+/* The figure keeps its own case ("17.62k", like the chips above); only the
+   word is uppercased. */
+.savpart .savpartv {
+  text-transform: none;
+}
 .savc .scl {
   font: calc(10px * var(--fs-scale))/1.5 var(--font-mono);
   color: var(--dim);

@@ -194,13 +194,16 @@ describe("FleetLens", () => {
       ],
     });
     const { container } = renderFleetLens();
-    await waitFor(() => expect(screen.getByText("140 cached")).toBeInTheDocument());
-    expect(screen.getByText("145 utility")).toBeInTheDocument();
+    const part = (sel: string) => Array.from(container.querySelectorAll(sel)).map((e) => e.textContent);
+    await waitFor(() => expect(part(".savc .savpart")).toEqual(["140 cached"]));
+    expect(part(".savlead .savpart")).toEqual(["145 utility"]);
     // The part lines sit with their parents: cached inside the INPUT chip,
-    // utility beside the ALL TOKENS label.
-    const cached = screen.getByText("140 cached");
+    // utility beside the ALL TOKENS label. The figure is its own span so only
+    // the word is uppercased ("17.62k utility", not "17.62K").
+    const cached = container.querySelector(".savc .savpart")!;
     expect(cached.closest(".savc")?.querySelector(".scl")?.textContent).toBe("input");
-    expect(screen.getByText("145 utility").closest(".savlead")).not.toBeNull();
+    expect(cached.querySelector(".savpartv")?.textContent).toBe("140");
+    expect(container.querySelector(".savlead .savpart .savpartv")?.textContent).toBe("145");
     // No chip is labeled cached or utility on its own.
     const labels = Array.from(container.querySelectorAll(".savc .scl")).map((e) => e.textContent);
     expect(labels).not.toContain("cached");

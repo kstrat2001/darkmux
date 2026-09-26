@@ -108,12 +108,12 @@ function machineRunsHash(uid: string, runningSessionIds: string[]): string | nul
  * own doc in `styles.css`). `.scv` is a `<div>`, matching `.savnum`'s own
  * block-fills-its-track sizing, so only a height floor (`minHeight="1.1em"`,
  * `.savc .scv`'s own line-height) is needed. */
-function Chip({ value, label, cls, loading, part }: { value?: string | number; label: string; cls?: string; loading?: boolean; part?: string | null }) {
+function Chip({ value, label, cls, loading, part }: { value?: string | number; label: string; cls?: string; loading?: boolean; part?: { value: string; label: string } | null }) {
   return (
     <div className={`savc${cls ? ` ${cls}` : ""}`}>
       {loading ? <Shimmer as="div" className="scv" minHeight="1.1em" /> : <div className="scv">{value}</div>}
       <div className="scl">{label}</div>
-      {part && !loading ? <div className="savpart">{part}</div> : null}
+      {part && !loading ? <div className="savpart"><span className="savpartv">{part.value}</span> {part.label}</div> : null}
     </div>
   );
 }
@@ -231,7 +231,7 @@ function SavingsHero({
               layout's column-reverse keeps label and part together. */}
           <div className="savlblwrap">
             <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
-            {t.utility && settled ? <div className="savpart">{fmtC(t.utility)} utility</div> : null}
+            {t.utility && settled ? <div className="savpart"><span className="savpartv">{fmtC(t.utility)}</span> utility</div> : null}
           </div>
         </div>
         <div className="savclasses">
@@ -245,7 +245,7 @@ function SavingsHero({
               figure it belongs to, never as a peer chip. INPUT + GENERATED equal
               ALL TOKENS whenever providers report total = prompt +
               completion; no filler chip covers a provider total above it. */}
-          <Chip value={fmtC(t.input)} loading={!settled} label="input" part={t.cached != null ? `${fmtC(t.cached)} cached` : null} />
+          <Chip value={fmtC(t.input)} loading={!settled} label="input" part={t.cached != null ? { value: fmtC(t.cached), label: "cached" } : null} />
           <Chip value={fmtC(t.generated)} loading={!settled} label="generated" cls="gen" />
           <Chip value={t.runs} loading={!settled} label={`dispatch${t.runs === 1 ? "" : "es"}`} />
         </div>
