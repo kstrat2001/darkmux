@@ -5829,7 +5829,7 @@ fn run_list_usage_breakdown_end_to_end() {
     let usage = |sid: &str, payload: serde_json::Value| {
         serde_json::json!({ "ts": now, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": sid, "handle": "coder", "payload": payload })
     };
-    let records = vec![
+    let records = [
         serde_json::json!({ "ts": now, "action": "dispatch start", "session_id": "sess-modern", "handle": "coder" }),
         usage("sess-modern", serde_json::json!({ "call_kind": "turn", "purpose": "work", "requested_model": "qwen-a", "reported_model": "qwen-a-served", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200, "cached_tokens": 300 })),
         usage("sess-modern", serde_json::json!({ "call_kind": "compaction", "purpose": "utility", "requested_model": "util-4b", "endpoint": "http://127.0.0.1:1234/v1", "token_source": "provider", "prompt_tokens": 80, "completion_tokens": 10, "total_tokens": 90 })),

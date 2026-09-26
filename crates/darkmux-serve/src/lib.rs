@@ -3430,7 +3430,7 @@ pub(crate) fn for_each_flow_record_across_days(
 /// `YYYY-MM-DD`, string-comparable — filenames sort the same as their
 /// dates). A SEPARATE, smaller primitive rather than adding an optional
 /// range param to the unbounded walker — matching this crate's existing
-/// precedent (`runs::for_each_recent_flow_record`) of keeping a bounded
+/// precedent (`runs::for_each_flow_record_from`) of keeping a bounded
 /// scan physically distinct from the full-history one its OTHER callers
 /// still need (`/flow-mission/:id`, the catalog endpoints' own
 /// `collect_records_by_field` walk).
