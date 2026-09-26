@@ -230,8 +230,11 @@ fn resolve_local_placement_inner_with(
             return Err(ResolutionFailed(format!("select_model: {error}")))
         }
     };
-    if !target.is_managed() {
-        return Err(PlacementMiss::Remote);
+    // (#2902 review C4) Exhaustive on the kind, so a new kind is a compile
+    // error at the placement decision.
+    match target.kind {
+        darkmux_types::EndpointKind::Managed(_) => {}
+        darkmux_types::EndpointKind::Unmanaged => return Err(PlacementMiss::Remote),
     }
     let pm = &target.model;
     // (#2902 step 4) The one n_ctx rule (`ProfileModel::require_n_ctx`).

@@ -2594,8 +2594,14 @@ fn try_resolve_remote_target(
         opts.config_path.as_deref(),
         opts.allow_utility_model,
     )? {
-        Some(t) if !t.is_managed() => t,
-        _ => return Ok(None), // managed ⇒ container path
+        // (#2902 review C4) An exhaustive match on the kind, so a new kind
+        // (#2916's fleet machine) is a compile error here, not a silent
+        // fall onto one arm.
+        Some(t) => match t.kind {
+            darkmux_types::EndpointKind::Unmanaged => t,
+            darkmux_types::EndpointKind::Managed(_) => return Ok(None), // managed ⇒ container path
+        },
+        None => return Ok(None),
     };
     // (#1698 Packet B2) `system_prompt_override` is honored HERE too, not
     // just in `dispatch_local_single_shot` — a caller-supplied override
@@ -2677,7 +2683,11 @@ pub fn dispatch_resolves_remote(
     };
     // (#2914) A work question: the utility model is set aside here too.
     match resolve_target(role, profile_name, config_path, false) {
-        Ok(Some(t)) => !t.is_managed(),
+        // (#2902 review C4) Exhaustive on the kind; see `try_resolve_remote_target`.
+        Ok(Some(t)) => match t.kind {
+            darkmux_types::EndpointKind::Unmanaged => true,
+            darkmux_types::EndpointKind::Managed(_) => false,
+        },
         // No profile model resolves ⇒ the container path's local fallback.
         Ok(None) => false,
         // A quarantined profile (#1282) — the dispatch itself is about to
@@ -2736,8 +2746,10 @@ pub fn dispatch_local_target(
     let role = roles.iter().find(|r| r.id == role_id)?;
     // (#2914) A work question: the utility model is set aside here too.
     let t = resolve_target(role, profile_name, config_path, false).ok().flatten()?;
-    if !t.is_managed() {
-        return None;
+    // (#2902 review C4) Exhaustive on the kind.
+    match t.kind {
+        darkmux_types::EndpointKind::Managed(_) => {}
+        darkmux_types::EndpointKind::Unmanaged => return None,
     }
     Some(LocalTarget { identifier: t.wire_model(), model_key: bare_model_key(&t.model.id).to_string() })
 }
