@@ -123,15 +123,11 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // on the profile the workload's ROLE is bound to (`role_profiles`),
     // else `default_profile`: the same precedence `darkmux dispatch <role>`
     // resolves, so the run's `profile=` stamp names the profile that ran.
-    // The role is the manifest's, else `runtime.default_role`; a workload
-    // that names neither keeps the provider's own default role and the
-    // `default_profile` stamp, as before.
-    let run_role = loaded_workload
-        .manifest
-        .workload
-        .role
-        .clone()
-        .or_else(darkmux_types::config_access::default_role);
+    // (#2902 re-review C3) The role is the one the PROVIDER dispatches as
+    // (`WorkloadProvider::dispatch_role`), so the profile chosen here and
+    // the role that runs cannot disagree (tool-bench's own `tool-bench`
+    // default, a prompt workload's `runtime.default_role`, …).
+    let run_role = workload_role(&loaded_workload);
     let mapped = run_role.as_deref().and_then(darkmux_types::config_access::role_profile);
     let profile_name = run_profile_name(opts.profile_name.as_deref(), run_role.as_deref(), mapped, &registry_loaded.registry)?;
     let profile = get_profile(&registry_loaded.registry, &profile_name)?;
@@ -622,6 +618,21 @@ pub(crate) fn resolve_source_sandbox(
     } else {
         Ok(paths.sandboxes.join(&loaded.manifest.workload.id))
     }
+}
+
+/// (#2902 re-review C3) The role `loaded`'s provider dispatches as; `None`
+/// when the provider is not registered or dispatches no single role.
+fn workload_role(loaded: &crate::workloads::types::LoadedWorkload) -> Option<String> {
+    with_provider(&loaded.manifest.workload.provider, |p| p.dispatch_role(loaded)).ok().flatten()
+}
+
+/// (#2902 re-review C4) The role workload `workload_id` dispatches as, for a
+/// caller that sizes something for that dispatch before the run (the loop
+/// lab's A/B brief). Loads the workload the way `lab run` does.
+pub fn workload_dispatch_role(workload_id: &str) -> Option<String> {
+    let user_workloads_root = paths::resolve(ResolveScope::ForceUser).root;
+    let loaded = load(workload_id, Some(user_workloads_root.as_path())).ok()?;
+    workload_role(&loaded)
 }
 
 /// The profile a lab run is on (see the call site): an explicit

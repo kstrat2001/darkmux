@@ -30,6 +30,9 @@ impl WorkloadProvider for CodingTaskProvider {
     fn description(&self) -> &'static str {
         "Coding workload: prompt + sandbox seed + verification command (e.g. npm test)."
     }
+    fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
+        Some(pick_role(loaded))
+    }
 
     fn setup(&self, loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()> {
         if !run_dir.exists() {

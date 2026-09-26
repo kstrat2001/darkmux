@@ -23,6 +23,9 @@ impl WorkloadProvider for PromptProvider {
     fn description(&self) -> &'static str {
         "Trivial provider: dispatch a single prompt, capture reply, optionally check keywords."
     }
+    fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
+        Some(pick_role(loaded))
+    }
 
     fn setup(&self, _loaded: &LoadedWorkload, run_dir: &Path, _sandbox_dir: &Path) -> Result<()> {
         if !run_dir.exists() {

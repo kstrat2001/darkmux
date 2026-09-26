@@ -975,6 +975,13 @@ fn chain_depths_strict(extras: &BTreeMap<String, serde_json::Value>) -> Result<V
 
 // ─── provider impl ───────────────────────────────────────────────────────
 
+/// The role every tool-bench task dispatches as: the manifest's, else the
+/// bench's own `tool-bench` role. One definition, read by `run` and by
+/// `dispatch_role` (which `lab run` picks the profile for).
+fn bench_role(loaded: &LoadedWorkload) -> String {
+    loaded.manifest.workload.role.clone().unwrap_or_else(|| "tool-bench".to_string())
+}
+
 impl WorkloadProvider for ToolBenchProvider {
     fn id(&self) -> &'static str {
         "tool-bench"
@@ -982,6 +989,9 @@ impl WorkloadProvider for ToolBenchProvider {
     fn description(&self) -> &'static str {
         "Tool-call bench: nonce-provenance-scored tasks per axis (selection, arguments, \
          chaining, recovery, termination) dispatched through the internal runtime."
+    }
+    fn dispatch_role(&self, loaded: &LoadedWorkload) -> Option<String> {
+        Some(bench_role(loaded))
     }
 
     fn setup(&self, _loaded: &LoadedWorkload, run_dir: &Path, sandbox_dir: &Path) -> Result<()> {
@@ -1135,7 +1145,7 @@ impl WorkloadProvider for ToolBenchProvider {
             .unwrap_or_else(|| (now_ms as u64) ^ ((std::process::id() as u64) << 32));
 
         let tasks = generate_tasks(seed, &chain_depths);
-        let role = wl.role.clone().unwrap_or_else(|| "tool-bench".to_string());
+        let role = bench_role(loaded);
 
         // Forensics: the full fixture (prompts, files, expected answers) so a
         // surprising score is auditable straight from the run dir.
@@ -2581,6 +2591,29 @@ not json — tolerated
         let doc = scores::read_scores(&run_dir.path().join("scores.json")).expect("the run wrote scores.json");
         assert!(!doc.rows.is_empty());
         assert!(doc.rows.iter().all(|r| r.artifact.n_ctx == Some(128_000)), "{:?}", doc.rows[0].artifact);
+    }
+
+    /// (#2902 re-review C3) `lab run` chooses the profile for the role the
+    /// provider reports, and that is the role every task dispatches as.
+    #[test]
+    fn the_reported_role_is_the_dispatched_role() {
+        for (extras, want) in [(serde_json::json!({ "chainDepths": [2] }), "tool-bench"), (serde_json::json!({ "chainDepths": [2], "role": "coder" }), "coder")] {
+            let loaded = loaded_workload(extras);
+            let reported = ToolBenchProvider::with_dispatch(Arc::new(|_opts: DispatchOpts| mock_ok_result())).dispatch_role(&loaded);
+            assert_eq!(reported.as_deref(), Some(want));
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured = seen.clone();
+            let provider = ToolBenchProvider::with_dispatch(Arc::new(move |opts: DispatchOpts| {
+                captured.lock().unwrap().push(opts.role_id.clone());
+                mock_ok_result()
+            }));
+            let (run_dir, sandbox_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+            provider
+                .run(&loaded, run_dir.path(), sandbox_dir.path(), &Profile::default(), "default", None, None, &mut |_sid: &str| {})
+                .expect("run completes");
+            let roles = seen.lock().unwrap().clone();
+            assert!(!roles.is_empty() && roles.iter().all(|r| Some(r.as_str()) == reported.as_deref()), "{roles:?}");
+        }
     }
 
     /// (#2685) Pins the WIRING, not just the predicate: `run()` must hand

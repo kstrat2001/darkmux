@@ -2042,6 +2042,7 @@ pub(crate) fn coder_brief_with_injected_context(
 pub(crate) fn injected_context_for_lab(
     mission_id: Option<&str>,
     workspace_root: &Path,
+    role: Option<&str>,
     profile: Option<&str>,
     profiles_file: Option<&str>,
 ) -> String {
@@ -2065,25 +2066,26 @@ pub(crate) fn injected_context_for_lab(
         None => (Vec::new(), Vec::new()),
     };
     let lessons = engagement_lessons(&intent);
-    let budget = injected_budget_chars(
-        // (#1282) `Err` = the named/default profile is quarantined. The lab
-        // dispatch itself hard-fails with this same error; here (bench-brief
-        // sizing, a String-returning helper) degrade loudly to the
-        // no-window budget default instead.
-        // (#2905) No role in hand: the lab workload's manifest names the
-        // role later, inside `lab run`, so this stays role-blind.
-        crew::dispatch_internal::resolve_context_window_internal(None, profile, profiles_file)
-            .unwrap_or_else(|e| {
-                eprintln!("{e:#}");
-                None
-            }),
-    );
+    let budget = injected_budget_chars(lab_context_window(role, profile, profiles_file));
     let (c, ca, l) = allocate_injected_context(corrections, cautions, lessons, budget);
     // append_injected_blocks prefixes each block with "\n\n"; drop the leading
     // blank lines so the result is a clean prepend for the lab prompt.
     append_injected_blocks(String::new(), &l, &c, &ca)
         .trim_start()
         .to_string()
+}
+
+/// The window the lab A/B brief is budgeted against. (#2902 re-review C4)
+/// With the workload's dispatch `role` (the caller asks the provider), it
+/// is the SELECTED model's window, the one that reads the brief; with none,
+/// the profile default's. (#1282) `Err` = the named/default profile is
+/// quarantined; the lab dispatch itself hard-fails with this same error, so
+/// here it degrades loudly to the no-window budget default.
+pub(crate) fn lab_context_window(role: Option<&str>, profile: Option<&str>, profiles_file: Option<&str>) -> Option<u32> {
+    crew::dispatch_internal::resolve_context_window_internal(role, profile, profiles_file).unwrap_or_else(|e| {
+        eprintln!("{e:#}");
+        None
+    })
 }
 
 /// (#849 half 1) The adjudication corrections recorded across this mission's

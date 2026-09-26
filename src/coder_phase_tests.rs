@@ -335,9 +335,29 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// lessons in the real `<lessons>` block (no mission → no cautions). The
     /// block is the same one a coder dispatch would inject (shared
     /// `append_injected_blocks`). `#[serial]` — mutates DARKMUX_HOME.
+    /// (#2902 re-review C4) The lab A/B brief is budgeted for the model that
+    /// reads it: with the workload's role, the selected model's window.
+    #[test]
+    #[serial_test::serial]
+    fn the_lab_brief_is_budgeted_for_the_roles_selected_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pf = tmp.path().join("profiles.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{"mixed":{"default_model":"generalist","models":[
+                    {"id":"generalist","n_ctx":32000,"capabilities":{"reasoning":1.0}},
+                    {"id":"codestar","n_ctx":128000,"capabilities":{"code":1.0}}]}},
+                "default_profile":"mixed"}"#,
+        )
+        .unwrap();
+        assert_eq!(lab_context_window(Some("coder"), None, pf.to_str()), Some(128_000));
+        assert_eq!(lab_context_window(None, None, pf.to_str()), Some(32_000));
+    }
+
     #[test]
     #[serial_test::serial]
     fn injected_context_for_lab_builds_the_lessons_block() {
+
         let tmp = tempfile::TempDir::new().unwrap();
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
@@ -346,7 +366,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
             crew::lessons::add(&conn, "American English", "house style across all work", None, None)
                 .unwrap();
         }
-        let ctx = injected_context_for_lab(None, tmp.path(), None, None);
+        let ctx = injected_context_for_lab(None, tmp.path(), None, None, None);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_HOME", v),
