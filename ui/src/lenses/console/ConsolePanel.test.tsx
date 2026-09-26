@@ -526,7 +526,9 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     expect(kindToken).toHaveAttribute("aria-haspopup", "listbox");
     expect(kindToken).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "false");
-    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ [--all]");
+    // (#2902) The usage toggle is a second switch, declared last.
+    expect(screen.getByRole("switch", { name: "--usage" })).toHaveAttribute("aria-checked", "false");
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ [--all] [--usage]");
   });
 
   /// (#1911) The half that was missing: `parseRoute` could READ a selection
@@ -662,11 +664,11 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     const fetchMock = vi.fn((url: string) => (url.startsWith("/panel/") ? new Promise(() => {}) : Promise.resolve(runsJson())));
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("run-list");
-    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ [--all]"));
+    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ [--all] [--usage]"));
 
     fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
     fireEvent.click(screen.getByRole("option", { name: "dispatch" }));
-    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind dispatch ▾ [--all]"));
+    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind dispatch ▾ [--all] [--usage]"));
   });
 
   it("keyboard: Enter opens the menu focused on the current value, ArrowDown moves, Enter selects, focus returns to the token", async () => {
