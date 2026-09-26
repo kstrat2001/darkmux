@@ -2733,6 +2733,7 @@
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
             remote_origin: None,
+            live_channel: true,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
@@ -4543,81 +4544,77 @@
         assert_eq!(argv[30], "-e");
         assert_eq!(argv[31], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
 
-        // 5f. (#2928) The live channel's resolved cadence, always forwarded.
-        assert_eq!(argv[32], "-e");
-        assert!(argv[33].starts_with("DARKMUX_LIVE_SAMPLE_MS="), "{}", argv[33]);
-
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[34], "-v");
+        assert_eq!(argv[32], "-v");
         assert_eq!(
-            argv[35],
+            argv[33],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[36], "--entrypoint");
-        assert_eq!(argv[37], "/darkmux-runtime");
+        assert_eq!(argv[34], "--entrypoint");
+        assert_eq!(argv[35], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[38], "--");
-        assert_eq!(argv[39], "rust:slim"); // image
-        assert_eq!(argv[40], "run"); // runtime subcommand
-        assert_eq!(argv[41], "--model");
-        assert_eq!(argv[42], "llama3-8b");
+        assert_eq!(argv[36], "--");
+        assert_eq!(argv[37], "rust:slim"); // image
+        assert_eq!(argv[38], "run"); // runtime subcommand
+        assert_eq!(argv[39], "--model");
+        assert_eq!(argv[40], "llama3-8b");
         // (Security audit, #2114 resume follow-up) Unconditional, every
         // dispatch — see `DockerRunConfig::role_id`'s own doc.
-        assert_eq!(argv[43], "--role-id");
-        assert_eq!(argv[44], "test-role");
+        assert_eq!(argv[41], "--role-id");
+        assert_eq!(argv[42], "test-role");
         // (#2386) Unconditional too — the runtime needs its finding-key
         // namespace on every dispatch. See `DockerRunConfig::session_id`.
-        assert_eq!(argv[45], "--session-id");
-        assert_eq!(argv[46], "sess-test");
-        assert_eq!(argv[47], "--system");
-        assert_eq!(argv[48], "You are a coding assistant.");
+        assert_eq!(argv[43], "--session-id");
+        assert_eq!(argv[44], "sess-test");
+        assert_eq!(argv[45], "--system");
+        assert_eq!(argv[46], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[49], "--prompt-file");
-        assert_eq!(argv[50], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[47], "--prompt-file");
+        assert_eq!(argv[48], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[51], "--json");
+        assert_eq!(argv[49], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[52], "--allowed-tools");
-        assert_eq!(argv[53], "exec,edit");
+        assert_eq!(argv[50], "--allowed-tools");
+        assert_eq!(argv[51], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[54], "--compact-threshold-tokens");
-        assert_eq!(argv[55], "4096");
-        assert_eq!(argv[56], "--compactor-model");
-        assert_eq!(argv[57], "util-model");
-        assert_eq!(argv[58], "--compact-threshold-ratio");
-        assert_eq!(argv[59], "0.75");
-        assert_eq!(argv[60], "--context-window");
-        assert_eq!(argv[61], "32000");
+        assert_eq!(argv[52], "--compact-threshold-tokens");
+        assert_eq!(argv[53], "4096");
+        assert_eq!(argv[54], "--compactor-model");
+        assert_eq!(argv[55], "util-model");
+        assert_eq!(argv[56], "--compact-threshold-ratio");
+        assert_eq!(argv[57], "0.75");
+        assert_eq!(argv[58], "--context-window");
+        assert_eq!(argv[59], "32000");
         // (#2808) The COMPACTOR's own window, and it must be DISTINCT from
         // the primary's 32,000 above — passing the primary's here would be
         // the defect, not the fix. Without this flag the runtime bounds its
         // compaction excerpt by nothing and posts a ~30,000-token excerpt to
         // a 16,000-token model, which LMStudio refuses with HTTP 400 every
         // time.
-        assert_eq!(argv[62], "--compactor-context-window");
-        assert_eq!(argv[63], "16000");
-        assert_eq!(argv[64], "--compact-strategy");
-        assert_eq!(argv[65], "structured-slot");
-        assert_eq!(argv[66], "--bail-after-compactions");
-        assert_eq!(argv[67], "10");
-        assert_eq!(argv[68], "--compactor-custom-instructions");
-        assert_eq!(argv[69], "Be terse.");
+        assert_eq!(argv[60], "--compactor-context-window");
+        assert_eq!(argv[61], "16000");
+        assert_eq!(argv[62], "--compact-strategy");
+        assert_eq!(argv[63], "structured-slot");
+        assert_eq!(argv[64], "--bail-after-compactions");
+        assert_eq!(argv[65], "10");
+        assert_eq!(argv[66], "--compactor-custom-instructions");
+        assert_eq!(argv[67], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[70], "--feedback-templates-json");
+        assert_eq!(argv[68], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[71].contains("error"));
-        assert!(argv[71].contains("An error occurred"));
+        assert!(argv[69].contains("error"));
+        assert!(argv[69].contains("An error occurred"));
 
         // Total arg count: 66 (0..=65) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
@@ -4627,7 +4624,7 @@
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
         // +2 for `--session-id <id>` (#2386). +1 for `--init` (#2481).
         // +2 for `--compactor-context-window <n>` (#2808).
-        assert_eq!(argv.len(), 72);
+        assert_eq!(argv.len(), 70);
     }
 
     // ─── #2904: the container's LMStudio base URL follows the configured one ───
@@ -5897,27 +5894,23 @@
         );
     }
 
-    /// (#2928) The live cadence reaches the container as the RESOLVED value
-    /// (a non-default, so a hard-coded literal cannot pass), before the image.
+    /// (#2928 review, MF1) The live cadence is a HOST-side knob: it never
+    /// reaches the container, so the runtime's trajectory (a kept artifact)
+    /// is the same whatever the cadence is.
     #[test]
     #[serial]
-    fn build_docker_run_argv_forwards_the_resolved_live_cadence() {
+    fn build_docker_run_argv_never_forwards_the_live_cadence() {
         let k = "DARKMUX_LIVE_SAMPLE_MS";
         let prev = std::env::var(k).ok();
-        unsafe { std::env::set_var(k, "500") };
+        unsafe { std::env::set_var(k, "100") };
         let argv = build_docker_run_argv(&base_argv_config());
-        unsafe { std::env::set_var(k, "0") };
-        let off = build_docker_run_argv(&base_argv_config());
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
                 None => std::env::remove_var(k),
             }
         }
-        let at = argv.iter().position(|a| a == "DARKMUX_LIVE_SAMPLE_MS=500").expect("forwarded");
-        assert_eq!(argv[at - 1], "-e");
-        assert!(at < argv.iter().position(|a| a == "--").unwrap(), "a docker flag, not a runtime arg");
-        assert!(off.iter().any(|a| a == "DARKMUX_LIVE_SAMPLE_MS=0"), "off is forwarded too, never omitted");
+        assert!(!argv.iter().any(|a| a.contains("LIVE_SAMPLE")), "{argv:?}");
     }
 
     // ─── N6 (final #2110/#2109 re-check): stale pace.json cleanup ───
@@ -7472,6 +7465,7 @@
                 None,
                 None, // (#2902) endpoint
                 None, // (#2902 step 1b) compactor endpoint
+                None, // (#2928) live sender
             )
         });
 
@@ -10579,6 +10573,39 @@
         );
     }
 
+    /// (#2928 review, lab decision) A dispatch that opts out of the live
+    /// channel gets no sender at all (so no sampling either), whatever the
+    /// cadence knob says; one that opts in gets one while the knob is on.
+    #[test]
+    #[serial]
+    fn live_sender_for_honors_the_dispatch_opt_out_and_the_knob() {
+        let k = "DARKMUX_LIVE_SAMPLE_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::set_var(k, "250") };
+        assert!(live_sender_for(false).is_none(), "an opted-out (lab) dispatch has no sender");
+        assert!(live_sender_for(true).is_some());
+        unsafe { std::env::set_var(k, "0") };
+        assert!(live_sender_for(true).is_none(), "the knob still turns it off for everyone");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// (#2928 review, lab decision) The one production tailer spawn passes
+    /// the dispatch's own opt-out through. Checked on the source: exercising
+    /// the call site needs a real container, which a unit test does not run.
+    #[test]
+    fn the_production_tailer_spawn_honors_the_dispatch_opt_out() {
+        let src = include_str!("dispatch_internal.rs");
+        let spawn = src.find("let (_tailer_stop_guard, tailer_handle) = spawn_guarded_tailer(").expect("the spawn site");
+        let call = &src[spawn..spawn + src[spawn..].find(");").unwrap()];
+        assert!(call.contains("live_sender_for(opts.live_channel)"), "the spawn must pass the dispatch's own live_channel");
+        assert_eq!(src.matches("spawn_guarded_tailer(").count(), 2, "one definition, one production call");
+    }
+
     /// (#2928) A simulated execution's trajectory: an opener, 1 s of steady
     /// visible text, a 60 ms think burst, more text, then one compaction
     /// start and its call. Event times are fixed, so the live sampler's
@@ -10689,9 +10716,61 @@
 
         let live = &summary.live;
         assert_eq!(live.samples_sent as usize, samples.len(), "the summary counts what was sent");
-        assert_eq!(live.samples_dropped, 0);
-        assert_eq!((live.cadence_ms, live.runtime_ticks, live.runtime_tick_us), (250, 7, 91));
+        assert_eq!((live.dropped_no_receiver, live.dropped_full), (0, 0));
+        assert_eq!(live.cadence_ms, 250);
         assert!(live.bytes > 0);
+        // (#2928 review, C7) The stamped cost covers the sampler's work on
+        // every chunk, not only the sends.
+        assert!(live.sampler_us >= live.forward_us, "{live:?}");
+    }
+
+    /// (#2928 review, MF1) Through a silent tool-call write the HOST keeps
+    /// the live view fresh: each post-poll flush past the cadence re-sends
+    /// the writing state stamped with the host's clock, and it stops at the
+    /// stream's end. The runtime wrote one writing line; nothing else.
+    #[test]
+    #[serial]
+    fn tailer_refreshes_a_silent_tool_call_write_on_the_host_clock() {
+        let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+        let tmp = TempDir::new().unwrap();
+        let traj = tmp.path().join("trajectory.jsonl");
+        let sock_dir = TempDir::new().unwrap();
+        let sock = sock_dir.path().join("live.sock");
+        let rx = darkmux_flow::live::bind_ingest(&sock).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut st = TailerState::new(traj.clone(), "w-sess".into(), "coder".into(), "m".into(), Arc::new(Mutex::new(Instant::now())), 600)
+            .with_live(Some(darkmux_flow::live::LiveSender::to_path(sock)), 250);
+        let t = 1_758_700_000_000u64;
+        std::fs::write(
+            &traj,
+            format!(
+                "{}\n{}\n",
+                format_args!(r#"{{"type":"model.streaming.start","seq":1,"ts":{t},"system_chars":10,"prompt_chars":10}}"#),
+                format_args!(r#"{{"type":"model.partial","seq":1,"partial_index":1,"cumulative_chars":0,"generated_chars":40,"phase":"writing_tool_call","tool_name":"write","ts":{}}}"#, t + 50),
+            ),
+        )
+        .unwrap();
+        st.poll_and_emit();
+        for dt in [100u64, 300, 400, 600, 900, 1_200] {
+            st.live_flush(t + dt);
+        }
+        let mut refreshed = Vec::new();
+        let mut buf = [0u8; darkmux_flow::live::MAX_LIVE_DATAGRAM];
+        while let Ok(n) = rx.recv(&mut buf) {
+            let s = darkmux_flow::live::LiveSample::from_datagram(&buf[..n]).unwrap();
+            if s.fields.get("phase").is_some() && s.at_ms > t + 50 {
+                refreshed.push(s.at_ms - t);
+            }
+        }
+        assert_eq!(refreshed, vec![300, 600, 900, 1_200], "one refresh per cadence, stamped with the host's clock");
+        // The stream ends: no more refreshes.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&traj).unwrap();
+        writeln!(f, r#"{{"type":"model.streaming.end","seq":1,"partial_count":1,"total_content_chars":0,"tool_calls_count":1,"observations":0,"ts":{}}}"#, t + 1_300).unwrap();
+        drop(f);
+        st.poll_and_emit();
+        st.live_flush(t + 5_000);
+        assert!(rx.recv(&mut buf).is_err(), "nothing after the stream ended");
     }
 
     /// (#2928) No daemon listening: the tailer carries on, every sample is a
@@ -10704,7 +10783,8 @@
         let (with, summary) = run_live_fixture(Some(darkmux_flow::live::LiveSender::to_path(dir.path().join("absent.sock"))));
         assert_eq!(with, without);
         assert_eq!(summary.live.samples_sent, 0);
-        assert!(summary.live.samples_dropped > 0);
+        assert!(summary.live.dropped_no_receiver > 0, "no daemon is a no-receiver drop");
+        assert_eq!(summary.live.dropped_full, 0);
     }
 
     /// (#2889 review, M2) Two-event helper: write `lines` as one trajectory
@@ -14206,6 +14286,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             None, // (#2902) endpoint
             None, // (#2902 step 1b) compactor endpoint
+            None, // (#2928) live sender
         );
         let elapsed = started.elapsed();
 
@@ -14561,6 +14642,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 None,
                 None, // (#2902) endpoint
                 None, // (#2902 step 1b) compactor endpoint
+                None, // (#2928) live sender
             );
             *handle_holder_for_closure.lock().unwrap() = Some(handle);
             panic!("simulated panic between the tailer's spawn and dispatch()'s own stores");

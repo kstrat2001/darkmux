@@ -7337,7 +7337,8 @@ mod fleet_cache_wall_clock {
         }
 
         fn sample_bytes(session: &str, gen: u64) -> Vec<u8> {
-            let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, 1_758_700_000_000 + gen, 250);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, now + gen % 1000, 250);
             s.session_id = Some(session.to_string());
             s.fields.insert("generated_chars".into(), serde_json::json!(gen));
             s.to_bytes().unwrap()
@@ -7433,18 +7434,83 @@ mod fleet_cache_wall_clock {
             let tmp = TempDir::new().unwrap();
             let sock_dir = TempDir::new().unwrap();
             let sock = sock_dir.path().join("live.sock");
-            assert!(live_hub::spawn_ingest(sock.clone()).is_some());
+            assert!(live_hub::spawn_ingest(sock.clone(), 0).is_some());
             let today = today_utc_date();
             let mut v = open_viewer(build_router_local(tmp.path().to_path_buf()), &today).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             let mut tx = darkmux_flow::live::LiveSender::to_path(sock);
-            let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, 5, 250);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Utility, now, 250);
             s.fields.insert("event".into(), serde_json::json!("start"));
             s.fields.insert("job_id".into(), serde_json::json!("radio_routing-e2e"));
             assert!(tx.send(&s));
             let got = read_until(&mut v, "radio_routing-e2e").await;
             assert!(got.contains("event: live") && got.contains("radio_routing-e2e"), "{got:?}");
             assert_eq!(files_under(tmp.path()), 0);
+        }
+
+        /// (#2928 review, C4) A sample stamped far from the daemon's own
+        /// clock is refused: a live sample is about now or it is nothing.
+        #[test]
+        fn a_sample_far_from_now_is_refused() {
+            let now = 1_758_700_000_000u64;
+            let at = |ms: u64| {
+                let mut s = darkmux_flow::live::LiveSample::new(darkmux_flow::live::LiveKind::Model, ms, 250);
+                s.session_id = Some("clock".into());
+                s.to_bytes().unwrap()
+            };
+            assert!(live_hub::accept_at(&at(now), now));
+            assert!(live_hub::accept_at(&at(now - 4_000), now), "a few seconds of skew is fine");
+            assert!(live_hub::accept_at(&at(now + 4_000), now));
+            assert!(!live_hub::accept_at(&at(now - 60_000), now), "a minute old is not live");
+            assert!(!live_hub::accept_at(&at(now + 60_000), now), "nor a minute ahead");
+        }
+
+        /// (#2928 review, C3) `/health` says which socket the daemon bound,
+        /// by fingerprint and port (never the path: `/health` is open to the
+        /// tailnet), so `doctor` can compare it with the one a dispatch uses.
+        #[tokio::test]
+        #[serial]
+        async fn health_names_the_bound_socket_by_fingerprint() {
+            let sock_dir = TempDir::new().unwrap();
+            let sock = sock_dir.path().join("live-4242.sock");
+            assert!(live_hub::spawn_ingest(sock.clone(), 4242).is_some());
+            let tmp = TempDir::new().unwrap();
+            let resp = build_router_local(tmp.path().to_path_buf())
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+            let live = &body["live"]["ingest"];
+            assert_eq!(live["socket_id"], darkmux_flow::live::socket_fingerprint(&sock));
+            assert_eq!(live["socket_port"], 4242);
+            assert_eq!(live["bound"], true);
+            assert!(!body.to_string().contains(sock_dir.path().to_str().unwrap()), "no filesystem path on /health");
+        }
+
+        /// (#2928 review, C5) A second daemon that replaces this one's
+        /// socket file is noticed and reported (`bound: false`), never fought
+        /// over; and this daemon's shutdown does not delete the other's.
+        #[test]
+        #[serial]
+        fn a_replaced_socket_is_reported_and_never_deleted_on_shutdown() {
+            let sock_dir = TempDir::new().unwrap();
+            let sock = sock_dir.path().join("live-4343.sock");
+            let (handle, state) = live_hub::spawn_ingest_checking(sock.clone(), 4343, Duration::from_millis(50)).expect("bound");
+            assert!(state.bound());
+            // The other daemon: unlink and bind its own at the same path.
+            std::fs::remove_file(&sock).unwrap();
+            let other = darkmux_flow::live::bind_ingest(&sock).unwrap();
+            let t0 = std::time::Instant::now();
+            while state.bound() && t0.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!state.bound(), "the loss was noticed");
+            state.remove_socket_if_ours();
+            assert!(sock.exists(), "the other daemon's socket survives our shutdown");
+            assert_eq!(darkmux_flow::live::probe_socket(&sock), darkmux_flow::live::SocketState::Listening);
+            drop(other);
+            drop(handle);
         }
 
         /// A viewer that falls behind skips what it missed and keeps going:

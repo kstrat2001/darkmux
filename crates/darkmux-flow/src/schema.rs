@@ -82,14 +82,17 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.62.0";
 //   1.62.0 (#2928, the live channel): additive, one payload block.
 //           `dispatch complete.payload.live`: the live channel's own cost for
 //           the execution — `cadence_ms` (0 when the channel was off),
-//           `samples_sent`, `samples_dropped`, `forward_us` (time the
-//           dispatch spent handing samples to the local daemon), `bytes`,
-//           and the runtime's `runtime_ticks` / `runtime_tick_us` (its
-//           silence ticks and their handling cost). The live SAMPLES are
-//           never flow records: they travel dispatch -> local daemon ->
-//           SSE `event: live` and are dropped, so no action is added and
-//           nothing new reaches a day file, Redis or the audit chain.
-//           Readers ignoring the key see 1.61.0 unchanged.
+//           `samples_sent`, `dropped_no_receiver` (no daemon, or a stale
+//           socket) and `dropped_full` (a daemon too slow to drain),
+//           `sampler_us` (all the channel's time on this execution: building
+//           each chunk's sample, the sampler, the sends), `forward_us` (the
+//           sends' share) and `bytes`. A dispatch that opted out
+//           (`DispatchOpts::live_channel: false`, the lab) reports zeros.
+//           The live SAMPLES are never flow records: they travel dispatch ->
+//           local daemon -> SSE `event: live` and are dropped, so no action
+//           is added and nothing new reaches a day file, Redis, the audit
+//           chain or the runtime's trajectory. Readers ignoring the key see
+//           1.61.0 unchanged.
 //   1.61.0 (#2915, utility work is lean but VISIBLE): additive, two
 //           actions and utility fields on the usage record.
 //

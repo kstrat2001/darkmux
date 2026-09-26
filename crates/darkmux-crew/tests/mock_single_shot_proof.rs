@@ -151,6 +151,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
@@ -334,6 +335,7 @@ fn container_free_single_shot_dispatch_stamps_mission_id_resolved_from_phase() {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

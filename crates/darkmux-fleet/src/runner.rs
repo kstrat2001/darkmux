@@ -105,6 +105,7 @@ impl WorkJob {
             // (#2914) Work never runs on the utility model.
             allow_utility_model: false,
             remote_origin: None,
+            live_channel: true,
             // (#2265) A cross-machine job carries its brief as TEXT, so a
             // `--finding`-briefed dispatch still reaches the runner with the
             // finding's record inside `message`; only the keys field — this

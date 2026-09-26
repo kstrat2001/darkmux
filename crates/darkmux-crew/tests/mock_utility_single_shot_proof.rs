@@ -378,7 +378,7 @@ fn a_utility_job_sends_its_start_and_end_on_the_live_channel() {
     let profiles_path = write_registry(registry_dir.path());
     let flows_dir = tempfile::tempdir().unwrap();
     // The daemon's ingest socket, where this process's sender resolves it.
-    let sock = darkmux_flow::live::local_socket_path();
+    let sock = darkmux_flow::live::local_socket_path().expect("a socket path");
     let rx = darkmux_flow::live::bind_ingest(&sock).expect("binding the ingest socket");
     rx.set_nonblocking(true).unwrap();
 

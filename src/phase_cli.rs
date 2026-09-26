@@ -454,6 +454,7 @@ pub(crate) fn phase_review_output_at(
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

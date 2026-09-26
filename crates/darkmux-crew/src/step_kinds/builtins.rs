@@ -484,6 +484,7 @@ pub(crate) fn dispatch_opts_for(
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         brief_refs,
         workspace_read_only: false,
         record_context: None,

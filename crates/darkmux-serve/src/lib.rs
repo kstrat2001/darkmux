@@ -1341,17 +1341,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // daemon actually bound (so a preview daemon on another port never
         // receives another's samples). Bound only AFTER the TCP bind above
         // succeeded, which is what makes replacing a stale socket safe.
-        // Off when `runtime.live_sample_ms` is 0.
-        let live_socket = {
-            let liveness = darkmux_types::dispatch_liveness::liveness_dir();
-            let home = liveness.parent().map(std::path::Path::to_path_buf).unwrap_or(liveness);
-            darkmux_flow::live::socket_path_for(&home, addr.port())
-        };
-        let _live_handle = if darkmux_types::config_access::live_cadence().enabled() {
-            live_hub::spawn_ingest(live_socket.clone())
-        } else {
-            None
-        };
+        // Always bound (#2928 review, C3): `runtime.live_sample_ms` is the
+        // producers' cadence; a daemon always accepts.
+        let _live_handle = darkmux_flow::live::socket_path_for(&darkmux_flow::live::live_home(), addr.port())
+            .and_then(|p| live_hub::spawn_ingest(p, addr.port()));
 
         // (#647) Presence edge-recording for playback. Self-emit this machine's
         // `machine.online` open-edge now (it's online), and spawn the reconciler
@@ -1394,7 +1387,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         tokio::spawn(async move {
             shutdown_signal().await;
             host_sampler_stop.store(true, Ordering::SeqCst);
-            live_hub::remove_socket(&live_socket);
+            if let Some(st) = live_hub::ingest_state() {
+                st.remove_socket_if_ours();
+            }
             // (#2476, reordered in review round 2 — MUST FIX 3) Reap the
             // fleet runner's in-flight dispatch child, and give it a
             // bounded window to reach quiescence, BEFORE telling axum to
@@ -1527,6 +1522,9 @@ async fn health(peer: Option<ConnectInfo<SocketAddr>>) -> axum::Json<serde_json:
         // readable without a debugger. Never a sample itself.
         "live": {
             "sample_ms": darkmux_types::config_access::live_sample_ms(),
+            // (#2928 review, C3) Which socket this daemon bound, by
+            // fingerprint and port; `null` when none.
+            "ingest": live_hub::ingest_state().map(|s| s.health_json()),
             "received": live_hub::stats().received.load(Ordering::Relaxed),
             "rejected": live_hub::stats().rejected.load(Ordering::Relaxed),
             "handle_us": live_hub::stats().handle_ns.load(Ordering::Relaxed) / 1_000,

@@ -2944,19 +2944,61 @@ fn check_dispatch_free_concurrency() -> Check {
     }
 }
 
+/// (#2928 review, C3) The live socket a running daemon reports on `/health`
+/// (`live.ingest`): a fingerprint, the port it is keyed by, and whether it
+/// is still that daemon's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonLiveSocket {
+    socket_id: String,
+    socket_port: u16,
+    bound: bool,
+}
+
+fn parse_daemon_live_socket(health_body: &str) -> Option<DaemonLiveSocket> {
+    let v: serde_json::Value = serde_json::from_str(health_body.split("\r\n\r\n").last()?).ok()?;
+    let i = v.get("live")?.get("ingest")?;
+    Some(DaemonLiveSocket {
+        socket_id: i.get("socket_id")?.as_str()?.to_string(),
+        socket_port: u16::try_from(i.get("socket_port")?.as_u64()?).ok()?,
+        bound: i.get("bound")?.as_bool()?,
+    })
+}
+
 /// (#2928) Surface the live channel's resolved cadence with provenance, the
-/// clamp when one applied, and whether this machine's daemon is listening
-/// for samples. Cadence is a recorded knob, never adaptive-silent: a value
-/// outside 100..=1000 is clamped and this row says so (Warn), rather than
-/// the channel quietly running at a number nobody wrote.
+/// clamp when one applied, and whether this machine's dispatches and its
+/// daemon agree on the socket. Cadence is a recorded knob, never
+/// adaptive-silent: a value outside 100..=1000 is clamped and this row says
+/// so (Warn). (#2928 review, C3) Also names a stale socket (a daemon killed
+/// without cleaning up), a daemon bound to a DIFFERENT socket than the one
+/// dispatches send to (a `--port` that differs from `serve.port`), and a
+/// daemon that lost its socket to another process.
 fn check_live_channel() -> Check {
-    let name = "live channel";
     let c = darkmux_types::config_access::live_cadence();
+    let socket = darkmux_flow::live::local_socket_path();
+    let state = socket.as_deref().map(darkmux_flow::live::probe_socket);
+    let addr = darkmux_types::config_access::serve_client_addr();
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1").to_string();
+    let daemon = loopback_http_body(&host, darkmux_types::config_access::serve_port(), "/health")
+        .as_deref()
+        .and_then(parse_daemon_live_socket);
+    classify_live_channel(c, socket.as_deref(), state, daemon.as_ref(), darkmux_types::config_access::serve_port())
+}
+
+fn classify_live_channel(
+    c: darkmux_types::config_access::LiveCadence,
+    socket: Option<&std::path::Path>,
+    state: Option<darkmux_flow::live::SocketState>,
+    daemon: Option<&DaemonLiveSocket>,
+    dispatch_port: u16,
+) -> Check {
+    use darkmux_flow::live::SocketState;
+    let name = "live channel";
     let provenance = match c.source {
         darkmux_types::config_access::Source::Env => "from DARKMUX_LIVE_SAMPLE_MS env",
         darkmux_types::config_access::Source::Config => "from config.json",
         darkmux_types::config_access::Source::BuiltIn => "default",
     };
+    let warn = |message: String, hint: String| Check { name: name.into(), status: Status::Warn, message, hint: Some(hint) };
     if !c.enabled() {
         return Check {
             name: name.into(),
@@ -2968,8 +3010,17 @@ fn check_live_channel() -> Check {
             hint: None,
         };
     }
-    let socket = darkmux_flow::live::local_socket_path();
-    let listening = if socket.exists() { "the daemon's socket is present" } else { "no daemon socket yet (start `darkmux serve`)" };
+    let Some(socket) = socket else {
+        return warn(
+            format!("{} ms ({provenance}), but no private socket path is available: the darkmux home path is too long for a socket and the fallback directory is not private to this user. Viewers see 2 s heartbeats", c.effective_ms),
+            "use a shorter DARKMUX_HOME, or set XDG_RUNTIME_DIR to a directory only you can read".into(),
+        );
+    };
+    let listening = match state {
+        Some(SocketState::Listening) => "a daemon is receiving",
+        Some(SocketState::Stale) => "STALE: a socket file nobody reads",
+        _ => "no daemon socket yet (start `darkmux serve`)",
+    };
     let base = format!(
         "{} ms ({provenance}) — model state and utility jobs reach this machine's viewers at \
          this cadence through the local daemon ({}, {listening}); never written to the flow \
@@ -2977,18 +3028,39 @@ fn check_live_channel() -> Check {
         c.effective_ms,
         socket.display()
     );
+    if state == Some(SocketState::Stale) {
+        return warn(
+            format!("{base}. A daemon was killed without removing its socket; every live sample is dropped"),
+            "start `darkmux serve` (it replaces the stale socket), or delete the socket file named above".into(),
+        );
+    }
+    if let Some(d) = daemon {
+        if d.socket_id != darkmux_flow::live::socket_fingerprint(socket) {
+            return warn(
+                format!(
+                    "{base}. The running daemon bound a DIFFERENT socket (keyed by port {}) than dispatches send to (port {dispatch_port}): its viewers get no live samples",
+                    d.socket_port
+                ),
+                format!("run the daemon on the configured port, or set it: `darkmux config set serve.port {}`", d.socket_port),
+            );
+        }
+        if !d.bound {
+            return warn(
+                format!("{base}. The daemon lost its socket to another process and receives no live samples"),
+                "restart `darkmux serve`; if a second daemon runs on the same port, stop one".into(),
+            );
+        }
+    }
     if c.clamped() {
-        return Check {
-            name: name.into(),
-            status: Status::Warn,
-            message: format!("{base}. Configured {} ms was clamped to {} ms", c.configured_ms, c.effective_ms),
-            hint: Some(format!(
+        return warn(
+            format!("{base}. Configured {} ms was clamped to {} ms", c.configured_ms, c.effective_ms),
+            format!(
                 "set runtime.live_sample_ms between {} and {} (or 0 for off): \
                  `darkmux config set runtime.live_sample_ms 250`",
                 darkmux_types::config_access::LIVE_SAMPLE_MS_MIN,
                 darkmux_types::config_access::LIVE_SAMPLE_MS_MAX
-            )),
-        };
+            ),
+        );
     }
     Check { name: name.into(), status: Status::Pass, message: base, hint: None }
 }
@@ -9877,6 +9949,37 @@ mod tests {
         let off = live_channel_check_with(Some("0"));
         assert_eq!(off.status, Status::Pass);
         assert!(off.message.starts_with("off (from DARKMUX_LIVE_SAMPLE_MS env)"), "{}", off.message);
+    }
+
+    /// (#2928 review, C3) The socket agreement cases, through the pure
+    /// classifier.
+    #[test]
+    fn classify_live_channel_names_stale_mismatch_and_loss() {
+        use darkmux_flow::live::{socket_fingerprint, SocketState};
+        use darkmux_types::config_access::{LiveCadence, Source};
+        let c = LiveCadence { configured_ms: 250, effective_ms: 250, source: Source::BuiltIn };
+        let sock = std::path::Path::new("/h/run/live-8765.sock");
+        let ours = DaemonLiveSocket { socket_id: socket_fingerprint(sock), socket_port: 8765, bound: true };
+        let ok = classify_live_channel(c, Some(sock), Some(SocketState::Listening), Some(&ours), 8765);
+        assert_eq!(ok.status, Status::Pass, "{}", ok.message);
+        assert!(ok.message.contains("a daemon is receiving"));
+        let stale = classify_live_channel(c, Some(sock), Some(SocketState::Stale), None, 8765);
+        assert_eq!(stale.status, Status::Warn);
+        assert!(stale.message.contains("killed without removing its socket"), "{}", stale.message);
+        let other = DaemonLiveSocket { socket_id: socket_fingerprint(std::path::Path::new("/h/run/live-19491.sock")), socket_port: 19491, bound: true };
+        let mm = classify_live_channel(c, Some(sock), Some(SocketState::Absent), Some(&other), 8765);
+        assert_eq!(mm.status, Status::Warn);
+        assert!(mm.message.contains("port 19491") && mm.message.contains("port 8765"), "{}", mm.message);
+        let lost = DaemonLiveSocket { bound: false, ..ours.clone() };
+        let l = classify_live_channel(c, Some(sock), Some(SocketState::Listening), Some(&lost), 8765);
+        assert!(l.message.contains("lost its socket"), "{}", l.message);
+        let none = classify_live_channel(c, None, None, None, 8765);
+        assert!(none.message.contains("no private socket path"), "{}", none.message);
+        assert_eq!(
+            parse_daemon_live_socket(r#"{"live":{"ingest":{"socket_id":"ab","socket_port":8765,"bound":true}}}"#),
+            Some(DaemonLiveSocket { socket_id: "ab".into(), socket_port: 8765, bound: true })
+        );
+        assert_eq!(parse_daemon_live_socket(r#"{"live":{"ingest":null}}"#), None, "an older daemon says nothing");
     }
 
     // ─── (#2394) check_dispatch_free_concurrency — resolved state + provenance ─

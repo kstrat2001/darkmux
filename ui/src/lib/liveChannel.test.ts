@@ -138,8 +138,11 @@ describe("the issue's defect: a short think burst between 2 s heartbeats", () =>
     const s = deriveLiveState(merged, at);
     expect(s.state).toBe("generating");
     expect(s.thinking).toBe(true);
-    // The transition back is shown at once too.
+    // The transition back is shown too (after the think state's own frame).
+    vi.useFakeTimers();
     store.ingest(wireModel(T0 + 1_500, 300, 240), T0 + 1_500);
+    vi.advanceTimersByTime(1_000);
+    vi.useRealTimers();
     const back = deriveLiveState(mergeLive(durable.filter((r) => Date.parse(r.ts) <= T0 + 1_500), store.snapshot().bySession.get(SID)), T0 + 1_500);
     expect(back.thinking).toBeFalsy();
   });
@@ -243,6 +246,77 @@ describe("LiveStore render pacing", () => {
     expect(notified, "the trailing edge carries the rest").toBe(2);
     vi.advanceTimersByTime(1000);
     expect(notified, "and nothing more without new samples").toBe(2);
+    vi.useRealTimers();
+  });
+});
+
+describe("(#2928 review, C1) a hole in the live feed does not erase durable heartbeats", () => {
+  test("durable beats inside a 20 s hole between two live stretches are kept", () => {
+    const before = [T0, T0 + 250, T0 + 500].map((at, i) => liveSampleToRecord(JSON.parse(wireModel(at, 10 + i, 10 + i)))!);
+    const after = [T0 + 20_500, T0 + 20_750].map((at, i) => liveSampleToRecord(JSON.parse(wireModel(at, 900 + i, 900 + i)))!);
+    const d = [durableBeat(T0 + 250, 11, 11), durableBeat(T0 + 6_000, 300, 300), durableBeat(T0 + 12_000, 600, 600), durableBeat(T0 + 20_600, 901, 901)];
+    const merged = mergeLive(d, [...before, ...after]);
+    const kept = merged.filter((r) => r.action === "dispatch.turn.heartbeat" && !(r as { live?: boolean }).live).map((r) => (r as unknown as { payload: { sampled_at_ms: number } }).payload.sampled_at_ms);
+    expect(kept).toEqual([T0 + 6_000, T0 + 12_000]);
+  });
+});
+
+describe("(#2928 review, C2) a state that came and went between renders is drawn for a frame", () => {
+  test("a 60 ms think burst whose edges arrive inside one pacing window lights THINK once", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const store = new LiveStore();
+    const durable = [start()];
+    const seen: boolean[] = [];
+    store.subscribe(() => {
+      const s = deriveLiveState(mergeLive(durable, store.snapshot().bySession.get(SID)), T0 + 1_100);
+      seen.push(s.thinking === true);
+    });
+    store.ingest(wireModel(T0 + 1_000, 100, 100), T0); // rendered (leading edge)
+    // All inside one 250 ms window: last visible, first think, last think, first visible.
+    store.ingest(wireModel(T0 + 1_020, 120, 120), T0);
+    store.ingest(wireModel(T0 + 1_040, 140, 120), T0);
+    store.ingest(wireModel(T0 + 1_080, 180, 120), T0);
+    store.ingest(wireModel(T0 + 1_100, 200, 140), T0);
+    // The frame stays up for a moment even though newer data has arrived.
+    const up = deriveLiveState(mergeLive(durable, store.snapshot().bySession.get(SID)), T0 + 1_100);
+    expect(up.thinking, "the think frame is what is drawn right now").toBe(true);
+    vi.advanceTimersByTime(1_000);
+    expect(deriveLiveState(mergeLive(durable, store.snapshot().bySession.get(SID)), T0 + 1_100).thinking).toBeFalsy();
+    expect(seen.some(Boolean), `renders: ${seen}`).toBe(true);
+    expect(seen[seen.length - 1], "the final state is visible text").toBe(false);
+    vi.useRealTimers();
+  });
+
+  test("a sub-second utility job whose start and end land in one window is drawn open once", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const store = new LiveStore();
+    const open: boolean[] = [];
+    store.subscribe(() => open.push(utilityStrip([], M, T0 + 100, { id: "u4b", loaded: true }, store.snapshot().utility).job !== null));
+    store.ingest(wireModel(T0, 1, 1), T0); // leading edge taken by something else
+    store.ingest(wireUtility(T0 + 10, "start", "fast"), T0);
+    store.ingest(wireUtility(T0 + 60, "end", "fast"), T0);
+    vi.advanceTimersByTime(1_000);
+    expect(open.some(Boolean), `renders: ${open}`).toBe(true);
+    expect(open[open.length - 1]).toBe(false);
+    vi.useRealTimers();
+  });
+});
+
+describe("(#2928 review, C9) idle entries leave on a timer", () => {
+  test("a session with no new samples is pruned without any new sample arriving", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const store = new LiveStore();
+    let notified = 0;
+    store.subscribe(() => notified++);
+    store.ingest(wireModel(T0, 1, 1), T0);
+    expect(store.snapshot().bySession.has(SID)).toBe(true);
+    const before = notified;
+    vi.advanceTimersByTime(LIVE_SESSION_TTL_MS + 10_000);
+    expect(store.snapshot().bySession.has(SID)).toBe(false);
+    expect(notified, "subscribers are told").toBeGreaterThan(before);
     vi.useRealTimers();
   });
 });

@@ -225,15 +225,18 @@ darkmux release.
   a tool call being written, the next turn opening) reaches this machine's
   viewers every 250 ms, and every transition at once, so a short think
   burst between the 2 s heartbeats now shows as THINK instead of reading as
-  generation. Utility jobs ride it too: a sub-second radio routing job
-  lights the fleet card's utility glyph while it runs. Nothing is written:
-  the samples go from the dispatch to the local `darkmux serve` over a unix
-  socket and to its open viewers as SSE `live` events, never to a day file,
-  Redis, the audit chain or playback, so the durable heartbeat stays at 2 s
-  and history does not grow. A slow or absent daemon never slows a
-  dispatch. Local only: another machine's cards stay at 2 s. The cadence is
-  `runtime.live_sample_ms` (`0` off, clamped 100..=1000, shown by `darkmux
-  doctor`), and every `dispatch complete` carries the channel's own cost as
+  generation; a state that begins and ends between two screen updates is
+  still drawn for one frame. Utility jobs ride it too: a sub-second radio
+  routing job lights the fleet card's utility glyph while it runs. Nothing
+  is written anywhere: the samples go from the dispatch to the local
+  `darkmux serve` over a unix socket and to its open viewers as SSE `live`
+  events, never to a day file, Redis, the audit chain, playback or the
+  runtime's trajectory, so the durable heartbeat stays at 2 s and no
+  history grows. A slow or absent daemon never slows a dispatch. Local
+  only: another machine's cards stay at 2 s. Lab benchmark runs don't feed
+  it. The cadence is `runtime.live_sample_ms` (`0` off, clamped
+  100..=1000); `darkmux doctor` shows it and names a stale or mismatched
+  socket, and every `dispatch complete` carries the channel's own cost as
   `payload.live`. A replayed scope says on hover that it is drawn from 2 s
   heartbeats. No layout changes. FLOW schema 1.62.0, CONFIG 1.29.
 

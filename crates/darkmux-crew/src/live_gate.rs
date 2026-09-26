@@ -55,6 +55,9 @@ pub(crate) struct LiveGate {
     counts: Option<(u64, u64)>,
     /// The newest sample not sent yet, with its event time.
     held: Option<(u64, Value)>,
+    /// (#2928 review, MF1) The latest state while a stream is open, for the
+    /// host-clock refresh through a silence. Cleared at the stream's end.
+    last: Option<Value>,
 }
 
 fn count(p: &Value, key: &str) -> Option<u64> {
@@ -71,6 +74,7 @@ impl LiveGate {
             turn: None,
             counts: None,
             held: None,
+            last: None,
         }
     }
 
@@ -110,6 +114,7 @@ impl LiveGate {
             .or_else(|| count(&sample, "cumulative_chars"))
             .unwrap_or(0);
         self.counts = Some((gen, count(&sample, "cumulative_chars").unwrap_or(0)));
+        self.last = Some(sample.clone());
 
         let window_over = self
             .window_start
@@ -144,6 +149,41 @@ impl LiveGate {
         }
         self.held = Some((ts, sample));
         Vec::new()
+    }
+
+    /// (#2928 review, MF1) Through a silence, the current state again, once
+    /// per cadence on the HOST's clock `now_ms` (its `sampled_at_ms` is
+    /// restamped to `now_ms`; nothing else changes). This is what keeps the
+    /// live view fresh while the endpoint sends nothing, without the runtime
+    /// writing a single extra trajectory line.
+    ///
+    /// Only for the two silent states whose samples never pair into a rate:
+    /// a tool call being written, and a turn's opener (prompt processing). A
+    /// generating state is never repeated: for a slow model whose chunks are
+    /// simply further apart than the cadence, a repeat would read as a 0
+    /// tok/s pair and then a spike. Nothing is refreshed while a sample is
+    /// held (the flush sends that) or after the stream ended.
+    pub(crate) fn refresh_due(&mut self, now_ms: u64) -> Option<Value> {
+        if self.held.is_some()
+            || !matches!(self.mode, Some(LiveMode::Writing) | Some(LiveMode::Opening))
+        {
+            return None;
+        }
+        let start = self.window_start?;
+        if now_ms < start.saturating_add(self.cadence_ms) {
+            return None;
+        }
+        let mut again = self.last.clone()?;
+        again["sampled_at_ms"] = Value::from(now_ms);
+        self.window_start = Some(now_ms);
+        self.window_sends = 1;
+        Some(again)
+    }
+
+    /// (#2928 review, MF1) The stream ended: nothing more is refreshed. A
+    /// held sample still flushes (it is the stream's real last state).
+    pub(crate) fn end_stream(&mut self) {
+        self.last = None;
     }
 
     /// The held sample, once its window has closed on the caller's clock
@@ -298,5 +338,64 @@ mod tests {
             "within 250 ms of the flushed sample"
         );
         assert_eq!(g.offer(1_350, chunk(1, 40, 40)).len(), 1);
+    }
+
+    /// (#2928 review, MF1) A silence while the model writes a tool call is
+    /// kept fresh on the HOST: the last state is re-sent at the cadence,
+    /// stamped with the host's clock, and the runtime writes nothing extra.
+    #[test]
+    fn a_silent_tool_call_write_is_refreshed_at_the_cadence_on_the_host_clock() {
+        let mut g = LiveGate::new(250);
+        let w = json!({ "turn_seq": 1, "generated_chars": 10, "cumulative_chars": 10, "phase": "writing_tool_call", "tool_name": "bash" });
+        assert_eq!(g.offer(1_000, w.clone()).len(), 1);
+        assert_eq!(g.flush_due(1_300), None, "nothing held");
+        assert_eq!(g.refresh_due(1_100), None, "inside the window");
+        let r = g
+            .refresh_due(1_250)
+            .expect("refreshed once the window closes");
+        assert_eq!(
+            r["sampled_at_ms"], 1_250,
+            "the host's clock, not the runtime's"
+        );
+        assert_eq!(r["tool_name"], "bash");
+        assert_eq!(
+            r["generated_chars"], 10,
+            "the state is repeated, never invented"
+        );
+        assert_eq!(g.refresh_due(1_400), None, "one per cadence");
+        assert!(g.refresh_due(1_500).is_some());
+    }
+
+    /// The opener (prompt processing) is refreshed the same way.
+    #[test]
+    fn prompt_processing_is_refreshed() {
+        let mut g = LiveGate::new(250);
+        g.offer(1_000, json!({ "turn_seq": 2, "generated_chars": 0, "cumulative_chars": 0, "prompt_chars": 9000 }));
+        assert_eq!(
+            g.refresh_due(1_300).expect("refreshed")["prompt_chars"],
+            9000
+        );
+    }
+
+    /// A generating state is NOT refreshed: a repeat with unchanged counts
+    /// would read as a 0 tok/s pair followed by a spike for a slow model
+    /// whose chunks are simply further apart than the cadence.
+    #[test]
+    fn a_generating_state_is_never_refreshed() {
+        let mut g = LiveGate::new(250);
+        g.offer(1_000, chunk(1, 10, 10));
+        assert_eq!(g.refresh_due(5_000), None);
+        g.offer(6_000, chunk(1, 30, 10));
+        assert_eq!(g.refresh_due(9_000), None, "nor while reasoning");
+    }
+
+    /// A stream that ended is not refreshed: the next state (tools, rest,
+    /// the next prompt) belongs to the durable markers.
+    #[test]
+    fn nothing_is_refreshed_after_the_stream_ends() {
+        let mut g = LiveGate::new(250);
+        g.offer(1_000, json!({ "turn_seq": 1, "generated_chars": 10, "cumulative_chars": 10, "phase": "writing_tool_call", "tool_name": "bash" }));
+        g.end_stream();
+        assert_eq!(g.refresh_due(5_000), None);
     }
 }

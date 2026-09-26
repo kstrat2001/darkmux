@@ -2957,7 +2957,7 @@ fn run_with_sleeper(
                 Watch {
                     interval: per_call_cap,
                     carried: turn.carried(),
-                    tick: silence_tick(std::env::var("DARKMUX_LIVE_SAMPLE_MS").ok().as_deref()),
+                    tick: STREAM_TICK,
                 },
             )?;
             (outcome.response, outcome.cut)
@@ -5166,20 +5166,6 @@ struct Watch<'a> {
 /// unchanged.
 pub(crate) const STREAM_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// (#2928) The silence tick this dispatch runs at, from the host-forwarded
-/// `DARKMUX_LIVE_SAMPLE_MS` (the live channel's cadence). While the channel
-/// is on, a silent stream is sampled at that cadence so the live view sees
-/// "still writing" as often as it sees chunks. Off (`0`), absent (an older
-/// host, a manual `docker run`) or unparseable keeps [`STREAM_TICK`]. The
-/// host clamps the knob to 100..=1000 ms; the same clamp here means a
-/// hand-set env can never tick faster than that, or slower than 1 s.
-pub(crate) fn silence_tick(live_sample_ms: Option<&str>) -> std::time::Duration {
-    match live_sample_ms.and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(ms) if ms > 0 => std::time::Duration::from_millis(ms.clamp(100, 1000)),
-        _ => STREAM_TICK,
-    }
-}
-
 /// Run one SSE-streamed turn: consume the chunk iterator, emit a
 /// `model.partial` trajectory event per chunk (stats only — no content
 /// in the events to keep `trajectory.jsonl` bounded), and return the
@@ -5229,12 +5215,6 @@ fn run_streaming_turn(
         policy.acts(),
     );
     let mut cut = CutSource::None;
-    // (#2928) The observer's own cost: how many silence ticks this stream
-    // woke for, and the time spent handling them. Stamped on
-    // `model.streaming.end` so the cost of a finer tick is a number in the
-    // trajectory, never an assumption.
-    let mut idle_ticks: u64 = 0;
-    let mut idle_tick_ns: u64 = 0;
     // (#2889) Ticking, so the loop wakes during a silence and can say the
     // model is still writing a tool call — see `TickingStream`'s doc.
     let stream = client.chat_streaming_ticking(request, watch.tick)?;
@@ -5263,7 +5243,6 @@ fn run_streaming_turn(
             // watchdog on this event. A tick proves only that the runtime is
             // waiting, which a wedged endpoint would also produce.
             Ok(crate::lmstudio::StreamEvent::Idle) => {
-                let t0 = std::time::Instant::now();
                 if let Some(name) = accumulator.writing_tool_name() {
                     trajectory.append_tool_call_writing(
                         seq,
@@ -5273,8 +5252,6 @@ fn run_streaming_turn(
                         name,
                     );
                 }
-                idle_ticks += 1;
-                idle_tick_ns = idle_tick_ns.saturating_add(t0.elapsed().as_nanos() as u64);
                 continue;
             }
             Err(e) if e.downcast_ref::<crate::lmstudio::StreamWentSilent>().is_some() => {
@@ -5453,8 +5430,6 @@ fn run_streaming_turn(
         tool_calls_count,
         gate.observations(),
         chars_per_token,
-        idle_ticks,
-        idle_tick_ns / 1_000,
     );
     if let Some(reasoning) = reasoning_content {
         trajectory.append_model_reasoning(seq, &reasoning, "separate-field");

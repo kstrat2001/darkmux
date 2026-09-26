@@ -141,29 +141,100 @@ impl LiveSample {
 /// samples, and a dispatch sends to the daemon its own config names.
 ///
 /// A unix socket path is limited to ~104 bytes. When the home-based path is
-/// longer (a deep test or scratch home), the socket moves to a per-user
-/// directory under the system temp dir, named by a hash of the home so two
-/// homes never share one. Both ends compute the same path.
-pub fn socket_path_for(home: &Path, port: u16) -> PathBuf {
+/// longer (a deep test or scratch home), the socket moves to a private
+/// directory `darkmux-live-<hash of home>/` under `$XDG_RUNTIME_DIR` when set,
+/// else the system temp dir (shared `/tmp` on Linux). That directory is
+/// created 0700 and, when it already exists, used only if it is a real
+/// directory (not a symlink), 0700, and owned by the home's owner; otherwise
+/// `None` (no channel), never a socket another user could plant or read.
+/// Both ends compute the same path.
+pub fn socket_path_for(home: &Path, port: u16) -> Option<PathBuf> {
     let primary = home.join("run").join(format!("live-{port}.sock"));
     if primary.as_os_str().len() <= 100 {
-        return primary;
+        return Some(primary);
     }
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
+        "darkmux-live-{:016x}",
+        fnv64(home.as_os_str().as_encoded_bytes())
+    ));
+    private_dir(&dir, home)?;
+    Some(dir.join(format!("live-{port}.sock")))
+}
+
+/// Create `dir` 0700, or accept an existing one only if it is a real
+/// directory, 0700, owned by `home`'s owner (the user darkmux runs as).
+fn private_dir(dir: &Path, home: &Path) -> Option<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Some(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    let owner = std::fs::metadata(home).ok()?.uid();
+    let ok = meta.file_type().is_dir()
+        && meta.permissions().mode() & 0o777 == 0o700
+        && meta.uid() == owner;
+    ok.then_some(())
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in home.as_os_str().as_encoded_bytes() {
+    for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    std::env::temp_dir().join(format!("darkmux-live-{:016x}-{port}.sock", h))
+    h
+}
+
+/// A short, stable fingerprint of a socket path, for `/health` to say WHICH
+/// socket a daemon bound without publishing a filesystem path (`/health` is
+/// open to the tailnet). `darkmux doctor` compares it with its own.
+pub fn socket_fingerprint(path: &Path) -> String {
+    format!("{:016x}", fnv64(path.as_os_str().as_encoded_bytes()))
+}
+
+/// The darkmux home the socket path derives from: the liveness dir's parent,
+/// the same resolution the dispatch and the daemon both use.
+pub fn live_home() -> PathBuf {
+    let liveness = darkmux_types::dispatch_liveness::liveness_dir();
+    liveness.parent().map(Path::to_path_buf).unwrap_or(liveness)
 }
 
 /// The socket this machine's daemon uses, from the resolved home and the
 /// resolved serve port (`env > config.serve.port > 8765`, the same
-/// resolution `darkmux serve` binds with).
-pub fn local_socket_path() -> PathBuf {
-    let liveness = darkmux_types::dispatch_liveness::liveness_dir();
-    let home = liveness.parent().map(Path::to_path_buf).unwrap_or(liveness);
-    socket_path_for(&home, crate::daemon_probe::daemon_port())
+/// resolution `darkmux serve` binds with). `None` when no private path is
+/// available (see [`socket_path_for`]).
+pub fn local_socket_path() -> Option<PathBuf> {
+    socket_path_for(&live_home(), crate::daemon_probe::daemon_port())
+}
+
+/// What is at a socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketState {
+    /// No file: no daemon has bound it.
+    Absent,
+    /// A socket file nobody is reading: a daemon that died without
+    /// removing it (SIGKILL). Senders drop into it as "no receiver".
+    Stale,
+    /// A daemon is bound and receiving.
+    Listening,
+}
+
+/// Probe a socket path without sending anything (a datagram `connect`).
+pub fn probe_socket(path: &Path) -> SocketState {
+    let Ok(s) = std::os::unix::net::UnixDatagram::unbound() else {
+        return SocketState::Absent;
+    };
+    match s.connect(path) {
+        Ok(()) => SocketState::Listening,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SocketState::Absent,
+        Err(_) => SocketState::Stale,
+    }
 }
 
 /// A sender's own cost and outcome, stamped into the dispatch's summary so
@@ -172,9 +243,23 @@ pub fn local_socket_path() -> PathBuf {
 pub struct LiveSendStats {
     pub sent: u64,
     pub dropped: u64,
+    /// Of `dropped`: no daemon (no socket, a stale one, or the backoff
+    /// that follows), or no usable socket at all.
+    pub dropped_no_receiver: u64,
+    /// Of `dropped`: the daemon's receive buffer was full (a slow daemon).
+    pub dropped_full: u64,
     /// Total time spent in `send` (serialization and the syscall), in ns.
     pub send_ns: u64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Ok,
+    NoReceiver,
+    Full,
+    /// Refused before any syscall (oversize).
+    Refused,
 }
 
 /// The dispatch side of the channel. Never blocks, never errors.
@@ -206,7 +291,7 @@ impl LiveSender {
         if !darkmux_types::config_access::live_cadence().enabled() {
             return None;
         }
-        Some(Self::to_path(local_socket_path()))
+        local_socket_path().map(Self::to_path)
     }
 
     /// Send one sample. Returns whether it was handed to the daemon's socket.
@@ -214,46 +299,55 @@ impl LiveSender {
     /// drop, counted; the caller carries on either way.
     pub fn send(&mut self, sample: &LiveSample) -> bool {
         let t0 = Instant::now();
-        let ok = self.send_inner(sample, t0);
+        let outcome = self.send_inner(sample, t0);
         self.stats.send_ns = self
             .stats
             .send_ns
             .saturating_add(t0.elapsed().as_nanos() as u64);
-        if ok {
-            self.stats.sent += 1;
-        } else {
-            self.stats.dropped += 1;
+        match outcome {
+            Sent::Ok => self.stats.sent += 1,
+            Sent::NoReceiver => {
+                self.stats.dropped += 1;
+                self.stats.dropped_no_receiver += 1;
+            }
+            Sent::Full => {
+                self.stats.dropped += 1;
+                self.stats.dropped_full += 1;
+            }
+            Sent::Refused => self.stats.dropped += 1,
         }
-        ok
+        outcome == Sent::Ok
     }
 
-    fn send_inner(&mut self, sample: &LiveSample, now: Instant) -> bool {
+    fn send_inner(&mut self, sample: &LiveSample, now: Instant) -> Sent {
         if self.backoff_until.is_some_and(|t| now < t) {
-            return false;
+            return Sent::NoReceiver;
         }
         let Some(sock) = self.sock.as_ref() else {
-            return false;
+            return Sent::NoReceiver;
         };
         let Some(bytes) = sample.to_bytes() else {
-            return false;
+            return Sent::Refused;
         };
         match sock.send_to(&bytes, &self.path) {
             Ok(_) => {
                 self.backoff_until = None;
                 self.stats.bytes = self.stats.bytes.saturating_add(bytes.len() as u64);
-                true
+                Sent::Ok
             }
-            Err(e) => {
-                // No daemon: back off. A full buffer (a slow daemon) is
-                // just this sample lost; the next may fit.
+            // No daemon (no socket, or a stale one): back off.
+            Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) {
-                    self.backoff_until = Some(now + ABSENT_BACKOFF);
-                }
-                false
+                ) =>
+            {
+                self.backoff_until = Some(now + ABSENT_BACKOFF);
+                Sent::NoReceiver
             }
+            // A full buffer (a slow daemon, EAGAIN/ENOBUFS): just this sample
+            // is lost; the next may fit.
+            Err(_) => Sent::Full,
         }
     }
 
@@ -337,27 +431,80 @@ mod tests {
     }
 
     #[test]
-    fn a_long_home_moves_the_socket_under_the_temp_dir_deterministically() {
+    fn a_long_home_moves_the_socket_to_a_private_dir_deterministically() {
         let short = socket_path_for(Path::new("/Users/x/.darkmux"), 8765);
-        assert_eq!(short, PathBuf::from("/Users/x/.darkmux/run/live-8765.sock"));
-        let deep = PathBuf::from(format!("/{}", "d".repeat(120)));
-        let a = socket_path_for(&deep, 8765);
-        assert!(a.starts_with(std::env::temp_dir()), "{a:?}");
-        assert!(
-            a.as_os_str().len() <= 104 || std::env::temp_dir().as_os_str().len() > 60,
-            "{a:?}"
-        );
         assert_eq!(
-            a,
-            socket_path_for(&deep, 8765),
-            "both ends compute the same path"
+            short,
+            Some(PathBuf::from("/Users/x/.darkmux/run/live-8765.sock"))
         );
-        assert_ne!(
-            a,
-            socket_path_for(&PathBuf::from(format!("/{}", "e".repeat(120))), 8765),
-            "two homes never share one"
+        let base = tempfile::tempdir().unwrap();
+        let home_root = tempfile::tempdir().unwrap();
+        let deep = home_root.path().join("d".repeat(120));
+        std::fs::create_dir_all(&deep).unwrap();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", base.path()) };
+        let a = socket_path_for(&deep, 8765).expect("a private path");
+        let again = socket_path_for(&deep, 8765);
+        let other_port = socket_path_for(&deep, 8766);
+        // A directory someone else prepared at the name a second home hashes
+        // to: world-readable, so refused.
+        let deep2 = home_root.path().join("e".repeat(120));
+        std::fs::create_dir_all(&deep2).unwrap();
+        let planted = base.path().join(format!(
+            "darkmux-live-{:016x}",
+            fnv64(deep2.as_os_str().as_encoded_bytes())
+        ));
+        std::fs::create_dir(&planted).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = socket_path_for(&deep2, 8765);
+        // A symlink planted at the name is refused too.
+        let deep3 = home_root.path().join("f".repeat(120));
+        std::fs::create_dir_all(&deep3).unwrap();
+        let link = base.path().join(format!(
+            "darkmux-live-{:016x}",
+            fnv64(deep3.as_os_str().as_encoded_bytes())
+        ));
+        let target = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(target.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        let via_link = socket_path_for(&deep3, 8765);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        assert!(a.starts_with(base.path()), "under XDG_RUNTIME_DIR: {a:?}");
+        let dir_mode = std::fs::metadata(a.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "a private directory");
+        assert_eq!(again, Some(a.clone()), "both ends compute the same path");
+        assert_ne!(other_port, Some(a), "keyed by port");
+        assert_eq!(refused, None, "a directory that is not 0700 is never used");
+        assert_eq!(via_link, None, "a symlink is never followed");
+    }
+
+    #[test]
+    fn a_socket_nobody_reads_probes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        assert_eq!(probe_socket(&path), SocketState::Absent);
+        let rx = bind_ingest(&path).unwrap();
+        assert_eq!(probe_socket(&path), SocketState::Listening);
+        drop(rx); // a SIGKILLed daemon leaves its socket file behind
+        assert!(path.exists());
+        assert_eq!(probe_socket(&path), SocketState::Stale);
+        let mut tx = LiveSender::to_path(path);
+        assert!(!tx.send(&model_sample(1)));
+        assert_eq!(
+            tx.stats().dropped_no_receiver,
+            1,
+            "a stale socket is a no-receiver drop"
         );
-        assert_ne!(a, socket_path_for(&deep, 8766), "keyed by port");
     }
 
     #[test]
@@ -394,6 +541,10 @@ mod tests {
         let elapsed = t0.elapsed();
         let st = tx.stats();
         assert!(
+            st.dropped_full > 0 && st.dropped_no_receiver == 0,
+            "a full buffer is its own cause: {st:?}"
+        );
+        assert!(
             st.dropped > 0,
             "the buffer filled and later samples were dropped: {st:?}"
         );
@@ -418,6 +569,11 @@ mod tests {
             assert!(!tx.send(&model_sample(i)));
         }
         assert_eq!(tx.stats().dropped, 101);
+        assert_eq!(
+            tx.stats().dropped_no_receiver,
+            101,
+            "no daemon, during the backoff too"
+        );
         // A daemon appearing is picked up once the window passes.
         let path = dir.path().join("nobody.sock");
         let rx = bind_ingest(&path).unwrap();

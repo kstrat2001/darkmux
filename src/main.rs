@@ -1306,6 +1306,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // (#2914) Work never runs on the utility model.
         allow_utility_model: false,
         remote_origin: None,
+        live_channel: true,
         // (#2774 review F2) Operator-settable now, so a checkpoint written
         // under a read-only mount (every crawl unit) can actually be
         // resumed — the resume gate refuses an origin-read-only checkpoint

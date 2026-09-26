@@ -98,6 +98,7 @@ export function liveSampleToRecord(raw: unknown): (FlowRecord & LiveRecordMark) 
       model: s.model,
       payload: fields,
       live: true,
+      live_cadence_ms: s.cadence_ms,
     } as unknown as FlowRecord & LiveRecordMark;
   }
   if (s.kind === "utility") {
@@ -157,20 +158,13 @@ function liveEdgeKey(r: FlowRecord): string | null {
  *  nothing live to merge, so an idle page does no extra work. */
 export function mergeLive(durable: readonly FlowRecord[], live: readonly FlowRecord[] | undefined): FlowRecord[] {
   if (!live || live.length === 0) return durable as FlowRecord[];
-  let first = Infinity;
-  let last = -Infinity;
-  for (const r of live) {
-    if (r.action !== "dispatch.turn.heartbeat") continue;
-    const at = beatMs(r);
-    if (at < first) first = at;
-    if (at > last) last = at;
-  }
+  const spans = liveSpans(live);
   let durableEdges: Set<string> | null = null;
   const out: FlowRecord[] = [];
   for (const r of durable) {
     if (r.action === "dispatch.turn.heartbeat") {
       const at = beatMs(r);
-      if (at >= first && at <= last) continue;
+      if (spans.some(([a, b]) => at >= a && at <= b)) continue;
     } else {
       const k = durableEdgeKey(r);
       if (k) (durableEdges ??= new Set()).add(k);
@@ -187,22 +181,93 @@ export function mergeLive(durable: readonly FlowRecord[], live: readonly FlowRec
   return out;
 }
 
-/** The overlay store. One per page; `liveStore` below is that one. */
+/** (#2928 review, C1) The stretches the live samples actually cover: a gap
+ *  longer than two cadences plus the host's 250 ms poll ends a stretch. A
+ *  durable heartbeat is dropped only INSIDE a stretch; one in a hole (the
+ *  feed dropped, the daemon restarted, the page lost its stream) stays. */
+function liveSpans(live: readonly FlowRecord[]): [number, number][] {
+  const beats = live
+    .filter((r) => r.action === "dispatch.turn.heartbeat")
+    .map((r) => ({ at: beatMs(r), gap: 2 * cadenceOf(r) + HOST_POLL_MS }))
+    .sort((a, b) => a.at - b.at);
+  const spans: [number, number][] = [];
+  for (const b of beats) {
+    const cur = spans[spans.length - 1];
+    if (cur && b.at - cur[1] <= b.gap) cur[1] = b.at;
+    else spans.push([b.at, b.at]);
+  }
+  return spans;
+}
+
+/** The host tailer's trajectory poll: the most a sample can lag its window. */
+const HOST_POLL_MS = 250;
+
+function cadenceOf(r: FlowRecord): number {
+  const c = (r as unknown as { live_cadence_ms?: unknown }).live_cadence_ms;
+  return typeof c === "number" && Number.isFinite(c) && c > 0 ? c : 250;
+}
+
+type Mode = "opening" | "thinking" | "visible" | "writing";
+
+/** How long a frame drawn for a state that came and went between renders
+ *  (C2) stays up before the next one: about two frames at 60 Hz. */
+export const TRANSIENT_FRAME_MS = 32;
+/** At most this many such frames per notification: a flapping stream never
+ *  queues an animation of its own. */
+const MAX_TRANSIENT_FRAMES = 4;
+/** How often idle entries are pruned while the store holds any (C9). */
+export const LIVE_PRUNE_EVERY_MS = 5_000;
+
+interface SessionMode {
+  mode: Mode;
+  turn: unknown;
+  gen: number;
+  vis: number;
+}
+
+function modeAfter(prev: SessionMode | undefined, f: Record<string, unknown>): Mode {
+  if (typeof f.prompt_chars === "number") return "opening";
+  if (typeof f.phase === "string") return "writing";
+  const gen = typeof f.generated_chars === "number" ? f.generated_chars : 0;
+  const vis = typeof f.cumulative_chars === "number" ? f.cumulative_chars : 0;
+  if (!prev || prev.turn !== f.turn_seq) return vis > 0 ? "visible" : gen > 0 ? "thinking" : "opening";
+  if (vis > prev.vis) return "visible";
+  if (gen > prev.gen) return "thinking";
+  return prev.mode;
+}
+
+/** The overlay store. One per page; `liveStore` below is that one.
+ *
+ *  Render pacing: subscribers are told at most once per cadence (the
+ *  samples' own `cadence_ms`), leading edge immediate, trailing edge
+ *  scheduled, so a page watching several executions renders at the
+ *  channel's cadence rather than once per sample each. Every sample is in
+ *  the data either way.
+ *
+ *  (#2928 review, C2) Pacing must not swallow a state: a model state (or a
+ *  utility job) that began after the last notification and has already
+ *  ended when the next sample arrives is drawn for one frame
+ *  (`TRANSIENT_FRAME_MS`) from a snapshot taken just before it ended, then
+ *  the latest state. Fast transitions are shown as they happen, never
+ *  averaged away. */
 export class LiveStore {
   private bySession = new Map<string, FlowRecord[]>();
   private lastSeen = new Map<string, number>();
   private utility: FlowRecord[] = [];
-  private snap: LiveOverlay = EMPTY_OVERLAY;
+  private latest: LiveOverlay = EMPTY_OVERLAY;
+  private frames: LiveOverlay[] = [];
   private listeners = new Set<() => void>();
   private version = 0;
-  /** Render pacing: at most one notification per cadence (the samples' own
-   *  `cadence_ms`), leading edge immediate, trailing edge scheduled. Every
-   *  sample is kept in the snapshot either way; only how often subscribers
-   *  are told is bounded, so a page watching several executions renders at
-   *  the channel's cadence rather than once per sample per execution. */
   private cadenceMs = 250;
   private lastNotifyMs = -Infinity;
   private pending: ReturnType<typeof setTimeout> | null = null;
+  private frameTimer: ReturnType<typeof setTimeout> | null = null;
+  private pruneTimer: ReturnType<typeof setTimeout> | null = null;
+  private modes = new Map<string, SessionMode>();
+  /** Sessions whose current mode began after the last notification. */
+  private unrenderedMode = new Set<string>();
+  /** Utility jobs whose start arrived after the last notification. */
+  private unrenderedStart = new Set<string>();
 
   /** Ingest one SSE `live` frame's data. Returns whether it was used. */
   ingest(data: string, nowMs: number = Date.now()): boolean {
@@ -217,11 +282,25 @@ export class LiveStore {
     const cadence = (parsed as { cadence_ms?: unknown }).cadence_ms;
     if (typeof cadence === "number" && Number.isFinite(cadence)) this.cadenceMs = Math.min(1000, Math.max(50, cadence));
     const sid = rec.session_id;
+    const f = fieldsOf(rec);
     if (rec.action === "dispatch.turn.heartbeat" && sid) {
+      const prev = this.modes.get(sid);
+      const mode = modeAfter(prev, f);
+      if (prev && prev.mode !== mode && this.unrenderedMode.has(sid)) this.keepFrame();
+      if (!prev || prev.mode !== mode) this.unrenderedMode.add(sid);
+      this.modes.set(sid, {
+        mode,
+        turn: f.turn_seq,
+        gen: typeof f.generated_chars === "number" ? f.generated_chars : 0,
+        vis: typeof f.cumulative_chars === "number" ? f.cumulative_chars : 0,
+      });
       const list = [...(this.bySession.get(sid) ?? []), rec];
       this.bySession.set(sid, list.length > MAX_LIVE_PER_SESSION ? list.slice(-MAX_LIVE_PER_SESSION) : list);
       this.lastSeen.set(sid, nowMs);
     } else {
+      const jobId = typeof f.job_id === "string" ? f.job_id : null;
+      if (rec.action === LIVE_UTILITY_END_ACTION && jobId !== null && this.unrenderedStart.has(jobId)) this.keepFrame();
+      if (rec.action === UTILITY_START_ACTION && jobId !== null) this.unrenderedStart.add(jobId);
       this.utility = [...this.utility, rec].filter((r) => nowMs - Date.parse(r.ts) <= LIVE_UTILITY_TTL_MS).slice(-MAX_LIVE_PER_SESSION);
       if (sid) {
         this.bySession.set(sid, [...(this.bySession.get(sid) ?? []), rec].slice(-MAX_LIVE_PER_SESSION));
@@ -230,39 +309,88 @@ export class LiveStore {
     }
     this.prune(nowMs);
     this.publish();
+    this.schedulePrune();
     return true;
   }
 
-  private prune(nowMs: number): void {
+  /** Keep the state as it is now (before this sample) as a frame to draw. */
+  private keepFrame(): void {
+    if (this.frames.length >= MAX_TRANSIENT_FRAMES) return;
+    this.frames.push({ version: ++this.version, bySession: new Map(this.bySession), utility: this.utility });
+    this.showFrames();
+  }
+
+  private showFrames(): void {
+    if (this.frameTimer !== null) return;
+    const step = () => {
+      if (this.frames.length === 0) {
+        this.frameTimer = null;
+        this.notify();
+        return;
+      }
+      this.frameTimer = setTimeout(() => {
+        this.frames.shift();
+        step();
+      }, TRANSIENT_FRAME_MS);
+      for (const l of this.listeners) l();
+    };
+    step();
+  }
+
+  private prune(nowMs: number): boolean {
+    let changed = false;
     for (const [sid, at] of this.lastSeen) {
       if (nowMs - at > LIVE_SESSION_TTL_MS) {
         this.lastSeen.delete(sid);
         this.bySession.delete(sid);
+        this.modes.delete(sid);
+        changed = true;
       }
     }
+    const kept = this.utility.filter((r) => nowMs - Date.parse(r.ts) <= LIVE_UTILITY_TTL_MS);
+    if (kept.length !== this.utility.length) {
+      this.utility = kept;
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** (#2928 review, C9) While anything is held, prune on a timer too, so an
+   *  execution that stopped sending leaves without waiting for another. */
+  private schedulePrune(): void {
+    if (this.pruneTimer !== null) return;
+    this.pruneTimer = setTimeout(() => {
+      this.pruneTimer = null;
+      if (this.prune(Date.now())) this.publish();
+      if (this.bySession.size > 0 || this.utility.length > 0) this.schedulePrune();
+    }, LIVE_PRUNE_EVERY_MS);
   }
 
   private publish(): void {
     this.version += 1;
-    this.snap = { version: this.version, bySession: new Map(this.bySession), utility: this.utility };
-    if (this.pending !== null) return;
+    this.latest = { version: this.version, bySession: new Map(this.bySession), utility: this.utility };
+    if (this.pending !== null || this.frameTimer !== null) return;
     const wait = this.lastNotifyMs + this.cadenceMs - Date.now();
     if (wait <= 0) {
       this.notify();
     } else {
       this.pending = setTimeout(() => {
         this.pending = null;
-        this.notify();
+        if (this.frameTimer === null) this.notify();
       }, wait);
     }
   }
 
   private notify(): void {
     this.lastNotifyMs = Date.now();
+    this.unrenderedMode.clear();
+    this.unrenderedStart.clear();
     for (const l of this.listeners) l();
   }
 
-  snapshot = (): LiveOverlay => this.snap;
+  /** What subscribers draw: a transient frame while one is up, else the
+   *  latest state. */
+  snapshot = (): LiveOverlay => this.frames[0] ?? this.latest;
 
   subscribe = (fn: () => void): (() => void) => {
     this.listeners.add(fn);
@@ -271,13 +399,19 @@ export class LiveStore {
 
   /** Test seam: forget everything. */
   reset(): void {
-    if (this.pending !== null) clearTimeout(this.pending);
+    for (const t of [this.pending, this.frameTimer, this.pruneTimer]) if (t !== null) clearTimeout(t);
     this.pending = null;
+    this.frameTimer = null;
+    this.pruneTimer = null;
     this.lastNotifyMs = -Infinity;
     this.bySession.clear();
     this.lastSeen.clear();
+    this.modes.clear();
+    this.unrenderedMode.clear();
+    this.unrenderedStart.clear();
+    this.frames = [];
     this.utility = [];
-    this.snap = EMPTY_OVERLAY;
+    this.latest = EMPTY_OVERLAY;
   }
 }
 
