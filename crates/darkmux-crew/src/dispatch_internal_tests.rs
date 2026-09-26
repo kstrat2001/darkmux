@@ -4530,10 +4530,54 @@
             ("http://127.0.0.1:1234", "http://host.docker.internal:1234/v1"),
             ("http://[::1]:1234", "http://host.docker.internal:1234/v1"),
             ("http://LOCALHOST", "http://host.docker.internal/v1"),
+            // Review of #2906: each of these worked pre-PR (the container
+            // used its default) and must not regress to dialing the
+            // container's own loopback.
+            ("http://0.0.0.0:1234", "http://host.docker.internal:1234/v1"),
+            ("http://127.0.0.2:1234", "http://host.docker.internal:1234/v1"),
+            ("http://127.255.0.9:4321/v1", "http://host.docker.internal:4321/v1"),
+            ("http://[0:0:0:0:0:0:0:1]:1234", "http://host.docker.internal:1234/v1"),
+            ("http://[::]:1234", "http://host.docker.internal:1234/v1"),
+            ("https://Localhost:8443", "https://host.docker.internal:8443/v1"),
         ] {
             assert_eq!(
                 container_argv_base_url_for_env(configured, None).as_deref(),
                 Some(want),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_keeps_userinfo_while_rewriting_a_loopback_host() {
+        for (configured, want) in [
+            ("http://user@localhost:4321", "http://user@host.docker.internal:4321/v1"),
+            ("http://user:pw@127.0.0.1:4321", "http://user:pw@host.docker.internal:4321/v1"),
+            // Userinfo on a non-loopback host: untouched.
+            ("http://user@192.168.1.5:4321", "http://user@192.168.1.5:4321/v1"),
+            // A userinfo that merely LOOKS like a loopback host is not the host.
+            ("http://localhost@192.168.1.5:4321", "http://localhost@192.168.1.5:4321/v1"),
+        ] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None).as_deref(),
+                Some(want),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_base_url_without_a_scheme_omits_the_flag_rather_than_pass_a_malformed_one() {
+        // A scheme-less `lmstudio_url` cannot be dialed as-is; forwarding it
+        // would hand the runtime a malformed `--base-url`. Omitting the flag
+        // leaves the runtime's own default in place, which is the pre-#2904
+        // behavior for every configured URL.
+        for configured in ["localhost:4321", "192.168.1.5:4321/v1"] {
+            assert_eq!(
+                container_argv_base_url_for_env(configured, None),
+                None,
                 "configured {configured:?}"
             );
         }

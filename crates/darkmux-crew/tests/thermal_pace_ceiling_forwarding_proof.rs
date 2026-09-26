@@ -102,7 +102,7 @@ fn write_profiles_registry(dir: &Path) -> std::path::PathBuf {
 /// A fake `docker` that appends its own argv to `record` and exits, and a
 /// fake `lms` that answers `ps --json` with an empty resident set. Same
 /// idiom as `dispatch_internal_tests.rs`'s `install_fake_docker`.
-fn install_fake_docker_and_lms(dir: &Path, record: &Path) -> std::path::PathBuf {
+fn install_fake_docker_and_lms(dir: &Path, record: &Path, lms_ps_json: &str) -> std::path::PathBuf {
     let fake_docker = dir.join("docker");
     fs::write(
         &fake_docker,
@@ -113,7 +113,7 @@ fn install_fake_docker_and_lms(dir: &Path, record: &Path) -> std::path::PathBuf 
     let fake_lms = dir.join("lms");
     fs::write(
         &fake_lms,
-        "#!/bin/sh\nif [ \"$1\" = \"ps\" ]; then\necho '[]'\nexit 0\nfi\nexit 0\n",
+        format!("#!/bin/sh\nif [ \"$1\" = \"ps\" ]; then\necho '{lms_ps_json}'\nexit 0\nfi\nexit 0\n"),
     )
     .expect("writing fake lms");
 
@@ -134,6 +134,20 @@ fn install_fake_docker_and_lms(dir: &Path, record: &Path) -> std::path::PathBuf 
 /// `DARKMUX_THERMAL_MAX_PAUSE_MS` set to `max_pause_ms`, and return every
 /// argv line the shim recorded.
 fn captured_docker_argv(max_pause_ms: &str) -> String {
+    captured_docker_argv_with(max_pause_ms, Some("http://127.0.0.1:1/v1"), None, "[]")
+}
+
+/// The general form: `base_url_override` is `DispatchOpts::
+/// model_base_url_override`; `lmstudio_url` (when `Some`) is exported as
+/// `DARKMUX_LMSTUDIO_URL`; `lms_ps_json` is what the fake `lms ps --json`
+/// prints (a resident set lets the host-side residency path, which runs
+/// whenever there is no override, find the model already loaded).
+fn captured_docker_argv_with(
+    max_pause_ms: &str,
+    base_url_override: Option<&str>,
+    lmstudio_url: Option<&str>,
+    lms_ps_json: &str,
+) -> String {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home_dir = tmp.path().join("home");
     let flows_dir = tmp.path().join("flows");
@@ -144,7 +158,7 @@ fn captured_docker_argv(max_pause_ms: &str) -> String {
     }
     let record = tmp.path().join("docker-argv.txt");
     let profiles_path = write_profiles_registry(tmp.path());
-    let fake_lms = install_fake_docker_and_lms(&fake_bin_dir, &record);
+    let fake_lms = install_fake_docker_and_lms(&fake_bin_dir, &record, lms_ps_json);
 
     let real_path = std::env::var("PATH").unwrap_or_default();
 
@@ -157,6 +171,7 @@ fn captured_docker_argv(max_pause_ms: &str) -> String {
     let _lms = EnvVarGuard::set("DARKMUX_LMS_BIN", &fake_lms);
     let _path = EnvVarGuard::set("PATH", format!("{}:{real_path}", fake_bin_dir.display()));
     let _thermal = EnvVarGuard::set("DARKMUX_THERMAL_MAX_PAUSE_MS", max_pause_ms);
+    let _lmstudio_url = lmstudio_url.map(|u| EnvVarGuard::set("DARKMUX_LMSTUDIO_URL", u));
 
     let opts = DispatchOpts {
         brief_refs: Vec::new(),
@@ -189,7 +204,7 @@ fn captured_docker_argv(max_pause_ms: &str) -> String {
         // the only `lms` call possible is the sampler's own `ps --json`.
         // The URL is never dialed: the fake `docker` never runs the real
         // runtime binary that would try.
-        model_base_url_override: Some("http://127.0.0.1:1/v1".to_string()),
+        model_base_url_override: base_url_override.map(str::to_string),
         step_id: None,
         system_prompt_override: None,
     };
@@ -256,5 +271,32 @@ fn a_finite_max_pause_forwards_the_operators_own_value() {
         run_line.contains("DARKMUX_MAX_PAUSE_MS=120000"),
         "a finite cap is both the episode cap AND the staleness ceiling — it must reach the \
          container verbatim: {run_line}"
+    );
+}
+
+/// (#2904) `dispatch()` hands the container the configured LMStudio URL,
+/// translated for Docker, when no mock override is set. Pins the ONE
+/// assignment in `dispatch()` (`base_url_override:
+/// container_lmstudio_base_url(...)`) that the unit tests in
+/// `dispatch_internal_tests.rs` cannot reach: reverting it to
+/// `opts.model_base_url_override.clone()` drops `--base-url` from the argv
+/// and the container falls back to the runtime's `:1234` default.
+///
+/// No override means the host-side residency path runs, so the fake `lms`
+/// reports the profile's model as already resident under darkmux's
+/// namespace at the profile's `n_ctx` — nothing is loaded, and the URL is
+/// never dialed (the fake `docker` never starts the runtime).
+#[test]
+#[serial_test::serial]
+fn a_configured_lmstudio_url_reaches_the_container_translated_for_docker() {
+    let resident = r#"[{"identifier":"darkmux:mock-model","modelKey":"mock-model","contextLength":8192,"status":"idle"}]"#;
+    let recorded = captured_docker_argv_with("120000", None, Some("http://localhost:4321"), resident);
+    // Proves a `docker run` reached the shim. The runtime args follow the
+    // multi-line `--system` prompt, so they land on later record lines:
+    // assert against the whole record, not just the env-block line.
+    let _ = docker_run_line(&recorded);
+    assert!(
+        recorded.contains("--base-url http://host.docker.internal:4321/v1"),
+        "the configured lmstudio_url must reach the container as its --base-url: {recorded}"
     );
 }

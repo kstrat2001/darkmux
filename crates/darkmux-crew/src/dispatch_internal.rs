@@ -1906,61 +1906,6 @@ pub struct DockerRunConfig {
 ///
 /// Order: program, `run`, OPTIONS (--rm, --name, hardening flags, mounts,
 /// injection), then `--` + image + runtime CLI args.
-/// (#2904) The LMStudio base URL the dispatch container dials, as the
-/// runtime's `--base-url` (an OpenAI-compat `/v1` root; the runtime appends
-/// `/chat/completions`).
-///
-/// An explicit override (the mock-model harness) wins, verbatim. Otherwise
-/// it is the SAME resolved `lmstudio_url` the host-side single-shot path
-/// reads (`config_access::lmstudio_url`, env > config.json > default),
-/// normalized to `/v1` by the shared `single_shot::lmstudio_v1_base`, then
-/// rewritten for the container's view of the network: a loopback host
-/// names the container itself inside Docker, so it becomes
-/// `host.docker.internal` (Docker Desktop's name for the host, which the
-/// runtime's baked-in default already relies on). Any other host, the port,
-/// and the path pass through unchanged. This is a networking translation
-/// only; it says nothing about where the endpoint is.
-///
-/// Before #2904 the flag was emitted only for the override, so an operator
-/// on a non-default port had it honored by single-shot calls but not by
-/// agentic dispatches, which kept dialing the runtime's `:1234` default.
-pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<String> {
-    if let Some(url) = override_url {
-        return Some(url.to_string());
-    }
-    let base = crate::single_shot::lmstudio_v1_base(&darkmux_types::config_access::lmstudio_url());
-    Some(loopback_to_docker_host(&base))
-}
-
-/// Rewrite a loopback host (`localhost`, `127.0.0.1`, `[::1]`, any case) in
-/// `url` to `host.docker.internal`, keeping scheme, port, and path. Any
-/// other URL is returned unchanged.
-fn loopback_to_docker_host(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(authority_end);
-    // `[::1]:port` keeps its colon inside the brackets; split the port off
-    // after the closing bracket, else at the last `:`.
-    let (host, port) = if authority.starts_with('[') {
-        match authority.find(']') {
-            Some(i) => authority.split_at(i + 1),
-            None => (authority, ""),
-        }
-    } else {
-        match authority.rfind(':') {
-            Some(i) => authority.split_at(i),
-            None => (authority, ""),
-        }
-    };
-    let is_loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]";
-    if !is_loopback {
-        return url.to_string();
-    }
-    format!("{scheme}://host.docker.internal{port}{path}")
-}
-
 pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -2190,6 +2135,95 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
 
     args
 }
+
+/// (#2904) The LMStudio base URL the dispatch container dials, as the
+/// runtime's `--base-url` (an OpenAI-compat `/v1` root; the runtime appends
+/// `/chat/completions`).
+///
+/// An explicit override (the mock-model harness) wins, verbatim. Otherwise
+/// it is the SAME resolved `lmstudio_url` the host-side single-shot path
+/// reads (`config_access::lmstudio_url`, env > config.json > default),
+/// normalized to `/v1` by the shared `single_shot::lmstudio_v1_base`, then
+/// rewritten for the container's view of the network by
+/// [`loopback_to_docker_host`]. This is a networking translation only; it
+/// says nothing about where the endpoint is.
+///
+/// A configured URL with no `scheme://` returns `None` (flag omitted, the
+/// runtime keeps its own default, which is the pre-#2904 behavior) with a
+/// stderr warning, rather than forwarding a value the runtime cannot dial.
+///
+/// Before #2904 the flag was emitted only for the override, so an operator
+/// on a non-default port had it honored by single-shot calls but not by
+/// agentic dispatches, which kept dialing the runtime's `:1234` default.
+pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<String> {
+    if let Some(url) = override_url {
+        return Some(url.to_string());
+    }
+    let configured = darkmux_types::config_access::lmstudio_url();
+    if !configured.contains("://") {
+        eprintln!(
+            "darkmux dispatch: lmstudio_url `{configured}` has no scheme (expected e.g. \
+             `http://localhost:1234`); the dispatch container keeps its default LMStudio \
+             address instead. (#2904)"
+        );
+        return None;
+    }
+    let base = crate::single_shot::lmstudio_v1_base(&configured);
+    Some(loopback_to_docker_host(&base))
+}
+
+/// Rewrite a host that means "this machine" in `url` to
+/// `host.docker.internal` (Docker Desktop's name for the host, which the
+/// runtime's baked-in default already relies on), because inside the
+/// container that same host names the container itself. "This machine" is
+/// `localhost` (any case), all of `127.0.0.0/8`, the unspecified `0.0.0.0`
+/// and `[::]`, and IPv6 loopback in any spelling (`[::1]`,
+/// `[0:0:0:0:0:0:0:1]`). Scheme, userinfo, port and path are kept. Any
+/// other URL, including one with no `scheme://`, is returned unchanged.
+fn loopback_to_docker_host(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    // Userinfo ends at the LAST `@` of the authority.
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => authority.split_at(i + 1),
+        None => ("", authority),
+    };
+    // `[v6]:port` keeps its colons inside the brackets; split the port off
+    // after the closing bracket, else at the last `:`.
+    let (host, port) = if hostport.starts_with('[') {
+        match hostport.find(']') {
+            Some(i) => hostport.split_at(i + 1),
+            None => (hostport, ""),
+        }
+    } else {
+        match hostport.rfind(':') {
+            Some(i) => hostport.split_at(i),
+            None => (hostport, ""),
+        }
+    };
+    if !host_means_this_machine(host) {
+        return url.to_string();
+    }
+    format!("{scheme}://{userinfo}host.docker.internal{port}{path}")
+}
+
+/// See [`loopback_to_docker_host`] for the set.
+fn host_means_this_machine(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|a| a.is_loopback() || a.is_unspecified());
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|a| a.is_loopback() || a.is_unspecified())
+}
+
 
 /// Construct the dispatch `Command` from [`build_docker_run_argv`]'s output.
 /// That vector is a FULL command — the program (`docker`) at `[0]` followed by
