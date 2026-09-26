@@ -3364,13 +3364,37 @@ body {
     display: flex;
     flex-direction: column;
   }
-  .savlblwrap {
+  /* Two classes, not one: the base `.savlblwrap` rule further down (the
+     label-line row every other width uses) comes later in the file. */
+  .savlead .savlblwrap {
     display: contents;
   }
   .savlead .savlbl {
     order: -1;
     margin-top: 0;
     margin-bottom: 3px;
+  }
+  /* (#2902, layout) The UTILITY part sits BESIDE the figure, on its
+     baseline, not on a line under it: a line of its own grew the hero
+     18.5px whenever utility spend was in the window and shrank it again when
+     it scrolled out. Label / figure-and-part: the part stays with the
+     figure it is a share of and never sits between the label and the
+     figure (the ambiguity the paragraph above removes). */
+  .savlead {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "lbl lbl" "num part";
+    align-items: baseline;
+  }
+  .savlead .savlbl {
+    grid-area: lbl;
+  }
+  .savlead .savnum {
+    grid-area: num;
+  }
+  .savlead .savpart {
+    grid-area: part;
+    margin: 0 0 0 10px;
   }
 }
 .savlbl {
@@ -3432,6 +3456,43 @@ body {
    word is uppercased. */
 .savpart .savpartv {
   text-transform: none;
+}
+/* (#2902, layout) A part line never takes a line of its own: that grew the
+   hero 18.5px (INPUT's CACHED on a phone, ALL TOKENS' UTILITY everywhere)
+   whenever a provider reported it, and shrank it again when it scrolled out
+   of the window. It rides on its figure's LABEL line instead, after the
+   label, on the label's baseline, one line, clipped rather than wrapped if a
+   narrow track ever runs out of room. The label never gives up width; only
+   the part does. Line-height 1 inside the lead so the smaller part can
+   never be taller than the label line it shares. */
+.savc__lbl,
+.savlblwrap {
+  display: flex;
+  align-items: baseline;
+  gap: 0 10px;
+  white-space: nowrap;
+  min-width: 0;
+}
+.savc__lbl .scl,
+.savlblwrap .savlbl {
+  flex: 0 0 auto;
+}
+.savc__lbl .savpart,
+.savlblwrap .savpart {
+  margin-top: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Bottom-aligned, not baseline-aligned, in the lead: two fonts of different
+   sizes on one baseline measured 0.6px taller than the label alone. With
+   line-height 1 the part's box is shorter than the label's and sits inside
+   it, so the line is exactly the label's height either way. */
+.savlblwrap {
+  align-items: flex-end;
+}
+.savlblwrap .savpart {
+  line-height: 1;
 }
 .savc .scl {
   font: calc(10px * var(--fs-scale))/1.5 var(--font-mono);

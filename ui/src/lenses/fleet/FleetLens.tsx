@@ -112,8 +112,13 @@ function Chip({ value, label, cls, loading, part }: { value?: string | number; l
   return (
     <div className={`savc${cls ? ` ${cls}` : ""}`}>
       {loading ? <Shimmer as="div" className="scv" minHeight="1.1em" /> : <div className="scv">{value}</div>}
-      <div className="scl">{label}</div>
-      {part && !loading ? <div className="savpart"><span className="savpartv">{part.value}</span> {part.label}</div> : null}
+      {/* (#2902, layout) The part line rides on the label's own line, never
+          a line of its own: the hero keeps one height whether a provider
+          reported cached tokens or not (see `.savc__lbl` in `styles.css`). */}
+      <div className="savc__lbl">
+        <div className="scl">{label}</div>
+        {part && !loading ? <div className="savpart"><span className="savpartv">{part.value}</span> {part.label}</div> : null}
+      </div>
     </div>
   );
 }
@@ -229,9 +234,11 @@ function SavingsHero({
               the return (hooks cannot sit in a conditional branch). */}
           {settled ? <div className="savnum">{heroTotal}</div> : <Shimmer as="div" className="savnum" minHeight="1em" />}
           {/* (#2902) UTILITY is a PART of all tokens, not a peer figure, so
-              it sits under the total it belongs to; a peer chip read as a
-              third bucket to add. Wrapped with the label so the phone
-              layout's column-reverse keeps label and part together. */}
+              it sits with the total it belongs to; a peer chip read as a
+              third bucket to add. (layout) It takes no line of its own: on
+              the label's line under the figure on a desktop, beside the
+              figure on a phone (`.savlblwrap` in `styles.css`), so the hero
+              is the same height with or without it. */}
           <div className="savlblwrap">
             <div className="savlbl">all tokens{liveMode ? ` · last ${hours}h` : ""}</div>
             {t.utility && settled ? <div className="savpart"><span className="savpartv">{fmtC(t.utility)}</span> utility</div> : null}
