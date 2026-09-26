@@ -68,6 +68,18 @@ const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
             "/../../templates/builtin/mission-configs/review.json"
         )),
     ),
+    // (#2918) `machine-status` — the read-only `darkmux machine status`
+    // verb as an advertised panel command, so radio's router and the
+    // editor panel can route "which models are loaded?" to it. Advertised
+    // through the same `panel` block every operator command uses; there is
+    // no special case for it anywhere in the router.
+    (
+        "machine-status",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/mission-configs/machine-status.json"
+        )),
+    ),
 ];
 
 /// The raw embedded JSON for a built-in id. `pub(crate)` (#1284 review

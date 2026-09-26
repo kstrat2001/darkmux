@@ -49,6 +49,7 @@
       <div class="cmd-out">radio: To inspect a specific past run, use <code>darkmux lab run inspect</code>. You'll need the run ID; if you don't have it handy, run <code>darkmux lab run list</code> to pull one from the recent history. If you just want a quick overview of what happened, append <code>--summary</code>.</div>
     </div>
     <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max: qwen3.6-35b-a3b answering, qwen3-4b routing, humor at the shipped default of 50 unless shown otherwise.</p>
+    <p>Since 4.0 the first question no longer reaches the answering seat at all. <code>/machine-status</code> is a built-in advertised command, so the router sends "which models are loaded?" straight to <code>darkmux machine status</code> and radio prints the loaded models instead of telling you which verb to run. It is read-only; nothing that unloads a model is advertised.</p>
   </div>
 </section>
 
@@ -126,7 +127,7 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
 <section>
   <div class="wrap">
     <h2>Advertise your own commands</h2>
-    <p>radio only routes to what is advertised. A mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog by carrying a <code>panel</code> block; its <code>description</code> is what the router reads. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
+    <p>radio only routes to what is advertised. Two commands ship built in, <code>/review</code> and the read-only <code>/machine-status</code>; a mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog by carrying a <code>panel</code> block, and its <code>description</code> is what the router reads. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
     <pre><code>{
   "id": "pr-merge",
   "name": "PR Merge",

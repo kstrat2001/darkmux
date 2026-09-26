@@ -5232,6 +5232,136 @@ fn run_radio_launch_to_completion(config_id: &str, dispatch_port: u16) -> (std::
     (output.status, home)
 }
 
+/// (#2918) A fake `lms` that records every argv it is called with to
+/// `argv_log` (one line per call) and answers `ps --json` with ONE
+/// darkmux-managed resident, whose `status` is `status`. Everything else
+/// exits 0 silently. The status word is a parameter because #2917's busy
+/// check reads exactly that field: `idle` is the resting shape, and the
+/// non-idle words are LM Studio's own (`generating`, `processingPrompt`).
+fn write_recording_fake_lms(dir: &std::path::Path, argv_log: &std::path::Path, status: &str) -> std::path::PathBuf {
+    let fake = dir.join("lms");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{}'\n\
+             if [ \"$1\" = \"ps\" ]; then\n\
+             echo '[{{\"identifier\":\"darkmux:stub-worker\",\"modelKey\":\"stub-worker\",\"status\":\"{status}\",\"sizeBytes\":1000000000,\"contextLength\":8000,\"parallel\":1}}]'\n\
+             fi\n\
+             exit 0\n",
+            argv_log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+    }
+    fake
+}
+
+/// (#2918) "Which models are loaded on this machine right now?" used to be
+/// REFUSED: the catalog radio hands its router had no machine command in it,
+/// so the question fell through to the answering seat. The built-in
+/// `machine-status` config is now advertised like any other panel command,
+/// and this proves the whole chain through the real binary: the router
+/// (mocked, answering `machine-status`) is OFFERED the command in its
+/// catalog, the routed command runs `darkmux machine status` in-process
+/// (procedural-only ⇒ ephemeral), and that verb reaches `lms ps --json` —
+/// the argv the fake `lms` records — whose one resident then renders in
+/// radio's own stdout. No model, no LM Studio, no Docker.
+#[test]
+fn radio_routes_a_loaded_models_question_to_machine_status_which_runs_lms_ps() {
+    let (route_port, router_requests) = start_capturing_route_decision_stub("machine-status");
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let argv_log = home.path().join("lms-argv.log");
+    let fake_lms = write_recording_fake_lms(home.path(), &argv_log, "idle");
+
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{route_port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .args(["radio", "which models are loaded on this machine right now?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The catalog OFFERED to the router carried the command — read off the
+    // router's own request body, not inferred from the route it returned
+    // (the stub answers `machine-status` whatever it is asked).
+    let offered = router_requests.lock().unwrap().join("\n");
+    assert!(
+        offered.contains("- machine-status:"),
+        "the router's catalog must list the built-in machine-status command (#2918):\n{offered}"
+    );
+
+    assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("routing to /machine-status"), "{stdout}");
+    // `darkmux machine status` ran, against the fake: its ONE managed
+    // resident renders in radio's own output …
+    assert!(stdout.contains("darkmux-managed (1):"), "the routed `machine status` output must render:\n{stdout}");
+    assert!(stdout.contains("darkmux:stub-worker"), "{stdout}");
+    // … and the argv that produced it is the read-only listing, nothing
+    // that mutates: `machine eject` would call `lms unload`. (A `load
+    // stub-util …` line IS expected here — that is the ROUTER's own utility-
+    // model residency preflight, #2914, not the routed command.)
+    let argv = fs::read_to_string(&argv_log).expect("the fake lms must have been called");
+    assert!(argv.lines().any(|l| l.trim() == "ps --json"), "expected `lms ps --json` in the recorded argv:\n{argv}");
+    assert!(!argv.contains("unload"), "read-only only — nothing that unloads (#2918):\n{argv}");
+}
+
+/// (#2918) [`start_route_decision_stub`], additionally capturing every
+/// request body it receives so a test can assert on the CATALOG the router
+/// was offered (the `Available commands:` block of the user message), not
+/// only on the decision the stub hands back.
+fn start_capturing_route_decision_stub(command: &str) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the route-decision stub");
+    let port = listener.local_addr().unwrap().port();
+    let content = format!("```json\n{{\"command\": \"{command}\", \"args\": \"\"}}\n```");
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let requests_for_thread = requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let content = content.clone();
+            let requests = requests_for_thread.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 64 * 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                requests.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": content } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, requests)
+}
+
 /// (#2477 review) Inverted-direction proof for the fix above: an
 /// UNSIGNALLED `darkmux radio` invocation whose launched child completes on
 /// its own must still return exactly the CHILD's exit code, unchanged by

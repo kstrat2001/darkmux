@@ -62,6 +62,17 @@ darkmux release.
   `compactor`/`utility` pair on `telemetry.lms` records. FLOW schema
   1.60.0.
 
+### Added
+
+- **`/machine-status` is a built-in advertised command** (#2918). "Which
+  models are loaded on this machine right now?" was refused: the catalog
+  radio's router (and the editor panel) route over had no machine command
+  in it, so the question fell through to the answering seat. The read-only
+  `darkmux machine status` verb now ships as a built-in mission config with
+  a `panel` block, advertised exactly the way an operator's own commands
+  are, so the router routes to it and the panel lists it. Read-only only:
+  `machine eject` stays un-advertised.
+
 ## [3.13.0] - 2026-09-25
 
 ### Added

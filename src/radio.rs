@@ -1024,6 +1024,42 @@ mod tests {
         }
     }
 
+    /// (#2918) "Which models are loaded?" was refused because nothing in
+    /// the catalog answered it: `darkmux machine status` does, but it was
+    /// not an advertised command. The built-in `machine-status` config
+    /// (`templates/builtin/mission-configs/machine-status.json`) is merged
+    /// into every catalog the same way `review` is — through its `panel`
+    /// block, never a special case in the router prompt — so this holds
+    /// with NO user-tier configs at all.
+    #[test]
+    #[serial_test::serial]
+    fn compile_catalog_advertises_the_built_in_machine_status_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", tmp.path()) };
+
+        let catalog = compile_catalog();
+        let entry = catalog
+            .iter()
+            .find(|c| c.id == "machine-status")
+            .unwrap_or_else(|| panic!("the built-in machine-status command must be advertised (#2918): {catalog:?}"));
+        assert!(
+            entry.description.to_ascii_lowercase().contains("loaded"),
+            "the router reads the panel description, which must name the question it answers: {}",
+            entry.description
+        );
+        assert!(!entry.accepts_args, "`machine status` takes no arguments");
+
+        // SAFETY: this test is #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn compile_catalog_falls_back_to_the_configs_name_when_panel_description_is_absent() {
