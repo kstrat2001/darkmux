@@ -131,38 +131,84 @@ export interface LiveUtilityJob {
 
 interface Open {
   job: string;
+  jobId: string | null;
   atMs: number;
   session: string | null;
   stallAfterMs: number;
   model: string | null;
 }
 
+function msField(p: Payload, key: string): number | null {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** (#2915 review, C3/C4) When a record happened, at the best precision it
+ *  carries. A flow `ts` is whole-second, so a utility marker's own
+ *  `started_at_ms` / `ended_at_ms` and a heartbeat's `sampled_at_ms` win. A
+ *  whole-second TERMINAL is read as the END of its second: it ends
+ *  everything its execution started in that second (a heartbeat without a
+ *  sample time keeps its `ts`, so a same-second one does not). */
+function whenMs(r: FlowRecord, p: Payload): number {
+  const precise = msField(p, isUtilityStart(r) ? "started_at_ms" : isUtilityEnd(r) ? "ended_at_ms" : "sampled_at_ms");
+  if (precise !== null) return precise;
+  const t = Date.parse(r.ts);
+  return isDispatchTerminal(r.action) ? t + 999 : t;
+}
+
 /** Every job open as of `nowMs` in `records` (one machine's, or one
- *  execution's), oldest first. A start is closed by the next end of the
- *  SAME job in the SAME session (a routing job's is none), in order, or,
- *  for a job that serves an execution, by that execution moving on. */
+ *  execution's), oldest first.
+ *
+ *  - An end that names a `job_id` (flow schema 1.61.0) closes the start with
+ *    that id. An end without one (an older writer) closes the most recent
+ *    open start of its job in its scope (session, or none for routing).
+ *  - Either way, closing a start also DROPS every older open start of the
+ *    same job in the same scope: the utility instance serves requests in
+ *    order, so a job that started earlier and has not ended by now never
+ *    will (a routing call killed mid-flight). One orphan must not read
+ *    "radio routing", then "stalled", for the rest of the window.
+ *  - A job that serves an execution also ends when that execution moves on
+ *    (its next turn's opener, a turn end, a tool, a rest, an installed
+ *    compaction) or ends (a terminal, even in the start's own second). */
 export function openUtilityJobs(records: readonly FlowRecord[], nowMs: number): LiveUtilityJob[] {
   const ordered = records
-    .map((r) => ({ r, atMs: Date.parse(r.ts) }))
-    .filter((x) => Number.isFinite(x.atMs) && x.atMs <= nowMs)
+    .map((r) => {
+      const p = payloadOf(r);
+      const cut = msField(p, isUtilityStart(r) ? "started_at_ms" : isUtilityEnd(r) ? "ended_at_ms" : "sampled_at_ms") ?? Date.parse(r.ts);
+      return { r, p, atMs: whenMs(r, p), cut };
+    })
+    .filter((x) => Number.isFinite(x.atMs) && x.cut <= nowMs)
     .sort((a, b) => a.atMs - b.atMs);
   let open: Open[] = [];
-  for (const { r, atMs } of ordered) {
+  const closeWithOlder = (i: number) => {
+    const closed = open[i];
+    open = open.filter((o, k) => k !== i && !(o.job === closed.job && o.session === closed.session && o.atMs <= closed.atMs));
+  };
+  for (const { r, p, atMs } of ordered) {
     const session = r.session_id || null;
     if (isUtilityStart(r)) {
-      const p = payloadOf(r);
       const job = typeof p.job === "string" && p.job ? p.job : "";
+      const jobId = typeof p.job_id === "string" && p.job_id ? p.job_id : null;
       const bound = typeof p.stall_after_seconds === "number" && p.stall_after_seconds > 0 ? p.stall_after_seconds * 1000 : UTILITY_JOB_DEFAULT_STALL_MS;
       const model = typeof p.model === "string" && p.model ? p.model : r.model || null;
-      open.push({ job, atMs, session, stallAfterMs: bound, model });
+      open.push({ job, jobId, atMs, session, stallAfterMs: bound, model });
     } else if (isUtilityEnd(r)) {
+      const jobId = typeof p.job_id === "string" && p.job_id ? p.job_id : null;
       const job = utilityJobOf(r);
-      const i = open.findIndex((o) => o.session === session && (job === null || o.job === job));
-      if (i >= 0) open.splice(i, 1);
-    } else if (session && executionMovedOn(r.action)) {
-      // Strictly later only: a record `ts` is whole-second, and the previous
-      // turn's last heartbeat can share a second with the start it preceded.
-      open = open.filter((o) => o.session !== session || o.atMs >= atMs);
+      let i = jobId !== null ? open.findIndex((o) => o.jobId === jobId) : -1;
+      if (i < 0) {
+        // No id, or its start is outside the window: the most recent open
+        // start of this job in this scope.
+        for (let k = open.length - 1; k >= 0; k--) {
+          if (open[k].session === session && (job === null || open[k].job === job)) {
+            i = k;
+            break;
+          }
+        }
+      }
+      if (i >= 0) closeWithOlder(i);
+    } else if (session && (executionMovedOn(r.action))) {
+      open = open.filter((o) => o.session !== session);
     }
   }
   return open.map((o) => ({

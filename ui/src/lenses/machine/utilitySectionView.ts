@@ -6,8 +6,8 @@
  *   `/machine/specs`, this machine only), whether it is resident and its
  *   measured footprint (gestalt's residency row for it);
  * - the live job, the same reading as the fleet card's utility strip;
- * - each job's recent usage (calls, tokens) from its usage records, every
- *   known job listed even at zero, then any job this build does not know.
+ * - each job's recent usage (calls, tokens) from its usage records: one row
+ *   per known job, then one "other" row, all present even at zero.
  *
  * This supersedes the `utility` badge on the model's residency row. Every
  * line is always present (the live line reads "idle", a job with no calls
@@ -53,12 +53,19 @@ export function utilitySectionView(args: {
   const job = strip.job;
   const liveLine = job ? (job.stalled ? `${job.word} · stalled` : `${job.word} · ${Math.max(0, Math.floor((args.nowMs - job.sinceMs) / 1000))}s`) : "idle";
   const mine = args.data.filter((r) => uidOf(r) === args.uid && T(r.ts) <= args.nowMs);
-  const jobs = utilityUsageByJob(mine).map((u) => ({
-    word: u.job === null ? "unnamed job" : utilityJobWord(u.job),
-    calls: `${u.calls.toLocaleString("en-US")} ${u.calls === 1 ? "call" : "calls"}`,
-    tokens: `${fmtC(u.tokens)} tokens`,
-    known: u.known,
-  }));
+  // (#2915 review, C7) A FIXED set of rows, so the section is one size
+  // whatever ran: one per known job, then ONE "other" row folding every job
+  // this build does not know and every utility record that names none (a
+  // routing record from before 1.61.0), present even at zero.
+  const usage = utilityUsageByJob(mine);
+  const other = usage.filter((u) => !u.known).reduce((acc, u) => ({ calls: acc.calls + u.calls, tokens: acc.tokens + u.tokens }), { calls: 0, tokens: 0 });
+  const row = (word: string, calls: number, tokens: number, known: boolean) => ({
+    word,
+    calls: `${calls.toLocaleString("en-US")} ${calls === 1 ? "call" : "calls"}`,
+    tokens: `${fmtC(tokens)} tokens`,
+    known,
+  });
+  const jobs = [...usage.filter((u) => u.known).map((u) => row(utilityJobWord(u.job), u.calls, u.tokens, true)), row("other", other.calls, other.tokens, false)];
   return {
     strip,
     modelLine: strip.model ?? "no utility model seen",

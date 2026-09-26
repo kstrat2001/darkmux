@@ -49,7 +49,17 @@ describe("(#2915) the machine page's Utility section", () => {
     expect(v.jobs).toEqual([
       { word: "compacting", calls: "0 calls", tokens: "0 tokens", known: true },
       { word: "radio routing", calls: "2 calls", tokens: "100 tokens", known: true },
-      { word: "dream job", calls: "1 call", tokens: "5 tokens", known: false },
+      { word: "other", calls: "1 call", tokens: "5 tokens", known: false },
     ]);
+  });
+
+  test("(#2915 review, C7) a fixed set of rows: unknown and unnamed jobs fold into ONE 'other' row, always present", () => {
+    const rows = (data: FlowRecord[]) => utilitySectionView({ data, uid: U, nowMs: ms(60), specs: specs({}), isLocal: true, residentRow: null }).jobs;
+    const none = rows([]);
+    const many = rows([usage(1, "dream_job", 5), usage(2, "nightmare_job", 6), usage(3, null, 7)]);
+    expect(none.map((r) => r.word)).toEqual(["compacting", "radio routing", "other"]);
+    expect(many.map((r) => r.word)).toEqual(["compacting", "radio routing", "other"]);
+    expect(many[2]).toMatchObject({ calls: "3 calls", tokens: "18 tokens" });
+    expect(none[2]).toMatchObject({ calls: "0 calls", tokens: "0 tokens" });
   });
 });

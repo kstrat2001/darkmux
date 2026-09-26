@@ -78,7 +78,7 @@ const STATES = [
     recs: (b, d) => [...b.prefix(d), b.complete(d)],
   },
   {
-    id: "prompt", date: "2026-08-03", now: "12:00:09", runText: "processing prompt", rateText: "processing",
+    id: "prompt", date: "2026-08-03", now: "12:00:09", runText: "processing prompt", rateText: "processing", utilLive: "idle",
     recs: (b, d) => [...b.prefix(d), b.opener(d)],
   },
   {
@@ -142,7 +142,7 @@ const STATES = [
     // strip shows the compacting glyph.
         // The run page's playback transport ends at the run's own last record
     // (the start itself), so it reads "compacting · 0s" there.
-    id: "compacting", date: "2026-08-31", now: "12:00:15", runText: /compacting · \d+s$/, rateText: /^compacting · \d+s$/, utilVisual: "compacting",
+    id: "compacting", date: "2026-08-31", now: "12:00:15", runText: /compacting · \d+s$/, rateText: /^compacting · \d+s$/, utilVisual: "compacting", utilLive: "compacting · 7s",
     recs: (b, d) => [
       ...b.prefix(d),
       b.rec(at(d, "12:00:08"), "utility.start", { job: "compaction", model: "darkmux:util-layout", serves: b.sid, stall_after_seconds: 600 }, { category: "telemetry", source: "utility", handle: "compactor" }),
@@ -153,11 +153,42 @@ const STATES = [
     // (#2915) A radio routing job on the machine while its execution reads
     // the next prompt: machine-level (no session), so the work model's
     // readings are PROMPT's and only the utility strip radiates.
-    id: "radio-routing", date: "2026-09-02", now: "12:00:09", runText: "processing prompt", rateText: "processing", utilVisual: "radio",
+    id: "radio-routing", date: "2026-09-02", now: "12:00:09", runText: "processing prompt", rateText: "processing", utilVisual: "radio", utilLive: "radio routing · 1s",
     recs: (b, d) => [
       ...b.prefix(d),
       b.opener(d),
       { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+    ],
+  },
+  {
+    // (#2915 review, C7) A utility job this build has no visual for: the
+    // strip shows the generic indicator; the machine page names it.
+    id: "utility-generic", date: "2026-09-04", now: "12:00:09", runText: "processing prompt", rateText: "processing", utilVisual: "generic", utilLive: "dream job · 1s",
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.opener(d),
+      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "dream-role", ...MACHINE, payload: { job: "dream_job", job_id: "dream-1", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+    ],
+  },
+  {
+    // (#2915 review, C7) A routing job with no end past its 30s bound: the
+    // strip's stalled glyph, while the execution rests.
+    id: "utility-stalled", date: "2026-09-06", now: "12:00:45", runText: "rest", rateText: "rest", utilVisual: "radio", utilStalled: true, utilLive: "radio routing · stalled",
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.rec(at(d, "12:00:08"), "dispatch.rest", { ms: 120000 }),
+      { ts: at(d, "12:00:08"), action: "utility.start", category: "telemetry", source: "utility", handle: "radio-router", ...MACHINE, payload: { job: "radio_routing", job_id: "route-1", model: "darkmux:util-layout", stall_after_seconds: 30 } },
+      tick(d, "12:00:45"),
+    ],
+  },
+  {
+    // (#2915 review, C7) A routing usage record from before 1.61.0 (no
+    // `job`): quiet strip; the machine page counts it under "other".
+    id: "utility-legacy", date: "2026-09-08", now: "12:00:09", runText: "processing prompt", rateText: "processing", utilLive: "idle",
+    recs: (b, d) => [
+      ...b.prefix(d),
+      b.opener(d),
+      { ts: at(d, "12:00:08"), action: "telemetry.tokens", category: "telemetry", source: "tokens", handle: "radio-router", ...MACHINE, payload: { purpose: "utility", call_kind: "single_shot", token_source: "provider", total_tokens: 40, requested_model: "darkmux:util-layout", endpoint: "http://127.0.0.1:1234/v1" } },
     ],
   },
   {
@@ -208,7 +239,26 @@ const PLAYBACK_NOW = Date.parse("2026-09-20T12:00:00Z");
  * connected; `blockStream` answers it with an immediately-closed body
  * instead, so the page reads as disconnected.
  */
-async function installLayoutRoutes(page, { blockStream = false } = {}) {
+/** (#2915) `/machine/specs` for the fixture machine, so `#lens=machine`
+ *  resolves it as THIS machine and renders its Utility section. Served only
+ *  when a suite asks (`machineSpecs`), so every other page stays as before. */
+const MACHINE_SPECS = {
+  darkmux_version: "0.0.0-layout",
+  flow_schema_version: "1.61.0",
+  machine_id: MACHINE.machine_id,
+  machine_uid: UID,
+  os: "macos aarch64",
+  ram_total_bytes: null,
+  ram_free_for_ai_bytes: null,
+  cpu_brand: null,
+  loaded_models: [],
+  lms_unreachable: false,
+  utility_model: { id: "darkmux:util-layout", loaded: true, n_ctx: 32768 },
+  redis_url_redacted: null,
+  generated_at_ms: 0,
+};
+
+async function installLayoutRoutes(page, { blockStream = false, machineSpecs = false } = {}) {
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
@@ -219,6 +269,7 @@ async function installLayoutRoutes(page, { blockStream = false } = {}) {
     }
     let m = p.match(/^\/flow\/(\d{4}-\d{2}-\d{2})$/);
     if (m) return json(byDate.get(m[1]) ?? []);
+    if (machineSpecs && p === "/machine/specs") return json(MACHINE_SPECS);
     if (p === "/flow-days") return json([...byDate.keys()].sort().reverse().map((date) => ({ date, count: byDate.get(date).length })));
     // The daemon's catalog shape (`catalog_records_response`).
     const catalog = (records) => json({ records, count: records.length, truncated: false });

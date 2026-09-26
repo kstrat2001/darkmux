@@ -164,9 +164,10 @@ describe("machine lens — at-rest prose budget", () => {
     // hint, and the always-open info-message paragraph are all gone from
     // the at-rest surface now). The ceiling only ever moves down, with ONE
     // recorded exception: (#2915) the Utility section the operator asked for
-    // (2026-09-26) adds its model, facts, live and per-job lines, measured
-    // at 334 here. That is a new section, not prose regrowing on an old one.
-    expect(words).toBeLessThanOrEqual(334);
+    // (2026-09-26) adds its model, facts, live and per-job lines (a fixed
+    // row per known job plus one "other"), measured at 339 here. That is a
+    // new section, not prose regrowing on an old one.
+    expect(words).toBeLessThanOrEqual(339);
   });
 
   // (#2440 cut 4 supersedes fix-loop 4's finding above) The operator's own

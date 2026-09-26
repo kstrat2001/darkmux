@@ -1297,6 +1297,22 @@ describe("(#2915) compacting", () => {
     expect(deriveLiveState([...before, routingStart(at)], at + 2_000)).toEqual(deriveLiveState(before, at + 2_000));
   });
 
+  it("(#2915 review, C4) counts from the start's own ms time, not its whole-second ts", () => {
+    const at = toolAt + 1_000;
+    const s = compactStart(at, 600);
+    (s as unknown as { payload: Record<string, unknown> }).payload.started_at_ms = at + 800;
+    expect(deriveLiveState([...before, s], at + 2_700)).toMatchObject({ compacting: true, compactingSeconds: 1 });
+  });
+
+  it("(#2915 review, C4) a sub-second compaction (start and end in one whole second) ends", () => {
+    const at = Math.floor((toolAt + 1_000) / 1000) * 1000;
+    const s = compactStart(at, 600);
+    (s as unknown as { payload: Record<string, unknown> }).payload.started_at_ms = at + 200;
+    const e = compactUsage(at);
+    (e as unknown as { payload: Record<string, unknown> }).payload.ended_at_ms = at + 900;
+    expect(deriveLiveState([...before, s, e], at + 1_500)).toEqual({ state: "prompt" });
+  });
+
   it("labels as `compacting · Ns`, never `processing prompt`", () => {
     expect(liveStateLabel({ state: "prompt", compacting: true, compactingSeconds: 7 })).toBe("compacting · 7s");
     expect(liveStateLabel({ state: "prompt" })).toBe("processing prompt");

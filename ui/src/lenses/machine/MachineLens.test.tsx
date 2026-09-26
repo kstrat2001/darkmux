@@ -484,6 +484,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual([
       "compacting0 calls0 tokens",
       "radio routing0 calls0 tokens",
+      "other0 calls0 tokens",
     ]);
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
   });

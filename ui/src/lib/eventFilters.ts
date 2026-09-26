@@ -15,6 +15,7 @@
 import type { FlowRecord } from "../types/handwritten";
 import { isPlainObject } from "./guards";
 import { isDispatchStart, isDispatchComplete, isDispatchError } from "./flow";
+import { UTILITY_ERROR_ACTION, UTILITY_START_ACTION } from "./utilityJobs";
 
 /** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
@@ -47,6 +48,9 @@ export function activityOf(r: FlowRecord): string {
   // `FLOW_SCHEMA_VERSION` 1.42.0's changelog) instead of fragmenting into
   // a second, differently-named facet.
   if (a === "machine.telemetry") return "host telemetry";
+  // (#2915) A utility job's start/error markers: their own facet, filed with
+  // the machine (utility jobs are machine-level), not generic telemetry.
+  if (a === UTILITY_START_ACTION || a === UTILITY_ERROR_ACTION) return "utility";
   if (r.category === "telemetry") {
     if (r.source === "detector") return "detector";
     if (r.source === "tokens") return "tokens";
@@ -82,6 +86,7 @@ export const ACT_ORDER: string[] = [
   "tokens",
   "lms",
   "host telemetry",
+  "utility",
   "telemetry",
   "other",
 ];
@@ -331,7 +336,7 @@ const DISPATCH_SECTION_VALUES = new Set([
   "routing",
   "session end", "telemetry"]);
 const MISSION_SECTION_VALUES = new Set(["note"]);
-const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "host telemetry"]);
+const MACHINE_SECTION_VALUES = new Set(["machine online", "machine offline", "host telemetry", "utility"]);
 
 /** Which section a single activity value (a mapped `ACT_ORDER` label, or a
  * raw value `activityOf`'s fallback passed through unmapped) belongs under.

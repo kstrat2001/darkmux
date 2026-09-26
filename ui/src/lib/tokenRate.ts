@@ -575,7 +575,9 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // other job that serves no execution) never lands here: it carries no
       // session, so it is not in an execution's records at all.
       const bound = num(fields(r).stall_after_seconds);
-      m = { atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound * 1000 : UTILITY_JOB_DEFAULT_STALL_MS };
+      // (#2915 review, C4) The start's own ms time counts the seconds.
+      const startedAt = num(fields(r).started_at_ms);
+      m = { atMs: startedAt !== null && startedAt > 0 ? startedAt : atMs, kind: "compacting", stallAfterMs: bound !== null && bound > 0 ? bound * 1000 : UTILITY_JOB_DEFAULT_STALL_MS };
     } else if (
       marker?.kind === "compacting" &&
       ((isUtilityEnd(r) && utilityJobOf(r) === UTILITY_JOB.compaction) || r.action === "dispatch.compaction")
@@ -583,8 +585,10 @@ export function deriveLiveState(records: FlowRecord[], nowMs: number): LiveState
       // (#2915) The compaction ended; the runtime's next step is the next
       // prompt. Only ever ENDS a compaction: with none open, a compaction
       // usage record is not a marker (a run from before 1.61.0 reads as it
-      // always did).
-      m = { atMs, kind: "prompt" };
+      // always did). (#2915 review, C4) At its own ms end time, and never
+      // before the start it ends (both can share one whole-second `ts`).
+      const endedAt = num(fields(r).ended_at_ms);
+      m = { atMs: Math.max(endedAt !== null && endedAt > 0 ? endedAt : atMs, marker.atMs), kind: "prompt" };
     } else if (r.action === "dispatch.rest") {
       // Only the completed-rest shape (`ms` present) counts — the
       // announce-only sibling (`pause: false, delay_ms`, no `ms`) is the

@@ -152,3 +152,65 @@ describe("utilityUsageByJob: each job's recent usage", () => {
     expect(rows.find((r) => !r.known)).toMatchObject({ job: null, calls: 1, tokens: 10 });
   });
 });
+
+// (#2915 review) Pairing by job id, orphans, terminals, ms times.
+describe("(#2915 review) machineUtilityJob pairing", () => {
+  const withId = (r: FlowRecord, id: string, ms?: Record<string, number>): FlowRecord =>
+    ({ ...r, payload: { ...(r.payload as Record<string, unknown>), job_id: id, ...(ms ?? {}) } }) as FlowRecord;
+
+  test("MUST 1: an orphaned routing start never absorbs a later job's end: [orphan, start, end] -> quiet", () => {
+    const recs = [
+      withId(start(0, UTILITY_JOB.radio_routing), "a1"),
+      withId(start(10, UTILITY_JOB.radio_routing), "b1"),
+      withId(usage(11, UTILITY_JOB.radio_routing), "b1"),
+    ];
+    expect(machineUtilityJob(recs, ms(12))).toBeNull();
+    // ...and stays quiet long after, where the orphan would have read stalled.
+    expect(machineUtilityJob(recs, ms(12) + 3_600_000)).toBeNull();
+  });
+
+  test("an end closes ITS start by id, not the oldest or newest open one", () => {
+    const recs = [
+      withId(start(0, UTILITY_JOB.radio_routing), "a1"),
+      withId(start(1, UTILITY_JOB.radio_routing), "b1"),
+      withId(usage(2, UTILITY_JOB.radio_routing), "a1"),
+    ];
+    expect(machineUtilityJob(recs, ms(3))).toMatchObject({ job: UTILITY_JOB.radio_routing, sinceMs: ms(1) });
+  });
+
+  test("records without ids (older writers): an end closes the most recent open start and drops older same-kind ones", () => {
+    const recs = [start(0, UTILITY_JOB.radio_routing), start(10, UTILITY_JOB.radio_routing), usage(11, UTILITY_JOB.radio_routing)];
+    expect(machineUtilityJob(recs, ms(12))).toBeNull();
+  });
+
+  test("MUST 2: a compaction whose runtime was killed is closed by its execution's dispatch error", () => {
+    const s = start(0, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" });
+    const errRec = { ts: at(4), action: "dispatch error", session_id: "s1", machine_uid: M, payload: {} } as FlowRecord;
+    expect(machineUtilityJob([s, errRec], ms(5))).toBeNull();
+    const done = { ...errRec, action: "dispatch complete" } as FlowRecord;
+    expect(machineUtilityJob([s, done], ms(5))).toBeNull();
+  });
+
+  test("C3: a terminal in the SAME second as the start still closes it", () => {
+    const s = withId(start(4, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" }), "s1:compaction:1", { started_at_ms: ms(4) + 400 });
+    const errRec = { ts: at(4), action: "dispatch.error", session_id: "s1", machine_uid: M, payload: {} } as FlowRecord;
+    expect(machineUtilityJob([s, errRec], ms(5))).toBeNull();
+  });
+
+  test("a heartbeat is judged by its own sample time: one sampled before the start leaves it open, one after closes it", () => {
+    const s = withId(start(4, UTILITY_JOB.compaction, { session_id: "s1" }, { serves: "s1" }), "s1:compaction:1", { started_at_ms: ms(4) + 400 });
+    const beat = (sampled: number) => ({ ts: at(4), action: "dispatch.turn.heartbeat", session_id: "s1", machine_uid: M, payload: { sampled_at_ms: sampled } }) as FlowRecord;
+    expect(machineUtilityJob([beat(ms(4) + 100), s], ms(5))?.job).toBe(UTILITY_JOB.compaction);
+    expect(machineUtilityJob([s, beat(ms(4) + 700)], ms(5))).toBeNull();
+  });
+
+  test("C4: a sub-second job (start and end in one whole second) is open between its ms times and quiet after", () => {
+    const recs = [
+      withId(start(8, UTILITY_JOB.radio_routing), "r1", { started_at_ms: ms(8) + 100 }),
+      withId(usage(8, UTILITY_JOB.radio_routing), "r1", { ended_at_ms: ms(8) + 600 }),
+    ];
+    expect(machineUtilityJob(recs, ms(8) + 300)?.job).toBe(UTILITY_JOB.radio_routing);
+    expect(machineUtilityJob(recs, ms(8) + 300)?.sinceMs).toBe(ms(8) + 100);
+    expect(machineUtilityJob(recs, ms(8) + 700)).toBeNull();
+  });
+});
