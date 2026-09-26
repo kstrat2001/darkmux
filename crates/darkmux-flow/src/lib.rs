@@ -3243,7 +3243,10 @@ mod tests {
         //            new single-shot producers, and additive `call_kind` /
         //            `requested_model` / `reported_model` / `endpoint` /
         //            `token_source` on every record of the family.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.57.0");
+        //   1.58.0 — (#2902 step 1b) the runtime's calls: `reported_model` on
+        //            turn records, and one `call_kind: "compaction"` record
+        //            per compactor call, attributed to the compactor.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.58.0");
     }
 
     #[test]

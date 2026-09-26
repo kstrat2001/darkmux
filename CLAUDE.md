@@ -300,8 +300,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      (compaction, scribe, estimator) are SUB-EXECUTIONS — themselves role executions, of a
      utility role — attributed to their OWN role and model, never blended into the primary's
      metrics. Naming the unit for the role is what makes this compose rather than needing a
-     special case: a sub-execution is the same kind of thing as its parent, one level in. `emit_telemetry` currently violates this — it stamps
-     the specialist's `role_id`/`model` on the compaction record too (#1974).
+     special case: a sub-execution is the same kind of thing as its parent, one level in. The compactor's per-call usage record
+     (`telemetry.tokens`, `call_kind: "compaction"`) conforms since #2902 step 1b: its `handle` is `compactor`
+     and its `model` the compactor's. The `dispatch.compaction` and `telemetry.compaction` records still carry
+     the specialist's `role_id`/`model` at record level, naming the compactor only in `payload.compactor_model`
+     (#1974).
    - **A specialist change is an EXECUTION BOUNDARY.** Escalation mints a new role execution;
      it never puts a second specialist role inside this one. Any predicate that infers a "model swap" from
      residency alone is wrong: a declared utility role going resident is not a swap (#1934).

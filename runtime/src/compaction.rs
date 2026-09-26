@@ -41,7 +41,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::lmstudio::{ChatRequest, LmStudioClient, Message};
+use crate::lmstudio::{ChatRequest, ChatResponse, LmStudioClient, Message};
 
 /// Default ratio applied to a known `context_window` when the
 /// operator hasn't set an explicit `threshold_tokens` or
@@ -144,6 +144,39 @@ pub const MIN_SUMMARY_CHARS: usize = 200;
 /// immediately — a compaction loop. grok-build discards below a 20%
 /// reduction; we match that.
 pub const MIN_REDUCTION_RATIO: f32 = 0.20;
+
+/// (#2902 step 1b) One compactor model call that got a reply: what the
+/// runtime needs to write its `compaction.call` trajectory event, from which
+/// the host writes the call's one `telemetry.tokens` record
+/// (`call_kind: "compaction"`).
+///
+/// Captured the moment the reply returns, before any parsing that can fail,
+/// so a compaction that is later refused (a degenerate summary, an
+/// unparseable structured reply, an insufficient reduction) still accounts
+/// for every call it spent. A call that never got a reply (transport error)
+/// is not captured: there is no usage to account for and none is invented.
+#[derive(Debug, Clone)]
+pub struct CompactorCall {
+    /// The compaction generation the call served.
+    pub generation: u32,
+    /// The model id sent on the wire (the host-resolved compactor id).
+    pub requested_model: String,
+    /// The reply's own `model`, when the server named one.
+    pub reported_model: Option<String>,
+    /// The reply's usage block, when it carried one.
+    pub usage: Option<crate::lmstudio::Usage>,
+}
+
+impl CompactorCall {
+    pub fn from_response(generation: u32, request: &ChatRequest, response: &ChatResponse) -> Self {
+        Self {
+            generation,
+            requested_model: request.model.clone(),
+            reported_model: response.served_model().map(str::to_string),
+            usage: response.usage.clone(),
+        }
+    }
+}
 
 /// (#1389 mechanism 1) Neutralize any structural delimiter the compactor
 /// echoed into its summary, by inserting a zero-width space after the
@@ -787,6 +820,7 @@ pub fn compact(
     messages: &mut Vec<Message>,
     generation: u32,
     cfg: &CompactionConfig,
+    calls: &mut Vec<CompactorCall>,
 ) -> Result<usize> {
     // (#2571) `needs_compaction` is the ONLY gate every production caller
     // checks before calling this, and it now refuses whenever
@@ -885,6 +919,7 @@ pub fn compact(
     let summary = loop {
         attempt += 1;
         let response = client.chat(&request)?;
+        calls.push(CompactorCall::from_response(generation, &request, &response));
         let raw = response
             .choices
             .into_iter()
@@ -992,6 +1027,7 @@ pub fn structured_compact(
     generation: u32,
     cfg: &CompactionConfig,
     budget: Option<BudgetSnapshot>,
+    calls: &mut Vec<CompactorCall>,
 ) -> Result<(StructuredCompactionOutput, usize)> {
     // (#2571) Same defense-in-depth gate `compact` applies — see its own
     // comment. `needs_compaction` already refuses to call either compactor
@@ -1086,7 +1122,7 @@ pub fn structured_compact(
     // and the patcher inserts the same defaults. Kept for variance
     // against transient HTTP / no-content failures (which the
     // recovery layers can't catch) per the #354 Q2 commitment.
-    let parse_result_1 = call_and_parse(client, &request);
+    let parse_result_1 = call_and_parse(client, &request, generation, calls);
     let parsed = match parse_result_1 {
         Ok(out) => out,
         Err(e1) => {
@@ -1102,7 +1138,7 @@ pub fn structured_compact(
             // error kind would need `call_and_parse` to return a typed error;
             // deferred (the layer-1+2 repair above already salvages most
             // truncations, so the wasted call is rare in practice).
-            call_and_parse(client, &request).map_err(|e2| {
+            call_and_parse(client, &request, generation, calls).map_err(|e2| {
                 anyhow!("tier-2 compaction failed twice (attempt 1: {e1}; attempt 2: {e2})")
             })?
         }
@@ -1446,8 +1482,11 @@ pub fn structured_compactor_system_prompt_with_custom(custom_instructions: Optio
 fn call_and_parse(
     client: &LmStudioClient,
     request: &ChatRequest,
+    generation: u32,
+    calls: &mut Vec<CompactorCall>,
 ) -> Result<StructuredCompactionOutput> {
     let response = client.chat(request)?;
+    calls.push(CompactorCall::from_response(generation, request, &response));
     let message = response
         .choices
         .into_iter()
@@ -2337,7 +2376,7 @@ mod tests {
         };
         let budget = excerpt_budget_chars(8_000, 0);
 
-        let _ = compact(&client, &mut messages, 1, &cfg);
+        let _ = compact(&client, &mut messages, 1, &cfg, &mut Vec::new());
 
         let bodies = EXCERPT_WIRE.get().unwrap().lock().unwrap().clone();
         assert!(!bodies.is_empty(), "the compactor was never called at all");
@@ -2385,7 +2424,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let err = compact(&client, &mut messages, 1, &cfg)
+        let err = compact(&client, &mut messages, 1, &cfg, &mut Vec::new())
             .expect_err("an excerpt that cannot fit the compactor must not be posted");
         let msg = err.to_string();
 
@@ -2493,7 +2532,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let installed = compact(&client, &mut messages, 1, &cfg).unwrap_or_else(|e| {
+        let installed = compact(&client, &mut messages, 1, &cfg, &mut Vec::new()).unwrap_or_else(|e| {
             panic!(
                 "this summary is a real reduction against the {original}-character span it \
                  replaces, and must be accepted. Measuring it against the ELIDED excerpt \
@@ -2548,7 +2587,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let out = structured_compact(&client, &mut messages, 1, &cfg, None);
+        let out = structured_compact(&client, &mut messages, 1, &cfg, None, &mut Vec::new());
         let (_, summary_chars) = out.unwrap_or_else(|e| {
             panic!(
                 "this replacement is a real reduction against the {original}-character \
@@ -2593,7 +2632,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let _ = compact(&client, &mut messages, 1, &cfg);
+        let _ = compact(&client, &mut messages, 1, &cfg, &mut Vec::new());
 
         let bodies = NARRATIVE_WIRE.get().unwrap().lock().unwrap().clone();
         assert!(!bodies.is_empty(), "the compactor was never called");
@@ -2855,7 +2894,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let err = structured_compact(&client, &mut messages, 1, &cfg, None)
+        let err = structured_compact(&client, &mut messages, 1, &cfg, None, &mut Vec::new())
             .expect_err("an excerpt that cannot fit must not be posted");
         assert!(err.to_string().contains("8000"), "must name the window: {err}");
     }
@@ -2986,7 +3025,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let _ = structured_compact(&client, &mut messages, 1, &cfg, None);
+        let _ = structured_compact(&client, &mut messages, 1, &cfg, None, &mut Vec::new());
 
         let bodies = STRUCTURED_WIRE.get().unwrap().lock().unwrap().clone();
         assert!(!bodies.is_empty(), "the structured compactor was never called");
@@ -3089,7 +3128,7 @@ mod tests {
         let before = messages.clone();
         let cfg = CompactionConfig::never_compact_with_model();
 
-        let result = structured_compact(&client, &mut messages, 9, &cfg, None);
+        let result = structured_compact(&client, &mut messages, 9, &cfg, None, &mut Vec::new());
 
         let err = result.expect_err(
             "a replacement larger than the middle it replaces must be refused, never installed",
@@ -3205,7 +3244,7 @@ mod tests {
         let mut msgs = messages.clone();
         let cfg = CompactionConfig::never_compact_with_model();
 
-        let err = structured_compact(&client, &mut msgs, 13, &cfg, None).expect_err(
+        let err = structured_compact(&client, &mut msgs, 13, &cfg, None, &mut Vec::new()).expect_err(
             "a replacement costing more than the middle must be REFUSED — the \
              round-2 rule compared against the inflated render and would have \
              installed this, growing the thread",
@@ -3333,7 +3372,7 @@ mod tests {
         };
 
         let (_out, summary_chars) =
-            structured_compact(&client, &mut messages, 11, &cfg, Some(budget)).expect(
+            structured_compact(&client, &mut messages, 11, &cfg, Some(budget), &mut Vec::new()).expect(
                 "a replacement that costs less than the middle it replaces must be \
                  INSTALLED — the old ratio bar refused this exact case",
             );
@@ -3384,7 +3423,7 @@ mod tests {
             max_tokens_per_call: 1_000,
         };
 
-        let err = structured_compact(&client, &mut messages, 12, &cfg, Some(budget))
+        let err = structured_compact(&client, &mut messages, 12, &cfg, Some(budget), &mut Vec::new())
             .expect_err("a growing replacement must be refused on the production render too");
         let msg = err.to_string();
         assert!(msg.contains("would not shrink the thread"));
@@ -3441,7 +3480,7 @@ mod tests {
         let original_len = messages.len();
         let cfg = CompactionConfig::never_compact_with_model();
 
-        let (out, summary_chars) = structured_compact(&client, &mut messages, 7, &cfg, None)
+        let (out, summary_chars) = structured_compact(&client, &mut messages, 7, &cfg, None, &mut Vec::new())
             .expect("happy path returns parsed output");
 
         // Confirms the mock actually matched — proving the wire body
@@ -3538,7 +3577,7 @@ mod tests {
             Message::assistant("done"),      // 7 tail
         ];
 
-        compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model())
+        compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model(), &mut Vec::new())
             .expect("compaction succeeds");
 
         // Invariant: every tool-result is immediately preceded by an
@@ -3595,7 +3634,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig::never_compact_with_model();
 
-        let summary_chars = compact(&client, &mut messages, 3, &cfg)
+        let summary_chars = compact(&client, &mut messages, 3, &cfg, &mut Vec::new())
             .expect("narrative compaction returns the summary char count");
         mock.assert_hits(1);
 
@@ -3644,7 +3683,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig::never_compact_with_model();
 
-        let result = structured_compact(&client, &mut messages, 1, &cfg, None);
+        let result = structured_compact(&client, &mut messages, 1, &cfg, None, &mut Vec::new());
         assert!(result.is_err(), "both attempts return malformed → bail");
         // Confirm the retry happened — 2 calls to the mock, not 1.
         assert_eq!(mock.hits(), 2, "expected 1 initial + 1 retry attempt");
@@ -3665,7 +3704,7 @@ mod tests {
         let original_len = messages.len();
         let cfg = CompactionConfig::never_compact_with_model();
 
-        let result = structured_compact(&client, &mut messages, 1, &cfg, None);
+        let result = structured_compact(&client, &mut messages, 1, &cfg, None, &mut Vec::new());
         assert!(result.is_err());
         assert_eq!(
             messages.len(),
@@ -4264,14 +4303,14 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let cfg = CompactionConfig::never_compact(); // compactor_model: None
 
-        let err = compact(&client, &mut messages, 1, &cfg)
+        let err = compact(&client, &mut messages, 1, &cfg, &mut Vec::new())
             .expect_err("compact() must refuse rather than dial an unconfigured model");
         assert!(
             err.to_string().contains("no compactor configured"),
             "the error must name what's missing: {err}"
         );
 
-        let err = structured_compact(&client, &mut messages, 1, &cfg, None)
+        let err = structured_compact(&client, &mut messages, 1, &cfg, None, &mut Vec::new())
             .expect_err("structured_compact() must refuse the same way");
         assert!(
             err.to_string().contains("no compactor configured"),
@@ -4806,7 +4845,7 @@ mod tests {
             ..CompactionConfig::never_compact_with_model()
         };
 
-        let _out = structured_compact(&client, &mut messages, 9, &cfg, None)
+        let _out = structured_compact(&client, &mut messages, 9, &cfg, None, &mut Vec::new())
             .expect("happy path with custom_instructions returns parsed output");
 
         mock.assert_hits(1);
@@ -5341,7 +5380,7 @@ mod tests {
         let mut messages = dummy_messages_long_enough_to_compact();
         let original_len = messages.len();
 
-        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model());
+        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model(), &mut Vec::new());
         assert!(result.is_err(), "degenerate summary must not be installed");
         assert!(
             result.unwrap_err().to_string().contains("degenerate summary"),
@@ -5390,7 +5429,7 @@ mod tests {
         ];
         let original_len = messages.len();
 
-        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model());
+        let result = compact(&client, &mut messages, 1, &CompactionConfig::never_compact_with_model(), &mut Vec::new());
         assert!(result.is_err(), "barely-reducing compaction must be discarded");
         assert!(
             result.unwrap_err().to_string().contains("less than"),
@@ -5419,12 +5458,120 @@ mod tests {
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
         let mut messages = dummy_messages_long_enough_to_compact();
 
-        let summary_chars = compact(&client, &mut messages, 4, &CompactionConfig::never_compact_with_model())
+        let summary_chars = compact(&client, &mut messages, 4, &CompactionConfig::never_compact_with_model(), &mut Vec::new())
             .expect("good summary installs");
         assert_eq!(mock.hits(), 1, "one call, no retry on a good summary");
         let inserted = messages[PRESERVE_HEAD].content.as_ref().unwrap();
         assert!(inserted.starts_with("[compacted:4] "));
         assert!(!inserted.contains("```"), "installed summary is sanitized");
         assert_eq!(summary_chars, inserted.len());
+    }
+
+    // ─── (#2902 step 1b) every compactor call is accounted for ────────
+
+    /// A successful narrative compaction makes one compactor call and reports
+    /// exactly one `CompactorCall`: the model it SENT, the model the server
+    /// says answered, and the reply's own usage.
+    #[test]
+    #[serial_test::serial]
+    fn narrative_compaction_reports_its_one_compactor_call() {
+        let server = GuardedMockServer::start();
+        let summary = "The agent read the parser, found the off-by-one in the tokenizer loop, \
+                       fixed it, and ran the parser's tests, which now pass. Remaining: update \
+                       the changelog entry and re-run the integration target before review.";
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(summary));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let mut calls = Vec::new();
+        compact(&client, &mut messages, 3, &cfg, &mut calls).expect("compaction installs");
+        assert_eq!(calls.len(), 1, "one call, one record: {calls:?}");
+        let c = &calls[0];
+        assert_eq!(c.generation, 3);
+        assert_eq!(c.requested_model, DEFAULT_COMPACTOR_MODEL);
+        assert_eq!(c.reported_model.as_deref(), Some("test-compactor"));
+        assert_eq!(c.usage.as_ref().map(|u| u.total_tokens), Some(580));
+    }
+
+    /// A compaction that is REFUSED after its calls returned still spent
+    /// them: the degenerate-summary path retries once and then errs, and both
+    /// replied calls are reported. Nothing is installed; the calls happened.
+    #[test]
+    #[serial_test::serial]
+    fn a_refused_narrative_compaction_still_reports_every_replied_call() {
+        let server = GuardedMockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content("ok"));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let mut calls = Vec::new();
+        compact(&client, &mut messages, 1, &cfg, &mut calls)
+            .expect_err("a degenerate summary is refused");
+        mock.assert_hits(2);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+    }
+
+    /// A call that never got a reply (the endpoint is unreachable) is not a
+    /// call with usage to account for: nothing is reported, nothing invented.
+    #[test]
+    fn an_unreachable_compactor_reports_no_call() {
+        let client = LmStudioClient::with_base_url("http://127.0.0.1:1/v1".to_string());
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let mut calls = Vec::new();
+        let _ = compact(&client, &mut messages, 1, &cfg, &mut calls);
+        let _ = structured_compact(&client, &mut messages, 1, &cfg, None, &mut calls);
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    /// The structured path reports its call the same way.
+    #[test]
+    #[serial_test::serial]
+    fn structured_compaction_reports_its_one_compactor_call() {
+        let server = GuardedMockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(
+                r#"{"objective":"audit refresh-token","current_truth":{"active_files":"x.ts"},"compaction_metadata":{"schema_version":"0.1","generation":7,"source_message_count":4}}"#,
+            ));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let mut calls = Vec::new();
+        structured_compact(&client, &mut messages, 7, &cfg, None, &mut calls)
+            .expect("happy path");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].generation, 7);
+        assert_eq!(calls[0].requested_model, DEFAULT_COMPACTOR_MODEL);
+        assert_eq!(calls[0].reported_model.as_deref(), Some("test-compactor"));
+        assert_eq!(calls[0].usage.as_ref().map(|u| u.prompt_tokens), Some(500));
+    }
+
+    /// The structured path's retry: attempt 1 replies with nothing usable,
+    /// attempt 2 likewise; the compaction fails, and BOTH replies are
+    /// reported, because both were calls the compactor answered.
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_structured_compaction_still_reports_both_replied_calls() {
+        let server = GuardedMockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_with_json_content(""));
+        });
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let mut messages = dummy_messages_long_enough_to_compact();
+        let cfg = CompactionConfig::never_compact_with_model();
+        let mut calls = Vec::new();
+        structured_compact(&client, &mut messages, 2, &cfg, None, &mut calls)
+            .expect_err("no usable content twice fails the compaction");
+        mock.assert_hits(2);
+        assert_eq!(calls.len(), 2, "{calls:?}");
     }
 }

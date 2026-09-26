@@ -14,7 +14,7 @@ import { runRegions } from "../lenses/session/sessionRun";
 import { applyRecordToMetrics, indexGraph, type MetricsMap } from "../lenses/mission/graph";
 import { measuredCharsPerToken, averageGenerationRate } from "./tokenRate";
 import { turnItems } from "./turnGroups";
-import { countsInLegacyTokenSums, isTurnUsage } from "./usageRecords";
+import { countsInExecutionTokenSums, countsInLegacyTokenSums, isCompactionUsage, isTurnUsage } from "./usageRecords";
 
 const LMS = "http://127.0.0.1:1234/v1";
 const HOSTED = "azure:example.cognitiveservices.azure.com/gpt-5.1";
@@ -180,5 +180,101 @@ describe("#2902 step 1a: per-call usage records change no consumer's result", ()
     expect(isTurnUsage({ call_kind: "turn" })).toBe(true);
     expect(isTurnUsage({ call_kind: "single_shot" })).toBe(false);
     expect(isTurnUsage({ call_kind: "map_item" })).toBe(false);
+  });
+});
+
+// (#2902 step 1b) The runtime's COMPACTOR calls now emit their own usage
+// records (`call_kind: "compaction"`), attributed to the compactor (record
+// `handle: "compactor"`, its own `model`), with `remote: false` (the runtime
+// never routes the compactor through a hosted brain). Each stream below is fed
+// with and without them.
+describe("#2902 step 1b: compaction usage records", () => {
+  const M = "m-2";
+  function compactionStreams(): [FlowRecord[], FlowRecord[]] {
+    clock = 0;
+    const without: FlowRecord[] = [];
+    const withC: FlowRecord[] = [];
+    const both = (x: FlowRecord) => { without.push(x); withC.push(x); };
+    const only = (x: FlowRecord) => { withC.push(x); };
+    const compaction = (sid: string, total: number, extra: Record<string, unknown> = {}, mission?: string) =>
+      ({ ...usage(sid, "compactor", { call_kind: "compaction", requested_model: "darkmux:c4b", reported_model: "c4b", endpoint: LMS, token_source: "provider", remote: false, generation: 1, parent_role_id: "coder", parent_model: "darkmux:q", prompt_tokens: total - 80, completion_tokens: 80, total_tokens: total, ...extra }, mission), model: "darkmux:c4b" }) as FlowRecord;
+
+    // A HOSTED-brain container run that compacts once between its turns.
+    both(r({ action: "dispatch.start", session_id: "h1", handle: "coder", model: "gpt-5.1", payload: { runtime: "internal", endpoint: HOSTED } }));
+    both(r({ action: "dispatch.turn.heartbeat", session_id: "h1", payload: { turn_seq: 1, generated_chars: 20000, sampled_at_ms: 1000 } }));
+    both(r({ action: "dispatch.turn", session_id: "h1", payload: { turn_seq: 1, generation_ms: 2000 } }));
+    both(usage("h1", "coder", { call_kind: "turn", requested_model: "gpt-5.1", endpoint: HOSTED, token_source: "provider", turn_seq: 1, prompt_tokens: 900, completion_tokens: 100, total_tokens: 1000 }));
+    only(compaction("h1", 580));
+    both(r({ action: "dispatch.turn", session_id: "h1", payload: { turn_seq: 2, generation_ms: 500 } }));
+    both(usage("h1", "coder", { call_kind: "turn", requested_model: "gpt-5.1", endpoint: HOSTED, token_source: "provider", turn_seq: 2, prompt_tokens: 1100, completion_tokens: 100, total_tokens: 1200 }));
+    both(r({ action: "dispatch.complete", session_id: "h1", handle: "coder", payload: { runtime: "internal", endpoint: HOSTED, result_class: "ok", total_turns: 2, prompt_tokens: 2000, completion_tokens: 200, total_tokens: 2200 } }));
+
+    // A mission step (container path) that compacts: the graph's step meter.
+    both(r({ action: "dispatch start", session_id: "task-t3", handle: "cs", mission_id: M, payload: { step_id: "cs", kind: "dispatch.internal" } }));
+    both(usage("task-t3", "cs", { call_kind: "turn", requested_model: "darkmux:q", endpoint: LMS, token_source: "provider", turn_seq: 1, prompt_tokens: 400, completion_tokens: 50, total_tokens: 450, step_id: "cs" }, M));
+    only(compaction("task-t3", 300, { step_id: "cs" }, M));
+    return [without, withC];
+  }
+
+  it("the fleet hero counts compaction in its total, and on the LOCAL side of the split", () => {
+    const [without, withC] = compactionStreams();
+    const a = tokensOffMeter(without);
+    const b = tokensOffMeter(withC);
+    expect(b.total).toBe(a.total + 580 + 300);
+    expect(b.cloud).toBe(a.cloud); // a hosted-brain run's compactor call is not cloud spend
+    expect(b.local).toBe(a.local + 580 + 300);
+    // The turn re-read decomposition is unchanged; the compactor calls' input
+    // lands in the unclassified bucket rather than breaking the turn sequence.
+    expect(b.fresh).toBe(a.fresh);
+    expect(b.reread).toBe(a.reread);
+    expect(b.uncls).toBe(a.uncls + 500 + 220);
+    expect(b.runs).toBe(a.runs);
+    expect(b.cloudRuns).toBe(a.cloudRuns);
+  });
+
+  it("the run page never blends compaction into the execution's own tiles (contract 8)", () => {
+    const [without, withC] = compactionStreams();
+    // `lastBeatMs` is liveness, not accounting: a compactor call IS activity
+    // in the session, so the last beat may move to it. Everything else holds.
+    const tiles = (recs: FlowRecord[], sid: string) => ({ ...runRegions(recs, sid, Date.UTC(2026, 8, 27)), lastBeatMs: 0 });
+    for (const sid of ["h1", "task-t3"]) {
+      expect(tiles(withC, sid)).toEqual(tiles(without, sid));
+    }
+  });
+
+  it("the mission graph's step meter never blends compaction in (contract 8)", () => {
+    const [without, withC] = compactionStreams();
+    const idx = indexGraph({ nodes: [{ id: "t3", kind: "task", steps: [{ id: "cs", kind: "dispatch.internal" }] }] as never });
+    const fold = (recs: FlowRecord[]) => recs.reduce<MetricsMap>((m, x) => applyRecordToMetrics(m, x, idx, M), {});
+    const a = fold(withC);
+    expect(a.cs?.tokRun).toBe(450);
+    expect({ ...a.cs, lastTs: 0 }).toEqual({ ...fold(without).cs, lastTs: 0 });
+  });
+
+  it("live rate and calibration exclude compaction records, even one carrying a turn_seq", () => {
+    const [without, withC] = compactionStreams();
+    expect(measuredCharsPerToken(without)).not.toBe(4); // calibrated, not the default
+    expect(measuredCharsPerToken(withC)).toBe(measuredCharsPerToken(without));
+    expect(averageGenerationRate([withC])).toEqual(averageGenerationRate([without]));
+    const stray = usage("h1", "compactor", { call_kind: "compaction", turn_seq: 1, completion_tokens: 999, endpoint: LMS });
+    expect(measuredCharsPerToken([...withC, stray])).toBe(measuredCharsPerToken(without));
+    expect(averageGenerationRate([[...withC, stray]])).toEqual(averageGenerationRate([without]));
+  });
+
+  it("turn groups are unchanged", () => {
+    const [without, withC] = compactionStreams();
+    const vis = (recs: FlowRecord[]) => recs.filter((x) => x.action !== "telemetry.tokens");
+    expect(turnItems(vis(withC), withC)).toEqual(turnItems(vis(without), without));
+  });
+
+  it("the predicates", () => {
+    expect(countsInExecutionTokenSums({ call_kind: "compaction", token_source: "provider" })).toBe(false);
+    expect(countsInExecutionTokenSums({ call_kind: "turn", token_source: "provider" })).toBe(true);
+    expect(countsInExecutionTokenSums({})).toBe(true);
+    expect(countsInExecutionTokenSums({ call_kind: "single_shot" })).toBe(false);
+    expect(countsInLegacyTokenSums({ call_kind: "compaction", token_source: "provider" })).toBe(true);
+    expect(isTurnUsage({ call_kind: "compaction" })).toBe(false);
+    expect(isCompactionUsage({ call_kind: "compaction" })).toBe(true);
+    expect(isCompactionUsage({ call_kind: "turn" })).toBe(false);
   });
 });

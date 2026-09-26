@@ -1,5 +1,5 @@
 import { isDispatchComplete, isDispatchStart, isDispatchError, T } from "../../lib/flow";
-import { countsInLegacyTokenSums } from "../../lib/usageRecords";
+import { countsInLegacyTokenSums, isCompactionUsage } from "../../lib/usageRecords";
 /**
  * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
  * savings hero's summing logic: tokens kept off the (frontier) meter, split
@@ -567,6 +567,8 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   let unknown = 0;
   const sess = new Map<string, SessTurn[]>();
 
+  // (#2902 step 1b) Compactor calls' input tokens, outside the turn sequence.
+  let compactionPrompt = 0;
   for (const r of data) {
     if (r.category === "telemetry" && r.source === "tokens") {
       const p = (r.payload as TokenPayload) || {};
@@ -679,6 +681,15 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       // a ts must not merge into one pseudo-session; it would corrupt the
       // turn_seq decomposition below), so there is one key expression here
       // rather than two that have to be kept in step.
+      // (#2902 step 1b) A compactor call counts in the totals and the split
+      // above (its `remote: false` puts it on the local side, hosted brain or
+      // not), but it is not a TURN: grouped with the run's turns it would
+      // break the turn re-read sequence below (no `turn_seq`) and demote the
+      // whole run to unclassified. Its input is its own, so it lands there.
+      if (isCompactionUsage(p as Record<string, unknown>)) {
+        compactionPrompt += p.prompt_tokens || 0;
+        continue;
+      }
       const arr = sess.get(rk);
       if (arr) arr.push({ ...p, ts: r.ts });
       else sess.set(rk, [{ ...p, ts: r.ts }]);
@@ -690,7 +701,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // is per-tier.
   let fresh = 0;
   let reread = 0;
-  let uncls = 0;
+  let uncls = compactionPrompt;
   for (const [, recs] of sess) {
     const sp = recs.reduce((a, p) => a + (p.prompt_tokens || 0), 0);
     if (recs.every((p) => p.turn_seq != null)) {

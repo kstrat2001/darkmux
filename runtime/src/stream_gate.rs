@@ -486,6 +486,7 @@ mod tests {
 
     fn chunk(reasoning: Option<&str>, content: Option<&str>, tool: bool) -> ChatChunk {
         ChatChunk {
+            model: None,
             id: "c".into(),
             choices: vec![ChoiceDelta {
                 index: 0,
@@ -528,6 +529,7 @@ mod tests {
     /// A chunk carrying one fragment of a tool call's `arguments` on slot 0.
     fn args_chunk(fragment: &str) -> ChatChunk {
         ChatChunk {
+            model: None,
             id: "c".into(),
             choices: vec![ChoiceDelta {
                 index: 0,

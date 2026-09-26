@@ -112,7 +112,8 @@ Every line in `trajectory.jsonl` has a `type` field. Use `grep '"type":"<EVENT>"
   "ts": <unix_ms>,
   "finish_reason": "stop" | "tool_calls" | "length",
   "usage": { "prompt_tokens": <int>, "completion_tokens": <int>, "total_tokens": <int> } | null,
-  "tool_calls": [{ "id": <str>, "name": <str>, "arguments_chars": <int> }] | null
+  "tool_calls": [{ "id": <str>, "name": <str>, "arguments_chars": <int> }] | null,
+  "reported_model": <str>   // the model the server says answered; ABSENT when it named none (#2902)
 }
 ```
 
@@ -167,6 +168,14 @@ things. Trajectories predating #469 omit `ok` entirely; treat missing as
 ```
 { "type": "compaction", "generation": <int>, "ts": <unix_ms>, "before_messages": <int>, "after_messages": <int>, "summary_chars": <int> }
 ```
+
+### `compaction.call` (1 per compactor model call that got a reply, #2902)
+
+```
+{ "type": "compaction.call", "generation": <int>, "ts": <unix_ms>, "requested_model": <str>, "reported_model": <str, absent when unknown>, "usage": { ...same shape as model.completed... } | null }
+```
+
+One per compactor CALL, installed or refused (a retried or refused compaction still spent its calls), so it can outnumber `compaction` events. It is not a turn: never count it with `model.completed`. The host turns each into a `telemetry.tokens` flow record with `call_kind: "compaction"`, attributed to the compactor.
 
 ### Runtime signal events (0+ per dispatch — heuristics + recovery)
 

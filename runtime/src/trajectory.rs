@@ -245,32 +245,9 @@ impl Trajectory {
         finish_reason: &str,
         usage: Option<&Usage>,
         tool_calls: Option<&[ToolCall]>,
+        reported_model: Option<&str>,
     ) {
-        let usage_json = usage.map(|u| {
-            serde_json::json!({
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens,
-                // (#1444) `null` — not a fabricated `0` — when the provider
-                // didn't report a details object/field at all. Present on
-                // hosted reasoning-family models (Azure/OpenAI o-series,
-                // GPT-5.1-class); always `null` for LMStudio-local calls
-                // today. Whether `reasoning_tokens` sits INSIDE
-                // `completion_tokens` or outside it is provider-specific —
-                // see `Usage::reasoning_tokens`'s doc; do not derive one
-                // from the other here or downstream.
-                //
-                // This writer is the ONLY producer of these two keys in the
-                // trajectory, and the host's `turn_tokens_payload` reads
-                // them straight back out — so
-                // `model_completed_usage_carries_reasoning_and_cached_tokens`
-                // below pins them here rather than relying on the host-side
-                // test, which feeds a hand-written fixture and would stay
-                // green forever if this emission were deleted.
-                "reasoning_tokens": u.reasoning_tokens(),
-                "cached_tokens": u.cached_tokens(),
-            })
-        });
+        let usage_json = usage_event_json(usage);
         let tool_calls_json = tool_calls.map(|calls| {
             calls
                 .iter()
@@ -283,14 +260,49 @@ impl Trajectory {
                 })
                 .collect::<Vec<_>>()
         });
-        self.write_event(&serde_json::json!({
+        let mut event = serde_json::json!({
             "type": "model.completed",
             "seq": seq,
             "ts": unix_ms(),
             "finish_reason": finish_reason,
             "usage": usage_json,
             "tool_calls": tool_calls_json,
-        }));
+        });
+        // (#2902 step 1b) The model the server says answered this turn, so
+        // the host's per-turn usage record can carry `reported_model`.
+        // ABSENT when the server named none; never copied from the request.
+        if let Some(m) = reported_model {
+            event["reported_model"] = serde_json::json!(m);
+        }
+        self.write_event(&event);
+    }
+
+    /// (#2902 step 1b) `compaction.call` — one per compactor model call that
+    /// got a reply, whether or not the compaction it served was installed.
+    ///
+    /// Its own event type, NOT a `model.completed`: every consumer of
+    /// `model.completed` (the host's turn counter, `dispatch.turn`, the
+    /// checkpoint fold) counts PRIMARY turns, and a compactor call is a
+    /// sub-execution of a utility role, not a turn of the specialist
+    /// (CLAUDE.md contract 8). The host maps each one to a `telemetry.tokens`
+    /// record with `call_kind: "compaction"`, attributed to the compactor.
+    ///
+    /// `requested_model` is the model id sent on the wire, `reported_model`
+    /// the reply's own `model` (absent when it had none), and `usage` the
+    /// same object shape `model.completed` writes (`null` when the reply
+    /// carried no usage block).
+    pub fn append_compaction_call(&mut self, call: &crate::compaction::CompactorCall) {
+        let mut event = serde_json::json!({
+            "type": "compaction.call",
+            "generation": call.generation,
+            "ts": unix_ms(),
+            "requested_model": call.requested_model,
+            "usage": usage_event_json(call.usage.as_ref()),
+        });
+        if let Some(m) = &call.reported_model {
+            event["reported_model"] = serde_json::json!(m);
+        }
+        self.write_event(&event);
     }
 
     /// model.reasoning — one per turn where the model emitted reasoning
@@ -1464,6 +1476,36 @@ pub(crate) fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The `usage` object a model-call event carries (`model.completed`,
+/// `compaction.call`): one shape, so the host reads both with one mapper.
+fn usage_event_json(usage: Option<&Usage>) -> Option<serde_json::Value> {
+    usage.map(|u| {
+        serde_json::json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens,
+            // (#1444) `null` — not a fabricated `0` — when the provider
+            // didn't report a details object/field at all. Present on
+            // hosted reasoning-family models (Azure/OpenAI o-series,
+            // GPT-5.1-class); always `null` for LMStudio-local calls
+            // today. Whether `reasoning_tokens` sits INSIDE
+            // `completion_tokens` or outside it is provider-specific —
+            // see `Usage::reasoning_tokens`'s doc; do not derive one
+            // from the other here or downstream.
+            //
+            // This writer is the ONLY producer of these two keys in the
+            // trajectory, and the host's `turn_tokens_payload` reads
+            // them straight back out — so
+            // `model_completed_usage_carries_reasoning_and_cached_tokens`
+            // below pins them here rather than relying on the host-side
+            // test, which feeds a hand-written fixture and would stay
+            // green forever if this emission were deleted.
+            "reasoning_tokens": u.reasoning_tokens(),
+            "cached_tokens": u.cached_tokens(),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,7 +1542,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-2").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         t.append_dispatch_start("test-model", 100, 50, &["read", "search"]);
-        t.append_model_completed(1, "stop", None, None);
+        t.append_model_completed(1, "stop", None, None, None);
         drop(t);
 
         let traj_file = ws
@@ -1540,12 +1582,12 @@ mod tests {
             }),
             prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(20) }),
         };
-        t.append_model_completed(1, "stop", Some(&usage), None);
+        t.append_model_completed(1, "stop", Some(&usage), None, None);
 
         // A second turn whose provider reported NO details object at all —
         // both keys must be JSON `null`, never a fabricated `0`.
         let bare = Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, ..Default::default() };
-        t.append_model_completed(2, "stop", Some(&bare), None);
+        t.append_model_completed(2, "stop", Some(&bare), None, None);
         drop(t);
 
         let body =
@@ -1879,5 +1921,63 @@ mod tests {
             final_assistant_preview: "".into(),
         };
         t.save_metrics(&m).unwrap();
+    }
+
+    /// (#2902 step 1b) A turn names the model that answered it, when the
+    /// server said so; the key is ABSENT (not null) when it did not.
+    #[test]
+    fn model_completed_carries_the_reported_model_only_when_known() {
+        let ws = tempfile::Builder::new().prefix("traj-reported").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_model_completed(1, "stop", None, None, Some("served-a"));
+        t.append_model_completed(2, "stop", None, None, None);
+        drop(t);
+        let body =
+            fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> =
+            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines[0]["reported_model"], "served-a");
+        assert!(lines[1].get("reported_model").is_none(), "{}", lines[1]);
+    }
+
+    /// (#2902 step 1b) One `compaction.call` event per compactor model call:
+    /// its own type (a consumer counting `model.completed` as turns must not
+    /// see it), the model sent on the wire, the served model when known, and
+    /// the usage block in the same shape `model.completed` writes.
+    #[test]
+    fn compaction_call_event_records_one_compactor_call() {
+        let ws = tempfile::Builder::new().prefix("traj-compaction-call").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        let usage = Usage { prompt_tokens: 500, completion_tokens: 80, total_tokens: 580, ..Default::default() };
+        t.append_compaction_call(&crate::compaction::CompactorCall {
+            generation: 3,
+            requested_model: "darkmux:compactor-4b".into(),
+            reported_model: Some("compactor-4b".into()),
+            usage: Some(usage),
+        });
+        t.append_compaction_call(&crate::compaction::CompactorCall {
+            generation: 3,
+            requested_model: "darkmux:compactor-4b".into(),
+            reported_model: None,
+            usage: None,
+        });
+        drop(t);
+        let body =
+            fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> =
+            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        let e = &lines[0];
+        assert_eq!(e["type"], "compaction.call");
+        assert_eq!(e["generation"], 3);
+        assert_eq!(e["requested_model"], "darkmux:compactor-4b");
+        assert_eq!(e["reported_model"], "compactor-4b");
+        assert_eq!(e["usage"]["prompt_tokens"], 500);
+        assert_eq!(e["usage"]["total_tokens"], 580);
+        assert!(e["usage"]["reasoning_tokens"].is_null(), "never a fabricated 0: {e}");
+        assert!(e["ts"].is_number());
+        let bare = &lines[1];
+        assert!(bare["usage"].is_null(), "no usage block is recorded as null: {bare}");
+        assert!(bare.get("reported_model").is_none(), "{bare}");
     }
 }

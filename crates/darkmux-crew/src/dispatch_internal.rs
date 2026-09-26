@@ -5986,6 +5986,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         Some(remote_endpoint_raw_label.clone().unwrap_or_else(|| {
             crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())
         })),
+        // (#2902 step 1b) The compactor's endpoint: always the LMStudio base,
+        // hosted brain or not (the runtime never routes the compactor through
+        // the hosted URL; `runtime/src/main.rs`, #1187).
+        Some(crate::usage::lmstudio_endpoint(opts.model_base_url_override.as_deref())),
     );
 
     // (#363, then #457) Inactivity watchdog. Phase B dogfood (Beat 39,
@@ -7607,6 +7611,7 @@ fn spawn_guarded_tailer(
     compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
+    compactor_endpoint: Option<String>,
 ) -> (StopFlagGuard, thread::JoinHandle<TrajectorySummary>) {
     // Armed the moment this function is called — see `StopFlagGuard`'s own
     // doc. The caller holds the returned guard to the natural end of its
@@ -7631,6 +7636,7 @@ fn spawn_guarded_tailer(
             compactor_model,
             record_context,
             endpoint,
+            compactor_endpoint,
         )
     });
     (guard, handle)
@@ -7665,6 +7671,7 @@ fn run_tailer(
     compactor_model: Option<String>,
     record_context: Option<serde_json::Value>,
     endpoint: Option<String>,
+    compactor_endpoint: Option<String>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -7682,6 +7689,7 @@ fn run_tailer(
     .with_compaction_threshold(compaction_threshold)
     .with_compactor_model(compactor_model)
     .with_endpoint(endpoint)
+    .with_compactor_endpoint(compactor_endpoint)
     .with_record_context(record_context);
 
     loop {
@@ -9206,6 +9214,12 @@ struct TailerState {
     /// resolved LMStudio base. Stamped on every per-turn usage record.
     /// `None` only in test fixtures that never set it.
     endpoint: Option<String>,
+    /// (#2902 step 1b) The endpoint the runtime's COMPACTOR client called:
+    /// always the resolved LMStudio base (host-side form), because the
+    /// runtime never routes the compactor through a hosted brain's URL or
+    /// auth (`runtime/src/main.rs`, #1187). Stamped on every
+    /// `call_kind: "compaction"` usage record. `None` only in test fixtures.
+    compactor_endpoint: Option<String>,
     /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
     /// forwarded from the call site — provenance the runtime cannot know
     /// (e.g. the crawl launcher's `workspace`/`source`/`sha`/`rule`/`unit`),
@@ -9291,6 +9305,7 @@ impl TailerState {
             inactivity_secs,
             compaction_threshold: None,
             endpoint: None,
+            compactor_endpoint: None,
             record_context: None,
         }
     }
@@ -9304,6 +9319,12 @@ impl TailerState {
     /// only production `run_tailer` opts in.
     fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// (#2902 step 1b) The compactor's endpoint fact; see the field.
+    fn with_compactor_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.compactor_endpoint = endpoint;
         self
     }
 
@@ -9380,6 +9401,7 @@ impl TailerState {
             inactivity_secs: 600,
             compaction_threshold: None,
             endpoint: None,
+            compactor_endpoint: None,
             record_context: None,
         }
     }
@@ -9700,6 +9722,31 @@ impl TailerState {
                 // dispatcher because they build different records from
                 // different stores, and neither may fail the dispatch.
                 self.materialize_mod(&event, tool_ok, &bounded_emission);
+            }
+            "compaction.call" => {
+                // (#2902 step 1b) One runtime COMPACTOR call, installed or
+                // refused: exactly one usage record, attributed to the
+                // compactor (record `handle` + `model`), never to the
+                // specialist this dispatch is for (CLAUDE.md contract 8,
+                // #1974). Deliberately touches nothing in `self.summary`:
+                // the `dispatch complete` totals are the specialist's own,
+                // and a compactor call is neither a turn nor a compaction
+                // (the `compaction` event below counts installs).
+                let payload = compaction_call_tokens_payload(
+                    &event,
+                    self.compactor_model.as_deref(),
+                    self.compactor_endpoint.as_deref().unwrap_or_default(),
+                    &self.role_id,
+                    &self.model,
+                );
+                let model = payload["requested_model"].as_str().map(str::to_string);
+                self.emit_telemetry_as(
+                    COMPACTOR_ROLE,
+                    model.as_deref(),
+                    crate::usage::USAGE_SOURCE,
+                    crate::usage::USAGE_ACTION,
+                    payload,
+                );
             }
             "compaction" => {
                 self.summary.compactions += 1;
@@ -10320,16 +10367,32 @@ impl TailerState {
     /// `emit` but routes through `build_telemetry_record` so the record
     /// lands under `category=telemetry` with a caller-supplied `source`
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
-    fn emit_telemetry(&self, source: &str, action: &str, mut payload: serde_json::Value) {
+    fn emit_telemetry(&self, source: &str, action: &str, payload: serde_json::Value) {
+        self.emit_telemetry_as(&self.role_id, Some(&self.model), source, action, payload);
+    }
+
+    /// (#2902 step 1b) `emit_telemetry` for a record whose work was done by
+    /// a SUB-EXECUTION: the record's `handle` and `model` name that
+    /// sub-execution's own role and model (CLAUDE.md contract 8), while the
+    /// session, mission, phase and step stay the parent's, so the record
+    /// still joins the run it happened in.
+    fn emit_telemetry_as(
+        &self,
+        role_id: &str,
+        model: Option<&str>,
+        source: &str,
+        action: &str,
+        mut payload: serde_json::Value,
+    ) {
         self.stamp_step_id(&mut payload);
         merge_record_context(&mut payload, &self.record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,
             source,
-            &self.role_id,
+            role_id,
             &self.session_id,
-            Some(&self.model),
+            model,
             self.mission_id.as_deref(),
             self.phase_id.as_deref(),
             payload,
@@ -10426,13 +10489,14 @@ fn turn_tokens_payload(
     endpoint: &str,
 ) -> serde_json::Value {
     // (#2902 step 1a) Through the one accounting writer. `turn_seq` is the
-    // one field only a turn has; `reported_model` stays absent until the
-    // runtime forwards the served model (#2902 step 1b).
+    // one field only a turn has. (#2902 step 1b) `reported_model` is the
+    // runtime's `model.completed.reported_model`, the reply's own `model`;
+    // absent when the runtime (or an older image) wrote none.
     let mut payload = crate::usage::usage_payload(
         &crate::usage::CallFacts {
             call_kind: crate::usage::CallKind::Turn,
             requested_model,
-            reported_model: None,
+            reported_model: event_model_id(event, "reported_model").as_deref(),
             endpoint,
         },
         &turn_usage_counts(event),
@@ -10440,6 +10504,67 @@ fn turn_tokens_payload(
     payload["turn_seq"] = event.get("seq").cloned().unwrap_or(serde_json::Value::Null);
     payload
 }
+
+/// (#2902 step 1b) A model id a runtime model-call event names (`key` is
+/// `reported_model` on `model.completed`/`compaction.call`, or
+/// `requested_model` on `compaction.call`), when non-empty. Bounded like
+/// every other string this tailer lifts out of the container's trajectory
+/// (`MAX_TRAJ_FIELD_BYTES`): a served model id comes from the endpoint's
+/// reply, which darkmux does not control.
+fn event_model_id(event: &serde_json::Value, key: &str) -> Option<String> {
+    event
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.is_empty())
+        .map(|m| cap_str(m, MAX_TRAJ_FIELD_BYTES))
+}
+
+/// (#2902 step 1b) Map a `compaction.call` trajectory event (one runtime
+/// COMPACTOR call) to its `telemetry.tokens` payload, through the one
+/// writer. Pure, like `turn_tokens_payload`.
+///
+/// - `requested_model` is the model the runtime put on the wire (the event
+///   names it); `compactor_model` (the tailer's own copy of the same id) is
+///   only the fallback for an event that omits it.
+/// - `endpoint` is the compactor's endpoint fact (the LMStudio base).
+/// - `remote: false` is the same per-seat routing fact `dispatch.map` stamps
+///   (#2690): the runtime builds the compactor client with no hosted URL and
+///   no auth, so this call never took a hosted route. It is what keeps the
+///   fleet hero from counting a hosted-brain run's compactor calls as cloud.
+/// - `generation` names the compaction the call served, and
+///   `parent_role_id`/`parent_model` name the specialist execution it ran
+///   inside, so a reader can relate the two without blending them.
+fn compaction_call_tokens_payload(
+    event: &serde_json::Value,
+    compactor_model: Option<&str>,
+    endpoint: &str,
+    parent_role_id: &str,
+    parent_model: &str,
+) -> serde_json::Value {
+    let requested_model = event_model_id(event, "requested_model")
+        .or_else(|| compactor_model.map(str::to_string))
+        .unwrap_or_default();
+    let mut payload = crate::usage::usage_payload(
+        &crate::usage::CallFacts {
+            call_kind: crate::usage::CallKind::Compaction,
+            requested_model: &requested_model,
+            reported_model: event_model_id(event, "reported_model").as_deref(),
+            endpoint,
+        },
+        &turn_usage_counts(event),
+    );
+    payload["remote"] = serde_json::json!(false);
+    payload["generation"] = event.get("generation").cloned().unwrap_or(serde_json::Value::Null);
+    payload["parent_role_id"] = serde_json::json!(parent_role_id);
+    payload["parent_model"] = serde_json::json!(parent_model);
+    payload
+}
+
+/// The role label a compactor call's usage record is attributed to: the
+/// SEAT name `telemetry_sampler::role_for_load` already gives the compactor
+/// on `telemetry.lms` records. No role manifest names the compactor; the
+/// utility model bound to `internal.utility` fills this seat.
+const COMPACTOR_ROLE: &str = "compactor";
 
 /// (#795, #2902 step 1a) The counts a `model.completed` event reported.
 /// No `usage` object (upstream omitted it) is "not reported": the record

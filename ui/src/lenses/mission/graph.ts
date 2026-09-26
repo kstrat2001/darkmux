@@ -25,7 +25,7 @@
  */
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtElapsed } from "../../lib/format";
-import { countsInLegacyTokenSums } from "../../lib/usageRecords";
+import { countsInExecutionTokenSums } from "../../lib/usageRecords";
 
 // ─── wire types (crates/darkmux-serve/src/mission_graph.rs) ────────────────
 
@@ -571,8 +571,10 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   const action = rec.action || "";
   const isUsage = (rec.category === "telemetry" && rec.source === "tokens") || action === "telemetry.tokens";
   // (#2902 step 1a) The new single-shot and count-less usage records stay out
-  // of the running sum, so it reads what it read before them.
-  const isTok = isUsage && countsInLegacyTokenSums(p as Record<string, unknown>);
+  // of the running sum, so it reads what it read before them. (#2902 step 1b)
+  // So do the compactor's calls: a step's meter is its own execution's
+  // numbers, never a sub-execution's (contract 8).
+  const isTok = isUsage && countsInExecutionTokenSums(p as Record<string, unknown>);
   const isTurn = action === "dispatch.turn";
   const isTool = action === "dispatch.tool";
   const isComplete = action === "dispatch complete" || action === "dispatch.complete";

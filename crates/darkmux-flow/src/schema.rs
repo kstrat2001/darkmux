@@ -77,8 +77,47 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.57.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.58.0";
 // Version history:
+//   1.58.0 (#2902 step 1b, the runtime's model calls): additive.
+//           Completes 1.57.0's "one `telemetry.tokens` per model call" for
+//           the calls made INSIDE the container runtime.
+//
+//           Turns: the per-turn record (`call_kind: "turn"`) now carries
+//           `reported_model`, the reply's own `model` (the streaming path
+//           takes it from the chunks). Still ABSENT when the server sent
+//           none, and on records from an older runtime image; never copied
+//           from the request.
+//
+//           Compaction: every runtime COMPACTOR call that got a reply now
+//           emits one `telemetry.tokens` with `call_kind: "compaction"`,
+//           whether its compaction was installed or refused (a refused one
+//           still spent the call; a retried one emits one per reply). Before
+//           this, compactor calls recorded no usage at all. Its payload is
+//           the canonical usage payload plus `generation` (the compaction it
+//           served), `remote: false` (the runtime never routes the compactor
+//           through a hosted brain's URL or auth; the same per-seat routing
+//           fact `dispatch.map` stamps, 1.49.0), and `parent_role_id` /
+//           `parent_model` (the specialist execution it ran inside).
+//           `requested_model` is the compactor id sent on the wire and
+//           `endpoint` the LMStudio base the compactor called, on a
+//           hosted-brain dispatch too.
+//
+//           ATTRIBUTION (CLAUDE.md contract 8): a compactor call is a
+//           sub-execution of a utility role, so the record's `handle` is
+//           `"compactor"` (the seat name `telemetry.lms` already uses) and
+//           its `model` is the compactor's, NOT the specialist's. Its
+//           `session_id`/`mission_id`/`phase_id`/`step_id` stay the parent
+//           execution's so it joins the run it happened in. Its counts never
+//           enter the parent's `dispatch complete` totals.
+//
+//           Readers: a total that sums every usage record now includes
+//           compaction (the fleet hero). A reader reporting ONE execution's
+//           own numbers (the run page tiles, the mission graph's step meter)
+//           excludes `call_kind: "compaction"`. A reader keyed on turns
+//           (`isTurnUsage`, `turn_seq`) never sees it: the record carries no
+//           `turn_seq`, and the runtime writes it from its own trajectory
+//           event (`compaction.call`), never from `model.completed`.
 //   1.57.0 (#2902 step 1a, one usage record per model call): additive.
 //           The MODEL CALL is the unit of accounting: every call darkmux
 //           makes to a model endpoint emits exactly one `telemetry.tokens`
@@ -101,7 +140,7 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.57.0";
 //
 //           New payload keys on every `telemetry.tokens`:
 //           `call_kind` (`"turn"` | `"single_shot"` | `"map_item"`;
-//           `"compaction"` is reserved for step 1b), `requested_model` (the
+//           `"compaction"` reserved here, emitted from 1.58.0), `requested_model` (the
 //           model id darkmux sent), `reported_model` (the response's own
 //           `model`, ABSENT when it had none; absent on turns until the
 //           runtime forwards it, step 1b), `endpoint` (what darkmux called,

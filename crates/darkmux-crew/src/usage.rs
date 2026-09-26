@@ -8,7 +8,7 @@
 //!
 //! | field             | meaning                                                        |
 //! |-------------------|----------------------------------------------------------------|
-//! | `call_kind`       | `"turn"` · `"single_shot"` · `"map_item"` (`"compaction"` is reserved for the runtime, #2902 step 1b) |
+//! | `call_kind`       | `"turn"` · `"single_shot"` · `"map_item"` · `"compaction"` |
 //! | `requested_model` | the model id darkmux put on the wire                           |
 //! | `reported_model`  | the response's own `model` field; ABSENT when it had none      |
 //! | `endpoint`        | the endpoint darkmux called, as a fact (see below)             |
@@ -38,6 +38,16 @@
 //! - the `dispatch.single_shot` step kind, both arms (`"single_shot"`)
 //! - `dispatch.map`, one record per model call of each item, retries included
 //!   (`"map_item"`, via `map_call_token_payload`)
+//! - the container path's tailer again, one per runtime COMPACTOR call
+//!   (`"compaction"`, #2902 step 1b), from each `compaction.call` trajectory
+//!   event. A compactor call is a sub-execution of a utility role, so its
+//!   record's `handle`/`model` are the compactor's, never the specialist's
+//!   (CLAUDE.md contract 8), and its `endpoint` is the LMStudio base the
+//!   compactor client called (it never takes a hosted brain's route).
+//!
+//! `reported_model` on a turn record comes from the runtime's
+//! `model.completed` event (#2902 step 1b), parsed from the reply (the
+//! streaming path takes it from the chunks).
 //!
 //! `usage_conformance` (tests) drives each one and holds the roster.
 
@@ -55,6 +65,9 @@ pub enum CallKind {
     SingleShot,
     /// One `dispatch.map` item.
     MapItem,
+    /// (#2902 step 1b) One runtime compactor call: a sub-execution of the
+    /// utility role, attributed to it, never to the specialist.
+    Compaction,
 }
 
 impl CallKind {
@@ -63,6 +76,7 @@ impl CallKind {
             CallKind::Turn => "turn",
             CallKind::SingleShot => "single_shot",
             CallKind::MapItem => "map_item",
+            CallKind::Compaction => "compaction",
         }
     }
 }
