@@ -10,21 +10,37 @@ use anyhow::Result;
 use crate::fleet;
 use crate::flow;
 
-pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>) -> Result<i32> {
-    // (#2768) Resolve THIS host's own hardware identity only when the
-    // entry being added describes THIS host — the documented
-    // self-registration shape (`machine add <id> --address
-    // 127.0.0.1:8765`, always-on-hub guide Step 6 / add-machine skill Step
-    // 7). A peer added by its real tailnet/DNS address is, by
-    // construction, not this process's own hardware — `machine add`
-    // performs no network call, so there is nothing here that could ever
-    // resolve a REMOTE peer's uid. That entry's `machine_uid` therefore
-    // stays whatever `add_machine` already had for it: `None` on a fresh
-    // add (legitimately "unknown identity" — see `MachineEntry::machine_uid`'s
-    // own doc), or a previously-resolved/hand-edited value preserved
-    // across this update (see `add_machine`'s own doc for why `None` here
-    // never clobbers it).
-    let is_self_entry = fleet::address_host_is_loopback(address);
+/// `darkmux machine add` — register (or update) a roster entry.
+///
+/// (#2924) **The entry's id is the machine's `machine_id`.** That one name is
+/// what flow records carry, what presence beats carry as `display_name`, and
+/// what #2916's `profile@machine` addresses will resolve. So an entry is
+/// THIS machine's own entry exactly when `id` equals this machine's resolved
+/// machine_id, and only then is this host's hardware uid (#2768) stored on
+/// it. That used to be decided by the address instead (a loopback address
+/// meant "self"), which is what put `127.0.0.1:8765` in the Studio's roster.
+///
+/// (#2924) **A loopback address is refused** unless `allow_loopback`. A
+/// roster entry is read by other machines — the daemon serves the roster to
+/// every viewer on the tailnet, and fleet routing dials it — and a loopback
+/// address reaches whichever machine reads it, never the one the entry
+/// describes. `--allow-loopback` exists for several daemons on one host (a
+/// same-host test fleet), where loopback really does reach the peer.
+pub(crate) fn cmd_machine_add(
+    id: &str,
+    address: &str,
+    description: Option<&str>,
+    allow_loopback: bool,
+) -> Result<i32> {
+    if let Some(msg) = loopback_refusal(id, address, allow_loopback) {
+        eprintln!("{msg}");
+        return Ok(2);
+    }
+    let local_id = flow::resolve_machine_id();
+    let is_self_entry = local_id.as_deref() == Some(id);
+    // A peer's hardware cannot be probed from here — `machine add` performs no
+    // network call — so a non-self entry passes `None`, which `add_machine`
+    // treats as "keep whatever the entry already had" (see its own doc).
     let uid = if is_self_entry {
         darkmux_hardware::machine_uid()
     } else {
@@ -40,145 +56,200 @@ pub(crate) fn cmd_machine_add(id: &str, address: &str, description: Option<&str>
     if let Some(d) = description {
         println!("  description: {d}");
     }
-    if let Some(u) = uid {
-        println!("  machine_uid: {u} (resolved locally — self-registration)");
+    if is_self_entry {
+        let recorded = if uid.is_some() { "; hardware identity recorded" } else { "" };
+        println!("  this machine (its machine_id is `{id}`){recorded}");
     }
     println!("  roster: {}", fleet::roster_path().display());
-    if let Some(w) = self_entry_port_warning(
-        is_self_entry,
-        address,
-        &darkmux_types::config_access::serve_bind(),
-        darkmux_types::config_access::serve_port(),
-    ) {
-        println!("{w}");
-    }
     Ok(0)
 }
 
-/// The port a roster address resolves to: the explicit `:port` when one is
-/// written, else the portless default every roster lookup applies.
-///
-/// Total and non-resolving on purpose — it feeds a WARNING, never a
-/// rejection, so an address it cannot read as `host:port` reads as portless
-/// rather than as an error. Ordering mirrors `address_host_is_loopback`: a
-/// bare IP literal is checked FIRST, because `::1` would otherwise split at
-/// its own last colon and report port `1`.
-fn roster_address_port(address: &str) -> u16 {
-    let trimmed = address.trim();
-    let rest = trimmed
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(trimmed)
-        .trim_end_matches('/');
-    let unbracketed = rest
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(rest);
-    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
-        return crate::serve::DEFAULT_DAEMON_PORT;
-    }
-    rest.rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-        .unwrap_or(crate::serve::DEFAULT_DAEMON_PORT)
-}
-
-/// The host a roster address names, unbracketed and scheme-stripped — the
-/// twin of [`roster_address_port`], split out for the same reason that one
-/// exists: this feeds a WARNING, so an unreadable address yields the string
-/// as-typed rather than an error. Ordering mirrors it exactly (bare IP
-/// literal first, so `::1` is not split at its own last colon).
-fn roster_address_host(address: &str) -> String {
-    let trimmed = address.trim();
-    let rest = trimmed
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(trimmed)
-        .trim_end_matches('/');
-    let unbracketed = rest
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(rest);
-    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
-        return unbracketed.to_string();
-    }
-    match rest.rsplit_once(':') {
-        Some((host, p)) if p.parse::<u16>().is_ok() => host
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(host)
-            .to_string(),
-        _ => rest.to_string(),
-    }
-}
-
-/// (#2782 C4) Warn when a SELF entry names an address this machine's daemon
-/// does not answer on. Returns the text rather than printing, so it is
-/// testable without capturing stdout.
-///
-/// (#2782 C2) Compares the whole ADDRESS, not just the port, and renders
-/// both sides through `config_access::format_client_addr` — the same
-/// function `serve_client_addr` (and therefore `darkmux doctor`'s `serve
-/// address` row, and the daemon-reachability probe) resolves with. A
-/// port-only comparison with a hardcoded `127.0.0.1:{port}` suggestion was
-/// wrong in both directions the moment `serve.bind = ::1` became bindable
-/// in this same delta: it would tell an operator on a `::1` bind to write
-/// `127.0.0.1:8822`, which answers nothing, and it stayed silent when they
-/// typed that address themselves.
-///
-/// A WILDCARD bind (`0.0.0.0`, `::`) is the one case compared on port
-/// alone: it answers on every interface, so any loopback host in the entry
-/// reaches it and only the port can disagree. `format_client_addr` collapses
-/// a wildcard to loopback for the suggestion, which is what a client should
-/// dial — so the bind is passed in alongside rather than read back out of
-/// the rendered string.
-///
-/// The roster's `DEFAULT_DAEMON_PORT` is deliberately uniform — a roster
-/// entry names ANOTHER machine, and one machine's `serve.port` must not
-/// silently redirect traffic aimed at another (see that constant's own doc).
-/// #2782 C10 handled the one case that carve-out does not cover — the
-/// documented self-registration recipe, where the port IS this machine's —
-/// in the DOCS alone. This is the structural half of the same fix, and it
-/// belongs HERE rather than in the roster for the same reason the carve-out
-/// exists: `cmd_machine_add` is the layer that already knows whether an
-/// entry is "me" (it branches on exactly that to resolve `machine_uid`),
-/// while the roster deliberately does not model the distinction.
-///
-/// Surface + suggest, never mutate (#44): the entry is written as typed. An
-/// operator CAN legitimately want a self entry on another address — a second
-/// daemon on this host — so this reports the mismatch and names both sides
-/// rather than correcting one of them.
-fn self_entry_port_warning(
-    is_self_entry: bool,
-    address: &str,
-    serve_bind: &str,
-    serve_port: u16,
-) -> Option<String> {
-    if !is_self_entry {
-        return None;
-    }
-    use darkmux_types::config_access::format_client_addr;
-    let named = format_client_addr(&roster_address_host(address), roster_address_port(address));
-    let resolved = format_client_addr(serve_bind, serve_port);
-    let bind_is_wildcard = serve_bind
-        .trim()
-        .parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_unspecified())
-        .unwrap_or(false);
-    let agrees = if bind_is_wildcard {
-        roster_address_port(address) == serve_port
-    } else {
-        named == resolved
-    };
-    if agrees {
+/// (#2924) The refusal `machine add` prints for a loopback address, or `None`
+/// when the address is acceptable. Pure so the rule is testable apart from
+/// the verb; the verb's own test proves the call site honors it.
+fn loopback_refusal(id: &str, address: &str, allow_loopback: bool) -> Option<String> {
+    if allow_loopback || !fleet::address_host_is_loopback(address) {
         return None;
     }
     Some(format!(
-        "  ⚠ this entry points at {named}, but this machine's daemon resolves to {resolved}.\n    \
-         A roster address is the one place `serve.bind`/`serve.port` are NOT consulted — a peer's \
-         address is not this machine's — so a self entry has to name the address itself. Re-run with \
-         `--address {resolved}` if you meant this daemon; `darkmux doctor`'s `serve address` row \
-         prints the resolved value and its tier."
+        "machine: refusing loopback address `{address}` for `{id}`. A roster entry is read by other \
+         machines (the daemon serves the roster to every viewer, and fleet routing dials it), and a \
+         loopback address reaches whichever machine reads it, never `{id}`.\n  \
+         Use the machine's tailnet DNS name: `darkmux machine add {id} --address <tailnet-dns-name>` \
+         (`tailscale status` on that machine prints it).\n  \
+         Several daemons on ONE host (a same-host test fleet)? Pass --allow-loopback."
     ))
+}
+
+/// (#2924) The fleet-roster rows `darkmux doctor` appends: `roster
+/// addresses` (a loopback address no peer can use) and `roster identity`
+/// (an entry not named by its machine's machine_id). Nothing when there is
+/// no roster — a single machine has no fleet to check.
+///
+/// Gathers what this machine knows about fleet identity from three sources,
+/// in rising precedence for "what does uid X go by now": local flow history
+/// (latest name wins), live presence beats, and this machine's own
+/// resolution. Presence is read only when Redis is configured, with the
+/// same bounded connect every presence read uses.
+pub(crate) fn roster_doctor_checks() -> Vec<crate::doctor::Check> {
+    let roster = match fleet::load_roster() {
+        Ok(r) => r,
+        Err(e) => {
+            return vec![crate::doctor::Check {
+                name: "roster identity".into(),
+                status: crate::doctor::Status::Warn,
+                message: format!("the fleet roster could not be read: {e:#}"),
+                hint: Some("Fix the JSON in the roster file named above; `darkmux machine list` reads the same file.".into()),
+            }];
+        }
+    };
+    if roster.machines.is_empty() {
+        return Vec::new();
+    }
+    let local = darkmux_hardware::machine_uid().zip(flow::resolve_machine_id());
+    let beats: Vec<(String, String)> = darkmux_flow::redis_url()
+        .and_then(|url| redis::Client::open(url.expose_for_probe()).ok())
+        .and_then(|client| darkmux_flow::presence::read_live(&client).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| (b.machine_uid, b.display_name))
+        .collect();
+    let local = local.as_ref().map(|(u, n)| (*u, n.as_str()));
+    // Flow history is read only when this machine and the live beats cannot
+    // settle every entry on their own — the normal, healthy fleet never pays
+    // for the scan.
+    let live = gather_identity_knowledge(None, &beats, local);
+    let known = if roster_needs_history(&roster, &live) {
+        gather_identity_knowledge(Some(&darkmux_types::config_access::flows_dir()), &beats, local)
+    } else {
+        live
+    };
+    roster_checks(&roster, &known)
+}
+
+/// True when some roster entry cannot be settled from live knowledge alone:
+/// it declares no uid and is not a current name, or declares a uid nobody
+/// live answers to. History can only change the verdict for those.
+fn roster_needs_history(roster: &fleet::FleetRoster, live: &crate::doctor::FleetIdentityKnowledge) -> bool {
+    roster.machines.values().any(|m| match &m.machine_uid {
+        Some(uid) => !live.current_name_by_uid.contains_key(uid),
+        None => !live.current_name_by_uid.values().any(|n| *n == m.id),
+    })
+}
+
+/// A flow record's top-level `(machine_id, machine_uid)`, or `None` when it
+/// carries no machine_id.
+///
+/// Measured cost is why this is not a plain `serde_json` parse: a full
+/// history on the laptop is ~300 MB, and parsing every line added ~4 s to a
+/// debug `darkmux doctor`. darkmux writes both fields as flat strings among
+/// the record's leading scalar fields, so the fast path reads them by key,
+/// accepting a match only when no `{` precedes it (i.e. it is not inside a
+/// nested object). Any other shape falls back to a real parse.
+fn record_identity(line: &str) -> Option<(String, Option<String>)> {
+    fn flat_field<'a>(line: &'a str, key: &str) -> Option<Option<&'a str>> {
+        let pat = format!("\"{key}\":\"");
+        let Some(at) = line.find(&pat) else {
+            return if line.contains(&format!("\"{key}\"")) { None } else { Some(None) };
+        };
+        if line.get(1..at).is_some_and(|pre| pre.contains('{')) {
+            return None;
+        }
+        let rest = &line[at + pat.len()..];
+        let end = rest.find('"')?;
+        let v = &rest[..end];
+        if v.contains('\\') {
+            return None;
+        }
+        Some(Some(v))
+    }
+    let fast = flat_field(line, "machine_id").zip(flat_field(line, "machine_uid"));
+    let (id, uid) = match fast {
+        Some((id, uid)) => (id.map(str::to_string), uid.map(str::to_string)),
+        None => {
+            #[derive(serde::Deserialize)]
+            struct Ids {
+                machine_id: Option<String>,
+                machine_uid: Option<String>,
+            }
+            let ids: Ids = serde_json::from_str(line).ok()?;
+            (ids.machine_id, ids.machine_uid)
+        }
+    };
+    let id = id.filter(|n| !n.is_empty())?;
+    Some((id, uid.filter(|u| !u.is_empty())))
+}
+
+/// The pure half of [`roster_doctor_checks`]: roster + knowledge in, rows out.
+fn roster_checks(
+    roster: &fleet::FleetRoster,
+    known: &crate::doctor::FleetIdentityKnowledge,
+) -> Vec<crate::doctor::Check> {
+    let views: Vec<crate::doctor::RosterEntryView> = roster
+        .machines
+        .values()
+        .map(|m| crate::doctor::RosterEntryView {
+            id: m.id.clone(),
+            machine_uid: m.machine_uid.clone(),
+            address: m.address.clone(),
+            address_is_loopback: fleet::address_host_is_loopback(&m.address),
+        })
+        .collect();
+    vec![
+        crate::doctor::check_roster_addresses(&views),
+        crate::doctor::check_roster_identity(&views, known),
+    ]
+}
+
+/// Build [`crate::doctor::FleetIdentityKnowledge`] from local flow history,
+/// presence beats `(uid, display_name)`, and this machine's own `(uid,
+/// machine_id)`. Later sources override earlier ones for a uid's CURRENT
+/// name; every name ever seen stays traceable to its uid.
+///
+/// Flow files are read in name (date) order so the last name a uid wrote is
+/// its current one by history. Each line is deserialized into just the two
+/// identity fields rather than a full record.
+fn gather_identity_knowledge(
+    flows_dir: Option<&std::path::Path>,
+    beats: &[(String, String)],
+    local: Option<(&str, &str)>,
+) -> crate::doctor::FleetIdentityKnowledge {
+    use std::io::BufRead;
+    let mut known = crate::doctor::FleetIdentityKnowledge::default();
+    let mut files: Vec<std::path::PathBuf> = flows_dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    for path in files {
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            let Some((name, uid)) = record_identity(&line) else { continue };
+            match uid {
+                Some(uid) => {
+                    known.uid_by_name.insert(name.clone(), uid.clone());
+                    known.current_name_by_uid.insert(uid, name);
+                }
+                None => {
+                    known.uidless_names.insert(name);
+                }
+            }
+        }
+    }
+    let overlays = beats
+        .iter()
+        .map(|(u, n)| (u.as_str(), n.as_str()))
+        .chain(local);
+    for (uid, name) in overlays {
+        known.uid_by_name.insert(name.to_string(), uid.to_string());
+        known.current_name_by_uid.insert(uid.to_string(), name.to_string());
+    }
+    known
 }
 
 pub(crate) fn cmd_machine_remove(id: &str) -> Result<i32> {
@@ -646,191 +717,225 @@ mod tests {
         );
     }
 
-    // ── self-entry port mismatch (#2782 C4) ─────────────────────────────
-
-    #[test]
-    fn roster_address_port_reads_the_written_port_or_the_default() {
-        let d = crate::serve::DEFAULT_DAEMON_PORT;
-        assert_eq!(roster_address_port("127.0.0.1:8799"), 8799);
-        assert_eq!(roster_address_port("127.0.0.1"), d, "portless → default");
-        assert_eq!(roster_address_port("http://127.0.0.1:8799/"), 8799);
-        // A bare v6 literal is PORTLESS — it must not split at its own last
-        // colon and report port 1, which is what a naive rsplit does.
-        assert_eq!(roster_address_port("::1"), d);
-        assert_eq!(roster_address_port("[::1]"), d);
-        assert_eq!(roster_address_port("[::1]:8799"), 8799);
-        // Unreadable tail → portless, never an error (this feeds a warning).
-        assert_eq!(roster_address_port("localhost:not-a-port"), d);
-        assert_eq!(roster_address_port("studio.tailnet-example.ts.net"), d);
-    }
-
-    #[test]
-    fn roster_address_host_reads_the_host_or_the_string_as_typed() {
-        assert_eq!(roster_address_host("127.0.0.1:8799"), "127.0.0.1");
-        assert_eq!(roster_address_host("127.0.0.1"), "127.0.0.1");
-        assert_eq!(roster_address_host("http://127.0.0.1:8799/"), "127.0.0.1");
-        // A bare v6 literal is a HOST, not `host:port` — the same ordering
-        // `roster_address_port` relies on, from the other side.
-        assert_eq!(roster_address_host("::1"), "::1");
-        assert_eq!(roster_address_host("[::1]"), "::1");
-        assert_eq!(roster_address_host("[::1]:8799"), "::1");
-        assert_eq!(
-            roster_address_host("studio.tailnet-example.ts.net"),
-            "studio.tailnet-example.ts.net"
-        );
-        // Unreadable tail → the whole string is the host, never an error.
-        assert_eq!(
-            roster_address_host("localhost:not-a-port"),
-            "localhost:not-a-port"
-        );
-    }
-
-    #[test]
-    fn self_entry_port_warning_fires_only_on_a_self_entry_that_disagrees() {
-        // The failure #2782 C10 documented: self entry at the built-in
-        // default while this daemon listens elsewhere.
-        let w = self_entry_port_warning(true, "127.0.0.1:8765", "127.0.0.1", 8799)
-            .expect("a self entry naming a dead port must warn");
-        assert!(w.contains("8765") && w.contains("8799"), "names BOTH ports: {w}");
-        assert!(w.contains("serve address"), "points at the resolved value: {w}");
-        // A portless self entry inherits the roster default, so it is the
-        // same mismatch — the carve-out is exactly what makes it one.
-        assert!(self_entry_port_warning(true, "127.0.0.1", "127.0.0.1", 8799).is_some());
-        // Agreement is silent.
-        assert_eq!(
-            self_entry_port_warning(true, "127.0.0.1:8799", "127.0.0.1", 8799),
-            None
-        );
-        assert_eq!(
-            self_entry_port_warning(true, "127.0.0.1", "127.0.0.1", 8765),
-            None
-        );
-        // A PEER is never warned about, however its port compares to ours:
-        // that is the roster carve-out, and warning here would contradict it.
-        assert_eq!(
-            self_entry_port_warning(false, "192.0.2.10:8765", "127.0.0.1", 8799),
-            None
-        );
-        assert_eq!(
-            self_entry_port_warning(
-                false,
-                "studio.tailnet-example.ts.net",
-                "127.0.0.1",
-                8799
-            ),
-            None
-        );
-    }
-
-    /// (#2782 C2) The comparison and the suggestion are ADDRESS-shaped, not
-    /// port-shaped. `serve.bind = ::1` only became bindable in this same
-    /// delta, and a v4 entry does not reach a v6-only daemon — measured:
-    /// `curl http://[::1]:8822/health` answers, `curl
-    /// http://127.0.0.1:8822/health` does not.
-    #[test]
-    fn self_entry_warning_is_address_aware_not_port_only() {
-        // Right port, wrong family → previously silent, and dead.
-        let w = self_entry_port_warning(true, "127.0.0.1:8822", "::1", 8822)
-            .expect("a v4 self entry against a v6-only bind must warn");
-        assert!(w.contains("[::1]:8822"), "suggests the bracketed v6: {w}");
-        assert!(
-            !w.contains("--address 127.0.0.1:8822"),
-            "must not suggest the dead v4 address: {w}"
-        );
-        // …and the converse: the entry that DOES reach a `::1` daemon is
-        // silent, which is what makes the warning above actionable.
-        assert_eq!(
-            self_entry_port_warning(true, "[::1]:8822", "::1", 8822),
-            None
-        );
-        assert_eq!(self_entry_port_warning(true, "::1", "::1", 8765), None);
-        // A wildcard bind answers on every interface, so ANY loopback host
-        // reaches it — only the port can disagree there.
-        assert_eq!(
-            self_entry_port_warning(true, "127.0.0.1:8822", "0.0.0.0", 8822),
-            None
-        );
-        assert_eq!(
-            self_entry_port_warning(true, "[::1]:8822", "0.0.0.0", 8822),
-            None
-        );
-        assert!(self_entry_port_warning(true, "127.0.0.1:8765", "0.0.0.0", 8822).is_some());
-        // A wildcard is a bind directive, never a destination: the
-        // suggestion dials loopback, matching `serve_client_addr`.
-        let w = self_entry_port_warning(true, "127.0.0.1:8765", "0.0.0.0", 8822)
-            .expect("port mismatch under a wildcard bind still warns");
-        assert!(w.contains("--address 127.0.0.1:8822"), "{w}");
-        assert!(!w.contains("0.0.0.0"), "never suggests dialing a wildcard: {w}");
-    }
-
-    // ── cmd_machine_add uid resolution (#2768) ──────────────────────────
+    // ── machine add: loopback refusal + self by machine_id (#2924) ──────
     //
-    // `cmd_machine_add` is the one call site that decides WHETHER to
-    // resolve `darkmux_hardware::machine_uid()` at all — `add_machine`
-    // itself just stores whatever it's handed. These tests exercise that
-    // decision through the real CLI entry point, not `fleet::add_machine`
-    // directly (already covered in `darkmux-fleet`'s own test suite).
+    // `cmd_machine_add` is the one writer of operator roster entries, so the
+    // guards are exercised through it, not only through the pure helper.
+
+    /// Pin the roster file and the machine_id for one test; returns the
+    /// TempDir guard. Env-mutating, so every caller is `#[serial]`.
+    fn isolated_add_env(machine_id: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("DARKMUX_FLEET_FILE", tmp.path().join("fleet.json"));
+            std::env::set_var("DARKMUX_MACHINE_ID", machine_id);
+        }
+        tmp
+    }
+
+    fn clear_add_env() {
+        unsafe {
+            std::env::remove_var("DARKMUX_FLEET_FILE");
+            std::env::remove_var("DARKMUX_MACHINE_ID");
+        }
+    }
+
+    #[test]
+    fn loopback_refusal_names_the_fix_and_the_escape_hatch() {
+        for addr in ["127.0.0.1:8765", "127.0.0.1", "[::1]:8765", "http://127.0.0.1:8765"] {
+            let msg = loopback_refusal("studio", addr, false)
+                .unwrap_or_else(|| panic!("{addr} must be refused"));
+            assert!(msg.contains("darkmux machine add studio --address <tailnet-dns-name>"), "{msg}");
+            assert!(msg.contains("--allow-loopback"), "{msg}");
+        }
+        assert_eq!(loopback_refusal("studio", "127.0.0.1:8765", true), None);
+        assert_eq!(loopback_refusal("studio", "studio.tailnet.example", false), None);
+        assert_eq!(loopback_refusal("studio", "100.64.0.2:8765", false), None);
+    }
+
+    /// The Studio's defect, through the real verb: the documented
+    /// self-registration command no longer writes a loopback entry.
+    #[serial_test::serial]
+    #[test]
+    fn cmd_machine_add_refuses_a_loopback_address_and_writes_nothing() {
+        let _tmp = isolated_add_env("studio");
+        let code = cmd_machine_add("studio", "127.0.0.1:8765", None, false).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        clear_add_env();
+        assert_eq!(code, 2, "a refused add exits 2");
+        assert!(roster.machines.is_empty(), "nothing may be written: {:?}", roster.machines.keys());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn cmd_machine_add_writes_loopback_when_explicitly_allowed() {
+        let _tmp = isolated_add_env("viewer");
+        let code = cmd_machine_add("peer-a", "127.0.0.1:18765", None, true).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        clear_add_env();
+        assert_eq!(code, 0);
+        let entry = roster.machines.get("peer-a").unwrap();
+        assert_eq!(entry.address, "127.0.0.1:18765");
+        // Loopback no longer means "self": a same-host peer under another
+        // name must not be stamped with this host's identity.
+        assert_eq!(entry.machine_uid, None);
+    }
 
     #[serial_test::serial]
     #[test]
     fn cmd_machine_add_remote_address_never_resolves_a_uid() {
-        // (#2768 "decide and document") The non-loopback shape every
-        // ordinary peer registration uses. Deterministic regardless of
-        // platform: `cmd_machine_add` never calls `machine_uid()` at all
-        // on this branch, so there is nothing for the host's own hardware
-        // to affect.
-        let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("fleet.json");
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
-        cmd_machine_add("peer1", "100.64.0.2:8765", None).unwrap();
+        // A peer, named by something other than this machine's machine_id.
+        let _tmp = isolated_add_env("laptop");
+        cmd_machine_add("peer1", "100.64.0.2:8765", None, false).unwrap();
         let roster = fleet::load_roster().unwrap();
+        clear_add_env();
         assert_eq!(roster.machines.get("peer1").unwrap().machine_uid, None);
-        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+    }
+
+    /// (#2924) Self is recognized by NAME — the entry's id equals this
+    /// machine's machine_id — at a peer-usable address. Asserted against
+    /// `darkmux_hardware::machine_uid()`'s own live answer (None off macOS is
+    /// correct there too); on macOS it must actually resolve, so the equality
+    /// cannot pass vacuously on None == None.
+    #[serial_test::serial]
+    #[test]
+    fn cmd_machine_add_self_entry_is_recognized_by_machine_id_and_records_the_uid() {
+        let _tmp = isolated_add_env("studio");
+        cmd_machine_add("studio", "studio.tailnet.example", None, false).unwrap();
+        let roster = fleet::load_roster().unwrap();
+        clear_add_env();
+        let uid = roster.machines.get("studio").unwrap().machine_uid.clone();
+        assert_eq!(uid.as_deref(), darkmux_hardware::machine_uid());
+        #[cfg(target_os = "macos")]
+        assert!(uid.is_some(), "a self entry on macOS must carry this host's uid");
     }
 
     #[serial_test::serial]
     #[test]
-    fn cmd_machine_add_loopback_address_resolves_this_hosts_uid() {
-        // (#2768) The documented self-registration recipe. Asserted
-        // against `darkmux_hardware::machine_uid()`'s OWN live answer for
-        // this host, never a hardcoded `Some(...)` — `None` off macOS (or
-        // wherever `ioreg` is unavailable) is the correct outcome there
-        // too, and hardcoding `Some` would make this test platform-
-        // dependent instead of testing that `cmd_machine_add` reaches the
-        // exact same resolver.
-        let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("fleet.json");
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
-        cmd_machine_add("self", "127.0.0.1:8765", None).unwrap();
+    fn cmd_machine_add_re_add_of_the_self_entry_keeps_its_uid() {
+        let _tmp = isolated_add_env("studio");
+        cmd_machine_add("studio", "studio.tailnet.example", None, false).unwrap();
+        cmd_machine_add("studio", "studio.tailnet.example", Some("updated"), false).unwrap();
         let roster = fleet::load_roster().unwrap();
-        let entry_uid = roster.machines.get("self").unwrap().machine_uid.clone();
-        assert_eq!(entry_uid.as_deref(), darkmux_hardware::machine_uid());
-        unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn cmd_machine_add_re_add_over_loopback_does_not_erase_a_resolved_uid() {
-        // Idempotency, #2768-specific: re-running the documented
-        // self-registration command (e.g. to update a description) must
-        // not toggle the resolved identity on and off — `add_machine`'s
-        // `Some` always wins here (loopback re-resolves fresh every time),
-        // so a legitimately-resolved uid never regresses to `None` on this
-        // path. (The OTHER preservation direction — a `None` from a
-        // remote-address call never erasing a prior resolution — is
-        // covered at the `add_machine` level in `darkmux-fleet`'s own
-        // suite; this test is the loopback side, through the real CLI
-        // entry point.)
-        let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("fleet.json");
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &file) };
-        cmd_machine_add("self", "127.0.0.1:8765", None).unwrap();
-        cmd_machine_add("self", "127.0.0.1:8765", Some("updated")).unwrap();
-        let roster = fleet::load_roster().unwrap();
-        let entry = roster.machines.get("self").unwrap();
+        clear_add_env();
+        let entry = roster.machines.get("studio").unwrap();
         assert_eq!(entry.machine_uid.as_deref(), darkmux_hardware::machine_uid());
         assert_eq!(entry.description.as_deref(), Some("updated"));
+    }
+
+    // ── doctor roster rows (#2924) ──────────────────────────────────────
+
+    fn write_flow(dir: &std::path::Path, file: &str, lines: &[&str]) {
+        std::fs::write(dir.join(file), lines.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn gather_identity_knowledge_takes_each_uids_latest_name_and_keeps_old_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_flow(tmp.path(), "2026-06-01.jsonl", &[
+            r#"{"ts":"2026-06-01T00:00:00Z","machine_id":"laptop","machine_uid":"UID-A"}"#,
+            r#"{"ts":"2026-06-01T00:00:01Z","machine_id":"old-box"}"#,
+            "not json at all",
+        ]);
+        write_flow(tmp.path(), "2026-09-01.jsonl", &[
+            r#"{"ts":"2026-09-01T00:00:00Z","machine_id":"MacBook-Pro","machine_uid":"UID-A"}"#,
+        ]);
+        std::fs::write(tmp.path().join("notes.txt"), r#"{"machine_id":"ignored","machine_uid":"UID-Z"}"#).unwrap();
+        let k = gather_identity_knowledge(Some(tmp.path()), &[], None);
+        assert_eq!(k.current_name_by_uid.get("UID-A").map(String::as_str), Some("MacBook-Pro"));
+        assert_eq!(k.uid_by_name.get("laptop").map(String::as_str), Some("UID-A"));
+        assert!(k.uidless_names.contains("old-box"));
+        assert!(!k.current_name_by_uid.contains_key("UID-Z"), "only .jsonl flow files are read");
+    }
+
+    /// Presence outranks history, and this machine's own resolution
+    /// outranks presence, for what a uid goes by NOW.
+    #[test]
+    fn gather_identity_knowledge_lets_presence_and_self_override_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_flow(tmp.path(), "2026-09-01.jsonl", &[
+            r#"{"machine_id":"laptop","machine_uid":"UID-A"}"#,
+            r#"{"machine_id":"studio-old","machine_uid":"UID-B"}"#,
+        ]);
+        let beats = vec![("UID-A".to_string(), "MacBook-Pro".to_string())];
+        let k = gather_identity_knowledge(Some(tmp.path()), &beats, Some(("UID-B", "studio")));
+        assert_eq!(k.current_name_by_uid.get("UID-A").map(String::as_str), Some("MacBook-Pro"));
+        assert_eq!(k.current_name_by_uid.get("UID-B").map(String::as_str), Some("studio"));
+        assert_eq!(k.uid_by_name.get("MacBook-Pro").map(String::as_str), Some("UID-A"));
+    }
+
+    /// The live fleet from #2924, end to end through the row builder: the
+    /// Studio's self entry at loopback, and the laptop rostered under a name
+    /// it no longer goes by.
+    #[test]
+    fn roster_checks_report_the_studio_loopback_and_the_laptop_rename() {
+        let mut roster = fleet::FleetRoster::default();
+        fleet::add_machine(&mut roster, "studio", "127.0.0.1:8765", None, Some("UID-B")).unwrap();
+        fleet::add_machine(&mut roster, "laptop", "laptop.tailnet.example", None, None).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_flow(tmp.path(), "2026-06-10.jsonl", &[r#"{"machine_id":"laptop","machine_uid":"UID-A"}"#]);
+        let beats = vec![("UID-A".to_string(), "MacBook-Pro".to_string())];
+        let known = gather_identity_knowledge(Some(tmp.path()), &beats, Some(("UID-B", "studio")));
+        let checks = roster_checks(&roster, &known);
+        let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
+        let addr = by_name("roster addresses");
+        assert_eq!(addr.status, crate::doctor::Status::Warn, "{}", addr.message);
+        assert!(addr.message.contains("`studio` at 127.0.0.1:8765"), "{}", addr.message);
+        let ident = by_name("roster identity");
+        assert_eq!(ident.status, crate::doctor::Status::Warn, "{}", ident.message);
+        assert!(ident.message.contains("`laptop` is the machine whose machine_id is now `MacBook-Pro`"), "{}", ident.message);
+        assert!(!ident.message.contains("`studio`"), "the studio entry is correctly named: {}", ident.message);
+    }
+
+    #[test]
+    fn record_identity_reads_top_level_fields_and_falls_back_on_anything_else() {
+        let id = |l: &str| record_identity(l);
+        assert_eq!(
+            id(r#"{"ts":"t","machine_id":"studio","machine_uid":"U1","data":{"x":1}}"#),
+            Some(("studio".into(), Some("U1".into())))
+        );
+        assert_eq!(id(r#"{"ts":"t","machine_id":"studio"}"#), Some(("studio".into(), None)));
+        // A machine_id inside a nested object is not the record's own: the
+        // fast path must not take it, and the real parse finds the top-level one.
+        assert_eq!(
+            id(r#"{"data":{"machine_id":"nested","machine_uid":"UN"},"machine_id":"top","machine_uid":"UT"}"#),
+            Some(("top".into(), Some("UT".into())))
+        );
+        assert_eq!(id(r#"{"data":{"machine_id":"nested"}}"#), None);
+        // null / escaped values go through the real parse.
+        assert_eq!(id(r#"{"machine_id":"a","machine_uid":null}"#), Some(("a".into(), None)));
+        assert_eq!(id(r#"{"machine_id":"a\"b"}"#), Some(("a\"b".into(), None)));
+        assert_eq!(id(r#"{"ts":"t"}"#), None);
+        assert_eq!(id(r#"{"machine_id":""}"#), None);
+        assert_eq!(id("not json"), None);
+    }
+
+    /// The scan is skipped only when live knowledge settles every entry.
+    #[test]
+    fn roster_needs_history_only_for_entries_live_knowledge_cannot_settle() {
+        let live = gather_identity_knowledge(None, &[("UID-A".into(), "MacBook-Pro".into())], Some(("UID-B", "studio")));
+        let mut healthy = fleet::FleetRoster::default();
+        fleet::add_machine(&mut healthy, "studio", "studio.tailnet.example", None, Some("UID-B")).unwrap();
+        fleet::add_machine(&mut healthy, "MacBook-Pro", "mbp.tailnet.example", None, None).unwrap();
+        assert!(!roster_needs_history(&healthy, &live));
+
+        let mut stale = healthy.clone();
+        fleet::add_machine(&mut stale, "laptop", "laptop.tailnet.example", None, None).unwrap();
+        assert!(roster_needs_history(&stale, &live), "a uid-less non-current name needs history");
+
+        let mut offline = healthy.clone();
+        fleet::add_machine(&mut offline, "mini-1", "mini.tailnet.example", None, Some("UID-C")).unwrap();
+        assert!(roster_needs_history(&offline, &live), "a uid nobody live answers to needs history");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn roster_doctor_checks_are_silent_without_a_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", tmp.path().join("fleet.json")) };
+        let checks = roster_doctor_checks();
         unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") };
+        assert!(checks.is_empty(), "{:?}", checks.iter().map(|c| &c.name).collect::<Vec<_>>());
     }
 
     // ── fetch_peer_json error shapes (#1426) ────────────────────────────
@@ -920,9 +1025,8 @@ mod tests {
         // (#1849 MUST FIX 1, red-prove: loopback direction) `one_shot_http`
         // binds loopback, so the roster address IS a bare IP
         // (`127.0.0.1:<port>`) by shape — but loopback traffic never
-        // traverses `tailscale serve` (the docs' own self-registration
-        // recipe, `machine add <id> --address 127.0.0.1:8765`, is exactly
-        // this shape), so the hint must NOT fire here. This is the
+        // traverses `tailscale serve` (a same-host `--allow-loopback` entry
+        // is exactly this shape), so the hint must NOT fire here. This is the
         // opposite of what this test asserted before #1849's loopback
         // exclusion — it used to assert the hint DID fire, which was only
         // true because the guard didn't yet know loopback isn't the

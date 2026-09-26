@@ -1176,19 +1176,20 @@ pub(crate) enum MachineCmd {
     /// fields but preserves the original `added_unix_ms` so the fleet-age
     /// signal stays honest.
     ///
-    /// (#2768) When `--address` is a loopback literal (`127.0.0.1`, `::1` —
-    /// the self-registration recipe both the always-on-hub guide and the
-    /// add-machine skill give for registering the machine you're standing
-    /// at), this also resolves THIS host's stable hardware identity
-    /// (`IOPlatformUUID`) and stores it on the entry. That is what lets the
-    /// fleet viewer join this roster entry to its live flow-derived card
-    /// even after `<id>` and the machine's actual `machine_id` have drifted
-    /// apart (a rename, a hostname change). A non-loopback `--address` (the
-    /// ordinary shape for registering a peer) cannot be resolved from here —
-    /// `machine add` never makes a network call — so that entry's identity
-    /// stays unknown until it is resolved on the peer's own host.
+    /// (#2924) `<id>` must be the machine's own `machine_id` (the name its
+    /// `darkmux doctor` prints): that one name joins the roster to flow
+    /// records and presence. When `<id>` is THIS machine's machine_id, the
+    /// entry also records this host's stable hardware identity
+    /// (`IOPlatformUUID`, #2768), so the viewer can still join it after a
+    /// rename. A peer's identity cannot be resolved from here — `machine
+    /// add` never makes a network call.
+    ///
+    /// A loopback `--address` (`127.0.0.1`, `::1`) is refused: other
+    /// machines read the roster, and loopback reaches whichever machine
+    /// reads it. Register every machine, this one included, by its tailnet
+    /// DNS name.
     Add {
-        /// Logical machine id (what flow records carry as `machine_id`).
+        /// The machine's `machine_id` (what flow records and presence carry).
         /// Example: `studio`, `laptop`, `mini-1`.
         id: String,
         /// Tailnet DNS name to reach the daemon on. Example: `studio`,
@@ -1196,13 +1197,19 @@ pub(crate) enum MachineCmd {
         /// peer behind `tailscale serve` routes by Host header and will
         /// 404 a bare IP. A raw `host:port` works for a daemon bound
         /// directly to a non-loopback address. If no `:port` suffix,
-        /// port 8765 is assumed.
+        /// port 8765 is assumed. Loopback is refused (see
+        /// `--allow-loopback`).
         #[arg(long)]
         address: String,
         /// Optional one-line description for `machine list` + topology
         /// tooltips.
         #[arg(long)]
         description: Option<String>,
+        /// Accept a loopback `--address`. Only for several daemons on ONE
+        /// host (a same-host test fleet), where loopback does reach the
+        /// peer; no other machine can use such an entry.
+        #[arg(long)]
+        allow_loopback: bool,
     },
     /// Remove a machine from the fleet roster (#1426 — absorbs the retired
     /// `fleet remove`). Doesn't touch the actual remote machine — just

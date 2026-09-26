@@ -580,6 +580,12 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
         &maintainer_only,
     ));
 
+    // (#2924) Fleet-roster rows: a loopback address no peer can use, and an
+    // entry not named by its machine's machine_id. Appended here because they
+    // read the roster (darkmux-fleet), which the doctor crate does not depend
+    // on — it evaluates, this layer gathers.
+    report.checks.extend(fleet_cli::roster_doctor_checks());
+
     // (#1177) Opt-in live endpoint probes append to the same report so they
     // share the verdict/exit-code path — a failed probe exits 1 like any
     // failed check.
@@ -1632,7 +1638,8 @@ fn cmd_machine(sub: Option<MachineCmd>) -> Result<i32> {
             id,
             address,
             description,
-        }) => fleet_cli::cmd_machine_add(&id, &address, description.as_deref()),
+            allow_loopback,
+        }) => fleet_cli::cmd_machine_add(&id, &address, description.as_deref(), allow_loopback),
         Some(MachineCmd::Remove { id }) => fleet_cli::cmd_machine_remove(&id),
     }
 }

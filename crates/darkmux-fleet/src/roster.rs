@@ -33,19 +33,12 @@ const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// normalize_daemon_base`, which build peer base URLs from the same
 /// portless form.
 ///
-/// **The one case the reasoning does NOT cover, and how it is handled**
-/// (#2782 C10). `always-on-hub.html` and the `darkmux-add-machine` skill
-/// both tell the operator to register THIS machine in its own roster
-/// (`machine add <me> --address 127.0.0.1:8765`), and there the port IS
-/// this machine's — so an operator who set `serve.port` and followed the
-/// old wording got a self entry pointing at a dead port. The fix is in the
-/// DOCS, not here: both now say to type the port this daemon listens on
-/// and where to read it (`darkmux doctor`'s `serve address` row). Resolving
-/// it in code would mean this constant knowing whether an entry is "me",
-/// which the roster deliberately does not model — a roster entry is a
-/// name plus an address, and the whole carve-out above is that this file
-/// must not infer a peer's port from local config. Keeping the rule
-/// uniform and making the docs explicit is the smaller surface.
+/// (#2782 C10, superseded by #2924) The one case this reasoning used not to
+/// cover was a loopback SELF entry (`machine add <me> --address
+/// 127.0.0.1:8765`, the old documented recipe), where the port was this
+/// machine's. #2924 retired that recipe: `machine add` refuses a loopback
+/// address, and every entry, this machine's own included, names a
+/// tailnet-reachable address — so the rule above now holds uniformly.
 pub(crate) const DEFAULT_DAEMON_PORT: u16 = 8765;
 
 /// Hard cap on DNS resolution time inside `parse_address` (Wave-E.10
@@ -347,12 +340,12 @@ fn fsync_dir(dir: &std::path::Path) -> Result<()> {
 ///
 /// `uid` (#2768) — the machine's stable hardware identity, when the CALLER
 /// was able to resolve one. There is exactly one case that can:
-/// self-registration, where `cmd_machine_add` recognizes the address as
-/// loopback (`address_host_is_loopback`) and reads
-/// `darkmux_hardware::machine_uid()` on the SAME host this process is
-/// running on. A remote peer's hardware cannot be probed from here —
-/// `machine add` performs no network call — so that caller always passes
-/// `None`.
+/// self-registration, where `cmd_machine_add` sees the entry's id equal this
+/// machine's resolved machine_id (#2924; it used to key on a loopback
+/// address) and reads `darkmux_hardware::machine_uid()` on the SAME host
+/// this process is running on. A remote peer's hardware cannot be probed
+/// from here — `machine add` performs no network call — so that caller
+/// always passes `None`.
 ///
 /// The merge rule mirrors `added_unix_ms`'s "don't clobber what a plain
 /// re-add didn't recompute": a `Some` always WINS (self-registration
@@ -451,12 +444,11 @@ pub fn probe_reachability(address: &str) -> ReachabilityResult {
 /// context without resolving anything or touching the network itself.
 ///
 /// Loopback (`127.0.0.1`, `::1`, …) is excluded on purpose: loopback
-/// traffic never traverses `tailscale serve` — a machine self-registering
-/// its own daemon (`machine add <id> --address 127.0.0.1:8765`, the
-/// recipe both `docs/guide/always-on-hub.html` and
-/// `skills/darkmux-add-machine/SKILL.md` give for Step 6) hits the local
-/// daemon directly, so a 404 there is never that failure mode and the
-/// hint would be actively wrong.
+/// traffic never traverses `tailscale serve` — an entry at a loopback
+/// address (a same-host test fleet's `--allow-loopback` entry, or an old
+/// self entry from before #2924 retired that recipe) hits a local daemon
+/// directly, so a 404 there is never that failure mode and the hint would
+/// be actively wrong.
 pub fn address_host_is_bare_ip(address: &str) -> bool {
     let trimmed = address.trim();
     let without_scheme = trimmed
@@ -494,27 +486,28 @@ pub fn address_host_is_bare_ip(address: &str) -> bool {
     }
 }
 
-/// True when `address`'s host portion is a loopback literal
-/// (`127.0.0.0/8`, `::1`), with or without an explicit `:port` suffix or a
-/// `scheme://` prefix. (#2768) This is the shape `machine add <id>
-/// --address 127.0.0.1:8765` uses for SELF-registration — the always-on-hub
-/// guide's Step 6 and the `darkmux-add-machine` skill's Step 7 both give
-/// this exact recipe for registering the machine the operator is standing
-/// at, because loopback is the one address guaranteed to reach this host's
-/// own daemon regardless of its tailnet/DNS setup (the same fact
-/// `address_host_is_bare_ip`'s doc names from the other side). `machine
-/// add` uses this predicate to decide whether it may resolve
-/// `darkmux_hardware::machine_uid()` for the new entry — see that
-/// function's own doc and `add_machine`'s `uid` parameter.
+/// True when `address` reaches only the machine that reads it: its host is
+/// a loopback literal (`127.0.0.0/8`, `::1`) or a `localhost` name, with or
+/// without an explicit `:port` suffix or a `scheme://` prefix.
 ///
-/// A DNS name — including `localhost`, deliberately NOT special-cased, since
-/// the documented recipe is the literal IP, not the name that happens to
-/// resolve to it — answers `false`, same as any real peer address. Sibling
-/// implementation to `address_host_is_bare_ip` (this file already carries
-/// one other near-duplicate host-parse, `parse_address`'s own as-is/DNS
-/// branches, for the same reason: each predicate answers a different
-/// question about the same string and a shared parser would have to thread
-/// both answers back out through one signature).
+/// (#2924) This is the question the roster needs answered, because a roster
+/// entry is read by OTHER machines (the daemon serves the roster to every
+/// viewer on the tailnet, and #2916 routes work to it). Such an address in a
+/// roster names whichever machine reads it, never the one the entry
+/// describes. `machine add` refuses one (short of `--allow-loopback` for a
+/// same-host test fleet) and `darkmux doctor`'s `roster addresses` row flags
+/// one already written.
+///
+/// History: #2768 used this predicate to decide SELF-registration (the docs
+/// then said `machine add <me> --address 127.0.0.1:8765`), and excluded
+/// `localhost` because the recipe named the literal IP. #2924 moved "is this
+/// entry me?" to the entry's id matching this machine's machine_id, so the
+/// predicate is free to answer the reachability question fully.
+///
+/// Sibling implementation to `address_host_is_bare_ip` (this file already
+/// carries one other near-duplicate host-parse, `parse_address`'s own
+/// as-is/DNS branches, for the same reason: each predicate answers a
+/// different question about the same string).
 pub fn address_host_is_loopback(address: &str) -> bool {
     let trimmed = address.trim();
     let without_scheme = trimmed
@@ -530,6 +523,10 @@ pub fn address_host_is_loopback(address: &str) -> bool {
     if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
         return ip.is_loopback();
     }
+    let host_is_local = |host: &str| {
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        host == "localhost" || host.ends_with(".localhost")
+    };
     match without_scheme.rsplit_once(':') {
         Some((host, _port)) => {
             let host = host
@@ -539,9 +536,9 @@ pub fn address_host_is_loopback(address: &str) -> bool {
             let host = host.strip_suffix('.').unwrap_or(host);
             host.parse::<std::net::IpAddr>()
                 .map(|ip| ip.is_loopback())
-                .unwrap_or(false)
+                .unwrap_or_else(|_| host_is_local(host))
         }
-        None => false,
+        None => host_is_local(without_scheme),
     }
 }
 
@@ -758,11 +755,8 @@ mod address_host_is_bare_ip_tests {
     }
 
     // (#1849 MUST FIX 1, red-prove both directions) Loopback is a bare IP
-    // literal by shape, but it never traverses `tailscale serve` — the
-    // self-registration recipe (`machine add <id> --address
-    // 127.0.0.1:8765`) both the hub guide and the add-machine skill give
-    // is loopback, and a 404 there must never carry the tailscale-serve
-    // hint.
+    // literal by shape, but it never traverses `tailscale serve`, so a 404
+    // from a loopback entry must never carry the tailscale-serve hint.
     #[test]
     fn loopback_ipv4_is_not_a_bare_ip() {
         assert!(!address_host_is_bare_ip("127.0.0.1"));
@@ -801,8 +795,8 @@ mod address_host_is_bare_ip_tests {
 mod address_host_is_loopback_tests {
     use super::*;
 
-    // (#2768) The documented self-registration recipe, exactly as both the
-    // always-on-hub guide and the add-machine skill give it.
+    // The shape the pre-#2924 self-registration recipe wrote, which
+    // `machine add` now refuses.
     #[test]
     fn bare_loopback_v4_is_loopback() {
         assert!(address_host_is_loopback("127.0.0.1"));
@@ -828,16 +822,26 @@ mod address_host_is_loopback_tests {
         assert!(!address_host_is_loopback("fd7a:115c:a1e0::1234"));
     }
 
-    // A DNS name is never loopback by this predicate, even `localhost` —
-    // the documented recipe is the literal IP, not a name that happens to
-    // resolve to it, so `machine add <id> --address localhost:8765` does
-    // NOT get treated as self-registration.
+    // An ordinary DNS name is not loopback.
     #[test]
-    fn dns_name_including_localhost_is_not_loopback() {
+    fn a_peer_dns_name_is_not_loopback() {
         assert!(!address_host_is_loopback("studio"));
         assert!(!address_host_is_loopback("studio.tailnet.ts.net:8765"));
-        assert!(!address_host_is_loopback("localhost"));
-        assert!(!address_host_is_loopback("localhost:8765"));
+        assert!(!address_host_is_loopback("mylocalhost.example"));
+    }
+
+    // (#2924) `localhost` names the reading machine exactly like 127.0.0.1
+    // does, and this predicate now answers "does this address reach only the
+    // machine that reads it?" (`machine add` refuses such an address; doctor
+    // flags one). It used to exclude `localhost` because it also decided
+    // self-registration, which is now decided by machine_id instead.
+    #[test]
+    fn localhost_names_are_loopback() {
+        assert!(address_host_is_loopback("localhost"));
+        assert!(address_host_is_loopback("localhost:8765"));
+        assert!(address_host_is_loopback("http://LocalHost:8765/"));
+        assert!(address_host_is_loopback("localhost."));
+        assert!(address_host_is_loopback("studio.localhost:8765"));
     }
 
     #[test]

@@ -481,7 +481,7 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     let empty_cwd = TempDir::new().unwrap();
     let out = cmd
         .current_dir(empty_cwd.path())
-        .args(["machine", "add", "spawn-isolation-probe", "--address", "127.0.0.1:1"])
+        .args(["machine", "add", "spawn-isolation-probe", "--address", "127.0.0.1:1", "--allow-loopback"])
         .output()
         .expect("running `darkmux machine add`");
     assert!(
@@ -1820,60 +1820,71 @@ fn roster_with_peer(tmp: &TempDir, id: &str, addr: &str) -> std::path::PathBuf {
     let fleet_file = tmp.path().join("fleet.json");
     darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
-        .args(["machine", "add", id, "--address", addr])
+        // Loopback fixtures stand in for peers here (#2924).
+        .args(["machine", "add", id, "--address", addr, "--allow-loopback"])
         .assert()
         .success();
     fleet_file
 }
 
-/// (#2782 C3) `machine add` actually PRINTS the self-entry warning.
-///
-/// The helper behind it is covered in both directions as a pure function in
-/// `fleet_cli`'s own tests — but deleting the whole `if let Some(w) =
-/// self_entry_port_warning(…) { println!("{w}") }` block left all 20 of
-/// those green, because none of them reach the call site. Same
-/// extracted-guard-hides-call-site shape this PR fixed twice elsewhere, so
-/// this one runs the real verb and reads its real stdout.
-///
-/// Both directions, so a warning that fired unconditionally would fail here
-/// too: a self entry naming the built-in default against a configured
-/// `serve.port` of 8799 warns; the same entry naming 8799 is silent.
+/// (#2924) `machine add` refuses a loopback address end to end: argv parse,
+/// the refusal on stderr, exit 2, and an untouched roster. The documented
+/// self-registration recipe (`machine add <me> --address 127.0.0.1:8765`)
+/// is what put a loopback entry in the Studio's roster, where no peer could
+/// use it. `--allow-loopback` still writes it, for same-host test fleets.
 #[test]
-fn machine_add_prints_the_self_entry_warning_when_the_port_disagrees() {
+fn machine_add_refuses_a_loopback_address_unless_allowed() {
     let tmp = TempDir::new().unwrap();
     let fleet_file = tmp.path().join("fleet.json");
     let out = darkmux_cmd()
         .env("DARKMUX_FLEET_FILE", &fleet_file)
-        .env("DARKMUX_SERVE_PORT", "8799")
-        .args(["machine", "add", "self", "--address", "127.0.0.1:8765"])
+        .args(["machine", "add", "studio", "--address", "127.0.0.1:8765"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "refused add exits 2: {stderr}");
+    assert!(
+        stderr.contains("darkmux machine add studio --address <tailnet-dns-name>"),
+        "the refusal names the fix: {stderr}"
+    );
+    assert!(!fleet_file.exists(), "a refused add must not write the roster");
+
+    let out2 = darkmux_cmd()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .args(["machine", "add", "studio", "--address", "127.0.0.1:8765", "--allow-loopback"])
+        .output()
+        .unwrap();
+    assert!(out2.status.success(), "{}", String::from_utf8_lossy(&out2.stderr));
+    let roster = std::fs::read_to_string(&fleet_file).unwrap();
+    assert!(roster.contains("127.0.0.1:8765"), "{roster}");
+}
+
+/// (#2924) `darkmux doctor` actually appends the fleet-roster rows. The
+/// evaluators and the row builder are tested as pure functions; deleting the
+/// one `report.checks.extend(fleet_cli::roster_doctor_checks())` line in
+/// `cmd_doctor` would leave all of those green, so this runs the real verb
+/// against a roster holding the Studio's loopback self entry.
+#[test]
+fn doctor_reports_a_loopback_roster_entry() {
+    let tmp = TempDir::new().unwrap();
+    let fleet_file = tmp.path().join("fleet.json");
+    std::fs::write(
+        &fleet_file,
+        r#"{"version":"2","machines":{"studio":{"id":"studio","address":"127.0.0.1:8765","added_unix_ms":1}}}"#,
+    )
+    .unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_FLEET_FILE", &fleet_file)
+        .env_remove("DARKMUX_REDIS_URL")
+        .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
+        .env("DARKMUX_LMS_BIN", "/nonexistent/lms")
+        .args(["doctor"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(out.status.success(), "machine add must still succeed: {stdout}");
-    assert!(
-        stdout.contains("127.0.0.1:8765") && stdout.contains("127.0.0.1:8799"),
-        "the printed warning names both addresses: {stdout}"
-    );
-    assert!(
-        stdout.contains("serve address"),
-        "the printed warning points at the resolved-value row: {stdout}"
-    );
-
-    // Agreement is silent — an entry naming the configured port prints no
-    // warning at all.
-    let tmp2 = TempDir::new().unwrap();
-    let out2 = darkmux_cmd()
-        .env("DARKMUX_FLEET_FILE", tmp2.path().join("fleet.json"))
-        .env("DARKMUX_SERVE_PORT", "8799")
-        .args(["machine", "add", "self", "--address", "127.0.0.1:8799"])
-        .output()
-        .unwrap();
-    let stdout2 = String::from_utf8_lossy(&out2.stdout).to_string();
-    assert!(out2.status.success(), "{stdout2}");
-    assert!(
-        !stdout2.contains("serve address"),
-        "an agreeing self entry must print nothing: {stdout2}"
-    );
+    assert!(stdout.contains("roster addresses"), "{stdout}");
+    assert!(stdout.contains("`studio` at 127.0.0.1:8765"), "{stdout}");
+    assert!(stdout.contains("roster identity"), "{stdout}");
 }
 
 /// (#2782 C4) The brew wrapper passes NO `--bind` / `--port`.

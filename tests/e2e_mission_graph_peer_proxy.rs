@@ -100,6 +100,8 @@ fn register_peer(reader: &FleetNode, peer: &FleetNode) {
         .args([
             "machine", "add", &peer.machine_id,
             "--address", &format!("127.0.0.1:{}", peer.daemon_port),
+            // Same-host test fleet: loopback does reach the peer (#2924).
+            "--allow-loopback",
         ])
         .output()
         .expect("running `darkmux machine add`");

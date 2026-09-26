@@ -16633,92 +16633,204 @@ mod tests {
 
 }
 
-// ─── (#2796) roster identity ──────────────────────────────────────────────
+// ─── (#2796, #2924) roster identity ──────────────────────────────────────
 
-/// One roster row, reduced to what the identity check needs. A view rather
+/// One roster row, reduced to what the roster checks need. A view rather
 /// than `darkmux_fleet::MachineEntry` so this crate stays a pure evaluator
-/// with no dependency on the fleet crate.
+/// with no dependency on the fleet crate; the caller computes
+/// `address_is_loopback` with `darkmux_fleet::address_host_is_loopback`.
 #[derive(Debug, Clone)]
 pub struct RosterEntryView {
     pub id: String,
-    /// The hardware uid the entry declares, when it has one. `None` is the
-    /// whole subject of this check.
+    /// The hardware uid the entry declares, when it has one.
     pub machine_uid: Option<String>,
+    /// The address as written in the roster.
+    pub address: String,
+    /// True when `address` reaches only the machine that reads it (a
+    /// loopback literal or a `localhost` name).
+    pub address_is_loopback: bool,
 }
 
-/// What the fleet currently knows about itself, gathered by the caller from
-/// presence beats and the flow window.
+/// What this machine knows about fleet identity, gathered by the caller from
+/// its own resolution, presence beats, and local flow history.
 #[derive(Debug, Clone, Default)]
 pub struct FleetIdentityKnowledge {
-    /// Hardware uids that are beating, or that appear in the flow window.
-    pub known_uids: std::collections::BTreeSet<String>,
-    /// EVERY name any known uid has appeared under — not just its current
-    /// one. A rename is normal and the older names stay valid evidence.
-    pub known_names: std::collections::BTreeSet<String>,
+    /// Each known hardware uid -> the machine_id that machine goes by NOW:
+    /// this machine's own resolution, a live presence beat's `display_name`,
+    /// else the most recent name in flow history.
+    pub current_name_by_uid: std::collections::BTreeMap<String, String>,
+    /// EVERY name a known uid has appeared under -> that uid. Old names stay
+    /// here after a rename; that is what lets a stale roster name be traced
+    /// to the machine it used to mean.
+    pub uid_by_name: std::collections::BTreeMap<String, String>,
+    /// machine_ids seen in flow history with no uid attached (records written
+    /// before flow records carried `machine_uid`). Known names whose machine
+    /// cannot be identified further.
+    pub uidless_names: std::collections::BTreeSet<String>,
 }
 
-/// (#2796) Find roster entries that can no longer be joined to any machine
-/// the fleet knows about, and say so before they become a phantom card.
+/// How one roster entry fails to join the fleet's canonical names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RosterNameIssue {
+    /// The entry names a machine that now goes by `current`.
+    Renamed { current: String },
+    /// No machine this machine can see has ever gone by this name.
+    Unknown,
+}
+
+/// Classify one entry against the canonical-name rule (#2924): a roster
+/// entry's id must be the machine_id of the machine it describes, because
+/// that one name is what flow records, presence beats and (in 4.0)
+/// `profile@machine` addresses all join on.
+fn roster_name_issue(e: &RosterEntryView, known: &FleetIdentityKnowledge) -> Option<RosterNameIssue> {
+    // A declared uid is the strongest evidence: if that machine is known and
+    // goes by another name now, the entry is stale. An unknown uid is a peer
+    // this machine has not seen, which is not evidence against the entry.
+    if let Some(uid) = &e.machine_uid {
+        return match known.current_name_by_uid.get(uid) {
+            Some(current) if *current != e.id => Some(RosterNameIssue::Renamed { current: current.clone() }),
+            _ => None,
+        };
+    }
+    if known.current_name_by_uid.values().any(|n| *n == e.id) {
+        return None;
+    }
+    if let Some(current) = known.uid_by_name.get(&e.id).and_then(|u| known.current_name_by_uid.get(u)) {
+        return Some(RosterNameIssue::Renamed { current: current.clone() });
+    }
+    if known.uidless_names.contains(&e.id) {
+        return None;
+    }
+    Some(RosterNameIssue::Unknown)
+}
+
+/// (#2796, #2924) Find roster entries whose name is not the machine_id of
+/// the machine they describe, and say which name to use.
 ///
-/// **Why this needs surfacing rather than fixing silently.** The viewer folds
-/// a roster entry onto a real machine by three fallbacks, in order: the uid it
-/// declares, its name, then a normalized form of its name. A stale entry —
-/// a machine renamed after `machine add`, which is ordinary — survives on the
-/// SECOND fallback, because the old name is still in the flow window as an
-/// alias of the same uid. That is not durable. Flow files age out. When the
-/// last record carrying the old name rolls past retention, all three fallbacks
-/// miss and one physical machine starts rendering as two.
+/// **The canonical name is the machine's own `machine_id`** (the env var
+/// `DARKMUX_MACHINE_ID`, else `config.json`'s `machine_id`, else hostname). Flow records carry it, presence
+/// beats carry it as `display_name`, the viewer titles cards with it (#2802),
+/// and #2916's `profile@machine` addresses will name it. The roster is the
+/// one surface keyed by a string the operator typed at `machine add` time,
+/// so it is the one that drifts: the live case is a laptop rostered as
+/// `laptop` whose machine_id became `MacBook-Pro`. #2796 tolerated such an
+/// entry while the old name was still in the flow window; #2924 does not,
+/// because an alias that only joins through history cannot be the name a
+/// work address resolves.
 ///
-/// Nothing is corrupt when that happens, nothing changed, and the operator did
-/// nothing wrong — which is exactly why it needs a check. The failure arrives
-/// months after its cause, with no event to connect it to.
+/// **What is NOT flagged.** An entry that declares a uid nobody has seen (a
+/// peer switched off since it was added), and an entry whose name appears in
+/// flow history with no uid to say which machine it was. Both are names this
+/// machine has no evidence against.
 ///
-/// **What is NOT flagged.** An entry that DECLARES a uid is never flagged,
-/// even when that uid is nowhere in the window: a peer that is switched off
-/// is a machine the operator deliberately added, not a phantom. Only an entry
-/// with no uid AND no name the fleet recognises is unjoinable, and only that
-/// is reported.
+/// Surface and suggest only: the operator's roster and config are never
+/// rewritten here (#44). Both repairs are offered, because either name can be
+/// the one the operator wants.
 pub fn check_roster_identity(
     entries: &[RosterEntryView],
     known: &FleetIdentityKnowledge,
 ) -> Check {
-    let unjoinable: Vec<&RosterEntryView> = entries
-        .iter()
-        .filter(|e| e.machine_uid.is_none())
-        .filter(|e| !known.known_names.contains(&e.id))
-        .collect();
+    let mut renamed: Vec<(&RosterEntryView, String)> = Vec::new();
+    let mut unknown: Vec<&RosterEntryView> = Vec::new();
+    for e in entries {
+        match roster_name_issue(e, known) {
+            Some(RosterNameIssue::Renamed { current }) => renamed.push((e, current)),
+            Some(RosterNameIssue::Unknown) => unknown.push(e),
+            None => {}
+        }
+    }
 
-    if unjoinable.is_empty() {
+    if renamed.is_empty() && unknown.is_empty() {
         return Check {
             name: "roster identity".into(),
             status: Status::Pass,
             message: format!(
-                "{} roster entr{} resolve to a known machine",
+                "{} roster entr{} named by the machine's own machine_id",
                 entries.len(),
-                if entries.len() == 1 { "y" } else { "ies" }
+                if entries.len() == 1 { "y is" } else { "ies are" }
             ),
             hint: None,
         };
     }
 
-    let names: Vec<&str> = unjoinable.iter().map(|e| e.id.as_str()).collect();
+    let mut msg: Vec<String> = Vec::new();
+    let mut hint: Vec<String> = Vec::new();
+    for (e, current) in &renamed {
+        msg.push(format!("`{}` is the machine whose machine_id is now `{current}`", e.id));
+        let addr = if e.address_is_loopback { "<tailnet-dns-name>" } else { e.address.as_str() };
+        hint.push(format!(
+            "For `{id}`: rename the entry to the machine's own name (`darkmux machine remove {id}` \
+             then `darkmux machine add {current} --address {addr}`), or keep `{id}` by setting it on \
+             that machine (`darkmux config set machine_id {id}` there).",
+            id = e.id
+        ));
+    }
+    for e in &unknown {
+        msg.push(format!("`{}` matches no machine_id this machine can see", e.id));
+        hint.push(format!(
+            "For `{id}`: run `darkmux doctor` on the machine it means — its `machine_id` row prints \
+             the name to use — and re-add the entry under that name, or remove it with \
+             `darkmux machine remove {id}`.",
+            id = e.id
+        ));
+    }
     Check {
         name: "roster identity".into(),
         status: Status::Warn,
         message: format!(
-            "{} roster entr{} declare no hardware uid and match no name this fleet \
-             knows — {}. Each will render as a machine of its own.",
-            unjoinable.len(),
-            if unjoinable.len() == 1 { "y" } else { "ies" },
-            names.join(", ")
+            "{} of {} roster entr{} not named by the machine's machine_id: {}. Roster, presence \
+             and flow records join on that one name.",
+            renamed.len() + unknown.len(),
+            entries.len(),
+            if entries.len() == 1 { "y is" } else { "ies are" },
+            msg.join("; ")
+        ),
+        hint: Some(hint.join(" ")),
+    }
+}
+
+/// (#2924) Flag roster entries whose address is a loopback literal.
+///
+/// A roster entry is read by other machines: the daemon serves the roster at
+/// `GET /fleet/roster` to every viewer on the tailnet, and #2916 routes work
+/// to it. `127.0.0.1` there means "whichever machine is reading", which is
+/// never the machine the entry describes. The documented self-registration
+/// recipe used to write exactly this (`machine add <me> --address
+/// 127.0.0.1:8765`), and the Studio's roster still carries it. `machine add`
+/// now refuses it; this check finds the ones already written.
+pub fn check_roster_addresses(entries: &[RosterEntryView]) -> Check {
+    let loopback: Vec<&RosterEntryView> = entries.iter().filter(|e| e.address_is_loopback).collect();
+    if loopback.is_empty() {
+        return Check {
+            name: "roster addresses".into(),
+            status: Status::Pass,
+            message: format!(
+                "{} roster entr{} a non-loopback address",
+                entries.len(),
+                if entries.len() == 1 { "y has" } else { "ies have" }
+            ),
+            hint: None,
+        };
+    }
+    let named: Vec<String> = loopback.iter().map(|e| format!("`{}` at {}", e.id, e.address)).collect();
+    let fixes: Vec<String> = loopback
+        .iter()
+        .map(|e| format!("`darkmux machine add {} --address <tailnet-dns-name>`", e.id))
+        .collect();
+    Check {
+        name: "roster addresses".into(),
+        status: Status::Warn,
+        message: format!(
+            "{} roster entr{} a loopback address: {}. A loopback address reaches whichever machine \
+             reads it, never the machine the entry describes, so no peer can use it.",
+            loopback.len(),
+            if loopback.len() == 1 { "y has" } else { "ies have" },
+            named.join(", ")
         ),
         hint: Some(format!(
-            "This is what a rename leaves behind: `machine add {first}` recorded a \
-             name but no uid, the machine was later renamed, and the old name has now \
-             aged out of the flow window that was joining them. Remove the stale entry \
-             with `darkmux machine remove {first}`, or re-add the machine so its uid is \
-             recorded and the name stops mattering.",
-            first = names[0]
+            "Re-add each with the machine's tailnet DNS name (re-adding keeps the entry's added time): {}. \
+             `tailscale status` on that machine prints its DNS name.",
+            fixes.join(", ")
         )),
     }
 }
@@ -16727,75 +16839,131 @@ pub fn check_roster_identity(
 mod roster_identity_tests {
     use super::*;
 
-    fn known(uids: &[&str], names: &[&str]) -> FleetIdentityKnowledge {
+    fn known(current: &[(&str, &str)], aliases: &[(&str, &str)], uidless: &[&str]) -> FleetIdentityKnowledge {
         FleetIdentityKnowledge {
-            known_uids: uids.iter().map(|s| s.to_string()).collect(),
-            known_names: names.iter().map(|s| s.to_string()).collect(),
+            current_name_by_uid: current.iter().map(|(u, n)| (u.to_string(), n.to_string())).collect(),
+            uid_by_name: aliases.iter().map(|(n, u)| (n.to_string(), u.to_string())).collect(),
+            uidless_names: uidless.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     fn entry(id: &str, uid: Option<&str>) -> RosterEntryView {
-        RosterEntryView { id: id.into(), machine_uid: uid.map(str::to_string) }
+        RosterEntryView {
+            id: id.into(),
+            machine_uid: uid.map(str::to_string),
+            address: format!("{id}.tailnet.example:8765"),
+            address_is_loopback: false,
+        }
     }
 
-    /// The live shape this check was written for: one machine renamed
-    /// `laptop` -> `MacBook-Pro`, the old self-entry still in the roster, and
-    /// the flow window no longer carrying the old name.
+    /// The live shape: the laptop's own entry declares its uid but carries
+    /// the old name, while the machine now resolves as `MacBook-Pro`.
     #[test]
-    fn a_renamed_machines_stale_entry_is_reported_once_its_old_name_ages_out() {
+    fn an_entry_whose_uid_now_goes_by_another_name_is_reported_with_both_repairs() {
         let check = check_roster_identity(
-            &[entry("laptop", None), entry("MacBook-Pro", Some("UID-A"))],
-            &known(&["UID-A"], &["MacBook-Pro"]),
+            &[entry("laptop", Some("UID-A"))],
+            &known(&[("UID-A", "MacBook-Pro")], &[], &[]),
         );
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.message.contains("laptop"), "{}", check.message);
-        assert!(
-            check.hint.as_deref().is_some_and(|h| h.contains("machine remove laptop")),
-            "the hint must name the exact command: {:?}",
-            check.hint
-        );
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("`laptop`") && check.message.contains("`MacBook-Pro`"), "{}", check.message);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("darkmux machine remove laptop"), "{hint}");
+        assert!(hint.contains("darkmux machine add MacBook-Pro --address laptop.tailnet.example:8765"), "{hint}");
+        assert!(hint.contains("darkmux config set machine_id laptop"), "{hint}");
     }
 
-    /// While the old name is still in the window the viewer folds the entry
-    /// correctly, so there is nothing to report yet. This is the state the
-    /// live fleet is in today — and the reason the defect is invisible until
-    /// retention rolls past the rename.
+    /// Superseded rule. #2796 kept this entry silent while `laptop` was still
+    /// in the flow window as an alias of the live uid. Under #2924 an alias
+    /// is not the name: the entry is traced through history to the machine it
+    /// means, and reported under that machine's current name.
     #[test]
-    fn the_same_entry_is_silent_while_its_old_name_is_still_in_the_window() {
+    fn a_uidless_entry_named_by_an_old_alias_is_traced_and_reported() {
         let check = check_roster_identity(
-            &[entry("laptop", None), entry("MacBook-Pro", Some("UID-A"))],
-            &known(&["UID-A"], &["MacBook-Pro", "laptop"]),
+            &[entry("laptop", None)],
+            &known(&[("UID-A", "MacBook-Pro")], &[("laptop", "UID-A"), ("MacBook-Pro", "UID-A")], &[]),
+        );
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("machine_id is now `MacBook-Pro`"), "{}", check.message);
+    }
+
+    #[test]
+    fn an_entry_matching_no_known_machine_id_is_reported() {
+        let check = check_roster_identity(
+            &[entry("ghost", None)],
+            &known(&[("UID-A", "MacBook-Pro")], &[("MacBook-Pro", "UID-A")], &[]),
+        );
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("`ghost` matches no machine_id"), "{}", check.message);
+        assert!(check.hint.unwrap().contains("darkmux machine remove ghost"));
+    }
+
+    /// A renamed entry whose address is loopback must not be told to re-add
+    /// at loopback — `machine add` refuses that.
+    #[test]
+    fn the_rename_repair_never_suggests_a_loopback_address() {
+        let mut e = entry("laptop", Some("UID-A"));
+        e.address = "127.0.0.1:8765".into();
+        e.address_is_loopback = true;
+        let check = check_roster_identity(&[e], &known(&[("UID-A", "MacBook-Pro")], &[], &[]));
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("--address <tailnet-dns-name>"), "{hint}");
+        assert!(!hint.contains("127.0.0.1"), "{hint}");
+    }
+
+    #[test]
+    fn an_entry_named_by_its_machines_current_machine_id_passes() {
+        let check = check_roster_identity(
+            &[entry("MacBook-Pro", None), entry("studio", Some("UID-B"))],
+            &known(&[("UID-A", "MacBook-Pro"), ("UID-B", "studio")], &[], &[]),
         );
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
     /// THE FALSE POSITIVE THIS MUST NOT HAVE. A peer the operator added on
-    /// purpose, switched off, with a uid recorded: not a phantom, and warning
-    /// about it would teach the operator to ignore this check.
+    /// purpose, switched off, with a uid recorded: no evidence against it.
     #[test]
     fn a_declared_peer_that_is_merely_offline_is_never_reported() {
         let check = check_roster_identity(
             &[entry("studio", Some("UID-B"))],
-            &known(&["UID-A"], &["MacBook-Pro"]),
+            &known(&[("UID-A", "MacBook-Pro")], &[], &[]),
         );
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
-    /// An entry whose NAME still matches is joinable even with no uid — the
-    /// viewer's second fallback — so it is not reported either.
+    /// A name seen only in records older than `machine_uid` is a machine_id
+    /// that existed; nothing says which machine it was, so nothing is claimed.
     #[test]
-    fn an_entry_whose_name_still_matches_is_not_reported() {
-        let check = check_roster_identity(
-            &[entry("MacBook-Pro", None)],
-            &known(&["UID-A"], &["MacBook-Pro"]),
-        );
+    fn a_name_known_only_from_uidless_history_is_not_reported() {
+        let check = check_roster_identity(&[entry("mini-1", None)], &known(&[], &[], &["mini-1"]));
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
     #[test]
     fn an_empty_roster_passes_without_claiming_anything() {
-        let check = check_roster_identity(&[], &known(&[], &[]));
+        let check = check_roster_identity(&[], &known(&[], &[], &[]));
         assert_eq!(check.status, Status::Pass);
+    }
+
+    // ── roster addresses (#2924) ──
+
+    #[test]
+    fn a_loopback_roster_address_is_reported_with_the_re_add_command() {
+        let mut e = entry("studio", None);
+        e.address = "127.0.0.1:8765".into();
+        e.address_is_loopback = true;
+        let check = check_roster_addresses(&[e, entry("laptop", None)]);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("`studio`") && check.message.contains("127.0.0.1:8765"), "{}", check.message);
+        assert!(!check.message.contains("`laptop`"), "{}", check.message);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("darkmux machine add studio --address <tailnet-dns-name>"), "{hint}");
+    }
+
+    #[test]
+    fn non_loopback_roster_addresses_pass() {
+        let check = check_roster_addresses(&[entry("studio", None), entry("laptop", None)]);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("2 roster"), "{}", check.message);
     }
 }
 

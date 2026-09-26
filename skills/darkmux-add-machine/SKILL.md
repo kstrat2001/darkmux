@@ -114,14 +114,13 @@ If `flow sink health` is `⚠` — re-check the Redis URL. The most common error
 ## Step 6 — Add this machine to the local roster
 
 ```bash
-# 8765 unless serve.port is set — read the resolved one from
-# `darkmux doctor`'s `serve address` row and type THAT port here.
-darkmux machine add <this-machine-id> --address 127.0.0.1:8765
+darkmux machine add <this-machine-id> --address <this-machine-tailnet-dns-name>
 ```
 
-This registers the new machine in its OWN roster; the address points at the local daemon.
+This registers the new machine in its OWN roster. Two rules, both enforced:
 
-**Use the port this daemon actually listens on.** `8765` is the built-in default, but if `serve.port` is set to something else, a self entry at `:8765` points at a dead port. A roster address is deliberately the one place `serve.port` is NOT consulted — a roster entry normally names ANOTHER machine, and one machine's config must not silently redirect traffic aimed at another — so a portless roster address always defaults to `8765`. That carve-out is right for a peer and wrong here, so type the port. `darkmux doctor`'s `serve address` row prints the resolved one.
+- **The id is this machine's `machine_id`** — the exact name `darkmux doctor`'s `machine_id` row printed in Step 5. That one name is what flow records, presence and the roster join on; an entry under any other name shows up in `darkmux doctor` as `roster identity` drift. When the id matches, `machine add` also records this machine's hardware identity on the entry.
+- **The address is the tailnet DNS name, never `127.0.0.1`.** Other machines read this roster (the daemon serves it to every viewer on the tailnet), and a loopback address reaches whichever machine reads it. `machine add` refuses a loopback address; `tailscale status` prints this machine's DNS name.
 
 Verify:
 
@@ -138,6 +137,8 @@ This is the hand-coordinated step the cross-machine state issue ([#280](https://
 ```bash
 darkmux machine add <new-machine-id> --address <new-machine-tailnet-dns-name>:8765
 ```
+
+`<new-machine-id>` is the SAME id this machine's `darkmux doctor` prints on its `machine_id` row — not a nickname. A roster entry under another name does not join this machine's records or presence.
 
 The `<new-machine-tailnet-dns-name>` is THIS machine's Tailscale Magic DNS name (operator can find via `tailscale status` on this machine, or the Tailscale admin console). Prefer the DNS name over the tailnet IP: a machine that later sits behind `tailscale serve` routes by Host header, so a roster entry pointing at the bare IP gets Tailscale's own 404 even though the daemon is healthy — the DNS name works in both setups. A raw `host:port` is fine only for a daemon bound directly to a non-loopback address (no `tailscale serve` in front of it).
 

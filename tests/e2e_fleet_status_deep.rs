@@ -67,6 +67,8 @@ fn populate_roster_via_cli(viewer: &e2e::harness::FleetNode, peers: &[&e2e::harn
             .args([
                 "machine", "add", &peer.machine_id,
                 "--address", &format!("127.0.0.1:{}", peer.daemon_port),
+                // Same-host test fleet: loopback does reach the peer (#2924).
+                "--allow-loopback",
             ])
             .output()
             .expect("running `darkmux machine add`");
@@ -163,6 +165,7 @@ fn fleet_status_deep_degrades_gracefully_for_unreachable_peers() {
         .args([
             "machine", "add", "ghost-machine",
             "--address", "127.0.0.1:1",
+            "--allow-loopback",
         ])
         .output()
         .expect("adding ghost-machine to roster");

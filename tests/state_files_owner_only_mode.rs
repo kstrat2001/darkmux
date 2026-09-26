@@ -192,7 +192,7 @@ fn fleet_roster_is_owner_only_mode() {
         // binary so it picks up the same HOME we set above and resolves
         // its roster path through the production code path.
         let out = darkmux_cmd(home)
-            .args(["machine", "add", "test-node", "--address", "127.0.0.1:9999"])
+            .args(["machine", "add", "test-node", "--address", "127.0.0.1:9999", "--allow-loopback"])
             .output()
             .expect("running `darkmux fleet add`");
         assert!(
