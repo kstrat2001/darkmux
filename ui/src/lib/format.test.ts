@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MISSING, clkrange, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { K_TO_M, MISSING, clkrange, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -321,5 +321,31 @@ describe("fmtC — compact token counts (#2842)", () => {
     expect(fmtC(984)).toBe("984");
     expect(fmtC(1.2e6)).toBe("1.2M");
     expect(fmtC(1.2e7)).toBe("12M");
+  });
+
+  it("(#2919) hands the thousands arm over to the millions arm where two decimals would round to 1000.00k", () => {
+    // Two decimals of thousands round 999,995 up to "1000.00k": a million
+    // spelled as a thousand. The CLI's `tokens_cell` (src/run_list.rs,
+    // #2902) promotes at the same value, and pins the same vectors.
+    expect(K_TO_M).toBe(999_995);
+    expect(fmtC(999_994)).toBe("999.99k");
+    expect(fmtC(999_995)).toBe("1.0M");
+    expect(fmtC(999_999)).toBe("1.0M");
+    expect(fmtC(1_000_000)).toBe("1.0M");
+    expect(fmtC(1_234_567)).toBe("1.2M");
+    // Nothing the thousands arm prints is wider than "999.99k".
+    for (const n of [1000, 999_994, 999_995, 999_999, 1e6, 9_999_999, 1e7, 999_999_999]) {
+      expect(fmtC(n).length, `${n}`).toBeLessThanOrEqual("999.99k".length);
+    }
+  });
+
+  it("(#2919) the ten-million step drops the decimal; the widest one-decimal form is 10.0M, as the CLI prints it", () => {
+    // Not a unit change, so no promotion: 9.96M rounds to "10.0M" and
+    // 10,000,000 reads "10M". `tokens_cell` renders the same pair.
+    expect(fmtC(9_940_000)).toBe("9.9M");
+    expect(fmtC(9_960_000)).toBe("10.0M");
+    expect(fmtC(9_999_999)).toBe("10.0M");
+    expect(fmtC(10_000_000)).toBe("10M");
+    expect(fmtC(12_345_678)).toBe("12M");
   });
 });

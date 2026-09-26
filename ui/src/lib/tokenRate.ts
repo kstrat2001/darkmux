@@ -984,7 +984,15 @@ export function promptTokensLabel(promptChars: number, charsPerToken: number): s
   if (!(promptChars > 0) || !(charsPerToken > 0)) return null;
   const tokens = promptChars / charsPerToken;
   if (tokens < 1) return null;
-  return tokens >= 1000 ? `~${Math.round(tokens / 1000)}k` : `~${Math.round(tokens)}`;
+  // (#2919) Each arm hands over where the arm below it would ROUND to its
+  // unit: `Math.round(999.5)` is 1000, so from 999.5 the label reads "~1k",
+  // never "~1000"; from 999,500 it reads "~1.0M", never "~1000k". The same
+  // rule as `fmtC` (`lib/format.ts`) and the CLI's `tokens_cell`; this one
+  // needs its own constants because its input is fractional and its
+  // thousands arm rounds to a whole number.
+  if (tokens >= 999_500) return `~${(tokens / 1e6).toFixed(1)}M`;
+  if (tokens >= 999.5) return `~${Math.round(tokens / 1000)}k`;
+  return `~${Math.round(tokens)}`;
 }
 
 /** Accessor for `STATE_PRIORITY` — the pager's default-page pick

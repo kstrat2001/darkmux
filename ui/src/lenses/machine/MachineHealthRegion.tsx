@@ -480,7 +480,7 @@ function ModelRow({
             on the id alone is correct by construction. The title carries the
             gloss the card used to spend three lines on. */}
         {!isGhost && isUtility && (
-          <span className="mm-row-chip is-identity" title="darkmux's internal small-model tier — handles compaction · mission-compile · estimate · scribe">
+          <span className="mm-row-chip is-identity" title="darkmux's internal small-model tier — runs darkmux's own jobs: compaction · radio routing">
             utility
           </span>
         )}

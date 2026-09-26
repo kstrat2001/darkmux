@@ -771,7 +771,10 @@ export function modelKvLine(m: MachineResourcesModel): string {
 
 /** Whether this residency row IS the machine's configured utility-tier
  * model — the badge that says "this resident is darkmux's own small-model
- * tier" (compaction, mission-compile, estimate, scribe).
+ * tier" — the model that runs darkmux's own jobs, compaction and radio
+ * routing (#2914; 4.0 retired the mission-compiler and scribe roles it used
+ * to list, #2912/#2913, and the "estimate" job it named never had an
+ * implementation in the tree).
  *
  * It takes only the configured ID and needs no `loaded` flag, which is the
  * whole point: a row exists in this ledger if and only if `lms ps` lists the

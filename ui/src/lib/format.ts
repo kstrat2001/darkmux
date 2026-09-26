@@ -126,17 +126,34 @@ export function fmtN(n: number): string {
  * of tiles stays aligned on the decimal point; these render in a grid where
  * ragged widths are harder to scan than a trailing zero.
  *
- * The millions arm is unchanged. It is reached by fleet-wide totals, where a
- * tenth of a million is already finer than any decision made from it.
+ * The millions arm keeps one decimal, none from ten million. It is reached
+ * by fleet-wide totals, where a tenth of a million is already finer than any
+ * decision made from it.
+ *
+ * (#2919) Each arm hands over where the arm below it would ROUND to its
+ * unit, not where the unit's value begins. Two decimals of thousands round
+ * 999,995 up to `1000.00k` — a figure that spells a million as a thousand,
+ * and one column wider than anything else the arm prints — so the millions
+ * arm takes over from {@link K_TO_M}, not from 1,000,000. This is the CLI's
+ * rule: `tokens_cell` (`src/run_list.rs`, #2902) promotes at the same value,
+ * and the two are meant to print one count identically. (The ten-million
+ * step only drops the decimal, so `9.96M` rounding to `10.0M` is the widest
+ * one-decimal form, not a unit change; the CLI prints the same.) The
+ * thousands arm below needs no such constant: an integer count cannot round
+ * to 1,000 from below, so `>= 1000` already IS that boundary.
  */
 export function fmtC(n: number): string {
-  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
-  // Guard the boundary: a bare `toFixed(2)` on 999.6 yields "1.00k", which
-  // claims a thousand tokens that were never spent. Below 1000 the exact
-  // integer is shown, so there is nothing to round.
+  if (n >= 1e7) return `${(n / 1e6).toFixed(0)}M`;
+  if (n >= K_TO_M) return `${(n / 1e6).toFixed(1)}M`;
+  // Below 1000 the exact integer is shown, so there is nothing to round.
   if (n >= 1000) return `${(n / 1000).toFixed(2)}k`;
   return fmtN(n);
 }
+
+/** (#2919) The smallest count `fmtC` prints in millions: the first value the
+ * thousands arm's two decimals would round up to `1000.00k`. Mirrors the CLI
+ * (`tokens_cell`, `src/run_list.rs`). */
+export const K_TO_M = 999_995;
 
 export const GIB = 1073741824; // 2³⁰
 export const MIB = 1048576; // 2²⁰
