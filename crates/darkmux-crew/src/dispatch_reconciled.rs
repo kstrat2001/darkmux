@@ -305,6 +305,8 @@ mod tests {
 
     fn test_opts(role: &str) -> DispatchOpts {
         DispatchOpts {
+            // (#2914) Work never runs on the utility model.
+            allow_utility_model: false,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,

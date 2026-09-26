@@ -1477,6 +1477,8 @@ impl StepKind for CrawlUnitStepKind {
             };
             let started = std::time::Instant::now();
             let opts = DispatchOpts {
+                // (#2914) Work never runs on the utility model.
+                allow_utility_model: false,
                 brief_refs: Vec::new(),
                 role_id: role_id.clone(),
                 message: message.clone(),

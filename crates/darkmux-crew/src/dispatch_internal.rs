@@ -2523,6 +2523,7 @@ fn resolve_selected_profile_model(
     role: &crate::types::Role,
     profile_override: Option<&str>,
     config_path: Option<&str>,
+    allow_utility_model: bool,
 ) -> Result<Option<darkmux_types::ProfileModel>> {
     use crate::select::select_model;
     use darkmux_profiles::profiles::load_registry;
@@ -2559,7 +2560,9 @@ fn resolve_selected_profile_model(
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    let Ok(id) = select_model(role, profile, |id| skill_index.get(id)) else {
+    // (#2914) Same set-aside as `resolve_dispatch_model_with_hosts`.
+    let set_aside = if allow_utility_model { None } else { loaded.registry.utility_model_id() };
+    let Ok(id) = select_model(role, profile, |id| skill_index.get(id), set_aside) else {
         return Ok(None);
     };
     Ok(profile.models.iter().find(|m| m.id == id).cloned())
@@ -2668,6 +2671,7 @@ fn try_resolve_remote_target(
         &role,
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
+        opts.allow_utility_model,
     )? {
         Some(pm) if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) => pm,
         _ => return Ok(None), // local ⇒ container path
@@ -2750,7 +2754,8 @@ pub fn dispatch_resolves_remote(
     let Some(role) = roles.iter().find(|r| r.id == role_id) else {
         return true;
     };
-    match resolve_selected_profile_model(role, profile_name, config_path) {
+    // (#2914) A work question: the utility model is set aside here too.
+    match resolve_selected_profile_model(role, profile_name, config_path, false) {
         Ok(Some(pm)) => pm.endpoint.as_ref().is_some_and(|e| e.is_remote()),
         // No profile model resolves ⇒ the container path's local fallback.
         Ok(None) => false,
@@ -3827,6 +3832,7 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         opts.profile_name.as_deref(),
         opts.config_path.as_deref(),
         opts.model_base_url_override.is_some(),
+        opts.allow_utility_model,
     )?;
 
     let session_id = opts
@@ -5187,6 +5193,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             opts.profile_name.as_deref(),
             opts.config_path.as_deref(),
             opts.model_base_url_override.is_some(),
+            opts.allow_utility_model,
         )
         .context(
             "model selection failed. Ensure `~/.darkmux/profiles.json` has \
@@ -11477,12 +11484,14 @@ fn resolve_dispatch_model_internal(
     profile_override: Option<&str>,
     config_path: Option<&str>,
     skip_lmstudio_residency: bool,
+    allow_utility_model: bool,
 ) -> Result<String> {
     resolve_dispatch_model_with_hosts(
         role,
         profile_override,
         config_path,
         skip_lmstudio_residency,
+        allow_utility_model,
         &ensure_model_loaded_at_ctx,
         &probe_loaded_model_list,
     )
@@ -11510,6 +11519,7 @@ fn resolve_dispatch_model_with_hosts(
     profile_override: Option<&str>,
     config_path: Option<&str>,
     skip_lmstudio_residency: bool,
+    allow_utility_model: bool,
     ensure_resident: &dyn Fn(&darkmux_types::ProfileModel) -> Result<()>,
     list_loaded: &dyn Fn() -> Result<Vec<String>>,
 ) -> Result<String> {
@@ -11600,7 +11610,10 @@ fn resolve_dispatch_model_with_hosts(
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-    match select_model(role, profile, |id| skill_index.get(id)) {
+    // (#2914) The machine's utility model is never a task's model; only the
+    // lab's benchmark opt-in leaves it selectable.
+    let set_aside = if allow_utility_model { None } else { loaded.registry.utility_model_id() };
+    match select_model(role, profile, |id| skill_index.get(id), set_aside) {
         Ok(id) => {
             // (#2038) Before anything else: a placeholder id would reach
             // LM Studio and come back as "model not found", which reads as

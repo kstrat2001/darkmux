@@ -880,6 +880,15 @@ pub fn launch(
     // call site).
     stamp_unit_timeout(&mut all_steps, timeout_seconds);
 
+    // (#2914) A task never runs on the machine's utility model. Refused
+    // HERE, before a single task record is persisted, so a mis-staffed
+    // config leaves nothing behind. Every selection path sets the utility
+    // model aside on its own (`select::select_model`); this is the same
+    // rule applied to the whole graph at once, with the task named.
+    refuse_utility_staffed_tasks(&tasks, &all_steps, &loaded_registry_for_staffing(&collected)?, &|role| {
+        darkmux_types::config_access::role_profile(role)
+    })?;
+
     for task in &tasks {
         if let Err(e) = crew::lifecycle::save_task(&mission_id, task) {
             eprintln!("{}", style::dim(&format!("mission launch: task persist warning: {e:#}")));
@@ -4569,12 +4578,191 @@ pub(crate) fn ensure_mission_and_phases_with_provenance(
     ensure_mission_and_phases_with_provenance_and_start_payload(mission_id, config, description, spec, None)
 }
 
+/// (#2914) The registry the staffing gate reads: the launch's own
+/// `profiles` input when supplied, else the machine's. A registry that
+/// cannot be loaded is the dispatch path's loud #1269 hard stop; the gate
+/// does not duplicate that error, it just has nothing to check.
+fn loaded_registry_for_staffing(
+    collected: &BTreeMap<String, serde_json::Value>,
+) -> Result<darkmux_types::ProfileRegistry> {
+    match darkmux_profiles::profiles::load_registry(collected.get("profiles").and_then(|v| v.as_str())) {
+        Ok(loaded) => Ok(loaded.registry),
+        Err(_) => Ok(darkmux_types::ProfileRegistry::default()),
+    }
+}
+
+/// (#2914) Refuse a graph in which a task would run on the machine's
+/// utility model (`internal.utility`). Two ways that happens, both checked
+/// here with the SAME predicate the selection paths use
+/// (`darkmux_crew::select::work_models`):
+///
+/// - a task whose staffing resolves (task `profile_name` > `role_profiles`
+///   binding > `default_profile`) to a profile with no work model once the
+///   utility model is set aside, so the dispatch's own selection would
+///   refuse it anyway, minutes later and with the run half-minted;
+/// - a model-naming step (`dispatch.single_shot`/`dispatch.map`, which
+///   select nothing and put `config.model` on the wire as given) whose
+///   `config.model_key`/`config.model` names the utility model.
+///
+/// A binding to a profile the registry lacks is NOT reported here (the
+/// scheduler raises that one, loudly, on its own); `Ok` when no utility
+/// model is registered. `mapped` is the live `role_profiles` read, passed
+/// in so the gate is testable with the config tier empty (#811).
+fn refuse_utility_staffed_tasks(
+    tasks: &[crew::types::Task],
+    steps: &BTreeMap<String, Step>,
+    registry: &darkmux_types::ProfileRegistry,
+    mapped: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    use darkmux_profiles::profiles::{resolve_role_profile_with, RoleBinding};
+    let Some(utility) = registry.utility_model_id() else {
+        return Ok(());
+    };
+    for task in tasks {
+        if let Some(role) = task.role_id.as_deref() {
+            let binding = match (task.profile_name.as_deref(), mapped(role)) {
+                (Some(p), _) => RoleBinding::Overridden(p.to_string()),
+                (None, Some(p)) => RoleBinding::Mapped(p),
+                (None, None) => RoleBinding::Unmapped,
+            };
+            if let Ok(resolved) = resolve_role_profile_with(role, &binding, registry) {
+                let profile = resolved.profile;
+                if !profile.models.is_empty() && crew::select::work_models(profile, Some(utility)).is_empty() {
+                    bail!(
+                        "mission launch: task `{}` (role `{role}`) is staffed on profile `{}`, and {} \
+                         Nothing was minted.",
+                        task.id,
+                        resolved.profile_name,
+                        crew::select::utility_only_error(utility),
+                    );
+                }
+            }
+        }
+        for step_id in &task.step_ids {
+            let Some(step) = steps.get(step_id) else { continue };
+            let named = ["model_key", "model"]
+                .iter()
+                .filter_map(|k| step.config.get(k).and_then(|v| v.as_str()))
+                .find(|m| crew::select::names_utility_model(m, utility));
+            if let Some(model) = named {
+                bail!(
+                    "mission launch: step `{}` of task `{}` names `{model}`, the machine's utility \
+                     model (`internal.utility`), and a task never runs on the utility model. Name a \
+                     work model in the step's config. Nothing was minted. (#2914)",
+                    step.id,
+                    task.id,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
+
+    // ─── #2914: a task never runs on the machine's utility model ───────
+
+    fn staffed_task(id: &str, role_id: Option<&str>, profile_name: Option<&str>, step_ids: &[&str]) -> crew::types::Task {
+        crew::types::Task {
+            run_on: darkmux_crew::types::default_run_on(),
+            id: id.into(),
+            phase_id: "m-1-p".into(),
+            description: String::new(),
+            display_name: None,
+            step_ids: step_ids.iter().map(|s| s.to_string()).collect(),
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: role_id.map(str::to_string),
+            profile_name: profile_name.map(str::to_string),
+            workdir: None,
+            image: None,
+        }
+    }
+
+    fn configured_step(id: &str, task_id: &str, kind: &str, config: serde_json::Value) -> Step {
+        Step {
+            id: id.into(),
+            task_id: task_id.into(),
+            kind: kind.into(),
+            gate: None,
+            status: crew::types::NodeStatus::Planned,
+            config,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        }
+    }
+
+    fn utility_gate_registry() -> darkmux_types::ProfileRegistry {
+        serde_json::from_value(serde_json::json!({
+            "default_profile": "work",
+            "internal": { "utility": { "id": "util-4b", "n_ctx": 120000 } },
+            "profiles": {
+                "work": { "models": [{ "id": "worker-35b", "n_ctx": 65536 }] },
+                "leftover": { "models": [{ "id": "util-4b", "n_ctx": 16000 }, { "id": "worker-35b", "n_ctx": 65536 }] },
+                "radio": { "models": [{ "id": "darkmux:util-4b", "n_ctx": 16000 }] }
+            }
+        }))
+        .unwrap()
+    }
+
+    /// (#2914) The launch refuses, before minting anything, a task whose
+    /// staffing resolves to the machine's utility model: a profile listing
+    /// only it (through the task's own `profile_name`, or through the
+    /// `role_profiles` binding), or a `dispatch.single_shot`/`dispatch.map`
+    /// step whose `config.model` names it outright. The error names the
+    /// task and the fix.
+    #[test]
+    fn launch_refuses_a_task_staffed_on_the_utility_model() {
+        let registry = utility_gate_registry();
+        let no_binding = |_: &str| None;
+        let radio_binding = |role: &str| (role == "coder").then(|| "radio".to_string());
+        let steps: BTreeMap<String, Step> = BTreeMap::new();
+
+        // A profile that still lists the utility model beside a work model is
+        // fine: the work model is what the task runs on.
+        let ok = [staffed_task("t-ok", Some("coder"), Some("leftover"), &[])];
+        refuse_utility_staffed_tasks(&ok, &steps, &registry, &no_binding).expect("a work model is available");
+
+        // The task's own profile lists only the utility model.
+        let own = [staffed_task("t-own", Some("coder"), Some("radio"), &[])];
+        let err = refuse_utility_staffed_tasks(&own, &steps, &registry, &no_binding).unwrap_err().to_string();
+        assert!(err.contains("t-own") && err.contains("radio") && err.contains("util-4b"), "{err}");
+        assert!(err.contains("internal.utility"), "names the fix: {err}");
+
+        // The role_profiles binding points the role at that profile.
+        let bound = [staffed_task("t-bound", Some("coder"), None, &[])];
+        let err = refuse_utility_staffed_tasks(&bound, &steps, &registry, &radio_binding).unwrap_err().to_string();
+        assert!(err.contains("t-bound"), "{err}");
+        // ...but an explicit task profile wins over the binding, as everywhere.
+        let explicit = [staffed_task("t-explicit", Some("coder"), Some("work"), &[])];
+        refuse_utility_staffed_tasks(&explicit, &steps, &registry, &radio_binding).unwrap();
+
+        // A model-naming step (no selection at all) is checked by its config.
+        let named = [staffed_task("t-named", None, None, &["s-named"])];
+        let steps: BTreeMap<String, Step> = [(
+            "s-named".to_string(),
+            configured_step(
+                "s-named",
+                "t-named",
+                "dispatch.single_shot",
+                serde_json::json!({ "model": "darkmux:util-4b", "model_key": "util-4b", "system": "s", "user": "u" }),
+            ),
+        )]
+        .into();
+        let err = refuse_utility_staffed_tasks(&named, &steps, &registry, &no_binding).unwrap_err().to_string();
+        assert!(err.contains("s-named") && err.contains("util-4b"), "{err}");
+
+        // No utility model registered: nothing to set aside, nothing refused.
+        let mut unbound = utility_gate_registry();
+        unbound.internal = None;
+        refuse_utility_staffed_tasks(&own, &steps, &unbound, &no_binding).unwrap();
+    }
 
     // ─── #1511: the consent gate's role must be the kind's own ──────────
     //

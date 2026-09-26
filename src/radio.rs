@@ -538,6 +538,8 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
 /// operator-tunable.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,

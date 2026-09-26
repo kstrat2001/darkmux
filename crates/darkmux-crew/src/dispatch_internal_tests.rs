@@ -1627,7 +1627,7 @@
         )
         .unwrap();
 
-        let err = resolve_dispatch_model_internal(&role, None, pf.to_str(), false).unwrap_err();
+        let err = resolve_dispatch_model_internal(&role, None, pf.to_str(), false, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not loadable"),
@@ -1714,7 +1714,7 @@
         .unwrap();
 
         let err =
-            resolve_dispatch_model_internal(&quarantine_test_role(), Some("review"), pf.to_str(), false)
+            resolve_dispatch_model_internal(&quarantine_test_role(), Some("review"), pf.to_str(), false, false)
                 .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("quarantined"), "got: {msg}");
@@ -1743,7 +1743,7 @@
         )
         .unwrap();
 
-        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str(), false)
+        let err = resolve_dispatch_model_internal(&quarantine_test_role(), None, pf.to_str(), false, false)
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("quarantined"), "got: {msg}");
@@ -2629,6 +2629,8 @@
     /// daemon is contacted on the way.
     fn dispatch_preflight_probe_opts() -> crate::dispatch::DispatchOpts {
         crate::dispatch::DispatchOpts {
+            // (#2914) Work never runs on the utility model.
+            allow_utility_model: false,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,
@@ -12836,6 +12838,7 @@ fn resolver_returns_the_namespaced_identifier_for_a_real_lmstudio_dispatch() {
         None,
         pf.to_str(),
         false,
+        false,
         &|pm| {
             ensured.borrow_mut().push(pm.id.clone());
             Ok(())
@@ -12873,6 +12876,7 @@ fn resolver_stays_bare_when_residency_is_skipped_for_a_non_lmstudio_base_url() {
         None,
         pf.to_str(),
         true,
+        false,
         // Both effects must be UNREACHED on this arm — that is the whole
         // point of the flag (a real `lms load` of a mock's made-up id fell
         // into an interactive picker and hung forever).

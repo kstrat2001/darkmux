@@ -898,6 +898,8 @@ impl StepKind for MissionCoderStepKind {
         let image = step.config.get("image").and_then(|v| v.as_str()).map(String::from);
 
         let opts = crew::dispatch::DispatchOpts {
+            // (#2914) Work never runs on the utility model.
+            allow_utility_model: false,
             brief_refs: Vec::new(),
             workspace_read_only: false,
             record_context: None,

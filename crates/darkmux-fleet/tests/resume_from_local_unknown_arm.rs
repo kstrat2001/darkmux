@@ -40,6 +40,8 @@ use std::time::Duration;
 /// duplicated here rather than widened for one caller.
 fn opts_for(role_id: &str) -> DispatchOpts {
     DispatchOpts {
+        // (#2914) Work never runs on the utility model.
+        allow_utility_model: false,
         brief_refs: Vec::new(),
         workspace_read_only: false,
         record_context: None,
