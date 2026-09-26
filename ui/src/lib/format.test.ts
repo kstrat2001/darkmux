@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { K_TO_M, MISSING, clkrange, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
+import { K_TO_M, MISSING, clkrange, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -336,6 +336,26 @@ describe("fmtC — compact token counts (#2842)", () => {
     // Nothing the thousands arm prints is wider than "999.99k".
     for (const n of [1000, 999_994, 999_995, 999_999, 1e6, 9_999_999, 1e7, 999_999_999]) {
       expect(fmtC(n).length, `${n}`).toBeLessThanOrEqual("999.99k".length);
+    }
+  });
+
+  it("(#2919) compactThousands derives each style's boundary from its own rounding", () => {
+    // Two decimals: 999,995 (the CLI's constant). One: 999,950. None: 999,500.
+    expect(compactThousands(K_TO_M - 1, { k: 2, m: 1 })).toBe("999.99k");
+    expect(compactThousands(K_TO_M, { k: 2, m: 1 })).toBe("1.0M");
+    expect(compactThousands(999_949, { k: 1, m: 1 })).toBe("999.9k");
+    expect(compactThousands(999_950, { k: 1, m: 1 })).toBe("1.0M");
+    expect(compactThousands(999_499, { k: 0, m: 1 })).toBe("999k");
+    expect(compactThousands(999_500, { k: 0, m: 1 })).toBe("1.0M");
+    // Per-value decimals reach the core as functions of the count.
+    expect(compactThousands(1500, { k: (n) => (n < 10_000 ? 1 : 0), m: 0 })).toBe("1.5k");
+    expect(compactThousands(15_000, { k: (n) => (n < 10_000 ? 1 : 0), m: 0 })).toBe("15k");
+    expect(compactThousands(12_345_678, { k: 2, m: (n) => (n >= 1e7 ? 0 : 1) })).toBe("12M");
+    // Nothing the thousands arm prints ever reads 1000 or more.
+    for (const kd of [0, 1, 2]) {
+      for (const n of [999_499, 999_500, 999_949, 999_950, 999_994, 999_995, 999_999]) {
+        expect(compactThousands(n, { k: kd, m: 1 }), `${n} at ${kd} decimals`).not.toMatch(/^1000/);
+      }
     }
   });
 

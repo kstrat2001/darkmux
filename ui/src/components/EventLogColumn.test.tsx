@@ -957,6 +957,12 @@ describe("compactCountLabel", () => {
     expect(compactCountLabel("12 matches · 900 hidden")).toBe("12 matches · 900 hidden");
     expect(compactCountLabel("12 matches · 4952 hidden")).toBe("12 matches · 5.0k hidden");
   });
+
+  it("(#2919) a count whose one decimal would round to 1000.0k prints in millions instead", () => {
+    expect(compactCountLabel("12 matches · 999949 hidden")).toBe("12 matches · 999.9k hidden");
+    expect(compactCountLabel("12 matches · 999950 hidden")).toBe("12 matches · 1.0M hidden"); // never "1000.0k"
+    expect(compactCountLabel("50 of 1234567 events · 1000000 hidden")).toBe("50/1.2M · 1.0M hidden");
+  });
 });
 
 // (operator, 2026-09-06 — desktop screenshot) The count pill's DOM group
@@ -1294,6 +1300,13 @@ describe("EventLogColumn — turns (#2863)", () => {
     expect(fmtTurnDuration(300, true)).toBe("~1 s");
     expect(fmtTok(933)).toBe("933");
     expect(fmtTok(18926)).toBe("18.9k");
+  });
+
+  it("(#2919) fmtTok hands the thousands arm over where its one decimal would round to 1000.0k", () => {
+    expect(fmtTok(999_949)).toBe("999.9k");
+    expect(fmtTok(999_950)).toBe("1.0M"); // never "1000.0k"
+    expect(fmtTok(1_000_000)).toBe("1.0M");
+    expect(fmtTok(1_234_567)).toBe("1.2M");
   });
 });
 

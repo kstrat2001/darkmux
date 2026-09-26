@@ -141,19 +141,57 @@ export function fmtN(n: number): string {
  * one-decimal form, not a unit change; the CLI prints the same.) The
  * thousands arm below needs no such constant: an integer count cannot round
  * to 1,000 from below, so `>= 1000` already IS that boundary.
+ *
+ * The rule itself lives in {@link compactThousands}, shared with the other
+ * compact styles in the app; this function only picks the decimals.
  */
 export function fmtC(n: number): string {
-  if (n >= 1e7) return `${(n / 1e6).toFixed(0)}M`;
-  if (n >= K_TO_M) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1000) return compactThousands(n, FMT_C_STYLE);
   // Below 1000 the exact integer is shown, so there is nothing to round.
-  if (n >= 1000) return `${(n / 1000).toFixed(2)}k`;
   return fmtN(n);
 }
 
+/** Two decimals of thousands; one of millions, none from ten million. */
+const FMT_C_STYLE: CompactStyle = { k: 2, m: (n) => (n >= 1e7 ? 0 : 1) };
+
 /** (#2919) The smallest count `fmtC` prints in millions: the first value the
- * thousands arm's two decimals would round up to `1000.00k`. Mirrors the CLI
- * (`tokens_cell`, `src/run_list.rs`). */
+ * thousands arm's two decimals would round up to `1000.00k`. The CLI
+ * (`tokens_cell`, `src/run_list.rs`) hardcodes this number; here it is what
+ * {@link compactThousands} derives for two decimals, and `format.test.ts`
+ * pins the two to each other. */
 export const K_TO_M = 999_995;
+
+/** How a compact count spells its arms: decimals in the thousands arm and in
+ * the millions arm, each either fixed or chosen per value (so a style can
+ * print `1.5k` but `15k`, or `1.2M` but `12M`). Units are always `k` and
+ * `M`; a count below 1000 never reaches this core, so how it prints is the
+ * caller's own business (`fmtN`, `String`, `toLocaleString` all exist). */
+export interface CompactStyle {
+  k: number | ((n: number) => number);
+  m: number | ((n: number) => number);
+}
+
+/** (#2919) THE compact-count core for a count of at least 1000: `fmtC`
+ * (the tiles and the fleet hero), the mission graph's `fmtTok` (step rows,
+ * node labels) and the event log's `fmtTok` / `compactCountLabel` all print
+ * through here, so the one rule that matters is written once:
+ *
+ *   an arm hands over to the next where its OWN rounding would carry the
+ *   unit — the thousands arm prints whatever `toFixed` gives it unless that
+ *   reads `1000` or more, in which case the millions arm prints instead.
+ *
+ * That derives the boundary from the style rather than pinning a constant
+ * per caller: 999,995 for two decimals, 999,950 for one, 999,500 for none.
+ * Before this, every copy of the rule sat at `1,000,000` and each printed a
+ * million as `1000.00k` / `1000.0k` / `1000k` just below it — and two had no
+ * millions arm at all, so they would have printed `1000k` forever. */
+export function compactThousands(n: number, style: CompactStyle): string {
+  const kd = typeof style.k === "function" ? style.k(n) : style.k;
+  const k = (n / 1000).toFixed(kd);
+  if (Number(k) < 1000) return `${k}k`;
+  const md = typeof style.m === "function" ? style.m(n) : style.m;
+  return `${(n / 1e6).toFixed(md)}M`;
+}
 
 export const GIB = 1073741824; // 2³⁰
 export const MIB = 1048576; // 2²⁰
