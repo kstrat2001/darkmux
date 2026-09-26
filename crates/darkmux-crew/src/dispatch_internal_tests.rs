@@ -1938,6 +1938,68 @@
         assert_eq!((window, compactor_n_ctx), (Some(32_000), None));
     }
 
+    /// (#2905 review) The CALL-SITE test. Every `resolve_dispatch_windows_with`
+    /// test above supplies the binding by hand, so replacing the live
+    /// `role_profile_binding(..)` read with `None` left the crate green. This
+    /// drives `resolve_dispatch_compaction` — the function `dispatch()` calls
+    /// with its own role and opts — with `role_profiles` set through the
+    /// config tier, the way production reads it.
+    #[test]
+    #[serial]
+    fn dispatch_compaction_reads_role_profiles_from_config() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let pf = state.join("profiles-2905-live.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"default_model":"model-fast","models":[
+                        {"id":"model-fast","n_ctx":32000},
+                        {"id":"util-4b","n_ctx":16000}
+                    ]},
+                    "big":{"default_model":"model-big","models":[
+                        {"id":"model-big","n_ctx":128000},
+                        {"id":"util-4b","n_ctx":64000}
+                    ]}
+                },
+                "internal":{"utility":"util-4b"},
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        let role: crate::types::Role = serde_json::from_str(
+            r#"{"id":"coder","description":"d","tool_palette":{"allow":[],"deny":[]},"escalation_contract":"bail-with-explanation"}"#,
+        )
+        .unwrap();
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "coder".to_string();
+        opts.config_path = Some(pf.to_str().unwrap().to_string());
+
+        // Unmapped (no config override installed): default_profile's windows.
+        let unmapped = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(unmapped.compaction.context_window, Some(32_000));
+        assert_eq!(unmapped.compactor_n_ctx, Some(16_000));
+
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            role_profiles: Some([("coder".to_string(), "big".to_string())].into_iter().collect()),
+            ..Default::default()
+        };
+        let _guard = darkmux_types::config_access::set_config_for_test(cfg);
+
+        let mapped = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(
+            mapped.compaction.context_window,
+            Some(128_000),
+            "role_profiles.coder=big (from config) must size the compaction window from `big`"
+        );
+        assert_eq!(mapped.compactor_n_ctx, Some(64_000), "and the compactor n_ctx from `big` too");
+        assert_eq!(mapped.utility_model.as_deref(), Some("util-4b"));
+
+        // An explicit --profile still wins over the configured mapping.
+        opts.profile_name = Some("fast".to_string());
+        let explicit = resolve_dispatch_compaction(&role, &opts).unwrap();
+        assert_eq!(explicit.compaction.context_window, Some(32_000));
+        assert_eq!(explicit.compactor_n_ctx, Some(16_000));
+    }
+
     #[test]
     #[serial]
     fn dispatch_windows_dangling_role_mapping_is_a_loud_error() {

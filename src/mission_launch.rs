@@ -6266,6 +6266,83 @@ mod tests {
         let _ = guard;
     }
 
+    /// (#2905) Registers the built-in `coder-phase` graph for role `coder` and
+    /// returns the `injected_budget_chars` stamped on the coder step.
+    fn coder_step_budget_after_registration() -> u64 {
+        let loaded = mission_config::load("coder-phase").unwrap();
+        let config = &loaded.config;
+        let mut collected = BTreeMap::new();
+        collected.insert("workdir".to_string(), serde_json::json!("/tmp/darkmux-mission-launch-test-worktree"));
+        collected.insert("branch".to_string(), serde_json::json!("darkmux-test-branch"));
+        collected.insert("base".to_string(), serde_json::json!("main"));
+        collected.insert("role".to_string(), serde_json::json!("coder"));
+        let mission_id = mint_run_id("coder-phase").unwrap();
+        let real_phase_ids = ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
+        let real_phase_id = real_phase_ids["build"].clone();
+        let coder_step_id = format!("{real_phase_id}-coder-step");
+        let mut steps = BTreeMap::new();
+        steps.insert(
+            coder_step_id.clone(),
+            crew::types::Step {
+                id: coder_step_id.clone(),
+                task_id: format!("{real_phase_id}-coder"),
+                gate: None,
+                kind: "mission.coder".to_string(),
+                status: NodeStatus::Planned,
+                config: serde_json::Value::Null,
+                started_ts: None,
+                completed_ts: None,
+                output: None,
+            },
+        );
+        let registry = crew::step_kinds::StepKindRegistry::with_builtins();
+        register_coder_phase_step_kinds(&registry).unwrap();
+        register_coder_phase_kinds(&registry, &mission_id, config, &real_phase_ids, &collected, 600, &mut steps)
+            .expect("registration must succeed");
+        steps[&coder_step_id].config["injected_budget_chars"].as_u64().expect("budget stamped")
+    }
+
+    /// (#2905) The coder step dispatches role `coder` with no `--profile`, so
+    /// its model comes from `role_profiles.coder` when mapped. The brief
+    /// budget stamped at registration must be sized from that SAME profile's
+    /// window, not `default_profile`'s.
+    #[test]
+    #[serial_test::serial]
+    fn coder_step_budget_follows_the_role_profiles_mapping() {
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        let guard = LaunchTestGuard::new();
+        let pf = state.join("profiles-2905.json");
+        std::fs::write(
+            &pf,
+            r#"{"profiles":{
+                    "fast":{"models":[{"id":"model-fast","n_ctx":32000}]},
+                    "big":{"models":[{"id":"model-big","n_ctx":128000}]}
+                },
+                "default_profile":"fast"}"#,
+        )
+        .unwrap();
+        // SAFETY: serial; `IsolatedState` recorded and restores DARKMUX_PROFILES.
+        unsafe { env::set_var("DARKMUX_PROFILES", &pf) };
+
+        let unmapped = coder_step_budget_after_registration();
+        assert_eq!(unmapped as usize, coder_phase::injected_budget_chars(Some(32_000)));
+
+        let cfg = darkmux_types::config::DarkmuxConfig {
+            role_profiles: Some([("coder".to_string(), "big".to_string())].into_iter().collect()),
+            ..Default::default()
+        };
+        let _cfg_guard = darkmux_types::config_access::set_config_for_test(cfg);
+        let mapped = coder_step_budget_after_registration();
+        assert_eq!(
+            mapped as usize,
+            coder_phase::injected_budget_chars(Some(128_000)),
+            "role_profiles.coder=big must size the coder brief budget from `big`'s window"
+        );
+        assert_ne!(mapped, unmapped, "precondition: the two windows give different budgets");
+        drop(_cfg_guard);
+        drop(guard);
+    }
+
     #[test]
     #[serial_test::serial]
     fn register_coder_phase_kinds_bails_loud_naming_the_missing_input() {

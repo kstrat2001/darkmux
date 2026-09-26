@@ -5423,22 +5423,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     };
 
     // Resolve compaction (role override + utility model + context window).
-    let mut compaction = opts.compaction.clone();
-    compaction.apply_role_override(role);
-    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
-    compaction.apply_utility_model(utility_model.as_deref());
-    // (#2905) ONE role-aware profile resolution feeds both the primary's
-    // compaction-trigger window and the compactor's own `n_ctx` (used in the
-    // residency block below), with the same precedence model selection used:
-    // `--profile` > `role_profiles.<role>` > `default_profile`.
-    let (primary_window, compactor_n_ctx) = resolve_dispatch_windows_with(
-        &role.id,
-        opts.profile_name.as_deref(),
-        role_profile_binding(Some(&role.id), opts.profile_name.as_deref()),
-        opts.config_path.as_deref(),
-        compaction.compactor_model.as_deref(),
-    )?;
-    ensure_context_window(&mut compaction, primary_window);
+    // (#2905) One call over the dispatch's own inputs, so the role-aware
+    // window resolution is exercised by tests exactly as it runs here.
+    let DispatchCompaction { mut compaction, compactor_n_ctx, utility_model } =
+        resolve_dispatch_compaction(role, &opts)?;
 
     // (#1280) Ensure the utility/compactor model is RESIDENT AT ITS DECLARED
     // CONTEXT — namespaced — before the container starts, exactly as the
@@ -11406,6 +11394,41 @@ fn resolve_utility_model_internal(config_path: Option<&str>) -> Option<String> {
     darkmux_profiles::profiles::load_registry(config_path)
         .ok()
         .and_then(|l| l.registry.utility_model_id().map(str::to_string))
+}
+
+/// (#2905) What `dispatch()` resolves about compaction before the container
+/// starts: the args (role override, utility model, primary window applied),
+/// the compactor's own declared `n_ctx`, and the utility model binding.
+#[derive(Debug)]
+struct DispatchCompaction {
+    compaction: crate::dispatch::CompactionDispatchArgs,
+    compactor_n_ctx: Option<u32>,
+    utility_model: Option<String>,
+}
+
+/// (#2905) `dispatch()`'s compaction resolution, extracted so a test drives
+/// it with the SAME inputs `dispatch()` has (the role and the opts) and the
+/// live `role_profiles` binding read from config. ONE role-aware profile
+/// resolution feeds both the primary's compaction-trigger window and the
+/// compactor's own `n_ctx`, with the same precedence model selection uses:
+/// `--profile` > `role_profiles.<role>` > `default_profile`.
+fn resolve_dispatch_compaction(
+    role: &crate::types::Role,
+    opts: &crate::dispatch::DispatchOpts,
+) -> Result<DispatchCompaction> {
+    let mut compaction = opts.compaction.clone();
+    compaction.apply_role_override(role);
+    let utility_model = resolve_utility_model_internal(opts.config_path.as_deref());
+    compaction.apply_utility_model(utility_model.as_deref());
+    let (primary_window, compactor_n_ctx) = resolve_dispatch_windows_with(
+        &role.id,
+        opts.profile_name.as_deref(),
+        role_profile_binding(Some(&role.id), opts.profile_name.as_deref()),
+        opts.config_path.as_deref(),
+        compaction.compactor_model.as_deref(),
+    )?;
+    ensure_context_window(&mut compaction, primary_window);
+    Ok(DispatchCompaction { compaction, compactor_n_ctx, utility_model })
 }
 
 /// (#632) Resolve the context window the runtime needs to compute its
