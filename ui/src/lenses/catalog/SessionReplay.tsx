@@ -805,16 +805,23 @@ export function SessionReplay({
                       // most recent heartbeats.
                       centerCarried={scopeHero.centerCarried}
                     />
-                    <ScopeLamps
-                      reading={scopeHero.lamps}
-                      noSignal={scopeHero.state === "nosignal"}
-                      finished={scopeHero.state === "finished"}
-                    />
-                    {/* A quiet line under the lamps: "no signal" when the page
-                        lost its connection (distinct from a genuinely idle
-                        run, which has nothing wrong to name), or the finished
-                        average's qualifier when it is partial or a fallback. */}
-                    {scopeHero.note && <div className="modelbox__note">{scopeHero.note}</div>}
+                    {/* The lamps and, under them, a quiet readout line: "no
+                        signal" when the page lost its connection (distinct
+                        from a genuinely idle run, which has nothing wrong to
+                        name), the finished average's qualifier when it is
+                        partial or a fallback, or (#2926) the tool being
+                        generated and its elapsed seconds. The readout takes
+                        NO height of its own: it sits in the hero's bottom
+                        padding (`.modelbox__status` in `styles.css`), so the
+                        MODEL section is the same size in every state. */}
+                    <div className="modelbox__status">
+                      <ScopeLamps
+                        reading={scopeHero.lamps}
+                        noSignal={scopeHero.state === "nosignal"}
+                        finished={scopeHero.state === "finished"}
+                      />
+                      {scopeHero.note && <div className="modelbox__note">{scopeHero.note}</div>}
+                    </div>
                   </div>
                 )}
                 {view.metricScope.model.length > 0 && (
