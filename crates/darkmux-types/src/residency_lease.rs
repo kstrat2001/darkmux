@@ -503,6 +503,24 @@ pub fn live_leased_models(own_pid: u32) -> Vec<String> {
     models
 }
 
+/// (#2917) Per OTHER live process: the `darkmux:*` identifiers it has
+/// CONFIRMED resident and in use (`loaded`, via [`LeaseGuard::mark_loaded`]),
+/// keyed by that process's pid. The intent-vs-in-use distinction is the
+/// point: a process that merely DESIRES an identifier (still acquiring it)
+/// is not occupying the instance, so `models` is deliberately not read
+/// here. Radio's busy check (`src/radio_busy.rs` in the binary crate) is
+/// the consumer — "a darkmux process is dispatching to the instance I
+/// would send to" is a fact this registry holds and `lms ps` cannot state
+/// (it reports the instance's status, never whose request it is serving).
+/// Same scan, liveness sweep and leniency as [`live_leased_models`].
+pub fn live_loaded_models_by_process(own_pid: u32) -> Vec<(u32, Vec<String>)> {
+    live_foreign_leases(own_pid)
+        .into_iter()
+        .filter(|lease| !lease.loaded.is_empty())
+        .map(|lease| (lease.pid, lease.loaded))
+        .collect()
+}
+
 fn pid_from_path(path: &Path) -> Option<u32> {
     path.file_stem()?.to_str()?.parse().ok()
 }

@@ -60,9 +60,26 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
     // `route_and_record`, not the bare `route`, so this invocation drops
     // the SAME shared-core flow record the ACP no-slash channel does — the
     // record is written once regardless of which surface routed.
-    let decision = radio::route_and_record(text, &catalog, radio::RadioSurface::Cli, &mut |message: &str| {
-        radio::dispatch_router_call(message)
-    });
+    //
+    // (#2917) …bounded: the router waits behind whatever occupies the one
+    // utility instance (a compaction, by decision), but past
+    // `ROUTER_SLOW_NOTICE_AFTER` it says so — what LM Studio reports the
+    // instance doing and, when darkmux knows, for which run — then keeps
+    // waiting to the call's ceiling. stderr, so a script capturing stdout
+    // still gets only the answer.
+    let decision = match radio::route_and_record_bounded(
+        text.to_string(),
+        catalog.clone(),
+        radio::RadioSurface::Cli,
+        radio::dispatch_router_call,
+        radio::ROUTER_SLOW_NOTICE_AFTER,
+    ) {
+        radio::RouteWait::Done(decision) => decision,
+        radio::RouteWait::Slow(pending) => {
+            eprintln!("radio: {}", crate::radio_busy::router_wait_notice_live(radio::ROUTER_SLOW_NOTICE_AFTER));
+            pending.recv().unwrap_or_else(|_| radio::routing_thread_ended_early())
+        }
+    };
 
     match decision {
         // (#1698 Packet B2, scope A) A refusal no longer prints the bare
@@ -78,9 +95,18 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             let shelf = crate::radio_answer::ArtifactShelf::default();
             let overrides = crate::radio_answer::AnswererOverrides::default();
             match crate::radio_answer::answer_live(text, &catalog, &shelf, &cwd, &overrides, radio::RadioSurface::Cli) {
-                Ok(outcome) => {
+                Ok(crate::radio_answer::LiveAnswer::Answered(outcome)) => {
                     println!("radio: {}", outcome.rendered);
                     Ok(0)
+                }
+                // (#2917) The seat's instance is busy: say so at once —
+                // what LM Studio reports, and for which run when darkmux
+                // knows — instead of queueing inside LM Studio until the
+                // 300s ceiling. Exit 1: the question was not answered, and
+                // a script must be able to tell that from an answer.
+                Ok(crate::radio_answer::LiveAnswer::Busy(busy)) => {
+                    println!("radio: {}", busy.answering_seat_message());
+                    Ok(1)
                 }
                 Err(e) => {
                     eprintln!("radio: the answering seat failed ({e:#}); falling back to the plain refusal");

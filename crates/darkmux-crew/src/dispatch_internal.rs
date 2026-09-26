@@ -2765,6 +2765,72 @@ pub fn dispatch_resolves_remote(
     }
 }
 
+/// (#2917) The LOCAL LM Studio instance a dispatch would send to: the
+/// namespaced identifier that goes on the wire (#2240) and the bare model
+/// key it was loaded from. A caller that wants to know whether that
+/// instance is BUSY before sending (radio, whose request would otherwise
+/// queue inside LM Studio until its timeout) checks `identifier` against
+/// `lms ps` and the residency-lease registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTarget {
+    /// The instance identifier on the wire and in `lms ps`: `darkmux:<key>`,
+    /// or the profile's explicit `identifier` opt-out.
+    pub identifier: String,
+    /// The bare catalog key the instance was loaded from.
+    pub model_key: String,
+}
+
+impl LocalTarget {
+    /// Whether a model string RECORDED elsewhere (a flow record's `model`,
+    /// which carries the wire identifier since #2240 but a bare key on
+    /// older archives) names this instance. Namespace-insensitive on the
+    /// recorded side only: the target is always the exact instance.
+    pub fn matches_recorded_model(&self, recorded: &str) -> bool {
+        recorded == self.identifier || bare_model_key(recorded) == self.model_key
+    }
+}
+
+/// (#2917) The local instance a dispatch with this (role, profile) would
+/// send to, or `None` when it would not target one at all: a remote
+/// endpoint, no resolvable profile model (the container path's own
+/// fallback), or a quarantined profile — in each case there is no local
+/// instance to check. Resolves through `resolve_selected_profile_model`,
+/// the SAME resolution the dispatch itself routes on (as
+/// [`dispatch_resolves_remote`] does), and mints the identifier the way
+/// [`dispatch_wire_model_id`] does, so the instance checked is the
+/// instance sent to.
+pub fn dispatch_local_target(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+) -> Option<LocalTarget> {
+    let roles = load_roles().ok()?;
+    let role = roles.iter().find(|r| r.id == role_id)?;
+    // (#2914) A work question: the utility model is set aside here too.
+    let pm = resolve_selected_profile_model(role, profile_name, config_path, false).ok().flatten()?;
+    if pm.endpoint.as_ref().is_some_and(|e| e.is_remote()) {
+        return None;
+    }
+    let model_key = bare_model_key(&pm.id);
+    Some(LocalTarget {
+        identifier: darkmux_gestalt::namespaced_identifier(model_key, pm.identifier.as_deref()),
+        model_key: model_key.to_string(),
+    })
+}
+
+/// (#2917) The machine utility model's instance, addressed exactly as
+/// `crate::utility::run_utility_single_shot` addresses it
+/// ([`compactor_wire_model_id`] over the `internal.utility` binding). `None`
+/// when no binding is registered — the utility job itself then fails with
+/// the fix named, and there is nothing to check.
+pub fn utility_local_target(config_path: Option<&str>) -> Option<LocalTarget> {
+    let (binding_id, _declared_n_ctx) = resolve_utility_model_internal(config_path)?;
+    Some(LocalTarget {
+        identifier: compactor_wire_model_id(&binding_id),
+        model_key: bare_model_key(&binding_id).to_string(),
+    })
+}
+
 /// The chat-completions URL: `{base}/chat/completions` (+ `?api-version=` for
 /// Azure). The operator's `endpoint.url` is the base up to `/chat/completions`
 /// (an Azure deployment URL, or e.g. `https://api.openai.com/v1`).

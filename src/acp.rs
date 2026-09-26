@@ -735,16 +735,27 @@ type AnswererCall = Arc<dyn Fn(&str, &crate::radio_answer::AnswererOverrides) ->
 /// wire tests testing the wire.
 type ScopeCall = Arc<dyn Fn(&crate::radio_answer::AnswererOverrides) -> crate::radio_answer::GroundingScope + Send + Sync>;
 
-/// The answering seat's two injectable seams, carried together: the model
-/// call, and the data-boundary decision that governs what may be put IN
-/// that call (#1698 Packet B2 gate). One struct rather than two positional
-/// parameters because they are never meaningfully separable — a caller
-/// holding the ability to dispatch the seat must also hold the rule about
-/// what it may be handed.
+/// (#2917) The BUSY seam: is the local instance the answering seat would
+/// send to (under the session's overrides) occupied right now? Production
+/// wires `radio_answer::answering_seat_busy`, which reads `lms ps` and the
+/// residency-lease registry. Injectable for the same reason [`ScopeCall`]
+/// is: the production check shells out to `lms` and reads the profile
+/// registry, so a pipe test asserting the busy REPLY renders would
+/// otherwise depend on the host's LM Studio.
+type BusyCall = Arc<dyn Fn(&crate::radio_answer::AnswererOverrides) -> Option<crate::radio_busy::BusyReport> + Send + Sync>;
+
+/// The answering seat's injectable seams, carried together: the model
+/// call, the data-boundary decision that governs what may be put IN
+/// that call (#1698 Packet B2 gate), and (#2917) the busy check that
+/// decides whether the call is made at all. One struct rather than
+/// positional parameters because they are never meaningfully separable —
+/// a caller holding the ability to dispatch the seat must also hold the
+/// rule about what it may be handed, and the rule about when not to.
 #[derive(Clone)]
 struct AnsweringSeat {
     call: AnswererCall,
     scope: ScopeCall,
+    busy: BusyCall,
 }
 
 /// Entry point for `darkmux acp`. Builds its own tokio runtime and blocks on
@@ -765,6 +776,7 @@ pub fn run() -> Result<i32> {
         crate::radio_answer::dispatch_answerer_call_with(m, overrides, crate::radio::RadioSurface::Panel)
     });
     let scope: ScopeCall = Arc::new(crate::radio_answer::grounding_scope_for);
+    let busy: BusyCall = Arc::new(crate::radio_busy::answering_seat_busy);
     rt.block_on(async {
         // (#2476) Reap-on-signal for the whole long-lived host — see
         // `host_shutdown_reap_loop`'s own doc for why this exits the
@@ -773,7 +785,7 @@ pub fn run() -> Result<i32> {
         // FIX 2) for why it treats `mission launch` children differently
         // from every other registered dispatch child.
         tokio::spawn(host_shutdown_reap_loop(reap_on_host_shutdown));
-        serve(router, AnsweringSeat { call: answerer, scope }, Arc::new(IdleState::new()), AcpStdio::new()).await
+        serve(router, AnsweringSeat { call: answerer, scope, busy }, Arc::new(IdleState::new()), AcpStdio::new()).await
     })?;
     Ok(0)
 }
@@ -1681,14 +1693,31 @@ async fn run_no_slash_route(
     sessions: &Sessions,
 ) -> Result<()> {
     let text_owned = text.to_string();
-    let decision = tokio::task::spawn_blocking(move || {
+    let mut routing = tokio::task::spawn_blocking(move || {
         let catalog = crate::radio::compile_catalog();
         crate::radio::route_and_record(&text_owned, &catalog, crate::radio::RadioSurface::Panel, &mut |message: &str| {
             (router_call)(message)
         })
-    })
-    .await
-    .context("joining the radio routing task")?;
+    });
+    // (#2917) The router waits behind whatever occupies the one utility
+    // instance (a compaction, by decision), but past
+    // `ROUTER_SLOW_NOTICE_AFTER` the panel says so — what LM Studio reports
+    // the instance doing and, when darkmux knows, for which run — then
+    // keeps waiting to the call's ceiling. The notice is gathered on its
+    // own blocking task (it shells to `lms ps`), never on this event loop;
+    // the routing task keeps running underneath the timeout, so nothing is
+    // restarted or lost when it fires.
+    let decision = match tokio::time::timeout(crate::radio::ROUTER_SLOW_NOTICE_AFTER, &mut routing).await {
+        Ok(joined) => joined.context("joining the radio routing task")?,
+        Err(_still_routing) => {
+            let waited = crate::radio::ROUTER_SLOW_NOTICE_AFTER;
+            let notice = tokio::task::spawn_blocking(move || crate::radio_busy::router_wait_notice_live(waited))
+                .await
+                .context("joining the radio busy-notice task")?;
+            cx.send_notification(agent_chunk(session_id, format!("darkmux: {notice}")))?;
+            routing.await.context("joining the radio routing task")?
+        }
+    };
 
     match decision {
         // (#1698 Packet B2, scope A) A router refusal no longer prints the
@@ -1741,6 +1770,21 @@ async fn answer_no_slash_refusal(
     sessions: &Sessions,
 ) -> Result<()> {
     let (shelf, overrides) = session_answer_context(sessions, session_id);
+    // (#2917) Busy FIRST — before the data boundary, before assembly. The
+    // seat's instance occupied by another run (LM Studio reports it, or a
+    // live darkmux lease holds it) is answered at once, with what occupies
+    // it, instead of a request that queues inside LM Studio until the
+    // ceiling. Same copy the CLI prints; a blocking task because the
+    // production check shells to `lms ps`.
+    let busy_check = seat.busy.clone();
+    let overrides_for_busy = overrides.clone();
+    if let Some(busy) = tokio::task::spawn_blocking(move || (busy_check)(&overrides_for_busy))
+        .await
+        .context("joining the radio busy-check task")?
+    {
+        eprintln!("[darkmux-acp] radio answering seat's instance is busy; answering at once, not queueing");
+        return Ok(cx.send_notification(agent_chunk(session_id, format!("darkmux: {}", busy.answering_seat_message())))?);
+    }
     // (#1698 Packet B2 gate) Resolve the data boundary BEFORE assembling —
     // the dispatch only ever sees a finished message, so this is the last
     // point at which "what may leave this machine" can still be decided.
@@ -2772,6 +2816,22 @@ mod tests {
         router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
         answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
     ) -> (DuplexStream, BufReader<DuplexStream>, Arc<IdleState>) {
+        // (#2917) Pinned to "not busy": these tests exercise the wire, and
+        // the production busy check shells to `lms ps` — see `BusyCall`.
+        spawn_test_agent_with_busy(router, answerer, |_| None)
+    }
+
+    /// (#2917) [`spawn_test_agent_observing_idle`] with the answering
+    /// seat's BUSY seam injectable too — the one knob the busy-reply pipe
+    /// test needs and every other test pins to "not busy".
+    fn spawn_test_agent_with_busy(
+        router: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
+        answerer: impl Fn(&str, &crate::radio_answer::AnswererOverrides) -> Result<String> + Send + Sync + 'static,
+        busy: impl Fn(&crate::radio_answer::AnswererOverrides) -> Option<crate::radio_busy::BusyReport>
+            + Send
+            + Sync
+            + 'static,
+    ) -> (DuplexStream, BufReader<DuplexStream>, Arc<IdleState>) {
         let (test_writer, agent_reader) = tokio::io::duplex(64 * 1024);
         let (agent_writer, test_reader) = tokio::io::duplex(64 * 1024);
         let router_call: RouterCall = Arc::new(router);
@@ -2779,13 +2839,14 @@ mod tests {
         // Pinned to `Full` (#1698 Packet B2 gate): these tests exercise the
         // WIRE, not the data boundary — see `ScopeCall`'s own doc.
         let scope_call: ScopeCall = Arc::new(|_| crate::radio_answer::GroundingScope::Full);
+        let busy_call: BusyCall = Arc::new(busy);
         let transport = ByteStreams::new(agent_writer.compat_write(), agent_reader.compat());
         let idle = Arc::new(IdleState::new());
         let idle_for_serve = idle.clone();
         tokio::spawn(async move {
             let _ = serve(
                 router_call,
-                AnsweringSeat { call: answerer_call, scope: scope_call },
+                AnsweringSeat { call: answerer_call, scope: scope_call, busy: busy_call },
                 idle_for_serve,
                 transport,
             )
@@ -3140,6 +3201,54 @@ mod tests {
         let text = chunk_text(&fallback);
         assert!(text.contains("that's outside the scope of mission comms"), "{text}");
         assert!(text.contains("echo-fixture"), "the live command listing follows the reason: {text}");
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// (#2917) The panel surface of the busy answer: when the answering
+    /// seat's instance is occupied, the reply chunk IS the busy report —
+    /// naming the instance, what LM Studio reports and the run — and the
+    /// answering dispatch is never made (the answerer here panics if
+    /// reached). Same copy the CLI prints, through the same
+    /// `answering_seat_message`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_refusal_answers_at_once_that_the_seat_instance_is_busy() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            Ok("```json\n{\"refuse\": \"that's outside the scope of mission comms\"}\n```".to_string())
+        };
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            panic!("a busy answering seat must never be dispatched to (#2917)")
+        };
+        let busy = |_overrides: &crate::radio_answer::AnswererOverrides| {
+            Some(crate::radio_busy::BusyReport {
+                identifier: "darkmux:qwen3.6-35b-a3b".to_string(),
+                source: crate::radio_busy::BusySource::LmStudioStatus("generating".to_string()),
+                occupant: crate::radio_busy::Occupant::Run {
+                    kind: "mission",
+                    id: "pepper-refresh-rotation".to_string(),
+                    role: Some("coder".to_string()),
+                },
+            })
+        };
+        let (mut writer, mut reader, _idle) = spawn_test_agent_with_busy(router, answerer, busy);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "what's the weather like on mars?").await;
+
+        let reply = recv_json(&mut reader).await;
+        let text = chunk_text(&reply);
+        assert!(text.contains("`darkmux:qwen3.6-35b-a3b`, is busy"), "{text}");
+        assert!(text.contains("LM Studio reports it generating for mission `pepper-refresh-rotation` (coder)"), "{text}");
+        assert!(text.contains("Radio did not queue behind it"), "{text}");
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);

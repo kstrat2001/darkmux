@@ -74,6 +74,15 @@ Run <code>darkmux init</code> to bootstrap one, or create it manually (see profi
 
 <section>
   <div class="wrap">
+    <h2>When the model is busy</h2>
+    <p>One LM Studio instance serves one request at a time. If the answering seat's model is the same instance a coder is using, a question asked mid-run would queue inside LM Studio, silently, until the call's 300-second ceiling. radio checks first. Before sending, it reads what LM Studio reports for that instance (<code>lms ps</code>: idle, generating, processing a prompt) and whether another darkmux process holds it in use. If either says busy, radio answers at once: which model, what LM Studio reports, and the run it is busy with when darkmux knows it; when nothing of darkmux's is on the instance, it says the work is not darkmux's. It never guesses from timing, and it never queues. On the CLI the exit status is 1, since no answer was given; the same words appear in the editor panel.</p>
+    <p>The routing seat is the exception. It runs on the machine's utility model, which also compacts context for running workers, and a routing call that lands during a compaction waits behind it by design. After ten seconds of waiting radio says what it is waiting on, in the same terms, and keeps waiting. A seat on a hosted endpoint is not checked: the queue, if any, is on the provider's side.</p>
+    <p>Two ways around a busy answering seat: ask again when the run finishes, or point <code>radio.answerer_profile</code> at a model the run is not using.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
     <h2>The dial</h2>
     <p>The answering seat has a persona, RADIO, and one knob: <code>radio.humor</code>, 0 to 100. It ships at 50. Under about 40 the model answers plainly; 100 is the full voice.</p>
     <div class="session">

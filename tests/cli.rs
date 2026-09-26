@@ -5322,6 +5322,96 @@ fn radio_routes_a_loaded_models_question_to_machine_status_which_runs_lms_ps() {
     assert!(!argv.contains("unload"), "read-only only — nothing that unloads (#2918):\n{argv}");
 }
 
+/// (#2917) One LM Studio instance serves one request at a time, so a radio
+/// request from another process used to queue inside LM Studio, silently,
+/// until the 300s ceiling. Radio now checks the instance its ANSWERING seat
+/// would send to BEFORE sending: here the fake `lms ps --json` reports the
+/// seat's instance (`darkmux:stub-worker`, the default profile's model)
+/// `generating`, so radio answers at once that the model is busy, names
+/// what LM Studio reports, and never opens a connection for the answer —
+/// the stub sees exactly ONE request, the router's. No lease and no live
+/// run name the occupant, so the copy says the work is not darkmux's.
+/// Exit 1: the question was not answered, and a script must be able to
+/// tell that from an answer.
+#[test]
+fn radio_answers_at_once_that_the_answering_model_is_busy_instead_of_queueing() {
+    let (port, connections) = start_counting_refusal_stub();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let os_home = TempDir::new().unwrap();
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, utility_binding_profiles_json()).unwrap();
+    let argv_log = home.path().join("lms-argv.log");
+    let fake_lms = write_recording_fake_lms(home.path(), &argv_log, "generating");
+
+    let output = darkmux_std_cmd()
+        .env("HOME", os_home.path())
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .env("DARKMUX_LMSTUDIO_URL", format!("http://127.0.0.1:{port}"))
+        .env("DARKMUX_LMS_BIN", &fake_lms)
+        .args(["radio", "what's the weather like on mars?"])
+        .output()
+        .expect("running darkmux radio");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the ROUTER may reach the stub; a busy answering seat is never sent to (#2917)\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("busy"), "radio must say the model is busy:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("darkmux:stub-worker"), "…naming the instance:\n{stdout}");
+    assert!(stdout.contains("generating"), "…with what LM Studio reports:\n{stdout}");
+    assert!(
+        stdout.contains("did not start"),
+        "no lease and no live run name the occupant, so the copy must say the work is not darkmux's:\n{stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1), "a busy answer is not an answer: exit 1\n{stdout}\n{stderr}");
+}
+
+/// (#2917) A stub LM Studio whose every chat completion is a router-shaped
+/// REFUSAL (`{"refuse": …}`), counting the connections it accepts. Both
+/// seats share one `DARKMUX_LMSTUDIO_URL`, so the count is the number of
+/// model calls radio actually made: 1 = the router only; 2 = the answering
+/// seat was sent to as well.
+fn start_counting_refusal_stub() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the refusal stub");
+    let port = listener.local_addr().unwrap().port();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({
+                    "choices": [{ "message": { "content": "```json\n{\"refuse\": \"outside my scope\"}\n```" } }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })
+                .to_string();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, connections)
+}
+
 /// (#2918) [`start_route_decision_stub`], additionally capturing every
 /// request body it receives so a test can assert on the CATALOG the router
 /// was offered (the `Available commands:` block of the user message), not

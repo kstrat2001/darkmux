@@ -12884,6 +12884,57 @@ fn resolvers_set_the_utility_model_aside_unless_the_lab_opts_in() {
     assert_eq!(pm.id, "util-4b");
 }
 
+/// (#2917) The busy check reads the instance a dispatch WOULD send to.
+/// `dispatch_local_target` names it the way the wire does (#2240: the
+/// `darkmux:` identifier, or the profile's explicit `identifier` opt-out)
+/// and answers `None` for a hosted seat — the queue there, if any, is on
+/// the provider's side, and a check against this machine's `lms ps` would
+/// be a claim about the wrong instance. `utility_local_target` names the
+/// utility binding the way `run_utility_single_shot` addresses it.
+#[test]
+#[serial]
+fn local_target_names_the_instance_a_dispatch_would_send_to_and_none_for_a_hosted_seat() {
+    let tmp = TempDir::new().unwrap();
+    let pf = tmp.path().join("profiles.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{
+                "work":{"models":[{"id":"worker-35b","n_ctx":65536}]},
+                "aliased":{"models":[{"id":"darkmux:worker-35b","n_ctx":65536,"identifier":"my-alias"}]},
+                "hosted":{"models":[{"id":"gpt-4o","n_ctx":128000,"endpoint":{"url":"https://example.invalid/v1"}}]}
+            },
+            "internal":{"utility":{"id":"util-4b","n_ctx":16000}},
+            "default_profile":"work"}"#,
+    )
+    .unwrap();
+
+    let target = super::dispatch_local_target("radio-host", None, pf.to_str()).expect("the default profile is local");
+    assert_eq!(
+        target,
+        super::LocalTarget { identifier: "darkmux:worker-35b".to_string(), model_key: "worker-35b".to_string() }
+    );
+    // The explicit `identifier` opt-out is what goes on the wire, so it is
+    // what gets checked; the key is still the bare one (#1615).
+    let aliased = super::dispatch_local_target("radio-host", Some("aliased"), pf.to_str()).expect("aliased is local");
+    assert_eq!(aliased, super::LocalTarget { identifier: "my-alias".to_string(), model_key: "worker-35b".to_string() });
+    assert_eq!(
+        super::dispatch_local_target("radio-host", Some("hosted"), pf.to_str()),
+        None,
+        "a hosted seat has no local instance to check"
+    );
+    assert_eq!(super::dispatch_local_target("no-such-role", None, pf.to_str()), None);
+
+    let util = super::utility_local_target(pf.to_str()).expect("the binding is registered");
+    assert_eq!(util, super::LocalTarget { identifier: "darkmux:util-4b".to_string(), model_key: "util-4b".to_string() });
+
+    // A recorded model matches its instance whether an archive wrote the
+    // identifier (#2240) or the bare key; a different instance never does.
+    assert!(target.matches_recorded_model("darkmux:worker-35b"));
+    assert!(target.matches_recorded_model("worker-35b"));
+    assert!(!target.matches_recorded_model("darkmux:util-4b"));
+    assert!(!aliased.matches_recorded_model("my-other-alias"));
+}
+
 /// RED on the "delete the assignment" mutation. A real LMStudio dispatch
 /// must hand its caller the darkmux-NAMESPACED identifier — the same one
 /// the residency preflight just loaded the model under — because that

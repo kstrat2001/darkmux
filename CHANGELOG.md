@@ -73,6 +73,23 @@ darkmux release.
   are, so the router routes to it and the panel lists it. Read-only only:
   `machine eject` stays un-advertised.
 
+### Fixed
+
+- **radio says the model is busy instead of queueing behind it** (#2917).
+  One LM Studio instance serves one request at a time, and darkmux caps
+  concurrency only within one process, so `darkmux radio` fired while a
+  coder ran queued inside LM Studio, silently, until the 300s ceiling. The
+  answering seat now checks the instance it would send to BEFORE sending:
+  if `lms ps` reports it `generating`/`processingPrompt`/`computingEmbedding`,
+  or another live darkmux process holds it loaded and in use (the
+  residency-lease registry), radio answers at once that the model is busy,
+  names the run when darkmux knows it (from the runs board), and otherwise
+  says the work is not darkmux's. Facts only, never a guess; a hosted seat
+  is not checked. Same copy on the CLI (exit 1: no answer was given) and
+  in the editor panel. The router still waits behind a compaction on the
+  utility instance (#2914's decision), but after 10s both surfaces say
+  what it is waiting on and keep waiting to the ceiling.
+
 ## [3.13.0] - 2026-09-25
 
 ### Added

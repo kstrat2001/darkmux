@@ -1001,6 +1001,27 @@ pub fn dispatch_resolves_remote(
     crate::dispatch_internal::dispatch_resolves_remote(role_id, profile_name, config_path)
 }
 
+/// (#2917) The local LM Studio instance a dispatch would send to — see
+/// `dispatch_internal::LocalTarget`.
+pub use crate::dispatch_internal::LocalTarget;
+
+/// (#2917) The local instance a dispatch with this (role, profile) would
+/// send to, `None` when it targets no local instance (remote endpoint,
+/// unresolvable). See `dispatch_internal::dispatch_local_target`'s own doc.
+pub fn dispatch_local_target(
+    role_id: &str,
+    profile_name: Option<&str>,
+    config_path: Option<&str>,
+) -> Option<LocalTarget> {
+    crate::dispatch_internal::dispatch_local_target(role_id, profile_name, config_path)
+}
+
+/// (#2917) The machine utility model's instance, as a utility job addresses
+/// it. See `dispatch_internal::utility_local_target`'s own doc.
+pub fn utility_local_target(config_path: Option<&str>) -> Option<LocalTarget> {
+    crate::dispatch_internal::utility_local_target(config_path)
+}
+
 /// Outcome of the `dispatch()` routing-decision branch. Extracted as a
 /// pure shape so the (Some(machine), local_machine_id) matrix is
 /// unit-testable without filesystem / env-var setup. (Wave-E.7 #255)

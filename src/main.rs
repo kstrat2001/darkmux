@@ -95,6 +95,9 @@ mod radio_cli;
 // assembler + artifact shelf + the answering dispatch. See its own module
 // doc.
 mod radio_answer;
+// (#2917) Is the instance radio would send to busy? Facts from `lms ps` and
+// the residency-lease registry, checked BEFORE a request is sent.
+mod radio_busy;
 mod radio_index;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
