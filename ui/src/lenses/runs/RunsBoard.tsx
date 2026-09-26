@@ -11,7 +11,7 @@ import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { machineNames, nameOf } from "../../lib/flow";
+import { machineNames, displayNameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -545,7 +545,9 @@ export function RunsBoard({
   // — see `format.ts::runsForMachine`'s own doc for the alias-matching
   // rationale and the "50 missions + 15 dispatches carry no machine at all"
   // exclusion it names.
-  const pinnedMachineName = machineUid != null ? nameOf(pinRecords, liveMachines, machineUid) : null;
+  // (#2921) The shared machine label; this board has no `/machine/specs`
+  // reading of its own, so no self floor (never the uid either way).
+  const pinnedMachineName = machineUid != null ? displayNameOf(pinRecords, liveMachines, null, machineUid) : null;
   const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(pinRecords, liveMachines, machineUid)) : runs;
 
   function selectKind(k: RunsKind) {

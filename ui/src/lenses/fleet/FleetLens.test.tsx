@@ -2209,3 +2209,65 @@ describe("(#2926) fleet card: THINK opener and TOOL GEN, from the real run", () 
     expect(latestTokenScopeProps()).toMatchObject({ state: "tools", toolName: "write", toolWriting: true, centerLabel: null, centerUnit: "tool gen" });
   });
 });
+
+// (#2921) A machine the window only knows by its hardware uid must never be
+// labeled with that uid: it lands in screenshots and identifies the machine.
+describe("(#2921) fleet page: no hardware uid is ever rendered as a label", () => {
+  // Fixture uid, uppercase like the real ones; not any real machine's.
+  const FAKE_UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  function renderFleet(records: FlowRecord[]) {
+    const playhead = pepperAt("10:51:33");
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={playhead} tMin={pepperAt("10:51:00")} playhead={playhead} historical />
+      </QueryClientProvider>,
+    );
+  }
+  const uidShapedText = () => {
+    const found: string[] = [];
+    if (UUID_RE.test(document.body.textContent ?? "")) found.push("text");
+    for (const attr of ["title", "aria-label"]) {
+      for (const el of document.querySelectorAll(`[${attr}]`)) {
+        if (UUID_RE.test(el.getAttribute(attr) ?? "")) found.push(`${attr} on .${el.className}`);
+      }
+    }
+    return found;
+  };
+
+  it("records carrying only machine_uid: card and lane read 'unnamed machine', no uid text or title", async () => {
+    renderFleet(pepperRecords({ extra: { machine_uid: FAKE_UID, machine_id: undefined } }));
+    await waitFor(() => expect(document.querySelector(".lane .lname")).toBeTruthy());
+    expect(document.querySelector(".lane .lname")?.textContent).toBe("unnamed machine");
+    expect(document.querySelector(".mach-name")?.textContent).toContain("unnamed machine");
+    expect(uidShapedText()).toEqual([]);
+  });
+
+  // The reported scenario: a live daemon with an empty DARKMUX_HOME (no
+  // roster), whose records carry only the uid.
+  const liveUidOnly = () => [
+    { ts: new Date(Date.now() - 60_000).toISOString(), action: "dispatch start", session_id: "s-live", machine_uid: FAKE_UID, handle: "coder" },
+  ];
+  it("live, no roster, no specs: the lane and card read 'unnamed machine'", async () => {
+    mockFleetFetch({ flowToday: liveUidOnly() });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".lane .lname")).toBeTruthy());
+    expect(document.querySelector(".lane .lname")?.textContent).toBe("unnamed machine");
+    expect(uidShapedText()).toEqual([]);
+  });
+
+  it("live, this daemon's own uid: its specs name titles the lane like the card", async () => {
+    mockFleetFetch({ flowToday: liveUidOnly(), specs: { machine_id: "scratch-box", machine_uid: FAKE_UID } });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".lane .lname")?.textContent).toBe("scratch-box"));
+    expect(document.querySelector(".mach-name")?.textContent).toContain("scratch-box");
+    expect(uidShapedText()).toEqual([]);
+  });
+
+  it("the record's machine_id names the machine when present", async () => {
+    renderFleet(pepperRecords({ extra: { machine_uid: FAKE_UID } }));
+    await waitFor(() => expect(document.querySelector(".lane .lname")).toBeTruthy());
+    expect(document.querySelector(".lane .lname")?.textContent).toBe("MacBook-Pro");
+    expect(uidShapedText()).toEqual([]);
+  });
+});

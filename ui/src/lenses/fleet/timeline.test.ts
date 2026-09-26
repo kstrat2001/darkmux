@@ -60,11 +60,15 @@ describe("buildActivityTimeline — lanes and bars", () => {
     rec({ machine_uid: "m1", session_id: "s5", action: "dispatch.complete", ts: iso(-1430) }),
   ];
 
-  it("builds one lane per machine uid, named via nameOf", () => {
+  it("builds one lane per machine uid, named via displayNameOf", () => {
     const tl = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60);
     expect(tl.lanes).toHaveLength(1);
     expect(tl.lanes[0].uid).toBe("m1");
-    expect(tl.lanes[0].name).toBe("m1"); // no machine_id record and no beat -> falls back to the uid itself
+    // No machine_id record and no beat: a neutral label, never the uid (#2921).
+    expect(tl.lanes[0].name).toBe("unnamed machine");
+    // This daemon's own name (specs) titles its lane, exactly as it titles its card.
+    const self = buildActivityTimeline(data, new Map(), uids, liveSet, TMAX, TMAX, 60, true, 0, TMAX, undefined, { machine_id: "studio", machine_uid: "m1" });
+    expect(self.lanes[0].name).toBe("studio");
   });
 
   it("classifies a still-live session as 'run', open-ended to the window's right edge", () => {

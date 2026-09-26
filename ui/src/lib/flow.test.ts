@@ -6,6 +6,7 @@ import {
   machineNames,
   localMachineUid,
   nameOf,
+  UNNAMED_MACHINE,
   displayNameOf,
   buildFlowWindow,
   liveSessionSet,
@@ -274,7 +275,7 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
   // start printing a 36-character UUID on an empty window. These two ship
   // together; the first without the second is a regression.
   it("(#2814) displayNameOf names THIS machine from specs when the window knows nothing", () => {
-    expect(nameOf([], new Map(), UID)).toBe(UID); // the gap, stated
+    expect(nameOf([], new Map(), UID)).toBe(UNNAMED_MACHINE); // the gap, stated (#2921: never the uid)
     expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, UID)).toBe("MacBook-Pro");
   });
 
@@ -284,13 +285,13 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
   });
 
   it("(#2814) displayNameOf does not lend this machine's name to a DIFFERENT uid", () => {
-    expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, OTHER)).toBe(OTHER);
+    expect(displayNameOf([], new Map(), { machine_id: "MacBook-Pro", machine_uid: UID }, OTHER)).toBe(UNNAMED_MACHINE);
   });
 
   it("(#2814) displayNameOf with no specs is exactly nameOf", () => {
     const data = [rec(UID, "MacBook-Pro")];
     expect(displayNameOf(data, new Map(), null, UID)).toBe(nameOf(data, new Map(), UID));
-    expect(displayNameOf([], new Map(), null, UID)).toBe(UID);
+    expect(displayNameOf([], new Map(), null, UID)).toBe(UNNAMED_MACHINE);
   });
 
   it("(#2814) keeps the name path when specs reports no uid (non-macOS, or an older build)", () => {
@@ -332,9 +333,10 @@ describe("nameOf recency", () => {
     expect(nameOf([newer, older], new Map(), UID)).toBe("MacBook-Pro");
   });
 
-  it("falls back to the presence beat, then the uid, when no record names it", () => {
+  it("falls back to the presence beat, then UNNAMED_MACHINE (never the uid), when no record names it", () => {
     expect(nameOf([], new Map([[UID, { display_name: "studio" } as never]]), UID)).toBe("studio");
-    expect(nameOf([], new Map(), UID)).toBe(UID);
+    expect(nameOf([], new Map(), UID)).toBe(UNNAMED_MACHINE);
+    expect(nameOf([], new Map(), UID)).toBe("unnamed machine");
   });
 
   it("keeps the first match when timestamps are unusable, rather than picking arbitrarily", () => {

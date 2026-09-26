@@ -701,7 +701,10 @@ describe("buildFleetCard", () => {
     expect(card.stat).toBe("offline");
     expect(card.active).toBe(false);
     expect(card.runsCount).toBe(0);
-    expect(card.name).toBe("studio");
+    // (#2921) The card builder never echoes an unknown `m` back as a title
+    // (that echo is how a raw hardware uid became one); `FleetLens` titles a
+    // roster-only card with the roster id itself.
+    expect(card.name).toBe("unnamed machine");
     // Never having reported hardware is honest, not a bug — darkmux has
     // genuinely never heard from this machine.
     expect(card.spec).toBe("");

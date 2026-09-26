@@ -380,6 +380,40 @@ describe("MachineDrawer (#2107)", () => {
     expect(about.textContent).toContain("3.3.0 (abc1234)");
   });
 
+  it("(#2921) a hardware uid the window never named is not the machine name: specs names this machine", () => {
+    const UID = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[{ ts: "2026-01-01T00:00:00Z", machine_uid: UID } as never]}
+        localUid={UID}
+        liveMachines={new Map()}
+        specs={{
+          darkmux_version: "3.3.0 (abc1234)",
+          flow_schema_version: "1.28.0",
+          machine_id: "scratch-box",
+          machine_uid: UID,
+          os: "macOS",
+          ram_total_bytes: null,
+          ram_free_for_ai_bytes: null,
+          cpu_brand: "",
+          loaded_models: [],
+          lms_unreachable: false,
+          utility_model: null,
+          redis_url_redacted: null,
+          generated_at_ms: NOW,
+        } as never}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    expect(screen.getByText("scratch-box")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  });
+
   it("(#2107) omits the header line entirely when nothing is known yet, rather than rendering an empty row", () => {
     render(
       <MachineDrawer

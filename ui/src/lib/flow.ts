@@ -356,7 +356,13 @@ export function computeTMin(data: FlowRecord[]): number {
 /** `uidOf()` — viewer.html:1107. */
 export const uidOf = (r: FlowRecord): string => r.machine_uid || "unknown";
 
-/** `nameOf()` — viewer.html:1112. */
+/** (#2921) The label for a machine nothing has named. Never the hardware uid:
+ * a uid lands in screenshots and identifies the physical machine. */
+export const UNNAMED_MACHINE = "unnamed machine";
+
+/** `nameOf()` — viewer.html:1112. The newest `machine_id` a record carried
+ * for this uid, then the presence beat's `display_name`, then
+ * `UNNAMED_MACHINE` — never the uid itself (#2921; legacy fell back to it). */
 export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, m: string): string {
   if (m === "unknown") return "unknown";
   // (#2030) The MOST RECENT name this uid carried, not the first one found.
@@ -392,7 +398,7 @@ export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBea
   }
   if (best) return best.machine_id as string;
   const b = liveMachines.get(m);
-  return b?.display_name || m;
+  return b?.display_name || UNNAMED_MACHINE;
 }
 
 /** `machines()` — viewer.html:1123. */
@@ -484,10 +490,14 @@ export interface SelfIdentity {
 /** (#2814) `nameOf` with the self-identity FLOOR applied — what to TITLE a
  * machine with, as opposed to `nameOf`'s "what has this uid been called".
  *
- * `nameOf` answers with the raw uid when the window holds no record naming
- * the machine. That is honest for a uid nothing is known about, and wrong
- * for the one uid the daemon can name out of its own config — a page titled
- * with a 36-character UUID is the display half of "self is unknown".
+ * `nameOf` answers `UNNAMED_MACHINE` when the window holds no record naming
+ * the machine (it answered with the raw uid until #2921). That is honest for
+ * a uid nothing is known about, and wrong for the one uid the daemon can
+ * name out of its own config.
+ *
+ * (#2921) This is THE machine-label helper: every surface that titles a
+ * machine (fleet card, activity lane, machine page, app title, runs pin,
+ * stats panel) goes through it, so none can render the uid.
  *
  * This became REQUIRED, not merely nicer, the moment self-identity resolved
  * by uid: before that, `localMachineUid` fell through to `?? machineId` on
@@ -498,8 +508,8 @@ export interface SelfIdentity {
  * regression.
  *
  * A FLOOR, not an override, and the shape of the condition is what makes it
- * one: it fires only where `nameOf` returned the uid itself, i.e. where it
- * had nothing. Any observed name — including an alias older than the one
+ * one: it fires only where `nameOf` returned `UNNAMED_MACHINE`, i.e. where
+ * it had nothing. Any observed name — including an alias older than the one
  * specs reports — still wins, because #2030's lesson is that a value which
  * cannot be outvoted is the defect rather than the fix. */
 export function displayNameOf(
@@ -509,7 +519,7 @@ export function displayNameOf(
   m: string,
 ): string {
   const derived = nameOf(data, liveMachines, m);
-  if (derived !== m) return derived;
+  if (derived !== UNNAMED_MACHINE) return derived;
   if (!specs?.machine_id) return derived;
   return isSelfMachine(data, liveMachines, specs, m) ? specs.machine_id : derived;
 }
