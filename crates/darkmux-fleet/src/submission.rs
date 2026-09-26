@@ -612,7 +612,11 @@ mod tests {
         let peer: IpAddr = "100.64.0.8".parse().unwrap();
         let mut n = test_node("", "ghost", "100.64.0.8");
         n.node_id = String::new();
-        let r = admit(TokenCheck::Match, || Ok(Some(n)), "tailscale", peer, &allow());
+        let mut a = allow();
+        // A hand-edited entry with an EMPTY id must not match a node the
+        // provider reports with an empty id either.
+        a.insert("blank".into(), entry(Some(""), &["host"], false));
+        let r = admit(TokenCheck::Match, || Ok(Some(n)), "tailscale", peer, &a);
         assert!(matches!(r, Err(Refusal::NotAllowed { .. })), "{r:?}");
     }
 
