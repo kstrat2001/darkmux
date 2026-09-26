@@ -16516,7 +16516,10 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
         assert_eq!(p["requested_model"], "darkmux:compactor-4b");
         assert_eq!(p["reported_model"], "compactor-4b");
         assert_eq!(p["endpoint"], "http://h:1234/v1");
-        assert_eq!(p["remote"], false, "the compactor never takes the hosted route: {p}");
+        assert!(
+            p.get("remote").is_none(),
+            "a usage record states facts; it never classifies local/cloud: {p}"
+        );
         assert_eq!(p["generation"], 2);
         assert_eq!(p["total_tokens"], 580);
         assert_eq!(p["token_source"], "provider");

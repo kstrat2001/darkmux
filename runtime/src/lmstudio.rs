@@ -250,6 +250,17 @@ pub struct ChatRequest {
     pub response_format: Option<serde_json::Value>,
 }
 
+/// (#2902 step 1b) `model` is read only as a string. Any other JSON value (an
+/// object, a number) reads as `None` rather than failing the whole reply's
+/// parse, as it did not before the field was read.
+fn lenient_model_id<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as Deserialize>::deserialize(d)?;
+    Ok(v.as_str().map(str::to_string))
+}
+
 /// One chat-completion response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatResponse {
@@ -261,7 +272,7 @@ pub struct ChatResponse {
     /// (#2902 step 1b) The model the server says produced this reply
     /// (OpenAI-compatible `model`). `None` when the server did not send one;
     /// never filled in from the request. Read through [`Self::served_model`].
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_model_id")]
     pub model: Option<String>,
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
@@ -662,7 +673,7 @@ pub struct ChatChunk {
     pub id: String,
     /// (#2902 step 1b) OpenAI-compatible servers name the serving model on
     /// every chunk; the accumulator keeps the first non-empty one.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_model_id")]
     pub model: Option<String>,
     pub choices: Vec<ChoiceDelta>,
     /// Some servers (LMStudio included, when `stream_options.include_usage`
@@ -2601,5 +2612,26 @@ mod tests {
         .unwrap();
         bare.ingest(&chunk);
         assert_eq!(bare.into_response().model, None, "absent on the wire, absent here");
+    }
+
+    /// (#2902 step 1b review) A `model` that is not a string (an object, a
+    /// number) must not fail the whole reply's parse, as it did not before
+    /// the field was read: it reads as `None`.
+    #[test]
+    fn a_non_string_model_is_ignored_not_fatal() {
+        for model in [r#"{"name":"x"}"#, "7", "null", "[1]"] {
+            let resp = format!(
+                r#"{{"id":"x","model":{model},"choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}},"finish_reason":"stop"}}]}}"#
+            );
+            let r: ChatResponse = serde_json::from_str(&resp)
+                .unwrap_or_else(|e| panic!("model={model}: reply must still parse: {e}"));
+            assert_eq!(r.model, None, "model={model}");
+            let chunk = format!(
+                r#"{{"id":"c","model":{model},"choices":[{{"index":0,"delta":{{"content":"a"}}}}]}}"#
+            );
+            let c: ChatChunk = serde_json::from_str(&chunk)
+                .unwrap_or_else(|e| panic!("model={model}: chunk must still parse: {e}"));
+            assert_eq!(c.model, None, "model={model}");
+        }
     }
 }

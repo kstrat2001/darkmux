@@ -95,10 +95,9 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.58.0";
 //           still spent the call; a retried one emits one per reply). Before
 //           this, compactor calls recorded no usage at all. Its payload is
 //           the canonical usage payload plus `generation` (the compaction it
-//           served), `remote: false` (the runtime never routes the compactor
-//           through a hosted brain's URL or auth; the same per-seat routing
-//           fact `dispatch.map` stamps, 1.49.0), and `parent_role_id` /
-//           `parent_model` (the specialist execution it ran inside).
+//           served) and `parent_role_id` / `parent_model` (the specialist
+//           execution it ran inside). No `remote` verdict: the record states
+//           what was called, never a local/cloud classification.
 //           `requested_model` is the compactor id sent on the wire and
 //           `endpoint` the LMStudio base the compactor called, on a
 //           hosted-brain dispatch too.

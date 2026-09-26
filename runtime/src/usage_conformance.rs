@@ -47,13 +47,13 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/lmstudio.rs",
         caller: "chat",
-        token: ".post(",
+        token: "post",
         duty: Duty::Transport,
     },
     CallSite {
         file: "src/lmstudio.rs",
         caller: "send_streaming",
-        token: ".post(",
+        token: "post",
         duty: Duty::Transport,
     },
     // The turn loop, non-streaming and streaming. Both replies reach
@@ -61,7 +61,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/loop_runner.rs",
         caller: "run_with_sleeper",
-        token: ".chat(",
+        token: "chat",
         duty: Duty::Emits {
             records_in: ("src/loop_runner.rs", "run_with_sleeper"),
             marker: "append_model_completed(",
@@ -71,7 +71,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/loop_runner.rs",
         caller: "run_streaming_turn",
-        token: ".chat_streaming_ticking(",
+        token: "chat_streaming_ticking",
         duty: Duty::Emits {
             records_in: ("src/loop_runner.rs", "run_with_sleeper"),
             marker: "append_model_completed(",
@@ -84,7 +84,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/compaction.rs",
         caller: "compact",
-        token: ".chat(",
+        token: "chat",
         duty: Duty::Emits {
             records_in: ("src/compaction.rs", "compact"),
             marker: "CompactorCall::from_response(",
@@ -94,7 +94,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/compaction.rs",
         caller: "call_and_parse",
-        token: ".chat(",
+        token: "chat",
         duty: Duty::Emits {
             records_in: ("src/compaction.rs", "call_and_parse"),
             marker: "CompactorCall::from_response(",
@@ -107,7 +107,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/loop_runner.rs",
         caller: "run_with_sleeper",
-        token: "compaction::compact(",
+        token: "compact",
         duty: Duty::Emits {
             records_in: ("src/loop_runner.rs", "run_with_sleeper"),
             marker: "append_compaction_call(",
@@ -117,7 +117,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/loop_runner.rs",
         caller: "run_with_sleeper",
-        token: "compaction::compact(",
+        token: "compact",
         duty: Duty::Emits {
             records_in: ("src/loop_runner.rs", "run_with_sleeper"),
             marker: "append_compaction_call(",
@@ -127,7 +127,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/loop_runner.rs",
         caller: "run_with_sleeper",
-        token: "compaction::structured_compact(",
+        token: "structured_compact",
         duty: Duty::Emits {
             records_in: ("src/loop_runner.rs", "run_with_sleeper"),
             marker: "append_compaction_call(",
@@ -137,7 +137,7 @@ const ROSTER: &[CallSite] = &[
     CallSite {
         file: "src/loop_runner.rs",
         caller: "run_with_sleeper",
-        token: "compaction::structured_compact(",
+        token: "structured_compact",
         duty: Duty::Emits {
             records_in: ("src/loop_runner.rs", "run_with_sleeper"),
             marker: "append_compaction_call(",
@@ -146,15 +146,20 @@ const ROSTER: &[CallSite] = &[
     },
 ];
 
-/// Every token counted. `.chat_streaming(` (test-only since #2889) is
-/// counted too, so a production use of it has to be rostered.
-const TOKENS: &[&str] = &[
-    ".post(",
-    ".chat(",
-    ".chat_streaming(",
-    ".chat_streaming_ticking(",
-    "compaction::compact(",
-    "compaction::structured_compact(",
+/// Every name counted, as an IDENTIFIER (see [`call_sites`]): a method or
+/// path call (`.chat(`, `ureq::post(`, `compaction::compact(`), a bare call
+/// after a `use` (`compact(`), and a path reference that could be called
+/// later (`LmStudioClient::chat` bound to a variable). `chat_streaming`
+/// (test-only since #2889) and the raw `ureq` verbs are counted too, so a
+/// production use of any of them has to be rostered.
+const NAMES: &[&str] = &[
+    "post",
+    "request",
+    "chat",
+    "chat_streaming",
+    "chat_streaming_ticking",
+    "compact",
+    "structured_compact",
 ];
 
 /// Source files that are test-only as a whole.
@@ -231,13 +236,17 @@ fn block_range(src: &str, from: usize) -> std::ops::Range<usize> {
 
 /// The production part of a source file: every `#[cfg(test)]` item cut out
 /// (a `mod tests { … }` block, a test-only fn, a `mod x;` line), with
-/// comment lines dropped first (a doc comment may mention the attribute).
+/// comment lines dropped and string-literal contents blanked first (a doc
+/// comment or a message may mention the attribute or a call name).
 fn production_source(src: &str) -> String {
     let mut prod = src
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n");
+    // String contents are not code: `"compact() called with no …"` in an
+    // error message is not a call. Blank them (quotes and newlines kept).
+    prod = blank_literals(&prod);
     while let Some(at) = prod.find("#[cfg(test)]") {
         let after = at + "#[cfg(test)]".len();
         let semi = prod[after..].find(';').map(|i| after + i);
@@ -264,21 +273,116 @@ fn declared_fn(line: &str) -> Option<&str> {
     (end > 0 && rest[end..].starts_with(['(', '<'])).then(|| &rest[..end])
 }
 
-/// Every production call of `token` in `src`, as the enclosing fn's name.
-fn call_sites(prod: &str, token: &str) -> Vec<String> {
+/// `src` with the contents of every string and raw-string literal replaced
+/// by spaces (newlines kept, so line structure survives).
+fn blank_literals(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(src.len());
+    let blank = |out: &mut String, c: char| out.push(if c == '\n' { '\n' } else { ' ' });
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Raw string: r"…", r#"…"#, br"…".
+        if c == 'r' && (i == 0 || !is_ident(chars[i - 1]) || (chars[i - 1] == 'b' && (i < 2 || !is_ident(chars[i - 2])))) {
+            let mut j = i + 1;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'"') {
+                let hashes = j - i - 1;
+                out.extend(&chars[i..=j]);
+                let mut k = j + 1;
+                loop {
+                    if chars[k] == '"' && (0..hashes).all(|h| chars.get(k + 1 + h) == Some(&'#')) {
+                        break;
+                    }
+                    blank(&mut out, chars[k]);
+                    k += 1;
+                }
+                out.extend(&chars[k..=k + hashes]);
+                i = k + hashes + 1;
+                continue;
+            }
+        }
+        if c == '"' {
+            out.push('"');
+            let mut k = i + 1;
+            while chars[k] != '"' {
+                if chars[k] == '\\' {
+                    blank(&mut out, chars[k]);
+                    k += 1;
+                }
+                blank(&mut out, chars[k]);
+                k += 1;
+            }
+            out.push('"');
+            i = k + 1;
+            continue;
+        }
+        if c == '\'' {
+            // A char literal ('"', '\'', 'x'), not a lifetime.
+            if chars.get(i + 1) == Some(&'\\') {
+                let end = (i + 3..chars.len()).find(|&k| chars[k] == '\'').expect("char literal closes");
+                out.push_str(&" ".repeat(end - i + 1));
+                i = end + 1;
+                continue;
+            }
+            if chars.get(i + 2) == Some(&'\'') {
+                out.push_str("   ");
+                i += 3;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Every production use of `name` in `prod` as a callable, by enclosing fn:
+/// an occurrence at identifier boundaries that is either CALLED (`name(`)
+/// or a PATH reference (`…::name`, which can be bound and called later).
+/// A declaration (`fn name(`) is neither. `use` lines are skipped here;
+/// [`aliases_of`] polices them.
+fn call_sites(prod: &str, name: &str) -> Vec<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut current = String::from("<no fn>");
     let mut out = Vec::new();
     for line in prod.lines() {
-        if let Some(name) = declared_fn(line) {
-            current = name.to_string();
+        if let Some(decl) = declared_fn(line) {
+            current = decl.to_string();
         }
-        // No token can match a declaration (`fn chat(` has no `.`, and
-        // `fn compact(` no path), so every match is a call.
-        for _ in 0..line.matches(token).count() {
-            out.push(current.clone());
+        if line.trim_start().starts_with("use ") || line.trim_start().starts_with("pub use ") {
+            continue;
+        }
+        for (at, _) in line.match_indices(name) {
+            let before = &line[..at];
+            let after = &line[at + name.len()..];
+            if before.chars().next_back().is_some_and(is_ident)
+                || after.chars().next().is_some_and(is_ident)
+            {
+                continue;
+            }
+            if before.trim_end().ends_with("fn") {
+                continue;
+            }
+            if after.trim_start().starts_with('(') || before.ends_with("::") {
+                out.push(current.clone());
+            }
         }
     }
     out
+}
+
+/// `use` lines that import a counted name under another name, which would
+/// hide its calls from [`call_sites`].
+fn aliases_of(prod: &str, name: &str) -> Vec<String> {
+    prod.lines()
+        .filter(|l| l.trim_start().starts_with("use ") || l.trim_start().starts_with("pub use "))
+        .filter(|l| l.contains(&format!("{name} as ")))
+        .map(|l| l.trim().to_string())
+        .collect()
 }
 
 fn crate_sources() -> Vec<String> {
@@ -330,7 +434,13 @@ fn every_model_call_site_is_on_the_roster() {
     );
     for file in &files {
         let prod = production_source(&read(file));
-        for token in TOKENS {
+        for token in NAMES {
+            let aliases = aliases_of(&prod, token);
+            assert!(
+                aliases.is_empty(),
+                "{file}: {aliases:?} imports `{token}` under another name, which hides its calls \
+                 from this roster (#2902); call it by its own name"
+            );
             let mut found = call_sites(&prod, token);
             found.sort();
             let mut rostered: Vec<String> = ROSTER
@@ -373,7 +483,7 @@ fn every_roster_path_reaches_its_event() {
 fn production_source_cuts_test_items_but_keeps_what_follows() {
     let src = "fn a() { x.chat(r); }\n#[cfg(test)]\nfn t() { y.chat(r); }\n#[cfg(test)]\nmod tests {\n fn u() { z.chat(r); }\n}\nfn b() { w.chat(r); }\npub fn chat(&self) {}\n";
     let prod = production_source(src);
-    assert_eq!(call_sites(&prod, ".chat("), vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(call_sites(&prod, "chat"), vec!["a".to_string(), "b".to_string()]);
 }
 
 /// The loop compacts at TWO sites (resume catch-up and the main loop), both

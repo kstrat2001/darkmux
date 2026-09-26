@@ -10527,10 +10527,8 @@ fn event_model_id(event: &serde_json::Value, key: &str) -> Option<String> {
 ///   names it); `compactor_model` (the tailer's own copy of the same id) is
 ///   only the fallback for an event that omits it.
 /// - `endpoint` is the compactor's endpoint fact (the LMStudio base).
-/// - `remote: false` is the same per-seat routing fact `dispatch.map` stamps
-///   (#2690): the runtime builds the compactor client with no hosted URL and
-///   no auth, so this call never took a hosted route. It is what keeps the
-///   fleet hero from counting a hosted-brain run's compactor calls as cloud.
+/// - No `remote` verdict: a usage record states what was called, never a
+///   local/cloud classification (#2902's design).
 /// - `generation` names the compaction the call served, and
 ///   `parent_role_id`/`parent_model` name the specialist execution it ran
 ///   inside, so a reader can relate the two without blending them.
@@ -10553,7 +10551,6 @@ fn compaction_call_tokens_payload(
         },
         &turn_usage_counts(event),
     );
-    payload["remote"] = serde_json::json!(false);
     payload["generation"] = event.get("generation").cloned().unwrap_or(serde_json::Value::Null);
     payload["parent_role_id"] = serde_json::json!(parent_role_id);
     payload["parent_model"] = serde_json::json!(parent_model);

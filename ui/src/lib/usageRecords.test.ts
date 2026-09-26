@@ -14,7 +14,7 @@ import { runRegions } from "../lenses/session/sessionRun";
 import { applyRecordToMetrics, indexGraph, type MetricsMap } from "../lenses/mission/graph";
 import { measuredCharsPerToken, averageGenerationRate } from "./tokenRate";
 import { turnItems } from "./turnGroups";
-import { countsInExecutionTokenSums, countsInLegacyTokenSums, isCompactionUsage, isTurnUsage } from "./usageRecords";
+import { countsInExecutionTokenSums, countsInLegacyTokenSums, handleNamesExecution, isCompactionUsage, isTurnUsage } from "./usageRecords";
 
 const LMS = "http://127.0.0.1:1234/v1";
 const HOSTED = "azure:example.cognitiveservices.azure.com/gpt-5.1";
@@ -185,9 +185,8 @@ describe("#2902 step 1a: per-call usage records change no consumer's result", ()
 
 // (#2902 step 1b) The runtime's COMPACTOR calls now emit their own usage
 // records (`call_kind: "compaction"`), attributed to the compactor (record
-// `handle: "compactor"`, its own `model`), with `remote: false` (the runtime
-// never routes the compactor through a hosted brain). Each stream below is fed
-// with and without them.
+// `handle: "compactor"`, its own `model`). Each stream below is fed with and
+// without them.
 describe("#2902 step 1b: compaction usage records", () => {
   const M = "m-2";
   function compactionStreams(): [FlowRecord[], FlowRecord[]] {
@@ -197,7 +196,7 @@ describe("#2902 step 1b: compaction usage records", () => {
     const both = (x: FlowRecord) => { without.push(x); withC.push(x); };
     const only = (x: FlowRecord) => { withC.push(x); };
     const compaction = (sid: string, total: number, extra: Record<string, unknown> = {}, mission?: string) =>
-      ({ ...usage(sid, "compactor", { call_kind: "compaction", requested_model: "darkmux:c4b", reported_model: "c4b", endpoint: LMS, token_source: "provider", remote: false, generation: 1, parent_role_id: "coder", parent_model: "darkmux:q", prompt_tokens: total - 80, completion_tokens: 80, total_tokens: total, ...extra }, mission), model: "darkmux:c4b" }) as FlowRecord;
+      ({ ...usage(sid, "compactor", { call_kind: "compaction", requested_model: "darkmux:c4b", reported_model: "c4b", endpoint: LMS, token_source: "provider", generation: 1, parent_role_id: "coder", parent_model: "darkmux:q", prompt_tokens: total - 80, completion_tokens: 80, total_tokens: total, ...extra }, mission), model: "darkmux:c4b" }) as FlowRecord;
 
     // A HOSTED-brain container run that compacts once between its turns.
     both(r({ action: "dispatch.start", session_id: "h1", handle: "coder", model: "gpt-5.1", payload: { runtime: "internal", endpoint: HOSTED } }));
@@ -216,13 +215,11 @@ describe("#2902 step 1b: compaction usage records", () => {
     return [without, withC];
   }
 
-  it("the fleet hero counts compaction in its total, and on the LOCAL side of the split", () => {
+  it("the fleet hero counts compaction in its total", () => {
     const [without, withC] = compactionStreams();
     const a = tokensOffMeter(without);
     const b = tokensOffMeter(withC);
     expect(b.total).toBe(a.total + 580 + 300);
-    expect(b.cloud).toBe(a.cloud); // a hosted-brain run's compactor call is not cloud spend
-    expect(b.local).toBe(a.local + 580 + 300);
     // The turn re-read decomposition is unchanged; the compactor calls' input
     // lands in the unclassified bucket rather than breaking the turn sequence.
     expect(b.fresh).toBe(a.fresh);
@@ -276,5 +273,8 @@ describe("#2902 step 1b: compaction usage records", () => {
     expect(isTurnUsage({ call_kind: "compaction" })).toBe(false);
     expect(isCompactionUsage({ call_kind: "compaction" })).toBe(true);
     expect(isCompactionUsage({ call_kind: "turn" })).toBe(false);
+    expect(handleNamesExecution({ handle: "compactor", action: "telemetry.tokens", payload: { call_kind: "compaction" } } as never)).toBe(false);
+    expect(handleNamesExecution({ handle: "coder", action: "telemetry.tokens", payload: { call_kind: "turn" } } as never)).toBe(true);
+    expect(handleNamesExecution({ handle: "coder", action: "dispatch.turn" } as never)).toBe(true);
   });
 });

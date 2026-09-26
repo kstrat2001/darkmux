@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { handleNamesExecution } from "../lib/usageRecords";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { useThrottledValue } from "../hooks/useThrottledValue";
@@ -636,7 +637,9 @@ export function EventLogColumn({
     // the set; same for a record with no machine.
     const machines = new Set(records.map((r) => r.machine_id).filter(Boolean) as string[]);
     const sessions = new Set(records.map((r) => r.session_id).filter(Boolean) as string[]);
-    const handles = new Set(records.map((r) => r.handle).filter(Boolean) as string[]);
+    // (#2902 step 1b) A compactor call's usage record names the compactor, a
+    // sub-execution inside this session, never who ran the session.
+    const handles = new Set(records.filter(handleNamesExecution).map((r) => r.handle).filter(Boolean) as string[]);
     const one = (set: Set<string>) => (set.size === 1 ? [...set][0] : null);
     return { machine: one(machines), session: one(sessions), handle: one(handles) };
   }, [records]);

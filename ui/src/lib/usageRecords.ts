@@ -52,3 +52,14 @@ export function isCompactionUsage(p: UsageFields | null | undefined): boolean {
 export function countsInExecutionTokenSums(p: UsageFields | null | undefined): boolean {
   return countsInLegacyTokenSums(p) && !isCompactionUsage(p);
 }
+
+/** (#2902 step 1b) True when a record's `handle` names the execution the
+ *  record belongs to. A compactor call's usage record is attributed to the
+ *  compactor (`handle: "compactor"`), a sub-execution INSIDE the session, so
+ *  it never names the session's own role (a header saying who ran a session
+ *  must not lose its role because the run compacted). */
+export function handleNamesExecution(r: { action?: string; payload?: unknown; fields?: unknown }): boolean {
+  if (r.action !== "telemetry.tokens") return true;
+  const p = (r.payload ?? r.fields) as UsageFields | null | undefined;
+  return !isCompactionUsage(p);
+}

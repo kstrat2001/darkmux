@@ -682,8 +682,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
       // turn_seq decomposition below), so there is one key expression here
       // rather than two that have to be kept in step.
       // (#2902 step 1b) A compactor call counts in the totals and the split
-      // above (its `remote: false` puts it on the local side, hosted brain or
-      // not), but it is not a TURN: grouped with the run's turns it would
+      // above, but it is not a TURN: grouped with the run's turns it would
       // break the turn re-read sequence below (no `turn_seq`) and demote the
       // whole run to unclassified. Its input is its own, so it lands there.
       if (isCompactionUsage(p as Record<string, unknown>)) {

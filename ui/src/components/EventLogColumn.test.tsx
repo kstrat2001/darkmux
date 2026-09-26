@@ -634,6 +634,22 @@ describe("EventLogColumn", () => {
     expect(shared.getAttribute("title")).toContain("darkmux-coding-x-1790125784225");
   });
 
+  // (#2902 step 1b review) A compactor call's usage record is attributed to
+  // the compactor (`handle: "compactor"`), a sub-execution inside this
+  // session. It must not break the header's "who ran it": the header is
+  // computed from the UNFILTERED list, so the default-hidden tokens filter
+  // does not protect it.
+  it("a compaction usage record does not take the session's handle off the header", () => {
+    const compaction = { call_kind: "compaction", token_source: "provider", total_tokens: 580 };
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "sess-c", machine_id: "MacBook-Pro", handle: "coder" }),
+      rec({ ts: "2026-08-08T12:00:30.000Z", session_id: "sess-c", machine_id: "MacBook-Pro", handle: "compactor", action: "telemetry.tokens", category: "telemetry", source: "tokens", payload: compaction, fields: compaction } as never),
+      rec({ ts: "2026-08-08T12:01:00.000Z", session_id: "sess-c", machine_id: "MacBook-Pro", handle: "coder" }),
+    ];
+    render(<EventLogColumn scopeLabel="runs" records={records} visible />);
+    expect(document.querySelector(".eventlog__sharedwho")!.textContent).toBe("coder on MacBook-Pro");
+  });
+
   it("records that carry no session do not stop a list from being one session", () => {
     // Measured on a live run's page: machine telemetry rides the same list
     // with no session id, and every row still repeated the session.
