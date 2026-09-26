@@ -21,7 +21,6 @@ pub const RADIO_ROUTER_ROLE_ID: &str = "radio-router";
 
 const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("coder", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/coder.json"))),
-    ("scribe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/scribe.json"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.json"))),
     ("crawler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/crawler.json"))),
     // (#2310 P4c) review.json's unit-<rule> dispatch role — crawler.json's
@@ -70,7 +69,6 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
     ("test-designer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/test-designer.json"))),
     ("lab-manager", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/lab-manager.json"))),
-    ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.json"))),
     // (#1698 Packet A) The radio interpreter's ROUTING seat — bounded
     // classification over the currently advertised command catalog. See
     // `src/radio.rs`'s module doc for the two-seat receiver architecture.
@@ -102,7 +100,6 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("voice-editing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/voice-editing.json"))),
     ("lab-running", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/lab-running.json"))),
     ("design-reviewing", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/design-reviewing.json"))),
-    ("mission-compiling", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/skills/mission-compiling.json"))),
 ];
 
 /// Role system prompts (`.md`) compiled into the binary. Used as the
@@ -111,7 +108,6 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
 /// `crew_role_prompt_coverage` doctor check verifies this invariant.
 pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     ("coder", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/coder.md"))),
-    ("scribe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/scribe.md"))),
     ("code-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/code-reviewer.md"))),
     ("crawler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/crawler.md"))),
     ("reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/reviewer.md"))),
@@ -127,7 +123,6 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     // mid,low}/review-judge/review-verify seat prompts were removed here
     // along with their role manifests above — the review funnel that
     // staffed them (`build_review_graph`) was deleted in #2310 P4d.
-    ("mission-compiler", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/mission-compiler.md"))),
     // (#1698 Packet A) Frozen model-facing text (contract 6) — byte-locked
     // by `radio::tests::radio_router_role_prompt_matches_frozen_golden`.
     (RADIO_ROUTER_ROLE_ID, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-router.md"))),
@@ -153,7 +148,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
 /// role prompts at dispatch-time so the model knows upfront it
 /// can't ask questions, can't pause, and should escalate
 /// explicitly if blocked. Utility roles (bounded-I/O transformers
-/// like mission-compiler) skip the preamble since they don't run
+/// like radio-router) skip the preamble since they don't run
 /// agent loops.
 const AUTONOMOUS_DISPATCH_PREAMBLE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md"));

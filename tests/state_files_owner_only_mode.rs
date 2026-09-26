@@ -215,27 +215,11 @@ fn fleet_roster_is_owner_only_mode() {
 
 #[test]
 fn lifecycle_save_json_is_owner_only_mode() {
-    // Drive lifecycle::save_json through a real CLI verb that creates
-    // a mission. `mission propose --dry-run` won't write; use `crew
-    // ack` which lifecycle::save_json's via mission_start path — or
-    // do it the simple way: invoke `darkmux mission show` after
-    // synthesizing a mission via direct file write, then probe the
-    // mode of the synthesized file. Easier path: call the binary with
-    // a verb that lands on save_json.
-    //
-    // Simplest reliable driver: write a minimal mission.json by hand
-    // (so we have something to update), then call any verb that
-    // updates it. For pure coverage of save_json's mode the JSON
-    // shape doesn't matter — we just need the writer to fire.
-    //
-    // Direct unit-test approach is cleaner: call save_json (it's
-    // pub(crate)) from a tests/ integration test we can't. We use
-    // the binary route. For Wave-E.11 the binary subcommand that
-    // most cleanly fires save_json with no other dependencies is
-    // `mission propose` with a synthetic intent — but that requires
-    // a live LMStudio. Easier: pre-stage a mission file with default
-    // umask, then call `darkmux mission start <id>` which goes
-    // through save_json + flips status to active.
+    // Drive lifecycle::save_json through a real CLI verb. Every verb that
+    // lands on save_json with no other dependencies needs a live model,
+    // so: pre-stage a mission file with default umask, then call
+    // `darkmux mission start <id>`, which goes through save_json + flips
+    // status to active.
     with_home(|home| {
         let crew = home.join(".darkmux").join("crew");
         let mission_id = "test-mission-e11";

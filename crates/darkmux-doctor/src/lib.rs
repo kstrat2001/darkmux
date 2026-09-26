@@ -171,6 +171,7 @@ pub fn run() -> DoctorReport {
         check_removed_review_config_block(),
         check_removed_telemetry_record_every_samples(),
         check_removed_radio_router_staffing(),
+        check_removed_notebook_settings(),
         check_step_command_timeout(),
         check_dispatch_free_concurrency(),
         check_turn_delay(),
@@ -1336,10 +1337,10 @@ fn utility_binding_status(
                     // utility-agent verbs". `utility_model_id()` has exactly
                     // three consumers — this check, a serve-side display read,
                     // and `apply_utility_model`, which sets `compactor_model`.
-                    // That is ALL the binding does. `mission propose` and
-                    // `lab notebook draft` resolve their own model from the
-                    // profile and reach the SAME self-loading dispatch path,
-                    // so no verb needs this resident first.
+                    // That is ALL the binding does. Every other verb resolves
+                    // its own model from the profile and reaches the SAME
+                    // self-loading dispatch path, so no verb needs this
+                    // resident first.
                     //
                     // What remains true is only that a hand-load moves the
                     // cost earlier. Say that and nothing more.
@@ -2675,6 +2676,56 @@ fn check_removed_telemetry_record_every_samples() -> Check {
              it is read leniently but has no effect"
                 .into(),
         ),
+    }
+}
+
+/// (#2913, 4.0) `dirs.notebook` and `DARKMUX_NOTEBOOK_DIR` are removed —
+/// `lab notebook draft`/`list` retired outright in 4.0 (no deprecation
+/// release, no compatibility read), replaced by the bundled
+/// `darkmux-lab-notebook` skill, which writes the entry wherever the
+/// operator's own instructions say. Because the `DirsConfig` field is gone,
+/// a `config.json` still carrying `dirs.notebook` is read leniently (serde
+/// ignores the unknown key) and has no effect; the env var is read by
+/// nothing at all. Both are silent by construction, so this is the ONE
+/// place an operator learns the setting is dead and what to change.
+///
+/// `Pass` when neither tier is set (including a fresh `with_defaults()`
+/// config); `Warn` naming exactly the tier(s) that are set, with the exact
+/// removal step for each. An empty env value reads as unset, matching every
+/// other env-tier accessor.
+fn check_removed_notebook_settings() -> Check {
+    let name = "dirs.notebook / DARKMUX_NOTEBOOK_DIR (removed)";
+    let cfg = darkmux_types::config::DarkmuxConfig::load_resolved();
+    // The typed field is gone, so a leftover key lands in `DirsConfig`'s
+    // flattened `extras` overflow — the same place the other removed-key
+    // checks above look.
+    let config_set = cfg.dirs.as_ref().is_some_and(|d| d.extras.contains_key("notebook"));
+    let env_set = std::env::var("DARKMUX_NOTEBOOK_DIR")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !config_set && !env_set {
+        return Check { name: name.into(), status: Status::Pass, message: "not present".into(), hint: None };
+    }
+    let mut found: Vec<&str> = Vec::new();
+    let mut steps: Vec<&str> = Vec::new();
+    if config_set {
+        found.push("config.json sets `dirs.notebook`");
+        steps.push("delete `dirs.notebook` from the `dirs` block in ~/.darkmux/config.json");
+    }
+    if env_set {
+        found.push("`DARKMUX_NOTEBOOK_DIR` is exported");
+        steps.push("unset DARKMUX_NOTEBOOK_DIR (remove the export from your shell rc)");
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!("{} — removed in 4.0 (#2913); nothing reads it", found.join("; ")),
+        hint: Some(format!(
+            "{}. The notebook verbs retired in 4.0; the bundled `darkmux-lab-notebook` skill \
+             (installed by `darkmux init`) drafts an entry from `darkmux lab run stats <run-id> --json` \
+             and writes it wherever your own instructions say",
+            steps.join("; ")
+        )),
     }
 }
 
@@ -9982,6 +10033,99 @@ mod tests {
         }
     }
 
+    // ─── (#2913, 4.0) check_removed_notebook_settings — removed dirs.notebook + env ─
+
+    /// Runs `check_removed_notebook_settings` against one config.json body
+    /// and one `DARKMUX_NOTEBOOK_DIR` value, with both tiers pinned and
+    /// restored around the call.
+    fn notebook_settings_check(config_body: &str, env_value: Option<&str>) -> Check {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("config.json"), config_body).unwrap();
+        let prev_home = std::env::var("DARKMUX_HOME").ok();
+        let prev_nb = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            match env_value {
+                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
+        let check = check_removed_notebook_settings();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match prev_nb {
+                Some(v) => std::env::set_var("DARKMUX_NOTEBOOK_DIR", v),
+                None => std::env::remove_var("DARKMUX_NOTEBOOK_DIR"),
+            }
+        }
+        check
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_passes_when_neither_tier_is_set() {
+        let check = notebook_settings_check(r#"{"schema_version":"1.22","dirs":{"lab":"~/runs"}}"#, None);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_passes_against_with_defaults() {
+        use darkmux_types::config::DarkmuxConfig;
+        let contents = serde_json::to_string_pretty(&DarkmuxConfig::with_defaults()).unwrap();
+        let check = notebook_settings_check(&contents, None);
+        assert_eq!(check.status, Status::Pass, "with_defaults() must never trip this: {}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_warns_on_leftover_config_key() {
+        let check = notebook_settings_check(
+            r#"{"schema_version":"1.22","dirs":{"notebook":"~/nb","lab":"~/runs"}}"#,
+            None,
+        );
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("dirs.notebook"), "names the key: {}", check.message);
+        assert!(!check.message.contains("DARKMUX_NOTEBOOK_DIR"), "env is not set: {}", check.message);
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains("delete `dirs.notebook`"), "the exact change: {hint}");
+        assert!(hint.contains("darkmux-lab-notebook"), "names the replacement: {hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_warns_on_leftover_env_var() {
+        let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("/tmp/nb"));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("DARKMUX_NOTEBOOK_DIR"), "names the var: {}", check.message);
+        assert!(!check.message.contains("dirs.notebook"), "config key is absent: {}", check.message);
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains("unset DARKMUX_NOTEBOOK_DIR"), "the exact change: {hint}");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_names_both_when_both_are_set() {
+        let check = notebook_settings_check(r#"{"dirs":{"notebook":"~/nb"}}"#, Some("/tmp/nb"));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("dirs.notebook") && check.message.contains("DARKMUX_NOTEBOOK_DIR"));
+        let hint = check.hint.expect("a removal step");
+        assert!(hint.contains("delete `dirs.notebook`") && hint.contains("unset DARKMUX_NOTEBOOK_DIR"));
+    }
+
+    /// An empty env value is "unset", the same reading every other env-tier
+    /// accessor gives it — a stale `export DARKMUX_NOTEBOOK_DIR=` must not
+    /// warn.
+    #[serial_test::serial]
+    #[test]
+    fn check_removed_notebook_settings_treats_empty_env_as_unset() {
+        let check = notebook_settings_check(r#"{"schema_version":"1.22"}"#, Some("  "));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
     // ─── (#2413 M5) check_removed_telemetry_record_every_samples ──────────
 
     #[serial_test::serial]
@@ -12419,7 +12563,9 @@ mod tests {
         //
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 64 + darkmux_eureka::all_rules().len();
+        // 64 plus (#2913) `check_removed_notebook_settings`, the 4.0
+        // migration note for `dirs.notebook` / `DARKMUX_NOTEBOOK_DIR`.
+        let expected = 65 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -12988,7 +13134,7 @@ mod tests {
         /// crude, but it is the only thing that goes red when an entry
         /// the membership test cannot see is dropped. Bump it — in the
         /// same commit as the entry — when a real destination is added.
-        const RESOLVED_DESTINATION_COUNT: usize = 21;
+        const RESOLVED_DESTINATION_COUNT: usize = 20;
 
         let state = darkmux_types::test_isolation::IsolatedState::new();
 
@@ -13014,7 +13160,6 @@ mod tests {
             ("mods", ca::mods_dir()),
             ("flow records", ca::flows_dir()),
             ("lab runs", ca::lab_dir()),
-            ("notebook", ca::notebook_dir()),
             // ── override-or-caller-default accessors ──
             (
                 "audit chain",
@@ -13207,7 +13352,6 @@ mod tests {
             let _ = ca::mods_dir();
             let _ = ca::flows_dir();
             let _ = ca::lab_dir();
-            let _ = ca::notebook_dir();
             let _ = ca::audit_dir_override();
             let _ = ca::ack_dir_override();
             let _ = ca::identity_path_override();
@@ -13522,16 +13666,9 @@ mod tests {
             hint.contains("--context-length"),
             "and the declared context, or the hand-load lands at the model default: {hint}"
         );
-        // The hint must not resurrect the false contrast that replaced the
-        // original false claim: `utility_model_id()` only ever names the
-        // compactor, and `mission propose` / `lab notebook draft` reach the
-        // same self-loading path as every other verb.
-        for verb in ["mission propose", "lab notebook draft"] {
-            assert!(
-                !hint.contains(verb),
-                "no verb needs this resident first — naming {verb:?} implies one does: {hint}"
-            );
-        }
+        // (#2912/#2913) A third assertion used to pin that the hint named no
+        // verb as needing this resident first; the two verbs it named are
+        // gone, and `utility_model_id()` still only ever names the compactor.
     }
 
     // ─── check_unpriceable_residents (#1819) ──────────────────────────────
@@ -13776,7 +13913,7 @@ mod tests {
     // is testable with no config.json / registry / role library on disk. A
     // dangling binding (role -> undefined profile, or an unknown role id)
     // WARNs; an all-resolving map (and the empty map) Pass. Bindings use REAL
-    // role ids (`dialectic-judge`, `code-reviewer`, `analyst`, `scribe`) —
+    // role ids (`dialectic-judge`, `code-reviewer`, `analyst`, `crawler`) —
     // the bare `judge`/`verify`/`probe-high` this suite used pre-#1547 are
     // not real role ids and were themselves an instance of the trap #1547
     // fixes (a doc/test example that reads as live but no-ops). (#2418: the
@@ -13799,7 +13936,7 @@ mod tests {
     fn roles(ids: &[&str]) -> std::collections::BTreeSet<String> {
         ids.iter().map(|n| n.to_string()).collect()
     }
-    const REAL_ROLES: &[&str] = &["dialectic-judge", "code-reviewer", "analyst", "scribe"];
+    const REAL_ROLES: &[&str] = &["dialectic-judge", "code-reviewer", "analyst", "crawler"];
 
     #[test]
     fn role_profiles_empty_map_passes() {
@@ -13813,7 +13950,7 @@ mod tests {
         let map = bindings(&[
             ("dialectic-judge", "qwen35b"),
             ("code-reviewer", "qwen35b"),
-            ("scribe", "qwen4b"),
+            ("crawler", "qwen4b"),
         ]);
         let c = super::role_profiles_status(&map, &known(&["qwen35b", "qwen4b"]), &quarantined(&[]), &roles(REAL_ROLES));
         assert_eq!(c.status, Status::Pass);

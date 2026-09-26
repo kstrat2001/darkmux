@@ -401,7 +401,7 @@ mod tests {
         // unexpected null values.
         let job = build_work_job(
             None, // target_machine None
-            "scribe".to_string(),
+            "crawler".to_string(),
             "draft a note".to_string(),
             "s-1".to_string(),
             None, // workdir None
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn work_job_v4_shape_round_trips_without_retired_fields() {
         let json = r#"{
-            "role_id": "scribe",
+            "role_id": "crawler",
             "message": "hi",
             "session_id": "s-1",
             "timeout_seconds": 300,
@@ -455,7 +455,7 @@ mod tests {
         // them.
         assert!(!reser.contains("deliver"), "no deliver in v4: {reser}");
         assert!(!reser.contains("runtime"), "no runtime in v4: {reser}");
-        assert_eq!(parsed.role_id, "scribe");
+        assert_eq!(parsed.role_id, "crawler");
     }
 
     /// (#1426 ship-3) The retired `deliver` key on an old-peer record is a
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn work_job_retired_deliver_key_rejected_at_deserialize() {
         let json = r#"{
-            "role_id": "scribe",
+            "role_id": "crawler",
             "message": "hi",
             "session_id": "s-1",
             "deliver": "discord:123",
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn work_job_retired_runtime_key_rejected_at_deserialize() {
         let json = r#"{
-            "role_id": "scribe",
+            "role_id": "crawler",
             "message": "hi",
             "session_id": "s-1",
             "runtime": "internal",

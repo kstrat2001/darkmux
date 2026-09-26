@@ -213,7 +213,6 @@ const KEYS: &[(&str, Ty)] = &[
     ("radio.humor", Ty::Uint),
     ("dirs.flows", Ty::Str),
     ("dirs.audit", Ty::Str),
-    ("dirs.notebook", Ty::Str),
     ("dirs.skills", Ty::Str),
     ("dirs.crew", Ty::Str),
     ("dirs.templates", Ty::Str),

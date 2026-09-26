@@ -35,6 +35,34 @@ darkmux release.
   (#2914). It comes from `internal.utility` alone (below). A profile entry
   for the utility model is inert: `darkmux doctor` names each such profile
   with the window it declared and the binding to move it into.
+- **`darkmux mission propose` and the `mission-compiler` role** (#2912).
+  The verb dispatched a local utility model to turn pasted text into a
+  Mission plus Phases, the pre-graph mission shape from before missions
+  became task/step graphs, so even a perfect proposal could not be
+  launched. Removed outright, no deprecation release, no compatibility
+  read. **Migration:** write the mission config yourself (or have your
+  orchestrator write it from the intent text) at
+  `~/.darkmux/mission-configs/<id>.json`, then `darkmux mission launch
+  <id>`; `darkmux mission config list`/`show` render the configs you can
+  launch. A config's `ticket` key still sets the mission's ticket (the
+  old `--ticket` flag went with the verb). An operator role override at
+  `<DARKMUX_HOME>/roles/mission-compiler.json` is now just an unused
+  file.
+- **`darkmux lab notebook draft` / `lab notebook list`, the `scribe`
+  role, and the `DARKMUX_NOTEBOOK_DIR` / `dirs.notebook` setting**
+  (#2913). Built-in notebook prose is not needed when a skill can do it
+  with the orchestrator, and the data side now exists in a better form
+  (`darkmux lab run stats <run> --json`). Removed outright; the
+  `<root>/notebook` directory is no longer created by `init`.
+  **Migration:** run `darkmux init` to install the bundled
+  `darkmux-lab-notebook` skill, which drafts an entry from `lab run stats
+  --json` (and the run's `manifest.json` when needed) and writes it
+  wherever your own instructions say your notebook lives. Delete
+  `dirs.notebook` from `config.json` and unset `DARKMUX_NOTEBOOK_DIR`;
+  neither is read any more, and `darkmux doctor` warns naming whichever
+  is still set with the exact change to make. `darkmux config set
+  dirs.notebook ...` now rejects the key. Existing entries on disk are
+  untouched.
 
 ### Changed (breaking, 4.0)
 

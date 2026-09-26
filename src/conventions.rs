@@ -18,7 +18,7 @@
 //! operator-sovereign home for it (no hidden behavior, no `--engagement` flag).
 //!
 //! Template variables: `{ticket}` (from the mission's `ticket` field, set
-//! via `mission propose --ticket`), `{phase}`, `{mission}`. A template that
+//! via a `"ticket"` key on the mission config), `{phase}`, `{mission}`. A template that
 //! references `{ticket}` on a ticketless mission falls back to the built-in
 //! default with a soft warning — loud beats quiet, but conventions never
 //! block a launch.

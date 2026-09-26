@@ -97,7 +97,7 @@ pub struct Role {
     /// `profile.runtime.compaction.reserve.bail_after_compactions`
     /// when set. Phase-shaped roles (coder, reviewer) typically pin
     /// a low value (2-3) for tight bound; long-arc roles (researcher,
-    /// mission-compiler) may pin higher (5-7) for more local-tier
+    /// radio-router) may pin higher (5-7) for more local-tier
     /// runway. Absent ⇒ profile default ⇒ runtime default (unbounded).
     /// Schema-compatible: older role manifests without the field
     /// continue to work unchanged.
@@ -115,7 +115,7 @@ pub struct Role {
     pub escalation_posture: Option<String>,
     /// (#425) Role family — a **scope** distinction (#590): `"specialist"`
     /// roles work the mission/phases (the deliverable); `"utility"` roles
-    /// support the runtime outside mission scope (mission-compiler, scribe,
+    /// support the runtime outside mission scope (radio-router, the compactor,
     /// and — once #590 lands it — the compactor). The split also drives
     /// dispatch shape: specialists run the multi-turn agent loop and get the
     /// autonomous-dispatch preamble prepended; utility roles are bounded-I/O
@@ -312,8 +312,8 @@ pub struct Mission {
     /// the operator may want to see when the most recent pause occurred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_ts: Option<u64>,
-    /// (#815) The operator's VERBATIM `mission propose` input — the
-    /// unabridged prose the mission-compiler summarized into the
+    /// (#815) The operator's VERBATIM intent (a config's `source_input` key) — the
+    /// unabridged prose that was summarized into the
     /// description + phase descriptions. `mission run` dispatches this
     /// alongside each phase's compiled description so exact strings and
     /// constraints survive the compiler's compression (the lost-in-
@@ -322,7 +322,7 @@ pub struct Mission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_input: Option<String>,
     /// (#816) Work-item / ticket id this mission realizes (e.g.
-    /// `SAMPLE-4101`), set via `mission propose --ticket`. Referenced as
+    /// `SAMPLE-4101`), set via the config's `ticket` key. Referenced as
     /// `{ticket}` by the target repo's `.darkmux/conventions.json`
     /// templates for branch names, commit subjects, and PR titles. None
     /// on ticketless missions — templates referencing `{ticket}` then
@@ -405,7 +405,7 @@ impl Mission {
     ///
     /// **The recorded discriminator is `spec.origin`, stamped at mint**
     /// from the launched config's tier ([`MissionSpecOrigin`]): a
-    /// USER-tier config — a `mission propose` product persisted to the
+    /// USER-tier config — an operator-written config persisted to the
     /// operator's own configs dir, or hand-authored there — is the
     /// operator's engagement work, and its launches stay on the board. A
     /// BUILTIN config's launches (`review`, `coder-phase`, `dispatch`) are
@@ -462,7 +462,7 @@ pub struct MissionSpec {
     /// (#1562) Which TIER the launched config came from — recorded at mint,
     /// because the mission board classifies on it and a board-time registry
     /// lookup would go stale the moment the operator deletes or renames the
-    /// config. `UserConfig` = the operator's own config (a `mission propose`
+    /// config. `UserConfig` = the operator's own config (a hand-written config
     /// product, or hand-authored under the user mission-configs dir): its
     /// launches are the operator's NAMED engagement work and stay on the
     /// default board. `Builtin` = a shipped config (`review`, `coder-phase`,

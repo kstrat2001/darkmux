@@ -2058,8 +2058,8 @@ pub struct FlowRecord {
     /// Convention: keys are snake_case strings; values are typed by event
     /// shape (e.g. `dispatch.tool` uses `tool_name: string`, `args_chars:
     /// integer`, `result_chars: integer`, `success: boolean`). See the
-    /// emit sites in `dispatch.rs` / `dispatch_internal.rs` /
-    /// `mission_propose.rs` for the per-event-type payload shapes.
+    /// emit sites in `dispatch.rs` / `dispatch_internal.rs` for the
+    /// per-event-type payload shapes.
     ///
     /// Older records (pre-1.6) lack the field; viewer treats absence as
     /// the empty object `{}`. New event types degrade to "action only" on

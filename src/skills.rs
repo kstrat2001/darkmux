@@ -92,6 +92,13 @@ const EMBEDDED_SKILLS: &[(&str, &str)] = &[
         "darkmux-mod-create",
         include_str!("../skills/darkmux-mod-create/SKILL.md"),
     ),
+    // (#2913, 4.0) Replaces the retired `lab notebook` verbs and the
+    // `scribe` role: the orchestrator drafts the entry from
+    // `lab run stats --json` and writes it where the operator says.
+    (
+        "darkmux-lab-notebook",
+        include_str!("../skills/darkmux-lab-notebook/SKILL.md"),
+    ),
 ];
 
 /// On-disk `skills/darkmux-*` directories deliberately NOT embedded, and so

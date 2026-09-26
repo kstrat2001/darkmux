@@ -74,7 +74,7 @@ thread_local! {
 /// reliably control its *value* anyway, and a populated real config silently
 /// flaked default-assertion tests (e.g. `redis.enabled: true` re-enabled the
 /// Redis sink → test records XADD'd to the real `darkmux:flow` stream; a set
-/// `dirs.notebook` beat the built-in default). Precedence is still fully tested
+/// `dirs.lab` beat the built-in default). Precedence is still fully tested
 /// — `pick_*()` take explicit cfg args, and accessor tests assert the env tier
 /// or the built-in default. A crate's whole test build opts in by enabling the
 /// `darkmux-types/test-support` feature (a dev-dependency); no per-test call.
@@ -2305,29 +2305,6 @@ pub fn skills_override_dirs() -> Vec<std::path::PathBuf> {
     )
 }
 
-/// The notebook directory: `env(DARKMUX_NOTEBOOK_DIR) > config.dirs.notebook >
-/// <root>/notebook`. UNLIKE the other dir accessors, the env value is
-/// **tilde-expanded** — operators write `~/Library/Mobile Documents/...` in the
-/// shell to point the notebook at an iCloud-synced path — preserving
-/// `paths_from_root`'s long-standing behavior, which this layers the config
-/// tier over. The `<root>/notebook` fallback routes back through
-/// `paths::resolve` (which also honors the env, redundantly + harmlessly, since
-/// env already won above when set).
-pub fn notebook_dir() -> std::path::PathBuf {
-    if let Some(s) = env_str("DARKMUX_NOTEBOOK_DIR") {
-        return crate::paths::expand_tilde(&s);
-    }
-    if let Some(s) = config()
-        .dirs
-        .as_ref()
-        .and_then(|d| d.notebook.as_deref())
-        .filter(|s| !s.trim().is_empty())
-    {
-        return crate::paths::expand_tilde(s);
-    }
-    crate::paths::resolve(crate::paths::ResolveScope::Auto).notebook
-}
-
 
 #[cfg(test)]
 mod detection_policy_regression {
@@ -3433,20 +3410,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn notebook_dir_env_is_tilde_expanded_then_default() {
-        let prev = std::env::var("DARKMUX_NOTEBOOK_DIR").ok();
-        // The notebook env value IS tilde-expanded (the documented iCloud-path
-        // ergonomics) — unlike the other dir accessors, whose env is raw.
-        unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", "~/nb"); }
-        assert_eq!(notebook_dir(), dirs::home_dir().expect("home").join("nb"));
-        unsafe { std::env::remove_var("DARKMUX_NOTEBOOK_DIR"); }
-        // No env, empty config → the `<root>/notebook` derived default.
-        assert!(notebook_dir().ends_with("notebook"));
-        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_NOTEBOOK_DIR", v); } }
     }
 
     #[serial_test::serial]

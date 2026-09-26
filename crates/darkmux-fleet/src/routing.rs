@@ -404,7 +404,7 @@ pub fn build_work_job(
 // here from `crew::dispatch` so `crew` no longer depends on `fleet` (the
 // edge that made `crew` un-extractable as a crate). `crew::dispatch::dispatch`
 // is now purely local; `dispatch_routed` is the front door for user-facing
-// dispatch callers (main / phase_cli / mission_propose / notebook). The
+// dispatch callers (main / phase_cli). The
 // fleet runner calls `crew::dispatch::dispatch` directly — it's already on
 // the chosen machine, so it must run locally and never re-route.
 // ─────────────────────────────────────────────────────────────────────────
@@ -422,7 +422,7 @@ use darkmux_crew::dispatch::{self, DispatchOpts, DispatchResult, RoutingDecision
 /// instead would independently Exclusive-reconcile against a single
 /// placement the scheduler already reconciled as part of a larger wave,
 /// evicting concurrent wave siblings this call can't see (see that
-/// module's own doc for the full hazard). `mission_propose` and `notebook
+/// module's own doc for the full hazard). The retired `mission_propose` and `notebook
 /// draft` are standalone (non-wave, non-`StepKind`) callers that DO want
 /// #2628's Exclusive-reconcile + #1487 lease protection — they call
 /// [`dispatch_routed_via`] directly with `dispatch_reconciled` as the
@@ -440,7 +440,7 @@ pub fn dispatch_routed(opts: DispatchOpts) -> Result<DispatchResult> {
 /// LOCAL execution primitive (#1509). `phase_cli`'s QA-gate dispatch passes
 /// the raw `crew::dispatch::dispatch` primitive via the [`dispatch_routed`]
 /// thin wrapper (unchanged pre-#1509 behavior — see that wrapper's doc for
-/// why it stays raw); `mission_propose` and `notebook draft` call this
+/// why it stays raw); the retired `mission_propose`/`notebook draft` (#2912/#2913) called this
 /// function directly with `darkmux_crew::dispatch_reconciled::
 /// dispatch_reconciled` (#2628 — Exclusive-reconcile + a #1487 lease for a
 /// standalone, non-wave dispatch); the CLI verb passes

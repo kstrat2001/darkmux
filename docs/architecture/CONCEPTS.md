@@ -65,26 +65,25 @@ tasks.
 | Family | What it is | Dispatch shape |
 |---|---|---|
 | **specialist** | Works the mission/phases; judgment-dependent, multi-turn agent-loop roles (coder, code-reviewer, analyst). Free-form output. | Runs the full agent loop; the autonomous-dispatch preamble (`templates/builtin/AUTONOMOUS_DISPATCH_PREAMBLE.md`) is prepended to the system prompt. |
-| **utility** | Supports the runtime, outside mission scope: `mission-compiler` today, with `compactor`/`estimator`/`scribe` joining (#590). Bounded I/O, structured output, no agent loop. | A single bounded transform; no preamble. |
+| **utility** | Supports the runtime, outside mission scope: `radio-router` today, plus compaction (a runtime function, #590). Bounded I/O, structured output, no agent loop. | A single bounded transform; no preamble. |
 
 - The family is carried by the optional `role_family` field on a role manifest
   (`crates/darkmux-crew/src/types.rs:161-174`).
 - `is_specialist()` returns `true` for any role whose `role_family` is **not**
   explicitly `"utility"`; an absent field defaults to specialist
   (`crates/darkmux-crew/src/types.rs:213-214`).
-- **mission-compiler is the single canonical utility role today.** It is the
-  only built-in with `role_family: "utility"`; all other built-ins omit the
-  field and default to specialist
-  (`templates/builtin/roles/mission-compiler.json`;
-  `crates/darkmux-crew/src/loader.rs:1230-1242`).
+- **radio-router is the single built-in utility role today** (the
+  `mission-compiler` and `scribe` roles were removed in 4.0, #2912/#2913). It
+  is the only built-in with `role_family: "utility"`; all other built-ins omit
+  the field and default to specialist
+  (`templates/builtin/roles/radio-router.json`; `crates/darkmux-crew/src/loader.rs`).
 
 ### "utility" is a role *family*, not "the compaction role"
 
 A utility role is defined by its **scope** (supporting the runtime outside
 mission work) and typically carries a bounded work shape (structured I/O, low
-per-call failure cost). The mission-compiler turns unstructured intent into a
-structured Mission + Phase proposal; the same family is home to estimation,
-scribe, and (in transition, #590) compaction. The util tier is a baked-in
+per-call failure cost). The radio router maps one message onto a closed
+command catalog; the same family is home to (in transition, #590) compaction. The util tier is a baked-in
 runtime **affordance**: the runtime can always summon a util model for these
 built-in tasks. Which model is config; whether it's resident is
 resource-dependent. Compaction is one of N such tasks, not the definition of
@@ -93,16 +92,16 @@ resource-dependent. Compaction is one of N such tasks, not the definition of
 ### The compactor: runtime function today, utility role in transition (#590)
 
 Compaction runs *inside* the agent loop (§5), and **today** there is no
-`compactor` crew role. The fourteen built-in roles (`coder`, `scribe`,
-`code-reviewer`, `analyst`, `voice-editor`, `design-reviewer`, `test-designer`,
-`lab-manager`, `mission-compiler`, `trip-researcher`, `logistics-coordinator`,
-`health-research`, `fitness-coach`, `legal-research`) include none named
-`compactor` (`crates/darkmux-crew/src/loader.rs`); the compactor model is
+`compactor` crew role. The built-in roles (`coder`, `code-reviewer`, `analyst`,
+`crawler`, `reviewer`, `voice-editor`, `design-reviewer`, `test-designer`,
+`lab-manager`, `trip-researcher`, `logistics-coordinator`, `health-research`,
+`fitness-coach`, `legal-research`, and the review, radio and bench seats)
+include none named `compactor` (`crates/darkmux-crew/src/loader.rs`); the compactor model is
 selected via the `ModelRole::Compactor` slot in the profile
 (`crates/darkmux-types/src/lib.rs`).
 
 > **Direction (#590):** that coupling is being undone. The compactor becomes a
-> standalone **utility role** (alongside `mission-compiler`/`scribe`); its model
+> standalone **utility role** (alongside `radio-router`); its model
 > is registered via the `[internal] utility` binding (#450) instead of a
 > `ModelRole::Compactor` profile slot; and `ModelRole` is removed, so a
 > **profile becomes a wrapper for its models' capabilities**, not a
@@ -196,14 +195,14 @@ All of the following are **shipped**:
 
 | Verb | What it does | Where |
 |---|---|---|
-| `darkmux mission propose` | Reads unstructured intent → dispatches the **mission-compiler** utility role → renders a Mission + Phases proposal → **mandatory operator approve/edit/reject/regenerate gate** → persists a mission CONFIG draft to `~/.darkmux/mission-configs/<id>.json` only on approval; `darkmux mission launch <id>` then mints the running instance (#1284 Packet 4a). | `src/mission_propose.rs`; `src/mission_launch.rs` |
+| `darkmux mission launch <config>` | Mints a running mission instance from a mission CONFIG (built-in, or one written at `~/.darkmux/mission-configs/<id>.json`) and drives it as a task graph, every dispatch gated on operator sign-off (#1284 Packet 4a). The `mission propose` verb that used to draft a config from unstructured intent was removed in 4.0 (#2912); the frontier orchestrator writes the config. | `src/mission_launch.rs` |
 | `darkmux mission launch review` | The code-review mission (#2310 P4d): one diff-scoped `plan.sites` task per rule, one reviewer dispatch per planned unit, an optional gated mod, then a rendered GitHub review payload. A config on the crawl's shared blocks — no launcher of its own (the bespoke funnel and its ten `review.*` step kinds were deleted). The coder-phase pipeline still runs its own in-gate `code-reviewer` QA pass (`src/coder_phase.rs`). | `templates/builtin/mission-configs/review.json`; `crates/darkmux-lab/src/crawl/` |
 | `darkmux mission dispatch` | Loads a mission, validates status, confirms the role exists, fans out its ready phases (`depends_on == []`) as work jobs onto the single global fleet work queue (`darkmux:work`); waits or returns session ids. | `src/main.rs` |
 | `darkmux dispatch <role>` | Single-turn dispatch to a named role through the internal runtime. | see `CLAUDE.md` → operator-facing commands |
 
-The **operator-approval gate on `mission propose`** is the sovereignty contract
-in action: the utility agent proposes structure; the operator approves before
-anything is written.
+The **operator sign-off on every `mission launch` dispatch** is the sovereignty
+contract in action: darkmux proposes the next step; the operator approves before
+anything runs.
 
 ---
 
@@ -420,7 +419,7 @@ Two principles thread through every concept above; both are spelled out in full 
 
 - **Operator sovereignty.** Defaults are overridable, automatic actions are
   auditable, suggestions are explainable. The operator never has to wonder where a
-  decision came from. (`mission propose`'s approval gate, the flow stream's
+  decision came from. (`mission launch`'s sign-off gate, the flow stream's
   provenance fields, and "read + propose, never write user state silently" are all
   instances.) Tracked as [#44](https://github.com/kstrat2001/darkmux/issues/44).
 - **Namespacing in shared state.** darkmux-owned entries in systems others also

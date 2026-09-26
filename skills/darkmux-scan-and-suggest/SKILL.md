@@ -36,7 +36,7 @@ Example:
 ```
 Worth adding:
   • Qwen3 1.7B (1.7B dense, 41K maxCtx)
-    — Fills the gap for fast/scribe-style single-turn work
+    — Fills the gap for fast utility-style single-turn work
     — Run: `darkmux profile draft qwen3-1.7b-fast --model qwen3-1.7b-mlx --task-class fast`
 ```
 
